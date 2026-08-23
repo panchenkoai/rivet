@@ -249,7 +249,7 @@ where
 fn emit_report(report: &ReconcileReport, format: &ReconcileOutputFormat) -> Result<()> {
     match format {
         ReconcileOutputFormat::Pretty => {
-            print_report_pretty(report);
+            write_report_pretty(&mut std::io::stdout(), report);
         }
         ReconcileOutputFormat::Json(None) => {
             println!("{}", report.to_json_pretty()?);
@@ -264,33 +264,61 @@ fn emit_report(report: &ReconcileReport, format: &ReconcileOutputFormat) -> Resu
     Ok(())
 }
 
-fn print_report_pretty(report: &ReconcileReport) {
-    println!();
-    println!("  Export    : {}", report.export_name);
-    println!("  Run       : {}", report.run_id);
-    println!("  Strategy  : {}", report.strategy);
-    println!(
+/// Render the human report to `w`.
+///
+/// Takes a writer rather than calling `println!` so a unit test can read what an
+/// operator would see. It used to print directly, and `replace
+/// print_report_pretty with ()` — the whole report silently gone — survived the
+/// lib suite: its only coverage was a live test, which the `--lib` mutation run
+/// cannot execute. The per-diff gate does not consult
+/// `docs/mutants-baseline.txt` either, so "live-guarded" is not an answer it
+/// accepts (2026-08-17).
+fn write_report_pretty(w: &mut impl std::io::Write, report: &ReconcileReport) {
+    let _ = writeln!(w);
+    let _ = writeln!(w, "  Export    : {}", report.export_name);
+    let _ = writeln!(w, "  Run       : {}", report.run_id);
+    let _ = writeln!(w, "  Strategy  : {}", report.strategy);
+    let _ = writeln!(
+        w,
         "  Partitions: {} ({} match, {} mismatch, {} unknown)",
         report.summary.total_partitions,
         report.summary.matches,
         report.summary.mismatches,
         report.summary.unknown,
     );
-    println!(
+    let _ = writeln!(
+        w,
         "  Rows      : source {} / exported {}",
         report.summary.total_source_rows, report.summary.total_exported_rows,
     );
 
+    // Say what the right-hand number IS. `exported` is `chunk_task.rows_written`
+    // — the count rivet RECORDED for each window, not a re-read of the parts. So
+    // "all partitions match" means the source agrees with rivet's own ledger; a
+    // part that was recorded at 500 rows and holds 400 reconciles clean. Naming
+    // the evidence is the difference between a report and a reassurance, and it
+    // is the same rule the preflight already follows: a diagnostic must not
+    // claim more than it checked (audit 2026-08-17).
+    let _ = writeln!(
+        w,
+        "  Evidence  : source COUNT(*) per window vs the per-chunk counts rivet \
+         RECORDED (state DB), not a re-read of the parts"
+    );
+    let _ = writeln!(
+        w,
+        "              to check the files themselves: rivet validate --depth full"
+    );
+
     let repair = report.repair_candidates();
     if repair.is_empty() {
-        println!("  Status    : all partitions match");
+        let _ = writeln!(w, "  Status    : all partitions match");
     } else {
-        println!("  Repair candidates:");
+        let _ = writeln!(w, "  Repair candidates:");
         for p in repair {
-            println!("    • {} — {}", p.identifier, format_status_note(p));
+            let _ = writeln!(w, "    • {} — {}", p.identifier, format_status_note(p));
         }
     }
-    println!();
+    let _ = writeln!(w);
 }
 
 fn format_status_note(p: &PartitionResult) -> String {
@@ -320,9 +348,12 @@ mod tests {
 
     fn chunked_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT * FROM orders".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),
                 chunk_size: 100,
@@ -504,5 +535,87 @@ mod tests {
     fn reconcile_exit_fails_when_mismatch_and_unknown_coexist() {
         // A real mismatch still gates even when other partitions are unverifiable.
         assert!(enforce_reconcile_exit(&summary(0, 1, 2)).is_err());
+    }
+
+    /// `emit_report` must actually EMIT — the dispatcher, not just the writer.
+    ///
+    /// `replace emit_report -> Result<()> with Ok(())` survived even after
+    /// `write_report_pretty` got its own unit test: stubbing the CALLER makes
+    /// every format silently produce nothing while the command still exits 0.
+    /// That is the layer-boundary shape this repo keeps paying for — a correct
+    /// test of correct logic, one layer below the thing that decides whether the
+    /// logic runs at all.
+    ///
+    /// Driven through the `Json(Some(path))` arm because its effect is a FILE,
+    /// readable without capturing stdout; the pretty arm is covered by the test
+    /// below and by the live reconcile suites.
+    #[test]
+    fn emit_report_actually_writes_the_json_report() {
+        let report = ReconcileReport::new(
+            "orders".into(),
+            "run_j".into(),
+            "chunked".into(),
+            Vec::new(),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.json");
+        emit_report(
+            &report,
+            &ReconcileOutputFormat::Json(Some(path.to_string_lossy().into_owned())),
+        )
+        .expect("emit_report must succeed");
+
+        let body = std::fs::read_to_string(&path)
+            .expect("emit_report must have WRITTEN the file, not merely returned Ok");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            v["export_name"].as_str(),
+            Some("orders"),
+            "the emitted document must be this report; got:\n{body}"
+        );
+    }
+
+    /// The report must reach the operator, and must NAME its evidence.
+    ///
+    /// `replace print_report_pretty with ()` — the whole report silently gone —
+    /// survived the lib suite: the only coverage was a live test, which the
+    /// `--lib` mutation run cannot execute, and the per-diff gate does not read
+    /// `docs/mutants-baseline.txt`. Taking a writer is what makes the operator's
+    /// view readable from a unit test at all.
+    ///
+    /// The evidence line is load-bearing, not decoration: `exported` is
+    /// `chunk_task.rows_written`, the count rivet RECORDED per window, never a
+    /// re-read of the parts — so "all partitions match" means the source agrees
+    /// with rivet's own ledger, and a chunk recorded at 500 rows whose file holds
+    /// 400 reconciles clean.
+    #[test]
+    fn the_pretty_report_names_what_it_compared() {
+        let report = ReconcileReport::new(
+            "orders".into(),
+            "run_x".into(),
+            "chunked".into(),
+            Vec::new(),
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        write_report_pretty(&mut buf, &report);
+        let out = String::from_utf8(buf).expect("the report is utf-8");
+
+        assert!(
+            out.contains("Export    : orders") && out.contains("Run       : run_x"),
+            "the report must reach the operator at all; got:\n{out}"
+        );
+        assert!(
+            out.contains("Evidence"),
+            "the report must name what it compared; got:\n{out}"
+        );
+        assert!(
+            out.contains("RECORDED") && out.contains("not a re-read"),
+            "and must say the right-hand number is rivet's own record rather than \
+             a re-read of the parts — that distinction is the whole point; got:\n{out}"
+        );
+        assert!(
+            out.contains("rivet validate --depth full"),
+            "and must point at the check that DOES read the files; got:\n{out}"
+        );
     }
 }

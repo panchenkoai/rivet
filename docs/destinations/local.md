@@ -17,15 +17,17 @@ Rivet creates the directory if it does not exist.
 Files are named automatically:
 
 ```
-{export_name}_{YYYYMMDD}_{HHMMSS}.{format}
+{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
 ```
 
-Examples:
-- `users_daily_20260406_120000.parquet`
-- `orders_incremental_20260406_120000.csv.zst`
+The trailing `_mmm` is milliseconds, added so two runs in the same second never overwrite each other.
 
-For chunked exports, each chunk appends `_chunk{N}`:
-- `orders_chunked_20260406_120000_chunk0.parquet`
+Examples:
+- `users_daily_20260406_120000_123.parquet`
+- `orders_incremental_20260406_120000_123.csv` (CSV is always uncompressed — a compression codec on CSV is rejected at config validation, see [Compression](#compression) below)
+
+For chunked exports, each part appends `_chunk{N}` plus a 16-hex random nonce (the nonce guarantees re-runs/repairs never overwrite an existing part):
+- `orders_chunked_20260406_120000_chunk0_9f3a1c2b4d5e6f70.parquet`
 
 ## File splitting
 
@@ -43,7 +45,7 @@ exports:
       path: ./output
 ```
 
-Parts are named: `big_table_20260406_120000_part000.parquet`, `...part001.parquet`, etc.
+Parts are named: `big_table_20260406_120000_123_part0.parquet`, `..._part1.parquet`, etc. (unpadded part index; the timestamp includes a millisecond field).
 
 Accepted size suffixes: `KB`, `MB`, `GB` (case-insensitive).
 

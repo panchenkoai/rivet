@@ -1,5 +1,227 @@
 # Changelog
 
+## Unreleased
+
+- **A service-account key file is now minted IN PROCESS — `gcloud` is off the
+  BigQuery path for it.** With `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
+  `service_account` JSON, rivet's shared Google auth seam
+  (`destination::gcs_auth`) returned "not my shape" and the BigQuery loader
+  shelled out to `gcloud` for a token. Rivet now builds the RFC 7523 claim set,
+  signs it RS256 with the file's own `private_key`, and exchanges it for an
+  access token itself — the same seam, so the GCS destination and the BigQuery
+  loader mint from ONE implementation and a run's two legs act as ONE identity.
+  Verified against a real service account: `INFORMATION_SCHEMA.JOBS_BY_PROJECT`
+  records `user_email = rivet-export@….iam.gserviceaccount.com` for the load's
+  jobs, with the `gcloud` fallback compiled to abort so a green run could not
+  come from the subprocess. Two behaviour notes: a service account is billable
+  on its own, so rivet no longer sends `x-goog-user-project` for it (the header
+  would demand `serviceusage.services.use`, which the roles that grant a load do
+  not include); and `external_account` / workload identity plus GCE metadata
+  still use the `gcloud` fallback — an STS exchange rivet does not model, and a
+  half-implemented subset would be worse than the documented subprocess. The
+  crypto is `jsonwebtoken`, already in the tree via `reqsign`: zero new crates,
+  zero added build time. Extension seam (ADR-0026): a WIDENING, not a break —
+  `AdcUserTokenLoader` / `try_authorized_user_loader()` keep their names and
+  signatures and gain `credential_kind()` / `principal()`.
+
+- **A multiplex CDC export (`mode: cdc` with `tables:`) can now be loaded.**
+  The config `rivet init --mode cdc` emits for a whole schema carries no
+  `table:` or `query:`, so `rivet load` bailed on it outright ("must specify
+  exactly one of 'query', 'query_file', or 'table'") and `rivet check --json`
+  silently dropped its `columns` block. Both halves now fan out per table: the
+  type report emits one document per table (with a new `table:` field and a
+  `cdc/orders` display name), and the loader builds one plan per table — its
+  own warehouse table, its own `<base>/<table>/` staging prefix. That prefix is
+  the load-critical half: the manifest listing is recursive, so N plans sharing
+  one base prefix would each sweep in every sibling table's parts and merge N
+  source tables into one warehouse table with every count agreeing.
+
+- **BigQuery loads no longer need the `bq` CLI (or the Google Cloud SDK) on
+  PATH.** `rivet load --target bigquery` talks to the BigQuery JSON API
+  directly over HTTPS, using the same Application Default Credentials rivet
+  already uses for GCS — one Google auth path, not two. A container or CI image
+  that installed the Cloud SDK only for rivet can drop it. Job labels, the
+  4,000-partition batch split, `PARSE_JSON`, and the partition-quota error hint
+  are unchanged; error messages now name the BigQuery job id. If ADC is a user
+  credential with no usable refresh grant, rivet still asks `gcloud` for a token
+  when it is present, and honours `RIVET_BQ_ACCESS_TOKEN` when it is not.
+
+- **`rivet load` no longer shells out to itself.** The load planner obtained
+  every column's warehouse type by SPAWNING `rivet check --target X --json` and
+  parsing the child's stdout; it now calls the same resolver in process
+  (`preflight::collect_type_reports`, the function that command renders from).
+  Version skew between the loading binary and the type-resolving one is gone by
+  construction, so the `--rivet-bin` flag that existed only to mitigate it is
+  **removed** (passing it is now an error — it had no other use), and the config
+  is parsed ONCE instead of twice with two different `${VAR}` resolutions. The
+  plan also keeps the resolver's whole `TargetColumnSpec` — `autoload_type`, the
+  note and the L5 `cast_sql` were silently dropped by the four-field JSON mirror.
+  `rivet load`'s planning step is now reachable from offline tests for the first
+  time.
+
+- **ADR-0028: one finalize seam for the export tail.** The post-write tail
+  (manifest schema-fingerprint pin, `on_schema_drift` gate, Form-B checksum
+  harvest, shape-drift warn) is now applied exactly once, at
+  `finalize::finalize_export` — called by the dispatcher between the runner
+  returning and `finalize_manifest` — from a `CommitLedger` the runners feed as
+  they commit. Previously every export runner re-assembled that tail by hand,
+  which is how a feature wired into one runner ended up silently absent on the
+  others (the recurring runner-bypass class: the keyset/mongo drift-gate miss,
+  Form-B computed-then-discarded on the large-table runners). Runners now only
+  feed the ledger; the ordering constraints live in one place. Behavior is
+  unchanged except keyset/mongo manifests now also carry the dest-schema
+  fingerprint single mode always recorded (uniform pin at the seam).
+
+- **`rivet plan` is now READ-ONLY without `--annotate-waves`.** It computes and
+  prints the advisory schedule (and the reviewable plan artifact) but no longer
+  touches your config file unless you pass `--annotate-waves`. Previously, plan
+  gated only the *overwrite* of an existing `wave:`/`parallel_safe:` behind the
+  flag but still SILENTLY ADDED those fields to any export that lacked them — so
+  a read-only-looking `rivet plan` mutated a fresh config (the ADD-arm of the
+  0.24.4 config-clobber incident, whose overwrite half `--annotate-waves` was
+  introduced to require consent for). Now config mutation is a single explicit
+  opt-in: no flag ⇒ no write, present field or absent. `--annotate-waves`
+  (over)writes the whole schedule as before. `rivet apply` is unaffected —
+  exports with no `wave:` run last, as one implicit final wave.
+
+- **Keyset part filenames no longer repeat the export name.** Parts landed as
+  `exports/<export>/<export>_<export>_<stamp>_pk_w3_2.parquet` because the
+  keyset name format prepends the export name AND derives its run-unique middle
+  segment from the run id, which is itself `<export>_<stamp>`; its three sibling
+  runners use a fresh stamp and never doubled. Run-uniqueness (the millisecond
+  stamp) and retry-overwrite (the tag is stable within a run) are unchanged, and
+  nothing parses the prefix — the `_pk_w` / `_keyset_` suffix readers key off is
+  untouched. Existing files are not renamed; new runs write the shorter name.
+
+- Internal, no behaviour change: the two orchestrator entry points now share one
+  post-plan execution script, the ~800-line load orchestrator moved out of the
+  CLI dispatch module, and the state / manifest / preflight seams were split
+  along the same lines. Test-harness and CI-gate hardening rides along.
+
+## 0.24.5 — 2026-08-19
+
+Product fixes surfaced by the harness-conceptual audit ("does rivet verify
+against the source, or against its own counters?") and the coverage passes
+that followed it:
+
+- **reconcile now records the source COUNT the run already paid for** and its
+  report names its own evidence: the right-hand number is rivet's RECORDED
+  per-window count, never a re-read of the parts, and the report says so and
+  points at `rivet validate --depth full` — the check that does read the files.
+  The one code path carrying the source count into the manifest was dead
+  (`set_source_row_count` was cursor-gated); full/chunked runs now carry it.
+- **`rivet cdc --max-events` could wedge a checkpointed NDJSON run forever**:
+  the cap broke on the event count alone, so a transaction longer than the cap
+  held no commit boundary to checkpoint — every run re-read the same position
+  and re-printed the same prefix. The cap now defers to the first commit
+  boundary past N (the semantics the config field always documented), matching
+  the file sink. Nothing was ever lost — the failure mode was no progress plus
+  duplicates, never a skip.
+- **a corrupt/foreign CDC checkpoint no longer aborts the run** (fuzz find):
+  a `_data` resume-token field sitting beside foreign keys reached an
+  `unreachable!` panic inside the bson deserializer; with `panic = "abort"`
+  that took the whole process down. The decoder now deserializes from `_data`
+  alone and errors cleanly on every malformed shape.
+- **one broken view no longer fails every schema-wide MySQL `rivet init`**:
+  a view whose base table is gone stays listed in the catalog with zero
+  columns, and the MySQL arm of the schema scan — alone of the three engines —
+  aborted the whole scan on it. All three arms now share one `scan_step`
+  tolerance: skip exactly the listed-but-vanished shape, abort on any real
+  error (a scan that shrugged off a connection drop would emit a silently
+  truncated scaffold).
+- **the concurrency governor reads pressure the export cannot inflate**
+  (0.24.5 carries the follow-through of the #229 rewrite): per-engine
+  write/redo counters, idle canaries on all three engines asserting the #229
+  shape (a shed that never recovers) stays impossible, an end-to-end shed
+  proof on the parallel checkpoint runner including the journalled
+  `ParallelismAdjusted` record, and the pool-level canary — `apply --pool`
+  with the governor armed, the exact field-incident combination, delivering
+  every row with no walk toward the floor.
+- **multi-table SQL Server CDC capture** is exercised end to end (the first
+  multi-table capture test, through the canonical Rig).
+- test-hook vocabulary grew a fourth primitive: `RIVET_TEST_PAUSE_AT`
+  pauses the product at its own sequence point (with a marker-file handshake),
+  so concurrency-window fixtures wait on a condition instead of racing
+  rivet's startup with a clock.
+
+Harness/CI (the larger half of this release by commit count): every coverage
+ledger in docs/ now admits zero gaps and each ratchet is at its floor; the
+azurite round-trip closed the destination matrix; per-column NULL profiles
+(MSSQL) and per-field presence profiles (Mongo) give the CDC matrices
+engine-independent oracles; the CDC CLI's untested flags (`--rollover`,
+`--stream`, `--source-env`/`--source-file`, `--format csv`) are covered with
+RED-proven tests; `apply --pool --split` into a cloud prefix is proven against
+the manifest-sidecar clobber (RED: 150001 of 300000); the workflow service
+stacks, LiveService ports, and CLI flag coverage are now derived-and-guarded
+rather than hand-typed; and a rig-adoption ratchet freezes bespoke test-runner
+sites at today's counts, shrink-only.
+
+## 0.24.4 — 2026-08-11
+
+Silent-loss hardening of the `apply --pool --split` GA (#167), driven to convergence:
+a multi-agent bughunt found the defects, an adversarial review caught an incomplete fix,
+and two consecutive fresh rounds then came up empty. Every "Fixed" defect below reported
+a successful run while the data was gapped, duplicated, or about to be deleted — and none
+changes a config or an output format.
+
+### Added
+
+- **Extension seam (ADR-0026): `rivet::google_auth`** —
+  `AdcUserTokenLoader` and `try_authorized_user_loader()` are now `pub`.
+  `reqsign` resolves service account → impersonated → external account → VM
+  metadata and has NO `authorized_user` arm, so every native Google client
+  needs this loader or it authenticates in CI and fails on a developer
+  laptop. It was already implemented here for the GCS destination; exposing
+  it lets `rivet-pro`'s native BigQuery client delete its own copy — which
+  had surfaced the token endpoint's error body (Google echoes the submitted
+  `client_id`/`client_secret` back in some failure modes), kept the secrets
+  un-zeroed, and invented a lifetime when `expires_in` was absent. Additive:
+  nothing existing changed shape.
+
+### Fixed — the run said success and the data disagreed
+
+- **A keyset `chunk_checkpoint` crash-resume duplicated a page** (measured live: 1300 rows
+  declared for a 1000-row table). A crash in the `after_manifest_update` window — the part's
+  `file_log` row written but the cursor not yet advanced — left the resume re-reading an
+  already-committed page while its rehydrated copy was also declared. The root fix is a new
+  **cursor-atomic checkpoint** (state schema **v25**): each keyset page stamps its high-water
+  key into the `file_log` row of its last part, so a crash-recovery resume reconciles the
+  cursor from the committed parts and NEVER re-reads a committed page. Loss-safe by
+  construction (a mid-page crash falls back to a recoverable dup, never a loss). NOT
+  split-only — any keyset export with `chunk_checkpoint` was affected; `--split` forced it on.
+- **A `--pool --split` Full load could gap AND duplicate rows** across two split generations
+  of equal size. The coherence guard only counted bottom/top/plain units; two generations at
+  the same unit count but different boundaries, with an interior unit substituted from the
+  older generation, passed it while the windows no longer tiled. Now a tiling check (the
+  multiset of non-None lower bounds must equal the multiset of upper bounds) refuses it.
+- **Split siblings superseded each other's `running` markers**, so a later-started sibling
+  finishing first made an earlier, still-live sibling look inactive — and a cross-host
+  `rivet load --gc-orphans` then deleted the live sibling's in-flight parts. Concurrent
+  split siblings are now excluded from supersession; a crash successor (same unit name)
+  still supersedes correctly.
+- **A trailing split crash dropped the widened tail** on the parallel-keyset runner: a
+  reconstruct after the top units hard-crashed widened the tail unit's window but resumed its
+  stale, narrower ranges. The open tail now runs fresh when its ordinal left no manifest.
+- **`gc_orphans` deleted parts a chunk-checkpoint resume was reusing** — a Failed run's parts
+  are adopted (not re-exported) by the resume, so they are now spared while a live run of the
+  same export may be adopting them.
+
+### Fixed — the diagnostic cried wolf
+
+- **`rivet check` reported a false UNSAFE** on a `mode: chunked` + `table:` export whose
+  chunk column the planner auto-resolves to the single-integer PK: preflight ignored that
+  resolution, probed nothing, and told the operator to "create an index" on an already-indexed
+  PK. All three engine diagnostics now resolve the same PK the planner would.
+
+### Internal
+
+- Refuse a synthesized split-unit name that collides with an existing export (would otherwise
+  silently drop that export's table); doc-honesty corrections (Mongo init gate, CDC
+  `single_event_commit` contract, the split resume "overwrite in place" claim); a dead mask
+  clause removed. Every fix ships a RED-proven regression test; the split guards are registered
+  in `docs/pool-split-matrix.yaml`. `--pool` was clean throughout; `apply --pool --split`
+  (#167) is now converged.
+
 ## 0.24.3 — 2026-08-07
 
 Nine silent-loss fixes, one loud refusal, and the layers that found them. Every

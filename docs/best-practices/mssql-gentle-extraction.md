@@ -23,7 +23,7 @@ exports:
     parallel: 1               # sequential = gentlest to the source
     chunk_checkpoint: true    # resumable
 source:
-  environment: production     # governor throttles concurrency on source write pressure
+  environment: production     # Balanced profile: gentler batch/throttle/retry defaults
 ```
 
 The one rule that matters: **on SQL Server, set `chunk_size` (rows) explicitly;
@@ -44,10 +44,30 @@ rivet export is a quiet tenant:
 | Peak lock count | **3–4** | shared locks released as each chunk scans (READ COMMITTED) |
 
 The lever: **`environment: production`** (or `replica`). It selects the
-*Balanced* tuning profile, which turns on the OPT-2 back-pressure governor — it
-samples the source's `Log Flush Waits` counter and **sheds a concurrent worker
-when the counter rises**, so a busy source slows rivet down instead of the other
-way round. `environment: local` (the default for dev) does **not** throttle.
+*Balanced* tuning profile — gentler batch/throttle/retry defaults.
+`environment: local` (the default for dev) does **not** throttle.
+
+The OPT-2 back-pressure governor is a separate, explicit opt-in: it arms only
+when you set **`tuning.adaptive: true` and `parallel > 1`** (with `parallel: 1`
+there is no worker to shed). When armed, on SQL Server it samples
+`Log Flush Waits/sec` — the `_Total` row of `sys.dm_os_performance_counters` —
+and **sheds a concurrent worker when that counter rises**, so a source someone
+*else* is hammering slows rivet down instead of the other way round.
+
+Read the table above together with this: `Log Flush Waits delta = 0` for a
+rivet export is exactly *why* it is the governor's signal. It measures redo-
+**write** pressure, which a read-only export cannot inflate — so the governor
+can only ever be moved by foreign write traffic, and rivet's own reads can
+never talk it into shedding its own workers. An earlier version sampled the
+tempdb-spill counters `Workfiles Created/sec` + `Worktables Created/sec`
+instead; because a large chunked read spills to tempdb *by design*, the
+governor read its own exhaust and walked parallelism 4→3→2→1 without ever
+recovering (a field pool run lost 1h48m to it). That implementation is gone.
+
+The practical consequence: **the governor does not react to rivet's own tempdb
+spills.** If your export is the thing straining tempdb, the levers are
+`tuning.batch_size` and `tuning.max_batch_memory_mb` (and a smaller
+`chunk_size`), not `adaptive`.
 
 > **Caveat — isolation.** rivet reads under SQL Server's default READ COMMITTED.
 > It does not downgrade to `NOLOCK` / snapshot isolation, so on a table under

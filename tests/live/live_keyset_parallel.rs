@@ -68,6 +68,24 @@ fn id_set_and_fanout(dir: &std::path::Path) -> (usize, BTreeSet<i64>, usize) {
     (count, keys, workers.len())
 }
 
+/// Parquet parts per range worker, keyed `w{ridx}` (the `_pk_w{ridx}_{page}` token
+/// in every part name). Lets a test assert a SPECIFIC range left N durable pages —
+/// needed to prove a mid-range failure's pre-failure pages are on disk (#200-1).
+fn worker_part_counts(dir: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let mut out: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for p in files_with_extension(dir, "parquet") {
+        if let Some(ridx) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split("_pk_w").nth(1))
+            .and_then(|s| s.split('_').next())
+        {
+            *out.entry(format!("w{ridx}")).or_default() += 1;
+        }
+    }
+    out
+}
+
 /// The shared scenario: run parallel keyset on an already-seeded `1..=n` integer
 /// key and assert (1) every row round-trips exactly once (structural parity across
 /// the N ranges) and (2) the run FANNED OUT to ≥2 workers (did not collapse).
@@ -625,6 +643,10 @@ fn parallel_keyset_incremental_survives_no_backslash_escapes_mysql() {
     require_alive(LiveService::Mysql);
     use mysql::prelude::Queryable;
     let table = unique_name("pk_nbs");
+    // :3306 GLOBAL flip — mutually exclude with every other shared-batch-server
+    // GLOBAL mutator (binlog-compression, governor tmp-storage) and the timing
+    // canaries under the SAME lock (r5 bughunt: a per-name lock excluded none).
+    let _serial = quiet_window_guard();
     let mut c = mysql_connect();
     let orig: String = c.query_first("SELECT @@global.sql_mode").unwrap().unwrap();
     // The hostile sql_mode must be the SERVER default so rivet's OWN connections inherit
@@ -790,6 +812,75 @@ fn parallel_keyset_worker_error_still_counts_the_durable_parts_postgres() {
         Some(on_disk as i64),
         "a failed parallel-keyset run must count the parts it left durable \
          ({on_disk} on disk) — the retry guard reads this and nothing else"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
+/// #200-1: the SAME durable-parts blind spot, one level deeper — page granularity
+/// WITHIN a range. The worker-level template above fails a range at its FIRST page
+/// (`keyset_parallel_worker:2`), so the failing range writes nothing and every
+/// on-disk part belongs to a COMMITTED range — `files_committed == on_disk` holds
+/// even with the bug, because the bug only drops the parts of a range that both
+/// (a) wrote pages AND (b) never committed.
+///
+/// This fixture makes a range do exactly that: `keyset_parallel_worker_midrange:2`
+/// fires only after range 2 has already made page 0 durable, so range 2 leaves a
+/// parquet on disk yet never reaches its checkpoint commit. Pre-fix those parts
+/// lived in the worker's `local_parts`, published to the shared count ONLY at
+/// range completion — the mid-range `return` dropped them, so `files_committed`
+/// under-counted the debris the retry guard reads. RED before the per-page publish:
+/// `files_committed` = the committed ranges only, `on_disk` = those + range 2's
+/// page 0.
+///
+/// Needs ≥2 pages per range so page 0 lands before the mid-range fire: 4000 rows /
+/// `parallel: 4` = 1000-row ranges over `chunk_size: 500` = 2 pages each.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_midrange_error_counts_pre_failure_page_parts_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_midr");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 4000) g;"
+    ))
+    .unwrap();
+    let rig = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker_midrange:2");
+    assert!(
+        !out.status.success(),
+        "a worker mid-range error must fail the run"
+    );
+
+    // The premise: range 2 wrote page 0 to disk BEFORE the mid-range failure, and
+    // the committed ranges wrote their pages too. If range 2 wrote nothing this
+    // test degenerates into the worker-level one and proves nothing new.
+    let per_worker = worker_part_counts(&rig.out_dir());
+    let on_disk: usize = per_worker.values().sum();
+    assert!(
+        per_worker.get("w2").copied().unwrap_or(0) >= 1,
+        "fixture is inert for #200-1: range 2 must leave ≥1 durable page BEFORE it \
+         fails mid-range, got per-worker parts {per_worker:?}"
+    );
+    assert!(
+        on_disk > per_worker.get("w2").copied().unwrap_or(0),
+        "fixture needs committed ranges too, got {per_worker:?}"
+    );
+
+    // The seam: files_committed must count EVERY durable part on disk, including
+    // range 2's pre-failure page — the retry guard reads this and nothing else.
+    // RED pre-fix: files_committed omitted range 2's uncommitted-but-durable page.
+    let db = StateDb::next_to_config(&rig.config_path());
+    let run_id = db.latest_run_id(rig.export_name());
+    let m = db.metrics_row(&run_id);
+    assert_eq!(
+        m.files_committed,
+        Some(on_disk as i64),
+        "a mid-range failure must count the pages the failing range already made \
+         durable ({on_disk} on disk, per-worker {per_worker:?})"
     );
 
     let mut c2 = pg_connect();
@@ -973,37 +1064,29 @@ fn parallel_keyset_resume_with_changed_worker_count_postgres() {
     ))
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = dir.path().join("cfg.yaml");
     let out = dir.path().join("out");
-    let write_cfg = |n: usize| {
-        let lines = [
-            format!("source: {{ type: postgres, url: \"{POSTGRES_URL}\" }}"),
-            "exports:".to_string(),
-            "  - name: pk_resn".to_string(),
-            format!("    table: public.{table}"),
-            "    mode: chunked".to_string(),
-            "    chunk_by_key: id".to_string(),
-            format!("    parallel: {n}"),
-            "    chunk_checkpoint: true".to_string(),
-            "    chunk_size: 200".to_string(),
-            "    format: parquet".to_string(),
-            format!(
-                "    destination: {{ type: local, path: \"{}/\" }}",
-                out.display()
-            ),
-        ];
-        std::fs::write(&cfg, lines.join("\n")).unwrap();
-    };
+    // Through the rig: the old hand-built config here justified itself with
+    // "the only way to vary N across a crash/resume pair" — false since
+    // replace_export_line exists for exactly that shape (and the r2 bughunt
+    // flagged this file as a live ratchet bypass: format!-built yaml +
+    // fs::write scored zero bespoke sites).
+    let mut rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named("pk_resn")
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 200")
+        .dest_path(out.clone());
     // Run 1: parallel:4, crash after range 1 commits (durable in keyset_range).
-    write_cfg(4);
-    let crash = run_rivet_env(
-        &["run", "-c", cfg.to_str().unwrap()],
+    let crash = rig.run_args_env(
+        &[],
         &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:1")],
     );
     assert!(!crash.status.success(), "the crash run must fail");
     // Run 2: parallel:8 — resume must reuse the crashed run's 4 persisted ranges.
-    write_cfg(8);
-    let resume = run_rivet_env(&["run", "-c", cfg.to_str().unwrap()], &[]);
+    rig.replace_export_line("parallel:", "parallel: 8");
+    let resume = rig.run_args(&[]);
     assert!(
         resume.status.success(),
         "resume with a changed parallel N must succeed: {}",
@@ -1016,4 +1099,128 @@ fn parallel_keyset_resume_with_changed_worker_count_postgres() {
     );
     assert_eq!(keys, (1..=2000i64).collect::<BTreeSet<i64>>());
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// ADR-0029, the ORIGINALLY-REPORTED defect: a parallel-keyset run that FAILS
+/// must record in its Failed manifest the schema fingerprint it OBSERVED, not
+/// the stale baseline the state DB held before the run.
+///
+/// This runner records durable parts ABOVE its error bail and used to feed the
+/// whole `CommitLedger` BELOW it, so `finalize_export_records` — the failure half
+/// of the ADR-0028 seam, whose entire job is "a Failed manifest must describe its
+/// debris honestly" — received an EMPTY ledger. Parallel keyset is the worst case
+/// because it has no direct `summary.schema_fingerprint` assignment at all (its
+/// three siblings set one from their own `shared_fingerprint`), so the ledger is
+/// its ONLY path. ADR-0029's split fixes it: the schema is an OBSERVATION — it
+/// describes what the runner READ and carries no coverage obligation — so it is
+/// fed above the bail while the Form-B checksums stay commit-gated below, the
+/// asymmetry `keyset.rs` states at its part-publishing site, now expressed in the
+/// ledger's shape instead of left to feed order.
+///
+/// THE FIXTURE IS THE WHOLE TEST, and two earlier drafts of it proved nothing —
+/// both measured GREEN with the fix reverted:
+///
+/// * "the Failed manifest carries a real fingerprint, not the `unavailable`
+///   placeholder" is fix-INVARIANT: the fallback `finalize_manifest` uses when the
+///   ledger is empty is `get_stored_schema`, and `capture_open_forensics` stores
+///   the schema (`store_schema_if_absent`) at run OPEN — so the fallback answers
+///   with the same schema the run observed.
+/// * making the source DRIFT between two runs is not enough either, if the second
+///   run gets a FRESH `Rig`: the rig owns its tempdir, so it owns its state DB,
+///   and a new rig has no baseline to be stale. The failing run stored the drifted
+///   schema itself at open and the fallback answered with it.
+///
+/// So the subject must be ONE rig (one state DB) run TWICE across a schema change:
+///
+///   1. same rig, clean run over `(id, payload)` — manifest gives fingerprint A,
+///      and A becomes this export's stored baseline;
+///   2. `ALTER TABLE ADD COLUMN` — the source is now schema B;
+///   3. a separate rig, clean run over the ALTERED table: an independent oracle
+///      for fingerprint B;
+///   4. the SAME rig again, failed by a worker error. Its stored baseline is still
+///      A (`store_schema_if_absent` will not overwrite, and the drift gate that
+///      would refresh it does not run on a failure), so a manifest carrying A is
+///      the fallback and a manifest carrying B is the observation.
+///
+/// RED against feeding `note_schema` below the bail: the Failed manifest carries
+/// A while its durable parquet is schema B — actively wrong forensics about data
+/// sitting on the prefix.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_failed_parallel_keyset_run_records_the_observed_schema_fingerprint_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_fpfail");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+
+    // (1) The SUBJECT rig — reused for run 4, so its state DB carries the baseline.
+    let subject = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let r1 = subject.run();
+    assert!(
+        r1.status.success(),
+        "baseline run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+    let fp_a = manifest_schema_fingerprint(&subject.out_dir());
+
+    // (2) The source moves to schema B.
+    c.batch_execute(&format!("ALTER TABLE {table} ADD COLUMN note TEXT;"))
+        .unwrap();
+
+    // (3) Independent oracle for B: its own rig, its own state DB, clean run.
+    let oracle = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let r2 = oracle.run();
+    assert!(
+        r2.status.success(),
+        "oracle run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+    let fp_b = manifest_schema_fingerprint(&oracle.out_dir());
+    assert_ne!(
+        fp_a, fp_b,
+        "fixture is inert: adding a column did not change the fingerprint, so the stale \
+         baseline and the observation are indistinguishable and this test grades nothing"
+    );
+
+    // (4) Same rig, same state DB (baseline still A), source now B, failed by a
+    // worker error after other ranges have already committed parts.
+    let out = subject.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker:2");
+    assert!(
+        !out.status.success(),
+        "a worker error must fail the run — otherwise this is not the failure path"
+    );
+    assert!(
+        !files_with_extension(&subject.out_dir(), "parquet").is_empty(),
+        "fixture is inert: the surviving ranges wrote no parts, so the Failed manifest \
+         has no debris to describe"
+    );
+
+    let recorded = manifest_schema_fingerprint(&subject.out_dir());
+    assert_eq!(
+        recorded, fp_b,
+        "a FAILED parallel-keyset run must pin the fingerprint it OBSERVED ({fp_b}); it \
+         recorded {recorded}, and the stale pre-ALTER baseline is {fp_a} — a Failed manifest \
+         describing durable parquet with the wrong schema is actively wrong forensics"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
+/// `manifest.json`'s recorded schema fingerprint, for either a Success or a
+/// Failed manifest (ADR-0012 M7 writes the manifest either way; only `_SUCCESS`
+/// is success-only).
+fn manifest_schema_fingerprint(dir: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(dir.join("manifest.json"))
+        .unwrap_or_else(|e| panic!("read {}/manifest.json: {e}", dir.display()));
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse manifest.json");
+    v["schema_fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("manifest.json has no schema_fingerprint: {text}"))
+        .to_string()
 }

@@ -207,3 +207,84 @@ fn init_source_env_unset_exits_nonzero() {
         "error must mention the missing env var; got:\n{stderr}"
     );
 }
+
+// ─── IE7: the cloud-destination scaffolding flags, and the constraints on them ──
+
+/// `rivet init --s3-bucket/--s3-region` and `--gcs-bucket/--gcs-credentials-file`
+/// — four flags with ZERO references anywhere in the tree, found by deriving the
+/// flag list from `args.rs` rather than reading the list I remembered.
+///
+/// What they produce is the destination block of a config a user then runs
+/// unmodified, so a wrong scaffold is a wrong export. And they carry clap
+/// constraints (`conflicts_with`, `requires`) that fail SILENTLY when wrong: a
+/// dropped `requires` lets `--gcs-credentials-file` scaffold without a bucket,
+/// and a dropped `conflicts_with` lets S3 and GCS both be named, where which one
+/// wins is invisible.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn init_cloud_destination_flags_scaffold_and_exclude_each_other() {
+    require_alive(LiveService::Postgres);
+    let _table = seed_pg_numeric_table(5);
+
+    let init = |extra: &[&str]| -> std::process::Output {
+        let mut args = vec!["init", "--source", POSTGRES_URL];
+        args.extend_from_slice(extra);
+        std::process::Command::new(RIVET_BIN)
+            .args(&args)
+            .output()
+            .expect("spawn rivet init")
+    };
+
+    // S3: the scaffold must name the backend AND carry the region it was given —
+    // asserting only "s3" would pass on a scaffold that dropped the region and
+    // left the export pointing at the wrong endpoint.
+    let s3 = init(&[
+        "--s3-bucket",
+        "qa-scaffold-bucket",
+        "--s3-region",
+        "eu-central-1",
+    ]);
+    assert!(
+        s3.status.success(),
+        "init --s3-bucket must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&s3.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&s3.stdout);
+    assert!(
+        yaml.contains("type: s3") && yaml.contains("qa-scaffold-bucket"),
+        "the scaffold must declare an s3 destination with the given bucket; got:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("eu-central-1"),
+        "--s3-region must reach the scaffold — a dropped region silently points the export \
+         at the default endpoint; got:\n{yaml}"
+    );
+
+    // GCS: the twin backend.
+    let gcs = init(&["--gcs-bucket", "qa-scaffold-gcs"]);
+    assert!(
+        gcs.status.success(),
+        "init --gcs-bucket must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&gcs.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&gcs.stdout);
+    assert!(
+        yaml.contains("type: gcs") && yaml.contains("qa-scaffold-gcs"),
+        "the scaffold must declare a gcs destination with the given bucket; got:\n{yaml}"
+    );
+
+    // The constraints. Both are `assert!(!success)` on purpose: the failure mode
+    // they guard is a SILENT resolution, not an error message.
+    let both = init(&["--s3-bucket", "a", "--gcs-bucket", "b"]);
+    assert!(
+        !both.status.success(),
+        "naming an S3 AND a GCS bucket must be REFUSED — otherwise one wins and which is \
+         invisible in the scaffold"
+    );
+    let creds_alone = init(&["--gcs-credentials-file", "/tmp/does-not-matter.json"]);
+    assert!(
+        !creds_alone.status.success(),
+        "--gcs-credentials-file without --gcs-bucket must be REFUSED (clap `requires`) — a \
+         credentials path with no bucket scaffolds a destination that cannot resolve"
+    );
+}

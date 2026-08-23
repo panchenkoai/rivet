@@ -67,6 +67,10 @@ pub struct ManifestBuilder {
     /// What this run's `_rivet_row_hash` covers. Taken from the plan snapshot so
     /// the manifest cannot claim a contract the run did not actually apply.
     row_hash: Option<crate::enrich::RowHashContract>,
+    /// For an `apply --pool --split` range sub-export: the `(lo, hi]` key window this unit
+    /// covered, set from the plan's split marker so `--split --resume` reconstructs the exact
+    /// partition. `None` for a non-split export.
+    split_window: Option<crate::manifest::SplitWindow>,
 }
 
 impl ManifestBuilder {
@@ -95,6 +99,7 @@ impl ManifestBuilder {
     ) -> Self {
         Self {
             checksum_render: None,
+            split_window: None, // set later via set_split_window from the plan's SplitSynth
             run_id: run_id.to_string(),
             export_name: plan.export_name.clone(),
             export_family: export_family.to_string(),
@@ -172,6 +177,30 @@ impl ManifestBuilder {
     ///
     /// `status` reflects the overall run outcome — `Success` is the only
     /// status that licenses the `_SUCCESS` marker (M2).
+    /// Record the source-side `COUNT(*)` this run probed, so the load side can
+    /// check the **source→file** leg (`load::reconcile` bails when
+    /// `source_row_count != row_count` — the extract silently dropped rows).
+    ///
+    /// Separate from [`set_cursor_range`] on purpose. The field used to be one
+    /// of that method's parameters, and that method is only called when the run
+    /// has a CURSOR — so on a `full` or `chunked` export the count could not
+    /// reach the manifest even if a caller had one to give. Combined with all
+    /// three production writers passing `None` there, the effect was that
+    /// `load::reconcile`'s source→file bail, its `LoadIntegrity.source_rows`
+    /// field and the whole `--allow-source-drift` flag were unreachable code:
+    /// the chain of custody always ended at "rivet says it wrote N" (audit
+    /// 2026-08-17).
+    ///
+    /// Still `None` unless the run actually probed the source — the field's
+    /// contract is "when cheaply known", and a blanket `COUNT(*)` on every
+    /// export is a scan nobody asked for. Today the probe is `--reconcile`,
+    /// which already runs the count and, before this, threw it away.
+    pub fn set_source_row_count(&mut self, source_row_count: Option<i64>) {
+        if let Some(ex) = self.source.extraction.as_mut() {
+            ex.source_row_count = source_row_count;
+        }
+    }
+
     /// Record the cursor range this run covered (incremental strategies) so
     /// the warehouse can prove continuity across runs. `low` is the prior
     /// run's high (or the min seen this run); `high` is the value the next run
@@ -232,7 +261,15 @@ impl ManifestBuilder {
             column_checksums: self.column_checksums,
             checksum_key_column: self.checksum_key_column,
             row_hash: self.row_hash,
+            split_window: self.split_window,
         }
+    }
+
+    /// Record the split window this unit covered (from the plan's `SplitSynth`), so
+    /// `--split --resume` reconstructs the exact original partition. No-op (`None`) for a
+    /// non-split export.
+    pub fn set_split_window(&mut self, window: Option<crate::manifest::SplitWindow>) {
+        self.split_window = window;
     }
 }
 
@@ -294,11 +331,29 @@ pub fn record_run_schema_fingerprint(
     summary.schema_fingerprint = Some(crate::state::schema_fingerprint(&columns));
 }
 
+/// What [`record_committed_part_with_fingerprint`] did to the manifest.
+///
+/// `part_id` is returned (not just the dedup verdict) because ADR-0029 keys the
+/// part → commit-unit map on it: it is stable across a dedup, unique within the
+/// manifest by M4, and 4 bytes rather than a second copy of every part path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedPart {
+    /// True iff an existing entry with the same path was refreshed in place.
+    pub deduped: bool,
+    /// The manifest id of the entry (existing on a dedup, freshly minted else).
+    pub part_id: u32,
+}
+
 /// Same as [`record_committed_part`] but with a precomputed fingerprint.
 ///
 /// Used by parallel-chunked aggregation, where workers compute fingerprints
 /// inside their thread (the local tmp file is dropped at thread exit) and
 /// the parent iterates over the shared `file_records` collection.
+/// Returns the entry's [`RecordedPart`]: `deduped` is true iff the part was DEDUPED in place (a
+/// re-read overwrote a rehydrated part of the same path) — the caller must then NOT double-count
+/// the run aggregates for it — and `part_id` is the manifest id of the entry either way, which
+/// ADR-0029 uses to key the part → commit-unit map the Form-B coverage is computed on.
+#[must_use]
 pub fn record_committed_part_with_fingerprint(
     summary: &mut RunSummary,
     relative_path: String,
@@ -306,7 +361,7 @@ pub fn record_committed_part_with_fingerprint(
     size_bytes: u64,
     content_fingerprint: String,
     content_md5: String,
-) {
+) -> RecordedPart {
     // ADR-0012 M4: part_id must be unique within the manifest.  Before the
     // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
     // safe ordinal because the list was always built from scratch this run.
@@ -315,6 +370,29 @@ pub fn record_committed_part_with_fingerprint(
     // write at len()=4 would get part_id=5 — duplicate).  Take max+1 of
     // existing part_ids instead.  Empty list → 1, matching the historical
     // first-part value.
+    // Dedup by PATH: a resume that re-reads a page whose REHYDRATED part shares this run's stable
+    // part name (keyset seek_tag / a chunked stable name) OVERWRITES the file on disk — the
+    // manifest must then carry ONE entry, not both, or finalize double-counts the page's rows (the
+    // after_manifest_update dup — measured 300/1000 on a live keyset resume, convergence round-1
+    // HIGH). Two parts sharing a path is never valid (each is a distinct file), so the re-read is
+    // authoritative: keep the existing part_id, refresh the payload in place. A first-time write
+    // (the common case) never collides and falls through to the push below unchanged.
+    if let Some(existing) = summary
+        .manifest_parts
+        .iter_mut()
+        .find(|p| p.path == relative_path)
+    {
+        existing.rows = rows;
+        existing.size_bytes = size_bytes;
+        existing.content_fingerprint = content_fingerprint;
+        existing.content_md5 = content_md5;
+        existing.status = PartStatus::Committed;
+        // deduped in place — the caller must NOT double-count the aggregates
+        return RecordedPart {
+            deduped: true,
+            part_id: existing.part_id,
+        };
+    }
     let part_id = summary
         .manifest_parts
         .iter()
@@ -331,6 +409,10 @@ pub fn record_committed_part_with_fingerprint(
         content_md5,
         status: PartStatus::Committed,
     });
+    RecordedPart {
+        deduped: false,
+        part_id,
+    }
 }
 
 /// Outcome of a manifest-write attempt.
@@ -384,6 +466,20 @@ pub fn write_manifest_without_success_marker(
     // `until_current` run. The canonical + `_SUCCESS` must stay a consistent pair,
     // updated together only by the terminal `write_manifest` at clean end.
     write_manifest_inner(dest, manifest, false, false)
+}
+
+/// Like [`write_manifest`] but WITHOUT the prefix-level `_SUCCESS` — keeps the
+/// canonical `manifest.json` + the run-unique copy. For a `--pool --split` UNIT
+/// (#167): the unit's canonical/copy are its record (validate reads the canonical,
+/// the load sums the copies), but the prefix `_SUCCESS` — which marks the WHOLE
+/// giant done — is written ONCE by the pool after every unit finishes, never by a
+/// single unit. Distinct from [`write_manifest_without_success_marker`], which
+/// also skips the canonical (the CDC per-roll case).
+pub fn write_manifest_keep_canonical_no_success(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+) -> Result<WriteOutcome> {
+    write_manifest_inner(dest, manifest, false, true)
 }
 
 fn write_manifest_inner(
@@ -755,6 +851,74 @@ mod tests {
         assert_eq!(ex.source_row_count, Some(123));
     }
 
+    /// The source count must reach the extraction section WITHOUT a cursor.
+    ///
+    /// It used to be a parameter of `set_cursor_range`, which `finalize` calls
+    /// only when the run has one — so on a `full` or `chunked` export the count
+    /// could not have reached the manifest even with a caller willing to supply
+    /// it. That is half of why `load::reconcile`'s source→file bail had never
+    /// executed; the other half was all three writers passing `None`.
+    ///
+    /// Written because the mutation gate caught `set_source_row_count with ()`
+    /// surviving: the setter's only coverage was a LIVE test
+    /// (`run_reconcile_flag_exits_zero_when_counts_match`), which the `--lib`
+    /// run cannot see. The live test stays — it observes the value at the
+    /// boundary, out of the artifact the real producer wrote — and this pins the
+    /// cursor-independence the live fixture happens not to exercise.
+    #[test]
+    fn builder_carries_the_source_row_count_without_a_cursor() {
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "e",
+            "run_src",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        // No `set_cursor_range` call at all — the `full`/`chunked` shape.
+        b.set_source_row_count(Some(4242));
+        let m = b.finalize(ManifestStatus::Success);
+        let ex = m.source.extraction.expect("extraction section present");
+        assert_eq!(
+            ex.source_row_count,
+            Some(4242),
+            "a run with no cursor must still record the source count — otherwise \
+             load::reconcile's source→file leg stays unreachable on every \
+             non-incremental export"
+        );
+        assert_eq!(
+            ex.cursor_column, None,
+            "and it must not fabricate a cursor to carry it"
+        );
+    }
+
+    /// `None` must survive as absent, not become 0.
+    ///
+    /// `load::reconcile` branches on `if let Some(src)`, so a `Some(0)` where no
+    /// probe ran would compare a real `row_count` against zero and bail on every
+    /// export that did not use `--reconcile`.
+    #[test]
+    fn an_unprobed_run_records_no_source_row_count() {
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "e",
+            "run_none",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        b.set_source_row_count(None);
+        let m = b.finalize(ManifestStatus::Success);
+        let ex = m.source.extraction.expect("extraction section present");
+        assert_eq!(ex.source_row_count, None);
+    }
+
     #[test]
     fn record_committed_part_assigns_max_plus_one_over_id_gaps() {
         // Mutants killed: `m + 1` → `m - 1` / `m * 1` in the part-id
@@ -775,7 +939,7 @@ mod tests {
                 status: PartStatus::Committed,
             });
         }
-        record_committed_part_with_fingerprint(
+        let _ = record_committed_part_with_fingerprint(
             &mut s,
             "part-next.parquet".into(),
             1,

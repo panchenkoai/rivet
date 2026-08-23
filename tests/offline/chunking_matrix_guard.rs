@@ -37,8 +37,19 @@
 //!    an INDEPENDENT oracle (a DuckDB/source-vs-dest re-read, outside rivet's decode
 //!    family) lowers the ceiling. So the shared-decode self-oracle debt is visible
 //!    and monotonically shrinks toward 0.
+//! 8. GENERATIVE runner-column completeness — #5 on the one axis that is not an
+//!    enum. `docs/runner-coverage-matrix.yaml` is keyed on RUNNERS, so #5 matched
+//!    none of its predicates and its column line was hand-written and tied to
+//!    nothing. The required set is derived from the product instead: a top-level
+//!    fn that drains through `commit::record_part` IS a commit loop (ADR-0028's
+//!    own definition of the seam every runner must call), and the derived set is
+//!    compared to the declared columns in BOTH directions — a new runner with no
+//!    column, and a column whose runner is gone. Its sibling grades the other half
+//!    of ADR-0028: the export TAIL has exactly one caller, which is what lets
+//!    several rows of that ledger be runner-agnostic `na` instead of a cell per
+//!    runner.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -52,6 +63,41 @@ use serde::Deserialize;
 /// → 12 (chunk_count ×2) → 7 (chunk_by_days ×3 + keyset-non-usable ×2) → 3
 /// (sparse-gappy ×2 + memory_mb-PG + keyset-auto-MSSQL→na) → 1 (small-table-escape
 /// ×2→na) → 0 (chunk_count-Mongo→na).
+/// Coverage ledgers that this guard does NOT cover, each naming the guard that
+/// does. Membership is checked against the file GLOB, and each named guard file
+/// must exist — a claim of coverage is not coverage.
+///
+/// The list used to be implicit: `MATRICES` held 20 of the 25
+/// `docs/*matrix*.yaml` files and nothing compared it to what is on disk, so a
+/// ledger could sit ungoverned indefinitely and read as governed. One of the
+/// five did worse than that — `scenario-artifact-matrix.yaml` was not valid
+/// YAML (three keys at column 0 among siblings indented 6) and neither of its
+/// two readers noticed, because both scan lines and strip them rather than
+/// parsing. Fixed in the same commit; the parse check below is what would have
+/// caught it (audit 2026-08-17).
+const EXEMPT: &[(&str, &str)] = &[
+    (
+        "docs/attestation-matrix.yaml",
+        "tests/offline/attestation_matrix_guard.rs",
+    ),
+    (
+        "docs/cdc-axis-matrix.yaml",
+        "tests/offline/cdc_axis_matrix_guard.rs",
+    ),
+    (
+        "docs/perf-matrix.yaml",
+        "tests/offline/perf_matrix_guard.rs",
+    ),
+    (
+        "docs/release-gate-matrix.yaml",
+        "tests/offline/release_gate_matrix_guard.rs",
+    ),
+    (
+        "docs/scenario-artifact-matrix.yaml",
+        "tests/offline/scenario_artifact_matrix_guard.rs",
+    ),
+];
+
 const MATRICES: &[(&str, usize)] = &[
     ("docs/chunking-matrix.yaml", 0),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
@@ -63,9 +109,13 @@ const MATRICES: &[(&str, usize)] = &[
     ("docs/cli-flag-matrix.yaml", 0),
     // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
     // cloud findings (prefix normalization B, --validate-is-advisory A) + the
-    // emulator round-trip + cross-backend parity. 1 gap: no azurite full-round-trip
-    // stand test (the CloudDestination path is shared + proven on S3/GCS).
-    ("docs/destination-matrix.yaml", 1),
+    // emulator round-trip + cross-backend parity.
+    //
+    // Lowered 1 -> 0 (2026-08-18): the azurite full-round-trip is written
+    // (`stand_dest_azure_{mysql,postgres}`), reading CONTENT back through the same
+    // `azure_parquet_total_rows` the multipart test uses rather than a second
+    // per-backend definition of delivered.
+    ("docs/destination-matrix.yaml", 0),
     ("docs/behaviour-matrix.yaml", 0),
     ("docs/type-fidelity-matrix.yaml", 0),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
@@ -143,9 +193,41 @@ const MATRICES: &[(&str, usize)] = &[
     // The last 3 then closed: a chunked-range + a parallel-Mongo drift live test, a
     // parallel-Mongo clobber live test, and mongo schema_drift reclassified `na` (a
     // Mongo Arrow schema is a fixed {_id, document, meta} shape — the verbatim-blob
-    // document column cannot structurally drift). 0 gaps — every runner × feature cell
-    // is a test or a justified n/a.
+    // document column cannot structurally drift).
+    //
+    // 0 → 2 on 2026-08-16, and this is the ONE direction the ratchet may move up: the
+    // `chunked` column was SPLIT into `chunked` (chunked/exec.rs) + `chunked_checkpoint`
+    // (sequential_checkpoint.rs + parallel_checkpoint.rs), the two runner families
+    // job.rs dispatches on `is_resumable()`. Nothing regressed; two admissions that
+    // already existed in PROSE became cells a guard can read. The allowance is for
+    // EXACTLY these two, and no others:
+    //   1. adaptive_concurrency_governor × chunked_checkpoint — the checkpoint runner's
+    //      END-TO-END shed has only an ad-hoc live run; the wiring + pool-shed mechanism
+    //      are proven offline. Was a paragraph in the cell's own `what` that said
+    //      "OPEN … not a committed test" next to a `test:` cell. Fill = a checkpoint
+    //      twin of governor_backs_off_under_concurrent_write_pressure.
+    // FILLED 2026-08-16 (2 → 1): failed_chunk_fails_the_run × chunked. Plain
+    // chunked_PARALLEL bails on collected worker errors AFTER the loop (exec.rs), the
+    // end-of-loop guard shape no PANIC test can reach, and it was not merely untested
+    // but UNTESTABLE — maybe_error_at_index("chunk_export", …) was wired into the two
+    // checkpoint runners and keyset/mongo, never into exec.rs. Wiring the hook there
+    // (the returning error a panic can never be) let the checkpoint-less twin
+    // `a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export` go RED
+    // against the removed guard: 100 of 150 rows shipped with `status: success`, exit 0.
+    // Unlike the checkpoint twin (RED only with BOTH guards off) this is a single-guard
+    // RED — the plain runner keeps no chunk_task ledger, so that one bail is all there is.
+    //
+    // Lowered 1 -> 0 (2026-08-18): the last admitted gap — the parallel checkpoint
+    // runner's END-TO-END governor shed, which two offline proofs could not reach —
+    // was filled by `checkpoint_governor_backs_off_under_concurrent_write_pressure`.
+    // At 0 this ledger admits nothing: any new gap cell fails here immediately.
     ("docs/runner-coverage-matrix.yaml", 0),
+    // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
+    // scheduler layer above the runners (each unit runs through chunked/keyset), so its
+    // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
+    // resume) is proven on every SQL engine via the Rig stand + a DuckDB manifest oracle;
+    // Mongo is `na` (no inline SQL range literal → left whole). 0 gaps.
+    ("docs/pool-split-matrix.yaml", 0),
     // CDC per-type value fidelity — the change-stream sibling of type-fidelity, the
     // axis where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
     // (BIT(64) bit 63) lived: batch correct, CDC/edge sibling not. Workhorse cells
@@ -171,8 +253,11 @@ struct Matrix {
 #[derive(Deserialize)]
 struct Scenario {
     id: String,
-    #[serde(default, rename = "what")]
-    _what: Option<String>,
+    /// The row's prose. Read by guard #8, which derives the rows whose `na`
+    /// cells REST on the ADR-0028 seam from the ledger itself rather than from
+    /// a hand-kept list here.
+    #[serde(default)]
+    what: Option<String>,
     #[serde(flatten)]
     cells: HashMap<String, Cell>,
 }
@@ -268,6 +353,81 @@ fn all_fn_names() -> HashSet<String> {
     names
 }
 
+/// Every fn under src/ or tests/ that actually RUNS as a test — i.e. one carrying a
+/// test attribute (`#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case(..)]`).
+///
+/// [`all_fn_names`] answers "does this name exist", which is one step short of what a
+/// `test:` cell claims. A helper (`manifest_count`, `seed_pg_wide_table`) satisfies the
+/// existence check while proving nothing, so "fill the gap" can be faked by naming a
+/// helper — the ledger-grading sibling of "a coverage ledger must grade the CALL SITE,
+/// not the definition". This set is the call-site half: a cell may only name something
+/// the test runner will execute.
+fn all_test_fn_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    for dir in ["src", "tests"] {
+        collect_test_fn_names(&repo_root().join(dir), &mut names);
+    }
+    names
+}
+
+/// Is this line a TEST attribute (not `#[cfg(test)]`, not `#[ignore]`)? Compares the
+/// attribute path only — `#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case(..)]`.
+fn is_test_attr(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("#[") else {
+        return false;
+    };
+    let path: &str = rest.split(['(', ']', '=']).next().unwrap_or("").trim();
+    path == "test" || path.ends_with("::test") || path == "rstest" || path == "test_case"
+}
+
+fn collect_test_fn_names(dir: &Path, out: &mut HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_test_fn_names(&path, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // A test fn is preceded by a contiguous run of attributes/doc comments, at
+        // least one of which is a test attribute. Any other statement resets the run.
+        let mut armed = false;
+        for line in text.lines() {
+            let t = line.trim_start();
+            if is_test_attr(t) {
+                armed = true;
+                continue;
+            }
+            if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+                continue; // #[ignore]/#[should_panic]/docs sit between the attr and the fn
+            }
+            let mut rest = t;
+            for prefix in ["pub(crate) ", "pub(super) ", "pub ", "async ", "unsafe "] {
+                if let Some(r) = rest.strip_prefix(prefix) {
+                    rest = r;
+                }
+            }
+            if armed
+                && let Some(rest) = rest.strip_prefix("fn ")
+                && let Some(name) = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                && !name.is_empty()
+            {
+                out.insert(name.to_string());
+            }
+            armed = false;
+        }
+    }
+}
+
 fn collect_fn_names(dir: &Path, out: &mut HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -358,6 +518,105 @@ fn matrix_every_mapped_test_exists() {
     }
 }
 
+/// Matrices whose `test:` cells legitimately name something that is NOT a `#[test]` fn,
+/// each with the reason. Keep this list at one entry unless a ledger genuinely grades a
+/// non-`cargo test` runner.
+const NON_TEST_CELL_MATRICES: &[(&str, &str)] = &[(
+    "docs/fuzz-matrix.yaml",
+    "cells name cargo-fuzz ENTRY fns in src/fuzz.rs (driven by fuzz.yml nightly), which \
+     are `pub fn`, not `#[test]` fns — asserted to live in src/fuzz.rs instead",
+)];
+
+/// Guard #3b — a `test:` cell must name a fn the test runner EXECUTES, not merely one
+/// that exists. [`matrix_every_mapped_test_exists`] accepts any `fn <name>` anywhere
+/// under src/ or tests/, so a helper (`manifest_count`, `chunk_run_id`, a seeding fn)
+/// satisfies it while proving nothing — and that is the cheapest way to make a `gap`
+/// look filled, which is exactly the move the gap ratchet makes tempting. Same rule as
+/// `every_gate_function_has_a_call_site` in release_gate_matrix_guard: registration is a
+/// claim about behaviour, only the runnable call site is evidence.
+#[test]
+fn matrix_mapped_tests_are_real_test_functions() {
+    let test_fns = all_test_fn_names();
+    // Parse sanity: a broken collector would silently accept everything.
+    assert!(
+        test_fns.len() > 500 && test_fns.contains("matrix_every_mapped_test_exists"),
+        "test-attribute scan produced {} names — the collector is broken, so this guard \
+         would pass vacuously",
+        test_fns.len()
+    );
+    let fuzz_src = std::fs::read_to_string(repo_root().join("src/fuzz.rs")).unwrap_or_default();
+    for (path, _) in MATRICES {
+        let exempt = NON_TEST_CELL_MATRICES.iter().find(|(p, _)| p == path);
+        let matrix = load_matrix(path);
+        for sc in &matrix.scenarios {
+            for (eng, cell) in sc.resolved_cells(&matrix.engines, path) {
+                let Some(name) = &cell.test else { continue };
+                if test_fns.contains(name) {
+                    continue;
+                }
+                let Some((_, why)) = exempt else {
+                    panic!(
+                        "{path} scenario '{}' column '{}' maps to `{name}`, which exists but \
+                         carries NO test attribute (#[test]/#[tokio::test]/…) — a helper fn is \
+                         not a proof. Name the test that RUNS, or record the cell as a `gap:` \
+                         with the reason.",
+                        sc.id, eng
+                    );
+                };
+                assert!(
+                    fuzz_src.contains(&format!("fn {name}(")),
+                    "{path} scenario '{}' column '{}' maps to `{name}`, which is neither a \
+                     #[test] fn nor a fuzz entry point in src/fuzz.rs. The exemption is: {why}",
+                    sc.id,
+                    eng
+                );
+            }
+        }
+    }
+}
+
+/// The engine-agnostic `na`-shared-seam scenarios in pool-split-matrix.yaml name their RED-proven
+/// regression test in `what` (not a `test:` cell, so [`matrix_every_mapped_test_exists`] does not
+/// reach them). Those tests ARE the regression barrier — the matrix only maps each split bug this
+/// session found to the guard that keeps it fixed. Assert every named test still EXISTS, so a
+/// renamed/deleted guard fails loud here instead of silently unmapping a bug's coverage.
+#[test]
+fn pool_split_shared_seam_scenarios_name_existing_regression_tests() {
+    let fns = all_fn_names();
+    // The regression tests the pool-split-matrix na-shared-seam `what` fields cite, one per split
+    // bug found in the post-0.24.3 review + the #217/#218 bughunts. Keep in sync with the matrix.
+    const NAMED: &[&str] = &[
+        "reconstruct_covers_a_leading_adjacent_crash_instead_of_re_sampling",
+        "reconstruct_fills_an_interior_adjacent_crash_without_overlapping_a_survivor",
+        "reconstruct_keeps_checkpoint_for_an_exactly_recovered_single_crash",
+        "reconstruct_runs_the_open_tail_fresh_after_a_trailing_adjacent_crash",
+        "verify_over_a_split_prefix_catches_a_missing_non_last_unit_part",
+        "split_unit_manifests_folds_every_same_family_split_sibling",
+        "latest_full_over_a_split_family_selects_every_unit_not_just_the_last",
+        "latest_full_over_a_split_family_takes_the_newest_run_per_unit",
+        "select_runs_full_refuses_a_mixed_generation_split_prefix",
+        "select_runs_full_refuses_an_equal_count_split_generation_with_an_interior_hole",
+        "incremental_and_cdc_exports_are_not_splittable",
+        "reconstruct_refuses_to_resurrect_a_now_unsplittable_export_on_resume",
+        "mongo_source_is_not_range_split_capable",
+    ];
+    // Cross-check the list against the matrix text so a `what` that stops naming a test (or names a
+    // new one) is caught — the list must not drift from the ledger it guards.
+    let matrix_text = std::fs::read_to_string("docs/pool-split-matrix.yaml").unwrap();
+    for name in NAMED {
+        assert!(
+            fns.contains(*name),
+            "pool-split-matrix names regression test `{name}` in a `what` field, but no `fn {name}` \
+             exists under src/ or tests/ — a renamed/deleted split-bug guard unmapped its coverage"
+        );
+        assert!(
+            matrix_text.contains(name),
+            "regression test `{name}` is in the guard list but no longer cited by any \
+             pool-split-matrix `what` — drop it here or re-cite it there"
+        );
+    }
+}
+
 #[test]
 fn matrix_gaps_do_not_exceed_ratchet() {
     for (path, ceiling) in MATRICES {
@@ -423,6 +682,14 @@ fn enum_variants(rel: &str, enum_name: &str) -> HashSet<String> {
 
 /// [`enum_variants`] lowercased — `SourceType::Postgres` → `"postgres"`,
 /// `ExportTarget::DuckDb` → `"duckdb"`, matching the matrix column labels exactly.
+/// The SourceType enum's variants, lowercased — for sibling matrix guards that
+/// hand-list engine columns and must fail if that list drifts from the enum
+/// (r5 bughunt: perf/release-gate hand-typed `const ENGINES` was ungoverned by
+/// the generative column check, which only iterates the non-EXEMPT MATRICES).
+pub(crate) fn source_engine_variants() -> HashSet<String> {
+    enum_variants_lowercased("src/config/source.rs", "SourceType")
+}
+
 fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
     enum_variants(rel, enum_name)
         .into_iter()
@@ -445,6 +712,13 @@ fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
 fn matrix_columns_cover_every_source_and_target_enum_variant() {
     let sources = enum_variants_lowercased("src/config/source.rs", "SourceType");
     let targets = enum_variants_lowercased("src/types/target.rs", "ExportTarget");
+    // The THIRD axis. This guard derived two of the six enums a ledger can be
+    // keyed on, so `docs/destination-matrix.yaml` — `engines: [local, gcs, s3,
+    // azure]` — matched neither predicate and was generatively ungraded: it was
+    // missing `stdout`, `DestinationType`'s fifth variant, and NO guard could
+    // see the hole. That is worse than an unproven cell, because the check that
+    // exists to find missing columns structurally could not (audit 2026-08-17).
+    let dests = enum_variants_lowercased("src/config/destination.rs", "DestinationType");
     // Parse sanity: a drift here would silently UNDER-require, defeating the guard.
     assert!(
         sources.len() == 4 && sources.contains("postgres") && sources.contains("mongo"),
@@ -454,12 +728,23 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
         targets.len() == 4 && targets.contains("duckdb") && targets.contains("clickhouse"),
         "ExportTarget parse produced {targets:?} (expected the 4 warehouse targets)"
     );
+    assert!(
+        dests.len() == 5 && dests.contains("local") && dests.contains("stdout"),
+        "DestinationType parse produced {dests:?} (expected the 5 destination kinds)"
+    );
 
     for (path, _) in MATRICES {
         let matrix = load_matrix(path);
         let declared: HashSet<&str> = matrix.engines.iter().map(String::as_str).collect();
         let keyed_on_sources = matrix.engines.iter().any(|e| sources.contains(e.as_str()));
         let keyed_on_targets = matrix.engines.iter().any(|e| targets.contains(e.as_str()));
+        // Ordered after the other two on purpose: `local`/`s3`/`gcs` are unique
+        // to DestinationType, but a ledger keyed on SOURCES must not be dragged
+        // in by a coincidental name, so this only claims a matrix no other axis
+        // claimed.
+        let keyed_on_dests = !keyed_on_sources
+            && !keyed_on_targets
+            && matrix.engines.iter().any(|e| dests.contains(e.as_str()));
         if keyed_on_sources {
             for s in &sources {
                 assert!(
@@ -468,6 +753,16 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
                      SourceType must be a column (a test/gap/na cell per scenario) — a \
                      silently-absent engine is the un-enumerated-sibling hole the audit found. \
                      Add it, or n/a it with a reason."
+                );
+            }
+        }
+        if keyed_on_dests {
+            for d in &dests {
+                assert!(
+                    declared.contains(d.as_str()),
+                    "{path} is keyed on destination kinds but is MISSING the '{d}' column. \
+                     Every DestinationType must be a column (test/gap/na per scenario) — \
+                     `stdout` was absent from this ledger and no guard could see it."
                 );
             }
         }
@@ -588,6 +883,458 @@ fn matrix_oracle_strength_ratchet() {
              give it an INDEPENDENT oracle (DuckDB/source re-read) or fail_loud, not a \
              batch-differential. If {weak} < {ceiling}: you UPGRADED one — lower the ceiling in \
              ORACLE_TRACKED to {weak} to lock the win."
+        );
+    }
+}
+
+/// Every `docs/*matrix*.yaml` on disk is either ratcheted here or exempted by
+/// name — and every exemption names a guard file that EXISTS.
+///
+/// The dimension is the GLOB, not a list: a hand-written list of ledgers cannot
+/// notice a ledger nobody added to it, which is the defect this repo has now
+/// corrected in five places. Before this, `MATRICES` held 20 of 25 and the other
+/// five were invisible; one of them was not even valid YAML.
+#[test]
+fn every_coverage_ledger_is_ratcheted_here_or_exempted_by_name() {
+    let docs = repo_root().join("docs");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&docs)
+        .expect("read docs/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("matrix") && n.ends_with(".yaml"))
+        .map(|n| format!("docs/{n}"))
+        .collect();
+    on_disk.sort();
+    assert!(
+        on_disk.len() >= 20,
+        "found only {} ledger(s) under docs/ — the glob lost its subject, and an \
+         empty dimension is exactly the failure this check replaces: {on_disk:?}",
+        on_disk.len()
+    );
+
+    let ratcheted: Vec<&str> = MATRICES.iter().map(|(f, _)| *f).collect();
+    let exempt: Vec<&str> = EXEMPT.iter().map(|(f, _)| *f).collect();
+    let ungoverned: Vec<&String> = on_disk
+        .iter()
+        .filter(|f| !ratcheted.contains(&f.as_str()) && !exempt.contains(&f.as_str()))
+        .collect();
+    assert!(
+        ungoverned.is_empty(),
+        "these coverage ledgers are governed by nothing — add them to MATRICES \
+         (with a ratchet) or to EXEMPT (naming the guard that covers them): {ungoverned:?}"
+    );
+
+    // An exemption is a CLAIM about another guard. Check the claim.
+    for (ledger, guard) in EXEMPT {
+        assert!(
+            repo_root().join(guard).exists(),
+            "{ledger} is exempted on the grounds that {guard} covers it, and that \
+             file does not exist"
+        );
+        assert!(
+            on_disk.contains(&ledger.to_string()),
+            "{ledger} is exempted but no longer exists — delete the exemption"
+        );
+    }
+    for (ledger, _) in MATRICES {
+        assert!(
+            on_disk.contains(&ledger.to_string()),
+            "{ledger} is ratcheted but no longer exists — delete the entry"
+        );
+    }
+}
+
+/// Every YAML under `docs/` actually parses as YAML.
+///
+/// A NEW axis, not a duplicate of the cell checks above: those read a ledger's
+/// CONTENT and only run on the files they know about. This asks whether a file
+/// is the format it claims to be, which nothing asked — `scenario-artifact-
+/// matrix.yaml` had three keys at column 0 among siblings indented 6 and was
+/// unparseable for as long as anyone can tell, because both of its readers scan
+/// lines and `strip()` them instead of parsing. It worked by luck: the day a
+/// reader is switched to a real parser, the harness breaks rather than the file.
+#[test]
+fn every_docs_yaml_parses_as_yaml() {
+    let docs = repo_root().join("docs");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&docs).expect("read docs/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
+            .unwrap_or_else(|e| panic!("docs/{name} is not valid YAML: {e}"));
+        checked += 1;
+    }
+    assert!(
+        checked >= 20,
+        "parsed only {checked} YAML file(s) under docs/ — the walk found nothing to grade"
+    );
+}
+
+// ── Guard #8: the runner axis, derived ────────────────────────────────────────
+//
+// The two generative guards above key on an ENUM, which is why neither of them
+// sees `docs/runner-coverage-matrix.yaml`: its columns are RUNNERS, and a runner
+// is not an enum variant — it is a commit loop the dispatcher fans out to. That
+// ledger's own header admits the consequence ("the columns collapse to FIVE
+// runner FAMILIES … the code actually has ~EIGHT distinct commit loops"), and
+// the collapse has already cost twice: a `test` cell proven only on
+// keyset_SEQUENTIAL while keyset_PARALLEL lacked the drift gate, and a governor
+// cell whose two runners had disjoint evidence until the 2026-08-16 column split.
+// Both were caught by a human reading the grid, because the column list was a
+// hand-written line of YAML tied to nothing.
+
+/// The ONE call that makes a function an export RUNNER.
+///
+/// ADR-0028 chose `commit::record_part` as the seam precisely because it is "the
+/// single drain point every runner — including parallel workers — must call to
+/// write". That makes it the honest structural definition of the runner set: a
+/// function that commits parts is a commit loop whether or not anyone remembered
+/// to give it a column.
+const COMMIT_DRAIN: &str = "commit::record_part(";
+
+/// Every COMMIT LOOP the product has → the runner-coverage COLUMN it collapses
+/// into. This table is the collapse the ledger's header describes, written where
+/// a guard can read it instead of in prose — and it is graded in BOTH directions
+/// by [`runner_matrix_columns_are_derived_from_the_commit_loops`]:
+///
+/// * a loop the derivation finds and this table does not name is a NEW runner
+///   with no column (the parallel-keyset shape: a second commit loop under an
+///   existing column, invisible to every cell in it);
+/// * a name here the derivation no longer finds is a MAPPING that outlived its
+///   runner, and a column claimed only by such names is a column for a runner
+///   that no longer exists.
+///
+/// So the hand-written part is the COLLAPSE (which loop belongs to which
+/// family), never the SET — the set comes from the code every time.
+const COMMIT_LOOP_COLUMN: &[(&str, &str)] = &[
+    ("run_single_export", "single"),
+    ("run_chunked_sequential", "chunked"),
+    ("run_chunked_parallel", "chunked"),
+    ("run_chunked_sequential_checkpoint", "chunked_checkpoint"),
+    ("run_chunked_parallel_checkpoint", "chunked_checkpoint"),
+    ("run_keyset", "keyset"),
+    ("run_keyset_parallel", "keyset"),
+    ("run_mongo_parallel", "mongo_parallel"),
+];
+
+const RUNNER_MATRIX: &str = "docs/runner-coverage-matrix.yaml";
+
+/// The seam ADR-0028 funnels the export TAIL through, and the one function
+/// allowed to call it. An allowlist rather than a count, so the exception a
+/// future dispatcher needs is written down WITH its reason (the shape
+/// `runner_frame_gate` already uses for the destination door).
+const TAIL_SEAM: &str = "finalize_export(";
+const TAIL_SEAM_CALLERS: &[(&str, &str)] = &[(
+    "execute_resolved_plan",
+    "THE dispatcher — ADR-0028 applies the tail here, once, between the runner returning \
+     and finalize_manifest",
+)];
+
+/// Every top-level fn under `src/pipeline` whose body calls `needle`, mapped to
+/// the first call site (`rel:line`) so a failure can name its witness.
+///
+/// Three things this deliberately does NOT count, each of them a way a text
+/// guard goes blind in the safe-looking direction:
+///
+/// * a COMMENT naming the call — `runner_frame_gate` was satisfiable by a doc
+///   mention of the very call it demanded. Honesty about strength: no comment in
+///   the tree forges either token TODAY, so stripping changes no verdict now. The
+///   nearest is `parallel_checkpoint.rs:430`, which writes
+///   `commit::record_part(state=None)` in prose inside a fn that is already a
+///   commit loop by its real drain at :578 — a rename away from mattering. Three
+///   runner files (single, keyset ×3, mongo_parallel) DO name
+///   `finalize::finalize_export` in their tail comments; they escape only because
+///   they write it without the trailing `(`. Verified by
+///   removing the strip and re-running: still green — which is why this bullet
+///   says "defence against the class", not "load-bearing today".
+/// * a `#[cfg(test)]` block — a unit test that calls the seam is not a runner.
+///   This one IS load-bearing: `finalize.rs`'s own unit tests call the seam
+///   twice, and counting them would make the seam look re-applied.
+/// * the DECLARATION line: `fn finalize_export(` is not a call to itself.
+fn top_level_callers_of(needle: &str) -> BTreeMap<String, String> {
+    let root = repo_root().join("src/pipeline");
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/pipeline") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // `sink/tests.rs` is a `#[cfg(test)] mod tests;` body in its own
+            // file, so the in-file cfg(test) skip below cannot see it: a unit
+            // test there would otherwise register as a runner.
+            if path.file_stem().and_then(|e| e.to_str()) == Some("tests") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(repo_root())
+                .expect("under repo root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).expect("read source");
+            scan_top_level_callers(&text, &rel, needle, &mut out);
+        }
+    }
+    out
+}
+
+/// [`top_level_callers_of`] for one file. Brace depth decides what "top level"
+/// means, so a nested fn or a worker closure is attributed to the fn that owns
+/// it — which is what a "commit loop" is: the loop, not the closure inside it.
+fn scan_top_level_callers(text: &str, rel: &str, needle: &str, out: &mut BTreeMap<String, String>) {
+    let mut depth: i64 = 0;
+    let mut current: Option<String> = None;
+    // `Some(d)` while inside a `#[cfg(test)]` item whose body opened at depth d.
+    let mut skip_below: Option<i64> = None;
+    let mut pending_cfg_test = false;
+    for (i, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        let before = depth;
+        let top_level = before == 0 && !line.starts_with([' ', '\t']);
+        if skip_below.is_none() {
+            if top_level && code.trim_start().starts_with("#[cfg(test)]") {
+                pending_cfg_test = true;
+            } else if top_level && let Some(name) = top_level_fn_name(code) {
+                current = Some(name);
+            } else if code.contains(needle)
+                && let Some(owner) = &current
+            {
+                out.entry(owner.clone())
+                    .or_insert_with(|| format!("{rel}:{}", i + 1));
+            }
+        }
+        depth += code.matches('{').count() as i64 - code.matches('}').count() as i64;
+        depth = depth.max(0);
+        if pending_cfg_test {
+            if depth > before {
+                // The cfg(test) item's body just opened — skip until it closes.
+                skip_below = Some(before);
+                pending_cfg_test = false;
+                current = None;
+            } else if code.trim_end().ends_with(';') {
+                // `#[cfg(test)] mod tests;` — the file is walked on its own, and
+                // nothing to skip here.
+                pending_cfg_test = false;
+            }
+        }
+        if let Some(d) = skip_below
+            && depth <= d
+        {
+            skip_below = None;
+        }
+    }
+}
+
+/// `pub(crate) async fn foo(` → `Some("foo")`, for a line at column 0.
+fn top_level_fn_name(code: &str) -> Option<String> {
+    let mut rest = code.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = match after.strip_prefix('(') {
+            Some(vis) => vis.split_once(')')?.1.trim_start(),
+            None => after.trim_start(),
+        };
+    }
+    for kw in ["const ", "async ", "unsafe ", "extern "] {
+        if let Some(r) = rest.strip_prefix(kw) {
+            rest = r.trim_start();
+        }
+    }
+    let name: String = rest
+        .strip_prefix("fn ")?
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// GENERATIVE runner-column completeness — guard #5's third axis, for the one
+/// ledger whose columns are neither engines nor targets nor destinations.
+///
+/// The required column set is derived from the PRODUCT: every top-level fn that
+/// drains through `commit::record_part` is a commit loop, and every commit loop
+/// belongs to exactly one column. Both directions fail:
+///
+/// * a commit loop with no mapping/column — the new-runner hole. `keyset` held
+///   two loops under one column for a whole release and the drift gate was
+///   absent on one of them; a THIRD loop appearing under some column is the same
+///   defect, and nothing in the tree asked about it before this.
+/// * a mapping (and so a column) whose loop is gone — the ledger keeps grading a
+///   runner that no longer exists, cells and ratchet and all.
+///
+/// Scope honesty: this grades the COLUMN SET, not the cells. Whether a `test:`
+/// cell is proven on both loops of a collapsed column is still prose (the
+/// 2026-08-04 per-variant audit); what changes is that the collapse itself is now
+/// written where a guard reads it, so growing an eighth loop into a ninth is a
+/// CI failure rather than a header paragraph nobody re-reads.
+#[test]
+fn runner_matrix_columns_are_derived_from_the_commit_loops() {
+    // NON-VACUITY: the whole derivation keys on one token. Rename the drain and
+    // a scan for it finds no runners, maps nothing, and passes — the direction
+    // text guards always fail in.
+    super::nonvacuity::require_needle(
+        &super::nonvacuity::subject_text("src/pipeline/single.rs"),
+        "src/pipeline/single.rs",
+        COMMIT_DRAIN,
+        1,
+        "If the commit drain moved off `commit::record_part`, re-point COMMIT_DRAIN at the \
+         new seam — the runner set is DERIVED from it, so a stale token derives nothing.",
+    );
+    let loops = top_level_callers_of(COMMIT_DRAIN);
+    super::nonvacuity::require_enumerated(
+        loops.len(),
+        6,
+        "commit loops (top-level fns that call the drain) found under src/pipeline",
+        "The runners moved, or the scan lost its subject — 8 loops live under src/pipeline \
+         today (single, chunked ×2, checkpoint ×2, keyset ×2, mongo_parallel).",
+    );
+
+    let matrix = load_matrix(RUNNER_MATRIX);
+    let columns: HashSet<&str> = matrix.engines.iter().map(String::as_str).collect();
+    let mapped: HashMap<&str, &str> = COMMIT_LOOP_COLUMN.iter().copied().collect();
+
+    // Direction 1 — a NEW runner, and no column for it.
+    for (name, site) in &loops {
+        let column = mapped.get(name.as_str()).unwrap_or_else(|| {
+            panic!(
+                "`{name}` ({site}) commits parts through {COMMIT_DRAIN} — it is an export \
+                 COMMIT LOOP — and no column of {RUNNER_MATRIX} claims it. Every per-export \
+                 feature (a gate, an integrity record, a stamp, a warning) is now something \
+                 this runner can miss while every count and sum stays green. Map it in \
+                 COMMIT_LOOP_COLUMN: to an existing column if it is a variant of that family \
+                 (say so in the ledger's header, as keyset_sequential/parallel are), or to a \
+                 NEW column, which needs a test/na/gap cell in every scenario."
+            )
+        });
+        assert!(
+            columns.contains(column),
+            "`{name}` ({site}) maps to column '{column}', which {RUNNER_MATRIX} does not \
+             declare. Add it to `engines:` (and a cell per scenario) — a runner with no \
+             column is graded by nothing."
+        );
+    }
+
+    // Direction 2 — a column for a runner that no longer exists. Checked per
+    // MAPPING, not per column, so a family losing ONE of its two loops (the
+    // collapse the header warns about) is caught too, not just an empty column.
+    for (name, column) in COMMIT_LOOP_COLUMN {
+        assert!(
+            loops.contains_key(*name),
+            "COMMIT_LOOP_COLUMN maps `{name}` → column '{column}' of {RUNNER_MATRIX}, and no \
+             top-level fn under src/pipeline calls {COMMIT_DRAIN} under that name any more. \
+             Either the loop was renamed (re-point the mapping) or it is gone — in which case \
+             drop it here, and if it was the column's last loop, drop the column and its cells \
+             rather than leaving the ledger to grade a runner the product does not have. \
+             Found: {:?}",
+            loops.keys().collect::<Vec<_>>()
+        );
+    }
+    let claimed: HashSet<&str> = COMMIT_LOOP_COLUMN.iter().map(|(_, c)| *c).collect();
+    for column in &matrix.engines {
+        assert!(
+            claimed.contains(column.as_str()),
+            "{RUNNER_MATRIX} declares column '{column}' and no commit loop maps to it. A \
+             column nothing runs is cells nobody can falsify — delete it, or map the loop it \
+             stands for in COMMIT_LOOP_COLUMN."
+        );
+    }
+}
+
+/// The ADR-0028 tail is applied at ONE seam — which is what lets several rows of
+/// the runner ledger be runner-AGNOSTIC instead of a cell per runner.
+///
+/// Before ADR-0028 the drift gate, the Form-B harvest and the shape-drift warn
+/// were re-assembled by hand in seven commit loops, and the ledger graded each
+/// one because each could forget. They now run once, from the CommitLedger the
+/// runners feed, in `finalize_export` — so those rows say `na: shared seam` and
+/// the honest guard for them is not more cells, it is this: that the seam has
+/// exactly one caller and no runner re-applies it.
+///
+/// That claim was prose in three `what:` fields and nothing checked it. If a
+/// runner starts calling the seam itself, those rows quietly become lies (a
+/// per-runner application graded by an `na` cell that says there isn't one) —
+/// the runner-bypass class returning through the door the ADR closed. This turns
+/// that into a diff-time failure naming the rows that would be affected.
+///
+/// The comment-blindness matters here more than anywhere: every runner's tail
+/// comment NAMES `finalize::finalize_export` while calling nothing, so a scan
+/// that counted comments would report the seam applied in five runners today.
+#[test]
+fn the_export_tail_seam_has_one_caller_and_no_runner_re_applies_it() {
+    super::nonvacuity::require_needle(
+        &super::nonvacuity::subject_text("src/pipeline/finalize.rs"),
+        "src/pipeline/finalize.rs",
+        &format!("fn {TAIL_SEAM}"),
+        1,
+        "The ADR-0028 tail seam was renamed or moved — re-point TAIL_SEAM at it. Grading a \
+         seam that no longer exists by that name passes over nothing.",
+    );
+
+    // The ledger rows whose `na:` cells REST on the seam being singular, read
+    // from the ledger itself rather than hand-listed here — so a row that starts
+    // (or stops) depending on the seam is named by the message without anyone
+    // remembering to update this test.
+    let matrix = load_matrix(RUNNER_MATRIX);
+    let seam_rows: Vec<&str> = matrix
+        .scenarios
+        .iter()
+        .filter(|s| {
+            s.what
+                .as_deref()
+                .is_some_and(|w| w.contains("finalize_export"))
+        })
+        .map(|s| s.id.as_str())
+        .collect();
+    super::nonvacuity::require_enumerated(
+        seam_rows.len(),
+        2,
+        "scenarios of the runner ledger that cite the finalize_export seam",
+        "Those rows are `na` BECAUSE the tail is applied once; if they no longer say so, \
+         either the ADR was reversed (then they need per-runner cells again) or the prose \
+         drifted away from the mechanism it depends on.",
+    );
+
+    let callers = top_level_callers_of(TAIL_SEAM);
+    let allowed: HashMap<&str, &str> = TAIL_SEAM_CALLERS.iter().copied().collect();
+    for (dispatcher, _) in TAIL_SEAM_CALLERS {
+        assert!(
+            callers.contains_key(*dispatcher),
+            "`{dispatcher}` no longer calls {TAIL_SEAM} — the export tail is applied nowhere \
+             (or somewhere this guard cannot see). Found callers: {:?}",
+            callers.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let loops: HashSet<&str> = COMMIT_LOOP_COLUMN.iter().map(|(f, _)| *f).collect();
+    for (caller, site) in &callers {
+        if allowed.contains_key(caller.as_str()) {
+            continue;
+        }
+        let runner = if loops.contains(caller.as_str()) {
+            format!(
+                " `{caller}` is a COMMIT LOOP: this is the runner-bypass class returning — \
+                 the tail re-applied per runner, which is what ADR-0028 removed and what \
+                 rows [{}] now describe as shared-seam `na` cells.",
+                seam_rows.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        panic!(
+            "{TAIL_SEAM} is called from `{caller}` ({site}), which is not an approved seam \
+             caller.{runner} If a second dispatcher genuinely needs the tail, add it to \
+             TAIL_SEAM_CALLERS with its reason; if a runner needs a feature the seam does not \
+             give it, that feature is per-runner again and rows [{}] of {RUNNER_MATRIX} need \
+             real cells instead of `na: shared seam`.",
+            seam_rows.join(", ")
         );
     }
 }

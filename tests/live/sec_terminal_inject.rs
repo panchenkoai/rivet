@@ -95,7 +95,6 @@ fn sec_db_error_escapes_stripped_from_terminal() {
 
     let table = seed_pg_numeric_table(3);
     let export_name = unique_name("sec_v9_single");
-    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
 
     // The query is pure ASCII; Postgres builds the escape bytes itself (chr(27)
@@ -103,20 +102,12 @@ fn sec_db_error_escapes_stripped_from_terminal() {
     // never sees a raw control byte and the leak arrives strictly via the
     // DB-error -> run_ui render path.
     let query = ansi_injection_query(table.name());
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\n\
-         exports:\n\
-         \x20 - name: {export_name}\n\
-         \x20   query: \"{query}\"\n\
-         \x20   mode: full\n\
-         \x20   format: parquet\n\
-         \x20   destination: {{type: local, path: {dir}}}\n\
-         \x20   tuning: {{max_retries: 0}}\n",
-        dir = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&query)
+        .export_line("tuning: {max_retries: 0}")
+        .dest_path(out.path().to_path_buf());
 
-    let run = run_rivet_export(&cfg, &export_name);
+    let run = rig.run_args(&["--export", &export_name]);
 
     // The export must fail (the column does not exist) — this is the trigger
     // for the error-card render path. If it somehow succeeded the vuln would be
@@ -160,31 +151,15 @@ fn sec_parallel_db_error_escapes_stripped() {
 
     let table = seed_pg_numeric_table(3);
     let export_name = unique_name("sec_v9_parallel");
-    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
 
     let query = ansi_injection_query(table.name());
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\n\
-         exports:\n\
-         \x20 - name: {export_name}\n\
-         \x20   query: \"{query}\"\n\
-         \x20   mode: full\n\
-         \x20   format: parquet\n\
-         \x20   destination: {{type: local, path: {dir}}}\n\
-         \x20   tuning: {{max_retries: 0}}\n",
-        dir = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&query)
+        .export_line("tuning: {max_retries: 0}")
+        .dest_path(out.path().to_path_buf());
 
-    let run = run_rivet(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        &export_name,
-        "--parallel-export-processes",
-    ]);
+    let run = rig.run_args(&["--export", &export_name, "--parallel-export-processes"]);
 
     assert!(
         !run.status.success(),

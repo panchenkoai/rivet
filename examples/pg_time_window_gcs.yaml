@@ -15,7 +15,11 @@ exports:
     mode: time_window
 
     # time_column: the timestamp column Rivet uses to filter.
-    # Rivet appends: WHERE created_at >= NOW() - INTERVAL '30 days'
+    # Rivet computes the boundary client-side in UTC (now minus days_window,
+    # truncated to midnight) and wraps the query:
+    #   SELECT * FROM (<your query>) AS _rivet WHERE "created_at" >= '<YYYY-MM-DD 00:00:00>'
+    # — a fixed literal anchored to midnight, stable for the whole run
+    # (not a server-side NOW() - INTERVAL).
     time_column: created_at
     time_column_type: timestamp     # timestamp (default) or unix
     days_window: 30                 # rolling window: last 30 days

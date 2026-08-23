@@ -88,10 +88,12 @@ compression_level: 6
 
 ## CSV output
 
-Compression profiles apply only to Parquet format. For CSV exports, the
-`compression_profile` field is parsed but silently ignored — CSV files are
-written uncompressed (you can compress them after export with `gzip`, `zstd`,
-etc.).
+Compression profiles apply only to Parquet format. On a CSV export any
+`compression_profile` other than `none` is **rejected at config-validation
+time** (`rivet check` / `doctor` / `run` error out with "CSV output does not
+support compression_profile: …"). CSV files are always written uncompressed —
+omit the field (or set `none`) and compress after export with `gzip`, `zstd`,
+etc. if needed.
 
 ---
 

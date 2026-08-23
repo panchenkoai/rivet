@@ -93,8 +93,11 @@ pub struct MongoConfig {
     /// `find({_id: {$gt: last}}).sort({_id: 1}).limit(page_size)` — an indexed
     /// range scan that becomes one output part file. Bounds longest-query time
     /// (no 35-minute cursor to hit a timeout / snapshot window) and is the base
-    /// for parallel `_id`-range reads. Requires an **ObjectId** `_id` (the
-    /// default); a non-ObjectId key errors with a clear message. Unset ⇒ the
+    /// for parallel `_id`-range reads. Works with any **uniform** `_id` type
+    /// (ObjectId — the default — integer, string, date, …); a collection mixing
+    /// `_id` type brackets errors with a clear message pointing at the full
+    /// ordered scan (Mongo's `$gt` compares only within a type bracket, so a
+    /// mixed key would silently drop every bracket but one). Unset ⇒ the
     /// single-cursor full scan.
     #[serde(default)]
     pub page_size: Option<usize>,
@@ -213,7 +216,13 @@ pub struct TlsConfig {
 }
 
 /// TLS enforcement mode, mirroring libpq's `sslmode` semantics where possible.
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+// `clap::ValueEnum` so `rivet init --tls <mode>` accepts exactly this enum — a
+// parallel CLI-only enum would be a second definition of the same four words,
+// and it would drift on the first variant change (#146). A regular comment,
+// not a doc comment: the doc text IS the schema description users see.
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsMode {
     /// Plaintext. Use only inside trusted networks (loopback, cgroup-private).
@@ -228,6 +237,19 @@ pub enum TlsMode {
     /// Recommended default for production.
     #[default]
     VerifyFull,
+}
+
+/// The kebab-case name serde/clap already own — ONE rendering for every
+/// user-facing surface (#162: three hand matches drifted-in-waiting).
+impl std::fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TlsMode::Disable => "disable",
+            TlsMode::Require => "require",
+            TlsMode::VerifyCa => "verify-ca",
+            TlsMode::VerifyFull => "verify-full",
+        })
+    }
 }
 
 impl TlsMode {

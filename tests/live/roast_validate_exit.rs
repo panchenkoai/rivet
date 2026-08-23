@@ -43,29 +43,16 @@ fn roast_validate_exits_nonzero_when_manifest_unreadable() {
     // non-streaming destination (finalize_manifest), no extra config needed.
     let table = seed_pg_numeric_table(10);
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let export_name = unique_name("roast_validate");
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount, created_at FROM {table_name} ORDER BY id"
-    mode: full
-    format: parquet
-    compression: zstd
-    destination:
-      type: local
-      path: {out_path}
-"#,
-        table_name = table.name(),
-        out_path = out_dir.path().display(),
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!(
+            "SELECT id, name, amount, created_at FROM {} ORDER BY id",
+            table.name()
+        ))
+        .export_line("compression: zstd")
+        .dest_path(out_dir.path().to_path_buf());
 
-    let run_out = run_rivet_export(&cfg_path, &export_name);
+    let run_out = rig.run_args(&["--export", &export_name]);
     assert!(
         run_out.status.success(),
         "setup: rivet run failed (exit {:?}); stderr:\n{}",
@@ -83,13 +70,7 @@ exports:
     // ── 2. Baseline: validate on the intact dataset exits 0 ──────────────
     // Pins that any non-zero exit below comes from the degraded manifest,
     // not from an unrelated config/destination problem.
-    let healthy = run_rivet(&[
-        "validate",
-        "--config",
-        cfg_path.to_str().unwrap(),
-        "--export",
-        &export_name,
-    ]);
+    let healthy = rig.cli(&["validate", "--export", &export_name]);
     assert!(
         healthy.status.success(),
         "setup: validate on the intact dataset must exit 0 (exit {:?}); stderr:\n{}",
@@ -123,13 +104,7 @@ exports:
     }
 
     // ── 4. The gate under test ────────────────────────────────────────────
-    let degraded = run_rivet(&[
-        "validate",
-        "--config",
-        cfg_path.to_str().unwrap(),
-        "--export",
-        &export_name,
-    ]);
+    let degraded = rig.cli(&["validate", "--export", &export_name]);
     assert!(
         !degraded.status.success(),
         "rivet validate exited {:?} although manifest.json was unreadable \

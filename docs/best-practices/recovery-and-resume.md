@@ -158,11 +158,14 @@ location, the state file is not copied with it — the resumed export starts fre
 
 If the process is killed mid-export:
 
-- **Incremental** — the cursor in state was last written at the end of the
-  previous successful batch. Re-running picks up from there; the last partial
-  batch is re-exported. Parquet output is idempotent by default
-  (`idempotent_overwrite: true`), so the re-exported batch overwrites the
-  partial file.
+- **Incremental** — the cursor is committed **once per run**, after the run's
+  manifest is durable. A crash mid-export leaves the cursor at the previous
+  run's value, so re-running re-exports the whole window — into **new,
+  uniquely-timestamped part files** (names embed a per-run millisecond stamp).
+  Files the crashed run already committed are complete, never partial, and are
+  **not overwritten** — they remain in the prefix as at-least-once duplicates,
+  which downstream consumers must tolerate (load from the manifest, see
+  [semantics.md](../semantics.md)).
 
 - **Chunked** — each chunk is committed to state only after it writes
   successfully. A crash mid-chunk means that chunk is retried on `--resume`.
@@ -174,7 +177,9 @@ If the process is killed mid-export:
   C1–C4 (see [reliability-matrix.md § Failure-mode coverage](../reliability-matrix.md#failure-mode-coverage)).
 
 - **Full** — full exports have no cursor. Re-running after a crash starts from
-  the beginning. Partial output files from the crashed run are overwritten.
+  the beginning and writes new, uniquely-timestamped part files; anything the
+  crashed run left behind stays in the prefix as an orphan (no manifest names
+  it) — load from the manifest, or clean orphans with `gc_orphans`.
 
 ---
 

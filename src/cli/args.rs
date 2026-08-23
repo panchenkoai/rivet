@@ -66,48 +66,7 @@ pub fn parse_cli() -> Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run export jobs defined in config
-    Run {
-        /// Path to YAML config file
-        #[arg(short, long)]
-        config: String,
-        /// Run only a specific export by name
-        #[arg(short, long)]
-        export: Option<String>,
-        /// Validate output files after writing
-        #[arg(long)]
-        validate: bool,
-        /// Row-count audit: run COUNT(*) on the source and compare with the
-        /// exported row count; a mismatch fails the run. Implies `--validate`
-        /// (also verifies the output file manifest).
-        #[arg(long)]
-        reconcile: bool,
-        /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
-        #[arg(long)]
-        resume: bool,
-        /// Override safety gates that would otherwise refuse the run.
-        ///
-        /// Today: with `--resume`, allows starting against a destination prefix
-        /// whose `_SUCCESS` marker is already present.  Without `--force`,
-        /// resume against an already-complete run refuses, so an operator
-        /// cannot accidentally re-export over a verified dataset.
-        #[arg(long)]
-        force: bool,
-        /// Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
-        #[arg(long)]
-        parallel_exports: bool,
-        /// Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)
-        #[arg(long)]
-        parallel_export_processes: bool,
-        /// Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
-        #[arg(long, value_name = "PATH")]
-        summary_output: Option<String>,
-        /// Print the run aggregate summary as JSON to stdout at the end of the run
-        #[arg(long)]
-        json: bool,
-        /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
-        #[arg(short, long = "param", value_name = "KEY=VALUE")]
-        params: Vec<String>,
-    },
+    Run(RunArgs),
     /// Column-type & schema report for each export (needs a working connection;
     /// run `doctor` first if it can't connect)
     Check {
@@ -170,14 +129,26 @@ pub enum Commands {
         /// source's and any other replica).
         #[arg(long, default_value_t = 4271)]
         server_id: u32,
-        /// Persist/resume the binlog position to this file. Omit to tail from the
-        /// current position without checkpointing.
+        /// Persist/resume the engine's log position to this file (MySQL binlog
+        /// coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN /
+        /// MongoDB resume token). If omitted, each engine falls back to its own
+        /// anchor: MySQL and MongoDB start at the source's CURRENT position (nothing
+        /// written before now is captured), PostgreSQL resumes from the slot itself
+        /// (server-side — a slot created here pins at the current WAL position), and
+        /// SQL Server starts at the capture instance's `fn_cdc_get_min_lsn` (it
+        /// over-reads the retained backlog rather than skipping).
         #[arg(long, value_name = "PATH")]
         checkpoint: Option<String>,
         /// Only emit changes for this table (repeatable; default: all tables).
         #[arg(long, value_name = "TABLE")]
         table: Vec<String>,
-        /// Stop after N change events (default: stream until interrupted).
+        /// Stop at the first COMMIT BOUNDARY once N change events have been
+        /// emitted — a soft cap, so the run may overshoot N by the remainder of
+        /// the transaction the cap lands in. A hard per-event stop cannot
+        /// checkpoint inside a transaction, so a transaction longer than N left
+        /// the run re-reading the same position on every restart. Without it the
+        /// default bounded run drains to the log end as of open and exits;
+        /// streaming until interrupted needs `--stream`.
         #[arg(long, value_name = "N")]
         max_events: Option<usize>,
         /// Write typed Parquet/CSV files to this directory (the upsert/after-image
@@ -201,8 +172,12 @@ pub enum Commands {
         #[arg(long, value_name = "INSTANCE")]
         capture_instance: Option<String>,
         /// Stream continuously instead of the DEFAULT bounded "read to the log end
-        /// and exit" drain. Continuous streaming is a long-lived daemon; omit this
-        /// for the scheduler-friendly bounded run (the default). For MySQL the
+        /// and exit" drain. What "continuously" means is per engine: MySQL (a
+        /// blocking binlog dump) and MongoDB (a change stream that blocks awaiting
+        /// events) stay up until stopped; PostgreSQL and SQL Server are poll
+        /// adapters that STILL EXIT ON CATCH-UP — there this is one unbounded pass,
+        /// not a daemon, so run it under a supervisor that restarts it. Omit it for
+        /// the scheduler-friendly bounded run (the default). For MySQL the
         /// bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain
         /// their backlog and exit.
         #[arg(long)]
@@ -221,12 +196,6 @@ pub enum Commands {
         /// and `allow_source_drift:` all live in the config, not on the CLI.
         #[arg(short = 'c', long)]
         config: String,
-        /// Path to the `rivet` binary used for the type-report subprocess.
-        /// Defaults to THIS executable (self), so the load's `rivet check`
-        /// resolves types with the same version — a `rivet` on `$PATH` may be a
-        /// different, skewed version. Override only to pin a specific binary.
-        #[arg(long)]
-        rivet_bin: Option<String>,
         /// Correlation id stamped on every warehouse job/query of this load run
         /// (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices
         /// per run as well as per table. Defaults to a generated id.
@@ -308,25 +277,21 @@ pub enum Commands {
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
+        /// TLS posture for BOTH the introspection connection init opens AND the
+        /// `source.tls:` block written into the scaffold. Required (or `disable`,
+        /// explicitly) for any non-loopback host — without it the TLS gate
+        /// refuses before connecting, and at init time there is no config file
+        /// to add a `tls:` block to yet.
+        #[arg(long, value_enum, value_name = "MODE")]
+        tls: Option<crate::config::TlsMode>,
+        /// PEM CA certificate for `--tls verify-ca` / `verify-full` against a
+        /// private CA; written into the scaffold as `ca_file:`. Refused with
+        /// `disable`/`require`, where it would be silently meaningless.
+        #[arg(long = "tls-ca", value_name = "PATH", requires = "tls")]
+        tls_ca: Option<String>,
     },
     /// Generate an execution plan artifact (no data exported)
-    Plan {
-        /// Path to YAML config file
-        #[arg(short, long)]
-        config: String,
-        /// Plan only a specific export by name
-        #[arg(short, long)]
-        export: Option<String>,
-        /// Query parameter: key=value (repeatable)
-        #[arg(short, long = "param", value_name = "KEY=VALUE")]
-        params: Vec<String>,
-        /// Write plan JSON to this file (default: print summary to stdout)
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Output format: "pretty" (human summary) or "json" (machine-readable)
-        #[arg(long, default_value = "pretty")]
-        format: PlanFormat,
-    },
+    Plan(PlanArgs),
     /// Execute a sealed plan artifact, or run a config's exports wave-by-wave
     Apply {
         /// A plan JSON artifact from `rivet plan` (sealed single-export replay),
@@ -346,35 +311,36 @@ pub enum Commands {
         /// finished tables. Independent tables are never re-exported.
         #[arg(long)]
         resume: bool,
-        /// Skip staleness check (allow plans older than 24 h)
+        /// Override whichever safety gate refuses the run: in JSON-artifact
+        /// mode the plan staleness check (> 24 h) and the incremental
+        /// cursor-drift check (each bypass is recorded in the run's
+        /// `apply_context`); in YAML config mode, with `--resume`, the refusal
+        /// to resume into a prefix whose `_SUCCESS` marker is already present
         #[arg(long)]
         force: bool,
+        /// Run the whole config as ONE bounded work-stealing pool of N export
+        /// slots (config mode only, #166): exports start longest-first (LPT, by
+        /// each export's last measured duration) and every freeing slot pulls
+        /// the next — no wave barriers, so the wall approaches
+        /// `max(longest, total/N)`. Priority `wave:` tiers are NOT honored
+        /// (makespan mode); exports that are not `parallel_safe` never run
+        /// concurrently with EACH OTHER (one heavy at a time; cheap exports
+        /// backfill the remaining slots).
+        #[arg(long, value_name = "N", conflicts_with = "parallel_export_processes")]
+        pool: Option<usize>,
+        /// With `--pool`: when ONE export dominates the pool floor (its predicted
+        /// duration ≫ the next-longest, #167), split it into N range sub-exports
+        /// over its key span — separate scheduler units the pool places
+        /// concurrently, so the giant stops being the makespan floor. The units
+        /// share one destination prefix and fold to one family, so the load view
+        /// reads them as a single logical table. Only full/chunked/keyset exports
+        /// with a `chunk_by_key:`/`chunk_column:` are split (never incremental/CDC).
+        /// Off by default; ignored without `--pool`.
+        #[arg(long, requires = "pool")]
+        split: bool,
     },
     /// Targeted repair of chunks flagged by reconcile: emit a repair plan, or re-export only mismatched ranges.
-    Repair {
-        /// Path to YAML config file
-        #[arg(short, long)]
-        config: String,
-        /// Export name to repair (must be `mode: chunked`)
-        #[arg(short, long)]
-        export: String,
-        /// Path to a reconcile JSON report produced by `rivet reconcile --format json`.
-        /// Omit to run reconcile in-process against the latest chunk run.
-        #[arg(long)]
-        report: Option<String>,
-        /// Actually re-export the affected chunks. Without this flag, the plan is printed and nothing is executed.
-        #[arg(long)]
-        execute: bool,
-        /// Output format for plan / report
-        #[arg(long, default_value = "pretty")]
-        format: ReconcileFormat,
-        /// Write plan / report JSON to this file (with `--format json`)
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Query parameter: key=value (repeatable)
-        #[arg(short, long = "param", value_name = "KEY=VALUE")]
-        params: Vec<String>,
-    },
+    Repair(RepairArgs),
     /// Re-run manifest-aware verification against an existing destination, no extraction.
     ///
     /// The same file-manifest checks `rivet run --validate` performs at
@@ -386,51 +352,7 @@ pub enum Commands {
     /// By default `validate` resolves the destination prefix the same way
     /// `run` does — `{date}` becomes today's UTC date.  Use `--date`,
     /// `--run-id`, or `--prefix` to point at a prior run instead of today.
-    Validate {
-        /// Path to YAML config file
-        #[arg(short, long)]
-        config: String,
-        /// Validate only this export (default: every export in the config)
-        #[arg(short, long)]
-        export: Option<String>,
-        /// Output format: "pretty" (human summary) or "json" (machine-readable)
-        #[arg(long, default_value = "pretty")]
-        format: ValidateFormat,
-        /// How deep to verify: "light" (manifest + _SUCCESS only, no prefix
-        /// listing), "sample" (light + part reconcile + untracked surplus), or
-        /// "full" (sample + the value-checksum re-read of every part).
-        ///
-        /// `full` is the default and matches the pre-graded behaviour. Use
-        /// `light` for a fast "is this a complete, marked run?" poll, or
-        /// `sample` for full structural verification without downloading parts.
-        #[arg(long, default_value = "full")]
-        depth: ValidateDepth,
-        /// Write JSON report to this file (only with `--format json`)
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Resolve `{date}` to this ISO-8601 day (e.g. `2026-05-21`) instead of today.
-        ///
-        /// Use when a run that landed on a prior day's prefix needs to be
-        /// re-verified — without this flag `validate` looks at today's
-        /// resolved prefix and reports "no manifest" for yesterday's data.
-        #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "prefix")]
-        date: Option<String>,
-        /// Substitute `{run_id}` in the destination template with this value.
-        ///
-        /// Composes with `--date`.  Has no effect if the template does not
-        /// contain `{run_id}`.
-        #[arg(long, value_name = "RUN_ID", conflicts_with = "prefix")]
-        run_id: Option<String>,
-        /// Skip placeholder resolution entirely and verify exactly this prefix.
-        ///
-        /// Use when the resolved template no longer matches the physical
-        /// layout (e.g. data was relocated, or the template changed since
-        /// the run landed).  The destination *type* still comes from
-        /// config (`local`, `s3`, `gcs`, `azure`); only the resolved
-        /// `path`/`prefix` string is overridden.
-        #[arg(long, value_name = "PREFIX")]
-        prefix: Option<String>,
-    },
+    Validate(ValidateArgs),
     /// Partition/window reconciliation: re-count per-partition on source and report mismatches.
     /// Requires a chunked export previously run with `chunk_checkpoint: true`.
     /// Exits non-zero when a mismatch is detected, so CI / orchestrators can gate on it
@@ -922,7 +844,7 @@ mod tests {
             Err(e) => panic!("validate should parse, got: {e}"),
         };
         match cli.command {
-            Commands::Validate { depth, .. } => depth,
+            Commands::Validate(a) => a.depth,
             _ => panic!("expected the Validate subcommand"),
         }
     }
@@ -956,4 +878,160 @@ mod tests {
             "an unknown depth must be rejected by clap"
         );
     }
+}
+
+/// Arguments of `rivet validate` — one struct instead of an N-arg
+/// tunnel (#162 item 3): the variant flattens it, dispatch takes it whole, and a
+/// new flag is a field, not another positional parameter at every layer.
+#[derive(clap::Args)]
+pub struct ValidateArgs {
+    /// Path to YAML config file
+    #[arg(short, long)]
+    pub config: String,
+    /// Validate only this export (default: every export in the config)
+    #[arg(short, long)]
+    pub export: Option<String>,
+    /// Output format: "pretty" (human summary) or "json" (machine-readable)
+    #[arg(long, default_value = "pretty")]
+    pub format: ValidateFormat,
+    /// How deep to verify: "light" (manifest + _SUCCESS only, no prefix
+    /// listing), "sample" (light + part reconcile + untracked surplus), or
+    /// "full" (sample + the value-checksum re-read of every part).
+    ///
+    /// `full` is the default and matches the pre-graded behaviour. Use
+    /// `light` for a fast "is this a complete, marked run?" poll, or
+    /// `sample` for full structural verification without downloading parts.
+    #[arg(long, default_value = "full")]
+    pub depth: ValidateDepth,
+    /// Write JSON report to this file (only with `--format json`)
+    #[arg(short, long)]
+    pub output: Option<String>,
+    /// Resolve `{date}` to this ISO-8601 day (e.g. `2026-05-21`) instead of today.
+    ///
+    /// Use when a run that landed on a prior day's prefix needs to be
+    /// re-verified — without this flag `validate` looks at today's
+    /// resolved prefix and reports "no manifest" for yesterday's data.
+    #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "prefix")]
+    pub date: Option<String>,
+    /// Substitute `{run_id}` in the destination template with this value.
+    ///
+    /// Composes with `--date`.  Has no effect if the template does not
+    /// contain `{run_id}`.
+    #[arg(long, value_name = "RUN_ID", conflicts_with = "prefix")]
+    pub run_id: Option<String>,
+    /// Skip placeholder resolution entirely and verify exactly this prefix.
+    ///
+    /// Use when the resolved template no longer matches the physical
+    /// layout (e.g. data was relocated, or the template changed since
+    /// the run landed).  The destination *type* still comes from
+    /// config (`local`, `s3`, `gcs`, `azure`); only the resolved
+    /// `path`/`prefix` string is overridden.
+    #[arg(long, value_name = "PREFIX")]
+    pub prefix: Option<String>,
+}
+
+/// Arguments of `rivet repair` — one struct instead of an N-arg
+/// tunnel (#162 item 3): the variant flattens it, dispatch takes it whole, and a
+/// new flag is a field, not another positional parameter at every layer.
+#[derive(clap::Args)]
+pub struct RepairArgs {
+    /// Path to YAML config file
+    #[arg(short, long)]
+    pub config: String,
+    /// Export name to repair (must be `mode: chunked`)
+    #[arg(short, long)]
+    pub export: String,
+    /// Path to a reconcile JSON report produced by `rivet reconcile --format json`.
+    /// Omit to run reconcile in-process against the latest chunk run.
+    #[arg(long)]
+    pub report: Option<String>,
+    /// Actually re-export the affected chunks. Without this flag, the plan is printed and nothing is executed.
+    #[arg(long)]
+    pub execute: bool,
+    /// Output format for plan / report
+    #[arg(long, default_value = "pretty")]
+    pub format: ReconcileFormat,
+    /// Write plan / report JSON to this file (with `--format json`)
+    #[arg(short, long)]
+    pub output: Option<String>,
+    /// Query parameter: key=value (repeatable)
+    #[arg(short, long = "param", value_name = "KEY=VALUE")]
+    pub params: Vec<String>,
+}
+
+/// Arguments of `rivet plan` — one struct instead of an N-arg
+/// tunnel (#162 item 3): the variant flattens it, dispatch takes it whole, and a
+/// new flag is a field, not another positional parameter at every layer.
+#[derive(clap::Args)]
+pub struct PlanArgs {
+    /// Path to YAML config file
+    #[arg(short, long)]
+    pub config: String,
+    /// Plan only a specific export by name
+    #[arg(short, long)]
+    pub export: Option<String>,
+    /// Query parameter: key=value (repeatable)
+    #[arg(short, long = "param", value_name = "KEY=VALUE")]
+    pub params: Vec<String>,
+    /// Write plan JSON to this file (default: print summary to stdout)
+    #[arg(short, long)]
+    pub output: Option<String>,
+    /// Write this plan's `wave:` / `parallel_safe:` schedule into the config,
+    /// (over)writing every export. WITHOUT this flag `rivet plan` is READ-ONLY:
+    /// it prints the schedule and the reviewable plan but never touches the
+    /// config file — not even to fill in absent fields. This makes config
+    /// mutation an explicit, opt-in act (a read-only-looking `rivet plan` once
+    /// turned a hand-tuned 5-per-wave split into one 76-export wave).
+    #[arg(long)]
+    pub annotate_waves: bool,
+    /// Output format: "pretty" (human summary) or "json" (machine-readable)
+    #[arg(long, default_value = "pretty")]
+    pub format: PlanFormat,
+}
+
+/// Arguments of `rivet run` — one struct instead of an 11-arg
+/// tunnel (#162 item 3): the variant flattens it, dispatch takes it whole, and a
+/// new flag is a field, not another positional parameter at every layer.
+#[derive(clap::Args)]
+pub struct RunArgs {
+    /// Path to YAML config file
+    #[arg(short, long)]
+    pub config: String,
+    /// Run only a specific export by name
+    #[arg(short, long)]
+    pub export: Option<String>,
+    /// Validate output files after writing
+    #[arg(long)]
+    pub validate: bool,
+    /// Row-count audit: run COUNT(*) on the source and compare with the
+    /// exported row count; a mismatch fails the run. Implies `--validate`
+    /// (also verifies the output file manifest).
+    #[arg(long)]
+    pub reconcile: bool,
+    /// Resume a chunked export with `chunk_checkpoint: true` (same query/chunk_column/chunk_size)
+    #[arg(long)]
+    pub resume: bool,
+    /// Override safety gates that would otherwise refuse the run.
+    ///
+    /// Today: with `--resume`, allows starting against a destination prefix
+    /// whose `_SUCCESS` marker is already present.  Without `--force`,
+    /// resume against an already-complete run refuses, so an operator
+    /// cannot accidentally re-export over a verified dataset.
+    #[arg(long)]
+    pub force: bool,
+    /// Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
+    #[arg(long)]
+    pub parallel_exports: bool,
+    /// Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)
+    #[arg(long)]
+    pub parallel_export_processes: bool,
+    /// Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
+    #[arg(long, value_name = "PATH")]
+    pub summary_output: Option<String>,
+    /// Print the run aggregate summary as JSON to stdout at the end of the run
+    #[arg(long)]
+    pub json: bool,
+    /// Query parameter: key=value (repeatable, substitutes ${key} in queries)
+    #[arg(short, long = "param", value_name = "KEY=VALUE")]
+    pub params: Vec<String>,
 }

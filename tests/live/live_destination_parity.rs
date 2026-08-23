@@ -22,40 +22,17 @@ fn parquet_rows(path: &std::path::Path) -> usize {
         .sum()
 }
 
-/// Export `query` through `destination_yaml` (YAML snippet for the
-/// `destination:` key in the rivet config) and run rivet with environment
-/// variables `env`.  Returns `(status_success, stderr_utf8)` so the caller
-/// can surface cloud-specific errors cleanly.
-fn export(query: &str, destination_yaml: &str, env: &[(&str, &str)]) -> (bool, String, String) {
+/// Export `query` through the destination the `dest` closure attaches to the
+/// base rig, with environment variables `env`. Returns `(status_success,
+/// stdout, stderr)` so the caller can surface cloud-specific errors cleanly.
+fn export(
+    query: &str,
+    dest: impl FnOnce(Rig) -> Rig,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
     let export_name = unique_name("qa63");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "{query}"
-    mode: full
-    format: parquet
-    {destination_yaml}
-"#
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
-
-    let mut cmd = std::process::Command::new(RIVET_BIN);
-    cmd.args([
-        "run",
-        "--config",
-        cfg_path.to_str().unwrap(),
-        "--export",
-        &export_name,
-    ]);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let out = cmd.output().expect("spawn rivet");
+    let rig = dest(Rig::pg_batch(&export_name).query(query));
+    let out = rig.run_args_env(&["--export", &export_name], env);
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -70,15 +47,9 @@ fn local_destination_produces_one_parquet_with_all_rows() {
     let table = seed_pg_numeric_table(25);
     let out_dir = tempfile::tempdir().unwrap();
 
-    let dest = format!(
-        r#"destination:
-      type: local
-      path: {}"#,
-        out_dir.path().display()
-    );
     let (ok, _stdout, stderr) = export(
         &format!("SELECT id, name FROM {}", table.name()),
-        &dest,
+        |r| r.dest_path(out_dir.path().to_path_buf()),
         &[],
     );
     assert!(ok, "rivet local failed; stderr:\n{stderr}");
@@ -99,16 +70,6 @@ fn s3_minio_destination_produces_one_parquet_with_all_rows() {
     let prefix = unique_name("qa63s3");
     let table = seed_pg_numeric_table(25);
 
-    let dest = format!(
-        r#"destination:
-      type: s3
-      bucket: {bucket}
-      prefix: {prefix}
-      region: us-east-1
-      endpoint: {MINIO_ENDPOINT}
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK"#
-    );
     let env = [
         ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
         ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
@@ -117,7 +78,7 @@ fn s3_minio_destination_produces_one_parquet_with_all_rows() {
     ];
     let (ok, _stdout, stderr) = export(
         &format!("SELECT id, name FROM {}", table.name()),
-        &dest,
+        |r| r.dest_s3(bucket, &prefix, MINIO_ENDPOINT),
         &env,
     );
     assert!(ok, "rivet s3 (MinIO) failed; stderr:\n{stderr}");
@@ -164,17 +125,9 @@ fn gcs_fake_destination_produces_one_parquet_with_all_rows() {
     let prefix = unique_name("qa63gcs");
     let table = seed_pg_numeric_table(25);
 
-    let dest = format!(
-        r#"destination:
-      type: gcs
-      bucket: {bucket}
-      prefix: {prefix}
-      endpoint: {FAKE_GCS_ENDPOINT}
-      allow_anonymous: true"#
-    );
     let (ok, _stdout, stderr) = export(
         &format!("SELECT id, name FROM {}", table.name()),
-        &dest,
+        |r| r.dest_gcs(bucket, &prefix, FAKE_GCS_ENDPOINT),
         &[],
     );
     assert!(ok, "rivet gcs (fake-gcs) failed; stderr:\n{stderr}");
@@ -223,11 +176,11 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
     // 1. Local
     let local_dir = tempfile::tempdir().unwrap();
     {
-        let dest = format!(
-            "destination:\n      type: local\n      path: {}",
-            local_dir.path().display()
+        let (ok, _, err) = export(
+            &base_query,
+            |r| r.dest_path(local_dir.path().to_path_buf()),
+            &[],
         );
-        let (ok, _, err) = export(&base_query, &dest, &[]);
         assert!(ok, "local failed: {err}");
     }
     let local_rows: usize = files_with_extension(local_dir.path(), "parquet")
@@ -240,22 +193,16 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
     ensure_minio_bucket(s3_bucket);
     let s3_prefix = unique_name("qa63_parity_s3");
     {
-        let dest = format!(
-            r#"destination:
-      type: s3
-      bucket: {s3_bucket}
-      prefix: {s3_prefix}
-      region: us-east-1
-      endpoint: {MINIO_ENDPOINT}
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK"#
-        );
         let env = [
             ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
             ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
             ("AWS_EC2_METADATA_DISABLED", "true"),
         ];
-        let (ok, _, err) = export(&base_query, &dest, &env);
+        let (ok, _, err) = export(
+            &base_query,
+            |r| r.dest_s3(s3_bucket, &s3_prefix, MINIO_ENDPOINT),
+            &env,
+        );
         assert!(ok, "s3 failed: {err}");
     }
     // Count rows by sampling the manifest via rivet state files instead of
@@ -288,15 +235,11 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
     ensure_gcs_bucket(gcs_bucket);
     let gcs_prefix = unique_name("qa63_parity_gcs");
     {
-        let dest = format!(
-            r#"destination:
-      type: gcs
-      bucket: {gcs_bucket}
-      prefix: {gcs_prefix}
-      endpoint: {FAKE_GCS_ENDPOINT}
-      allow_anonymous: true"#
+        let (ok, _, err) = export(
+            &base_query,
+            |r| r.dest_gcs(gcs_bucket, &gcs_prefix, FAKE_GCS_ENDPOINT),
+            &[],
         );
-        let (ok, _, err) = export(&base_query, &dest, &[]);
         assert!(ok, "gcs failed: {err}");
     }
 

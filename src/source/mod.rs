@@ -339,15 +339,42 @@ pub trait Source: Send {
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>>;
 
-    /// Sample a monotonic source-pressure counter for the OPT-2 concurrency
-    /// governor (`pipeline::chunked::exec`).
+    /// Sample the monotonic FOREIGN-pressure counter for the OPT-2
+    /// concurrency governor — write/redo pressure a read-only export cannot
+    /// move (PG `checkpoints_req`, MySQL `Innodb_log_waits`, MSSQL `Log
+    /// Flush Waits/sec`).
     ///
-    /// Higher = more pressure. The governor compares successive samples
-    /// (`cur > prev` ⇒ under pressure) — the same convention the adaptive
-    /// batch-size loop already uses. Returns `None` when the engine can't
-    /// cheaply sample a pressure proxy, in which case the governor holds
-    /// parallelism flat. Default: `None`.
-    fn sample_pressure(&mut self) -> Option<u64> {
+    /// This is the governor's ONLY signal, and it is deliberately NOT the
+    /// adaptive batch loop's. The batch loops sample engine-internally:
+    /// MySQL its own-extraction spill sum (`mysql_sample_extraction_pressure`
+    /// — shrinking the batch genuinely shrinks the per-query spill), PG the
+    /// same `checkpoints_req` both loops share (write-driven, own reads
+    /// can't move it), MSSQL nothing (its batch adaptation is inert).
+    /// Feeding the governor
+    /// those same spill counters made it read its own exhaust (field find,
+    /// 2026-08-13): a keyset export whose pages spill by design saw a
+    /// permanently-rising counter on an idle server, shed workers 4→3→2→1,
+    /// and never recovered — every keyset export 2–2.7× slower with zero
+    /// foreign load. The governor's question is "is someone ELSE straining
+    /// this server while I run?" — only a counter the export itself cannot
+    /// inflate can answer it.
+    ///
+    /// Higher = more pressure; the governor compares successive samples
+    /// (`cur > prev` ⇒ under pressure). Returns `None` when the engine has
+    /// no such counter — the governor then holds parallelism flat.
+    /// Default: `None`.
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// The Tier-2 source-harm counter snapshot (locks, rows read, buffer
+    /// misses, temp spills) the pipeline deltas around a run window and
+    /// stores in `export_harm` — the third telemetry axis beside
+    /// [`Source::sample_governor_pressure`] (governor) and each engine's
+    /// internal batch-pressure sampling. `None` when the engine can't sample
+    /// (e.g. MSSQL without `VIEW SERVER STATE`) — harm metrics are
+    /// observability, never a gate. Default: `None`.
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
         None
     }
 
@@ -563,6 +590,17 @@ pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
 /// allowed there because the bytes never leave the box. An explicit
 /// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
 /// remote plaintext and is **not** refused here.
+/// Marker error for the TLS-required policy refusal, so callers whose remedy
+/// differs (init: a FLAG, not a config block) can recognize it by type.
+#[derive(Debug)]
+pub(crate) struct TlsRequiredError;
+impl std::fmt::Display for TlsRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TLS required for a remote host")
+    }
+}
+impl std::error::Error for TlsRequiredError {}
+
 pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
     // An explicit `tls: {..}` (including `mode: disable`) is the operator's
     // opt-in and is never refused here — including for a host-LESS URL, which a
@@ -591,7 +629,11 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
              plaintext with `source.tls: { mode: disable }` if this network path is \
              already trusted.";
         log::error!("{msg}");
-        anyhow::bail!("{msg}");
+        // Typed, not just a string: `rivet init` has no config file to add a
+        // `tls:` block TO (it generates one), so its dispatch matches on this
+        // marker and re-prescribes the `--tls` flag instead — detection by
+        // downcast, never by string-matching the message (#146).
+        return Err(anyhow::Error::new(TlsRequiredError).context(msg));
     }
     Ok(())
 }
@@ -600,6 +642,26 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
 mod tls_gate_tests {
     use super::{host_is_loopback, host_port_span, require_tls_or_loopback};
     use crate::config::{TlsConfig, TlsMode};
+
+    /// The marker must be REACHABLE (downcast finds it on the chain) and must
+    /// SAY something (a `Display` stubbed to nothing turns `{:#}` chains into
+    /// a trailing colon and empty segment). Both halves lib-side, where the
+    /// marker lives — init's flag-naming remedy is tested bin-side.
+    #[test]
+    fn tls_required_error_is_downcastable_and_self_describing() {
+        let err = require_tls_or_loopback("mysql://u:p@203.0.113.9/db", None)
+            .expect_err("remote + no tls refuses");
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<super::TlsRequiredError>().is_some()),
+            "the refusal must carry the typed marker"
+        );
+        let display = format!("{}", super::TlsRequiredError);
+        assert!(
+            display.contains("TLS required"),
+            "the marker's own text must name the policy: {display:?}"
+        );
+    }
 
     #[test]
     fn loopback_variants_are_loopback() {

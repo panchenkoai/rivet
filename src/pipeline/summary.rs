@@ -77,6 +77,9 @@ pub struct RunSummary {
     pub total_rows: i64,
     pub files_produced: usize,
     pub bytes_written: u64,
+    /// Decoded bytes READ from the source this run (harvested once from the
+    /// plan's shared counter by `run_export_job` after the runner returns; v23).
+    pub bytes_read: u64,
     /// Incremented after each successful `dest.write()`. Non-zero means a previous
     /// attempt already committed data — retrying from the same cursor would duplicate rows.
     pub files_committed: usize,
@@ -133,7 +136,34 @@ pub struct RunSummary {
     /// as a false mismatch — mirroring how a rehydrated part's empty md5 degrades
     /// to a size-only check. An incomplete integrity record must be ABSENT, not
     /// partial-and-lying.
+    ///
+    /// ADR-0029: this is now a COMPUTED result, not a flag the resume paths must
+    /// remember to set. `harvest_column_checksums` compares the manifest's parts
+    /// against the commit units that contributed checksums and sets it when any
+    /// part is uncovered — a rehydrated part has no contribution, so the resume
+    /// case follows from the data.
     pub column_checksums_incomplete: bool,
+    /// ADR-0029: WHY the coverage was short, when it was — set only for the half
+    /// that is never legitimate on a successful run: a part this run RECORDED
+    /// (through `commit::record_part`) whose commit unit contributed no
+    /// checksums. The other half — a part the manifest lists but this run never
+    /// recorded (a checkpoint rehydration, an M8 `Skip` clone) — is expected and
+    /// leaves this false.
+    ///
+    /// It exists so "Form B is absent" stops being ambiguous between "nothing
+    /// computed it", "a resume hydrated parts" and "the runner paired its part
+    /// and its checksum under DIFFERENT unit ids". The last one suppresses Form
+    /// B on perfectly healthy data — fail-safe, but silent — which is the risk
+    /// ADR-0029 names against itself; `check_post_run_invariants` turns it into
+    /// a loud failure instead.
+    pub column_checksums_short_cover: bool,
+    /// ADR-0028: the run-wide tail ledger the runners FEED as they commit
+    /// (schema seen, per-part checksums, shape bytes) and that
+    /// `finalize::finalize_export` — called once by the dispatcher — APPLIES:
+    /// fingerprint pin, drift gate, Form-B harvest, shape warn. Runners no
+    /// longer apply any of those themselves; forgetting to FEED is caught by
+    /// the telltale invariants in `check_post_run_invariants` below.
+    pub(crate) ledger: super::commit::CommitLedger,
     /// Cursor range this run covered (incremental strategies) — travels to the
     /// manifest's extraction section for warehouse-side continuity checks.
     /// v1 ships column + low + high; cursor_type / source_row_count are
@@ -175,6 +205,15 @@ pub struct RunSummary {
     /// indicates cursor / sort spill to `pgsql_tmp/` — the safe action is to
     /// shrink `tuning.batch_size` or set `tuning.batch_size_memory_mb` below
     /// PG's `work_mem`.
+    ///
+    /// SCOPE: the counter is DATABASE-wide, so this is a WINDOW delta, not a
+    /// per-export measurement. Solo it is a fair attribution (rivet is the only
+    /// query stream it knows of); under any concurrent-sibling mode (--pool,
+    /// --parallel-exports, --parallel-export-processes, apply --parallel) every
+    /// concurrent export records the SAME shared window, so the values must not
+    /// be summed across exports nor read as "this export spilled N". The field
+    /// is kept — a window delta is still the only spill-volume signal there is —
+    /// and its warning hedges accordingly (`job::pg_temp_bytes_warning`).
     pub pg_temp_bytes_delta: Option<i64>,
     /// Human-readable parenthetical attached to `status: skipped` so the
     /// operator knows *why* there was nothing to export this run (e.g.
@@ -248,6 +287,7 @@ impl RunSummary {
             total_rows: 0,
             files_produced: 0,
             bytes_written: 0,
+            bytes_read: 0,
             files_committed: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
@@ -284,6 +324,8 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
+            column_checksums_short_cover: false,
+            ledger: Default::default(),
             checksum_key_column: None,
             cursor_column: None,
             cursor_low: None,
@@ -325,6 +367,7 @@ impl RunSummary {
             total_rows: 0,
             files_produced: 0,
             bytes_written: 0,
+            bytes_read: 0,
             files_committed: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
@@ -357,6 +400,8 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
+            column_checksums_short_cover: false,
+            ledger: Default::default(),
             checksum_key_column: None,
             cursor_column: None,
             cursor_low: None,
@@ -446,6 +491,7 @@ impl RunSummary {
                 duration_ms: self.duration_ms,
                 peak_rss_mb: self.peak_rss_mb,
                 error_message: self.error_message.clone(),
+                dest_retries: crate::destination::transient_retries_total(),
             });
             return;
         }
@@ -552,12 +598,14 @@ impl RunSummary {
         rows.push(("files", fmt_thousands(self.files_produced as i64)));
         rows.extend(self.output_row());
         rows.extend(self.position_row());
+        rows.extend(self.bytes_read_row());
         rows.extend(self.bytes_row());
         rows.push(("duration", fmt_duration_ms(self.duration_ms)));
         rows.extend(self.peak_rss_row());
         rows.extend(self.pg_temp_spill_row());
         rows.extend(self.compression_row());
         rows.extend(self.retries_row());
+        rows.extend(dest_retries_row());
         rows.extend(self.outcome_rows());
         rows.extend(self.error_row());
         format_block(&self.export_name, &rows)
@@ -616,10 +664,20 @@ impl RunSummary {
         }
     }
 
-    /// `bytes` — only when something was written.
+    /// `bytes read` / `bytes written` — SEPARATE rows (read is the source
+    /// leg's decoded volume, written the parquet leg's; the pair is the
+    /// read-vs-write-bound signal the field 163-min run had neither of).
     fn bytes_row(&self) -> Option<Row> {
         if self.bytes_written > 0 {
-            Some(("bytes", format_bytes(self.bytes_written)))
+            Some(("bytes written", format_bytes(self.bytes_written)))
+        } else {
+            None
+        }
+    }
+
+    fn bytes_read_row(&self) -> Option<Row> {
+        if self.bytes_read > 0 {
+            Some(("bytes read", format_bytes(self.bytes_read)))
         } else {
             None
         }
@@ -871,6 +929,34 @@ impl RunSummary {
                         .to_string(),
                 );
             }
+            // ADR-0029 — the telltale the computed coverage makes possible, and
+            // the guard against the risk that ADR names against ITSELF. Before
+            // it, "Form B is absent" was ambiguous (nothing computed it / a
+            // resume hydrated parts / the runner mis-keyed its units) and the
+            // branch above excused all three alike. Now the harvest records WHY,
+            // and exactly one of the three can never be legitimate on a run
+            // whose runner SUCCEEDED: a part this run recorded itself, whose
+            // commit unit contributed no checksums. On a success every commit
+            // unit that recorded a part also completed, so this can only mean
+            // `record_part`'s UnitId and the checksum feed's UnitId disagree —
+            // which suppresses Form B on healthy data, in the fail-safe
+            // direction, in silence. Resume-safe by CONSTRUCTION, with no
+            // exemption to remember: a rehydrated / M8-cloned part never went
+            // through record_part, so it is foreign, not uncovered, and leaves
+            // this flag false.
+            if self.column_checksums_short_cover {
+                return Err(
+                    "state_backed success committed parts whose commit unit contributed NO \
+                     Form-B checksums, so the harvest suppressed the record (ADR-0029 \
+                     computed coverage). On a successful run every unit that recorded a part \
+                     also committed it, so this is a UnitId mismatch between \
+                     commit::record_part and CommitLedger::contribute_checksums in the \
+                     runner — pair them on the same unit. Suppressing here is fail-safe but \
+                     SILENT: `validate --depth full` would stop re-reading values for every \
+                     run of this runner."
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -937,6 +1023,25 @@ fn time_window_skip_line(mode: &str, skip_reason: Option<&str>) -> Option<String
         return None;
     }
     Some("rolling time window matched no rows — check `time_column`/`days_window`".to_string())
+}
+
+/// The summary block's `dest retries:` row — transient destination-side retry
+/// attempts the OpenDAL `RetryLayer` scheduled this process, or `None` when
+/// there were none.
+///
+/// Reads the process-wide counter rather than a `RunSummary` field, mirroring
+/// what [`RunSummary::print`] already does when it forwards `dest_retries` on
+/// the child `Finished` event.
+///
+/// It exists because the aggregate block is NOT printed for a single-export
+/// run (`run.rs`: `if exports.len() > 1`), and a `--parallel-export-processes`
+/// child is exactly that shape. Demoting the per-attempt WARNs to DEBUG
+/// without this row left `rivet run -c cfg.yaml` (one export, cloud
+/// destination) printing NOTHING about a flaky destination at any level above
+/// debug — the signal was demoted and never re-surfaced.
+fn dest_retries_row() -> Option<Row> {
+    crate::destination::transient_retries_summary(crate::destination::transient_retries_total())
+        .map(|v| ("dest retries", v))
 }
 
 fn summarize_parallel_chunk_errors(raw: &str) -> Option<String> {
@@ -1133,9 +1238,12 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::default(),
@@ -1212,6 +1320,70 @@ mod tests {
         assert!(!line.contains('\n'), "single line: {:?}", line);
     }
 
+    /// A single-export run must SEE the destination-retry signal.
+    ///
+    /// `aggregate::print` — the only other place the count is reported — runs
+    /// only for `exports.len() > 1` (`run.rs`), and a
+    /// `--parallel-export-processes` child is always a one-export run. With the
+    /// per-attempt WARNs demoted to DEBUG, `rivet run -c cfg.yaml` over a flaky
+    /// cloud destination printed nothing above debug until this row existed.
+    ///
+    /// Producer chain, both halves proven rather than hand-built: the real
+    /// increment site (`RivetRetryNotify::intercept`) feeds this same
+    /// process-wide counter — asserted in
+    /// `destination::cloud::tests::retry_interceptor_counts_every_absorbed_retry`
+    /// (the interceptor is `pub(crate)` to `destination`, so it cannot be
+    /// called from here) — and this test drives the counter through the other
+    /// production writer, `add_transient_retries` (what the parent calls for
+    /// each CHILD PROCESS's `Finished` event, in
+    /// `parallel_children::adopt_child_event`), then reads the row out of the
+    /// real `render()`.
+    ///
+    /// Scope, so the next reader does not mistake this for more than it is:
+    /// it pins the ROW, not the wiring. It cannot see how the counter got its
+    /// value, which is why it stayed green while every in-process run folded
+    /// the counter into itself (finding #4) — that seam is pinned by
+    /// `parent_ui::tests::in_process_finished_event_must_not_refold_this_processs_own_retry_counter`,
+    /// which drives print → emit_event → Renderer for real.
+    ///
+    /// Delta-based, not absolute: the counter is process-wide and other tests
+    /// in this binary may bump it concurrently. The "no row when zero" half
+    /// cannot be asserted here for the same reason — it is covered by
+    /// `transient_retries_summary(0) == None` in the cloud module.
+    #[test]
+    fn single_export_summary_card_surfaces_destination_retries() {
+        let before = crate::destination::transient_retries_total();
+        // Two retries, not one: the row folds a counter, so a single element
+        // would not distinguish the total from "some retry happened".
+        crate::destination::add_transient_retries(2);
+
+        let s = RunSummary::stub_for_testing("run-dest-retries", "orders");
+        let block = s.render();
+
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("dest retries:"))
+            .unwrap_or_else(|| {
+                panic!("single-export summary card must carry a dest-retries row:\n{block}")
+            });
+        let value = line.split("dest retries:").nth(1).unwrap().trim();
+        let n: u64 = value
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|e| panic!("row must lead with the count, got {value:?}: {e}"));
+        assert!(
+            n >= before + 2,
+            "row must report the accumulated total (>= {} after two more), got {n}: {line:?}",
+            before + 2
+        );
+        assert!(
+            value.contains("transient retry attempts"),
+            "row must say ATTEMPTS, not claim recovery: {line:?}"
+        );
+    }
+
     #[test]
     fn compact_error_summarises_parallel_chunk_errors() {
         let raw = "export 'page_views': parallel checkpoint worker errors:\n\
@@ -1268,9 +1440,12 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "events".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::default(),
@@ -1342,9 +1517,12 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: export_name.into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::default(),

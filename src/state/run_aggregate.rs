@@ -30,6 +30,10 @@ pub struct RunAggregate {
     pub total_rows: i64,
     pub total_files: i64,
     pub total_bytes: u64,
+    /// Decoded bytes READ (v23) — display/JSON only; recomputed from
+    /// `per_export` on load (no DB column, entries carry it in details_json).
+    #[serde(default)]
+    pub total_bytes_read: u64,
     pub per_export: Vec<RunAggregateEntry>,
 }
 
@@ -42,6 +46,9 @@ pub struct RunAggregateEntry {
     pub rows: i64,
     pub files: i64,
     pub bytes: u64,
+    /// Decoded bytes READ from the source (v23); 0 in pre-v23 details_json.
+    #[serde(default)]
+    pub bytes_read: u64,
     pub duration_ms: i64,
     pub mode: String,
     pub error_message: Option<String>,
@@ -94,6 +101,9 @@ impl StateStore {
         self.query(sql, &[(limit as i64).into()], |r| {
             let per_export: Vec<RunAggregateEntry> =
                 serde_json::from_str(&r.text(13)).unwrap_or_default();
+            // total_bytes_read has no DB column: recompute from the entries so
+            // a read-back never shows a false 0 beside real per-export figures.
+            let total_bytes_read = per_export.iter().map(|e| e.bytes_read).sum();
             RunAggregate {
                 run_aggregate_id: r.text(0),
                 started_at: r.text(1),
@@ -108,6 +118,7 @@ impl StateStore {
                 total_rows: r.i64(10),
                 total_files: r.i64(11),
                 total_bytes: r.i64(12) as u64,
+                total_bytes_read,
                 per_export,
             }
         })
@@ -120,6 +131,7 @@ mod tests {
 
     fn sample(id: &str) -> RunAggregate {
         RunAggregate {
+            total_bytes_read: 0,
             run_aggregate_id: id.into(),
             started_at: "2026-04-27T10:00:00Z".into(),
             finished_at: "2026-04-27T10:11:30Z".into(),
@@ -135,6 +147,7 @@ mod tests {
             total_bytes: 750 * 1024 * 1024,
             per_export: vec![
                 RunAggregateEntry {
+                    bytes_read: 0,
                     export_name: "orders".into(),
                     status: "success".into(),
                     run_id: "orders_20260427T100000".into(),
@@ -146,6 +159,7 @@ mod tests {
                     error_message: None,
                 },
                 RunAggregateEntry {
+                    bytes_read: 0,
                     export_name: "users".into(),
                     status: "failed".into(),
                     run_id: "users_20260427T100000".into(),

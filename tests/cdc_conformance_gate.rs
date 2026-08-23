@@ -361,6 +361,266 @@ fn every_cdc_engine_covers_every_conformance_case() {
 /// manifested as 0-row successes that a bare `run_cdc(&cfg)` + no assertion
 /// would wave through. Every live CDC test that runs a capture must assert an
 /// outcome: manifest rows, a batch comparison, or an explicit failure check.
+/// Capture markers DERIVED from the harness sources: the name of every
+/// `pub fn` starting with run/cli/spawn/drain in the rig and the runner
+/// module, as a `name(` spelling. A new runner method is born graded — the
+/// failure mode this replaces is the hand dictionary silently lagging the
+/// rig's API (bughunt find #3: ~28 CDC tests ungraded).
+/// The derived capture-marker SET is pinned exactly — the >=12 floor alone
+/// left 9 markers of silent-shrink headroom (r2 bughunt: renaming the 7
+/// runner.rs wrappers to a non-prefix spelling dropped 21 -> 14, the floor
+/// stayed quiet, and 14 real CDC tests flipped to ungraded). A lost marker
+/// SKIPS tests rather than failing them, so shrink must be loud here.
+/// Renaming/removing a runner is fine — update this list in the same commit.
+#[test]
+fn derived_capture_marker_set_is_pinned() {
+    let expected: Vec<&str> = vec![
+        "cli(",
+        "cli_env(",
+        "drain_and_read(",
+        "run(",
+        "run_and_read(",
+        "run_args(",
+        "run_args_env(",
+        "run_expect_fail(",
+        "run_ok(",
+        "run_rivet(",
+        "run_rivet_args_bounded(",
+        "run_rivet_args_bounded_env(",
+        "run_rivet_bounded(",
+        "run_rivet_env(",
+        "run_rivet_export(",
+        "run_rivet_ok(",
+        "run_rivet_with_warn_log(",
+        "run_with_env(",
+        "run_with_envs(",
+        "run_with_envs_bounded(",
+        "spawn_args_env(",
+    ];
+    let derived = derived_capture_markers();
+    let derived_refs: Vec<&str> = derived.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        derived_refs, expected,
+        "the derived capture-marker set changed — if a runner was renamed or \
+         added on purpose, update this pin in the same commit; if not, the \
+         derivation regex or the harness layout rotted"
+    );
+}
+
+/// Clip a `#[test]`-split span to the FIRST function's body (attrs +
+/// signature + brace-matched block). Everything after — helper fns, the
+/// next test's doc comment — belongs to no test and must not lend markers
+/// to this one.
+fn clip_to_first_fn_body(raw: &str) -> &str {
+    let Some(fn_pos) = raw.find("fn ") else {
+        return raw;
+    };
+    let Some(open_rel) = raw[fn_pos..].find('{') else {
+        return raw;
+    };
+    let start = fn_pos + open_rel;
+    // STRING-AWARE brace counting: the r3 byte counter counted braces inside
+    // literals, so any corrupt-checkpoint fixture (`b"{ truncated"`) left the
+    // depth unbalanced and the clip silently no-opped on exactly those tests
+    // (r4 bughunt: 6 of 153 chunks; the opposite polarity — an unmatched `}`
+    // in a string — would TRUNCATE the chunk and silently ungrade the test).
+    // Handles "…" and b"…" with \-escapes, char literals, r"…"/r#"…"#
+    // raw strings, // line comments, and /* */ block comments.
+    let bytes = raw.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &raw[..i + 1];
+                }
+            }
+            b'"' => {
+                // plain (or byte) string: skip to the unescaped closing quote
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 1,
+                        b'"' => break,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            b'r' | b'b'
+                if i + 1 < bytes.len()
+                    && (bytes[i + 1] == b'"' || bytes[i + 1] == b'#' || bytes[i + 1] == b'r') =>
+            {
+                // possible raw / byte / byte-raw string: br#"…"#, r#"…"#, r"…", b"…"
+                let mut j = i + 1;
+                if bytes[j] == b'r' {
+                    j += 1; // br…
+                }
+                let mut hashes = 0;
+                while j < bytes.len() && bytes[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' {
+                    if bytes[i] == b'b' && bytes[i + 1] == b'"' {
+                        // b"…" is handled by the '"' arm next iteration; the
+                        // 'b' itself is inert
+                    } else {
+                        // raw string: scan for `"` followed by `hashes` #s
+                        j += 1;
+                        'raw: while j < bytes.len() {
+                            if bytes[j] == b'"' {
+                                let mut k = 0;
+                                while k < hashes
+                                    && j + 1 + k < bytes.len()
+                                    && bytes[j + 1 + k] == b'#'
+                                {
+                                    k += 1;
+                                }
+                                if k == hashes {
+                                    i = j + hashes;
+                                    break 'raw;
+                                }
+                            }
+                            j += 1;
+                        }
+                        if j >= bytes.len() {
+                            return raw; // unterminated — bail to the old behavior
+                        }
+                    }
+                }
+            }
+            b'\'' => {
+                // char literal (or lifetime — a lifetime has no closing quote
+                // within 3 bytes with an escape shape, so bound the scan)
+                if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                    i += 3; // '\x' escape form start; closing quote next
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                    i += 2; // 'c'
+                }
+                // else: lifetime like 'a — leave as-is
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let mut nest = 1;
+                i += 2;
+                while i + 1 < bytes.len() && nest > 0 {
+                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        nest += 1;
+                        i += 1;
+                    } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        nest -= 1;
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    raw
+}
+
+/// The clipper itself must not lend a neighbor's marker — RED against the
+/// unclipped split (the helper text below would leak into the chunk).
+#[test]
+fn chunk_clipper_drops_trailing_helper_text() {
+    let span = "\n#[ignore]\nfn my_test() {\n    rig.run_ok();\n}\n\nfn helper_parquet_ids(dir: &Path) -> Vec<i64> {\n    duckdb_dir_parquet_ids(dir)\n}\n";
+    let clipped = clip_to_first_fn_body(span);
+    assert!(clipped.contains("run_ok"), "the test body itself stays");
+    assert!(
+        !clipped.contains("parquet_ids"),
+        "the trailing helper must be clipped, not credited to the test: {clipped}"
+    );
+}
+
+/// Braces inside STRING literals must not unbalance the clip — the standard
+/// corrupt-checkpoint fixture writes `b"{ truncated"`, which no-opped the r3
+/// byte counter on exactly those tests (r4 bughunt; RED against it).
+#[test]
+fn chunk_clipper_ignores_braces_in_literals() {
+    let span = concat!(
+        "\nfn corrupt_test() {\n",
+        "    std::fs::write(&ckpt, b\"{ truncated\").unwrap();\n",
+        "    let y = r#\"source: { type: pg }\n  unbalanced { here\"#;\n",
+        "    // a } in a comment\n",
+        "    rig.run_ok();\n",
+        "}\n\n",
+        "fn helper_parquet_ids() {}\n"
+    );
+    let clipped = clip_to_first_fn_body(span);
+    assert!(clipped.contains("run_ok"), "body stays: {clipped}");
+    assert!(
+        !clipped.contains("helper_parquet_ids"),
+        "literal braces must not extend the chunk into the helper: {clipped}"
+    );
+}
+
+fn derived_capture_markers() -> &'static Vec<String> {
+    use std::sync::OnceLock;
+    static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
+    MARKERS.get_or_init(|| {
+        let mut out = Vec::new();
+        // The rig is a directory module (role split: render/materialize/
+        // invoke/oracle) — scan every .rs under it plus the runner module.
+        // The hollowing floor below fired the moment rig.rs became rig/ —
+        // exactly the failure mode it exists for.
+        let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir("tests/common/rig")
+            .expect("derive capture markers: read tests/common/rig")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        sources.push("tests/common/runner.rs".into());
+        for src in sources {
+            let text = std::fs::read_to_string(&src)
+                .unwrap_or_else(|e| panic!("derive capture markers: read {}: {e}", src.display()));
+            for line in text.lines() {
+                let l = line.trim_start();
+                if let Some(rest) = l.strip_prefix("pub fn ")
+                    && let Some(name) = rest.split('(').next()
+                    && ["run", "cli", "spawn", "drain"]
+                        .iter()
+                        .any(|p| name.starts_with(p))
+                {
+                    out.push(format!("{name}("));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        // An empty or shrunken derivation would silently hollow the gate
+        // (runs_capture=false SKIPS a test rather than failing it) — so the
+        // floor is a hard panic, and the trickiest historical miss is pinned
+        // by name: the trailing 's' that defeated the run_with_env( substring.
+        assert!(
+            out.len() >= 12,
+            "capture-marker derivation collapsed to {} markers — the harness \
+             sources moved or the regex rotted; the gate would silently skip \
+             every CDC test: {out:?}",
+            out.len()
+        );
+        assert!(
+            out.iter().any(|m| m == "run_with_envs("),
+            "derived markers must include run_with_envs( — the spelling whose \
+             absence hid the crash-injection tests: {out:?}"
+        );
+        out
+    })
+}
+
 #[test]
 fn every_live_cdc_test_asserts_an_outcome() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -377,6 +637,35 @@ fn every_live_cdc_test_asserts_an_outcome() {
         .map(|n| format!("tests/live/{n}"))
         .collect();
     files.push("tests/live/live_batch_switch_golden.rs".to_string());
+    // CONTENT net on top of the name filter: a CDC test in a file named
+    // without "cdc" was invisible to this gate (r4 bughunt —
+    // live_source_parity_sweep shipped exactly that shape). Any live file
+    // whose text constructs a CDC rig or declares a cdc-mode config gets
+    // scanned too, whatever it is called.
+    for e in fs::read_dir(root.join("tests/live"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+    {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let path = format!("tests/live/{n}");
+        if !n.ends_with(".rs") || files.contains(&path) {
+            continue;
+        }
+        let text = fs::read_to_string(e.path()).unwrap_or_default();
+        if [
+            "mysql_cdc(",
+            "pg_cdc(",
+            "mssql_cdc(",
+            "mongo_cdc(",
+            "mode: cdc",
+            "mode(\"cdc\")",
+        ]
+        .iter()
+        .any(|m| text.contains(m))
+        {
+            files.push(path);
+        }
+    }
     files.sort();
     assert!(
         files.len() >= 10,
@@ -385,8 +674,16 @@ fn every_live_cdc_test_asserts_an_outcome() {
     );
     for file in files {
         let src = fs::read_to_string(root.join(&file)).unwrap();
-        // Split on test attributes; each chunk is one test body (plus tail).
-        for chunk in src.split("#[test]").skip(1) {
+        // Split on test attributes, then CLIP each chunk to the first fn's
+        // body via brace counting. The raw span-to-next-#[test] merged any
+        // helper fn (and the next test's doc comment) into the PRECEDING
+        // test's chunk — a helper named `walkdir_parquet_ids` sat between two
+        // tests and its `parquet_` substring credited the previous test with
+        // an outcome it never asserted; a hollowed body (run_ok(); no
+        // asserts) graded green off the neighbor's text (r3 bughunt,
+        // reproduced against live_cdc_mongo).
+        for raw in src.split("#[test]").skip(1) {
+            let chunk = clip_to_first_fn_body(raw);
             let name = chunk
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("fn "))
@@ -399,14 +696,27 @@ fn every_live_cdc_test_asserts_an_outcome() {
             // forms (run_cdc helper, direct Command) bespoke sites keep.
             let runs_capture = chunk.contains("run_cdc(")
                 || chunk.contains("Command::new(RIVET_BIN)")
-                || chunk.contains("run_ok(")
-                || chunk.contains("run_with_env(")
-                || chunk.contains("run_expect_fail(")
-                || chunk.contains("run_and_read(");
+                // DERIVED, not hand-listed: every `pub fn run*/cli*/spawn*/
+                // drain*` in the rig and the runner module is a capture
+                // spelling by construction. The hand dictionary drifted twice
+                // in a month (run_rivet_ok, then the whole run_args family —
+                // ~28 tests silently ungraded); "derive the enumerated
+                // dimension, never type it in".
+                || derived_capture_markers()
+                    .iter()
+                    .any(|m| chunk.contains(m.as_str()));
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
             let asserts_outcome = chunk.contains("manifest_rows")
+                // `cdc_id_ops` (-> `read_cdc_changes`, arrow straight off the
+                // parquet) is the STRONGEST marker in this list and was missing
+                // from it: a test asserting only that — i.e. reading the
+                // delivered rows and nothing else — was reported as asserting no
+                // outcome, while `manifest_rows` alone (rivet's own summary of
+                // its own writes) counted. Found when the first test to use the
+                // independent reader ALONE was rejected here (2026-08-17).
+                || chunk.contains("cdc_id_ops")
                 || chunk.contains("assert_cdc_matches_batch")
                 || chunk.contains("read_one_batch")
                 || chunk.contains("parquet_")
@@ -422,6 +732,50 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("!res.status.success()")
                 || chunk.contains("!output.status.success()")
                 || chunk.contains("read_cdc_rows(") // replica-suite replay oracle
+                // Registered when the capture-marker fill (bughunt find #3)
+                // surfaced 11 tests whose ORACLES were real but unlisted —
+                // each spelling verified by reading the test, not guessed:
+                // the DuckDB re-read helper family (duckdb_dir_csv_id_set,
+                // duckdb_dir_parquet_ids, duckdb_total_parquet_rows, ...) —
+                // an independent reader, the strongest oracle class here;
+                || chunk.contains("duckdb_")
+                // reading the manifest SIDECAR back (source-identity /
+                // snapshot-leg tests assert on its recorded fields);
+                || chunk.contains("manifest.json")
+                // the mssql change-row replay oracle (read_cdc_rows' sibling);
+                || chunk.contains("read_cdc_changes(")
+                // The read-back DERIVED value the scenario smokes assert on.
+                // drain_and_read(/run_and_read( themselves are NOT outcome
+                // markers: they sit in the derived CAPTURE set too, so a
+                // `let _ = rig.run_and_read();` with the result discarded
+                // would self-satisfy the gate (r2 bughunt find).
+                || chunk.contains("num_rows()")
+                // …or typed CELL reads off the returned batches (downcasting a
+                // column and asserting on its values — the TOAST-recovery test).
+                || chunk.contains("downcast_ref::<")
+                // decoding the CLI's NDJSON event stream and asserting on the
+                // decoded events (the cdc-cli termination/backlog tests);
+                || chunk.contains("serde_json::from_str::<serde_json::Value>")
+                // Parquet re-read helpers (tests/common/parquet.rs): the seq
+                // helper reads __seq/__pos/counter columns back with DuckDB;
+                // deduped_current_sum folds a re-read change log. Registered
+                // when the rig migration made two mssql tests VISIBLE to this
+                // gate for the first time — they ran captures via a helper
+                // (`run_rivet_ok`) the capture list never matched, so the gate
+                // had never graded them at all.
+                || chunk.contains("assert_intra_transaction_seq(")
+                || chunk.contains("deduped_current_sum(")
+                // The SERVER's own slot position — the strongest oracle a
+                // slot-release test can have (roast_pg_cdc_empty_transaction_
+                // churn asserts confirmed_flush_lsn advanced past the churn,
+                // asked of PostgreSQL, never of rivet's counters).
+                || chunk.contains("confirmed_flush_lsn")
+                // A REFUSAL test's outcome is the named diagnostic, not a
+                // delivery: the compressed-binlog test asserts stderr names
+                // the event AND the setting (actionable), which is exactly the
+                // refusal contract. `status.success()` alone stays a
+                // non-marker; a named-diagnostic assertion does not.
+                || chunk.contains("the stream-time refusal must name")
                 // `rivet validate` re-reads the destination (parts + manifest +
                 // checksums) — an independent read-back, not the capture's exit.
                 || chunk.contains("args([\"validate\"")
@@ -457,11 +811,11 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("assert_complete(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
-                // `Rig::run_and_read` runs the capture AND returns every part as
-                // RecordBatches for the caller to assert on (it calls
-                // `read_all_parts` internally) — a read-back oracle, not the
-                // process exit. Same class as `read_all_parts(` above.
-                || chunk.contains("run_and_read(")
+                // run_and_read( is deliberately NOT here: it is a CAPTURE
+                // marker (derived set), and a dual-role spelling lets
+                // `let _ = rig.run_and_read();` self-satisfy the gate. The
+                // outcome is the assertion on the returned batches —
+                // num_rows()/assert markers above (r2 bughunt find).
                 || chunk.contains("stage_metrics(")
                 || chunk.contains("collect(") && chunk.contains("Metrics")
                 || chunk.contains("all_ok") // doctor --json contract
@@ -472,11 +826,18 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // it (the exact risk this gate guards). E.g. the corrupt-checkpoint
                 // roast — the run must fail loudly, not re-anchor and exit 0.
                 || chunk.contains("run_expect_fail(")
-                // Reads the persisted CDC checkpoint/anchor bytes back
-                // (`std::fs::read(rig.checkpoint())`) — the client-anchor engines'
-                // state-DB oracle. A checkpoint-advance/pin assertion is a real
-                // outcome (the committed log position), distinct from row read-back.
-                || chunk.contains("checkpoint())");
+                // Reads the persisted CDC checkpoint/anchor bytes back — the
+                // client-anchor engines' state-DB oracle. The spelling is the
+                // READ, not the accessor: the bare `checkpoint())` substring
+                // also matched pure builder configuration
+                // (`.checkpoint_path(rig.checkpoint())`, live_cdc_mongo.rs) and
+                // a setup WRITE (`write_checkpoint(.., &rig.checkpoint())`),
+                // so a test could satisfy the gate without reading anything
+                // back (r2 bughunt find).
+                || chunk.contains("fs::read(rig.checkpoint())")
+                || chunk.contains("read_to_string(rig.checkpoint())")
+                || chunk.contains("fs::read(&ckpt")
+                || chunk.contains("read_to_string(&ckpt");
             if runs_capture && !asserts_outcome {
                 naked.push(format!("{file}::{name}"));
             }

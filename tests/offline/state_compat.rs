@@ -123,6 +123,7 @@ fn fresh_db_opens_and_is_functional_end_to_end() {
             bytes: 1024,
             format: "parquet",
             compression: Some("zstd"),
+            cursor_high: None,
         })
         .unwrap();
     assert_eq!(

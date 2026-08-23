@@ -89,3 +89,35 @@ impl Drop for MysqlCdcTable {
         }
     }
 }
+
+/// RAII cross-process lock serializing tests that either FLIP server-wide
+/// MySQL tmp-table globals (`internal_tmp_mem_storage_engine`,
+/// `tmp_table_size`) or measure WALL-CLOCK ratios against the shared MySQL
+/// server. Cargo runs integration binaries in parallel, so a flipped global
+/// can slow an unrelated test's queries into flakiness, and a heavy sibling
+/// can skew an A/B timing bound (bughunt 2026-08-13). Same advisory
+/// `flock(2)` shape as `toxiproxy_guard` — the kernel releases it on drop,
+/// panic included.
+pub struct MysqlGlobalsGuard {
+    _file: std::fs::File,
+}
+
+pub fn mysql_globals_guard() -> MysqlGlobalsGuard {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("rivet_qa_mysql_globals.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open mysql globals lock {}: {e}", path.display()));
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        panic!(
+            "flock(LOCK_EX) on {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    MysqlGlobalsGuard { _file: file }
+}

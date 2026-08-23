@@ -3,6 +3,15 @@ use crate::config::{ExportConfig, ExportMode};
 
 /// B1: Human-readable strategy name derived from mode + config.
 pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
+    derive_strategy_resolved(export, None)
+}
+
+/// As [`derive_strategy`] but told the engine-introspected single-int PK the planner would
+/// auto-resolve an unset chunked `chunk_column` to (`build_plan`) — so the label reads
+/// `chunked(id, …)`, not `chunked(?, …)`, on a table whose PK the run actually ranges on.
+/// Post-0.24.3 review MED: the `?` placeholder + a false UNSAFE were the diagnostic-bypass
+/// tell (the sibling of the chunk_by_key false-alarm).
+pub(crate) fn derive_strategy_resolved(export: &ExportConfig, auto_pk: Option<&str>) -> String {
     // `chunk_by_key` pins keyset (seek) pagination regardless of the nominal
     // mode: page by ROWS on a unique index, not by key-span windows. The planner
     // (plan::build) turns it into ExtractionStrategy::Keyset, so the diagnostic
@@ -30,7 +39,11 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
             format!("incremental({})", col)
         }
         ExportMode::Chunked => {
-            let col = export.chunk_column.as_deref().unwrap_or("?");
+            let col = export
+                .chunk_column
+                .as_deref()
+                .or(auto_resolved_chunk_pk(export, auto_pk))
+                .unwrap_or("?");
             if let Some(days) = export.chunk_by_days {
                 if export.parallel > 1 {
                     format!(
@@ -56,6 +69,264 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
         }
         ExportMode::Cdc => "cdc".to_string(),
     }
+}
+
+/// The column the run actually SEEKS / RANGES / WINDOWS on — the index-probe
+/// subject shared by all three engine diagnostics. It MUST enumerate every
+/// strategy the runner can pick: `chunk_column` (range), `chunk_by_key` (keyset),
+/// `cursor_column` (incremental), `time_column` (time_window). A `.or()` chain
+/// shorter than the strategy set is the diagnostic-bypass class — roast
+/// 2026-08-09 caught `time_column` missing across all three engines, so every
+/// `time_window` export probed the wrong/absent column and reported a false
+/// "no index". Cross-check the arms against `derive_strategy` above.
+pub(crate) fn preflight_range_col(export: &ExportConfig) -> Option<&str> {
+    export
+        .chunk_column
+        .as_deref()
+        .or(export.chunk_by_key.as_deref())
+        .or(export.cursor_column.as_deref())
+        .or(export.time_column.as_deref())
+}
+
+/// [`preflight_range_col`] plus the planner's AUTO-RESOLUTION: when a chunked export leaves
+/// both `chunk_column` and `chunk_by_key` unset, `build_plan` range-chunks on the single-integer
+/// PK (`introspection.single_int_pk`). A diagnostic that omits it probes the wrong/absent column
+/// and reports a false UNSAFE + "create an index on chunk_column" on an already-PK-indexed table
+/// (post-0.24.3 review MED, the sibling of the chunk_by_key false-alarm). `auto_pk` is the engine-
+/// introspected single-int PK, threaded from each engine's diagnose (where the connection lives).
+pub(crate) fn preflight_range_col_resolved<'a>(
+    export: &'a ExportConfig,
+    auto_pk: Option<&'a str>,
+) -> Option<&'a str> {
+    preflight_range_col(export).or(auto_resolved_chunk_pk(export, auto_pk))
+}
+
+/// The single-int PK a chunked export auto-resolves to — `Some(auto_pk)` ONLY when the planner
+/// would actually use it. Shared by the range-col resolution AND the strategy label so both tell
+/// the same truth.
+fn auto_resolved_chunk_pk<'a>(
+    export: &'a ExportConfig,
+    auto_pk: Option<&'a str>,
+) -> Option<&'a str> {
+    if should_auto_resolve_chunk_pk(export) {
+        auto_pk
+    } else {
+        None
+    }
+}
+
+/// Does `build_plan` auto-resolve this export's chunk column to the single-integer PK? True iff
+/// mode is Chunked with NEITHER an explicit `chunk_column` NOR `chunk_by_key`. The ONE predicate
+/// every diagnose site (pg/mysql/mssql) and the analysis resolution share, so a future change to
+/// the planner's auto-resolution trigger (build_plan) is mirrored in ONE place — four inlined
+/// copies would silently diverge and reintroduce the false-UNSAFE this fixes.
+pub(crate) fn should_auto_resolve_chunk_pk(export: &ExportConfig) -> bool {
+    export.mode == ExportMode::Chunked
+        && export.chunk_column.is_none()
+        && export.chunk_by_key.is_none()
+}
+
+/// Does this strategy read on an indexed key the catalog probe should confirm?
+/// Every seek/range/window/incremental strategy does; only a plain full scan
+/// does not. Enumerated from the mode + `chunk_by_key`, never a subset — the
+/// gate that guards the `preflight_range_col` probe (a strategy omitted here is
+/// silently degraded to the base-query plan hint / a hard `false`).
+pub(crate) fn strategy_probes_index(export: &ExportConfig) -> bool {
+    matches!(
+        export.mode,
+        ExportMode::Chunked | ExportMode::Incremental | ExportMode::TimeWindow
+    ) || export.chunk_by_key.is_some()
+}
+
+// ── The probe seam: one diagnostic skeleton, three engines' catalog SQL ──────
+//
+// ADR-0015 (source introspection is a data-shape seam, not a trait) applies
+// here verbatim: the PROBES share nothing extractable — `pg_index` vs
+// `information_schema.STATISTICS` vs `sys.indexes`, three client crates, three
+// dialects — so they stay per-engine free functions. What they share is the
+// WIRING: which column to probe, when to probe it, and how the answer becomes a
+// verdict. That policy was hand-copied into all three `diagnose_*` (down to the
+// verbatim auto-pk comment), which is the mechanism by which `chunk_by_key` was
+// missed three ways. The three targets below plus [`assemble_diagnostic`] hold
+// it ONCE, so the next strategy or check lands once.
+
+/// The base relation the catalog probes key on, for the PG/MySQL diagnostics:
+/// the configured `table:` when there is one, else the single relation parsed
+/// out of a simple `SELECT … FROM <table>`. `None` for anything that is not one
+/// base table (joins, subqueries, hand-written inline SQL) — the probes then
+/// degrade to an honest "unknown" rather than describing the wrong relation.
+/// MSSQL resolves its own base relation (`strip_select_star_from` first, then
+/// the same simple-FROM parser) because its probes key on the RENDERED query;
+/// it feeds the result into the same two targets below.
+pub(crate) fn preflight_base_table<'a>(
+    export: &'a ExportConfig,
+    base_query: &'a str,
+) -> Option<&'a str> {
+    export
+        .table
+        .as_deref()
+        .or_else(|| super::postgres::table_from_simple_query(base_query))
+}
+
+/// The table an engine runs its single-int-PK probe against — `Some` ONLY when
+/// the planner would actually auto-resolve this export's chunk column
+/// ([`should_auto_resolve_chunk_pk`]) and the base relation is known. The gate
+/// `build_plan` mirrors: without it `range_col` / the strategy label / the index
+/// probe target a different column than the run reads, and a PK-indexed table
+/// reports a false UNSAFE + `chunked(?, …)` (post-0.24.3 MED).
+pub(crate) fn auto_pk_probe_target<'a>(
+    export: &ExportConfig,
+    base_table: Option<&'a str>,
+) -> Option<&'a str> {
+    if should_auto_resolve_chunk_pk(export) {
+        base_table
+    } else {
+        None
+    }
+}
+
+/// The `(table, column)` an engine runs its leading-key index probe against —
+/// `Some` ONLY when the strategy reads on an indexed key
+/// ([`strategy_probes_index`]), the read column resolves
+/// ([`preflight_range_col_resolved`]) and the base relation is known. A `None`
+/// here means "no catalog answer", which [`assemble_diagnostic`] reads as "keep
+/// the engine's plan hint" — never as "no index".
+pub(crate) fn index_probe_target<'a>(
+    export: &'a ExportConfig,
+    auto_pk: Option<&'a str>,
+    base_table: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    if !strategy_probes_index(export) {
+        return None;
+    }
+    let col = preflight_range_col_resolved(export, auto_pk)?;
+    Some((base_table?, col))
+}
+
+/// #149: measured beats declared — and the report SAYS which it stands on.
+///
+/// After one successful run, `export_metrics.total_rows` is EXACT; the catalog
+/// (`TABLE_ROWS`/`reltuples`) lied 2.5× in the field on a versioned table. The
+/// rule: the freshest measured figure wins UNLESS it is stale (older than
+/// [`ACTUALS_STALE_DAYS`]) AND the catalog diverges >2× from it — then the
+/// catalog wins and the fallback is SAID. A report that silently mixes sources
+/// is the diagnostic-bypass class; the label is the load-bearing half.
+pub(crate) const ACTUALS_STALE_DAYS: i64 = 14;
+
+pub(crate) fn choose_row_estimate(
+    catalog: Option<i64>,
+    measured: Option<(i64, chrono::DateTime<chrono::Utc>)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<i64>, String) {
+    match (catalog, measured) {
+        (_, Some((rows, at))) => {
+            let stale = (now - at).num_days() > ACTUALS_STALE_DAYS;
+            let diverges = catalog.is_some_and(|c| {
+                let (lo, hi) = (rows.min(c), rows.max(c));
+                lo > 0 && hi / lo >= 2 || (lo == 0 && hi > 0)
+            });
+            if stale && diverges {
+                (
+                    catalog,
+                    format!(
+                        "catalog estimate — a measured figure from {} was set aside as stale \
+                         (>{}d old) and >2× divergent",
+                        at.format("%Y-%m-%d"),
+                        ACTUALS_STALE_DAYS
+                    ),
+                )
+            } else {
+                (Some(rows), format!("measured {}", at.format("%Y-%m-%d")))
+            }
+        }
+        (c, None) => (c, "catalog estimate".to_string()),
+    }
+}
+
+/// Overlay the state store's freshest successful actual onto a diagnostic —
+/// the one place `check`/`plan` swap catalog for measured, so the two surfaces
+/// cannot drift (#149). Best-effort: an unreadable store keeps the catalog.
+pub(crate) fn overlay_measured_rows(
+    diag: &mut super::ExportDiagnostic,
+    export: &ExportConfig,
+    state: &crate::state::StateStore,
+) {
+    // A measured `total_rows` is the TABLE SIZE only when the run read the whole
+    // table — `mode: full` or a range-`chunked` pass. For incremental / keyset
+    // (which may continue from a cursor) a run's `total_rows` is the per-run
+    // DELTA, so overlaying it would report a 300M table as "~0 (measured)" after
+    // a quiet night (roast 2026-08-09, #149 mode-blindness). Gate conservatively:
+    // measure only the unambiguous whole-table modes; everything else keeps the
+    // catalog with its honest label.
+    if !is_whole_table_mode(&diag.mode) {
+        diag.row_source = Some("catalog estimate".to_string());
+        return;
+    }
+    let measured = state
+        .get_metrics(Some(&diag.export_name), 25)
+        .ok()
+        .and_then(|ms| {
+            ms.into_iter()
+                .find(|m| m.status == "success")
+                .and_then(|m| {
+                    chrono::DateTime::parse_from_rfc3339(&m.run_at)
+                        .ok()
+                        .map(|t| (m.total_rows, t.with_timezone(&chrono::Utc)))
+                })
+        });
+    let before = diag.row_estimate;
+    let (est, label) = choose_row_estimate(diag.row_estimate, measured, chrono::Utc::now());
+    diag.row_estimate = est;
+    diag.row_source = Some(label);
+
+    // A2 (roast 2026-08-09): the engine diagnostics already computed verdict /
+    // profile / parallelism / suggestion from the CATALOG estimate, so before
+    // this the report printed a MEASURED number above decisions made for the
+    // catalog one (a 2.5× field lie ⇒ wrong profile/parallelism). When the
+    // overlay actually MOVED the estimate, recompute the row-estimate-scaled
+    // decisions from the truth. These depend only on fields the diagnostic
+    // already carries (uses_index, avg_row_bytes) + the export.
+    if est != before && est.is_some() {
+        diag.verdict = compute_verdict(
+            est,
+            diag.uses_index,
+            export.cursor_column.is_some(),
+            diag.avg_row_bytes,
+            export.parallel,
+        );
+        diag.recommended_profile = recommend_profile(est, diag.uses_index, export);
+        diag.recommended_parallel = recommend_parallelism(export, est, diag.uses_index);
+        // Only recompute the suggestion for engines that HAD one. diagnose_mongo
+        // deliberately emits `suggestion: None` (Mongo is full-only — the
+        // cursor/incremental advice build_suggestion produces is for a mode it
+        // cannot do), and it is the sole engine that never calls build_suggestion.
+        // Recomputing unconditionally re-introduced that SQL-only advice for Mongo
+        // (roast 2026-08-10). Keep None as None.
+        if diag.suggestion.is_some() {
+            diag.suggestion = build_suggestion(&diag.verdict, est, diag.uses_index, export);
+        }
+        // #202: the warnings are row-estimate-scaled too (parallel-memory-risk,
+        // sparse-range, oversized-chunk) — re-run collect_warnings from the
+        // MEASURED figure so they don't keep quoting the catalog while the
+        // verdict/row line is measured. Inputs the diagnostic carries for exactly
+        // this recompute.
+        diag.warnings = collect_warnings(
+            export,
+            est,
+            diag.avg_row_bytes,
+            diag.chunk_min.as_deref(),
+            diag.chunk_max.as_deref(),
+            diag.db_max_connections,
+        );
+    }
+}
+
+/// Does this diagnostic's mode read the WHOLE table every run (so a measured
+/// `total_rows` IS the table size)? `full` and range-`chunked (column: …)` do;
+/// `incremental` and `keyset` may continue from a cursor and record a delta.
+/// The mode string is [`diagnose_mode_str`]'s output.
+pub(crate) fn is_whole_table_mode(mode: &str) -> bool {
+    mode == "full" || mode.starts_with("chunked (column")
 }
 
 /// The operator-facing mode line shown in the `rivet check` diagnostic —
@@ -712,6 +983,128 @@ pub(crate) fn build_suggestion(
     }
 }
 
+/// What one engine's catalog/plan probes ANSWERED about an export — the data
+/// shape the three SQL diagnostics hand to [`assemble_diagnostic`].
+///
+/// Every field is an observation, never a decision: the engine says what it
+/// found (or `None` where the probe was skipped / failed / has no analogue on
+/// that engine), and the policy above turns the set into a verdict. Fill it with
+/// the shared targets — [`auto_pk_probe_target`] for `auto_pk`,
+/// [`index_probe_target`] for `catalog_index` — so a probe never runs on a
+/// column the run does not read.
+pub(crate) struct ProbeFacts {
+    /// The single-integer PK the planner would auto-resolve an unset chunked
+    /// `chunk_column` to (`build_plan`). `None` when the export does not
+    /// auto-resolve, the base relation is unknown, or the PK is composite /
+    /// non-integer / absent — exactly when the planner would not use one either.
+    pub auto_pk: Option<String>,
+    /// Scan-free row estimate (PG EXPLAIN `rows=`, MySQL EXPLAIN `rows`, MSSQL
+    /// `dm_db_partition_stats`). `None` = unknown, which the checks read as
+    /// "unknown", never as zero.
+    pub row_estimate: Option<i64>,
+    /// Average bytes per row, where the engine has a figure worth trusting.
+    /// `None` on MySQL by choice (`AVG_ROW_LENGTH` rides the same InnoDB random
+    /// dives as `TABLE_ROWS`), which skips the oversized-chunk check.
+    pub avg_row_bytes: Option<i64>,
+    /// MIN/MAX of the incremental key expression or the range column, as text.
+    pub range_min: Option<String>,
+    pub range_max: Option<String>,
+    /// Human-readable access-path description from the query plan (`Seq Scan`,
+    /// `range using PRIMARY`). `None` where the engine exposes no parseable plan
+    /// over the diagnostic's seam (MSSQL) — the printer then omits the line
+    /// rather than fabricating one.
+    pub scan_type: Option<String>,
+    /// Did the plan for the BASE query use an index? A weak hint: the base query
+    /// has no WHERE, so PG/MySQL legitimately pick a seq scan on a perfectly
+    /// indexed chunk column. `false` where there is no plan to read (MSSQL).
+    pub plan_uses_index: bool,
+    /// Is the read column the leading key of an index on the base table, per the
+    /// CATALOG? `Some(true)`/`Some(false)` from a clean probe, `None` when the
+    /// probe was not run ([`index_probe_target`] said no) or failed.
+    pub catalog_index: Option<bool>,
+    /// The server's configured connection cap, for the parallelism check.
+    pub db_max_connections: Option<u32>,
+}
+
+/// Turn one engine's [`ProbeFacts`] into the export's [`ExportDiagnostic`] —
+/// the policy half of every `diagnose_*`, written once.
+///
+/// Owns the decisions the three engines used to each hand-copy: the
+/// catalog-overrides-the-plan-hint rule, the auto-resolved strategy label, and
+/// the verdict / profile / parallelism / warnings / suggestion assembly. The
+/// engines keep only their dialect-specific SQL, so a new check (or a new
+/// strategy) is wired HERE and every engine gets it — the diagnostic-bypass fix
+/// stated once instead of three times.
+pub(crate) fn assemble_diagnostic(
+    export: &ExportConfig,
+    facts: ProbeFacts,
+) -> super::ExportDiagnostic {
+    let ProbeFacts {
+        auto_pk,
+        row_estimate,
+        avg_row_bytes,
+        range_min,
+        range_max,
+        scan_type,
+        plan_uses_index,
+        catalog_index,
+        db_max_connections,
+    } = facts;
+
+    // The plan hint describes the BASE query (no WHERE), where a seq scan is
+    // often the right plan even on a perfectly indexed chunk column. The run
+    // does not issue that query — it issues `WHERE range_col >= $lo AND < $hi`
+    // (or `> $last`), which uses the btree. So a catalog YES outranks the plan
+    // hint; a catalog NO or an unavailable/skipped probe leaves the hint
+    // standing, since the catalog answer is about the range column only.
+    let uses_index = match catalog_index {
+        Some(true) => true,
+        Some(false) | None => plan_uses_index,
+    };
+
+    let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        avg_row_bytes,
+        export.parallel,
+    );
+    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
+    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
+    let warnings = collect_warnings(
+        export,
+        row_estimate,
+        avg_row_bytes,
+        range_min.as_deref(),
+        range_max.as_deref(),
+        db_max_connections,
+    );
+    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
+
+    super::ExportDiagnostic {
+        row_source: None,
+        export_name: export.name.clone(),
+        strategy,
+        mode: diagnose_mode_str(export),
+        cursor_column: export.cursor_column.clone(),
+        row_estimate,
+        avg_row_bytes,
+        cursor_min: range_min.clone(),
+        cursor_max: range_max.clone(),
+        scan_type,
+        uses_index,
+        verdict,
+        recommended_profile,
+        recommended_parallel,
+        warnings,
+        suggestion,
+        chunk_min: range_min,
+        chunk_max: range_max,
+        db_max_connections,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +1115,41 @@ mod tests {
             "name: test\nformat: parquet\ndestination:\n  type: local\n  path: /tmp\n{extra_yaml}"
         );
         serde_yaml_ng::from_str(&yaml).expect("parse ExportConfig")
+    }
+
+    // ── auto-resolved chunk PK: preflight must model the planner's fallback ───
+    #[test]
+    fn resolved_range_col_and_strategy_model_the_auto_chunk_pk() {
+        // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK; the
+        // preflight resolution + strategy label must model that SAME choice, else a perfectly
+        // PK-indexed chunked export gets a `?` label + false UNSAFE + "create an index on
+        // chunk_column" (post-0.24.3 review MED). RED against the pre-fix helpers that ignored it.
+        let e = cfg("mode: chunked\ntable: orders\n"); // no chunk_column / chunk_by_key
+        // Offline (engine gave no PK) there is nothing to resolve to — same as before.
+        assert_eq!(preflight_range_col(&e), None);
+        assert_eq!(
+            derive_strategy(&e),
+            format!("chunked(?, size={})", e.chunk_size)
+        );
+        // WITH the engine-introspected single-int PK threaded in, both resolve to it:
+        assert_eq!(preflight_range_col_resolved(&e, Some("id")), Some("id"));
+        assert_eq!(
+            derive_strategy_resolved(&e, Some("id")),
+            format!("chunked(id, size={})", e.chunk_size)
+        );
+        // An EXPLICIT chunk_column is never overridden by the auto_pk hint.
+        let e2 = cfg("mode: chunked\ntable: orders\nchunk_column: created_at\n");
+        assert_eq!(
+            preflight_range_col_resolved(&e2, Some("id")),
+            Some("created_at")
+        );
+        // The auto-resolve fires ONLY for chunked-with-no-explicit-key: an incremental export
+        // must NOT absorb the PK hint (its cursor_column is the real read key).
+        let e3 = cfg("mode: incremental\ncursor_column: updated_at\n");
+        assert_eq!(
+            preflight_range_col_resolved(&e3, Some("id")),
+            Some("updated_at")
+        );
     }
 
     // ── derive_strategy ─────────────────────────────────────────────────────
@@ -753,6 +1181,457 @@ mod tests {
     fn derive_strategy_date_chunked() {
         let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
         assert_eq!(derive_strategy(&e), "date-chunked(created_at, 7d)");
+    }
+
+    // ── #149: measured beats declared, and the label is load-bearing ─────────
+
+    #[test]
+    fn choose_row_estimate_rule_both_directions() {
+        use chrono::{Duration, Utc};
+        let now = Utc::now();
+        let fresh = Some((835_000_000i64, now - Duration::days(2)));
+        let stale = Some((835_000_000i64, now - Duration::days(30)));
+        // fresh actual beats the catalog, label says measured
+        let (est, src) = choose_row_estimate(Some(332_000_000), fresh, now);
+        assert_eq!(est, Some(835_000_000));
+        assert!(src.starts_with("measured "), "{src}");
+        // stale + >2x divergent falls back — and the fallback is SAID
+        let (est, src) = choose_row_estimate(Some(332_000_000), stale, now);
+        assert_eq!(est, Some(332_000_000));
+        assert!(src.contains("set aside as stale"), "{src}");
+        // stale but NOT divergent: the actual still wins (age alone is fine)
+        let (est, src) = choose_row_estimate(Some(800_000_000), stale, now);
+        assert_eq!(est, Some(835_000_000));
+        assert!(src.starts_with("measured "), "{src}");
+        // no actual: catalog, labelled as such
+        let (est, src) = choose_row_estimate(Some(100), None, now);
+        assert_eq!(est, Some(100));
+        assert_eq!(src, "catalog estimate");
+    }
+
+    /// The overlay through a REAL state store (RED against a catalog-only
+    /// path): a recorded success replaces the diagnostic's catalog figure and
+    /// the label names the source — the field 2.5x lie, ended.
+    #[test]
+    fn overlay_swaps_catalog_for_the_recorded_actual_and_says_so() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "versioned_giant".into(),
+                run_id: "r1".into(),
+                total_rows: 835_700_000,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "versioned_giant".into(),
+            strategy: "chunked(id, size=100000)".into(),
+            mode: "chunked (column: id, size: 100000)".into(),
+            cursor_column: None,
+            row_estimate: Some(331_966_196),
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: true,
+            verdict: super::super::HealthVerdict::Efficient,
+            warnings: Vec::new(),
+            recommended_profile: "balanced",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
+        };
+        let export = cfg("table: t\nmode: chunked\nchunk_column: id\nchunk_size: 100000\n");
+        // Seed a profile as if computed from the CATALOG (small) estimate.
+        diag.recommended_profile = "fast";
+        overlay_measured_rows(&mut diag, &export, &state);
+        assert_eq!(diag.row_estimate, Some(835_700_000), "measured must win");
+        // A2: the profile must be RECOMPUTED from the measured 835M (a huge table
+        // is not "fast") — before the fix it kept the catalog-derived value.
+        assert_ne!(
+            diag.recommended_profile, "fast",
+            "verdict/profile must be recomputed from the measured estimate, not the catalog one"
+        );
+        assert!(
+            diag.row_source
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("measured "),
+            "the report must SAY it stands on the measurement: {:?}",
+            diag.row_source
+        );
+    }
+
+    /// #202 (roast 2026-08-10): the overlay recomputes verdict/profile but left
+    /// diag.warnings on the CATALOG estimate — so a measured figure that crosses
+    /// a warning threshold (parallel-memory-risk at >5M rows) never surfaced. The
+    /// warnings must be re-run from the measured figure. RED against not
+    /// recomputing warnings.
+    #[test]
+    fn overlay_recomputes_row_scaled_warnings_from_the_measure() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "big_chunked".into(),
+                run_id: "r1".into(),
+                total_rows: 10_000_000, // > 5M → parallel-memory-risk fires
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let export =
+            cfg("table: t\nmode: chunked\nchunk_column: id\nchunk_size: 100000\nparallel: 4\n");
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "big_chunked".into(),
+            strategy: "chunked(id, size=100000)".into(),
+            mode: "chunked (column: id, size: 100000)".into(),
+            cursor_column: None,
+            row_estimate: Some(1000), // catalog: small → no memory-risk warning
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: true,
+            verdict: super::super::HealthVerdict::Efficient,
+            warnings: Vec::new(), // as collect_warnings(1000, parallel=4) produced
+            recommended_profile: "fast",
+            recommended_parallel: (4, "test"),
+            suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
+        };
+        overlay_measured_rows(&mut diag, &export, &state);
+        assert_eq!(diag.row_estimate, Some(10_000_000));
+        assert!(
+            diag.warnings
+                .iter()
+                .any(|w| w.message.contains("Parallel=4")),
+            "the parallel-memory-risk warning must be recomputed from the measured 10M rows: {:?}",
+            diag.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// #1 (roast 2026-08-10): Mongo emits suggestion: None (full-only — the
+    /// cursor/incremental advice does not apply). The overlay recompute must NOT
+    /// re-introduce it. RED against the unconditional build_suggestion recompute.
+    #[test]
+    fn overlay_keeps_a_none_suggestion_none_for_mongo() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "mongo_coll".into(),
+                run_id: "r1".into(),
+                total_rows: 12_000_000,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "mongo_coll".into(),
+            strategy: "full".into(),
+            mode: "full".into(),
+            cursor_column: None,
+            row_estimate: Some(5_000_000),
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: false,
+            verdict: super::super::HealthVerdict::Degraded,
+            warnings: Vec::new(),
+            recommended_profile: "safe",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
+        };
+        let export = cfg("table: coll\nmode: full\n");
+        overlay_measured_rows(&mut diag, &export, &state);
+        assert_eq!(
+            diag.row_estimate,
+            Some(12_000_000),
+            "measured overlay applied"
+        );
+        assert_eq!(
+            diag.suggestion, None,
+            "a None suggestion (Mongo) must stay None through the recompute"
+        );
+    }
+
+    /// #149 mode-blindness (roast 2026-08-09): an INCREMENTAL run's total_rows is
+    /// the per-run DELTA, not the table — overlaying it reports a 300M table as
+    /// "~0 (measured)" after a quiet night. The overlay must keep the catalog for
+    /// non-whole-table modes. RED against the un-gated overlay.
+    #[test]
+    fn overlay_does_not_measure_an_incremental_delta_as_the_table() {
+        assert!(is_whole_table_mode("full"));
+        assert!(is_whole_table_mode("chunked (column: id, size: 100000)"));
+        assert!(!is_whole_table_mode("incremental (cursor: updated_at)"));
+        assert!(!is_whole_table_mode("keyset (key: id, size: 50000)"));
+
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        // A quiet incremental night: a successful run that captured ZERO rows.
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "big_incremental".into(),
+                run_id: "r1".into(),
+                total_rows: 0,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "big_incremental".into(),
+            strategy: "incremental".into(),
+            mode: "incremental (cursor: updated_at)".into(),
+            cursor_column: Some("updated_at".into()),
+            row_estimate: Some(300_000_000),
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: true,
+            verdict: super::super::HealthVerdict::Efficient,
+            warnings: Vec::new(),
+            recommended_profile: "balanced",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
+        };
+        let export = cfg("table: t\nmode: incremental\ncursor_column: updated_at\n");
+        overlay_measured_rows(&mut diag, &export, &state);
+        assert_eq!(
+            diag.row_estimate,
+            Some(300_000_000),
+            "an incremental delta must NOT overwrite the table estimate"
+        );
+        assert_eq!(diag.row_source.as_deref(), Some("catalog estimate"));
+    }
+
+    // ── preflight_range_col / strategy_probes_index cover EVERY strategy ──────
+    // Diagnostic-bypass class (roast 2026-08-09): a strategy the runner reads on
+    // but the index-probe subject omits → a false "no index". Both engine
+    // diagnostics now route through these shared seams, so one offline test
+    // guards all three (and any future engine). RED against dropping the
+    // time_column arm / the TimeWindow match.
+
+    #[test]
+    fn preflight_range_col_resolves_every_read_strategy() {
+        assert_eq!(
+            preflight_range_col(&cfg("mode: chunked\nchunk_column: id\n")),
+            Some("id"),
+            "range chunk reads on chunk_column"
+        );
+        assert_eq!(
+            preflight_range_col(&cfg("mode: chunked\nchunk_by_key: uuid\n")),
+            Some("uuid"),
+            "keyset reads on chunk_by_key"
+        );
+        assert_eq!(
+            preflight_range_col(&cfg("mode: incremental\ncursor_column: updated_at\n")),
+            Some("updated_at"),
+            "incremental reads on cursor_column"
+        );
+        assert_eq!(
+            preflight_range_col(&cfg("mode: time_window\ntime_column: ts\ndays_window: 7\n")),
+            Some("ts"),
+            "time_window reads on time_column — the arm the roast found missing"
+        );
+    }
+
+    #[test]
+    fn strategy_probes_index_gates_every_read_strategy_but_full() {
+        assert!(
+            strategy_probes_index(&cfg("mode: time_window\ntime_column: ts\ndays_window: 7\n")),
+            "time_window issues WHERE ts >= window_start on a btree — must probe the index"
+        );
+        assert!(strategy_probes_index(&cfg(
+            "mode: chunked\nchunk_by_key: id\n"
+        )));
+        assert!(strategy_probes_index(&cfg(
+            "mode: chunked\nchunk_column: id\n"
+        )));
+        assert!(strategy_probes_index(&cfg(
+            "mode: incremental\ncursor_column: c\n"
+        )));
+        assert!(
+            !strategy_probes_index(&cfg("mode: full\n")),
+            "a plain full scan reads no indexed key — must NOT probe"
+        );
+    }
+
+    // ── the shared skeleton: probe targets + assemble_diagnostic ─────────────
+    // The wiring the three engines used to hand-copy. Fabricating ProbeFacts is
+    // legitimate here because the POLICY is the subject; per-engine probe
+    // correctness (does this catalog SQL answer truthfully?) stays with the live
+    // suites, where a real catalog is the oracle.
+
+    fn facts() -> ProbeFacts {
+        ProbeFacts {
+            auto_pk: None,
+            row_estimate: Some(1_000),
+            avg_row_bytes: None,
+            range_min: None,
+            range_max: None,
+            scan_type: None,
+            plan_uses_index: false,
+            catalog_index: None,
+            db_max_connections: None,
+        }
+    }
+
+    #[test]
+    fn index_probe_target_names_the_column_every_read_strategy_reads_on() {
+        let t = Some("orders");
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\nchunk_column: id\n"), None, t),
+            Some(("orders", "id"))
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\nchunk_by_key: uuid\n"), None, t),
+            Some(("orders", "uuid")),
+            "keyset probes its seek key, not the absent chunk_column"
+        );
+        assert_eq!(
+            index_probe_target(
+                &cfg("mode: time_window\ntime_column: ts\ndays_window: 7\n"),
+                None,
+                t
+            ),
+            Some(("orders", "ts"))
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\n"), Some("id"), t),
+            Some(("orders", "id")),
+            "an auto-resolved chunk PK is the column the run ranges on — probe THAT"
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: full\n"), None, t),
+            None,
+            "a plain full scan reads no indexed key — no probe to run"
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\nchunk_column: id\n"), None, None),
+            None,
+            "an unresolvable base relation must not be guessed at"
+        );
+    }
+
+    #[test]
+    fn auto_pk_probe_target_fires_only_where_the_planner_auto_resolves() {
+        assert_eq!(
+            auto_pk_probe_target(&cfg("mode: chunked\n"), Some("orders")),
+            Some("orders")
+        );
+        assert_eq!(
+            auto_pk_probe_target(&cfg("mode: chunked\nchunk_column: id\n"), Some("orders")),
+            None,
+            "an explicit chunk_column is what the planner ranges on — no PK probe"
+        );
+        assert_eq!(
+            auto_pk_probe_target(&cfg("mode: full\n"), Some("orders")),
+            None
+        );
+        assert_eq!(auto_pk_probe_target(&cfg("mode: chunked\n"), None), None);
+    }
+
+    #[test]
+    fn assemble_diagnostic_lets_a_catalog_yes_outrank_the_base_plan_hint() {
+        let e = cfg("mode: chunked\nchunk_column: id\n");
+        // The false-DEGRADED case the override exists for: EXPLAIN of the
+        // no-WHERE base query says Seq Scan, the catalog says the chunk column
+        // leads a btree, and the run issues the BETWEEN that uses it.
+        let d = assemble_diagnostic(
+            &e,
+            ProbeFacts {
+                plan_uses_index: false,
+                catalog_index: Some(true),
+                ..facts()
+            },
+        );
+        assert!(d.uses_index, "a catalog YES must beat the base-query plan");
+
+        // A clean catalog NO is about the range column only, so the plan hint
+        // (which described the whole query) still stands.
+        let d = assemble_diagnostic(
+            &e,
+            ProbeFacts {
+                plan_uses_index: true,
+                catalog_index: Some(false),
+                ..facts()
+            },
+        );
+        assert!(d.uses_index);
+
+        // No catalog answer (probe skipped or failed) => the plan hint, verbatim.
+        for hint in [true, false] {
+            let d = assemble_diagnostic(
+                &e,
+                ProbeFacts {
+                    plan_uses_index: hint,
+                    catalog_index: None,
+                    ..facts()
+                },
+            );
+            assert_eq!(d.uses_index, hint, "no catalog answer keeps the plan hint");
+        }
+    }
+
+    #[test]
+    fn assemble_diagnostic_labels_the_auto_resolved_pk_not_a_question_mark() {
+        let d = assemble_diagnostic(
+            &cfg("mode: chunked\nchunk_size: 50000\n"),
+            ProbeFacts {
+                auto_pk: Some("id".to_string()),
+                ..facts()
+            },
+        );
+        assert_eq!(d.strategy, "chunked(id, size=50000)");
+        assert!(
+            !d.strategy.contains('?'),
+            "the `?` placeholder is the diagnostic-bypass tell"
+        );
+    }
+
+    /// The skeleton is only de-triplicated while every engine ROUTES through it.
+    /// A second `ExportDiagnostic { … }` literal in an engine file is the old
+    /// wiring growing back — and with it the next check that lands in one engine
+    /// and silently skips the other two (the diagnostic-bypass class). Mongo is
+    /// deliberately NOT in this list: it runs no catalog probe and no policy
+    /// (full-scan only, mode-advice suppressed), so it keeps its own literal.
+    #[test]
+    fn every_sql_engine_diagnostic_routes_through_the_assembler() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/preflight");
+        for engine in ["postgres.rs", "mysql.rs", "mssql.rs"] {
+            let src = std::fs::read_to_string(dir.join(engine)).expect("read engine diagnostic");
+            // Comment-stripped, so a mention in prose cannot satisfy the gate.
+            let code = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                code.contains("assemble_diagnostic("),
+                "{engine} must build its diagnostic through the shared assembler"
+            );
+            assert!(
+                !code.contains("ExportDiagnostic {"),
+                "{engine} constructs an ExportDiagnostic itself — the assembly \
+                 policy (index override, strategy label, warnings) is shared and \
+                 must not be re-stated per engine"
+            );
+        }
     }
 
     // ── keyset (chunk_by_key) must be labelled keyset, never `chunked(?, …)` ──

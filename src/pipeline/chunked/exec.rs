@@ -15,7 +15,6 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::tuning::Governor;
 use crate::{destination, format, resource};
 
 pub(crate) fn run_chunked_sequential(
@@ -52,9 +51,14 @@ pub(crate) fn run_chunked_sequential(
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // Form B: XOR-combine each chunk's per-column checksums run-wide, harvest once
     // after the loop — so the finalize manifest records Form B for chunked exports.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
+
+    // Run the cross-shape manifest guard ONCE, at run start — the answer cannot
+    // change mid-run, and re-running it per chunk cost one remote GET per chunk
+    // (a 3000-chunk GCS export paid 3000 serialized GETs). The per-chunk writer
+    // below now opens UNGUARDED, safe because this probe already guarded the
+    // prefix (roast 2026-08-09; the sequential-CHECKPOINT sibling already did
+    // this — run_chunked_sequential was the last per-chunk-guarded runner).
+    let _ = crate::pipeline::frame::RunnerFrame::open(plan)?;
 
     for (i, (start, end)) in chunks.iter().enumerate() {
         if !resource::check_memory(plan.tuning.memory_threshold_mb) {
@@ -119,11 +123,13 @@ pub(crate) fn run_chunked_sequential(
         );
 
         if sink.total_rows > 0 {
-            let fmt =
-                format::create_format(plan.format, plan.compression, plan.compression_level, None);
-            let base = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
-            let dest = destination::create_destination(&plan.destination)?;
-            crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+            // Guarded once at run start (above); per-chunk writers open UNGUARDED
+            // so a large chunked export pays ONE manifest GET, not one per chunk
+            // (roast 2026-08-09). Satisfies the unguarded_callers_also_guard lint
+            // because this file now opens a guarded frame at run start.
+            let frame = crate::pipeline::frame::RunnerFrame::open_unguarded(plan)?;
+            let base = super::chunk_part_filename(&plan.export_name, i, &frame.ext);
+            let dest = frame.dest;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
             // write_sink_parts drains every part the sink produced — the
             // final temp file plus anything maybe_split rotated at
@@ -147,6 +153,9 @@ pub(crate) fn run_chunked_sequential(
                     super::super::commit::PartKind::Chunk {
                         chunk_index: i as i64,
                     },
+                    // ADR-0029: the chunk is this runner's commit unit — the
+                    // feed below is the same loop iteration over the same sink.
+                    super::super::commit::UnitId::Chunk(i as i64),
                 );
             }
         } else {
@@ -159,18 +168,19 @@ pub(crate) fn run_chunked_sequential(
                 file_name: None,
             });
         }
-        // Fold this chunk's Form B checksums into the run-wide accumulator (empty
-        // for a zero-row chunk — a no-op).
-        super::super::commit::accumulate_column_checksums(
-            &mut checksums_acc,
-            &sink.column_checksums,
+        // ADR-0028: feed this chunk's Form-B checksums into the run ledger (empty
+        // for a zero-row chunk — a no-op); the seam harvests once, at the
+        // dispatcher. Deliberately NOT the full sink drain: chunked runs its
+        // drift gate PRE-chunk from type_mappings (ADR-0021), so feeding the
+        // sink schema here would make the seam re-check post-run and overwrite
+        // the pre-chunk verdict.
+        summary.ledger.contribute_checksums(
+            super::super::commit::UnitId::Chunk(i as i64),
+            &std::mem::take(&mut sink.column_checksums),
+            sink.checksum_key_col.and(sink.cursor_column.clone()),
         );
-        if checksum_key_column.is_none() {
-            checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
-        }
     }
 
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
     pb.finish(summary.total_rows);
     log::info!("export '{}': all chunks completed", plan.export_name);
     Ok(())
@@ -216,8 +226,10 @@ pub(crate) fn run_chunked_parallel(
     );
 
     let completed = AtomicUsize::new(0);
-    // Every worker bumps this exactly once — on success OR failure — so the
-    // governor thread can tell when the run is *done* regardless of outcome.
+    // Every worker bumps this exactly once — on success, failure, OR an
+    // unwinding panic (it is bumped by the `WorkerExit` RAII guard, not a tail
+    // statement) — so the governor thread can tell when the run is *done*
+    // regardless of outcome.
     // `completed` counts only successes (progress bar / summary); using it for
     // the governor's exit condition deadlocks the `thread::scope` whenever a
     // chunk fails (the governor would loop forever waiting for a success count
@@ -240,7 +252,7 @@ pub(crate) fn run_chunked_parallel(
     // a parallel chunked manifest records Form B like single mode.
     #[allow(clippy::type_complexity)]
     let checksums_shared: std::sync::Mutex<
-        Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>,
+        Vec<(i64, std::collections::BTreeMap<String, u64>, Option<String>)>,
     > = std::sync::Mutex::new(Vec::new());
     // Schema fingerprint captured by whichever worker resolves the dest
     // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
@@ -255,55 +267,14 @@ pub(crate) fn run_chunked_parallel(
     let pb = ChunkProgress::new(&plan.export_name, total_chunks);
     let pb_handle = pb.handle();
 
-    // OPT-2 adaptive concurrency governor. Armed only when the user opted into
-    // adaptation (`tuning.adaptive`) and there is real parallelism to govern
-    // (`parallel > 1`). Floor defaults to 1; ceiling is the configured
-    // `parallel`. A failed monitoring connection degrades gracefully to static
-    // parallelism rather than failing the export.
-    // `parallel` can be 0 when there are no chunks; `.max(1)` keeps `clamp`'s
-    // bounds valid (the governor is off in that case anyway).
-    let governor_floor = plan
-        .tuning
-        .min_parallel
-        .unwrap_or(1)
-        .clamp(1, parallel.max(1));
-    let governor_on = plan.tuning.adaptive && parallel > 1;
-    let governor_monitor: Option<Box<dyn Source>> = if governor_on {
-        match source::create_source(&plan.source) {
-            Ok(s) => {
-                log::info!(
-                    "export '{}': adaptive concurrency governor active (parallel {}..{})",
-                    plan.export_name,
-                    governor_floor,
-                    parallel
-                );
-                Some(s)
-            }
-            Err(e) => {
-                log::warn!(
-                    "export '{}': governor monitoring connection failed; parallelism stays static at {}: {:#}",
-                    plan.export_name,
-                    parallel,
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Governor decisions buffered here (the journal is not thread-shared) and
-    // drained into `summary.journal` after the scope joins.
-    let governor_log: std::sync::Mutex<Vec<(usize, usize, String)>> =
-        std::sync::Mutex::new(Vec::new());
+    // OPT-2 adaptive concurrency governor — armed, spawned, and drained through the shared
+    // GovernorHarness (identical wiring in the keyset runner; #152).
+    let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
 
     // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
     // (`dispatch task is gone: runtime dropped` from the HTTP client).
-    let shared_destination =
-        std::sync::Arc::new(destination::create_destination(&plan.destination)?);
-    // Finding #44 early check (see single.rs) — chunked writes share the fate.
-    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
+    let (shared_destination, _frame_ext) = crate::pipeline::frame::RunnerFrame::open_shared(plan)?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,
@@ -312,54 +283,10 @@ pub(crate) fn run_chunked_parallel(
     );
 
     std::thread::scope(|s| {
-        // Governor thread: samples source pressure on its own monitoring
-        // connection and resizes the semaphore within [floor, parallel]. It
-        // self-terminates once every chunk worker has finished (success OR
-        // failure) — keyed on `finished`, not `completed`, so a failing chunk
-        // can't strand it and deadlock the scope. Holds parallelism flat
-        // whenever the engine can't sample (`sample_pressure` → None).
-        if let Some(mut monitor) = governor_monitor {
-            let semaphore = &semaphore;
-            let finished = &finished;
-            let governor_log = &governor_log;
-            let total = total_chunks;
-            let ceiling = parallel;
-            let floor = governor_floor;
-            let export_name = plan.export_name.as_str();
-            s.spawn(move || {
-                // The decision loop lives in [`tuning::Governor`]; the
-                // callback below is the only runner-specific binding
-                // (resize the kernel-park semaphore, log the transition,
-                // append it to the off-thread decision log so the parent
-                // can drain it into the run journal post-scope).
-                //
-                // `RIVET_GOVERNOR_INTERVAL_MS` is read inside
-                // [`Governor::new`]; the poll interval is clamped to the
-                // sample interval so a tiny override (deterministic live
-                // tests) actually polls that fast.
-                let mut gov = Governor::new(ceiling, floor, ceiling);
-                gov.run(
-                    &mut monitor,
-                    || finished.load(Ordering::Relaxed) >= total,
-                    |from, to| {
-                        semaphore.resize(to);
-                        let reason = if to < from {
-                            "source pressure rising: backed off"
-                        } else {
-                            "source pressure eased: recovered"
-                        };
-                        log::info!(
-                            "export '{}': governor parallelism {} → {} ({})",
-                            export_name,
-                            from,
-                            to,
-                            reason
-                        );
-                        poison::lock_recover(governor_log).push((from, to, reason.to_string()));
-                    },
-                );
-            });
-        }
+        // Governor thread (shared seam): samples source pressure on its own monitoring connection
+        // and resizes the semaphore within [floor, ceiling], self-terminating once every chunk
+        // worker has FINISHED (success OR failure) so a failing chunk can't strand it.
+        governor.spawn_into(s, &semaphore, &finished, total_chunks, &plan.export_name);
 
         for (i, (start, end)) in chunks.iter().enumerate() {
             // Block (kernel-park) until a worker slot frees up.
@@ -393,7 +320,26 @@ pub(crate) fn run_chunked_parallel(
             let shared_destination = std::sync::Arc::clone(&shared_destination);
 
             s.spawn(move || {
+                // Return the permit and mark this worker FINISHED on every exit path —
+                // including an unwinding panic, which the tail statements this replaced
+                // skipped: the governor thread's only exit is `finished >= total`, so a
+                // panicking worker left it looping forever and `thread::scope` could never
+                // join (the process hung instead of reporting the failure), while the
+                // un-released permit stalled the spawner loop at `parallel = 1` even with
+                // the governor disarmed. Same shape as the keyset runner's `FinishGuard`.
+                let _exit = crate::pipeline::governor::WorkerExit::new(semaphore, finished);
                 let result = (|| -> Result<()> {
+                    // Test-only, mirroring both checkpoint runners
+                    // (sequential_checkpoint.rs / parallel_checkpoint.rs): make ONE
+                    // chunk fail without killing the process, so the collected-worker-
+                    // error guard AFTER the scope join can be exercised. A panic hook
+                    // cannot reach that guard — it only runs once every worker has
+                    // joined, which a crashed process never does. Same point name and
+                    // 0-based chunk index as the checkpoint runners
+                    // (`RIVET_TEST_ERROR_AT=chunk_export:1`).
+                    crate::test_hook::maybe_error_at_index("chunk_export", i as i64)
+                        .map_err(|msg| anyhow::anyhow!(msg))?;
+
                     let chunk_query = build_chunk_query_sql(
                         base_query,
                         col,
@@ -464,8 +410,13 @@ pub(crate) fn run_chunked_parallel(
                         drop(records);
                         // Form B: hand this chunk's checksums to the parent to XOR-combine.
                         let key = sink.checksum_key_col.and(sink.cursor_column.clone());
-                        poison::lock_recover(checksums_shared)
-                            .push((std::mem::take(&mut sink.column_checksums), key));
+                        // ADR-0029: tagged with the chunk — the same unit the
+                        // parent's `record_part` drain records these parts under.
+                        poison::lock_recover(checksums_shared).push((
+                            i as i64,
+                            std::mem::take(&mut sink.column_checksums),
+                            key,
+                        ));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -483,16 +434,11 @@ pub(crate) fn run_chunked_parallel(
                     Ok(())
                 })();
 
-                semaphore.release();
-
                 if let Err(e) = result {
                     log::error!("export '{}': chunk {} failed: {:#}", export_name, i, e);
                     poison::lock_recover(errors).push(format!("chunk {}: {:#}", i, e));
                 }
-
-                // Mark this worker done (success OR failure) so the governor
-                // thread can terminate — must run on every exit path.
-                finished.fetch_add(1, Ordering::Relaxed);
+                // `_exit` drops here: permit released, `finished` bumped.
             });
         }
     });
@@ -502,12 +448,9 @@ pub(crate) fn run_chunked_parallel(
     super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
     pb.finish(summary.total_rows);
 
-    // Drain governor decisions (recorded off-thread) into the run journal.
-    for (from, to, reason) in poison::into_recover(governor_log) {
-        summary
-            .journal
-            .record(RunEvent::ParallelismAdjusted { from, to, reason });
-    }
+    // Drain governor decisions (recorded off-thread) into the run journal — BEFORE any error
+    // check, so a failed run still journals its ParallelismAdjusted events.
+    governor.drain_into(summary);
     if plan.validate {
         summary.validated = Some(true);
     }
@@ -528,6 +471,7 @@ pub(crate) fn run_chunked_parallel(
             Some(state),
             &rec,
             super::super::commit::PartKind::Chunk { chunk_index },
+            super::super::commit::UnitId::Chunk(chunk_index),
         );
     }
 
@@ -541,18 +485,17 @@ pub(crate) fn run_chunked_parallel(
         );
     }
 
-    // Form B: XOR-combine every worker's chunk checksums run-wide + harvest once
-    // (order-independent, so worker completion order does not matter).
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
-    for (part, key) in poison::into_recover(checksums_shared) {
-        super::super::commit::accumulate_column_checksums(&mut checksums_acc, &part);
-        if checksum_key_column.is_none() {
-            checksum_key_column = key;
-        }
+    // ADR-0028/0029: feed every worker's chunk checksums into the run ledger
+    // (order-independent merge) under the SAME chunk unit the drain above
+    // recorded that chunk's parts with; the seam harvests once, at the
+    // dispatcher, and computes the coverage itself.
+    for (chunk_index, part, key) in poison::into_recover(checksums_shared) {
+        summary.ledger.contribute_checksums(
+            super::super::commit::UnitId::Chunk(chunk_index),
+            &part,
+            key,
+        );
     }
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     log::info!(
         "export '{}': all {} chunks completed",
@@ -602,9 +545,12 @@ mod tests {
 
     fn chunked_plan_struct() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),
                 chunk_size: 100,

@@ -74,6 +74,11 @@ pub(crate) struct DiscoveryArtifact {
     pub source_type: String,
     /// Human-readable scope (e.g. `"PostgreSQL schema \"public\" (5 objects)"`).
     pub scope: String,
+    /// TLS posture the discovery connection used (`--tls`, #146) — recorded so
+    /// the artifact says HOW it looked at the database, not just what it saw.
+    /// `None` = no flag (loopback or URL-parameter-driven).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_mode: Option<String>,
     pub tables: Vec<TableDiscovery>,
 }
 
@@ -93,6 +98,7 @@ mod tests {
             rivet_version: "0.0.0-test".into(),
             source_type: "postgres".into(),
             scope: r#"schema "public" (1 object)"#.into(),
+            tls_mode: None,
             tables: vec![TableDiscovery {
                 schema: "public".into(),
                 table: "orders".into(),

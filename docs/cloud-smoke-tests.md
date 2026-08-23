@@ -19,7 +19,7 @@ the automated PR CI matrix described in
 | S3 | env access key | 2026-05-22 | maintainer |
 | S3 | session token (STS) | 2026-05-22 | maintainer |
 | S3 | AWS profile | 2026-05-22 | maintainer |
-| GCS | ADC / service account | 2026-05-22 | maintainer |
+| GCS | ADC / service account | 2026-08-19 | maintainer + assistant (0.24.5 pre-tag) |
 | Azure Blob | account key env | 2026-05-21 | maintainer |
 | Azure Blob | SAS token env | 2026-05-22 | maintainer |
 
@@ -62,6 +62,23 @@ For each backend, the smoke run covers:
 | `validate --prefix` | ✅ | — |
 | Manifest fingerprint match | ✅ | M2 |
 | Auth-failure secret-leak audit | ✅ | URL password redacted; access keys not echoed |
+
+### GCS — `2026-08-19` (0.24.5 pre-tag)
+
+Scope decision, recorded rather than implied: this release's real-cloud smoke
+was deliberately LIMITED to GCS. S3 and Azure keep their 2026-05-22/21 dates —
+their sessions were expired at smoke time and the release rides the emulator
+(MinIO / Azurite) coverage plus the shared `CloudDestination` path, which this
+GCS run exercises for real.
+
+| Scenario | Result | Notes |
+|---|:---:|---|
+| Fresh export | ✅ | real GCS bucket `rivet-matrix-smoke-…`, ADC; release binary |
+| `validate` | ✅ | — |
+| `validate --date` (historical) | ✅ | — |
+| `validate --prefix` | ✅ | prefix taken from validate's own JSON report |
+| `validate --run-id` | ✅ | re-check of the smoke run |
+| Auth-failure secret-leak audit | ✅ | probe password absent from stderr + every run artifact |
 
 ### GCS — `2026-05-22`
 
@@ -123,11 +140,16 @@ auth mode (see the per-backend pages under
 export AWS_ACCESS_KEY_ID=AKIA...
 export AWS_SECRET_ACCESS_KEY=wJa...
 export RIVET_SMOKE_S3_BUCKET=rivet-smoke-${USER}
-rivet doctor --config dev/cloud-smoke/s3.yaml
-rivet run    --config dev/cloud-smoke/s3.yaml
-rivet validate --config dev/cloud-smoke/s3.yaml
-rivet validate --config dev/cloud-smoke/s3.yaml --date "$(date -u +%Y-%m-%d)"
-rivet validate --config dev/cloud-smoke/s3.yaml --prefix "$(jq -r .resolved_prefix < .rivet/runs/*/summary.json | tail -1)"
+# Copy an example config to a scratch path and point it at the smoke bucket
+cp examples/pg_chunked_s3.yaml /tmp/smoke-s3.yaml
+# edit /tmp/smoke-s3.yaml: set `bucket:` to $RIVET_SMOKE_S3_BUCKET
+rivet doctor --config /tmp/smoke-s3.yaml
+rivet run    --config /tmp/smoke-s3.yaml
+rivet validate --config /tmp/smoke-s3.yaml
+rivet validate --config /tmp/smoke-s3.yaml --date "$(date -u +%Y-%m-%d)"
+# The resolved prefix comes from validate's own JSON report — the run
+# summary (.rivet/runs/<id>/summary.json) does not record it.
+rivet validate --config /tmp/smoke-s3.yaml --prefix "$(rivet validate --config /tmp/smoke-s3.yaml --format json | jq -r '.exports[0].resolved_prefix')"
 ```
 
 Equivalent recipes for GCS and Azure live under

@@ -6,7 +6,7 @@
 
 mod cursor;
 mod pipelined;
-pub(crate) use cursor::extract_last_cursor_value;
+pub(crate) use cursor::{extract_first_cursor_value, extract_last_cursor_value};
 pub(crate) use pipelined::PipelinedSink;
 
 use std::io::BufWriter;
@@ -38,6 +38,10 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) compression_level: Option<u32>,
     pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
     pub(in crate::pipeline) total_rows: usize,
+    /// The RUN-wide bytes-read counter, shared from `plan.bytes_read` (every
+    /// sink this run creates — per chunk, per worker — increments the same
+    /// `Arc`, so accumulation is runner-agnostic by construction; see #175).
+    pub(in crate::pipeline) bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(in crate::pipeline) part_rows: usize,
     /// Cursor column name (with internal columns), set from plan at construction.
     /// When `Some`, `on_batch` extracts the last cursor value inline so we never
@@ -45,6 +49,9 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) cursor_column: Option<String>,
     /// Last extracted cursor value — set by `on_batch`, consumed by `run_single_export`.
     pub(in crate::pipeline) last_cursor_value: Option<String>,
+    /// First observed cursor value of the RUN (first non-null of the first
+    /// batch carrying one) — the floor for cursor_min metrics (#151).
+    pub(in crate::pipeline) first_cursor_value: Option<String>,
     /// A lossless keyset token the SOURCE reported via `set_source_cursor`
     /// (MongoDB's BSON `_id`), overriding the type-ambiguous string extracted
     /// from the output column. `effective_cursor()` prefers it. `None` for SQL.
@@ -119,6 +126,40 @@ pub(in crate::pipeline) struct RowProgress {
 }
 
 impl ExportSink {
+    /// ADR-0029 (splitting ADR-0028's `drain_tail_into`) — the OBSERVATION half
+    /// of this sink's tail: the dest schema it resolved and the per-column shape
+    /// bytes it saw. Neither carries a coverage obligation, so drain them as
+    /// soon as the read is done and BEFORE any fallible write — a run that then
+    /// fails still records the fingerprint it OBSERVED instead of the stale
+    /// open-time baseline. Applied by `finalize::finalize_export{,_records}`.
+    pub(in crate::pipeline) fn drain_observations_into(
+        &mut self,
+        ledger: &mut crate::pipeline::commit::CommitLedger,
+    ) {
+        if let Some(schema) = self.dest_schema.as_deref() {
+            ledger.note_schema(schema);
+        }
+        ledger.merge_shape(&std::mem::take(&mut self.column_max_bytes));
+    }
+
+    /// ADR-0029 — the INTEGRITY half: the Form-B checksums this sink
+    /// accumulated (keyed to the cursor/key column when the key survived into
+    /// the dest batch), contributed under `unit`, the commit unit whose parts
+    /// they cover. Drain it only once that unit's parts are committed; the seam
+    /// compares `unit` against the units `record_part` registered and suppresses
+    /// Form B itself if the two sets disagree.
+    pub(in crate::pipeline) fn drain_integrity_into(
+        &mut self,
+        unit: crate::pipeline::commit::UnitId,
+        ledger: &mut crate::pipeline::commit::CommitLedger,
+    ) {
+        // Same keying rule the single tail used: the checksums are keyed only
+        // when the key column is present in the dest batch (`checksum_key_col`
+        // is its index there).
+        let key = self.checksum_key_col.and(self.cursor_column.clone());
+        ledger.contribute_checksums(unit, &std::mem::take(&mut self.column_checksums), key);
+    }
+
     pub fn new(plan: &ResolvedRunPlan) -> Result<Self> {
         let tmp = tempfile::NamedTempFile::new()?;
         let exported_at_us = chrono::Utc::now().timestamp_micros();
@@ -136,9 +177,11 @@ impl ExportSink {
             compression_level: plan.compression_level,
             tmp,
             total_rows: 0,
+            bytes_read: std::sync::Arc::clone(&plan.bytes_read),
             part_rows: 0,
             cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
             last_cursor_value: None,
+            first_cursor_value: None,
             source_cursor: None,
             schema: None,
             dest_schema: None,
@@ -703,6 +746,14 @@ impl BatchSink for ExportSink {
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Bytes READ from the source: the in-memory Arrow size of the batch as
+        // received, BEFORE any internal-column strip. Incremented on the RUN's
+        // shared counter (plan.bytes_read), so every sink — per chunk, per
+        // worker — feeds one total with no per-runner harvest to forget (#175).
+        self.bytes_read.fetch_add(
+            batch.get_array_memory_size() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Avoid cloning the batch when no internal column needs to be stripped.
         let stripped: Option<RecordBatch> = match &self.strip_internal_column {
             Some(strip) if batch.schema().index_of(strip).is_ok() => {
@@ -733,6 +784,9 @@ impl BatchSink for ExportSink {
             // unconditional assignment let it overwrite the good mark
             // accumulated from every prior batch with None, after which nothing
             // was recorded and nothing committed.
+            if self.first_cursor_value.is_none() {
+                self.first_cursor_value = extract_first_cursor_value(batch, col, schema);
+            }
             if let Some(v) = extract_last_cursor_value(batch, col, schema) {
                 self.last_cursor_value = Some(v);
             }

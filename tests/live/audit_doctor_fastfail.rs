@@ -43,50 +43,24 @@ fn audit_doctor_fastfails_against_unreachable_cloud_endpoint() {
     // SAFETY: test-only; the var is uniquely named so no other thread touches it.
     unsafe { std::env::remove_var(&unset_url_env) };
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: {url_env}
-
-exports:
-  - name: fastfail
-    query: "SELECT 1"
-    format: parquet
-    destination:
-      type: s3
-      bucket: rivet-fastfail-probe
-      endpoint: "{endpoint}"
-      region: us-east-1
-      access_key_env: RIVET_FASTFAIL_AK
-      secret_key_env: RIVET_FASTFAIL_SK
-"#,
-        url_env = unset_url_env,
-        endpoint = s3_endpoint,
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch("fastfail")
+        .query("SELECT 1")
+        .source_url_env(&unset_url_env)
+        .dest_s3("rivet-fastfail-probe", "fastfail", s3_endpoint);
 
     // Provide dummy S3 creds so the probe reaches the *network* (a missing
     // access_key_env would short-circuit in build_operator with an env error
-    // and never exercise the RetryLayer — the very thing under test).
-    // SAFETY: test-only; uniquely scoped, removed below.
-    unsafe {
-        std::env::set_var("RIVET_FASTFAIL_AK", "AKIAFASTFAILTEST");
-        std::env::set_var("RIVET_FASTFAIL_SK", "fastfail-secret");
-    }
-
+    // and never exercise the RetryLayer — the very thing under test). Passed
+    // on the CHILD's env via cli_env — no process-global set_var needed.
     let start = Instant::now();
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "-c", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet doctor");
+    let result = rig.cli_env(
+        &["doctor"],
+        &[
+            ("RIVET_TEST_MINIO_AK", "AKIAFASTFAILTEST"),
+            ("RIVET_TEST_MINIO_SK", "fastfail-secret"),
+        ],
+    );
     let elapsed = start.elapsed();
-
-    unsafe {
-        std::env::remove_var("RIVET_FASTFAIL_AK");
-        std::env::remove_var("RIVET_FASTFAIL_SK");
-    }
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);

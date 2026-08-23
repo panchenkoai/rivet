@@ -17,7 +17,7 @@ as a 44-line inline closure inside `std::thread::scope` in
 module from day one; the **loop body** wrapping it was not.
 
 Live coverage was the only way to exercise governor behaviour under
-pressure (`tests/live_governor.rs`):
+pressure (`tests/live/live_governor.rs`):
 
 - `governor_activates_and_run_completes` — verifies the governor arms
   and the run finishes.
@@ -45,11 +45,17 @@ Issues with the inline-closure shape:
 
 ## Decision
 
-Extract the loop body into `pipeline::Governor` (in
-`src/tuning/adaptive.rs`) and the pressure dependency into a narrow
-`pipeline::PressureSource` trait. The runner-side binding (resize
+Extract the loop body into `tuning::Governor` (in
+`src/tuning/adaptive.rs`, re-exported as `crate::tuning::Governor`) and
+the pressure dependency into a narrow `tuning::adaptive::PressureSource`
+trait (not re-exported). The runner-side binding (resize
 semaphore + log + record off-thread decision) stays where it is — the
 extraction is the **loop policy**, not the runner-specific side effects.
+[Update 2026-08: the runner-side binding has since moved too — into the
+separate shared wiring module `src/pipeline/governor.rs`
+(`GovernorHarness`, commit `ab0b6d7`), used by both the chunked and
+keyset parallel runners. `pipeline::governor` is a different thing from
+`tuning::Governor`, the loop policy this ADR extracts.]
 
 ### `Governor` struct surface
 
@@ -177,7 +183,9 @@ which the unit tests cannot exercise.
   process-global env state.
 - The runner-side closure in `run_chunked_parallel` shrinks from 44
   lines to a 14-line callback that does only resize + log + push to
-  off-thread decision log.
+  off-thread decision log. [Update: that callback was later extracted
+  into `src/pipeline/governor.rs::GovernorHarness::spawn_into` (commit
+  `ab0b6d7`), shared by the chunked and keyset parallel runners.]
 
 **Negative**
 
@@ -201,8 +209,30 @@ which the unit tests cannot exercise.
   generalizes cleanly.
 - If `PressureSource` gains a second non-test impl (e.g., a synthetic
   pressure source for chaos testing in production), promote the trait
-  to a more visible location (currently only used by chunked parallel
-  exec; could move to a dedicated module if scope grows).
+  to a more visible location (the governor loop and `PressureSource` are
+  now consumed by both parallel runners — chunked,
+  `src/pipeline/chunked/exec.rs`, and keyset, `src/pipeline/keyset.rs` —
+  through the dedicated shared wiring module `src/pipeline/governor.rs`
+  (`GovernorHarness::arm`/`spawn_into`/`drain_into`); the trait itself
+  still lives in `src/tuning/adaptive.rs`).
+
+## Update 2026-08-13 — the governor gets its own pressure signal
+
+The extraction preserved a coupling this ADR did not name: the governor
+sampled `Source::sample_pressure` — the SAME counter the adaptive batch loop
+uses. When that counter was later re-pointed at own-read spill proxies
+(MySQL `Created_tmp_disk_tables` for the batch loop's benefit; MSSQL
+`Workfiles/Worktables Created`, which — correction — only the governor ever
+consumed: MSSQL's batch loop has no pressure sampling), the governor
+silently inherited a signal its own workload inflates. On keyset exports (pages spill by design) it read its own
+exhaust as "pressure rising", shed to the floor, and never recovered —
+measured in a production pool run as 2–2.7× per-export slowdowns, +1h48m
+makespan, on a source with no foreign load. The fix separates the signals:
+`Source::sample_governor_pressure` (write/redo counters a read-only export
+cannot move — PG `checkpoints_req`, MySQL `Innodb_log_waits`, MSSQL `Log
+Flush Waits/sec`) feeds the governor; the batch loop keeps the spill
+counters. Sheds now log at WARN (an invisible deliberate slowdown is the
+info-level trap the sparse-chunk rule already names).
 
 ## References
 
@@ -210,10 +240,16 @@ which the unit tests cannot exercise.
   `run`, with unit tests at the bottom of the module.
 - `src/tuning/mod.rs` — re-exports `Governor` only (not the trait or
   the constants — those are internal).
-- `src/pipeline/chunked/exec.rs::run_chunked_parallel` — call site
-  with the 14-line callback.
-- `tests/live_governor.rs` — the three live tests that cover
-  production wiring.
+- `src/pipeline/chunked/exec.rs::run_chunked_parallel` — call site; the
+  runner-side binding (resize + log + off-thread decision push) was
+  extracted into `src/pipeline/governor.rs::GovernorHarness::spawn_into`
+  (commit `ab0b6d7`), shared by the chunked and keyset parallel runners,
+  so the runner now only calls
+  `GovernorHarness::arm`/`spawn_into`/`drain_into`.
+- `tests/live/live_governor.rs` — the four live tests that cover
+  production wiring (the original three plus
+  `keyset_governor_backs_off_under_concurrent_write_pressure`, added
+  when the governor was shared with the keyset runner).
 - ADR-0011 — `Source: Send not Sync`. `PressureSource: Send` matches.
 - ADR-0017 — durability ordering map; the governor's worker is
   one of the parallel-engine workers covered there.

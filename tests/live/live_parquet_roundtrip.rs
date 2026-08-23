@@ -20,29 +20,14 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 /// *assertion*, not the setup mechanics.
 fn export_to_parquet(query: &str, out_dir: &std::path::Path) -> std::path::PathBuf {
     let export_name = unique_name("qa22");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "{query}"
-    mode: full
-    format: parquet
-    compression: zstd
-    columns:
-      amount: "decimal(12,2)"
-    destination:
-      type: local
-      path: {}
-"#,
-        out_dir.display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(query)
+        .export_line("compression: zstd")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .dest_path(out_dir.to_path_buf());
 
-    let out = run_rivet_export(&cfg_path, &export_name);
+    let out = rig.run_args(&["--export", &export_name]);
     assert!(
         out.status.success(),
         "rivet exited {}; stderr:\n{}\nstdout:\n{}",
@@ -170,28 +155,12 @@ fn full_export_zero_row_table_succeeds_and_writes_no_file() {
         let table = seed_pg_numeric_table(0);
         let out_dir = tempfile::tempdir().unwrap();
         let export_name = unique_name("qa22_zero");
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: full
-    format: parquet
-    compression: zstd
-    skip_empty: {skip_empty}
-    destination:
-      type: local
-      path: {dir}
-"#,
-            table_name = table.name(),
-            dir = out_dir.path().display()
-        );
-        let cfg_path = write_config(&cfg_dir, &yaml);
-        let out = run_rivet_export(&cfg_path, &export_name);
+        let rig = Rig::pg_batch(&export_name)
+            .query(&format!("SELECT id, name FROM {}", table.name()))
+            .export_line("compression: zstd")
+            .export_line(&format!("skip_empty: {skip_empty}"))
+            .dest_path(out_dir.path().to_path_buf());
+        let out = rig.run_args(&["--export", &export_name]);
         assert!(
             out.status.success(),
             "rivet skip_empty={skip_empty} must exit 0 even for empty source; stderr:\n{}",
@@ -213,37 +182,14 @@ fn full_export_with_validate_flag_matches_exported_row_count() {
     let table = seed_pg_numeric_table(13);
     let out_dir = tempfile::tempdir().unwrap();
     let export_name = unique_name("qa22_val");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(12,2)"
-    destination:
-      type: local
-      path: {dir}
-"#,
-        table_name = table.name(),
-        dir = out_dir.path().display(),
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .dest_path(out_dir.path().to_path_buf());
 
     // Add --validate so rivet opens the produced Parquet and recounts rows.
-    let out = run_rivet(&[
-        "run",
-        "--config",
-        cfg_path.to_str().unwrap(),
-        "--export",
-        &export_name,
-        "--validate",
-    ]);
+    let out = rig.run_args(&["--export", &export_name, "--validate"]);
     assert!(
         out.status.success(),
         "rivet --validate exited {}; stderr:\n{}",
@@ -285,34 +231,19 @@ fn successful_run_writes_summary_artifacts_under_dot_rivet() {
 
     let table = seed_pg_numeric_table(10);
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let export_name = unique_name("gap4_summary_artifacts");
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {dir}
-"#,
-        table_name = table.name(),
-        dir = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_export(&cfg_path, &export_name);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .dest_path(out_dir.path().to_path_buf());
+    let cfg_path = rig.config_path();
+    let out = rig.run_args(&["--export", &export_name]);
     assert!(
         out.status.success(),
         "rivet must exit zero; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let runs_dir = cfg_dir.path().join(".rivet").join("runs");
+    let runs_dir = cfg_path.parent().unwrap().join(".rivet").join("runs");
     assert!(
         runs_dir.is_dir(),
         "I8: the run-report dir {runs_dir:?} must exist after a successful run"

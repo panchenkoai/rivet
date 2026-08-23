@@ -8,14 +8,17 @@
 
 mod aggregate;
 mod apply_cmd;
-#[cfg(not(test))]
-mod cdc_job;
-#[cfg(test)]
+// `pub(crate)`: the multiplex destination layout (`dest_for_table` — one
+// sub-prefix per captured table) is written HERE and read by everything that has
+// to find those files again — `rivet validate`, and the warehouse load planner.
+// One definition of where a table's parts live, not one per reader.
 pub(crate) mod cdc_job;
 pub(crate) mod chunked;
 mod cli;
 pub(crate) mod commit;
 mod finalize;
+pub(crate) mod frame;
+mod governor;
 pub(crate) mod ipc;
 mod job;
 mod keyset;
@@ -26,6 +29,7 @@ mod parallel_children;
 pub(crate) mod parent_ui;
 mod partition_expand;
 mod plan_cmd;
+pub(crate) mod pool;
 pub(crate) mod progress;
 mod reconcile_cmd;
 mod repair_cmd;
@@ -44,6 +48,7 @@ mod run_store;
 mod schema_drift;
 mod single;
 mod sink;
+pub(crate) mod split;
 mod summary;
 mod validate;
 mod validate_cmd;
@@ -271,9 +276,12 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "test_export".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::default(),

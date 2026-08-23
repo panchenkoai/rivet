@@ -67,11 +67,15 @@ become any of those, and shoehorning will be painful.
   surface tradeoffs in `rivet check` (sparse range warnings, global
   sort cost).  Look at the warnings, do not ignore them.
 
-- **Read replicas with replication lag.**  Rivet snapshots a
-  point-in-time consistent set of rows via a single transaction; if
-  the replica lags, you are dumping the replica's "now", not the
-  primary's "now".  Operator's responsibility to choose the right
-  endpoint.
+- **Read replicas with replication lag.**  On PostgreSQL, a
+  full-mode export runs inside a single snapshot transaction, so the
+  exported rows are point-in-time consistent as of the replica's
+  "now".  Chunked/keyset exports issue independent short queries
+  (parallel workers each on their own connection), and other engines
+  (e.g. MySQL) run plain autocommit SELECTs — there consistency is
+  per-query, not per-run.  Either way, a lagging replica gives you
+  the replica's "now", not the primary's.  Operator's responsibility
+  to choose the right endpoint.
 
 - **Sources behind SSH bastions / jump hosts.**  No native SSH tunnel
   support yet (tracked in `rivet_roadmap.md` Epic 13).  Use

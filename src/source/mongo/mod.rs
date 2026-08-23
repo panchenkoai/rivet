@@ -110,12 +110,12 @@ pub struct MongoSession {
 
 impl MongoSession {
     /// Connect + `ping`. `gate` applies the shared remote-plaintext TLS refusal
-    /// (`require_tls_or_loopback`, CWE-319); `rivet init` passes `false` (dev
-    /// convenience, like the SQL init helpers), every other caller `true`.
-    pub fn connect(url: &str, tls: Option<&TlsConfig>, gate: bool) -> Result<Self> {
-        if gate {
-            crate::source::require_tls_or_loopback(url, tls)?;
-        }
+    /// (`require_tls_or_loopback`, CWE-319); every caller passes `true` — the SQL init helpers gate too, so init
+    /// is not an exception (bug hunt 2026-08-08 corrected the old `false`).
+    pub fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Always refuse remote plaintext (CWE-319) — the old `gate: bool` let
+        // init opt out, which was the bug hunt 2026-08-08 find. No opt-out now.
+        crate::source::require_tls_or_loopback(url, tls)?;
         // Small multi-thread runtime (not current-thread): the driver spawns
         // background SDAM/heartbeat tasks that must make progress independently
         // of our `block_on` calls, or connection monitoring starves.
@@ -190,7 +190,7 @@ impl MongoSource {
     /// `create_source` (with the config block) and the `doctor` / type-report
     /// probes (with `None`).
     pub fn connect(url: &str, tls: Option<&TlsConfig>, cfg: Option<&MongoConfig>) -> Result<Self> {
-        let session = MongoSession::connect(url, tls, true)?;
+        let session = MongoSession::connect(url, tls)?;
         let (canonical_json, snapshot, no_cursor_timeout) = match cfg {
             None => (false, false, true),
             Some(c) => (
@@ -566,6 +566,19 @@ fn flush(
 }
 
 impl Source for MongoSource {
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        let session = &self.session;
+        session.block_on(async {
+            let status = session
+                .client()
+                .database(session.db())
+                .run_command(doc! { "serverStatus": 1 })
+                .await
+                .ok()?;
+            Some(harm_from_server_status(&status))
+        })
+    }
+
     fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
         // The structured read-intent: the bare collection behind the `table:`
         // shortcut (ADR-0027). `None` ⇒ a hand-written `query:` or a
@@ -829,7 +842,7 @@ fn nested_i64(doc: &Document, path: &[&str]) -> Option<i64> {
 /// Pull the source-harm counters out of a `serverStatus` response. Only
 /// **cumulative monotonic** counters are emitted (never gauges), because the
 /// pipeline stores the before→after *delta* — the same contract as the SQL
-/// engines' `sample_harm_counters`.
+/// engines' `Source::harm_counters` impls.
 fn harm_from_server_status(status: &Document) -> Vec<(String, i64)> {
     // (metric label, serverStatus path). Chosen as the Mongo analogues of the
     // PG harm set: docs/keys *scanned* are the read-amplification signal
@@ -860,7 +873,7 @@ fn harm_from_server_status(status: &Document) -> Vec<(String, i64)> {
 }
 
 /// Snapshot MongoDB's source-harm counters via `serverStatus` — the document-
-/// store analogue of the SQL engines' `sample_harm_counters`. Returns
+/// store analogue of the SQL engines' `harm_counters`. Returns
 /// `(metric, cumulative_value)` pairs; the pipeline captures these before and
 /// after the export and stores the per-metric delta in `export_harm`.
 ///
@@ -870,29 +883,43 @@ fn harm_from_server_status(status: &Document) -> Vec<(String, i64)> {
 /// `serverStatus` privilege) on authenticated deployments — `None` on any
 /// connect / permission / query failure, exactly like the SQL engines:
 /// harm metrics are observability, never a gate.
-pub(crate) fn sample_harm_counters(
-    url: &str,
-    tls: Option<&TlsConfig>,
-) -> Option<Vec<(String, i64)>> {
-    let session = MongoSession::connect(url, tls, true).ok()?;
-    session.block_on(async {
-        let status = session
-            .client()
-            .database(session.db())
-            .run_command(doc! { "serverStatus": 1 })
-            .await
-            .ok()?;
-        Some(harm_from_server_status(&status))
-    })
-}
-
+///
+/// (Documents [`MongoSource::harm_counters`]; the estimate below is a
+/// separate probe.)
 /// Scan-free document-count estimate for one collection — the preflight
 /// `row_estimate` (the Mongo analogue of PG `reltuples` / MySQL `TABLE_ROWS`).
 /// `estimatedDocumentCount` reads collection metadata, never scans the
 /// collection. `None` on any failure — the diagnostic then shows an unknown
 /// row count, exactly as MySQL does when its estimate is untrustworthy.
+/// The server's connection headroom for the preflight connection-limit check —
+/// `serverStatus().connections.available` (free slots), the Mongo analogue of PG
+/// `max_connections` / MySQL `@@max_connections`. Defaults high (the pool cap is
+/// usually 65536 / ulimit-derived), so the warning is inert unless the server is
+/// tightly capped and `parallel` (the mongo_parallel worker count) would exhaust
+/// it. `None` on any probe failure (fail-soft, like `estimated_count`).
+pub(crate) fn max_connections(url: &str, tls: Option<&TlsConfig>) -> Option<u32> {
+    let session = MongoSession::connect(url, tls).ok()?;
+    session.block_on(async {
+        let status = session
+            .client()
+            .database("admin")
+            .run_command(mongodb::bson::doc! { "serverStatus": 1 })
+            .await
+            .ok()?;
+        let conns = status.get_document("connections").ok()?;
+        // `available` is the free headroom; current + available ≈ the cap. The
+        // check compares `parallel` against what is actually usable now.
+        let avail = conns
+            .get_i32("available")
+            .ok()
+            .map(|v| v as i64)
+            .or_else(|| conns.get_i64("available").ok())?;
+        u32::try_from(avail).ok()
+    })
+}
+
 pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &str) -> Option<i64> {
-    let session = MongoSession::connect(url, tls, true).ok()?;
+    let session = MongoSession::connect(url, tls).ok()?;
     session.block_on(async {
         let n = session
             .client()

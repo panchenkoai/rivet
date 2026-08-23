@@ -3,6 +3,7 @@ mod candidates;
 /// Offline strategy-decision replay harness — test-only (no runtime caller).
 #[cfg(test)]
 mod catalog_replay;
+mod density;
 mod mongo;
 mod mssql;
 mod mysql;
@@ -32,6 +33,13 @@ pub(crate) struct ColumnInfo {
     /// `None` when not applicable or when precision is unbounded.
     pub numeric_precision: Option<u32>,
     pub numeric_scale: Option<u32>,
+    /// `true` when the column is backed by an index (PK, unique, or secondary).
+    /// The density probe (#148/#199) only samples an INDEXED key — MIN/MAX + K
+    /// windowed COUNTs on an UNINDEXED fallback column is up to 51 sequential
+    /// scans of a large table inside `rivet init`. `#[serde(default)]` (false)
+    /// so pre-existing catalog-replay fixtures still parse.
+    #[serde(default)]
+    pub is_indexed: bool,
 }
 
 /// Table metadata used to generate the config scaffold and discovery artifact.
@@ -49,6 +57,13 @@ pub(crate) struct TableInfo {
     /// Approximate physical size in bytes (heap + indexes), if available.
     pub total_bytes: Option<i64>,
     pub columns: Vec<ColumnInfo>,
+    /// First-run density probe (#148): when present, `row_estimate` above HAS
+    /// BEEN REPLACED by the sampled figure (the catalog's original lives in
+    /// `probe.catalog_rows`), so every downstream decision stands on the
+    /// measured number automatically. `serde(skip)`: a runtime measurement,
+    /// not part of the replayable catalog shape.
+    #[serde(skip, default)]
+    pub density: Option<crate::init::density::DensityProbe>,
 }
 
 impl TableInfo {
@@ -61,6 +76,24 @@ impl TableInfo {
             .or_else(|| {
                 // Fall back to first integer column
                 self.columns.iter().find(|c| is_integer_type(&c.data_type))
+            })
+            .map(|c| c.name.as_str())
+    }
+
+    /// Like [`best_chunk_column`](Self::best_chunk_column) but the fallback
+    /// integer column must be INDEXED (#199). The density probe runs MIN/MAX + K
+    /// windowed COUNTs on this key — on an UNINDEXED column that is up to 51
+    /// SEQUENTIAL SCANS of a large table inside `rivet init`. An integer PK is
+    /// always indexed; a non-PK integer key is used only when an index backs it,
+    /// else `None` (the probe then skips → catalog kept, unverified).
+    pub(crate) fn best_indexed_chunk_column(&self) -> Option<&str> {
+        self.columns
+            .iter()
+            .find(|c| c.is_primary_key && is_integer_type(&c.data_type))
+            .or_else(|| {
+                self.columns
+                    .iter()
+                    .find(|c| c.is_indexed && is_integer_type(&c.data_type))
             })
             .map(|c| c.name.as_str())
     }
@@ -84,6 +117,35 @@ impl TableInfo {
     }
 
     /// Best candidate for `cursor_column`: prefer updated_at, then created_at, then any timestamp.
+    /// The cursor column init actually RECORDS and RENDERS — the scored top
+    /// candidate. `best_cursor_column` (name-preference) is kept for MODE
+    /// SELECTION ("is any cursor viable"), where only existence matters; but the
+    /// value written into the YAML and the strategy_snapshot must be ONE picker,
+    /// or the snapshot records a cursor the config does not contain (bug hunt
+    /// 2026-08-08). This is that one picker.
+    pub(crate) fn chosen_cursor_column(&self) -> Option<String> {
+        crate::init::candidates::cursor_candidates(self)
+            .first()
+            .map(|c| c.column.clone())
+    }
+
+    /// [`chosen_cursor_column`] RESTRICTED to a timestamp column — for
+    /// `time_window`, whose `time_column` MUST be a timestamp. An integer
+    /// surrogate PK is a valid INCREMENTAL cursor (monotonic ids) and
+    /// `cursor_candidates` scores it as one, so `chosen_cursor_column` can return
+    /// `id` on a timestamp-less table; scaffolding that as a `time_column`
+    /// compares a bigint against a timestamp window at run time — an error on
+    /// PostgreSQL, a silently-empty export on MySQL (bug hunt 2026-08-09). Same
+    /// scoring/order as `chosen_cursor_column` among the timestamp candidates, so
+    /// a table WITH a timestamp gets the same column both modes would; `None`
+    /// (no timestamp) drives the honest REVIEW marker instead of a wrong column.
+    pub(crate) fn chosen_time_column(&self) -> Option<String> {
+        crate::init::candidates::cursor_candidates(self)
+            .into_iter()
+            .find(|c| is_timestamp_type(&c.data_type))
+            .map(|c| c.column)
+    }
+
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
@@ -145,12 +207,24 @@ impl TableInfo {
                 let base = format!(
                     "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
                     fmt_row_estimate(self.row_estimate),
-                    self.best_chunk_column().unwrap_or("id"),
+                    // Name the REAL chunk key: a keyset table has no chunk_column
+                    // but a keysettable PK — falling back to a phantom 'id' named
+                    // a column that may not exist (roast 2026-08-09, #173).
+                    self.best_chunk_column()
+                        .or_else(|| self.keysettable_pk_column())
+                        .unwrap_or("id"),
                 );
                 // A chunked re-run re-reads the whole table. If a cursor column
                 // exists, point operators at incremental for scheduled re-runs —
                 // the pilot showed a 655k-row table re-dumped 4× in 2 days under
                 // chunked, re-reading ~570k unchanged rows each time.
+                // Gate the incremental SUGGESTION on best_cursor_column
+                // (timestamp-only): incremental on an integer surrogate PK
+                // catches inserts but MISSES updates, so "pulls only changed
+                // rows" would be false advice — only suggest it when a real
+                // timestamp cursor exists (roast 2026-08-09: the incremental
+                // ARM below names chosen_, but this SUGGESTION must stay
+                // timestamp-gated, unlike an actual incremental export).
                 match self.best_cursor_column() {
                     Some(cursor) => format!(
                         "{base}. NOTE: chunked re-reads the whole table each run — for scheduled \
@@ -159,11 +233,21 @@ impl TableInfo {
                     None => base,
                 }
             }
-            "incremental" => format!(
-                "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to incremental on '{}'",
-                fmt_row_estimate(self.row_estimate),
-                self.best_cursor_column().unwrap_or("updated_at"),
-            ),
+            "incremental" => match self.chosen_cursor_column() {
+                Some(cursor) => format!(
+                    "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to \
+                     incremental on '{cursor}'",
+                    fmt_row_estimate(self.row_estimate),
+                ),
+                // No timestamp candidate: do NOT name a phantom `updated_at` —
+                // the scaffold emits a REVIEW marker here, so the rationale must
+                // agree (roast 2026-08-09).
+                None => format!(
+                    "auto: ~{} rows ≥ 100K threshold; chunk column missing — set cursor_column \
+                     manually (no timestamp column detected)",
+                    fmt_row_estimate(self.row_estimate),
+                ),
+            },
             "full" => {
                 // full is reached TWO ways: below the 100K threshold, OR above it
                 // with no usable chunk key / cursor column (e.g. a keyless table, or
@@ -206,8 +290,28 @@ impl TableInfo {
     /// a fast engine's sequential scan. `None` when the size is unknown —
     /// callers then fall back to a row-count-only heuristic.
     pub(crate) fn avg_row_bytes(&self) -> Option<i64> {
+        // #148 (roast 2026-08-09): when the density probe CORRECTED row_estimate
+        // (frozen stats), total_bytes is still the FROZEN figure — the ratio
+        // mixes a corrected numerator with a stale denominator and defeats the
+        // wide-row parallelism guard. A probe re-samples rows, not bytes, so the
+        // per-row size is unknown after a correction; report None.
+        // Any method that REPLACED row_estimate from a live re-count (Probed or
+        // Counted) leaves total_bytes on the FROZEN catalog figure — the ratio
+        // mixes a corrected numerator with a stale denominator either way (roast
+        // 2026-08-10: the Probed-only guard left the keyless Counted path exposed,
+        // and frozen TABLE_ROWS/DATA_LENGTH freeze together, the guard's own
+        // premise). CatalogTriaged/CatalogExact/Unverified keep row_estimate, so
+        // the ratio is honest there.
+        let probe_corrected = matches!(
+            &self.density,
+            Some(p) if matches!(
+                p.method,
+                crate::init::density::EstimateMethod::Probed
+                    | crate::init::density::EstimateMethod::Counted
+            )
+        );
         match self.total_bytes {
-            Some(b) if self.row_estimate > 0 => Some(b / self.row_estimate),
+            Some(b) if self.row_estimate > 0 && !probe_corrected => Some(b / self.row_estimate),
             _ => None,
         }
     }
@@ -441,10 +545,16 @@ pub fn init(
     yaml_destination: InitYamlDestination,
     filter: &TableFilter,
     mode_override: Option<&str>,
+    // `--tls` / `--tls-ca` (#146): the posture for the introspection
+    // connection init itself opens AND the `source.tls:` block the scaffold
+    // records — one value, both uses, so the generated config connects the
+    // same way init just did.
+    tls: Option<&crate::config::TlsConfig>,
 ) -> Result<()> {
     yaml_destination.validate()?;
     let (text, yaml_decimal_review, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
+            tls,
             source_url,
             provenance,
             table,
@@ -472,7 +582,7 @@ pub fn init(
                 );
             }
             (
-                init_discovery_json(source_url, table, schema, filter)?,
+                init_discovery_json(tls, source_url, table, schema, filter)?,
                 false,
                 // `--discover` writes a SURVEY, not a config — there is no
                 // strategy decision to record the evidence for.
@@ -534,8 +644,9 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
     ));
     s.push_str(&format!(
         "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
-         rivet plan  -c {path}     # assigns waves + writes a reviewable plan\n  \
-         rivet apply {path}        # runs wave-by-wave (parallel where safe)\n"
+         rivet plan  -c {path}                    # review the schedule (read-only)\n  \
+         rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
+         rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
     ));
     s
 }
@@ -598,6 +709,7 @@ fn resolve_single_table_schema<'a>(
 /// them. For MySQL, `--schema` selects the database via `USE`; for PG/MSSQL it
 /// is the introspection schema (defaulting to `public`/`dbo`).
 fn introspect_single_table(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     table: &str,
     schema_flag: Option<&str>,
@@ -605,15 +717,17 @@ fn introspect_single_table(
     let (eff_schema, table_name) = resolve_single_table_schema(table, schema_flag)?;
     Ok(match source_type(source_url)? {
         "postgres" => {
-            let mut client = postgres::connect(source_url)?;
-            postgres::introspect(
+            let mut client = postgres::connect(source_url, tls)?;
+            let mut info = postgres::introspect(
                 &mut client,
                 eff_schema.as_deref().unwrap_or("public"),
                 table_name,
-            )?
+            )?;
+            postgres::density_probe(&mut client, &mut info);
+            info
         }
         "mysql" => {
-            let mut conn = mysql::connect(source_url)?;
+            let mut conn = mysql::connect(source_url, tls)?;
             if let Some(db) = eff_schema.as_deref() {
                 // Guard (bughunt HIGH): `--schema` selecting a DIFFERENT database
                 // than the URL would introspect THAT db (via USE), but the
@@ -640,15 +754,19 @@ fn introspect_single_table(
                 }
                 mysql::use_database(&mut conn, db)?;
             }
-            mysql::introspect(&mut conn, table_name)?
+            let mut info = mysql::introspect(&mut conn, table_name)?;
+            mysql::density_probe(&mut conn, &mut info);
+            info
         }
         "mssql" => {
-            let mut conn = mssql::connect(source_url)?;
-            mssql::introspect(
+            let mut conn = mssql::connect(source_url, tls)?;
+            let mut info = mssql::introspect(
                 &mut conn,
                 &mssql_table_schema(eff_schema.as_deref().unwrap_or("public")),
                 table_name,
-            )?
+            )?;
+            mark_mssql_catalog_exact(&mut info);
+            info
         }
         "mongo" => {
             // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
@@ -656,7 +774,7 @@ fn introspect_single_table(
             // schema got the URL's database instead. Mongo has no schema namespace
             // — refuse rather than mislead; the database lives in the URL.
             reject_mongo_schema(schema_flag)?;
-            let conn = mongo::connect(source_url)?;
+            let conn = mongo::connect(source_url, tls)?;
             mongo::introspect(&conn, table_name)?
         }
         _ => unreachable!(),
@@ -677,7 +795,10 @@ fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors `init`'s own surface; a params
+// struct here would be a second InitYamlDestination
 fn init_yaml(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     provenance: &SourceProvenance,
     table: Option<&str>,
@@ -687,14 +808,20 @@ fn init_yaml(
     mode_override: Option<&str>,
 ) -> Result<(String, bool, Vec<crate::state::StrategySnapshot>)> {
     if let Some(t) = table {
-        let info = introspect_single_table(source_url, t, schema)?;
+        let info = introspect_single_table(tls, source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
         let snaps = vec![snapshot_of(&info, mode_override)];
-        let yaml =
-            yaml_scaffold::generate_config(&info, source_url, provenance, dest, mode_override)?;
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            source_url,
+            provenance,
+            dest,
+            mode_override,
+            tls,
+        )?;
         return Ok((yaml, hint, snaps));
     }
-    let infos = introspect_all(source_url, schema, filter)?;
+    let infos = introspect_all(tls, source_url, schema, filter)?;
     if infos.is_empty() {
         return Err(no_tables_error(filter));
     }
@@ -709,6 +836,7 @@ fn init_yaml(
         &label,
         dest,
         mode_override,
+        tls,
     )?;
     let snaps = infos
         .iter()
@@ -721,30 +849,66 @@ fn init_yaml(
 ///
 /// Every field here is something `init` already read from the catalog to make
 /// the choice; before this they were discarded the moment the YAML was written.
+/// MSSQL's `dm_db_partition_stats` row counts are near-exact by construction —
+/// no probe needed; the snapshot still SAYS where the number came from (#148).
+fn mark_mssql_catalog_exact(info: &mut TableInfo) {
+    // #148 (roast 2026-08-09): dm_db_partition_stats yields 0 for a VIEW or when
+    // stats are unavailable — a documented UNKNOWN, not an exact count. Stamping
+    // `catalog-exact` on a 0 turns "unknown" into an audited "exactly 0 rows".
+    // Only a positive figure is genuinely catalog-exact; 0 is unverified.
+    let method = if info.row_estimate > 0 {
+        crate::init::density::EstimateMethod::CatalogExact
+    } else {
+        crate::init::density::EstimateMethod::Unverified
+    };
+    info.density = Some(crate::init::density::DensityProbe {
+        rows: info.row_estimate,
+        density: 0.0,
+        method,
+        catalog_rows: info.row_estimate,
+        k: 0,
+        w: 0,
+    });
+}
+
 fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::StrategySnapshot {
     let d = yaml_scaffold::decided_strategy(info, mode_override);
     crate::state::StrategySnapshot {
         export_name: info.table.clone(),
         source_schema: (!info.schema.is_empty()).then(|| info.schema.clone()),
         source_table: info.table.clone(),
-        row_estimate: (info.row_estimate > 0).then_some(info.row_estimate),
+        row_estimate: info
+            .density
+            .as_ref()
+            .map(|p| p.rows)
+            .or((info.row_estimate > 0).then_some(info.row_estimate)),
         total_bytes: info.total_bytes,
         avg_row_bytes: info.avg_row_bytes(),
         chosen_mode: d.mode,
         strategy_kind: Some(d.kind.to_string()),
         key_column: d.key_column,
         chunk_size: d.chunk_size,
+        catalog_rows: info.density.as_ref().map(|p| p.catalog_rows),
+        density: info.density.as_ref().filter(|p| p.k > 0).map(|p| p.density),
+        estimate_method: info.density.as_ref().map(|p| p.method.label().to_string()),
+        probe_k: info
+            .density
+            .as_ref()
+            .filter(|p| p.k > 0)
+            .map(|p| p.k as i64),
+        probe_w: info.density.as_ref().filter(|p| p.w > 0).map(|p| p.w),
     }
 }
 
 fn init_discovery_json(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     table: Option<&str>,
     schema: Option<&str>,
     filter: &TableFilter,
 ) -> Result<String> {
     let (infos, scope) = if let Some(t) = table {
-        let info = introspect_single_table(source_url, t, schema)?;
+        let info = introspect_single_table(tls, source_url, t, schema)?;
         let scope = match source_type(source_url)? {
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
@@ -754,7 +918,7 @@ fn init_discovery_json(
         };
         (vec![info], scope)
     } else {
-        let infos = introspect_all(source_url, schema, filter)?;
+        let infos = introspect_all(tls, source_url, schema, filter)?;
         if infos.is_empty() {
             return Err(no_tables_error(filter));
         }
@@ -769,6 +933,7 @@ fn init_discovery_json(
         rivet_version: env!("CARGO_PKG_VERSION").to_string(),
         source_type: st.to_string(),
         scope,
+        tls_mode: tls.map(|t| t.mode.to_string()),
         tables,
     };
     artifact.to_json_pretty()
@@ -804,7 +969,30 @@ fn table_discovery(info: &TableInfo) -> TableDiscovery {
     }
 }
 
+/// Classify one table's introspection result during a WHOLE-SCHEMA scan: keep
+/// it, skip it, or abort the scan.
+///
+/// Skip covers exactly the "listed but not introspectable" shape every engine
+/// can produce — a table dropped between `list_tables` and `introspect` (the
+/// live suite's parallelism does this constantly), and MySQL's broken VIEW,
+/// which stays listed with zero columns after its base table is gone. Any OTHER
+/// error must abort: a scan that shrugged off a connection drop or a permission
+/// error would emit a silently truncated scaffold that reads as a small schema.
+///
+/// Pure and shared by all three engine arms, so the tolerance cannot drift
+/// per-engine again (MySQL shipped without it — one stale view failed every
+/// schema-wide init) and so both mutants of the guard (`skip everything` /
+/// `skip nothing`) die in a unit test rather than surviving on a live-only path.
+fn scan_step(res: Result<TableInfo>) -> Result<Option<TableInfo>> {
+    match res {
+        Ok(info) => Ok(Some(info)),
+        Err(e) if e.to_string().contains("not found or has no columns") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn introspect_all(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     schema: Option<&str>,
     filter: &TableFilter,
@@ -817,16 +1005,13 @@ fn introspect_all(
                 .unwrap_or("public");
             // One connection for the whole scan — a fresh client per table
             // would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
-            let mut client = postgres::connect(source_url)?;
+            let mut client = postgres::connect(source_url, tls)?;
             let names = retain_filtered(postgres::list_tables(&mut client, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match postgres::introspect(&mut client, sch, &n) {
-                    Ok(info) => out.push(info),
-                    // Table may have been dropped between list_tables and introspect.
-                    // Skip it rather than aborting the whole schema scan.
-                    Err(e) if e.to_string().contains("not found or has no columns") => {}
-                    Err(e) => return Err(e),
+                if let Some(mut info) = scan_step(postgres::introspect(&mut client, sch, &n))? {
+                    postgres::density_probe(&mut client, &mut info);
+                    out.push(info)
                 }
             }
             Ok(out)
@@ -854,11 +1039,17 @@ fn introspect_all(
             }
             // One pooled connection for the whole scan — a fresh Pool per
             // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
-            let mut conn = mysql::connect(source_url)?;
+            let mut conn = mysql::connect(source_url, tls)?;
             let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                out.push(mysql::introspect(&mut conn, &n)?);
+                // MySQL was the one arm WITHOUT the vanished-table tolerance: a
+                // BROKEN VIEW (listed, zero columns once its base is dropped)
+                // made every schema-wide init fail — see scan_step.
+                if let Some(mut info) = scan_step(mysql::introspect(&mut conn, &n))? {
+                    mysql::density_probe(&mut conn, &mut info);
+                    out.push(info);
+                }
             }
             Ok(out)
         }
@@ -869,22 +1060,20 @@ fn introspect_all(
                 .unwrap_or("dbo");
             // One connection for the whole scan — `MssqlSource` owns its runtime
             // and block_on's each query, so reusing it avoids N+1 TLS logins.
-            let mut conn = mssql::connect(source_url)?;
+            let mut conn = mssql::connect(source_url, tls)?;
             let names = retain_filtered(mssql::list_tables(&mut conn, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match mssql::introspect(&mut conn, sch, &n) {
-                    Ok(info) => out.push(info),
-                    // Dropped between list and introspect — skip, don't abort.
-                    Err(e) if e.to_string().contains("not found or has no columns") => {}
-                    Err(e) => return Err(e),
+                if let Some(mut info) = scan_step(mssql::introspect(&mut conn, sch, &n))? {
+                    mark_mssql_catalog_exact(&mut info);
+                    out.push(info)
                 }
             }
             Ok(out)
         }
         "mongo" => {
             reject_mongo_schema(schema)?;
-            let conn = mongo::connect(source_url)?;
+            let conn = mongo::connect(source_url, tls)?;
             let names = retain_filtered(mongo::list_tables(&conn)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
@@ -974,6 +1163,75 @@ fn record_strategy_snapshots(config_path: &str, snapshots: &[crate::state::Strat
 
 #[cfg(test)]
 mod tests {
+    /// `next_steps_block` is a pure string builder reached only via the init
+    /// command's `eprint!` (live/CLI-only), so its `-> String::new()` /
+    /// `"xyzzy"` stubs survive `cargo mutants -- --lib --bins`. This pins the
+    /// content directly — including the read-only-vs-annotate distinction the
+    /// 2026-08-20 plan change added — so the stubs die at the lib gate and the
+    /// help text can't silently drift back to "plan writes waves".
+    #[test]
+    fn next_steps_block_shows_read_only_plan_then_annotate() {
+        let s = super::next_steps_block("rivet.yaml", &super::SourceProvenance::Env("X".into()));
+        // The core three-step path is always present.
+        assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
+        assert!(
+            s.contains("rivet run    -c rivet.yaml --validate"),
+            "block:\n{s}"
+        );
+        // Plain plan is advertised as READ-ONLY, and --annotate-waves as the
+        // thing that writes — the exact contract the code now enforces.
+        assert!(
+            s.contains("rivet plan  -c rivet.yaml") && s.contains("read-only"),
+            "next-steps must present plain `rivet plan` as read-only; block:\n{s}"
+        );
+        assert!(
+            s.contains("--annotate-waves") && s.contains("write wave:/parallel_safe:"),
+            "next-steps must show --annotate-waves as the config-writing step; block:\n{s}"
+        );
+        // Env provenance does not print the inline DATABASE_URL export line.
+        assert!(
+            !s.contains("export DATABASE_URL"),
+            "Env provenance must not print the Inline-only export line; block:\n{s}"
+        );
+    }
+
+    /// Both mutants of `scan_step`'s guard, killed where the CI gate can see
+    /// them: the whole-schema scan is a live-only path, so `guard -> true` and
+    /// `guard -> false` survived `cargo mutants -- --lib --bins` on PR #245
+    /// until the decision was extracted into this pure function.
+    #[test]
+    fn scan_step_skips_only_the_vanished_table_shape() {
+        // The real message every engine's introspect emits for the shape.
+        let vanished = Err(anyhow::anyhow!(
+            "Table 'qa_broken_v' not found or has no columns. Check the table name \
+             and that the user has SELECT privilege."
+        ));
+        assert!(
+            matches!(scan_step(vanished), Ok(None)),
+            "a listed-but-vanished table (dropped mid-scan, or a broken view) must be \
+             SKIPPED — aborting on it is how one stale view failed every schema-wide init"
+        );
+
+        // `guard -> true` makes EVERY error a skip; this is what kills it.
+        let real = Err(anyhow::anyhow!("connection refused (os error 61)"));
+        assert!(
+            scan_step(real).is_err(),
+            "any other error must ABORT the scan — swallowing a connection drop emits a \
+             silently truncated scaffold that reads as a small schema"
+        );
+
+        // And the pass-through, so the extraction cannot quietly drop tables.
+        let info = TableInfo {
+            schema: "s".into(),
+            table: "t".into(),
+            row_estimate: 1,
+            total_bytes: None,
+            columns: Vec::new(),
+            density: None,
+        };
+        assert!(matches!(scan_step(Ok(info)), Ok(Some(i)) if i.table == "t"));
+    }
+
     use super::*;
 
     fn col(name: &str, ty: &str, pk: bool) -> ColumnInfo {
@@ -984,17 +1242,159 @@ mod tests {
             is_nullable: false,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         }
+    }
+
+    /// #199: the density probe's key must be INDEXED. PK (always indexed) →
+    /// returned; an unindexed integer fallback → None (probe skips, no 51-scan);
+    /// an indexed non-PK integer → returned (the versioned KEY(ref_id) case #148
+    /// targets). RED against best_chunk_column (which returns the unindexed one).
+    #[test]
+    fn best_indexed_chunk_column_requires_an_index() {
+        let c = |n: &str, ty: &str, pk: bool, idx: bool| ColumnInfo {
+            name: n.into(),
+            data_type: ty.into(),
+            is_primary_key: pk,
+            is_nullable: false,
+            numeric_precision: None,
+            numeric_scale: None,
+            is_indexed: idx,
+        };
+        // integer PK → indexed → returned.
+        let t = make_table(1, vec![c("id", "bigint", true, true)]);
+        assert_eq!(t.best_indexed_chunk_column(), Some("id"));
+        // uuid PK + UNINDEXED integer fallback → None (no scan).
+        let t = make_table(
+            1,
+            vec![c("uid", "uuid", true, true), c("qty", "int", false, false)],
+        );
+        assert_eq!(
+            t.best_indexed_chunk_column(),
+            None,
+            "unindexed fallback must not be probed"
+        );
+        assert_eq!(
+            t.best_chunk_column(),
+            Some("qty"),
+            "but best_chunk_column still picks it"
+        );
+        // indexed non-PK integer → returned (versioned KEY(ref_id)).
+        let t = make_table(
+            1,
+            vec![
+                c("uid", "uuid", true, true),
+                c("ref_id", "bigint", false, true),
+            ],
+        );
+        assert_eq!(t.best_indexed_chunk_column(), Some("ref_id"));
     }
 
     fn make_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "public".to_string(),
             table: "orders".to_string(),
             row_estimate: rows,
             total_bytes: None,
             columns: cols,
         }
+    }
+
+    /// #148 (roast 2026-08-09): avg_row_bytes must return None once the density
+    /// probe CORRECTED row_estimate — total_bytes is still frozen, so the ratio
+    /// would mix a corrected numerator with a stale denominator. Kills the
+    /// mod.rs:278 guard mutants (guard->true, &&->||, >->>=).
+    #[test]
+    fn avg_row_bytes_none_when_a_probe_corrected_the_rows() {
+        use crate::init::density::{DensityProbe, EstimateMethod};
+        // Frozen catalog 1000, probe corrected to 148_000; bytes still frozen.
+        let mut t = make_table(148_000, vec![]);
+        t.total_bytes = Some(4_000_000);
+        t.density = Some(DensityProbe {
+            rows: 148_000,
+            density: 3.0,
+            method: EstimateMethod::Probed,
+            catalog_rows: 1000,
+            k: 50,
+            w: 10_000,
+        });
+        assert_eq!(
+            t.avg_row_bytes(),
+            None,
+            "corrected rows + frozen bytes = unknown per-row"
+        );
+
+        // No probe correction (catalog trusted): the ratio is honest.
+        let mut t2 = make_table(1000, vec![]);
+        t2.total_bytes = Some(4_000_000);
+        assert_eq!(t2.avg_row_bytes(), Some(4000));
+        // Zero rows: None (no division).
+        let mut t3 = make_table(0, vec![]);
+        t3.total_bytes = Some(4_000_000);
+        assert_eq!(t3.avg_row_bytes(), None);
+    }
+
+    /// #148 (roast 2026-08-09): mark_mssql_catalog_exact must NOT stamp
+    /// catalog-exact on a 0 (a VIEW or stats-unavailable table yields 0 — a
+    /// documented UNKNOWN). Kills the mod.rs:822 mutants (stub, >->==, >-><, >->>=).
+    #[test]
+    fn mssql_catalog_exact_only_for_a_positive_count() {
+        use crate::init::density::EstimateMethod;
+        let mut base = make_table(500_000, vec![]);
+        mark_mssql_catalog_exact(&mut base);
+        assert_eq!(
+            base.density.as_ref().unwrap().method,
+            EstimateMethod::CatalogExact,
+            "a positive dm_db_partition_stats count IS catalog-exact"
+        );
+        let mut view = make_table(0, vec![]);
+        mark_mssql_catalog_exact(&mut view);
+        assert_eq!(
+            view.density.as_ref().unwrap().method,
+            EstimateMethod::Unverified,
+            "0 from a view / no-stats is UNKNOWN, not an audited exact 0"
+        );
+    }
+
+    /// A3/A2 (roast 2026-08-09): where best_cursor_column (name-preference) and
+    /// chosen_cursor_column (scored) DIVERGE, every user-facing surface that
+    /// names the cursor must name the CHOSEN one — the column actually written as
+    /// cursor_column — not the name-preferred phantom. Fixture: `updated_at` is
+    /// nullable (name-preferred but -10) and `modified_at` is not-null (scores
+    /// higher). RED against `mode_rationale` reading `best_cursor_column`.
+    #[test]
+    fn mode_rationale_names_the_chosen_cursor_not_the_name_preferred_one() {
+        let nullable_ts = |name: &str| ColumnInfo {
+            name: name.into(),
+            data_type: "timestamp".into(),
+            is_primary_key: false,
+            is_nullable: true,
+            numeric_precision: None,
+            numeric_scale: None,
+            is_indexed: false,
+        };
+        let info = make_table(
+            500_000,
+            vec![
+                col("payload", "text", false),
+                nullable_ts("updated_at"),
+                col("modified_at", "timestamp", false),
+            ],
+        );
+        // the divergence this test rests on (fixture is not inert)
+        assert_eq!(info.best_cursor_column(), Some("updated_at"));
+        assert_eq!(info.chosen_cursor_column().as_deref(), Some("modified_at"));
+        // the incremental rationale is printed next to `cursor_column: modified_at`
+        let r = info.mode_rationale("incremental");
+        assert!(
+            r.contains("modified_at"),
+            "must name the chosen cursor: {r}"
+        );
+        assert!(
+            !r.contains("updated_at"),
+            "must NOT name the name-preferred phantom: {r}"
+        );
     }
 
     #[test]
@@ -1139,6 +1539,7 @@ mod tests {
                     is_nullable: false,
                     numeric_precision: Some(20),
                     numeric_scale: Some(0),
+                    is_indexed: false,
                 },
                 col("name", "text", false),
             ],
@@ -1202,6 +1603,7 @@ mod tests {
                 &super::SourceProvenance::Inline,
                 &Default::default(),
                 None,
+                None,
             )
             .expect("scaffold");
             // COMMENTS STRIPPED. The keyset scaffold's hint line mentions
@@ -1264,6 +1666,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
@@ -1313,6 +1716,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
@@ -1350,6 +1754,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: incremental"), "got:\n{yaml}");
@@ -1360,6 +1765,7 @@ mod tests {
     #[test]
     fn generate_schema_config_emits_multiple_exports() {
         let a = TableInfo {
+            density: None,
             schema: "public".to_string(),
             table: "users".to_string(),
             row_estimate: 100,
@@ -1367,6 +1773,7 @@ mod tests {
             columns: vec![col("id", "bigint", true)],
         };
         let b = TableInfo {
+            density: None,
             schema: "public".to_string(),
             table: "orders".to_string(),
             row_estimate: 200,
@@ -1379,6 +1786,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             r#"schema "public" (2)"#,
             &InitYamlDestination::default(),
+            None,
             None,
         )
         .unwrap();
@@ -1416,6 +1824,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("type: gcs"), "got:\n{yaml}");
@@ -1442,6 +1851,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1467,6 +1877,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
             None,
         )
         .unwrap();
@@ -1498,6 +1909,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
             None,
         )
         .unwrap();
@@ -1596,6 +2008,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         // Plain `bucket: true` would deserialize to the boolean `true`.
@@ -1627,6 +2040,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         let parsed: serde_yaml_ng::Value =
@@ -1653,6 +2067,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
             None,
         )
         .unwrap();
@@ -1880,6 +2295,7 @@ mod tests {
                     is_nullable: true,
                     numeric_precision: None,
                     numeric_scale: None,
+                    is_indexed: false,
                 },
             ],
         );

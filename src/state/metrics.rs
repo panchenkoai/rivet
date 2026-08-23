@@ -1,6 +1,8 @@
 use crate::error::Result;
 
-use super::{StateConn, StateStore, pg_sql};
+#[cfg(test)]
+use super::StateConn;
+use super::StateStore;
 
 /// One row from `export_metrics`.
 #[derive(Debug)]
@@ -22,6 +24,8 @@ pub struct ExportMetric {
     pub retries: i64,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
+    /// v23 — decoded bytes READ from the source (0 for pre-v23 rows).
+    pub bytes_read: i64,
 }
 
 /// Every column written to one `export_metrics` row.
@@ -45,6 +49,8 @@ pub struct MetricRow {
     pub mode: Option<String>,
     pub files_produced: i64,
     pub bytes_written: i64,
+    /// Decoded bytes READ from the source (plan-shared counter; v23).
+    pub bytes_read: i64,
     pub retries: i64,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
@@ -95,65 +101,13 @@ pub struct MetricRow {
 /// Invariant I4 (Metric After Verdict) governs when `record_metric` is called:
 /// only after the terminal run outcome is determined.
 impl StateStore {
-    /// Back-compat shim: the original 15-field metric. Fills the v9 columns with
-    /// defaults (NULL) and delegates to [`record_metric_full`]. The production
-    /// run/apply path now builds a full [`MetricRow`]; this shim remains for the
-    /// unit + integration tests that only assert the core signals.
-    ///
-    /// `#[allow(dead_code)]`: the only non-test caller migrated to
-    /// `record_metric_full`, and the bin/lib dead-code pass can't see the uses
-    /// in `tests/*` (same reason `RunSummary::stub_for_testing` carries it).
-    #[allow(clippy::too_many_arguments, dead_code)]
-    pub fn record_metric(
-        &self,
-        export_name: &str,
-        run_id: &str,
-        duration_ms: i64,
-        total_rows: i64,
-        peak_rss_mb: Option<i64>,
-        status: &str,
-        error_message: Option<&str>,
-        tuning_profile: Option<&str>,
-        format: Option<&str>,
-        mode: Option<&str>,
-        files_produced: i64,
-        bytes_written: i64,
-        retries: i64,
-        validated: Option<bool>,
-        schema_changed: Option<bool>,
-    ) -> Result<()> {
-        self.record_metric_full(&MetricRow {
-            export_name: export_name.to_string(),
-            run_id: run_id.to_string(),
-            duration_ms,
-            total_rows,
-            peak_rss_mb,
-            status: status.to_string(),
-            error_message: error_message.map(str::to_string),
-            tuning_profile: tuning_profile.map(str::to_string),
-            format: format.map(str::to_string),
-            mode: mode.map(str::to_string),
-            files_produced,
-            bytes_written,
-            retries,
-            validated,
-            schema_changed,
-            ..Default::default()
-        })
-    }
-
     /// Drop a run's in-flight `running` aggregate. Only ever called by
     /// [`record_metric_full`], immediately before the terminal row replaces it.
     fn clear_running_metric(&self, run_id: &str) -> Result<()> {
-        let sql = "DELETE FROM export_metrics WHERE run_id = ?1 AND status = 'running'";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![run_id])?;
-            }
-            StateConn::Postgres(client) => {
-                client.borrow_mut().execute(&pg_sql(sql), &[&run_id])?;
-            }
-        }
+        self.execute(
+            "DELETE FROM export_metrics WHERE run_id = ?1 AND status = 'running'",
+            &[run_id.into()],
+        )?;
         Ok(())
     }
 
@@ -170,7 +124,7 @@ impl StateStore {
     /// rows and every sum over the table would count it five times. Hence UPDATE
     /// the run's `running` row, INSERT only when there is none, and let
     /// [`record_metric_full`] clear it when the terminal row lands.
-    pub(super) fn project_running_aggregate(
+    pub(crate) fn project_running_aggregate(
         &self,
         run_id: &str,
         export_name: &str,
@@ -202,20 +156,17 @@ impl StateStore {
         // idempotent against the v21 partial unique index, and the UPDATE that
         // follows recomputes the whole projection from `file_log`, so the final
         // row is correct no matter which worker won or in what order they ran.
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    ins,
-                    rusqlite::params![export_name, run_id, now, mode, format],
-                )?;
-                c.execute(upd, rusqlite::params![run_id, now])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(ins), &[&export_name, &run_id, &now, &mode, &format])?;
-                c.execute(&pg_sql(upd), &[&run_id, &now])?;
-            }
-        }
+        self.execute(
+            ins,
+            &[
+                export_name.into(),
+                run_id.into(),
+                now.as_str().into(),
+                mode.into(),
+                format.into(),
+            ],
+        )?;
+        self.execute(upd, &[run_id.into(), now.into()])?;
         Ok(())
     }
 
@@ -238,103 +189,54 @@ impl StateStore {
              chunk_size, parallel, source_type, destination_type, rivet_version,
              longest_chunk_ms, chunk_key,
              error_class, cursor_min, cursor_max, key_descriptor_json, offending_value,
-             server_context_json)
+             server_context_json, bytes_read)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-             ?32, ?33, ?34, ?35, ?36, ?37, ?38)";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![
-                        m.export_name,
-                        m.run_id,
-                        now,
-                        m.duration_ms,
-                        m.total_rows,
-                        m.peak_rss_mb,
-                        m.status,
-                        m.error_message,
-                        m.tuning_profile,
-                        m.format,
-                        m.mode,
-                        m.files_produced,
-                        m.bytes_written,
-                        m.retries,
-                        m.validated,
-                        m.schema_changed,
-                        m.files_committed,
-                        m.reconciled,
-                        m.source_count,
-                        m.quality_passed,
-                        m.pg_temp_bytes_delta,
-                        m.batch_size,
-                        m.batch_size_memory_mb,
-                        m.skip_reason,
-                        m.schema_fingerprint,
-                        m.chunk_size,
-                        m.parallel,
-                        m.source_type,
-                        m.destination_type,
-                        m.rivet_version,
-                        m.longest_chunk_ms,
-                        m.chunk_key,
-                        m.error_class,
-                        m.cursor_min,
-                        m.cursor_max,
-                        m.key_descriptor_json,
-                        m.offending_value,
-                        m.server_context_json
-                    ],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[
-                        &m.export_name,
-                        &m.run_id,
-                        &now,
-                        &m.duration_ms,
-                        &m.total_rows,
-                        &m.peak_rss_mb,
-                        &m.status,
-                        &m.error_message,
-                        &m.tuning_profile,
-                        &m.format,
-                        &m.mode,
-                        &m.files_produced,
-                        &m.bytes_written,
-                        &m.retries,
-                        &m.validated,
-                        &m.schema_changed,
-                        &m.files_committed,
-                        &m.reconciled,
-                        &m.source_count,
-                        &m.quality_passed,
-                        &m.pg_temp_bytes_delta,
-                        &m.batch_size,
-                        &m.batch_size_memory_mb,
-                        &m.skip_reason,
-                        &m.schema_fingerprint,
-                        &m.chunk_size,
-                        &m.parallel,
-                        &m.source_type,
-                        &m.destination_type,
-                        &m.rivet_version,
-                        &m.longest_chunk_ms,
-                        &m.chunk_key,
-                        &m.error_class,
-                        &m.cursor_min,
-                        &m.cursor_max,
-                        &m.key_descriptor_json,
-                        &m.offending_value,
-                        &m.server_context_json,
-                    ],
-                )?;
-            }
-        }
+             ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)";
+        self.execute(
+            sql,
+            &[
+                m.export_name.as_str().into(),
+                m.run_id.as_str().into(),
+                now.into(),
+                m.duration_ms.into(),
+                m.total_rows.into(),
+                m.peak_rss_mb.into(),
+                m.status.as_str().into(),
+                m.error_message.as_deref().into(),
+                m.tuning_profile.as_deref().into(),
+                m.format.as_deref().into(),
+                m.mode.as_deref().into(),
+                m.files_produced.into(),
+                m.bytes_written.into(),
+                m.retries.into(),
+                m.validated.into(),
+                m.schema_changed.into(),
+                m.files_committed.into(),
+                m.reconciled.into(),
+                m.source_count.into(),
+                m.quality_passed.into(),
+                m.pg_temp_bytes_delta.into(),
+                m.batch_size.into(),
+                m.batch_size_memory_mb.into(),
+                m.skip_reason.as_deref().into(),
+                m.schema_fingerprint.as_deref().into(),
+                m.chunk_size.into(),
+                m.parallel.into(),
+                m.source_type.as_deref().into(),
+                m.destination_type.as_deref().into(),
+                m.rivet_version.as_deref().into(),
+                m.longest_chunk_ms.into(),
+                m.chunk_key.as_deref().into(),
+                m.error_class.as_deref().into(),
+                m.cursor_min.as_deref().into(),
+                m.cursor_max.as_deref().into(),
+                m.key_descriptor_json.as_deref().into(),
+                m.offending_value.as_deref().into(),
+                m.server_context_json.as_deref().into(),
+                m.bytes_read.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -372,6 +274,9 @@ impl StateStore {
 
     /// Test-only read of the `export_harm` rows for a run, `(metric, delta)`
     /// sorted by metric — lets tests trace the harm signal through the table.
+    ///
+    /// Divergent-by-design (row.rs exemption): a sqlite-only test probe (the
+    /// non-sqlite arm deliberately returns empty), so it keeps its raw match.
     #[cfg(test)]
     pub(crate) fn harm_rows_for_test(&self, run_id: &str) -> Vec<(String, i64)> {
         match &self.conn {
@@ -395,6 +300,9 @@ impl StateStore {
     /// Test-only raw scalar read of a v9 metric column the typed `get_metrics`
     /// path intentionally doesn't surface — lets tests pin that the wide INSERT
     /// mapped each field to the right column (catches a positional param swap).
+    ///
+    /// Divergent-by-design (row.rs exemption): a sqlite-only test probe with a
+    /// `format!`-interpolated column name, so it keeps its raw match.
     #[cfg(test)]
     pub(crate) fn metric_scalar_i64(&self, run_id: &str, column: &str) -> Option<i64> {
         match &self.conn {
@@ -410,33 +318,68 @@ impl StateStore {
         }
     }
 
+    /// [`Self::get_last_success_metric`], excluding one run_id — the caller's
+    /// own freshly-recorded row, so a run can baseline against its
+    /// predecessor rather than itself.
+    pub fn get_last_success_metric_excluding(
+        &self,
+        export_name: &str,
+        exclude_run_id: &str,
+    ) -> Result<Option<ExportMetric>> {
+        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
+                    status, error_message, tuning_profile, format, mode, \
+                    files_produced, bytes_written, retries, validated, schema_changed, \
+                    bytes_read";
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT {cols} FROM export_metrics \
+                     WHERE export_name = ?1 AND status = 'success' \
+                       AND (run_id IS NULL OR run_id != ?2) \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                &[export_name.into(), exclude_run_id.into()],
+                metric_from_row,
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// The most recent SUCCESS row for `export_name`, regardless of how many
+    /// failed/interrupted attempts sit between it and now. A fixed recent
+    /// window (`get_metrics(_, N)`) goes blind after N consecutive failures —
+    /// exactly during the degraded period the pool predictor and the
+    /// run-over-run regression baseline exist for (bughunt 2026-08-13).
+    pub fn get_last_success_metric(&self, export_name: &str) -> Result<Option<ExportMetric>> {
+        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
+                    status, error_message, tuning_profile, format, mode, \
+                    files_produced, bytes_written, retries, validated, schema_changed, \
+                    bytes_read";
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT {cols} FROM export_metrics \
+                     WHERE export_name = ?1 AND status = 'success' \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                &[export_name.into()],
+                metric_from_row,
+            )?
+            .into_iter()
+            .next())
+    }
+
     pub fn get_metrics(
         &self,
         export_name: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ExportMetric>> {
         // One projection, written once for both backends (was duplicated per arm).
-        let extract = |r: &dyn super::row::StateRow| ExportMetric {
-            export_name: r.text(0),
-            run_id: r.opt_text(1),
-            run_at: r.text(2),
-            duration_ms: r.i64(3),
-            total_rows: r.i64(4),
-            peak_rss_mb: r.opt_i64(5),
-            status: r.text(6),
-            error_message: r.opt_text(7),
-            tuning_profile: r.opt_text(8),
-            format: r.opt_text(9),
-            mode: r.opt_text(10),
-            files_produced: r.opt_i64(11).unwrap_or(0),
-            bytes_written: r.opt_i64(12).unwrap_or(0),
-            retries: r.opt_i64(13).unwrap_or(0),
-            validated: r.opt_bool(14),
-            schema_changed: r.opt_bool(15),
-        };
+        let extract = metric_from_row;
         let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
                     status, error_message, tuning_profile, format, mode, \
-                    files_produced, bytes_written, retries, validated, schema_changed";
+                    files_produced, bytes_written, retries, validated, schema_changed, \
+                    bytes_read";
         match export_name {
             Some(name) => self.query(
                 &format!(
@@ -451,6 +394,30 @@ impl StateStore {
                 extract,
             ),
         }
+    }
+}
+
+/// Shared row→struct projection for every `export_metrics` query, written once
+/// for both state backends.
+fn metric_from_row(r: &dyn super::row::StateRow) -> ExportMetric {
+    ExportMetric {
+        export_name: r.text(0),
+        run_id: r.opt_text(1),
+        run_at: r.text(2),
+        duration_ms: r.i64(3),
+        total_rows: r.i64(4),
+        peak_rss_mb: r.opt_i64(5),
+        status: r.text(6),
+        error_message: r.opt_text(7),
+        tuning_profile: r.opt_text(8),
+        format: r.opt_text(9),
+        mode: r.opt_text(10),
+        files_produced: r.opt_i64(11).unwrap_or(0),
+        bytes_written: r.opt_i64(12).unwrap_or(0),
+        retries: r.opt_i64(13).unwrap_or(0),
+        validated: r.opt_bool(14),
+        schema_changed: r.opt_bool(15),
+        bytes_read: r.opt_i64(16).unwrap_or(0),
     }
 }
 
@@ -486,6 +453,7 @@ mod tests {
             bytes: 100,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .expect("seed a durable part");
 
@@ -538,41 +506,43 @@ mod tests {
     #[test]
     fn record_and_query_metrics() {
         let s = store();
-        s.record_metric(
-            "orders",
-            "run_001",
-            1200,
-            50000,
-            Some(142),
-            "success",
-            None,
-            Some("safe"),
-            Some("parquet"),
-            Some("full"),
-            1,
-            4096,
-            0,
-            Some(true),
-            Some(false),
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "orders".to_string(),
+            run_id: "run_001".to_string(),
+            duration_ms: 1200,
+            total_rows: 50000,
+            peak_rss_mb: Some(142),
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: Some("safe".to_string()),
+            format: Some("parquet".to_string()),
+            mode: Some("full".to_string()),
+            files_produced: 1,
+            bytes_written: 4096,
+            retries: 0,
+            validated: Some(true),
+            schema_changed: Some(false),
+            ..Default::default()
+        })
         .unwrap();
-        s.record_metric(
-            "orders",
-            "run_002",
-            300,
-            0,
-            Some(30),
-            "failed",
-            Some("timeout"),
-            Some("safe"),
-            Some("parquet"),
-            Some("full"),
-            0,
-            0,
-            2,
-            None,
-            None,
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "orders".to_string(),
+            run_id: "run_002".to_string(),
+            duration_ms: 300,
+            total_rows: 0,
+            peak_rss_mb: Some(30),
+            status: "failed".to_string(),
+            error_message: Some("timeout".to_string()),
+            tuning_profile: Some("safe".to_string()),
+            format: Some("parquet".to_string()),
+            mode: Some("full".to_string()),
+            files_produced: 0,
+            bytes_written: 0,
+            retries: 2,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
         let metrics = s.get_metrics(Some("orders"), 10).unwrap();
@@ -663,15 +633,43 @@ mod tests {
     #[test]
     fn query_metrics_all_exports() {
         let s = store();
-        s.record_metric(
-            "orders", "r1", 100, 1000, None, "success", None, None, None, None, 1, 500, 0, None,
-            None,
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "orders".to_string(),
+            run_id: "r1".to_string(),
+            duration_ms: 100,
+            total_rows: 1000,
+            peak_rss_mb: None,
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: None,
+            format: None,
+            mode: None,
+            files_produced: 1,
+            bytes_written: 500,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
-        s.record_metric(
-            "users", "r2", 200, 2000, None, "success", None, None, None, None, 1, 800, 0, None,
-            None,
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "users".to_string(),
+            run_id: "r2".to_string(),
+            duration_ms: 200,
+            total_rows: 2000,
+            peak_rss_mb: None,
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: None,
+            format: None,
+            mode: None,
+            files_produced: 1,
+            bytes_written: 800,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
         let metrics = s.get_metrics(None, 10).unwrap();
@@ -682,23 +680,24 @@ mod tests {
     fn metrics_limit_works() {
         let s = store();
         for i in 0..10 {
-            s.record_metric(
-                "t",
-                &format!("r{}", i),
-                i * 100,
-                i,
-                None,
-                "success",
-                None,
-                None,
-                None,
-                None,
-                0,
-                0,
-                0,
-                None,
-                None,
-            )
+            s.record_metric_full(&crate::state::MetricRow {
+                export_name: "t".to_string(),
+                run_id: format!("r{}", i),
+                duration_ms: i * 100,
+                total_rows: i,
+                peak_rss_mb: None,
+                status: "success".to_string(),
+                error_message: None,
+                tuning_profile: None,
+                format: None,
+                mode: None,
+                files_produced: 0,
+                bytes_written: 0,
+                retries: 0,
+                validated: None,
+                schema_changed: None,
+                ..Default::default()
+            })
             .unwrap();
         }
         let metrics = s.get_metrics(Some("t"), 3).unwrap();

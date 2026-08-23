@@ -27,13 +27,6 @@
 
 use crate::common::*;
 
-/// Write `yaml` into a fresh tempdir and return both so the dir stays alive.
-fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
-    (d, p)
-}
-
 // ─── #11: inapplicable type override must be rejected by `check` ──────────────
 
 #[test]
@@ -46,33 +39,14 @@ fn audit_check_rejects_inapplicable_type_override() {
     let out = tempfile::tempdir().unwrap();
     // quantity is int4 in the seeded `orders` table; declaring it `string`
     // is an inapplicable override that the run rejects mid-extraction.
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, quantity, price, status FROM orders"
-    mode: full
-    format: parquet
-    columns:
-      quantity: "string"
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query("SELECT id, quantity, price, status FROM orders")
+        .mode("full")
+        .export_line("columns:")
+        .export_line("  quantity: \"string\"")
+        .dest_path(out.path().to_path_buf());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfgpath.to_str().unwrap(),
-            "--export",
-            &export_name,
-            "--type-report",
-        ])
-        .output()
-        .expect("spawn rivet check --type-report");
+    let result = rig.cli(&["check", "--export", &export_name, "--type-report"]);
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -110,31 +84,13 @@ fn audit_check_flags_missing_cursor_column() {
     let out = tempfile::tempdir().unwrap();
     // does_not_exist is not a column of `orders`; the incremental cursor
     // references a phantom column.
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, quantity, price FROM orders"
-    mode: incremental
-    cursor_column: does_not_exist
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query("SELECT id, quantity, price FROM orders")
+        .mode("incremental")
+        .export_line("cursor_column: does_not_exist")
+        .dest_path(out.path().to_path_buf());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfgpath.to_str().unwrap(),
-            "--export",
-            &export_name,
-        ])
-        .output()
-        .expect("spawn rivet check (missing cursor column)");
+    let result = rig.cli(&["check", "--export", &export_name]);
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -170,24 +126,15 @@ fn audit_run_rejects_quality_on_nonexistent_column() {
     let out = tempfile::tempdir().unwrap();
     // nonexistent_col is not produced by the query; a uniqueness gate that
     // references it can never evaluate, so the gate silently disappears.
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, quantity, price, status FROM orders"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      unique_columns: [nonexistent_col]
-      unique_max_entries: 100000
-"#,
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query("SELECT id, quantity, price, status FROM orders")
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  unique_columns: [nonexistent_col]")
+        .export_line("  unique_max_entries: 100000")
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -227,34 +174,14 @@ fn audit_type_report_flags_lossy_scale_reduction() {
     let out = tempfile::tempdir().unwrap();
     // price is numeric(10,2); overriding to decimal(20,0) drops the 2 scale
     // digits — a lossy scale reduction that the run silently truncates.
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, price FROM orders"
-    mode: full
-    format: parquet
-    columns:
-      price: "decimal(20,0)"
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query("SELECT id, price FROM orders")
+        .mode("full")
+        .export_line("columns:")
+        .export_line("  price: \"decimal(20,0)\"")
+        .dest_path(out.path().to_path_buf());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfgpath.to_str().unwrap(),
-            "--export",
-            &export_name,
-            "--type-report",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet check --type-report --json");
+    let result = rig.cli(&["check", "--export", &export_name, "--type-report", "--json"]);
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -353,25 +280,13 @@ fn audit_scale_zero_override_must_not_silently_truncate() {
     );
 
     let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {table}
-    table: "public.{table}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(20,0)"
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
-    let run = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfgpath.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet run");
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named(&table)
+        .mode("full")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(20,0)\"")
+        .dest_path(out.path().to_path_buf());
+    let run = rig.run_args(&[]);
 
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 

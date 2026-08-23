@@ -80,6 +80,38 @@ pub(crate) fn maybe_exit_at_index(point: &str, index: i64) {
     }
 }
 
+/// PAUSE for the configured milliseconds if `RIVET_TEST_PAUSE_AT` names this
+/// point (`"{point}:{millis}"`). The fourth primitive beside panic / hard-exit /
+/// returned-error: some tests need to construct a CONCURRENCY WINDOW — "a
+/// writer commits AFTER the snapshot opens and BEFORE the read finishes" — and
+/// without a pause the only tool is a sleep in the TEST racing rivet's own
+/// startup. That race is exactly how the reconcile-mismatch fixture flaked both
+/// ways (a 600 ms sleep lost to startup on a loaded box; a pg_stat_activity
+/// wait turned a CI-green test red, cause never identified, reverted). A pause
+/// at the product's own sequence point does not race anything: the window IS
+/// open when the point is reached.
+#[inline]
+pub(crate) fn maybe_pause_at(point: &str) {
+    if let Ok(p) = std::env::var("RIVET_TEST_PAUSE_AT")
+        && let Some((configured, ms)) = p.rsplit_once(':')
+        && configured == point
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        eprintln!("rivet test-hook: pausing {ms}ms at '{point}' (RIVET_TEST_PAUSE_AT)");
+        // Announce the window to the TEST before sleeping: the pause opens a
+        // concurrency window, but the test's writer has no way to know it
+        // opened — a writer on its own clock races rivet's startup, which is
+        // the exact defect this hook exists to remove (measured: an immediate
+        // writer landed its rows BEFORE the snapshot and the window was
+        // pause-shaped but empty). Touching a file turns "the window is open"
+        // into a pollable condition instead of a guess.
+        if let Ok(marker) = std::env::var("RIVET_TEST_PAUSE_MARKER") {
+            let _ = std::fs::write(&marker, point);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// Return an `Err` if `RIVET_TEST_ERROR_AT` matches `"{point}:{index}"` — simulates a
 /// per-worker SQL error (connection drop / statement timeout) MID-RANGE, distinct from
 /// the hard-exit crash: the worker RETURNS an error (not process death), the parallel

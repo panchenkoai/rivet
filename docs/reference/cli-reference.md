@@ -141,9 +141,9 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 * `--server-id <SERVER_ID>` — Replica server-id for the binlog connection (must be distinct from the source's and any other replica)
 
   Default value: `4271`
-* `--checkpoint <PATH>` — Persist/resume the binlog position to this file. Omit to tail from the current position without checkpointing
+* `--checkpoint <PATH>` — Persist/resume the engine's log position to this file (MySQL binlog coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN / MongoDB resume token). If omitted, each engine falls back to its own anchor: MySQL and MongoDB start at the source's CURRENT position (nothing written before now is captured), PostgreSQL resumes from the slot itself (server-side — a slot created here pins at the current WAL position), and SQL Server starts at the capture instance's `fn_cdc_get_min_lsn` (it over-reads the retained backlog rather than skipping)
 * `--table <TABLE>` — Only emit changes for this table (repeatable; default: all tables)
-* `--max-events <N>` — Stop after N change events (default: stream until interrupted)
+* `--max-events <N>` — Stop at the first COMMIT BOUNDARY once N change events have been emitted — a soft cap, so the run may overshoot N by the remainder of the transaction the cap lands in. A hard per-event stop cannot checkpoint inside a transaction, so a transaction longer than N left the run re-reading the same position on every restart. Without it the default bounded run drains to the log end as of open and exits; streaming until interrupted needs `--stream`
 * `--output <DIR>` — Write typed Parquet/CSV files to this directory (the upsert/after-image shape) instead of NDJSON to stdout. Requires exactly one `--table` — its schema is resolved from the source
 * `--format <FORMAT>` — Output file format when `--output` is set: `parquet` (default) or `csv`
 
@@ -155,7 +155,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
   Default value: `rivet_slot`
 * `--capture-instance <INSTANCE>` — SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources
-* `--stream` — Stream continuously instead of the DEFAULT bounded "read to the log end and exit" drain. Continuous streaming is a long-lived daemon; omit this for the scheduler-friendly bounded run (the default). For MySQL the bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain their backlog and exit
+* `--stream` — Stream continuously instead of the DEFAULT bounded "read to the log end and exit" drain. What "continuously" means is per engine: MySQL (a blocking binlog dump) and MongoDB (a change stream that blocks awaiting events) stay up until stopped; PostgreSQL and SQL Server are poll adapters that STILL EXIT ON CATCH-UP — there this is one unbounded pass, not a daemon, so run it under a supervisor that restarts it. Omit it for the scheduler-friendly bounded run (the default). For MySQL the bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain their backlog and exit
 
 
 
@@ -170,7 +170,6 @@ The native column schema, target table, partition, and source URIs are all deriv
 ###### **Options:**
 
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
-* `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess. Defaults to THIS executable (self), so the load's `rivet check` resolves types with the same version — a `rivet` on `$PATH` may be a different, skewed version. Override only to pin a specific binary
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
 
 
@@ -334,6 +333,19 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--gcs-credentials-file <PATH>` — Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML
 * `--s3-bucket <NAME>` — Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--gcs-bucket` and `--discover`
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
+* `--tls <MODE>` — TLS posture for BOTH the introspection connection init opens AND the `source.tls:` block written into the scaffold. Required (or `disable`, explicitly) for any non-loopback host — without it the TLS gate refuses before connecting, and at init time there is no config file to add a `tls:` block to yet
+
+  Possible values:
+  - `disable`:
+    Plaintext. Use only inside trusted networks (loopback, cgroup-private)
+  - `require`:
+    Require a TLS handshake; accept the server certificate without verifying issuer or hostname. Protects against passive sniffing, not MITM
+  - `verify-ca`:
+    TLS + verify certificate chains to the configured / system trust store. Does not check hostname (useful for IP-addressed or internal names)
+  - `verify-full`:
+    TLS + verify chain **and** hostname against the server cert's SAN/CN. Recommended default for production
+
+* `--tls-ca <PATH>` — PEM CA certificate for `--tls verify-ca` / `verify-full` against a private CA; written into the scaffold as `ca_file:`. Refused with `disable`/`require`, where it would be silently meaningless
 
 
 
@@ -349,6 +361,7 @@ Generate an execution plan artifact (no data exported)
 * `-e`, `--export <EXPORT>` — Plan only a specific export by name
 * `-p`, `--param <KEY=VALUE>` — Query parameter: key=value (repeatable)
 * `-o`, `--output <OUTPUT>` — Write plan JSON to this file (default: print summary to stdout)
+* `--annotate-waves` — Write this plan's `wave:` / `parallel_safe:` schedule into the config, (over)writing every export. WITHOUT this flag `rivet plan` is READ-ONLY: it prints the schedule and the reviewable plan but never touches the config file — not even to fill in absent fields. This makes config mutation an explicit, opt-in act (a read-only-looking `rivet plan` once turned a hand-tuned 5-per-wave split into one 76-export wave)
 * `--format <FORMAT>` — Output format: "pretty" (human summary) or "json" (machine-readable)
 
   Default value: `pretty`
@@ -376,7 +389,9 @@ Execute a sealed plan artifact, or run a config's exports wave-by-wave
 
 * `--parallel-export-processes` — Run the cheap (low-cost) exports within each wave concurrently, as separate processes (same as `parallel_export_processes: true` in the config). Config-wave mode only; heavier exports — which already chunk-parallelize internally — still run one at a time
 * `--resume` — Config-wave mode: skip exports a prior run already completed (`_SUCCESS` present) and resume incomplete chunked exports from their checkpoints, so a re-run after a partial failure does not redo finished tables. Independent tables are never re-exported
-* `--force` — Skip staleness check (allow plans older than 24 h)
+* `--force` — Override whichever safety gate refuses the run: in JSON-artifact mode the plan staleness check (> 24 h) and the incremental cursor-drift check (each bypass is recorded in the run's `apply_context`); in YAML config mode, with `--resume`, the refusal to resume into a prefix whose `_SUCCESS` marker is already present
+* `--pool <N>` — Run the whole config as ONE bounded work-stealing pool of N export slots (config mode only, #166): exports start longest-first (LPT, by each export's last measured duration) and every freeing slot pulls the next — no wave barriers, so the wall approaches `max(longest, total/N)`. Priority `wave:` tiers are NOT honored (makespan mode); exports that are not `parallel_safe` never run concurrently with EACH OTHER (one heavy at a time; cheap exports backfill the remaining slots)
+* `--split` — With `--pool`: when ONE export dominates the pool floor (its predicted duration ≫ the next-longest, #167), split it into N range sub-exports over its key span — separate scheduler units the pool places concurrently, so the giant stops being the makespan floor. The units share one destination prefix and fold to one family, so the load view reads them as a single logical table. Only full/chunked/keyset exports with a `chunk_by_key:`/`chunk_column:` are split (never incremental/CDC). Off by default; ignored without `--pool`
 
 
 

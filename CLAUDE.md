@@ -605,6 +605,29 @@ one, and PROVE which by mutating and running the live suite: `total_rows += `
 file as a lib-suite survivor — is caught by three. What the live suite did NOT
 catch was worth the search: see the failed-chunk guard below.
 
+The corollary that keeps that exclusion HONEST: **a body the offline gate cannot
+reach may not DECIDE.** Excluding a live-only function wholesale
+(`replace run_pool -> Result`) is a truthful claim about the BODY and a silent
+one about the branches inside it — every `&&`, `!` or `x > y` written there is a
+mutant excluded with nothing asked in return. Measured: five decisions were
+pulled out of `execute_resolved_plan` (`src/pipeline/job.rs`) BY HAND this
+session — `should_reconcile`, `plan_rejection_error`,
+`resume_success_gate_applies`, `rerun_warning_applies`,
+`dispatches_to_cdc_runner` — each only because the in-diff gate pointed at that
+one operator and someone argued it out; `fold_failures` (`src/pipeline/run.rs`)
+came out of the same pass and was a REAL gap, with no unit oracle at all. Six
+extractions, six ad-hoc arguments, and nothing stopping the seventh from being
+written inline tomorrow. So the rule, not the litigation: **a live-only body is
+GLUE — sequencing, I/O, error context — and calls a NAMED PURE PREDICATE for
+anything it decides**; the predicate is offline-testable and its mutants are
+graded, the glue stays excluded for the reason its exclusion gives. The tell that
+this went wrong is an operator-shaped entry in `.cargo/mutants.toml` (`delete !
+in run_pool`, `replace == with != in check$`): that is a decision that should
+have been a function. Enforced by `tests/offline/live_only_purity_gate.rs`, which
+DERIVES the live-only set from the config's whole-function exclusions (never a
+typed-in list) and holds each body at a shrink-only ceiling — lower a row the
+moment you extract, and it fails downward too so the win stays banked.
+
 Scope honesty: mutation testing measures assertion SENSITIVITY on code that
 exists. It cannot see a missing behaviour (the manifest-clobber fix itself was
 invisible to it — an independent-oracle harness caught that), nor a test and
@@ -642,7 +665,28 @@ evidence about what the run delivered.
 Corollary on redundant guards: the parallel test goes RED only when BOTH guards
 are off. Say that in the test body rather than presenting it as two proofs —
 the same load-bearing / belt-and-suspenders distinction the `until_current`
-rule already insists on.
+rule already insists on. Not every runner is redundant, and the difference is
+worth stating: the PLAIN parallel runner keeps no `chunk_task` ledger and no
+completion count, so its single post-join bail is all that stands between a
+partial export and a green `_SUCCESS` — a single-guard RED, said so in the test.
+
+Sibling class the same fill exposed, and the reason the hook had to be wired at
+all: **an exit-status oracle over a fixture that fails for a SECOND reason
+grades nothing.** `governor_does_not_deadlock_when_chunks_fail` drives the exact
+runner, really does fail chunks, and asserts `!status.success()` — and it stays
+GREEN with the guard deleted, because its destination points under a regular
+file, so the run exits non-zero on the unwritable path whether or not the guard
+fires. It reads as a failure-path test and cannot distinguish rivet's guard from
+`Permission denied`. Process rule: **when a test's oracle is the exit status,
+name the ONE thing in the fixture that can produce it, and assert the delivered
+outcome (the ledger's `files_committed`, the absence of `_SUCCESS`) rather than
+the status alone** — otherwise the fixture's own breakage answers for the
+product. The tell is a fault-injection test whose fixture is ALSO misconfigured
+on purpose (an unwritable path, a missing table, a bad credential) to "make it
+fail": that second cause is now the thing being measured. RED-proven by the
+disagreement — `a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export`
+goes RED against the removed guard (100 of 150 rows shipped `status: success`,
+exit 0) while all 11 pre-existing tests in the same module stay green.
 
 ## A per-export feature must be wired into EVERY runner — the runner-bypass class
 

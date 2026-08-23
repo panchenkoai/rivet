@@ -47,16 +47,6 @@ fn seed_distinct_payload() -> (String, PgTable) {
     (name.clone(), PgTable::adopt(name))
 }
 
-/// Extract blob names from an Azure "List Blobs" XML body: each blob is
-/// `<Blob><Name>…</Name>…</Blob>`.
-fn blob_names_from_list_xml(xml: &str) -> Vec<String> {
-    xml.split("<Name>")
-        .skip(1)
-        .filter_map(|seg| seg.split("</Name>").next())
-        .map(|s| s.to_string())
-        .collect()
-}
-
 #[test]
 #[ignore = "live: requires docker compose postgres + azurite, and the az CLI on PATH"]
 fn cloud_multipart_azure_rotation_distinct_keys_and_all_rows() {
@@ -68,43 +58,22 @@ fn cloud_multipart_azure_rotation_distinct_keys_and_all_rows() {
     let prefix = unique_name("azmp");
     let (table, _g) = seed_distinct_payload();
 
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {prefix}
-    query: "SELECT id, payload FROM {table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 500
-    format: parquet
-    compression: none
-    max_file_size: 64KB
-    parquet:
-      row_group_strategy: fixed_rows
-      row_group_rows: 100
-    tuning: {{batch_size: 100}}
-    destination:
-      type: azure
-      bucket: {container}
-      prefix: {prefix}
-      account_name: {AZURITE_ACCOUNT}
-      account_key_env: RIVET_TEST_AZURITE_KEY
-      endpoint: {AZURITE_ENDPOINT}
-"#
+    let rig = Rig::pg_batch(&prefix)
+        .query(&format!("SELECT id, payload FROM {table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 500")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("parquet:")
+        .export_line("  row_group_strategy: fixed_rows")
+        .export_line("  row_group_rows: 100")
+        .export_line("tuning: {batch_size: 100}")
+        .dest_azure(&container, &prefix);
+    let run = rig.run_args_env(
+        &["--export", &prefix],
+        &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)],
     );
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &yaml);
-    let run = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &prefix,
-        ])
-        .env("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)
-        .output()
-        .expect("spawn rivet");
     assert!(
         run.status.success(),
         "azure multipart export must succeed; stderr:\n{}",
@@ -122,7 +91,7 @@ exports:
         .expect("azure list request")
         .text()
         .expect("azure list body");
-    let keys = blob_names_from_list_xml(&xml);
+    let keys = azure_blob_names_from_list_xml(&xml);
 
     let parquet: Vec<&String> = keys.iter().filter(|k| k.ends_with(".parquet")).collect();
     assert!(

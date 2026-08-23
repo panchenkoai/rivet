@@ -20,11 +20,12 @@ If you just want to export one table, start with [Getting Started](../getting-st
 - `rivet --version` works.
 - A writeable local path or an S3/GCS bucket for output.
 
-The repo ships a `docker-compose.yaml` with both engines pre-seeded by [`dev/postgres/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/postgres/init.sql) / [`dev/mysql/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/mysql/init.sql) and the bench seed tool (`cargo run --bin seed`). Follow along on that if you don't have a source handy.
+The repo ships a `docker-compose.yaml` with both engines pre-seeded by [`dev/postgres/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/postgres/init.sql) / [`dev/mysql/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/mysql/init.sql) and the bench seed tool (`cargo run --features dev-seed --bin seed` — the seeder is gated behind the off-by-default `dev-seed` cargo feature, so a bare `cargo run --bin seed` errors). Follow along on that if you don't have a source handy.
 
 ```bash
 docker compose up -d postgres mysql
-cargo run --bin seed -- --target both      # fills orders, events, orders_coalesce, orders_sparse
+cargo run --features dev-seed --bin seed -- --target both   # postgres + mysql: fills users, orders, events, page_views, content_items, orders_coalesce
+# orders_sparse is created and truncated but left EMPTY — add --sparse-chunk-demo to fill it
 export DATABASE_URL='postgresql://rivet:rivet@localhost:5432/rivet'
 ```
 
@@ -45,7 +46,7 @@ Everything below works with local-dev settings. For a real pilot against a manag
       ca_file: /etc/ssl/certs/rds-ca-2019-root.pem   # if your CA is not in system trust
   ```
 
-  See [reference/config.md § TLS](../reference/config.md#tls) for the full matrix (`disable` | `require` | `verify-ca` | `verify-full`). Omitting `tls:` connects in plaintext and logs a WARN.
+  See [reference/config.md § TLS](../reference/config.md#tls) for the full matrix (`disable` | `require` | `verify-ca` | `verify-full`). Omitting `tls:` is only allowed for loopback hosts (localhost / 127.0.0.0/8 / ::1), which connect in plaintext; against any remote (non-loopback) host rivet refuses the connection before any network I/O with a "TLS required" error. To opt into remote plaintext you must set `tls: { mode: disable }` explicitly.
 
 - **Never put the DB URL on the command line in prod.** Use `--source-env` for `rivet init`:
 
@@ -149,7 +150,12 @@ A single-export plan prints a `Priority` block; a multi-export plan adds a `Camp
 rivet plan -c pilot.yaml --format json -o plan.json
 ```
 
-For a multi-export config, `plan` also writes the assigned `wave:` and `parallel_safe:` fields back into the config **in place** (preserving your comments and field order) — visible, hand-editable, and consumed by `rivet apply <config>` in Step 4. The plan *suggests* the schedule; you stay in control.
+For a multi-export config, `plan` is **read-only**: it prints the recommended schedule and never touches your config. Pass `--annotate-waves` to write the `wave:` and `parallel_safe:` fields into the config **in place** (preserving your comments and field order) — visible, hand-editable, and consumed by `rivet apply <config>` in Step 4. The flag replaces the whole schedule with the plan's recommendations, absent fields and hand-tuned ones alike, so review the printed schedule first. The plan *suggests*; you stay in control.
+
+```bash
+rivet plan -c pilot.yaml                   # review the schedule (read-only)
+rivet plan -c pilot.yaml --annotate-waves  # then persist it into the config
+```
 
 **What the plan guarantees (PA1–PA8):**
 - PA1 — the artifact is the sole input to `apply`.
@@ -169,7 +175,7 @@ Three ways to execute, by how much orchestration you want.
 rivet run -c pilot.yaml --validate
 ```
 
-**Apply the whole config wave-by-wave** — `rivet plan` (Step 3) wrote a `wave:` onto each export; apply runs them lowest-wave first, with a barrier between waves. Tables are independent, so a failed export does **not** block its wave-mates: apply collects the failure, runs the rest, and exits non-zero. Add `--parallel-export-processes` to run the cheap (`parallel_safe`) exports within a wave concurrently — the heavy ones still run alone (they chunk-parallelize internally):
+**Apply the whole config wave-by-wave** — `rivet plan --annotate-waves` (Step 3) wrote a `wave:` onto each export; apply runs them lowest-wave first, with a barrier between waves. Exports with no `wave:` run last, as one implicit final wave — so a config you never annotated still applies, just in a single band. Tables are independent, so a failed export does **not** block its wave-mates: apply collects the failure, runs the rest, and exits non-zero. Add `--parallel-export-processes` to run the cheap (`parallel_safe`) exports within a wave concurrently — the heavy ones still run alone (they chunk-parallelize internally):
 
 ```bash
 rivet apply pilot.yaml                          # wave-ordered, sequential
@@ -253,7 +259,7 @@ rivet repair -c pilot.yaml -e orders --report reconcile.json --execute
 What `--execute` does:
 
 - Re-runs only the flagged chunk ranges via `run_chunked_sequential(ChunkSource::Precomputed)` — same SQL shape as extraction and reconcile (RR3).
-- Writes **new** output files alongside originals with `<export>_<ts>_chunk<idx>.<ext>` naming — Rivet does **not** delete or overwrite prior files (RR5). Downstream deduplication is the operator's responsibility (or put the output under a versioned prefix / partitioned path).
+- Writes **new** output files alongside originals with `<export>_<ts>_chunk<idx>_<16-hex-nonce>.<ext>` naming (e.g. `orders_20260611_120000_chunk2_a1b2c3d4e5f6a7b8.parquet`; the random nonce is what guarantees a repair part can never overwrite the original) — Rivet does **not** delete or overwrite prior files (RR5). Downstream deduplication is the operator's responsibility (or put the output under a versioned prefix / partitioned path).
 - Leaves `last_committed_*` untouched (RR4) — the chunk index was already covered at the original run; repair is corrective, not commitment.
 
 ---

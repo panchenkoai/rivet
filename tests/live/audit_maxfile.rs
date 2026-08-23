@@ -88,37 +88,21 @@ fn audit_maxfilesize_parquet_warns_when_inert() {
 
     let export = unique_name("audit_maxfile_pq");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
     // Snapshot parquet export with a tiny cap and NO parquet.row_group_rows, so
     // the default ~1M-row group means nothing is flushed until finish() and
     // `maybe_split` never sees `bytes_written() >= max`. Wide columns ensure the
     // single file comfortably exceeds the declared 64KB cap.
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, title, body, raw_html, metadata FROM {table} ORDER BY id"
-    mode: full
-    format: parquet
-    compression: zstd
-    max_file_size: 64KB
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!(
+            "SELECT id, title, body, raw_html, metadata FROM {table} ORDER BY id"
+        ))
+        .export_line("compression: zstd")
+        .export_line("max_file_size: 64KB")
+        .dest_path(out.path().to_path_buf());
 
     // RUST_LOG=warn so any log::warn! about the cap being unenforceable reaches
     // stderr (this repo's convention for asserting on warnings).
-    let run = run_rivet_with_warn_log(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        &export,
-    ]);
+    let run = rig.run_args_env(&["--export", &export], &[("RUST_LOG", "warn")]);
     assert!(
         run.status.success(),
         "setup: parquet export must succeed (exit {:?}); stderr:\n{}",
@@ -180,33 +164,20 @@ fn audit_validate_absent_prefix_can_fail() {
     // A minimal config with a local destination. We never run `rivet run`, so
     // no manifest is ever written at the prefix below.
     let export = unique_name("audit_validate_empty");
-    let cfg_dir = tempfile::tempdir().unwrap();
     let dest_dir = tempfile::tempdir().unwrap();
     let empty_prefix = dest_dir.path().join("never_written");
     std::fs::create_dir_all(&empty_prefix).expect("create empty prefix dir");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT 1 AS id"
-    mode: full
-    format: parquet
-    compression: zstd
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = dest_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query("SELECT 1 AS id")
+        .export_line("compression: zstd")
+        .dest_path(dest_dir.path().to_path_buf());
 
     // --prefix overrides the resolved destination path to a directory that was
     // never written. There is no manifest.json there, so the verifier returns
     // the legacy-run verdict (`legacy_run: true`), which the exit gate keeps at 0.
-    let out = run_rivet(&[
+    let out = rig.cli(&[
         "validate",
-        "--config",
-        cfg.to_str().unwrap(),
         "--export",
         &export,
         "--prefix",

@@ -53,6 +53,19 @@ impl GcsStore {
                 .map_err(|e| anyhow::anyhow!("failed to create tokio runtime for GCS ops: {e}"))?,
         );
         let _guard = runtime.enter();
+        // Retry transient HTTP failures (5xx / 429 / hyper-reqwest blips) on the
+        // LOAD/read path too — the export path (CloudDestination) applies this
+        // identical RetryLayer, but this store built the operator without it, so
+        // a transient blip during a load list/read failed hard (bug hunt
+        // 2026-08-09). One policy on both paths; harmless on the local Fs backend.
+        let async_op = async_op.layer(
+            opendal::layers::RetryLayer::new()
+                .with_max_times(3)
+                .with_min_delay(std::time::Duration::from_millis(200))
+                .with_max_delay(std::time::Duration::from_secs(10))
+                .with_jitter()
+                .with_notify(super::cloud::RivetRetryNotify),
+        );
         let op = opendal::blocking::Operator::new(async_op)?;
         Ok(Self {
             _runtime: runtime,
@@ -166,12 +179,14 @@ impl CloudBackend for GcsBackend {
             // A refreshing loader, not a static `.token()`: opendal pins a
             // static token with a usize::MAX expiry, so exports longer than
             // the ~1h ADC token TTL would 401 mid-run, non-retryably.
+            log::info!(
+                "GCS: using ADC {} credentials as {} (access token auto-refreshes before expiry)",
+                loader.credential_kind(),
+                loader.principal()
+            );
             builder = builder
                 .disable_vm_metadata()
                 .customized_token_loader(Box::new(loader));
-            log::info!(
-                "GCS: using ADC authorized_user credentials (access token auto-refreshes before expiry)"
-            );
         } else {
             log::info!(
                 "GCS: using Google default credential chain \

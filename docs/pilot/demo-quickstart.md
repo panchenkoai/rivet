@@ -31,10 +31,14 @@ A scripted, reproducible end-to-end demo that exercises every post-Epic feature 
 - Rust toolchain; build once:
 
   ```bash
-  cargo build --release --bin rivet --bin seed
+  cargo build --release --bin rivet
+  cargo build --release --features dev-seed --bin seed
   ```
 
-- `python3` and `jq` (used for pretty-printing JSON artifacts below). The §5
+  (The seeder is gated behind the off-by-default `dev-seed` cargo feature —
+  a bare `--bin seed` build errors.)
+
+- `python3` (used for parsing/pretty-printing JSON artifacts below). The §5
   Parquet-schema peek also needs `pyarrow` (`pip install pyarrow`).
 
 Container quick check:
@@ -60,7 +64,7 @@ mysql -h 127.0.0.1 -P 3306 -u rivet -privet rivet \
 
 # Bundled dev tables + orders_coalesce (composite-cursor fixture) come from the
 # Rust seeder — tunable scale.
-cargo run --release --bin seed -- --target postgres \
+cargo run --release --features dev-seed --bin seed -- --target postgres \
     --users 2000 --orders-per-user 5 --events-per-user 20 \
     --page-views 200000 --content-items 20000 \
     --sparse-chunk-demo --sparse-chunk-rows 500 --sparse-chunk-id-gap 5000 \
@@ -131,21 +135,18 @@ A curated, 12-export YAML lives at `demo/demo_pipeline.yaml` with deliberate `so
 ```bash
 ../target/release/rivet plan \
     -c demo_pipeline.yaml \
-    --format json > plans.jsonstream
+    --format json > plans.json
 ```
+
+For a multi-export config this emits **one** pretty-printed JSON array of
+artifacts (a single object only when there is exactly one export).
 
 Render the embedded `campaign` block:
 
 ```bash
 python3 <<'PY'
 import json
-raw = open('plans.jsonstream').read()
-dec = json.JSONDecoder()
-arts, pos = [], 0
-while pos < len(raw):
-    while pos < len(raw) and raw[pos].isspace(): pos += 1
-    if pos >= len(raw): break
-    obj, end = dec.raw_decode(raw, pos); arts.append(obj); pos = end
+arts = json.load(open('plans.json'))
 camp = arts[0]['prioritization']['campaign']
 print(f"{'score':>5}  {'wave':<4}  {'export':<18}  {'class':<7}  {'cost':<10}  {'group':<20}")
 for e in camp['ordered_exports']:
@@ -272,7 +273,7 @@ export DATABASE_URL='mysql://rivet:rivet@localhost:3306/rivet'
     --schema rivet --discover -o discovery_mysql.json
 
 ../target/release/rivet plan -c demo_pipeline_mysql.yaml --format json \
-    > plans_mysql.jsonstream
+    > plans_mysql.json
 ```
 
 A few MySQL notes:
@@ -285,8 +286,9 @@ A few MySQL notes:
 ## Cleanup
 
 ```bash
-# Destroy demo output + state, keep containers.
-rm -rf demo/{out,out_mysql,plans,*.json,*.jsonstream,.rivet_state.db}
+# Destroy demo output + state, keep containers. (`.rivet` holds the per-run
+# reports each run writes to demo/.rivet/runs/<run_id>/{summary.md,summary.json}.)
+rm -rf demo/{out,out_mysql,plans,*.json,*.jsonstream,.rivet_state.db,.rivet}
 
 # Drop the demo tables (keeps the dev base schema).
 PGPASSWORD=rivet psql -h localhost -U rivet -d rivet -c "

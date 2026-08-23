@@ -30,7 +30,7 @@ use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::config::{TlsConfig, TlsMode};
+use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
@@ -128,6 +128,16 @@ pub(crate) fn row_image(
     let Ok(rows) = src.query_single_column(&sql) else {
         return RowImage::Whole;
     };
+    row_image_verdict(&rows)
+}
+
+/// Pure verdict half of [`row_image`] (#161, the compression_refusal split):
+/// each row is `name:got/all` (captured vs source column counts for the capture
+/// instance rivet reads); any instance with `got < all` is a PARTIAL capture —
+/// refuse. Malformed rows are skipped (best-effort, like the query itself).
+/// Unit-tested in both directions; the connect+query half stays live-guarded.
+pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage {
+    use crate::source::cdc::RowImage;
     let short: Vec<String> = rows
         .iter()
         .filter_map(|r| {
@@ -671,14 +681,25 @@ impl MssqlChangeStream {
                 );
             }
         }
-        // Mark the commit boundary: a row is the last of its transaction when it
-        // is the final row of the batch OR the next row has a different start LSN.
-        let n = batch.len();
-        for i in 0..n {
-            let is_boundary = i + 1 == n || batch[i].0 != batch[i + 1].0;
-            batch[i].1.committed = is_boundary;
+        // #158: a batch holds one or more transactions, each a run of rows
+        // sharing `__$start_lsn`. Close EACH run through the shared framer —
+        // committed on the run's last row only (position is already the run's
+        // lsn, so close_group's position stamp is a no-op confirming it). The
+        // per-run split is MSSQL's engine-specific group detection; the CLOSE
+        // is shared. Marking every row committed would roll mid-transaction.
+        let lsns: Vec<String> = batch.iter().map(|(l, _)| l.clone()).collect();
+        let mut evs: Vec<ChangeEvent> = batch.into_iter().map(|(_, e)| e).collect();
+        let mut start = 0;
+        while start < evs.len() {
+            let mut end = start + 1;
+            while end < evs.len() && lsns[end] == lsns[start] {
+                end += 1;
+            }
+            let commit = Position(json!({ "lsn": lsns[start] }));
+            crate::source::cdc::TxnFramer::close_group(&mut evs[start..end], &commit);
+            start = end;
         }
-        for (_, ev) in batch {
+        for ev in evs {
             self.pending.push_back(ev);
         }
         match max_lsn {
@@ -833,7 +854,7 @@ async fn connect(
     // an explicit disable / accept-invalid, or for loopback (None — the
     // require_tls_or_loopback gate already ensured a remote host carries a tls block).
     match tls {
-        Some(c) if c.mode == TlsMode::Disable || c.accept_invalid_certs => config.trust_cert(),
+        Some(c) if crate::source::mssql::mssql_trusts_cert_without_verify(c) => config.trust_cert(),
         Some(c) => {
             if let Some(ca) = &c.ca_file {
                 config.trust_cert_ca(ca);
@@ -1251,5 +1272,28 @@ mod tests {
             vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
             "CDC change table must yield insert(2), update-after(4), delete(1)"
         );
+    }
+
+    /// #161: both directions of the got/all capture-column verdict.
+    #[test]
+    fn row_image_verdict_both_directions() {
+        use crate::source::cdc::RowImage;
+        // keep: every instance captures every column; malformed rows skipped.
+        assert!(matches!(
+            row_image_verdict(&["orders_ci:5/5".into(), "garbage".into()]),
+            RowImage::Whole
+        ));
+        assert!(matches!(row_image_verdict(&[]), RowImage::Whole));
+        // refuse: any instance short of the source column count.
+        match row_image_verdict(&["orders_ci:3/5".into(), "items_ci:4/4".into()]) {
+            RowImage::Partial { why } => {
+                assert!(why.contains("orders_ci (3 of 5 columns)"), "{why}");
+                assert!(
+                    !why.contains("items_ci"),
+                    "complete instance must not be named: {why}"
+                );
+            }
+            other => panic!("partial capture must refuse, got {other:?}"),
+        }
     }
 }

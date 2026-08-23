@@ -10,9 +10,12 @@ use std::time::Duration;
 
 use crate::common::*;
 
-/// CDC enable/disable mutates database-global metadata + a shared capture job, so
-/// the two tests must not run concurrently (cargo runs tests in parallel).
-static CDC_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// CDC enable/disable mutates database-global metadata + a shared capture job
+// (sp_cdc_stop_job/sp_cdc_start_job are SERVER-wide), so these tests must not
+// run concurrently. Serialization is cross_process_serial("mssql_cdc") — a
+// static Mutex sat here first and serialized NOTHING under the canonical
+// nextest one-process-per-test runner (r4 bughunt; same class as r3's
+// COMPRESSION_SERIAL).
 
 /// Enable CDC on the database (idempotent) + the table, creating capture instance
 /// `ci`. The capture job (SQL Server Agent) then populates `cdc.<ci>_CT`.
@@ -30,33 +33,32 @@ fn enable_cdc(table: &str, ci: &str) {
 /// Block until the capture job has copied at least `want` rows into the change
 /// table — the job runs asynchronously, so the test must wait for it.
 fn wait_for_capture(ci: &str, want: i64) {
-    for _ in 0..60 {
+    // 60s ceiling: the SQL Server Agent capture job is asynchronous and its
+    // scan interval stretches under a loaded E2E runner — a 30s bound flaked
+    // one test at ~456s suite wall-clock (r6 CI). Doubling the ceiling matches
+    // the async reality; it does NOT mask a bug (a real drop still times out).
+    for _ in 0..120 {
         if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
             return;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 30s");
+    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
 }
 
-fn mssql_cdc_config(
-    d: &tempfile::TempDir,
-    table: &str,
-    ci: &str,
-    ckpt: &std::path::Path,
-    out: &std::path::Path,
-) -> std::path::PathBuf {
-    let yaml = Rig::mssql_cdc(table, ci)
+/// One CDC rig per (table, capture instance, checkpoint, destination). Callers
+/// own ckpt/out so several configs can share one dir across a scenario; the rig
+/// owns everything else (this replaced a yaml round-trip through write_config).
+fn mssql_cdc_rig(table: &str, ci: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
+    Rig::mssql_cdc(table, ci)
         .checkpoint_path(ckpt.to_path_buf())
         .dest_path(out.to_path_buf())
-        .yaml();
-    write_config(d, &yaml)
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_resume_captures_only_new_changes() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_ms");
     let ci = format!("dbo_{table}");
@@ -75,7 +77,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     wait_for_capture(&ci, 2);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out1).run_ok();
     assert_eq!(manifest_rows(&out1), 2, "run 1 captures the 2 changes");
 
     // Resume: the checkpoint advanced past the first two, so run 2 must capture ONLY
@@ -84,7 +86,7 @@ fn mssql_cdc_resume_captures_only_new_changes() {
     wait_for_capture(&ci, 4);
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out2).run_ok();
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -103,7 +105,7 @@ fn mssql_cdc_intra_transaction_updates_get_distinct_seq() {
     // Peer of cdc_intra_transaction_updates_get_distinct_seq. SQL Server stamps
     // every change of a transaction with the same __$start_lsn (what rivet emits
     // as __pos), so __pos ties them — __seq restores the intra-transaction order.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     const N: i64 = 200;
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_ms_seq");
@@ -131,7 +133,7 @@ fn mssql_cdc_intra_transaction_updates_get_distinct_seq() {
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
 
     assert_intra_transaction_seq(&out, N);
 }
@@ -140,7 +142,7 @@ fn mssql_cdc_intra_transaction_updates_get_distinct_seq() {
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_sum_reconciles_across_intra_txn_updates() {
     // Peer of cdc_sum_reconciles_across_intra_txn_updates for SQL Server.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_ms_sum");
     let ci = format!("dbo_{table}");
@@ -186,7 +188,7 @@ fn mssql_cdc_sum_reconciles_across_intra_txn_updates() {
     let ckpt = d.path().join("cdc.ckpt");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
 
     let changes = read_cdc_changes(&out);
     assert!(
@@ -209,7 +211,7 @@ fn mssql_cdc_sum_reconciles_across_intra_txn_updates() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_msidle");
     let ci = format!("dbo_{table}");
@@ -227,7 +229,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     let ckpt = d.path().join("cdc.ckpt");
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out1).run_ok();
     assert_eq!(manifest_rows(&out1), 0, "idle run 1 captures nothing");
 
     // A change lands BETWEEN the idle run and the next scheduler cycle.
@@ -237,7 +239,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
     // Run 2 must capture it — never skip past it to the current max LSN.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out2).run_ok();
     assert_eq!(
         manifest_rows(&out2),
         1,
@@ -256,7 +258,7 @@ fn mssql_cdc_idle_first_run_then_change_is_captured_not_skipped() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let orders = unique_name("rivet_cdc_mixq");
     let audit = unique_name("rivet_cdc_mixa");
@@ -290,11 +292,11 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
     let qualified = format!("dbo.{orders}");
-    run_rivet_ok(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out1));
+    mssql_cdc_rig(&qualified, &ci_o, &ckpt, &out1).run_ok();
     assert_eq!(manifest_rows(&out1), 1, "qualified table: must capture");
 
     // And the checkpoint advanced past the mixed transaction.
-    run_rivet_ok(&mssql_cdc_config(&d, &qualified, &ci_o, &ckpt, &out2));
+    mssql_cdc_rig(&qualified, &ci_o, &ckpt, &out2).run_ok();
     assert_eq!(
         manifest_rows(&out2),
         0,
@@ -309,7 +311,7 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn gremlin_mssql_capture_job_stall_loses_nothing() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     // Self-heal first: an earlier aborted run of THIS test may have left the
     // capture job disabled/stopped (the fault it injects is exactly that).
     mssql_cdc_try_exec(
@@ -333,7 +335,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     wait_for_capture(&ci, 1);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out1).run_ok();
     assert_eq!(manifest_rows(&out1), 1);
 
     // Stall the capture job: DISABLE it (so the scheduler cannot restart it)
@@ -384,7 +386,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     // 0-row run, never an advance past the uncaptured changes.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out2).run_ok();
     assert_eq!(manifest_rows(&out2), 0, "stalled job ⇒ nothing new visible");
 
     // Job back: the changes must ALL appear on the next run.
@@ -407,7 +409,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     }
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out3));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out3).run_ok();
     assert_eq!(
         manifest_rows(&out3),
         2,
@@ -421,7 +423,7 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_update_and_delete_carry_full_types() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_updel");
     let ci = format!("dbo_{table}");
@@ -443,7 +445,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
 
     mssql_cdc_exec(&format!(
         "UPDATE dbo.{table} SET amount=99999999999999.9999, \
@@ -455,8 +457,8 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&upd_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &upd_out));
-    run_rivet_ok(&mssql_full_config(&d, &table, &batch_out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &upd_out).run_ok();
+    mssql_full_rig(&table, &batch_out).run_ok();
     let upd = read_one_batch(&upd_out);
     assert_eq!(upd.num_rows(), 1, "exactly the update after-image");
     let batch = read_one_batch(&batch_out);
@@ -475,7 +477,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
     wait_for_capture(&ci, 4);
     let del_out = d.path().join("del");
     std::fs::create_dir_all(&del_out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &del_out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &del_out).run_ok();
     let del = read_one_batch(&del_out);
     assert_eq!(del.num_rows(), 1);
     use arrow::array::Int32Array;
@@ -494,8 +496,7 @@ fn mssql_cdc_update_and_delete_carry_full_types() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let d = tempfile::tempdir().unwrap();
+    let _serial = cross_process_serial("mssql_cdc");
     let table = unique_name("rivet_cdc_init");
     let ci = format!("dbo_{table}");
     mssql_cdc_drop_table(&format!("dbo.{table}"));
@@ -514,7 +515,7 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
         .cdc("initial: snapshot")
         .cdc("until_current: true");
     let out = rig.out_dir();
-    let cfg = write_config(&d, &rig.yaml());
+    let cfg = rig.config_path();
 
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
@@ -551,7 +552,7 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_money_values_survive_batch_and_cdc() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_money");
     let ci = format!("dbo_{table}");
@@ -574,8 +575,8 @@ fn mssql_money_values_survive_batch_and_cdc() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
-    run_rivet_ok(&mssql_full_config(&d, &table, &batch_out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &cdc_out).run_ok();
+    mssql_full_rig(&table, &batch_out).run_ok();
 
     // Value-level check against the SOURCE literal (NULL == NULL between the
     // two exports would mask the loss — that is exactly how it hid).
@@ -621,7 +622,7 @@ fn mssql_money_values_survive_batch_and_cdc() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     // The table name contains underscores AND the capture instance is named
     // exactly after it — the shape the split-once heuristic gets wrong.
@@ -642,7 +643,7 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
     wait_for_capture(&ci, 2);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
     assert_eq!(
         manifest_rows(&out),
         2,
@@ -651,10 +652,95 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
     );
 }
 
+/// The routing bug's actual SHAPE needs two tables — the test above cannot
+/// express it.
+///
+/// The field failure was events for 6 of 8 tables landing under the WRONG table
+/// (the capture-instance name was split on `_`, so `product_catalog` became
+/// schema `product` / table `catalog`), while every run reported success. With
+/// ONE table a mis-route can only drop to zero, which `manifest_rows == 2`
+/// catches. With two, a swap keeps BOTH counts at 2 and only the CONTENT
+/// differs — and nothing in the suite looked at content, on this engine, until
+/// now (audit 2026-08-17). Its own rule: a guard against confusing two things
+/// needs two of the thing.
+///
+/// SQL Server cannot do this in one export — `Config` refuses `tables:` there
+/// because capture instances are per-table — so this is two CDC exports over one
+/// config, which is what `Rig::also_cdc_export` was added for.
+///
+/// The ids are deliberately DISJOINT (10,11 vs 20,21): identical ids in both
+/// tables would make a perfect swap invisible even to a content check, which is
+/// how the PG/MySQL uncaptured-table fixtures are shaped today (both insert
+/// `id = 1`).
+///
+/// HONEST LIMIT, stated because a reader will otherwise assume more. I could not
+/// build a mutant where this test bites and the single-table one above does not.
+/// Four were tried: ignore the catalog and split the instance name; the same with
+/// the identity guard disabled; resolve without `WHERE capture_instance`; and both
+/// together. The first and third fail LOUDLY in `rig.run_ok()` — the identity
+/// guard (`table_matches` against the catalog's spelling) refuses before any event
+/// moves. With the guard disabled the routing filter is byte-exact, so a
+/// mis-resolved export matches NOTHING and the prefix comes back EMPTY (`left:
+/// []`) rather than holding the other table's rows. Drop-to-zero is what the count
+/// assertion above already catches.
+///
+/// So what this adds is coverage, not proven sensitivity: multi-table SQL Server
+/// CDC had NO test at all before it (`Rig::also_cdc_export` had to be written for
+/// it), and per-prefix CONTENT is the assertion PG and MySQL already make and this
+/// engine did not. If someone later makes routing tolerant enough to place a row
+/// under the wrong prefix instead of dropping it, this is the test that sees it —
+/// but that is an argument from shape, and it has not been demonstrated.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_two_underscored_tables_do_not_cross_route() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+
+    let t1 = unique_name("rivet_cdc_ord");
+    let t2 = unique_name("rivet_cdc_inv");
+    let (ci1, ci2) = (t1.clone(), t2.clone());
+    for (t, ci) in [(&t1, &ci1), (&t2, &ci2)] {
+        mssql_cdc_drop_table(&format!("dbo.{t}"));
+        mssql_cdc_exec(&format!("CREATE TABLE dbo.{t}(id INT PRIMARY KEY, v INT)"));
+        enable_cdc(t, ci);
+    }
+    let _g1 = MssqlCdcTable {
+        table: t1.clone(),
+        ci: ci1.clone(),
+    };
+    let _g2 = MssqlCdcTable {
+        table: t2.clone(),
+        ci: ci2.clone(),
+    };
+
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{t1} VALUES (10,1),(11,1)"));
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{t2} VALUES (20,2),(21,2)"));
+    wait_for_capture(&ci1, 2);
+    wait_for_capture(&ci2, 2);
+
+    let rig = Rig::mssql_cdc(&t1, &ci1)
+        .checkpoint_path(d.path().join("cdc1.ckpt"))
+        .also_cdc_export(&t2, &t2, &[&format!("capture_instance: {ci2}")]);
+    rig.run_ok();
+
+    // Content, per export prefix. A swap leaves both counts at 2.
+    assert_eq!(
+        cdc_id_ops(&rig.out_dir()),
+        vec![(10, "insert".to_string()), (11, "insert".to_string())],
+        "export '{t1}' must hold ONLY its own rows — a cross-route keeps the count \
+         at 2 and swaps the ids, which is the shape the field failure had"
+    );
+    assert_eq!(
+        cdc_id_ops(&rig.out_dir_for(&t2)),
+        vec![(20, "insert".to_string()), (21, "insert".to_string())],
+        "export '{t2}' must hold ONLY its own rows"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     // At-least-once under a crash, now that SQL Server resumes by LSN: establish a
     // checkpoint, then crash on the next batch AFTER the part is durable but BEFORE
     // the checkpoint advances. The checkpoint must stay put, so the resume re-reads
@@ -678,7 +764,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     wait_for_capture(&ci, 2);
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out1).run_ok();
     assert_eq!(manifest_rows(&out1), 2);
 
     // Two more changes; run crashes after the part is durable, before the checkpoint.
@@ -686,17 +772,8 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     wait_for_capture(&ci, 4);
     let crash_out = d.path().join("crash");
     std::fs::create_dir_all(&crash_out).unwrap();
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            mssql_cdc_config(&d, &table, &ci, &ckpt, &crash_out)
-                .to_str()
-                .unwrap(),
-        ])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = mssql_cdc_rig(&table, &ci, &ckpt, &crash_out)
+        .run_with_envs(&[("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail the run"
@@ -706,7 +783,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
     // not lost (would be 0 if the checkpoint had advanced) and not all four.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out2));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out2).run_ok();
     assert_eq!(
         manifest_rows(&out2),
         2,
@@ -722,7 +799,7 @@ fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_datetimeoffset_value_is_preserved() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     // datetimeoffset is tz-aware: it must land as a tz-aware Timestamp carrying the
     // UTC instant — identical to the batch export (parity) — never silently dropped.
     // The adapter used to try_get it as NaiveDateTime (wrong type) → None → NULL.
@@ -746,7 +823,7 @@ fn mssql_cdc_datetimeoffset_value_is_preserved() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
 
     // tz-aware Timestamp carrying the UTC instant (10:00 +05:30 → 04:30:00 UTC).
     let dto = parquet_one_timestamp(&out, "dto");
@@ -800,7 +877,7 @@ fn parquet_col0_present(dir: &std::path::Path, col: &str) -> bool {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_uniqueidentifier_value_is_preserved() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     // uniqueidentifier resolves to a UUID column (FixedSizeBinary(16)). The adapter
     // used to map the Guid to its 36-char string, which does not fit the fixed-size
     // builder and silently became NULL — data loss.
@@ -823,30 +900,24 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
     wait_for_capture(&ci, 1);
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
     assert!(
         parquet_col0_present(&out, "u"),
         "uniqueidentifier must be captured (16 canonical bytes), not dropped to NULL"
     );
 }
 
-fn mssql_full_config(
-    d: &tempfile::TempDir,
-    table: &str,
-    out: &std::path::Path,
-) -> std::path::PathBuf {
-    let yaml = Rig::mssql_batch(&format!("{table}_batch"))
+fn mssql_full_rig(table: &str, out: &std::path::Path) -> Rig {
+    Rig::mssql_batch(&format!("{table}_batch"))
         .source_url(MSSQL_CDC_URL)
         .query(&format!("SELECT * FROM dbo.{table}"))
         .dest_path(out.to_path_buf())
-        .yaml();
-    write_config(d, &yaml)
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_full_type_matrix_matches_batch() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     // The parity contract, enforced: a comprehensive type table exported both ways —
     // batch (`mode: full`) and CDC — must produce the IDENTICAL Arrow column (type AND
     // value, via ArrayData equality) for every source column. Two value-decode paths
@@ -884,8 +955,8 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &cdc_out));
-    run_rivet_ok(&mssql_full_config(&d, &table, &batch_out));
+    mssql_cdc_rig(&table, &ci, &ckpt, &cdc_out).run_ok();
+    mssql_full_rig(&table, &batch_out).run_ok();
 
     let batch = read_one_batch(&batch_out);
     let cdc = read_one_batch(&cdc_out);
@@ -904,12 +975,85 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     }
     // CDC adds its change-metadata columns the batch export doesn't have.
     assert!(cdc.schema().index_of("__op").is_ok() && cdc.schema().index_of("__pos").is_ok());
+
+    // ─── Per-column NULL profile against SQL SERVER ITSELF ────────────────────
+    //
+    // HONEST LIMIT, first, because it changes how to read what follows: no mutant
+    // was found where THIS assertion is the one that bites. Two were tried.
+    // (1) `ColumnData::Guid(Some(g))` → `RivetValue::Null` in the MSSQL CDC
+    // decoder — the exact degrade-to-NULL shape — is caught FIRST by the
+    // ArrayData comparison above (`column u: CDC differs from the batch export`),
+    // because only the CDC side degrades. (2) The shared decision point, where a
+    // fault WOULD be symmetric — `RivetType::Uuid => FixedSizeBinary(16)` in
+    // `types/mapping.rs`, which both paths read — narrowed to `(8)` never runs:
+    // the product rejects it at `mapping.rs:294` ("Uuid extension only valid on
+    // FixedSizeBinary(16)"). That is a real result about the product, not a gap:
+    // the one place both paths could go wrong together is guarded by its own
+    // invariant.
+    //
+    // So this earns its place as defence in depth, not on a demonstrated kill —
+    // and the distinction is stated here rather than left for a reader to assume
+    // a kill. What it uniquely covers is the SYMMETRIC fault: the comparison
+    // above is differential (CDC against batch, both decoded by rivet), so a
+    // fault the two share passes its own inspection. This asks SQL Server.
+    //
+    // The class is not hypothetical on other engines: the `FixedSizeBinary(16)`
+    // builder nulled anything not exactly 16 bytes and `test_decoding` renders
+    // uuids as 36-char TEXT, so 100% of a PostgreSQL uuid column became NULL on a
+    // real bucket while every count and sum check passed.
+    //
+    // The column list is DERIVED from the catalog, never re-typed here: a
+    // hand-written list grades only the columns its author remembered and
+    // silently stops covering any the fixture gains later.
+    //
+    // INSERT images only — a CDC part holds one row per change, so the source's
+    // 2 rows are the 2 inserts; reading the whole part compares different
+    // populations.
+    let cols = mssql_cdc_query_strings(&format!(
+        "SELECT c.name FROM sys.columns c \
+         JOIN sys.tables t ON t.object_id = c.object_id \
+         WHERE t.name = '{table}' ORDER BY c.column_id"
+    ));
+    assert!(
+        cols.len() >= 20,
+        "the fixture must present a rich column set to profile; got {} — did the \
+         catalog query stop resolving the table?",
+        cols.len()
+    );
+    let mut columns_with_nulls = 0;
+    for col in &cols {
+        let src_nulls = mssql_cdc_query_i64(&format!(
+            "SELECT COUNT(*) - COUNT([{col}]) FROM dbo.{table}"
+        ));
+        columns_with_nulls += i32::from(src_nulls > 0);
+        let dst_nulls = duckdb_dir_scalar(
+            &cdc_out,
+            &format!("count(*) - count(\"{col}\")"),
+            Some("__op = 'insert'"),
+        );
+        assert_eq!(
+            src_nulls, dst_nulls,
+            "column '{col}': NULL-count parity against SQL Server itself — source \
+             {src_nulls}, captured {dst_nulls}. A per-cell decode that degrades to \
+             NULL moves this and nothing else."
+        );
+    }
+    // The fixture must actually LOAD this axis: row 2 sets only `id`, so every
+    // other column must show a source NULL. A column compared at 0-vs-0 is a
+    // green that proves nothing, and that is what this decays into if someone
+    // later simplifies the INSERTs.
+    assert!(
+        columns_with_nulls >= 15,
+        "only {columns_with_nulls} of {} columns carry a source NULL — the fixture \
+         stopped exercising the null axis, so the parity above is comparing zeros",
+        cols.len()
+    );
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     // If the resume LSN has fallen below the change table's min (the cleanup job
     // removed it), resuming from min would silently SKIP the cleaned-up changes. The
     // adapter must fail loudly (prompting a re-snapshot), never hide the gap.
@@ -934,16 +1078,7 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
     std::fs::write(&ckpt, r#"{"lsn":"00000000000000000001"}"#).unwrap();
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let res = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            mssql_cdc_config(&d, &table, &ci, &ckpt, &out)
-                .to_str()
-                .unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+    let res = mssql_cdc_rig(&table, &ci, &ckpt, &out).run();
     assert!(
         !res.status.success(),
         "a resume past retention must fail, not silently skip the gap"
@@ -963,7 +1098,7 @@ fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     // (create_change_stream) and the shared cdc_job resume-plan both route the
     // read through `Position::load`, which now errors on a corrupt checkpoint
     // instead of `.ok().flatten()`-ing it into a silent re-anchor.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_corrupt");
     let ci = format!("dbo_{table}");
@@ -983,7 +1118,7 @@ fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     let ckpt = d.path().join("cdc.ckpt");
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    mssql_cdc_rig(&table, &ci, &ckpt, &out1).run_ok();
     assert!(ckpt.exists(), "run 1 pins a checkpoint");
 
     // The checkpoint is corrupted; a further change lands. The run must refuse to
@@ -995,16 +1130,7 @@ fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     // Run 2 must FAIL loudly.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    let res = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            mssql_cdc_config(&d, &table, &ci, &ckpt, &out2)
-                .to_str()
-                .unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+    let res = mssql_cdc_rig(&table, &ci, &ckpt, &out2).run();
     assert!(
         !res.status.success(),
         "a corrupt checkpoint must fail the run, not be read as absent"
@@ -1027,7 +1153,7 @@ fn mssql_cdc_column_added_via_new_capture_instance_is_captured() {
     // The documented recovery is a SECOND capture instance (SQL Server allows two
     // per table). This proves rivet, pointed at the new instance, resolves and
     // emits the WIDER schema — reading the old instance would silently drop `w`.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_msdrift");
     let ci1 = format!("dbo_{table}_v1");
@@ -1055,7 +1181,7 @@ fn mssql_cdc_column_added_via_new_capture_instance_is_captured() {
     let ckpt1 = d.path().join("cdc1.ckpt");
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci1, &ckpt1, &out1));
+    mssql_cdc_rig(&table, &ci1, &ckpt1, &out1).run_ok();
     assert!(
         !duckdb_dir_parquet_has_column(&out1, "w"),
         "ci1 predates the added column"
@@ -1079,7 +1205,7 @@ fn mssql_cdc_column_added_via_new_capture_instance_is_captured() {
     let ckpt2 = d.path().join("cdc2.ckpt");
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci2, &ckpt2, &out2));
+    mssql_cdc_rig(&table, &ci2, &ckpt2, &out2).run_ok();
     assert!(
         duckdb_dir_parquet_has_column(&out2, "w"),
         "the new capture instance must expose the column added after ci1"
@@ -1097,7 +1223,7 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
     // The `until_current` bound is `get_max_lsn()` pinned at open; a writer that
     // keeps committing advances the DB LSN, but the bounded run must still stop at
     // the open-time bound (not chase it) and keep the pre-open backlog.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_mshb");
     let ci = format!("dbo_{table}");
@@ -1120,10 +1246,8 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
     wait_for_capture(&ci, 30);
 
     // A writer committing continuously while the bounded run drains.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let table_bg = table.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
             mssql_cdc_try_exec(&format!("INSERT INTO dbo.{table_bg} VALUES ({i},{i})"));
@@ -1135,12 +1259,9 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
     let ckpt = d.path().join("cdc.ckpt");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let elapsed = run_rivet_bounded(
-        &mssql_cdc_config(&d, &table, &ci, &ckpt, &out),
-        Duration::from_secs(30),
-    );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    let bounded_rig = mssql_cdc_rig(&table, &ci, &ckpt, &out);
+    let elapsed = run_rivet_bounded(&bounded_rig.config_path(), Duration::from_secs(30));
+    bg.stop();
 
     assert!(
         elapsed.is_some(),
@@ -1172,7 +1293,7 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
     // run 2 drains the tail, the union equals the SOURCE. Oracle: the source
     // table (count/sum/min/max of id — the scalar helpers can't fetch a set),
     // never rivet's own counters.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let table = unique_name("rivet_cdc_msob");
     let ci = format!("dbo_{table}");
     mssql_cdc_drop_table(&format!("dbo.{table}"));
@@ -1194,10 +1315,8 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
     wait_for_capture(&ci, 30);
 
     // A writer committing continuously while the bounded run drains.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let table_bg = table.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
             mssql_cdc_try_exec(&format!("INSERT INTO dbo.{table_bg} VALUES ({i},{i})"));
@@ -1209,8 +1328,7 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
     let rig = Rig::mssql_cdc(&table, &ci).cdc("until_current: true");
     let cfg = rig.config_path();
     let elapsed = run_rivet_bounded(&cfg, Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     assert!(
         elapsed.is_some(),
         "run 1 must terminate at the open-time max-LSN bound under sustained writes"
@@ -1268,7 +1386,7 @@ fn roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     // losing the tail. Fix: mark only the last row of each start-LSN group
     // committed. RED-proof: one 12-row transaction at rollover 5, crash at
     // `cdc_after_checkpoint_before_ack`. Oracle: the union of all parts on disk.
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_msatomic");
     let ci = format!("dbo_{table}");
@@ -1299,11 +1417,7 @@ fn roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         .dest_path(out.clone());
     // Run 1 crashes right after the checkpoint is persisted (MSSQL ack is a
     // no-op; the checkpoint is the durable resume position).
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_with_envs(&[("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -1335,7 +1449,7 @@ fn roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + duckdb"]
 fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("cdc_typed_ms"));
     let table = unique_name("rivet_cdc_typed");
@@ -1358,7 +1472,7 @@ fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
          1.5, 1, '12345678-1234-1234-1234-123456789012')"
     ));
     wait_for_capture(&ci, 1);
-    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &host_dir));
+    mssql_cdc_rig(&table, &ci, &ckpt, &host_dir).run_ok();
 
     let res = duckdb_run_sql_json(&format!(
         "SELECT (big = 9000000000000) AND (amount = 12345.6789) AND (label = 'hello') \
@@ -1395,7 +1509,7 @@ fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_a_partial_capture_instance_is_refused_even_beside_a_complete_sibling() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
     let d = tempfile::tempdir().unwrap();
     let table = unique_name("rivet_cdc_twoci");
     let ci_full = format!("{table}_full");
@@ -1448,7 +1562,8 @@ fn mssql_a_partial_capture_instance_is_refused_even_beside_a_complete_sibling() 
     let ckpt = d.path().join("cdc.ckpt");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let cfg = mssql_cdc_config(&d, &table, &ci_part, &ckpt, &out);
+    let partial_rig = mssql_cdc_rig(&table, &ci_part, &ckpt, &out);
+    let cfg = partial_rig.config_path();
     let res = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&res.stderr).into_owned();
 
@@ -1502,7 +1617,7 @@ fn mssql_a_partial_capture_instance_is_refused_even_beside_a_complete_sibling() 
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
-    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = cross_process_serial("mssql_cdc");
 
     // Mixed case ON PURPOSE — `unique_name` lowercases, and the whole mechanism
     // is a catalog name the config spells differently.
@@ -1524,7 +1639,8 @@ fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
     let ckpt = d.path().join("cdc.ckpt");
     // The config names the table in a case the catalog does not use. SQL Server
     // accepts it everywhere EXCEPT rivet's own byte-exact router.
-    let cfg = mssql_cdc_config(&d, &table.to_lowercase(), ci, &ckpt, out.path());
+    let anchor_rig = mssql_cdc_rig(&table.to_lowercase(), ci, &ckpt, out.path());
+    let cfg = anchor_rig.config_path();
 
     // The anchor run is where a catalog cross-check would fire, so it must be
     // allowed to REFUSE rather than asserted to succeed — refusing is the
@@ -1561,7 +1677,8 @@ fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
     // which happened: the change rows are still there, so a correctly-cased
     // re-run against the SAME checkpoint must find them.
     let still_in_ct = mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT"));
-    let fixed = mssql_cdc_config(&d, &format!("dbo.{table}"), ci, &ckpt, out.path());
+    let fixed_rig = mssql_cdc_rig(&format!("dbo.{table}"), ci, &ckpt, out.path());
+    let fixed = fixed_rig.config_path();
     let _ = run_rivet_env(&["run", "--config", fixed.to_str().unwrap()], &[]);
     let after_fix = read_cdc_changes(out.path()).len();
 
@@ -1573,5 +1690,125 @@ fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
          routes with the raw config string through the byte-exact `table_matches` \
          (src/source/cdc/sink.rs:220), and nothing compares the two. SQL Server's default \
          collation is case-insensitive, so every other layer accepted the name."
+    );
+}
+
+/// #200-3: the catalog-identity guard must also fire on the `rivet cdc` CLI path,
+/// not only in `mode: cdc` config mode. `dispatch.rs` hard-coded
+/// `configured_tables = Vec::new()` for the CLI, and `mssql/cdc.rs` disables the
+/// cross-check when that set is empty — so `rivet cdc --capture-instance X
+/// --table Y` opened WITHOUT the guard the config path has, and a `--table`
+/// spelled in a case the catalog does not use routes ZERO events while the
+/// checkpoint advances past them (the same silent drop the config-mode test above
+/// guards, on the sibling entry point).
+///
+/// The fix passes `--table` — which the CLI ALREADY routes/filters by — as
+/// `configured_tables`, so the guard has the same subject it does in config mode.
+/// The `--output` leg is used (durable sink + checkpoint), because the drop is
+/// only dangerous once a checkpoint can advance.
+// AUDIT-RED cdc-cli-identity: a case-only --table mismatch on the CLI path routes ZERO events while the checkpoint advances — expected to FAIL until the CLI passes --table as configured_tables.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
+    let _serial = cross_process_serial("mssql_cdc");
+
+    let table = format!("CliIdent{}", std::process::id() % 100_000);
+    let table = table.as_str();
+    let ci = &format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id int PRIMARY KEY, v nvarchar(50))"
+    ));
+    enable_cdc(table, ci);
+    let _guard = MssqlCdcTable {
+        table: table.to_string(),
+        ci: ci.clone(),
+    };
+
+    let d = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cli.ckpt");
+
+    // The CLI invocation, mirroring config mode's mismatch: --table in a case the
+    // catalog does not use. The anchor is allowed to REFUSE (the guard firing at
+    // open is exactly the fix) — refusing before any checkpoint advances is the
+    // outcome this test wants.
+    let cli = |dir: &std::path::Path, tbl: &str| {
+        run_rivet_env(
+            &[
+                "cdc",
+                "--source",
+                MSSQL_CDC_URL,
+                "--capture-instance",
+                ci,
+                "--table",
+                tbl,
+                "--checkpoint",
+                ckpt.to_str().unwrap(),
+                "--output",
+                dir.to_str().unwrap(),
+            ],
+            &[],
+        )
+    };
+
+    let anchor = cli(out.path(), &table.to_lowercase());
+    if !anchor.status.success() {
+        let why = String::from_utf8_lossy(&anchor.stderr);
+        assert!(
+            why.contains("no configured table matches"),
+            "the CLI anchor run failed for an unrelated reason:\n{why}"
+        );
+        return; // refused at open, before any checkpoint could advance — correct
+    }
+
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,'a'),(2,'b'),(3,'c');"
+    ));
+    wait_for_capture(ci, 3);
+
+    let o = cli(out.path(), &table.to_lowercase());
+    if !o.status.success() {
+        return; // refused — the guard the fix adds; correct
+    }
+
+    // Read the captured EVENTS back (the sibling test's oracle) — part
+    // presence alone is the weak "mc ls | wc -l" class the matrix audit
+    // banned; the content read costs nothing more and grades honestly.
+    let captured = read_cdc_changes(out.path()).len();
+    if captured > 0 {
+        return; // routed correctly; nothing to guard
+    }
+
+    // Captured nothing AND exited 0 — the pre-fix silent drop. Prove the changes
+    // were there all along: a correctly-cased CLI run against a FRESH checkpoint
+    // recovers them (parts appear on disk).
+    let still_in_ct = mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT"));
+    let out_fixed = tempfile::tempdir().unwrap();
+    let fixed_ckpt = d.path().join("cli_fixed.ckpt");
+    let _ = run_rivet_env(
+        &[
+            "cdc",
+            "--source",
+            MSSQL_CDC_URL,
+            "--capture-instance",
+            ci,
+            "--table",
+            &format!("dbo.{table}"),
+            "--checkpoint",
+            fixed_ckpt.to_str().unwrap(),
+            "--output",
+            out_fixed.path().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let after_fix = read_cdc_changes(out_fixed.path()).len();
+
+    panic!(
+        "the `rivet cdc` CLI path captured 0 of the {still_in_ct} change row(s) on a case-only \
+         --table mismatch and exited 0; a correctly-cased run wrote {after_fix} part(s). The CLI \
+         passed configured_tables = Vec::new() (dispatch.rs), which disables the catalog-identity \
+         cross-check (mssql/cdc.rs), so the guard the config path has never fired here — every \
+         event was dropped while the checkpoint advanced past it."
     );
 }

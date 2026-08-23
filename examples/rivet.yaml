@@ -20,7 +20,8 @@ exports:
     mode: incremental
     cursor_column: updated_at
     format: csv
-    # MySQL does not expose DECIMAL precision/scale, so declare it.
+    # MySQL's wire metadata lets Rivet derive DECIMAL(p,s) automatically;
+    # this declaration is an optional override for the rare case derivation fails.
     columns:
       price: decimal(10,2)
     destination:

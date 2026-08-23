@@ -12,12 +12,12 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
+use crate::destination;
 use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::{destination, format};
 
 pub(crate) fn run_with_reconnect(
     state: &StateStore,
@@ -29,6 +29,13 @@ pub(crate) fn run_with_reconnect(
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..=plan.tuning.max_retries {
+        // ADR-0028: the tail ledger accumulates ACROSS a runner invocation, and a
+        // retried attempt re-reads from scratch — carrying a failed attempt's
+        // partial checksums into the retry would double-merge them (the old
+        // runner-local accumulators got this for free by being re-declared per
+        // call). Reset at every attempt boundary; the successful attempt's feed
+        // is the only one the seam applies.
+        summary.ledger = Default::default();
         if attempt > 0 {
             summary.retries = attempt;
             let class = last_err
@@ -310,6 +317,16 @@ pub(super) fn run_single_export(
         w.finish()?;
     }
 
+    // ADR-0029: feed the OBSERVATION half of the ledger the moment the read is
+    // done — the dest schema this run SAW and the shape bytes it measured carry
+    // no coverage obligation, so recording them early can never be wrong. Every
+    // `?` below (the quality gate, `RunnerFrame::open`, and above all the
+    // per-part `write_part_file` inside the commit loop) used to escape ABOVE
+    // the single tail drain, so a run that failed mid-write pinned the STALE
+    // open-time fingerprint onto a Failed manifest describing parts written
+    // under the observed schema. The INTEGRITY half stays below the loop.
+    sink.drain_observations_into(&mut summary.ledger);
+
     summary.total_rows += sink.total_rows as i64;
     log::info!(
         "export '{}': {} rows written",
@@ -385,13 +402,9 @@ pub(super) fn run_single_export(
         });
     }
 
-    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let ext = fmt.file_extension();
-    let dest = destination::create_destination(&plan.destination)?;
-    // Finding #44, early check: fail cleanly before the first part if this
-    // prefix already belongs to a CDC export (cross-shape manifests clobber
-    // each other; the write-seam guard is the backstop).
-    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+    let frame = super::frame::RunnerFrame::open(plan)?;
+    let (dest, ext) = (frame.dest, frame.ext);
+    let ext = ext.as_str();
 
     // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
     destination::log_capabilities(
@@ -440,6 +453,12 @@ pub(super) fn run_single_export(
             super::commit::PartKind::File {
                 part_index: part_idx,
             },
+            // ADR-0029: single's commit unit is the whole invocation — ONE sink
+            // accumulated the checksums of every part in this loop, so the
+            // drain below either covers them all or (on a mid-loop bail, which
+            // skips it) none. Keying per part_index would claim a per-part
+            // correspondence the sink does not have.
+            super::commit::UnitId::Run,
         );
     }
 
@@ -468,79 +487,19 @@ pub(super) fn run_single_export(
         summary.cursor_high = Some(last_val.clone());
     }
 
-    // ADR-0012 M3: pin the dest schema fingerprint on the summary so
-    // `finalize_manifest` does not have to round-trip through the state
-    // store (which is only populated by the drift-detect path below, and
-    // not at all in chunked mode).
-    if let Some(schema) = sink.dest_schema.as_deref() {
-        super::manifest_writer::record_run_schema_fingerprint(summary, schema);
-    }
+    // ADR-0028/0029: feed the INTEGRITY half — every part of this run is now
+    // committed and recorded under `UnitId::Run`, so the sink's accumulated
+    // Form-B checksums cover exactly them. The seam
+    // (`finalize::finalize_export`, called by the dispatcher) applies the
+    // fingerprint pin, the `on_schema_drift` gate, the Form-B harvest and the
+    // shape-drift warn; the application lives in no runner.
+    sink.drain_integrity_into(super::commit::UnitId::Run, &mut summary.ledger);
 
-    if let (Some(schema), Some(st)) = (&sink.dest_schema, state) {
-        // Single mode: drift from the sink's resolved (data-derived) schema,
-        // post-write. Chunked runs the same facade pre-chunk via
-        // `check_from_type_mappings` (ADR-0021).
-        super::schema_drift::check_from_sink_schema(
-            st,
-            &plan.export_name,
-            schema,
-            plan.schema_drift_policy,
-            summary,
-        )?;
-    }
-
-    // Form B: harvest the per-column value checksums the sink accumulated into the
-    // summary, so the manifest records them. `validate` re-reads the parts to verify
-    // the Arrow→Parquet encode + post-write fault the in-process Form A cannot see.
-    // Single mode has one sink; the multi-part runners XOR-combine per part through
-    // the SAME seam (super::commit::{accumulate,harvest}_column_checksums).
-    let single_key = sink.checksum_key_col.and(sink.cursor_column.clone());
-    super::commit::harvest_column_checksums(
-        summary,
-        std::mem::take(&mut sink.column_checksums),
-        single_key,
-    );
-
-    // Epic 8: data shape drift — warn when string/binary columns grow beyond threshold.
-    if plan.shape_drift_warn_factor > 0.0
-        && !sink.column_max_bytes.is_empty()
-        && let Some(st) = state
-    {
-        match st.detect_shape_drift(
-            &plan.export_name,
-            &sink.column_max_bytes,
-            plan.shape_drift_warn_factor,
-        ) {
-            Ok(warnings) => {
-                for w in &warnings {
-                    log::warn!(
-                        "export '{}': shape drift in column '{}' — \
-                         max byte length grew {:.1}× ({} → {} bytes); \
-                         set `shape_drift_warn_factor` to a higher value to suppress",
-                        plan.export_name,
-                        w.column,
-                        w.growth_factor,
-                        w.stored_max_bytes,
-                        w.current_max_bytes,
-                    );
-                    summary.journal.record(RunEvent::Warning {
-                        context: format!("shape_drift:{}", w.column),
-                        message: format!(
-                            "column '{}' max byte length grew {:.1}× ({} → {} bytes)",
-                            w.column, w.growth_factor, w.stored_max_bytes, w.current_max_bytes
-                        ),
-                    });
-                }
-            }
-            Err(e) => log::warn!(
-                "export '{}': shape tracking error: {:#}",
-                plan.export_name,
-                e
-            ),
-        }
-    }
-
-    log::info!("export '{}' completed successfully", plan.export_name);
+    // "data phase complete", not "completed successfully": the post-run gates
+    // (drift policy, quality) run at the dispatcher AFTER this returns — a run
+    // they abort must not have already logged itself successful (seam bughunt
+    // 2026-08-21, LOW).
+    log::info!("export '{}': data phase complete", plan.export_name);
     Ok(())
 }
 
@@ -676,9 +635,12 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "test_export".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::None,

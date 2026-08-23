@@ -99,7 +99,11 @@ fn pg_schema_drift_detection() {
     use rivet::state::SchemaColumn;
 
     let Some(s) = pg_store() else { return };
-    let export = "pg_schema_drift_test";
+    // Unique per invocation: the fixed name persisted its stored schema on the
+    // shared :5434 state db, so a SECOND --ignored run saw v2 already stored
+    // and the "first run: no drift" assertion flipped (r6 bughunt).
+    let export = crate::common::unique_name("pg_schema_drift");
+    let export = export.as_str();
 
     let v1 = vec![
         SchemaColumn {
@@ -141,27 +145,31 @@ fn pg_schema_drift_detection() {
 #[ignore]
 fn pg_metrics_record_and_query() {
     let Some(s) = pg_store() else { return };
-
-    s.record_metric(
-        "pg_metrics_export",
-        "run_pg_001",
-        1500,
-        100_000,
-        Some(256),
-        "success",
-        None,
-        Some("balanced"),
-        Some("parquet"),
-        Some("full"),
-        3,
-        1_048_576,
-        0,
-        Some(true),
-        Some(false),
-    )
+    // Unique export name: record_metric_full is a plain INSERT and get_metrics
+    // returns every row for the name, so a fixed name made a 2nd run see len==2
+    // (r6 bughunt — fixed run_id on a shared state db).
+    let metrics_export = crate::common::unique_name("pg_metrics");
+    s.record_metric_full(&rivet::state::MetricRow {
+        export_name: metrics_export.clone(),
+        run_id: crate::common::unique_name("run_pg"),
+        duration_ms: 1500,
+        total_rows: 100_000,
+        peak_rss_mb: Some(256),
+        status: "success".to_string(),
+        error_message: None,
+        tuning_profile: Some("balanced".to_string()),
+        format: Some("parquet".to_string()),
+        mode: Some("full".to_string()),
+        files_produced: 3,
+        bytes_written: 1_048_576,
+        retries: 0,
+        validated: Some(true),
+        schema_changed: Some(false),
+        ..Default::default()
+    })
     .unwrap();
 
-    let metrics = s.get_metrics(Some("pg_metrics_export"), 10).unwrap();
+    let metrics = s.get_metrics(Some(&metrics_export), 10).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].status, "success");
     assert_eq!(metrics[0].total_rows, 100_000);

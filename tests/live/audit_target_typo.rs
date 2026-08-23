@@ -13,25 +13,11 @@
 
 use crate::common::*;
 
-/// Minimal single-export Postgres config (orders-style: int + text columns).
-fn simple_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+/// Minimal single-export Postgres rig (orders-style: int + text columns).
+fn simple_rig(table: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .dest_path(out_dir.to_path_buf())
 }
 
 // AUDIT-RED target-typo: `check --target <typo>` is silently dropped to None (dispatch.rs:194) — exit 0, no warning. Asserts CORRECT behavior; expected to FAIL until fixed.
@@ -42,13 +28,10 @@ fn audit_check_unknown_cli_target_exits_nonzero() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = run_rivet(&[
+    let result = rig.cli(&[
         "check",
-        "--config",
-        cfg.to_str().unwrap(),
         "--export",
         table.name(),
         "--target",
@@ -77,13 +60,10 @@ fn audit_check_unknown_cli_target_names_the_typo() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = run_rivet(&[
+    let result = rig.cli(&[
         "check",
-        "--config",
-        cfg.to_str().unwrap(),
         "--export",
         table.name(),
         "--target",
@@ -114,38 +94,11 @@ fn audit_check_unknown_config_target_errors_loudly_contrast() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     // Per-export `target:` carries the typo. `--strict` ensures the type-report
     // (and thus the config-level target validation at preflight/mod.rs:173) runs.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = simple_rig(table.name(), out.path()).export_line("target: bigqery");
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    target: bigqery
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = run_rivet(&[
-        "check",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-        "--strict",
-    ]);
+    let result = rig.cli(&["check", "--export", table.name(), "--strict"]);
 
     // This documents the LOUD baseline the CLI flag must mirror: a config-level
     // unknown target exits non-zero and names the typo. (Expected to already

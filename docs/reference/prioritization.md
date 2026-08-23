@@ -44,7 +44,7 @@ Missing signals (e.g. preflight failed) lower confidence explicitly — the reco
 
 ### Historical refinement (Epic I)
 
-When prior runs exist, `rivet plan` folds them into the score with **bounded contribution** (at most ~15 points across all three historical reasons combined) so history cannot override preflight:
+When prior runs exist, `rivet plan` folds them into the score with **bounded contribution** (fixed per-reason penalties: −8 recent failure, −5 high retry rate, −4 slow history — at most 17 points when all three fire) so history cannot override preflight:
 
 | Condition | Penalty | Reason |
 |---|---|---|

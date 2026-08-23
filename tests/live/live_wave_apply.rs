@@ -16,49 +16,26 @@ use crate::common::*;
 fn wave_failure_isolates_later_waves() {
     require_alive(LiveService::Postgres);
 
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let bad = unique_name("bad");
     let good_a = unique_name("orders_w2");
     let good_b = unique_name("users_w3");
 
     // wave 1 fails (query against a nonexistent table); waves 2/3 are valid
     // tables. Waves are hand-set so apply runs them in order regardless of cost.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
+    let rig = Rig::pg_batch(&bad)
+        .query(&format!("SELECT id FROM no_such_table_{bad}"))
+        .source_url_env("DATABASE_URL")
+        .export_line("wave: 1")
+        .also_export(&good_a, "SELECT id FROM orders")
+        .also_export_line("wave: 2")
+        .also_export(&good_b, "SELECT id FROM users")
+        .also_export_line("wave: 3");
+    let cfg = rig.config_path();
 
-exports:
-  - name: {bad}
-    query: "SELECT id FROM no_such_table_{bad}"
-    mode: full
-    format: parquet
-    wave: 1
-    destination: {{ type: local, path: {root}/{bad} }}
-  - name: {good_a}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 2
-    destination: {{ type: local, path: {root}/{good_a} }}
-  - name: {good_b}
-    query: "SELECT id FROM users"
-    mode: full
-    format: parquet
-    wave: 3
-    destination: {{ type: local, path: {root}/{good_b} }}
-"#,
-        root = out.path().display(),
+    let apply = run_rivet_env(
+        &["apply", cfg.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let apply = std::process::Command::new(RIVET_BIN)
-        .args(["apply", cfg.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
 
     // wave 1 failed → apply exits non-zero...
     assert!(
@@ -69,8 +46,8 @@ exports:
     );
 
     // ...but the later waves still ran: both downstream exports produced Parquet.
-    let a_files = files_with_extension(&out.path().join(&good_a), "parquet");
-    let b_files = files_with_extension(&out.path().join(&good_b), "parquet");
+    let a_files = files_with_extension(&rig.out_dir_for(&good_a), "parquet");
+    let b_files = files_with_extension(&rig.out_dir_for(&good_b), "parquet");
     assert!(
         !a_files.is_empty(),
         "wave 2 export '{good_a}' must produce Parquet despite the wave-1 failure \
@@ -93,38 +70,20 @@ exports:
 fn resume_skips_completed_exports() {
     require_alive(LiveService::Postgres);
 
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let exp = unique_name("orders_done");
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {exp}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 1
-    destination: {{ type: local, path: {root} }}
-"#,
-        root = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&exp)
+        .query("SELECT id FROM orders")
+        .source_url_env("DATABASE_URL")
+        .export_line("wave: 1");
+    let cfg = rig.config_path();
 
     let run = |args: &[&str]| {
-        std::process::Command::new(RIVET_BIN)
-            .arg("apply")
-            .arg(cfg.to_str().unwrap())
-            .args(args)
-            .env("DATABASE_URL", POSTGRES_URL)
-            .output()
-            .expect("spawn rivet apply")
+        let mut all = vec!["apply", cfg.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run_rivet_env(&all, &[("DATABASE_URL", POSTGRES_URL)])
     };
-    let parquet_count = || files_with_extension(out.path(), "parquet").len();
+    let parquet_count = || files_with_extension(&rig.out_dir(), "parquet").len();
 
     // Phase 1 — fresh run writes one Parquet + a `_SUCCESS` marker.
     let first = run(&[]);
@@ -180,34 +139,20 @@ fn resume_skips_a_completed_export_with_a_templated_destination() {
     // way `rivet run` does at write time. RED before that expansion.
     require_alive(LiveService::Postgres);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let exp = unique_name("orders_tmpl");
     // Destination path carries the `{export}` token → writes under `<root>/<exp>/`.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {exp}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 1
-    destination: {{ type: local, path: "{root}/{{export}}" }}
-"#,
-        root = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // The templated SUBPATH is the fixture's subject, so the rig's dest is
+    // overridden with it (a PathBuf carries the literal braces fine).
+    let rig = Rig::pg_batch(&exp)
+        .query("SELECT id FROM orders")
+        .source_url_env("DATABASE_URL")
+        .export_line("wave: 1")
+        .dest_path(out.path().join("{export}"));
+    let cfg = rig.config_path();
     let run = |args: &[&str]| {
-        std::process::Command::new(RIVET_BIN)
-            .arg("apply")
-            .arg(cfg.to_str().unwrap())
-            .args(args)
-            .env("DATABASE_URL", POSTGRES_URL)
-            .output()
-            .expect("spawn rivet apply")
+        let mut all = vec!["apply", cfg.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run_rivet_env(&all, &[("DATABASE_URL", POSTGRES_URL)])
     };
     // Detect a skip by the run-unique `manifest-<run_id>.json` copies under the
     // EXPANDED `<root>/<exp>/` prefix: a SKIP writes none, a re-run adds one. This
@@ -260,5 +205,83 @@ exports:
     assert!(
         manifest_copies() > after_first,
         "a plain re-run (no --resume) must re-export, adding a manifest copy",
+    );
+}
+
+/// `rivet plan` is READ-ONLY without `--annotate-waves`: it must not write the
+/// config AT ALL — neither replace a hand-tuned `wave:` nor ADD one to a blank
+/// export. `--annotate-waves` is the only thing that writes.
+///
+/// This is a regression with an incident behind it, recorded on the flag itself:
+/// before 0.24.4 a read-only-LOOKING `rivet plan` replaced the operator's
+/// `wave:` values, and a 5-per-wave split became one 76-export wave. 0.24.4
+/// gated the OVERWRITE — but left the ADD-arm open: plain `plan` still silently
+/// wrote `wave:`/`parallel_safe:` onto any export that LACKED them, so a fresh
+/// config was still mutated by a command that looks read-only. The read-only
+/// contract (2026-08-20) closes that arm: no flag ⇒ no write, present or absent.
+///
+/// The fixture carries BOTH arms so the byte-for-byte assertion below covers
+/// each: two hand-tuned exports (the OVERWRITE the flag once did silently) and
+/// one BLANK export with no wave at all (the ADD-arm 0.24.4 missed). Pre-fix,
+/// plain `plan` adds `wave:` to the blank export → the config changes → RED.
+///
+/// Both directions go through the real binary and read the CONFIG FILE back:
+/// without the flag it must survive byte-for-byte, with it it must change.
+/// Asserting only the first would pass on a `plan` that never annotates at all.
+/// The load-bearing gate is `fields_to_write(&recs, annotate_waves)` in
+/// plan_cmd.rs — the unit test `plan_is_read_only_without_annotate_and_packs_
+/// the_whole_config_with_it` pins it directly; this one pins the WIRING (the
+/// CLI actually reaches the gate with the flag the operator passed).
+#[test]
+#[ignore = "live: postgres"]
+fn plan_is_read_only_without_annotate_waves() {
+    require_alive(LiveService::Postgres);
+    let a = unique_name("wave_keep_a");
+    let b = unique_name("wave_keep_b");
+    let c = unique_name("wave_blank_c");
+
+    // Hand-tuned: two exports the planner would happily put in ONE wave, split
+    // across two on purpose (the OVERWRITE arm). Plus a THIRD export with NO
+    // wave/parallel_safe at all — the ADD-arm 0.24.4 left silently open.
+    let rig = Rig::pg_batch(&a)
+        .query("SELECT id FROM orders")
+        .export_line("wave: 7")
+        .export_line("parallel_safe: false")
+        .also_export(&b, "SELECT id FROM orders")
+        .also_export_line("wave: 9")
+        .also_export_line("parallel_safe: false")
+        .also_export(&c, "SELECT id FROM orders"); // blank: no wave, no parallel_safe
+    let cfg = rig.config_path();
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let plain = rig.cli(&["plan"]);
+    assert!(
+        plain.status.success(),
+        "rivet plan must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("re-read config"),
+        before,
+        "`rivet plan` without --annotate-waves must leave the config BYTE-FOR-BYTE alone — \
+         not replace the hand-tuned waves (7/9) AND not ADD a `wave:` to the blank export \
+         '{c}'. A read-only-looking command that mutates the file is the 0.24.4 incident \
+         class; the ADD-arm is the half 0.24.4 left open."
+    );
+
+    // …and the flag must actually do the thing, or the assertion above is
+    // satisfied by a `plan` that simply never annotates.
+    let annotated = rig.cli(&["plan", "--annotate-waves"]);
+    assert!(
+        annotated.status.success(),
+        "rivet plan --annotate-waves must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&annotated.stderr)
+    );
+    let after = std::fs::read_to_string(&cfg).expect("re-read config after annotate");
+    assert_ne!(
+        after, before,
+        "--annotate-waves must REWRITE the schedule (waves 7/9 were chosen so any real plan \
+         disagrees, and the blank export gains a wave); an unchanged file means the flag never \
+         reached the annotator and the read-only assertion above proves nothing"
     );
 }

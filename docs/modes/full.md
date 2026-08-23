@@ -18,7 +18,7 @@ Use `mode: full` when you want a complete snapshot of the query result set every
 
 ```yaml
 source:
-  type: postgres                                    # postgres or mysql
+  type: postgres                                    # postgres, mysql, mssql, or mongo
   url: "postgresql://user:pass@host:5432/dbname"
 
 exports:
@@ -31,7 +31,7 @@ exports:
       path: ./output                                # directory for output files
 ```
 
-Output file: `./output/users_daily_20260406_120000.parquet`
+Output file: `./output/users_daily_20260406_120000_123.parquet` (the timestamp ends with a 3-digit millisecond field, e.g. `_123`, so rapid re-runs never collide)
 
 ## Run it
 

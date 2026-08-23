@@ -113,7 +113,6 @@ fn audit_plan_output_preserves_all_exports() {
     require_alive(LiveService::Postgres);
 
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let plan_dir = tempfile::tempdir().unwrap();
 
     // Two distinct exports against two distinct seeded tables. Unique names so
@@ -122,39 +121,17 @@ fn audit_plan_output_preserves_all_exports() {
     let first = unique_name("orders_exp");
     let second = unique_name("users_exp");
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {first}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-  - name: {second}
-    query: "SELECT id FROM users"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&first)
+        .query("SELECT id FROM orders")
+        .source_url_env("DATABASE_URL")
+        .also_export(&second, "SELECT id FROM users")
+        .dest_path(out_dir.path().to_path_buf());
     let plan_path = plan_dir.path().join("plan.json");
 
     // No --export flag → plan iterates ALL exports in the config.
-    let plan_out = run_rivet_env(
+    let plan_out = rig.cli_env(
         &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--format",
             "json",
             "--output",
@@ -198,40 +175,13 @@ fn audit_apply_rejects_tampered_plan() {
     // Plan an `orders` export (2500 rows). Single-column `SELECT id` so the
     // tampered query is valid against both tables and would run cleanly today.
     let export = unique_name("orders_exp");
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {export}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query("SELECT id FROM orders")
+        .source_url_env("DATABASE_URL")
+        .dest_path(out_dir.path().to_path_buf());
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan_out = run_rivet_env(
-        &[
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--format",
-            "json",
-            "--output",
-            plan_path.to_str().unwrap(),
-        ],
-        &[("DATABASE_URL", POSTGRES_URL)],
-    );
+    let plan_out = rig.plan_json_env(&plan_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
     assert!(
         plan_out.status.success(),
         "rivet plan must exit 0; stderr:\n{}",
@@ -255,10 +205,7 @@ exports:
     let tampered_path = cfg_dir.path().join("tampered_plan.json");
     std::fs::write(&tampered_path, &tampered).expect("write tampered plan");
 
-    let apply_out = run_rivet_env(
-        &["apply", tampered_path.to_str().unwrap()],
-        &[("DATABASE_URL", POSTGRES_URL)],
-    );
+    let apply_out = rig.apply_env(&tampered_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
 
     // If apply DID run (exit 0), surface which table it exported so the failure
     // message names the wrong value: a users export under the orders name is
@@ -305,41 +252,16 @@ fn apply_must_not_advance_the_cursor_when_the_manifest_did_not_land() {
     let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
     let export = unique_name("orders_incr");
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {export}
-    query: "SELECT id, updated_at FROM orders"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query("SELECT id, updated_at FROM orders")
+        .source_url_env("DATABASE_URL")
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out_dir.path().to_path_buf());
+    let cfg = rig.config_path();
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan_out = run_rivet_env(
-        &[
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--format",
-            "json",
-            "--output",
-            plan_path.to_str().unwrap(),
-        ],
-        &[("DATABASE_URL", POSTGRES_URL)],
-    );
+    let plan_out = rig.plan_json_env(&plan_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
     assert!(
         plan_out.status.success(),
         "rivet plan must exit 0; stderr:\n{}",
@@ -349,10 +271,7 @@ exports:
     // Block the manifest write: a directory cannot be replaced by a file rename.
     std::fs::create_dir_all(out_dir.path().join("manifest.json")).expect("block manifest.json");
 
-    let apply_out = run_rivet_env(
-        &["apply", plan_path.to_str().unwrap()],
-        &[("DATABASE_URL", POSTGRES_URL)],
-    );
+    let apply_out = rig.apply_env(&plan_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
     let stderr = String::from_utf8_lossy(&apply_out.stderr).into_owned();
 
     // The fixture must not be inert: if no part landed, the run failed for an
@@ -427,26 +346,18 @@ fn audit_apply_honours_on_schema_drift_for_a_chunked_plan() {
 
     let out = tempfile::tempdir().unwrap();
     let cfgdir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url_env: DATABASE_URL}}
-exports:
-  - name: {table}
-    table: "public.{table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 100
-    on_schema_drift: fail
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfgdir, &yaml);
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named(&table)
+        .source_url_env("DATABASE_URL")
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100")
+        .export_line("on_schema_drift: fail")
+        .dest_path(out.path().to_path_buf());
     let env = [("DATABASE_URL", POSTGRES_URL)];
 
     // 1. A first run records the schema the drift gate will compare against.
-    let first = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &env);
+    let first = rig.run_args_env(&[], &env);
     assert!(
         first.status.success(),
         "first run must succeed; stderr:\n{}",
@@ -455,11 +366,9 @@ exports:
 
     // 2. Seal a plan against that schema.
     let plan = cfgdir.path().join("plan.json");
-    let planned = run_rivet_env(
+    let planned = rig.cli_env(
         &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--output",
             plan.to_str().unwrap(),
             "--format",
@@ -480,7 +389,7 @@ exports:
 
     // 4. CONTROL: the same config, run directly, must refuse. If this passes,
     //    the fixture never produced drift and the apply arm below proves nothing.
-    let control = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &env);
+    let control = rig.run_args_env(&[], &env);
     let control_text = String::from_utf8_lossy(&control.stderr).into_owned();
     assert!(
         !control.status.success() && control_text.contains("schema drift"),
@@ -489,7 +398,7 @@ exports:
     );
 
     // 5. The same policy, the same drift, through the plan artifact.
-    let applied = run_rivet_env(&["apply", plan.to_str().unwrap()], &env);
+    let applied = rig.apply_env(&plan, &[], &env);
     let applied_text = format!(
         "{}{}",
         String::from_utf8_lossy(&applied.stdout),

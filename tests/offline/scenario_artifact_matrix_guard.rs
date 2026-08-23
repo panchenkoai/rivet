@@ -18,15 +18,9 @@
 //! (an unknown class, an unknown engine, an unexplained restriction).
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 fn matrix_text() -> String {
-    let p = repo_root().join("docs/scenario-artifact-matrix.yaml");
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    super::nonvacuity::subject_text("docs/scenario-artifact-matrix.yaml")
 }
 
 /// Values under a top-level `engines: [a, b]` inline list.
@@ -109,6 +103,17 @@ fn scenarios(text: &str) -> Vec<(String, BTreeSet<String>, BTreeSet<String>, boo
     if let Some(s) = cur.take() {
         out.push(s);
     }
+    // The `scenarios:` HEADING missing panics above; a heading whose rows this
+    // hand-rolled line parser no longer recognises (a re-indent, a different
+    // list style) yields zero rows — and all four guards below iterate rows, so
+    // zero rows is four green tests over a ledger asserting nothing. 14 today.
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        8,
+        "scenario rows parsed from docs/scenario-artifact-matrix.yaml",
+        "The rows are still there and this parser stopped seeing them — fix the parser \
+         rather than the floor.",
+    );
     out
 }
 
@@ -132,6 +137,23 @@ fn every_expect_key_is_a_declared_artifact_class() {
          exists to remove:\n  {}\nDeclared classes: {:?}",
         bad.join("\n  "),
         classes
+    );
+}
+
+/// The matrix's self-declared `engines:` universe must BE the SourceType enum
+/// — not merely self-consistent. r5 wired this derive-check into release_gate
+/// but left this sibling hand-declaring the same universe (r6 bughunt): a new
+/// SourceType variant would not force a column here.
+#[test]
+fn declared_engines_are_the_source_type_enum() {
+    let declared = declared_engines(&matrix_text());
+    let derived: std::collections::BTreeSet<String> =
+        super::chunking_matrix_guard::source_engine_variants()
+            .into_iter()
+            .collect();
+    assert_eq!(
+        declared, derived,
+        "scenario-artifact matrix's declared engines drifted from SourceType:          declared {declared:?} vs enum {derived:?}"
     );
 }
 

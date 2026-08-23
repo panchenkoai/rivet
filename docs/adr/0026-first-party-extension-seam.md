@@ -22,6 +22,30 @@ The seam is the exact set of library items `rivet-pro` depends on. It stays `pub
 | `ExportTarget::resolve_table(&[TypeMapping]) -> Vec<TargetColumnSpec>` | `rivet::types::target` |
 | `ExportTarget::resolve_column(TargetInput) -> TargetColumnSpec` | `rivet::types::target` |
 | `TargetColumnSpec`, `TargetInput`, `TargetStatus` | `rivet::types::target` |
+| `AdcUserTokenLoader`, `try_authorized_user_loader()` | `rivet::google_auth` |
+
+The ADC loader is on the seam for a reason worth stating: `reqsign`'s token
+loader resolves service account → impersonated → external account → VM
+metadata and has **no `authorized_user` arm**, so any native Google client
+must supply one or it authenticates in CI and fails on a developer laptop.
+`rivet-pro` wrote a second copy of this exchange before the seam existed, and
+got three things wrong that this implementation had already learned — it
+surfaced the token endpoint's error body (Google echoes the submitted
+`client_id`/`client_secret` back in some failure modes), it kept the secrets
+in un-zeroed `String`s, and it pinned an invented lifetime when `expires_in`
+was absent. Exposing the loader is what makes "never hand-roll a second auth
+path" true across BOTH repos instead of only inside this one.
+
+The loader was WIDENED (0.24.x) to mint from a `service_account` key file too —
+the RFC 7523 jwt-bearer grant, RS256-signed in process — so a consumer pointing
+`GOOGLE_APPLICATION_CREDENTIALS` at a key file gets its token from this seam
+rather than from a `gcloud` subprocess. The seam items are UNCHANGED
+(`AdcUserTokenLoader` keeps its now-misleading name precisely because renaming
+it to describe a widening would break a consumer for nothing); two additive
+methods, `credential_kind()` and `principal()`, name the resolved identity for
+logs. `external_account` / workload identity still returns `Ok(None)`: it needs
+an STS exchange rivet does not model, and a half-implemented subset would be
+worse than the documented fallback.
 
 Everything else in the library keeps the ADR-0002 posture: `pub` only for the test harness, no stability guarantee.
 

@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "rivet-cli"
-version = "0.24.3"
+version = "0.24.5"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3568,6 +3568,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "indicatif",
+ "jsonwebtoken",
  "libc",
  "log",
  "mach2",
@@ -3583,13 +3584,16 @@ dependencies = [
  "postgres-types",
  "proptest",
  "rand 0.10.1",
+ "regex",
  "reqsign",
  "reqwest",
+ "rsa",
  "rusqlite",
  "schemars",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.10.9",
  "simdutf8",
  "tempfile",
  "tiberius",

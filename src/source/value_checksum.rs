@@ -672,12 +672,71 @@ pub fn validate_manifest_checksums(
     dest: &dyn crate::destination::Destination,
     prefix: &str,
 ) -> Result<Option<ReadbackFault>> {
-    use std::io::Write;
-
     use crate::manifest::{MANIFEST_FILENAME, RunManifest, join_key};
 
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
     let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
+
+    // #167: a `--pool --split` prefix holds N unit manifests, each with its OWN parts and
+    // per-unit `column_checksums`; the canonical `manifest.json` is last-writer-wins — one
+    // unit's parts/checksums. Re-reading only the canonical Form-B-checked exactly ONE of the N
+    // units, so a value corruption or row mis-count in a NON-last unit was silently PASSED — the
+    // value-integrity twin of the presence-check split-fold gap #167 already closed (validate's
+    // merge_split_unit_parts). Check every same-family SPLIT-UNIT sibling here too. A non-split /
+    // legacy manifest (empty family) checks the canonical alone, unchanged.
+    for unit in split_unit_manifests(dest, prefix, manifest)? {
+        if let Some(fault) = validate_one_manifest_checksums(dest, prefix, &unit)? {
+            return Ok(Some(fault));
+        }
+    }
+    Ok(None)
+}
+
+/// The unit manifests whose value-integrity [`validate_manifest_checksums`] must check: for a
+/// split family, the canonical plus every same-family SPLIT-UNIT sibling copy (deduped by
+/// run_id — the canonical's own copy is among them); for a plain/legacy export (empty family),
+/// just the canonical. Gated on `split_window` so a plain export's superseded historical copies
+/// are not re-checked (mirrors validate's `merge_split_unit_parts`).
+fn split_unit_manifests(
+    dest: &dyn crate::destination::Destination,
+    prefix: &str,
+    canonical: crate::manifest::RunManifest,
+) -> Result<Vec<crate::manifest::RunManifest>> {
+    use crate::manifest::{RunManifest, is_run_unique_manifest_name};
+    if canonical.export_family.is_empty() {
+        return Ok(vec![canonical]);
+    }
+    let mut seen = std::collections::BTreeSet::from([canonical.run_id.clone()]);
+    let family = canonical.export_family.clone();
+    let mut out = vec![canonical];
+    for meta in dest.list_prefix(prefix)? {
+        let base = meta.key.rsplit('/').next().unwrap_or("");
+        if !is_run_unique_manifest_name(base) {
+            continue;
+        }
+        let Ok(bytes) = dest.read(&meta.key) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes) else {
+            continue;
+        };
+        if m.export_family == family && m.split_window.is_some() && seen.insert(m.run_id.clone()) {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// Re-read ONE manifest's parts and check per-part row counts + per-column checksums against
+/// what THAT manifest recorded — the per-unit body of [`validate_manifest_checksums`].
+fn validate_one_manifest_checksums(
+    dest: &dyn crate::destination::Destination,
+    prefix: &str,
+    manifest: &crate::manifest::RunManifest,
+) -> Result<Option<ReadbackFault>> {
+    use std::io::Write;
+
+    use crate::manifest::join_key;
 
     // Materialise each part to a temp file so the Parquet reader can seek (the
     // dest may be a cloud backend); keep the temp files alive for the re-read.
@@ -704,7 +763,7 @@ pub fn validate_manifest_checksums(
     // Deliberately ABOVE the `column_checksums` early return: a run that recorded
     // no checksums (older artifact, non-Parquet leg) still has parts whose counts
     // can be checked, and the previous shape skipped everything for it.
-    if let Some(detail) = part_row_count_mismatch(&manifest, &paths)? {
+    if let Some(detail) = part_row_count_mismatch(manifest, &paths)? {
         return Ok(Some(ReadbackFault::PartRowCount(detail)));
     }
 
@@ -1531,6 +1590,90 @@ mod tests {
         assert!(
             res.is_err(),
             "a non-u64 recorded hash is operational (Err/exit 1), not a mismatch: {res:?}"
+        );
+    }
+
+    // Minimal split-unit manifest (only the fields split_unit_manifests reads matter).
+    fn split_unit(run: &str, name: &str, family: &str) -> crate::manifest::RunManifest {
+        use crate::manifest::{
+            MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus, RunManifest,
+            SplitWindow,
+        };
+        RunManifest {
+            manifest_version: MANIFEST_VERSION,
+            run_id: run.into(),
+            export_name: name.into(),
+            export_family: family.into(),
+            mode: "batch".into(),
+            started_at: "t".into(),
+            finished_at: "t".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "pg".into(),
+                schema: None,
+                table: None,
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: "file:///x".into(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: "xxh3:0".into(),
+            row_count: 0,
+            part_count: 0,
+            parts: vec![],
+            column_checksums: None,
+            checksum_render: None,
+            checksum_key_column: None,
+            row_hash: None,
+            split_window: Some(SplitWindow {
+                key_column: "id".into(),
+                lo: None,
+                hi: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn split_unit_manifests_folds_every_same_family_split_sibling() {
+        // The value-integrity fold must return ALL same-family split units (each has its OWN
+        // parts + per-unit checksums to re-read), not just the canonical (last-writer). Reading
+        // only the canonical Form-B-checked one of N units — a NON-last unit's corruption passed.
+        use crate::destination::local::LocalDestination;
+        use crate::manifest::run_unique_manifest_name;
+        let dir = tempfile::tempdir().unwrap();
+        // Two split units of family "orders" (+ a FOREIGN family unit that must NOT be folded).
+        for (run, name, fam) in [
+            ("r0", "orders#0", "orders"),
+            ("r1", "orders#1", "orders"),
+            ("rx", "other#0", "other"),
+        ] {
+            let m = split_unit(run, name, fam);
+            std::fs::write(
+                dir.path().join(run_unique_manifest_name(run)),
+                serde_json::to_vec(&m).unwrap(),
+            )
+            .unwrap();
+        }
+        let dest = LocalDestination::new(&crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Canonical = orders#1 (last writer). Fold must yield BOTH orders units, not the foreign.
+        let canonical = split_unit("r1", "orders#1", "orders");
+        let units = split_unit_manifests(&dest, "", canonical).unwrap();
+        let mut runs: Vec<&str> = units.iter().map(|m| m.run_id.as_str()).collect();
+        runs.sort_unstable();
+        assert_eq!(
+            runs,
+            vec!["r0", "r1"],
+            "value-checksum fold must cover every same-family split unit (canonical + siblings), \
+             deduped, and never a foreign family"
         );
     }
 }

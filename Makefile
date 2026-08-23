@@ -169,8 +169,23 @@ seed-garbage-mysql:
 seed-garbage-mssql:
 	docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -d rivet -b -i /dev/stdin < dev/garbage/mssql.sql
 
-release-oracle:  ## Release gate, BARE: only what is already in your shell. Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
-	python3 -m dev.release_oracle
+# The BARE target ADDS no baseline of its own, so it must GIVE UP the
+# prev-release comparison BY NAME. Since a missing `RIVET_PREV_RELEASE_BIN`
+# became a FAIL rather than a SKIP (a check that grades nothing must fail —
+# 0.24.4 shipped a +1h48m regression through a green gate whose only comparison
+# leg SKIPped), a bare invocation without this flag goes red on three stages for
+# a reason that has nothing to do with what it is checking.
+# `--without-prev-release-comparison` is the deliberate, named escape: it says
+# out loud, in every row it records and in the summary, that this run cannot
+# support a tag.
+#
+# The escape only excuses an ABSENT baseline. This target is "whatever is already
+# in your shell", so `RIVET_PREV_RELEASE_BIN=… make release-oracle` DOES carry
+# one, and the three stages then run and grade for real — the driver's banner and
+# its closing line are keyed on the baseline rather than on this flag, so such a
+# run is reported honestly instead of being announced as a skip it was not.
+release-oracle:  ## Release gate, BARE: only what is already in your shell. With no RIVET_PREV_RELEASE_BIN in your environment the prev-release comparison is GIVEN UP by name (cannot support a tag); with one exported, those three stages run and grade. Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
+	python3 -m dev.release_oracle --without-prev-release-comparison $(ARGS)
 
 # ─── the gate's environment, assembled ────────────────────────────────────────
 #
@@ -211,7 +226,12 @@ RIVET_CONC_SRC_CONTAINER  ?= rivet-postgres-1
 BQ_ORACLE_PROJECT         ?= $(shell gcloud config get-value project 2>/dev/null)
 BQ_ORACLE_DATASET         ?= rivet_blessed
 BQ_ORACLE_BUCKET          ?= rivet_data_test
-PREV_RELEASE_DIR          ?= target/prev-release
+# OUTSIDE target/: the oracle's first act is `cargo clean` (the gate builds the
+# binary it grades), which silently deleted a baseline downloaded into
+# target/prev-release — the regression leg then "declared-skipped" on every
+# single full run while the download step reported success. A baseline the
+# gate needs must live where the gate's own hygiene cannot eat it.
+PREV_RELEASE_DIR          ?= .gate-baseline
 
 GATE_ENV = \
   RIVET_ORACLE_POSTGRES_URL='$(RIVET_ORACLE_POSTGRES_URL)' \
@@ -235,7 +255,7 @@ GATE_ENV = \
   BQ_ORACLE_BUCKET='$(BQ_ORACLE_BUCKET)'
 
 release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regression + scale baseline). A downloaded asset, never a locally rebuilt parent.
-	@mkdir -p $(PREV_RELEASE_DIR)
+	@rm -rf $(PREV_RELEASE_DIR) && mkdir -p $(PREV_RELEASE_DIR)  # exactly one baseline: `ls | tail` below must not pick a lexicographically-wrong version from an accumulating dir (bug hunt 2026-08-08)
 	@tag=$$(gh release list --limit 1 --json tagName -q '.[0].tagName'); \
 	 arch=$$(uname -m); os=$$(uname -s | tr 'A-Z' 'a-z'); \
 	 [ "$$arch" = "arm64" ] && arch=aarch64; \
@@ -252,11 +272,21 @@ release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE env
 	@# `Fresh` on a binary that predates your edits — drop the snapshot first.
 	@rm -rf target/package
 	cargo build --release
-	@prev=$$(ls -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | tail -1); \
-	 echo "  previous release: $${prev:-<none — the regression + scale legs will SKIP>}"; \
+	@# newest by mtime, not lexical order (accumulating dir would mis-tail)
+	@# An ABSENT baseline is now a FAIL, not a SKIP, on all three prev-release
+	@# stages (release regression / previous-release differential / field symptom
+	@# replay) — so the echo says FAIL and names the escape. A gate run that
+	@# reaches here with an empty $$prev is telling you the download failed.
+	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
+	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
 	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" python3 -m dev.release_oracle $(ARGS)
 
 release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckdb-type goldens. Deliberate: a golden must be written by rivet's own code, never edited by hand.
 	@rm -rf target/package
 	cargo build --release
-	env $(GATE_ENV) python3 -m dev.release_oracle --bless-local $(ARGS)
+	@# It DEPENDS on release-oracle-prev-bin, so it downloads a baseline — and
+	@# used to then not pass it, failing three stages over the absence of a
+	@# binary it had just fetched. Same threading as release-oracle-full.
+	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
+	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
+	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" python3 -m dev.release_oracle --bless-local $(ARGS)

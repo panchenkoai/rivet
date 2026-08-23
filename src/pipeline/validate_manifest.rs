@@ -33,11 +33,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::destination::Destination;
+use crate::destination::{Destination, ObjectMeta};
 use crate::error::Result;
+use crate::manifest::census::ManifestCensus;
 use crate::manifest::{
-    MANIFEST_FILENAME, RunManifest, SUCCESS_FILENAME, join_key, parse_success_marker,
-    success_marker_body,
+    MANIFEST_FILENAME, PartStatus, RunManifest, SUCCESS_FILENAME, is_run_unique_manifest_name,
+    join_key, parse_success_marker, success_marker_body,
 };
 use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
@@ -569,6 +570,60 @@ impl ManifestVerification {
 ///
 /// Regardless of depth, `depth_level` on the returned verdict records the
 /// level this pass ran at.
+/// Read every run-unique manifest COPY (`manifest-<run_id>.json`) named in the
+/// prefix listing, keyed by the storage key it was read from (what
+/// [`ManifestCensus`] enumerates runs by). Best-effort: a copy that fails to read
+/// or parse is skipped — the untracked scan it feeds is advisory, so a bad sibling
+/// copy must never turn validate into an error (worst case a part it would have
+/// claimed stays flagged, the pre-#167 behaviour). The canonical `manifest.json`
+/// is not a copy and is excluded (it is already the primary manifest).
+///
+/// This is validate's I/O half; every question ASKED of the copies — which of them
+/// are this family's split units, which parts they claim — is the census's.
+fn read_sibling_manifests(
+    dest: &dyn Destination,
+    listing: &[ObjectMeta],
+) -> Vec<(String, RunManifest)> {
+    let mut out = Vec::new();
+    for meta in listing {
+        let base = meta.key.rsplit('/').next().unwrap_or("");
+        if !is_run_unique_manifest_name(base) {
+            continue;
+        }
+        if let Ok(bytes) = read_capped(dest, &meta.key, MANIFEST_MAX_BYTES)
+            && let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes)
+        {
+            out.push((meta.key.clone(), m));
+        }
+    }
+    out
+}
+
+/// A working manifest whose `parts` are the UNION of `canonical`'s parts and every
+/// `Committed` part declared by a SAME-FAMILY **split unit** under the prefix, deduped by
+/// declared path. The reconcile target for a `--pool --split` prefix: presence/size/md5 then
+/// cover EVERY unit, not just the last writer whose parts the canonical `manifest.json`
+/// happens to list (#167 merge-back).
+///
+/// WHICH copies are units is [`ManifestCensus::split_units`]'s answer, not validate's — a
+/// plain export's HISTORICAL repeated-run copies share the family but are SUPERSEDED
+/// snapshots, and presence-checking a legitimately cleaned old part would false-fail. The
+/// canonical's own copy is among them, so seeding `seen` with the canonical's parts keeps it
+/// from being added twice. Only `parts` differ from `canonical`.
+fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) -> RunManifest {
+    let mut merged = canonical.clone();
+    let mut seen: std::collections::BTreeSet<String> =
+        merged.parts.iter().map(|p| p.path.clone()).collect();
+    for unit in census.split_units(&canonical.export_family) {
+        for p in &unit.manifest.parts {
+            if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
+                merged.parts.push(p.clone());
+            }
+        }
+    }
+    merged
+}
+
 pub fn verify_at_destination(
     dest: &dyn Destination,
     manifest_dir: &str,
@@ -687,11 +742,34 @@ pub fn verify_at_destination(
     // the parts are physically present.
     let reconciliation = if depth.runs_part_reconcile() {
         match dest.list_prefix(manifest_dir) {
-            Ok(listing) => Some(reconcile_manifest_against_listing(
-                &manifest,
-                &listing,
-                manifest_dir,
-            )),
+            Ok(listing) => {
+                // #167: a `--pool --split` prefix holds N run-unique manifest copies of ONE
+                // family, each declaring a DISJOINT set of parts. The canonical `manifest.json`
+                // lists only the LAST writer's parts, so reconciling the canonical alone
+                // presence/size/md5-checked ONLY the last unit — a missing/corrupt part of any
+                // OTHER split unit was invisible (no PartMissing: not in the canonical list; no
+                // UntrackedObject: not on disk), and the trust oracle silently PASSED an
+                // incomplete split (adjacent-bughunt finding, HIGH). Fold every SAME-FAMILY
+                // SPLIT-UNIT sibling's parts into the reconcile target so each unit is checked.
+                let siblings = if manifest.export_family.is_empty() {
+                    Vec::new()
+                } else {
+                    read_sibling_manifests(dest, &listing)
+                };
+                let census = ManifestCensus::new(&siblings);
+                let target = merge_split_unit_parts(&manifest, &census);
+                let mut rec = reconcile_manifest_against_listing(&target, &listing, manifest_dir);
+                // Same-family sibling parts — the folded split units AND a plain export's
+                // SUPERSEDED historical / CDC-soak copies (no split_window, so NOT folded
+                // above) — are declared by their own copies elsewhere in the prefix, so they
+                // must not read as untracked surplus (noise that also MASKS a real orphan). A
+                // foreign family's parts are never claimed, so cross-contamination still shows.
+                if !rec.untracked.is_empty() && !manifest.export_family.is_empty() {
+                    let claimed = census.claimed_parts(&manifest.export_family, manifest_dir);
+                    rec.untracked.retain(|o| !claimed.contains(&o.key));
+                }
+                Some(rec)
+            }
             Err(e) => {
                 out.failures.push(Failure::ListPrefixError {
                     detail: format!("{e:#}"),
@@ -893,6 +971,7 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
@@ -934,6 +1013,175 @@ mod tests {
         if matches!(m.status, ManifestStatus::Success) {
             std::fs::write(dir.join(SUCCESS_FILENAME), success_marker_body(&body)).unwrap();
         }
+    }
+
+    // ── #167 merge-back: reconcile the UNION of same-family split-unit parts ──
+
+    fn split_win() -> crate::manifest::SplitWindow {
+        crate::manifest::SplitWindow {
+            key_column: "id".into(),
+            lo: None,
+            hi: Some("1000".into()),
+        }
+    }
+
+    /// A sibling copy keyed the way the prefix listing hands it to the census.
+    fn sib_keyed(m: RunManifest) -> (String, RunManifest) {
+        (crate::manifest::run_unique_manifest_name(&m.export_name), m)
+    }
+
+    /// merge_split_unit_parts folds every SAME-FAMILY SPLIT-UNIT sibling's committed parts
+    /// into the reconcile target, and EXCLUDES both a FOREIGN family's parts and a
+    /// SAME-FAMILY non-split (plain, superseded) copy's parts — so a `--pool --split`
+    /// snapshot is checked across ALL units without false-checking a plain export's
+    /// historical run or a foreign export sharing the prefix. WHICH copies are units is the
+    /// census's classification (`ManifestCensus::split_units`); this pins how validate turns
+    /// that answer into the presence-check target.
+    #[test]
+    fn merge_split_unit_parts_folds_split_siblings_only() {
+        let unit = |name: &str, path: &str, fam: &str, split: bool| {
+            let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+            m.export_family = fam.into();
+            m.export_name = name.into();
+            m.parts[0].path = path.into();
+            m.split_window = if split { Some(split_win()) } else { None };
+            sib_keyed(m)
+        };
+        let canonical = unit("daily#3", "daily#3_p.parquet", "daily", true).1; // last split writer
+        let siblings = vec![
+            unit("daily#0", "daily#0_p.parquet", "daily", true),
+            unit("daily#1", "daily#1_p.parquet", "daily", true),
+            unit("daily#3", "daily#3_p.parquet", "daily", true), // canonical's OWN copy
+            unit("daily", "daily_old.parquet", "daily", false),  // SAME family, PLAIN (superseded)
+            unit("other#0", "other_p.parquet", "other", true),   // FOREIGN family
+        ];
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let paths: std::collections::BTreeSet<&str> =
+            merged.parts.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "daily#0_p.parquet",
+                "daily#1_p.parquet",
+                "daily#3_p.parquet"
+            ]
+            .into_iter()
+            .collect(),
+            "fold same-family SPLIT units only — never a foreign family, never a same-family \
+             plain/superseded copy: {paths:?}"
+        );
+        assert_eq!(
+            merged
+                .parts
+                .iter()
+                .filter(|p| p.path == "daily#3_p.parquet")
+                .count(),
+            1,
+            "the canonical's own sibling copy must not double its part"
+        );
+    }
+
+    /// A non-committed (quarantined) split-unit sibling part is NOT merged — only durable
+    /// committed parts belong to the dataset the reconcile checks for presence.
+    #[test]
+    fn merge_split_unit_parts_skips_non_committed_siblings() {
+        let mut canonical = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+        canonical.export_family = "daily".into();
+        canonical.export_name = "daily#0".into();
+        canonical.parts[0].path = "daily#0_p.parquet".into();
+        canonical.split_window = Some(split_win());
+
+        let mut sib = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+        sib.export_family = "daily".into();
+        sib.export_name = "daily#1".into();
+        sib.parts[0].path = "daily#1_q.parquet".into();
+        sib.parts[0].status = PartStatus::Quarantined;
+        sib.split_window = Some(split_win());
+
+        let siblings = vec![sib_keyed(sib)];
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let paths: Vec<&str> = merged.parts.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["daily#0_p.parquet"],
+            "a quarantined split-unit part must not be folded into the reconcile target"
+        );
+    }
+
+    // The claimed-part set validate subtracts from its untracked scan is the census's
+    // (`ManifestCensus::claimed_parts`) — same-family only, committed only, nothing under an
+    // empty family. Its unit tests live beside it, in `manifest::census`; the end-to-end
+    // section below still pins that VALIDATE subtracts it.
+
+    /// End-to-end: a `--pool --split` prefix where a NON-last unit's part is missing must
+    /// FAIL validation. Before the merge-back fix, verify reconciled only the canonical
+    /// (last writer's) parts, so a lost part of any other unit was invisible — no PartMissing
+    /// (not in the canonical list) and no UntrackedObject (not on disk) — and the trust
+    /// oracle silently PASSED an incomplete split (adjacent-bughunt finding, HIGH).
+    #[test]
+    fn verify_over_a_split_prefix_catches_a_missing_non_last_unit_part() {
+        use crate::manifest::run_unique_manifest_name;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two split units of family "orders": #0 (run r0) and #1 (run r1 = LAST → canonical).
+        let mut u0 = build_manifest(
+            vec![part(0, 10, 4, "xxh3:0000000000000000")],
+            ManifestStatus::Success,
+        );
+        u0.export_family = "orders".into();
+        u0.export_name = "orders#0".into();
+        u0.run_id = "r0".into();
+        u0.parts[0].path = "orders#0-part.parquet".into();
+        u0.split_window = Some(crate::manifest::SplitWindow {
+            key_column: "id".into(),
+            lo: None,
+            hi: Some("1000".into()),
+        });
+
+        let mut u1 = build_manifest(
+            vec![part(1, 20, 5, "xxh3:1111111111111111")],
+            ManifestStatus::Success,
+        );
+        u1.export_family = "orders".into();
+        u1.export_name = "orders#1".into();
+        u1.run_id = "r1".into();
+        u1.parts[0].path = "orders#1-part.parquet".into();
+        u1.split_window = Some(crate::manifest::SplitWindow {
+            key_column: "id".into(),
+            lo: Some("1000".into()),
+            hi: None,
+        });
+
+        // Both units' run-unique copies on disk; canonical manifest.json = u1 (last writer).
+        std::fs::write(
+            dir.path().join(run_unique_manifest_name("r0")),
+            serde_json::to_vec(&u0).unwrap(),
+        )
+        .unwrap();
+        let u1_body = serde_json::to_vec(&u1).unwrap();
+        std::fs::write(dir.path().join(run_unique_manifest_name("r1")), &u1_body).unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILENAME), &u1_body).unwrap();
+        std::fs::write(
+            dir.path().join(SUCCESS_FILENAME),
+            success_marker_body(&u1_body),
+        )
+        .unwrap();
+        // u1's part present (5 bytes = its declared size); u0's part DELIBERATELY MISSING.
+        std::fs::write(dir.path().join("orders#1-part.parquet"), b"BBBBB").unwrap();
+
+        let dest = local_dest(dir.path());
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(
+            !v.passed,
+            "a missing part of a NON-last split unit must fail validation, not pass silently"
+        );
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::PartMissing { .. })),
+            "expected a PartMissing for the dropped orders#0 part; got {:?}",
+            v.failures
+        );
     }
 
     // ── happy path ───────────────────────────────────────────────────────
@@ -1152,6 +1400,78 @@ mod tests {
             v.failures
                 .iter()
                 .any(|f| matches!(f, Failure::ManifestSelfInconsistent { .. }))
+        );
+    }
+
+    /// A `manifest.json` that is not valid JSON at all.
+    ///
+    /// The branch above this one — `self_inconsistent_manifest_is_flagged_but_
+    /// part_check_still_runs` — writes a manifest that PARSES cleanly and then
+    /// lies (`row_count = 9999`); that is the self-consistency check far below.
+    /// The branch here is the one where `serde_json::from_slice` itself FAILS,
+    /// and until now nothing reached it: the 2026-08-16 nightly rotation caught
+    /// `delete field manifest_found` and `delete field failures` from this very
+    /// struct expression, both surviving the whole lib suite.
+    ///
+    /// Two halves of the operator-facing contract, both ungraded:
+    ///  * the verdict must still say a manifest was FOUND — reading a corrupt
+    ///    manifest as ABSENT routes the reader to the ADR-0012 M6 legacy-run
+    ///    explanation, a different and wrong story about their destination;
+    ///  * it must carry a FAILURE naming why — without it `rivet validate`
+    ///    reports a destination that did not pass with an EMPTY `failures`
+    ///    list: a red verdict and no reason on it.
+    ///
+    /// (The third survivor from the same report, `delete field passed`, is
+    /// EQUIVALENT — every exit from the main body calls `recompute_passed()`,
+    /// so that literal is unobservable. It has been in `.cargo/mutants.toml`
+    /// with that reason since 2026-07-14 and needs no test.)
+    #[test]
+    fn an_unparseable_manifest_is_found_and_carries_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // Present on disk so the fixture is not inert: if this early return
+        // ever stopped happening we would fall through to the part check
+        // rather than silently do nothing at all.
+        std::fs::write(dir.path().join("part-000001.parquet"), b"AAAA").unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILENAME), b"{ this is not json").unwrap();
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+
+        assert!(
+            v.manifest_found,
+            "an unreadable manifest.json is still a manifest that EXISTS — \
+             reporting it absent sends the operator to the legacy-run path \
+             instead of at the corruption: {v:?}"
+        );
+        assert!(
+            !v.legacy_run,
+            "a corrupt manifest is not a legacy run: {v:?}"
+        );
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::ManifestSelfInconsistent { .. })),
+            "a parse failure must be RECORDED as a failure — a red verdict with \
+             an empty `failures` gives the operator no reason at all: {v:?}"
+        );
+        assert!(
+            !v.passed,
+            "a destination whose manifest cannot be parsed has not passed: {v:?}"
+        );
+
+        // The reason must name the artifact, not just the kind: the operator
+        // reads this line, never the enum variant.
+        let detail = v
+            .failures
+            .iter()
+            .find_map(|f| match f {
+                Failure::ManifestSelfInconsistent { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("asserted present above");
+        assert!(
+            detail.contains("manifest.json"),
+            "the reason must name the file it is about: {detail}"
         );
     }
 
@@ -1899,6 +2219,12 @@ mod tests {
                 },
                 "RIVET_VERIFY_CDC_POSITION",
             ),
+            (
+                Failure::PartRowCountMismatch {
+                    detail: "declared 500, holds 400".into(),
+                },
+                "RIVET_VERIFY_PART_ROW_COUNT",
+            ),
         ];
         for (failure, code) in cases {
             assert_eq!(&failure.error_code(), code, "code for {failure:?}");
@@ -1907,6 +2233,66 @@ mod tests {
                 "every code shares the RIVET_VERIFY_ prefix"
             );
         }
+
+        // COMPLETENESS, derived from the enum rather than trusted to the list
+        // above. The list is hand-written — that is unavoidable, since each case
+        // must construct a value — so the thing that CANNOT be hand-written is
+        // the check that it covers everything. It did not:
+        // `PartRowCountMismatch` was absent, the one code with no stability
+        // guard, in the test whose comment says renaming a code is a silent
+        // break for any CI gate keying off it (audit 2026-08-17).
+        let src = include_str!("validate_manifest.rs");
+        let enum_body = {
+            let at = src
+                .find("pub enum Failure {")
+                .expect("the Failure enum must be declared here");
+            let rest = &src[at..];
+            &rest[..rest.find("\n}").expect("the enum must close")]
+        };
+        let declared: Vec<&str> = enum_body
+            .lines()
+            .skip(1)
+            .filter(|l| l.starts_with("    ") && !l.starts_with("     "))
+            .filter_map(|l| {
+                let t = l.trim();
+                t.chars().next().filter(|c| c.is_ascii_uppercase())?;
+                Some(t.split(|c: char| !c.is_alphanumeric()).next().unwrap_or(""))
+            })
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert!(
+            declared.len() >= 12,
+            "parsed only {} variant(s) from `Failure` — an empty dimension would \
+             make this assertion vacuous, which is the defect it replaces: {declared:?}",
+            declared.len()
+        );
+        let covered: Vec<&str> = cases
+            .iter()
+            .map(|(f, _)| match f {
+                Failure::PartMissing { .. } => "PartMissing",
+                Failure::PartSizeMismatch { .. } => "PartSizeMismatch",
+                Failure::PartChecksumMismatch { .. } => "PartChecksumMismatch",
+                Failure::ValueChecksumMismatch { .. } => "ValueChecksumMismatch",
+                Failure::PartRowCountMismatch { .. } => "PartRowCountMismatch",
+                Failure::CdcPositionViolation { .. } => "CdcPositionViolation",
+                Failure::SuccessMarkerMalformed { .. } => "SuccessMarkerMalformed",
+                Failure::SuccessMarkerStale { .. } => "SuccessMarkerStale",
+                Failure::ManifestSelfInconsistent { .. } => "ManifestSelfInconsistent",
+                Failure::ManifestReadError { .. } => "ManifestReadError",
+                Failure::SuccessMarkerReadError { .. } => "SuccessMarkerReadError",
+                Failure::ListPrefixError { .. } => "ListPrefixError",
+                Failure::UntrackedObject { .. } => "UntrackedObject",
+                Failure::ContentVerificationUnmet { .. } => "ContentVerificationUnmet",
+                Failure::ManifestRequiredButAbsent { .. } => "ManifestRequiredButAbsent",
+            })
+            .collect();
+        let missing: Vec<&&str> = declared.iter().filter(|v| !covered.contains(v)).collect();
+        assert!(
+            missing.is_empty(),
+            "`Failure` declares {} variant(s); these have no error-code case, so \
+             renaming their code would break a CI gate silently: {missing:?}",
+            declared.len()
+        );
     }
 
     #[test]

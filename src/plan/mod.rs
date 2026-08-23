@@ -9,6 +9,7 @@ pub mod recommend;
 pub mod reconcile;
 pub mod repair;
 pub mod validate;
+pub(crate) mod waves;
 
 #[allow(unused_imports)]
 pub use history::{HistorySnapshot, LastStatus};

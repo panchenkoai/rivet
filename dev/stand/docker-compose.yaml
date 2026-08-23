@@ -179,7 +179,7 @@ services:
     healthcheck: *mongo-health
 
   mongo80-batch:
-    image: mongo:8.0
+    image: mongo:8.0.13 # 8.0.14+ kernel gate (SERVER-121912) refuses kernel >=6.19; 7.0.14+ kernels are fixed (SERVER-125742)
     profiles: ["batch"]
     restart: unless-stopped
     ports: ["27108:27017"]
@@ -302,7 +302,7 @@ services:
     healthcheck: *mongo-rs-health
 
   mongo80-cdc:
-    image: mongo:8.0
+    image: mongo:8.0.13 # 8.0.14+ kernel gate (SERVER-121912) refuses kernel >=6.19; 7.0.14+ kernels are fixed (SERVER-125742)
     profiles: ["cdc"]
     restart: unless-stopped
     command: ["--replSet", "rs0", "--bind_ip_all"]

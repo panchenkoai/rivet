@@ -7,7 +7,7 @@
 
 ## Context
 
-Five runners produce output parts (file + manifest entry + state row +
+Eight runners produce output parts (file + manifest entry + state row +
 journal event) on the destination + state-store boundary:
 
 - `pipeline::single::run_single_export` (Snapshot, Incremental)
@@ -16,8 +16,10 @@ journal event) on the destination + state-store boundary:
 - `pipeline::chunked::exec::run_chunked_parallel` (Chunked, thread pool)
 - `pipeline::chunked::sequential_checkpoint::run_chunked_sequential_checkpoint` (Checkpoint, single thread)
 - `pipeline::chunked::parallel_checkpoint::run_chunked_parallel_checkpoint` (Checkpoint, worker pool)
+- `pipeline::keyset::run_keyset_parallel` (Keyset, worker pool — added 2026-07)
+- `pipeline::mongo_parallel::run_mongo_parallel` (Mongo, worker pool)
 
-All five share `pipeline::commit::record_part` for the ordered tail
+All eight share `pipeline::commit::record_part` for the ordered tail
 (I2/M1 manifest + I7 file-log + counters + journal), introduced by
 the commit_part seam work. The cursor + progression writes that follow
 share `pipeline::run_store::RunStore` (ADR-0018).
@@ -46,10 +48,13 @@ each variant satisfies.
 | `sequential_checkpoint` | inline, per-chunk | inline, per-chunk | inline, per-chunk |
 | **`parallel_checkpoint`** | **per-chunk in worker (sync)** | **post-scope drain (`state=None`)** | **post-scope drain** |
 | **`keyset_parallel`** | **per-RANGE in worker (sync, txn)** | **post-scope drain (`state=None`)** | **post-scope drain** |
+| **`mongo_parallel`** | **post-scope drain** | **post-scope drain** | **post-scope drain** |
 
-The odd rows are `chunked_parallel`, `parallel_checkpoint`, and
-`keyset_parallel` (feat/parallel-keyset). They are odd for **different**
-reasons.
+The odd rows are `chunked_parallel`, `parallel_checkpoint`,
+`keyset_parallel` (feat/parallel-keyset), and `mongo_parallel` (whose
+main-thread drain calls `record_part(Some(state))` post-scope — the
+`chunked_parallel` shape; `src/pipeline/mongo_parallel.rs`). They are
+odd for **different** reasons.
 
 ### `keyset_parallel` — per-RANGE worker-sync file_log (added 2026-07)
 
@@ -117,8 +122,12 @@ detects this directly: it asserts post-resume `file_log` and
 The migration commit (e9b0796) initially moved file_log writes to the
 post-scope drain (matching `chunked_parallel`'s shape). C3 failed
 immediately. The fix: write `file_log` **synchronously per chunk in
-the worker** (via `StateStore::open(&config_path_w)` — see "Known
-performance smell" below), push the `PartRecord` to the shared Vec,
+the worker** (via `StateStore::open_at_ref(&state_ref)` — see "Known
+performance smell" below; the earlier `StateStore::open(&config_path_w)`
+variant was removed because `rivet apply` dispatches the runner with an
+empty `config_path`, so `StateStore::open("")` resolved to a stray
+`./.rivet_state.db` and silently stranded the durable-part rows),
+push the `PartRecord` to the shared Vec,
 and have the parent drain call `record_part(state=None, …)` so the
 manifest_parts + counters + journal half runs once without
 double-writing the file_log.
@@ -147,16 +156,17 @@ question.
 ## Known performance smell: per-chunk `StateStore::open`
 
 The `parallel_checkpoint` worker opens a fresh `StateStore` connection
-per chunk just to call `record_file`. `StateStore::open` on SQLite
-takes ~1-5 ms (cold) — for a 1000-chunk run that amortizes to ~1-5
-seconds of overhead.
+per chunk just to call `record_durable_part`. `StateStore::open` on
+SQLite takes ~1-5 ms (cold) — for a 1000-chunk run that amortizes to
+~1-5 seconds of overhead.
 
 This is **not fixed in this release**. The clean fix is a
-`record_file_at_ref(&StateRef, run_id, name, …)` helper in
+`record_durable_part_at_ref(&StateRef, …)` helper in
 `state::file_log` that uses the shared `StateRef::Sqlite(path)`
-without re-opening — matching the existing pattern for
-`claim_next_chunk_task_at_ref`, `complete_chunk_task_at_ref`,
-`fail_chunk_task_at_ref`. ~50 lines of state-crate work.
+without re-opening — matching the surviving `*_at_ref` pattern
+(`claim_next_chunk_task_at_ref`; `complete_chunk_task` /
+`fail_chunk_task` are now plain methods invoked after
+`StateStore::open_at_ref`). ~50 lines of state-crate work.
 
 Tracked as follow-up; this ADR exists so future readers see the smell
 was conscious and addressable, not a hidden footgun.
@@ -167,7 +177,7 @@ was conscious and addressable, not a hidden footgun.
 
 - Each runner's crash-window semantics are explicit and matched to
   its resume contract.
-- The five runners share the maximum possible code (`commit::record_part`
+- The eight runners share the maximum possible code (`commit::record_part`
   body) — the asymmetry is at the **caller** layer, not in
   `record_part` itself.
 - C3 at-least-once durability under worker-crash is preserved for the
@@ -186,7 +196,7 @@ was conscious and addressable, not a hidden footgun.
 ## References
 
 - `src/pipeline/commit.rs` — the shared `record_part` body that runs
-  in all five runners.
+  in all eight runners.
 - `src/pipeline/run_store.rs` — cursor + progression ordering at the
   next layer (see ADR-0018).
 - `src/pipeline/chunked/exec.rs` — `chunked_parallel` runner with

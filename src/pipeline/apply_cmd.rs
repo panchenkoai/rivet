@@ -20,12 +20,36 @@ use super::chunked::ChunkSource;
 use super::summary::ApplyContext;
 
 /// Entry point for `rivet apply <plan-file> [--parallel-export-processes] [--resume] [--force]`.
-pub fn run_apply_command(plan_file: &str, force: bool, parallel: bool, resume: bool) -> Result<()> {
+pub fn run_apply_command(
+    plan_file: &str,
+    force: bool,
+    parallel: bool,
+    resume: bool,
+    pool: Option<usize>,
+    split: bool,
+) -> Result<()> {
     // A YAML config selects the wave-ordered multi-export path (plan→apply
-    // cycle): run every export wave-by-wave in ascending `wave:` order. A JSON
-    // plan artifact falls through to the sealed single-export replay below.
+    // cycle): run every export wave-by-wave in ascending `wave:` order — or,
+    // with `--pool N`, as one bounded work-stealing pool (#166). A JSON plan
+    // artifact falls through to the sealed single-export replay below.
     if plan_file.ends_with(".yaml") || plan_file.ends_with(".yml") {
+        if let Some(m) = pool {
+            return super::run::run_pool(plan_file, force, resume, m, split);
+        }
+        if split {
+            log::warn!(
+                "--split applies only to `--pool` scheduling (it breaks the pool's single-export \
+                 floor); ignored without --pool."
+            );
+        }
         return super::run::run_waves(plan_file, force, parallel, resume);
+    }
+    if pool.is_some() {
+        anyhow::bail!(
+            "--pool schedules a whole CONFIG's exports (it needs the full set to order by \
+             duration) and does not apply to a sealed single-export plan artifact. Pass the \
+             YAML config instead: `rivet apply <config.yaml> --pool N`."
+        );
     }
     if parallel || resume {
         log::warn!(
@@ -188,13 +212,43 @@ pub fn run_apply_command(plan_file: &str, force: bool, parallel: bool, resume: b
         force_bypassed,
     };
     let plan = artifact.resolved_plan.clone();
-    super::run_export_job_with_chunk_source(
+    let (result, summary) = super::run_export_job_with_chunk_source(
         &plan,
         &state,
         chunk_source,
         plan_file,
         Some(apply_context),
-    )
+    );
+
+    // 7. The run's tail. This arm is a FULL orchestrator — it opens the state
+    // store, drives one export to completion and writes its `export_metrics`
+    // row — so it owes the same run-over-run self-check every other tail emits,
+    // through the same seam (`run::self_check_throughput`: it holds the
+    // exactly-once deferral for a re-exec'd child and the ONE call site of
+    // `aggregate::warn_throughput_regressions`).
+    //
+    // Without it, `rivet plan -c cfg.yaml -e orders -o plan.json && rivet apply
+    // plan.json` degraded 2.7× in silence — and the degraded row then became the
+    // baseline, so the NEXT run could not flag it either — while the byte-
+    // identical export under `rivet run` warned (round-7 bughunt, the fifth tail
+    // of the runner-bypass class).
+    //
+    // No aggregate card and no `run_aggregate` row: one export is exactly the
+    // count `run::reports_run_aggregate` refuses, and the per-export card above
+    // already printed every number it would carry. The self-check is not gated
+    // on that count — a sealed artifact IS the whole invocation.
+    //
+    // The mode is `run_mode_label(1, false)` — "sequential", asked of the same
+    // producer every other runner asks, never spelled here: this replay runs one
+    // export in this process, overlapping nothing, so the self-check must keep
+    // its ACTIONABLE tail rather than excusing a regression as source sharing.
+    let entries = vec![super::aggregate::entry_from_summary(&summary)];
+    super::run::self_check_throughput(
+        &state,
+        &entries,
+        &super::run::RunModes::uniform(super::run::run_mode_label(1, false)),
+    );
+    result
 }
 
 /// Finding #17: reject — with an actionable remedy — a plan whose source
@@ -262,9 +316,12 @@ mod tests {
 
     fn unreachable_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
             compression: CompressionType::Zstd,
@@ -399,7 +456,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &artifact);
 
-        let err = run_apply_command(&path, false, false, false).unwrap_err();
+        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("hours old") || msg.contains("24 h"),
@@ -417,7 +474,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &artifact);
 
-        let err = run_apply_command(&path, false, false, false).unwrap_err();
+        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("drifted") || msg.contains("cursor"),
@@ -429,8 +486,15 @@ mod tests {
 
     #[test]
     fn missing_plan_file_returns_error() {
-        let err = run_apply_command("/tmp/rivet_nonexistent_xyzxyz.json", false, false, false)
-            .unwrap_err();
+        let err = run_apply_command(
+            "/tmp/rivet_nonexistent_xyzxyz.json",
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cannot read") || msg.contains("No such file"),
@@ -443,7 +507,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("plan.json");
         std::fs::write(&path, b"not valid json at all").unwrap();
-        let err = run_apply_command(path.to_str().unwrap(), false, false, false).unwrap_err();
+        let err = run_apply_command(path.to_str().unwrap(), false, false, false, None, false)
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("invalid plan") || msg.contains("JSON") || msg.contains("expected"),
@@ -474,7 +539,7 @@ mod tests {
         let tampered = json.replace("SELECT 1", "SELECT * FROM secrets");
         std::fs::write(&path, &tampered).unwrap();
 
-        let err = run_apply_command(&path, false, false, false).unwrap_err();
+        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("integrity check failed") && msg.contains("modified after planning"),
@@ -482,7 +547,7 @@ mod tests {
         );
 
         // And --force must NOT override it — a hand-edited contract is not opt-in.
-        let err_forced = run_apply_command(&path, true, false, false).unwrap_err();
+        let err_forced = run_apply_command(&path, true, false, false, None, false).unwrap_err();
         let msg_forced = format!("{err_forced:#}");
         assert!(
             msg_forced.contains("integrity check failed"),

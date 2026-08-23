@@ -7,8 +7,8 @@
 //! estimate. The scaffold then emits a `type: mongo` source + one
 //! `table: <collection>` / `mode: full` export per collection.
 //!
-//! The async→sync bridge is the shared [`MongoSession`]; init connects
-//! ungated (dev convenience, like the SQL init helpers).
+//! The async→sync bridge is the shared [`MongoSession`]; init connects GATED
+//! (refuses remote plaintext), matching the PG/MySQL init helpers.
 
 use mongodb::bson::Document;
 
@@ -16,10 +16,15 @@ use super::TableInfo;
 use crate::error::Result;
 use crate::source::mongo::MongoSession;
 
-/// Connect once (ungated) so one session serves the whole `list_tables` +
-/// per-collection `introspect` scan.
-pub(super) fn connect(url: &str) -> Result<MongoSession> {
-    MongoSession::connect(url, None, false)
+/// Connect once (GATED — refuses remote plaintext) so one session serves the
+/// whole `list_tables` + per-collection `introspect` scan.
+pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<MongoSession> {
+    // gate=true, matching PG init (connect_client) and MySQL init (connect_pool),
+    // both of which refuse remote plaintext. The old `false` + "like the SQL
+    // init helpers" comment was doubly wrong: the SQL helpers DO gate, and
+    // skipping it let `rivet init` dial a remote Mongo in cleartext with no
+    // refusal (bug hunt 2026-08-08).
+    MongoSession::connect(url, tls)
 }
 
 /// List the user collections in the URL's database, skipping the internal
@@ -52,6 +57,7 @@ pub(super) fn introspect(session: &MongoSession, collection: &str) -> Result<Tab
         })
         .unwrap_or(0);
     Ok(TableInfo {
+        density: None,
         schema: session.db().to_string(),
         table: collection.to_string(),
         row_estimate: i64::try_from(count).unwrap_or(0),

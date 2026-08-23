@@ -32,15 +32,6 @@ use crate::common::*;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Write `yaml` to a fresh tempdir and return `(dir_guard, config_path)`.
-/// The `TempDir` must be kept alive for the duration of the test; dropping it
-/// deletes the config file and the state DB that rivet writes next to it.
-fn make_cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
-    (d, p)
-}
-
 /// Read `last_cursor_value` for `export` from the state DB next to `cfg_path`.
 fn read_cursor(cfg_path: &std::path::Path, export: &str) -> Option<String> {
     let db = cfg_path.parent().unwrap().join(".rivet_state.db");
@@ -68,7 +59,7 @@ fn gremlin_row_count_min_fires_on_empty_source_table() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_empty");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -76,11 +67,9 @@ fn gremlin_row_count_min_fires_on_empty_source_table() {
         .mode("full")
         .export_line("quality:")
         .export_line("  row_count_min: 1")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     assert!(
         !result.status.success(),
         "row_count_min=1 on empty table must fail the export; stderr:\n{}",
@@ -115,50 +104,24 @@ fn gremlin_row_count_min_fires_on_exhausted_incremental_cursor() {
     let export_name = unique_name("gr_incr");
 
     // First run: no quality gate.  Consumes all 10 rows, cursor advances to max.
-    let yaml_run1 = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, created_at FROM {table_name}"
-    mode: incremental
-    cursor_column: created_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let (cfgdir, cfgpath) = make_cfg(&yaml_run1);
-    let run1 = run_rivet_export(&cfgpath, &export_name);
+    let mut rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, created_at FROM {}", table.name()))
+        .mode("incremental")
+        .export_line("cursor_column: created_at")
+        .dest_path(out.path().to_path_buf());
+    let run1 = rig.run_args(&["--export", &export_name]);
     assert!(run1.status.success(), "first run must succeed");
     assert!(
-        read_cursor(&cfgpath, &export_name).is_some(),
+        read_cursor(&rig.config_path(), &export_name).is_some(),
         "cursor must be set after first run"
     );
 
     // Second run: identical query + row_count_min=1.  Cursor is already at max →
-    // zero new rows → quality gate must fire.
-    let yaml_run2 = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, created_at FROM {table_name}"
-    mode: incremental
-    cursor_column: created_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 1
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    // Overwrite the config in the same tempdir so the existing state DB is reused.
-    let cfgpath2 = write_config(&cfgdir, &yaml_run2);
+    // zero new rows → quality gate must fire. `amend_export_lines` re-renders the
+    // SAME config path, so the adjacent state DB (and its cursor) is reused.
+    rig.amend_export_lines(&["quality:", "  row_count_min: 1"]);
 
-    let run2 = run_rivet_export(&cfgpath2, &export_name);
+    let run2 = rig.run_args(&["--export", &export_name]);
     assert!(
         !run2.status.success(),
         "row_count_min=1 on exhausted cursor must fail the export; stderr:\n{}",
@@ -185,7 +148,7 @@ fn gremlin_unique_max_entries_cap_emits_warn_and_export_succeeds() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_ucap");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -194,18 +157,10 @@ fn gremlin_unique_max_entries_cap_emits_warn_and_export_succeeds() {
         .export_line("quality:")
         .export_line("  unique_columns: [id]")
         .export_line("  unique_max_entries: 10")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
     // RUST_LOG=warn surfaces the quality Warn message in stderr.
-    let result = run_rivet_with_warn_log(&[
-        "run",
-        "--config",
-        cfgpath.to_str().unwrap(),
-        "--export",
-        &export_name,
-    ]);
+    let result = rig.run_args_env(&["--export", &export_name], &[("RUST_LOG", "warn")]);
     assert!(
         result.status.success(),
         "unique cap hit must not fail the export; stderr:\n{}",
@@ -239,7 +194,7 @@ fn gremlin_auto_shrink_total_rows_correct_under_quality_gate() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_shrink");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, payload FROM {table_name}"#,
             table_name = table.name()
@@ -250,11 +205,9 @@ fn gremlin_auto_shrink_total_rows_correct_under_quality_gate() {
         .export_line("  on_batch_memory_exceeded: auto_shrink")
         .export_line("quality:")
         .export_line("  row_count_min: 2000")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     assert!(
         result.status.success(),
         "auto_shrink + row_count_min=2000 on 2000-row table must pass; stderr:\n{}",
@@ -291,7 +244,7 @@ fn gremlin_crash_before_quality_check_recovery_re_evaluates_gate() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_qcrash");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, created_at FROM {table_name}"#,
             table_name = table.name()
@@ -300,23 +253,14 @@ fn gremlin_crash_before_quality_check_recovery_re_evaluates_gate() {
         .export_line("cursor_column: created_at")
         .export_line("quality:")
         .export_line("  row_count_min: 5")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
     // Injected crash: source was read but writer was not finalised and quality
     // checks were not evaluated.  Post-crash state must be completely clean.
-    let crash_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfgpath.to_str().unwrap(),
-            "--export",
-            &export_name,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_source_read")
-        .output()
-        .expect("spawn rivet (crash run)");
+    let crash_out = rig.run_args_env(
+        &["--export", &export_name],
+        &[("RIVET_TEST_PANIC_AT", "after_source_read")],
+    );
     assert!(
         !crash_out.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -329,20 +273,20 @@ fn gremlin_crash_before_quality_check_recovery_re_evaluates_gate() {
         "after_source_read crash must not produce an output file"
     );
     assert_eq!(
-        read_cursor(&cfgpath, &export_name),
+        read_cursor(&rig.config_path(), &export_name),
         None,
         "after_source_read crash must not advance the cursor"
     );
 
     // Recovery run: no crash injection, quality gate must pass on the 10 rows.
-    let rec = run_rivet_export(&cfgpath, &export_name);
+    let rec = rig.run_args(&["--export", &export_name]);
     assert!(
         rec.status.success(),
         "recovery run must succeed (quality gate: 10 rows >= row_count_min 5); stderr:\n{}",
         String::from_utf8_lossy(&rec.stderr)
     );
     assert!(
-        read_cursor(&cfgpath, &export_name).is_some(),
+        read_cursor(&rig.config_path(), &export_name).is_some(),
         "cursor must be advanced after recovery run"
     );
     assert_eq!(
@@ -367,7 +311,7 @@ fn gremlin_row_count_max_fires_on_over_limit_source() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_rmax");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -375,11 +319,9 @@ fn gremlin_row_count_max_fires_on_over_limit_source() {
         .mode("full")
         .export_line("quality:")
         .export_line("  row_count_max: 10")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     assert!(
         !result.status.success(),
         "row_count_max=10 on 50-row table must fail; stderr:\n{}",
@@ -406,25 +348,22 @@ fn gremlin_row_count_min_boundary_is_inclusive() {
     let out_exact = tempfile::tempdir().unwrap();
     let out_short = tempfile::tempdir().unwrap();
 
+    // One rig per boundary side: TWO independent configs is the fixture's
+    // shape (each side gets its own state/destination), so two rigs, not an
+    // amend — an amend would thread run 1's state under run 2.
+    let boundary_rig = |export: &str, min: u32, dest: std::path::PathBuf| {
+        Rig::pg_batch(export)
+            .query(&format!("SELECT id FROM {}", table.name()))
+            .mode("full")
+            .export_line("quality:")
+            .export_line(&format!("  row_count_min: {min}"))
+            .dest_path(dest)
+    };
+
     // Exact boundary: 10 rows == min 10 → must pass.
     let export_exact = unique_name("gr_b_exact");
-    let yaml_exact = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_exact}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 10
-"#,
-        table_name = table.name(),
-        dir = out_exact.path().display()
-    );
-    let (_d1, cfg_exact) = make_cfg(&yaml_exact);
-    let r_exact = run_rivet_export(&cfg_exact, &export_exact);
+    let rig_exact = boundary_rig(&export_exact, 10, out_exact.path().to_path_buf());
+    let r_exact = rig_exact.run_args(&["--export", &export_exact]);
     assert!(
         r_exact.status.success(),
         "row_count_min=10 on 10-row source must pass (inclusive boundary); stderr:\n{}",
@@ -433,23 +372,8 @@ exports:
 
     // Off-by-one: 10 rows < min 11 → must fail.
     let export_short = unique_name("gr_b_short");
-    let yaml_short = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_short}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 11
-"#,
-        table_name = table.name(),
-        dir = out_short.path().display()
-    );
-    let (_d2, cfg_short) = make_cfg(&yaml_short);
-    let r_short = run_rivet_export(&cfg_short, &export_short);
+    let rig_short = boundary_rig(&export_short, 11, out_short.path().to_path_buf());
+    let r_short = rig_short.run_args(&["--export", &export_short]);
     assert!(
         !r_short.status.success(),
         "row_count_min=11 on 10-row source must fail (off-by-one boundary)"
@@ -474,16 +398,14 @@ fn gremlin_unique_columns_nullable_column_does_not_false_positive() {
     // Inject NULL values into a nullable column by issuing a follow-up UPDATE.
     // Use the `name` column which is NOT NULL by default — we union with a
     // SELECT-NULL projection in the export query to inject the NULLs.
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(r#"SELECT id, name FROM {table_name} UNION ALL SELECT 100 AS id, NULL::text AS name UNION ALL SELECT 101 AS id, NULL::text AS name"#, table_name = table.name()))
         .mode("full")
         .export_line("quality:")
         .export_line("  unique_columns: [id]")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     assert!(
         result.status.success(),
         "two NULL rows on a column NOT in unique_columns must not affect uniqueness on `id`; stderr:\n{}",
@@ -517,18 +439,16 @@ fn gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("gr_chunk_empty");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .tables(&[table.name()])
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line("chunk_size: 10")
         .export_line("quality:")
         .export_line("  row_count_min: 6")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     assert!(
         result.status.success(),
         "chunked export with sparse IDs must pass row_count_min=6 by total, not per-chunk; stderr:\n{}",
@@ -550,37 +470,21 @@ fn gremlin_multi_export_one_quality_fail_does_not_abort_others() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(5);
     let out_fail = tempfile::tempdir().unwrap();
-    let out_ok = tempfile::tempdir().unwrap();
     let fail_name = unique_name("gr_me_fail");
     let ok_name = unique_name("gr_me_ok");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {fail_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir_fail}}}
-    quality:
-      row_count_min: 100
-  - name: {ok_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir_ok}}}
-"#,
-        table_name = table.name(),
-        dir_fail = out_fail.path().display(),
-        dir_ok = out_ok.path().display(),
-    );
-    let (_cfgdir, cfgpath) = make_cfg(&yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfgpath.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet (multi-export)");
+    // Multi-export through the rig: the primary export carries the failing
+    // quality gate, the sibling (`also_export`) is the healthy one whose
+    // survival is the assertion. Its destination is the rig's `out_dir_for`.
+    let q = format!("SELECT id FROM {}", table.name());
+    let rig = Rig::pg_batch(&fail_name)
+        .query(&q)
+        .mode("full")
+        .export_line("quality:")
+        .export_line("  row_count_min: 100")
+        .dest_path(out_fail.path().to_path_buf())
+        .also_export(&ok_name, &q);
+    let result = rig.run_args(&[]);
 
     assert!(
         !result.status.success(),
@@ -592,7 +496,7 @@ exports:
     // sibling export failed. This is the actual gate: a "bail on first
     // failure" regression would leave out_ok empty.
     assert!(
-        !files_with_extension(out_ok.path(), "parquet").is_empty(),
+        !files_with_extension(&rig.out_dir_for(&ok_name), "parquet").is_empty(),
         "second export must complete independently of first export's failure; \
          out_ok=is_empty would mean a regression aborted siblings"
     );

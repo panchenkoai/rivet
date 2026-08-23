@@ -9,7 +9,9 @@ disk? The answer is not the same across engines, and Rivet is explicit about it.
 
 PostgreSQL's logical replication slot is a **consume-retention** mechanism: the
 server keeps WAL from the slot's confirmed position forward until the consumer
-acknowledges it. That is what makes resume exactly-once — and it is also the one
+acknowledges it. That is what makes resume lossless — Rivet's CDC delivery is
+at-least-once (a crash between flush and acknowledge re-reads the un-acked span;
+dedupe downstream by PK + `__op` if you need exactly-once effects) — and it is also the one
 place where a reader can hurt the source. While Rivet keeps up, retention is
 bounded to roughly `interval × write-rate` (≈ 23.5 MB over a 6 s cycle at
 ~4 MB/s in the harness). But an **abandoned or stuck slot is unbounded**: during

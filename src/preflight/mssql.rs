@@ -57,9 +57,19 @@ pub(super) fn diagnose_export_mssql(
     diagnose_mssql(&mut conn, export)
 }
 
-fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
-    let mode_str = diagnose_mode_str(export);
+/// `@@MAX_CONNECTIONS` — SQL Server's configured `user connections` cap and the
+/// portable analogue of PG `max_connections` / MySQL `@@max_connections`. Read
+/// over the scalar seam; `None` when the probe fails (fail-soft, like the other
+/// engines) — the connection-limit check then only emits its skipped-note.
+fn fetch_max_connections_mssql(conn: &mut MssqlSource) -> Option<u32> {
+    conn.query_scalar("SELECT @@MAX_CONNECTIONS")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
 
+fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
@@ -72,24 +82,26 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         return Err(fail);
     }
 
-    // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column
-    // (incremental) — the run's real read column. Without chunk_by_key a keyset
-    // table's range_col is None, so the index probe below never runs and the
-    // verdict falls to a false "no index".
-    let range_col = export
-        .chunk_column
-        .as_deref()
-        .or(export.chunk_by_key.as_deref())
-        .or(export.cursor_column.as_deref());
-
     // Recover the base relation (`[schema.]table`) the probes key on. `init`
     // emits `query: SELECT cols FROM <table>`, and the `table:` shortcut emits
     // `SELECT * FROM <table>` — both resolve to a single relation here. Anything
     // the parser can't reduce to one base table (joins, subqueries, hand-written
     // inline SQL) yields `None`, and the row-estimate / index probes degrade to
-    // an honest "unknown" rather than guessing the wrong relation.
+    // an honest "unknown" rather than guessing the wrong relation. Resolved from
+    // the RENDERED query (not `preflight_base_table`'s configured-`table:` first
+    // order) because the MSSQL catalog probes key on the emitted relation.
     let base_table =
         strip_select_star_from(base_query).or_else(|| table_from_simple_query(base_query));
+
+    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
+    // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
+    // probe target the SAME column, not a `?` placeholder on a PK-indexed table.
+    let auto_pk: Option<String> =
+        auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_mssql(conn, t));
+
+    // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column (incremental) OR the
+    // auto-resolved PK above — the run's real read column.
+    let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     // Row estimate from `sys.dm_db_partition_stats` — the same fast,
     // no-`COUNT(*)` probe `rivet init` and `introspect_mssql_table_for_chunking`
@@ -119,65 +131,37 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     };
 
     // Honest index signal: no query plan is parsed (SQL Server has no portable
-    // `EXPLAIN` over the scalar seam), so `scan_type` stays `None`. For
-    // chunked/incremental modes the catalog *can* answer the question that
-    // actually matters for the run (`WHERE range_col > $last` / `BETWEEN`): is
-    // the range column the single leading key of some index? That fact alone
-    // drives the verdict, the same way the PG/MySQL catalog probe overrides
-    // their EXPLAIN hint.
-    let scan_type = None;
-    let uses_index = if (matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
-        || export.chunk_by_key.is_some())
-        && let Some(col) = range_col
-        && let Some(table) = base_table
-    {
-        column_has_index_mssql(conn, table, col).unwrap_or(false)
-    } else {
-        false
-    };
+    // `EXPLAIN` over the scalar seam), so `scan_type` stays `None` and the plan
+    // hint is a hard `false`. For chunked/incremental modes the catalog *can*
+    // answer the question that actually matters for the run
+    // (`WHERE range_col > $last` / `BETWEEN`): is the range column the single
+    // leading key of some index? With no plan hint to fall back on, that fact
+    // alone drives `uses_index` through the shared override policy.
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
+        .and_then(|(table, col)| column_has_index_mssql(conn, table, col));
 
-    let strategy = derive_strategy(export);
-    let verdict = compute_verdict(
-        row_estimate,
-        uses_index,
-        export.cursor_column.is_some(),
-        avg_row_bytes,
-        export.parallel,
-    );
-    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
-    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
-    // SQL Server has no portable per-user `max_connections` server variable
-    // readable over this seam (the cap is per-edition / Resource Governor), so
-    // the connection-limit warning is skipped — `None` makes `collect_warnings`
-    // emit the "check skipped" note only when parallel > 1, exactly like the
-    // PG/MySQL path when that probe fails.
-    let warnings = collect_warnings(
+    // SQL Server's `@@MAX_CONNECTIONS` IS the portable analogue of PG
+    // max_connections / MySQL @@max_connections (the configured `user
+    // connections` cap; default 32767 ≈ unlimited, so the warning is inert on a
+    // default install and fires only when an admin lowers it). Read it over the
+    // same query_scalar seam so the connection-limit check has parity with the
+    // other engines.
+    let db_max_connections = fetch_max_connections_mssql(conn);
+
+    Ok(assemble_diagnostic(
         export,
-        row_estimate,
-        avg_row_bytes,
-        range_min.as_deref(),
-        range_max.as_deref(),
-        None,
-    );
-    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
-
-    Ok(ExportDiagnostic {
-        export_name: export.name.clone(),
-        strategy,
-        mode: mode_str,
-        cursor_column: export.cursor_column.clone(),
-        row_estimate,
-        avg_row_bytes,
-        cursor_min: range_min,
-        cursor_max: range_max,
-        scan_type,
-        uses_index,
-        verdict,
-        recommended_profile,
-        recommended_parallel,
-        warnings,
-        suggestion,
-    })
+        ProbeFacts {
+            auto_pk,
+            row_estimate,
+            avg_row_bytes,
+            range_min,
+            range_max,
+            scan_type: None,
+            plan_uses_index: false,
+            catalog_index,
+            db_max_connections,
+        },
+    ))
 }
 
 /// Row estimate from `sys.dm_db_partition_stats` for `[schema.]table`. Mirrors
@@ -319,6 +303,42 @@ fn range_min_max_mssql(
 /// index (`ic.key_ordinal = 1`). This is the SQL Server analogue of the
 /// PG/MySQL leading-key probe; it asks `sys.index_columns` directly rather than
 /// inspect a query plan, so the signal is a catalog fact, not a heuristic.
+/// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to — so the
+/// diagnostic ranges/probes on the SAME column, not a `?` placeholder (post-0.24.3 review MED).
+/// EXACT two-step mirror of `source::mssql::introspect_mssql_table_for_chunking`'s single_int_pk
+/// (the PK col via is_primary_key + GROUP BY HAVING COUNT(*)=1, then an int-family type check) —
+/// replicated verbatim so the diagnostic resolves the SAME column the planner will (any
+/// divergence here would REINTRODUCE the false UNSAFE this fixes). `None` on composite / non-int /
+/// absent PK or a probe error.
+fn single_int_pk_mssql(conn: &mut MssqlSource, qualified_table: &str) -> Option<String> {
+    let (schema, table) = split_qualified(qualified_table);
+    let pk_sql = format!(
+        "SELECT TOP 1 c.name, t.name FROM sys.indexes i \
+         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         JOIN sys.objects o ON o.object_id = i.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE i.is_primary_key = 1 AND s.name = N'{}' AND o.name = N'{}' \
+         GROUP BY c.name, t.name HAVING COUNT(*) = 1",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    );
+    let pk_col = conn.query_scalar(&pk_sql).ok().flatten()?;
+    let type_sql = format!(
+        "SELECT t.name FROM sys.columns c \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         JOIN sys.objects o ON o.object_id = c.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE s.name = N'{}' AND o.name = N'{}' AND c.name = N'{}'",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''"),
+        pk_col.replace('\'', "''")
+    );
+    let ty = conn.query_scalar(&type_sql).ok().flatten()?;
+    matches!(ty.as_str(), "tinyint" | "smallint" | "int" | "bigint").then_some(pk_col)
+}
+
 fn column_has_index_mssql(
     conn: &mut MssqlSource,
     qualified_table: &str,

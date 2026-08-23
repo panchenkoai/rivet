@@ -111,7 +111,7 @@ scenarios:
       run_status_terminal: 1
       export_metrics_rows: 1
       parts_on_disk: ">0"
-committed_matches_parts: 1
+      committed_matches_parts: 1
       manifests_success: 1
       manifests_non_success: []
       success_marker: 1
@@ -124,7 +124,7 @@ committed_matches_parts: 1
     expect:
       run_status_running: []
       parts_on_disk: ">0"
-committed_matches_parts: 1
+      committed_matches_parts: 1
       manifests_success: 1
       manifests_non_success: []
       chunk_run_rows: 0
@@ -159,7 +159,7 @@ committed_matches_parts: 1
     expect:
       run_status_running: []
       parts_on_disk: ">0"
-committed_matches_parts: 1
+      committed_matches_parts: 1
       files_committed: ">0"
       manifests_success: 1
       success_marker: 1

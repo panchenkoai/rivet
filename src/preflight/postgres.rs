@@ -48,20 +48,20 @@ fn diagnose_pg(
     export: &ExportConfig,
     db_max_connections: Option<u32>,
 ) -> Result<ExportDiagnostic> {
-    let mode_str = diagnose_mode_str(export);
-
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
+    let base_table = preflight_base_table(export, base_query);
 
-    // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column
-    // (incremental) — the column the run actually reads on. Omitting
-    // chunk_by_key leaves keyset tables with range_col = None, which the index
-    // override below reads as "no index" and reports a false UNSAFE.
-    let range_col = export
-        .chunk_column
-        .as_deref()
-        .or(export.chunk_by_key.as_deref())
-        .or(export.cursor_column.as_deref());
+    // The planner auto-resolves an UNSET chunked chunk_column to the single-integer PK
+    // (build_plan), and `auto_pk_probe_target` is that gate — so range_col / the strategy
+    // label / the index probe target the SAME column the run ranges on, instead of reporting
+    // a false UNSAFE + `chunked(?,…)` on an already-PK-indexed table.
+    let auto_pk: Option<String> =
+        auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_pg(client, t));
+
+    // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column (incremental) OR the
+    // auto-resolved PK above — the column the run actually reads on.
+    let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Postgres) {
         format!(
@@ -112,70 +112,29 @@ fn diagnose_pg(
     let (scan_type, plan_uses_index) = analyze_plan_pg(client, &effective_query);
 
     // The EXPLAIN above runs against the *base* query (the whole table,
-    // typically). PostgreSQL picks `Seq Scan` for a full-table read even
-    // when there's a perfect btree on the chunk column — the index path is
-    // genuinely slower for a full read. But the chunked/incremental run
-    // does NOT issue the base query; it issues `WHERE chunk_col >= $lo
-    // AND chunk_col < $hi`, which *will* use the btree.
-    //
-    // So for those modes, ask the catalog directly: is there a btree index
-    // whose leading column is the range column? If yes, treat it as
-    // indexed regardless of what EXPLAIN said for the base query. This
-    // collapses the most common false-DEGRADED case (chunked on a PK).
-    let uses_index = if (matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
-        || export.chunk_by_key.is_some())
-        && let Some(col) = range_col
-        && let Some(table) = export
-            .table
-            .as_deref()
-            .or_else(|| table_from_simple_query(base_query))
-    {
-        match column_has_btree_pg(client, table, col) {
-            Some(true) => true,
-            Some(false) => plan_uses_index,
-            None => plan_uses_index,
-        }
-    } else {
-        plan_uses_index
-    };
+    // typically). PostgreSQL picks `Seq Scan` for a full-table read even when
+    // there's a perfect btree on the chunk column — the index path is genuinely
+    // slower for a full read. But the chunked/incremental run does NOT issue the
+    // base query; it issues `WHERE chunk_col >= $lo AND chunk_col < $hi`, which
+    // *will* use the btree. So answer the question from the catalog and let
+    // `assemble_diagnostic` apply the shared override policy.
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
+        .and_then(|(table, col)| column_has_btree_pg(client, table, col));
 
-    let strategy = derive_strategy(export);
-    let verdict = compute_verdict(
-        row_estimate,
-        uses_index,
-        export.cursor_column.is_some(),
-        avg_row_bytes,
-        export.parallel,
-    );
-    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
-    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
-    let warnings = collect_warnings(
+    Ok(assemble_diagnostic(
         export,
-        row_estimate,
-        avg_row_bytes,
-        range_min.as_deref(),
-        range_max.as_deref(),
-        db_max_connections,
-    );
-    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
-
-    Ok(ExportDiagnostic {
-        export_name: export.name.clone(),
-        strategy,
-        mode: mode_str,
-        cursor_column: export.cursor_column.clone(),
-        row_estimate,
-        avg_row_bytes,
-        cursor_min: range_min,
-        cursor_max: range_max,
-        scan_type,
-        uses_index,
-        verdict,
-        recommended_profile,
-        recommended_parallel,
-        warnings,
-        suggestion,
-    })
+        ProbeFacts {
+            auto_pk,
+            row_estimate,
+            avg_row_bytes,
+            range_min,
+            range_max,
+            scan_type,
+            plan_uses_index,
+            catalog_index,
+            db_max_connections,
+        },
+    ))
 }
 
 /// Returns `(row_estimate, avg_row_bytes)` parsed from one EXPLAIN — the top
@@ -432,6 +391,34 @@ pub(crate) fn column_has_btree_pg(
             None
         }
     }
+}
+
+/// The single-integer primary key `build_plan` auto-resolves an unset chunked `chunk_column`
+/// to — so the diagnostic probes the SAME column the run will range on, not a `?` placeholder
+/// (post-0.24.3 review MED, the sibling of the chunk_by_key false-alarm). Mirrors the
+/// `single_int_pk` introspection in `source::postgres::mod`: exactly one PK column, integer
+/// family (`int2`/`int4`/`int8`). `None` on a composite / non-int / absent PK or a probe error.
+pub(crate) fn single_int_pk_pg(
+    client: &mut postgres::Client,
+    qualified_table: &str,
+) -> Option<String> {
+    let (schema, table) = match qualified_table.split_once('.') {
+        Some((s, t)) => (s, t),
+        None => ("public", qualified_table),
+    };
+    let sql = "SELECT a.attname::text, t.typname::text \
+               FROM pg_index i \
+               JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+               JOIN pg_type t ON t.oid = a.atttypid \
+               WHERE i.indrelid = (($1::text || '.' || $2::text)::regclass) \
+                 AND i.indisprimary";
+    let rows = client.query(sql, &[&schema, &table]).ok()?;
+    if rows.len() != 1 {
+        return None; // composite or absent PK → the planner does not auto-resolve
+    }
+    let col: String = rows[0].get(0);
+    let pg_type: String = rows[0].get(1);
+    matches!(pg_type.as_str(), "int2" | "int4" | "int8").then_some(col)
 }
 
 fn analyze_plan_pg(client: &mut postgres::Client, query: &str) -> (Option<String>, bool) {

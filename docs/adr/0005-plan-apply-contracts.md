@@ -37,7 +37,7 @@ Without explicit contracts, `rivet apply` cannot reason about whether the artifa
 
 **Rationale**: The artifact's `plan_id` and `created_at` field are set at plan time. Any post-generation modification breaks the audit trail and the staleness check. The artifact is a point-in-time snapshot, not a mutable config.
 
-**Current implementation**: `PlanArtifact` is deserialized from the file at apply time. No write-back or in-place mutation occurs. The file on disk is never opened for writing by `apply_cmd`.
+**Current implementation**: `PlanArtifact` is deserialized from the file at apply time. No write-back or in-place mutation occurs. The file on disk is never opened for writing by `apply_cmd`. [Update: immutability is now machine-enforced, not just an operator convention — see PA10.]
 
 ---
 
@@ -99,11 +99,11 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 ### PA6 — Fingerprint Stability (FS)
 
-> For Chunked exports, the `plan_fingerprint` field is computed at plan time from `(base_query, chunk_column, chunk_size, dense, by_days)` via `chunk_plan_fingerprint`. This fingerprint is embedded in the artifact and logged at apply time for operator visibility.
+> For Chunked exports, the `plan_fingerprint` field is computed at plan time from `(base_query, chunk_column, chunk_size, chunk_count, dense, by_days)` via `chunk_plan_fingerprint`. This fingerprint is embedded in the artifact and displayed in `rivet plan`'s summary output.
 
 **Rationale**: If the config changes between plan and apply (query rewritten, chunk_size changed), the fingerprint computed from the new config would differ from the artifact's fingerprint. This mismatch is an operator signal that the artifact may no longer represent the intended extraction, even if apply can technically proceed.
 
-**Current behavior**: The fingerprint is logged but not enforced as a hard gate. The operator is responsible for regenerating the plan when the config changes.
+**Current behavior**: The fingerprint is displayed only at plan time (`PlanArtifact::print_summary`); nothing at apply time reads, logs, or enforces it. The operator is responsible for regenerating the plan when the config changes.
 
 **Alignment with ADR-0001 I5**: The chunk checkpoint system (`chunk_run.plan_hash`) enforces fingerprint matching at resume time. The plan artifact fingerprint is a complementary audit signal, not a resume gate.
 
@@ -115,7 +115,7 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 **Rationale**: The artifact replaces chunk boundary detection only. It does not change the semantics of state persistence. All ADR-0001 invariants (I1–I7) apply unchanged to an `apply` run.
 
-**Consequence**: The `StateStore` file (`.rivet_state.db`) used by apply is resolved from the directory containing the plan file. Operators should ensure the plan file is placed adjacent to (or in the directory of) the original config so the same state database is used.
+**Consequence**: The `StateStore` file (`.rivet_state.db`) used by apply is resolved primarily from the directory of the artifact's recorded `config_path` when that directory exists (F13, 0.7.5 audit — this keeps apply consistent with `rivet run`'s state location). Only if the config directory is gone, or the artifact predates 0.7.5 and recorded no config path, does apply fall back to the plan file's own directory, emitting a WARN about the divergence.
 
 ---
 
@@ -144,9 +144,19 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 **Scope of protection**: PA9 covers only the source-side credentials embedded in `ResolvedRunPlan.source`. Destination secrets are already ADR-0004-compliant (S3/GCS use env/file references via `access_key_env`, `secret_key_env`, `credentials_file`; no plaintext equivalents exist in the destination schema).
 
-**Current implementation**: `SourceConfig::redact_for_artifact` in `src/config/models.rs`; called from `PlanArtifact::new` in `src/plan/artifact.rs`. URL parsing uses a path-aware `@` scan so `@` in a query string or path does not trigger false redaction.
+**Current implementation**: `SourceConfig::redact_for_artifact` in `src/config/source.rs`; called from `PlanArtifact::new` in `src/plan/artifact.rs`. URL parsing uses a path-aware `@` scan so `@` in a query string or path does not trigger false redaction.
 
-**Test coverage**: `redact_plaintext_password_stripped`, `redact_password_embedded_in_url`, `redact_url_without_userinfo_is_unchanged`, `redact_env_references_are_preserved`, `redact_does_not_confuse_at_in_path` in `src/config/tests.rs`; `artifact_strips_plaintext_password_from_source`, `artifact_strips_credentials_from_url` in `src/plan/artifact.rs`.
+**Test coverage**: `redact_plaintext_password_stripped`, `redact_password_embedded_in_url`, `redact_url_without_userinfo_is_unchanged`, `redact_env_references_are_preserved`, `redact_does_not_confuse_at_in_path` in `src/config/tests/secops.rs`; `artifact_strips_plaintext_password_from_source`, `artifact_strips_credentials_from_url` in `src/plan/artifact.rs`.
+
+---
+
+### PA10 — Artifact Tamper-Evidence (ATE)
+
+> Before running any query, `rivet apply` calls `PlanArtifact::verify_integrity()` and rejects an artifact whose `resolved_plan` was edited after planning. Unlike staleness (PA3) and cursor drift (PA4), this gate is **not** bypassable by `--force` — a hand-edited execution contract is never something the operator can opt into; the only correct recovery is to re-run `rivet plan`.
+
+**Rationale**: PA2 declares the artifact a sealed, read-only input; PA10 is its machine enforcement. Without it, a post-plan edit would execute silently with a `plan_id`/`created_at` audit trail that no longer describes what ran.
+
+**Current implementation**: `PlanArtifact::verify_integrity` in `src/plan/artifact.rs` (integrity checksum over the resolved plan), called from `apply_cmd::run_apply_command` before any state or source access (finding #16).
 
 ---
 
@@ -155,14 +165,15 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 | ID | Name | Enforced? | On Violation |
 |----|------|-----------|-------------|
 | PA1 | Artifact Is the Communication Channel | yes | apply cannot run without an artifact |
-| PA2 | Artifact Immutability | operator | undefined behavior if modified |
+| PA2 | Artifact Immutability | yes (integrity checksum, PA10) | `bail!` — not `--force`-bypassable |
 | PA3 | Staleness Boundary | yes (hard at 24 h) | `bail!` unless `--force` |
 | PA4 | Cursor Snapshot Integrity | yes (Incremental only) | `bail!` — regenerate plan |
 | PA5 | Chunk Range Monotonicity | by construction | no explicit runtime gate |
-| PA6 | Fingerprint Stability | advisory (logged) | operator responsibility |
+| PA6 | Fingerprint Stability | advisory (plan-time display only) | operator responsibility |
 | PA7 | State Writes Unchanged | yes (ADR-0001) | same failure modes as `rivet run` |
 | PA8 | Diagnostics Are Advisory | explicit non-enforcement | verdict visible in artifact; no gate |
 | PA9 | Artifact Credential Redaction | yes (on `PlanArtifact::new`) | plaintext `password`/URL userinfo silently stripped; WARN logged |
+| PA10 | Artifact Tamper-Evidence | yes (`verify_integrity` before any query) | `bail!` — not `--force`-bypassable |
 
 ---
 

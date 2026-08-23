@@ -84,7 +84,7 @@ holds without any persisted counter.
 ## Blast radius
 
 - CDC sink schema gains one column (`__seq INT64`), all engines.
-- Three capture paths populate it (SQL Server from `__$seqval`; MySQL/Postgres
+- One capture-agnostic path populates it — the shared `TxnSeq` per-commit ordinal, stamped as the stream is consumed on every engine (SQL Server's `__$seqval` only orders the change-table read; MySQL/Postgres
   from a per-commit ordinal).
 - `validate.rs` can additionally assert `(__pos, __seq)` is strictly increasing
   in part→row order (today it only checks `__pos` non-decreasing).

@@ -11,7 +11,7 @@
 | Command | Input | Output | Side effects |
 |---|---|---|---|
 | `rivet reconcile -c -e` | Latest `chunk_run` + committed files (manifest) | `ReconcileReport` (pretty or JSON) | May advance `last_verified_*` (ADR-0008 PG5) |
-| `rivet repair -c -e [--report … \| --auto] [--execute]` | `ReconcileReport` (file or fresh) | `RepairPlan` (without `--execute`) or `RepairReport` (with `--execute`) | With `--execute`: new output files; manifest entries; no cursor/commit changes |
+| `rivet repair -c -e [--report …] [--execute]` | `ReconcileReport` (from `--report <file>`, or built fresh in-process against the latest chunk run when `--report` is omitted) | `RepairPlan` (without `--execute`) or `RepairReport` (with `--execute`) | With `--execute`: new output files; manifest entries; no cursor/commit changes |
 
 ---
 
@@ -26,7 +26,7 @@
 | **RC5** | Report shape stability | `ReconcileReport` JSON fields (`export_name`, `run_id`, `strategy`, `partitions[]`, `summary`) form a stable schema; new fields are additive only. | `plan::reconcile`, serde defaults |
 | **RC6** | Verified advances only on full match | Verified boundary (ADR-0008 PG5) is written **iff** `summary.mismatches == 0 && summary.unknown == 0`. | `reconcile_cmd::reconcile_chunked` |
 | **RR1** | Repair derives only from reconcile | `RepairPlan::from_reconcile` is the **single** path that produces repair actions — no direct config paths, no operator-typed ranges. | `plan::repair::RepairPlan::from_reconcile` |
-| **RR2** | Plan before execute | Without `--execute`, `rivet repair` prints the plan and exits; no source queries are issued, no files are written. | `repair_cmd::run_repair_command` |
+| **RR2** | Plan before execute | Without `--execute`, `rivet repair` prints the plan and exits; no destination files are written and nothing is re-exported. When `--report` is omitted it first builds a fresh reconcile in-process, issuing one read-only `SELECT COUNT(*)` per partition against the source (and, on a fully-clean result, advancing the verified boundary per RC6); only the `--report <file>` path is source-query-free. | `repair_cmd::run_repair_command` |
 | **RR3** | Repair SQL parity | Repair chunk queries use the **same** `build_chunk_query_sql` as extraction and reconcile — repair is apples-to-apples with the original run. | `run_chunked_sequential(ChunkSource::Precomputed)` |
 | **RR4** | Committed boundary not moved by repair | Repair re-exports chunks already covered by committed progression; `last_committed_*` is **not** re-stamped by repair. Operator advances verified by running `rivet reconcile` afterwards. | `repair_cmd::execute_repair` (no `record_committed_*` call) |
 | **RR5** | Destination files are additive | Repair writes **new** files alongside originals using `<export>_<ts>_chunk<idx>_<nonce>.<ext>` naming; the 64-bit `<nonce>` makes the name collision-proof so a re-export of the same chunk **never** overwrites the original even when it lands in the same wall-clock second (the second-granularity `<ts>` alone would collide). Rivet does not delete or overwrite prior files. Downstream dedup is the operator's responsibility. | `chunked::chunk_part_filename` |

@@ -61,6 +61,34 @@ pub mod destination_for_tests {
 // consumer side would be a second thing that can drift from the extractor —
 // which is exactly the failure §5h removes, and the reason there is only one
 // hash left to recompute.
+/// Google ADC support — an ADR-0026 extension-seam item.
+///
+/// A NARROW re-export (two items), not `pub mod destination`: the seam's own
+/// principle is that every `pub` is a compatibility commitment, so the module
+/// that happens to host the implementation stays private.
+///
+/// `reqsign`'s token loader resolves service account → impersonated →
+/// external account → VM metadata and has NO `authorized_user` arm, so
+/// anything that talks to a Google API natively — this crate's GCS
+/// destination, and the first-party extension consumer's BigQuery client —
+/// needs this loader or it authenticates in CI and fails on a developer
+/// laptop. Exposing it is what keeps "never hand-roll a second auth path"
+/// true across both sides of the seam rather than only inside this crate.
+///
+/// The loader also mints from a `service_account` KEY FILE (RFC 7523
+/// jwt-bearer, RS256-signed in process), so a consumer holding a
+/// `GOOGLE_APPLICATION_CREDENTIALS` key file gets a token from this seam
+/// instead of a `gcloud` subprocess. That is a WIDENING, not a break: the item
+/// names and signatures are unchanged (`AdcUserTokenLoader` keeps its name for
+/// exactly that reason), and a shape rivet cannot mint — `external_account`
+/// workload identity — still reads as `Ok(None)`.
+///
+/// (The consumer is named in docs/adr/0026, not here: the dependency-direction
+/// guard keeps the paid tier out of MIT sources, manifest and comments alike.)
+pub mod google_auth {
+    pub use crate::destination::gcs_auth::{AdcUserTokenLoader, try_authorized_user_loader};
+}
+
 pub mod enrich;
 pub(crate) mod notify;
 pub(crate) mod plan;

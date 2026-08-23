@@ -104,6 +104,34 @@ fn token_data(v: &serde_json::Value) -> Option<String> {
     v.get("_data").and_then(|d| d.as_str()).map(String::from)
 }
 
+/// Pure bound verdicts (#161): Mongo was the only engine whose `until_current`
+/// stop rules lived inline in the drain loop instead of a testable transition
+/// (its siblings: MySQL `commit_past_bound`, PG `tx_disposition`, MSSQL
+/// `fill_sql`). Two rules, both unit-tested in both directions:
+///
+/// An EMPTY poll's disposition: the stream's resume token has silently advanced
+/// past the open-time `_data` target → the backlog is drained, STOP; no target
+/// (unbounded shouldn't reach here, and an unparseable boundary fails OPEN) →
+/// STOP; otherwise the backlog is still coming → POLL again.
+fn idle_poll_stops(advanced: Option<&str>, target: Option<&str>) -> bool {
+    match (advanced, target) {
+        (Some(cur), Some(tgt)) => cur > tgt,
+        (_, None) => true,
+        _ => false,
+    }
+}
+
+/// The TIME bound: an event whose `cluster_time` is past the open-time cluster
+/// time arrived AFTER we opened — a bounded run stops there (without it,
+/// sustained writes keep `next_if_any` yielding and the run never terminates).
+fn past_time_bound(
+    until_current: bool,
+    cluster_time: Option<mongodb::bson::Timestamp>,
+    bound: Option<mongodb::bson::Timestamp>,
+) -> bool {
+    until_current && matches!((cluster_time, bound), (Some(ct), Some(b)) if ct > b)
+}
+
 /// Persist a resume token as a [`Position`] LOSSLESSLY. A token can carry a BSON
 /// binary `_typeBits` field (for typed sort keys — e.g. an integer `_id`), and a
 /// plain `serde_json` round-trip mangles that binary, so the server rejects it on
@@ -147,8 +175,15 @@ pub(crate) fn decode_resume_token(
     // handed to the `ResumeToken`/bson deserializer, which PANICS (not `Err`s)
     // on a type mismatch. The release build is `panic = "abort"`, so an unguarded
     // deserialize would abort the whole run on a corrupt/foreign checkpoint.
-    if v.get("_data").and_then(|x| x.as_str()).is_some() {
-        return Ok(serde_json::from_value(v.clone())?);
+    // Deserialize a document built from `_data` ALONE, never `v` itself: a file
+    // carrying `_data` beside foreign keys panicked the bson visitor rather than
+    // erroring (fuzz crash 1c53b95b, 2026-08-17), so passing `v` through checked
+    // one key and then trusted the whole object. A resume token's meaning is
+    // entirely in `_data`; anything else in the file is noise to drop.
+    if let Some(data) = v.get("_data").and_then(|x| x.as_str()) {
+        return Ok(serde_json::from_value(
+            serde_json::json!({ "_data": data }),
+        )?);
     }
     anyhow::bail!(
         "mongodb cdc: unrecognized resume-token checkpoint shape \
@@ -168,7 +203,7 @@ impl MongoChangeStream {
         mode: DrainMode,
     ) -> Result<Self> {
         let until_current = mode.is_bounded();
-        let session = MongoSession::connect(url, tls, true)?;
+        let session = MongoSession::connect(url, tls)?;
         let db_name = session.db().to_string();
         // The resume token persisted by a prior run (opaque JSON → driver token).
         // A corrupt / unreadable checkpoint is a LOUD error, never silently
@@ -345,7 +380,7 @@ fn probe_capability_on(session: &MongoSession) -> MongoCdcCapability {
 
 /// Connect + probe (for `rivet doctor` — a fresh connection).
 pub(crate) fn probe_capability(url: &str, tls: Option<&TlsConfig>) -> Result<MongoCdcCapability> {
-    let session = MongoSession::connect(url, tls, true)?;
+    let session = MongoSession::connect(url, tls)?;
     Ok(probe_capability_on(&session))
 }
 
@@ -396,7 +431,7 @@ fn to_change_event(
         _ => (None, Some(image)),
     };
 
-    Ok(ChangeEvent {
+    let mut ev = ChangeEvent {
         op,
         schema: db_name.to_string(),
         table,
@@ -404,12 +439,20 @@ fn to_change_event(
         after,
         // The per-event resume token is the exact re-open position.
         position: encode_resume_token(&cse.id)?,
-        // Every change-stream event is already committed (post-commit oplog).
-        committed: true,
+        committed: false,
         image_names: Some(std::sync::Arc::clone(&IMAGE_NAMES)),
         seq: 0, // stamped by TxnSeq as the stream is consumed
         poison: None,
-    })
+    };
+    // #158: Mongo's model — a SINGLE-document write's change event IS its own commit (post-commit
+    // oplog), so it is a boundary. A MULTI-document transaction (one lsid/txnNumber) shares one
+    // commit across N events, so marking each `committed` can roll the sink MID-transaction — but
+    // Mongo's resume token is PER-EVENT and consume-free, so a crash between the mid-txn checkpoint
+    // and the tail RE-READS the remaining events (at-least-once, dedup absorbs it), never SKIPS them
+    // like the PG slot / MSSQL from-LSN would (which is why those engines frame the true boundary).
+    // A NAMED decision via the shared framer, not an inline `committed: true` that reads as a divergence.
+    crate::source::cdc::TxnFramer::single_event_commit(&mut ev);
+    Ok(ev)
 }
 
 impl ChangeStream for MongoChangeStream {
@@ -441,11 +484,10 @@ impl ChangeStream for MongoChangeStream {
                             .and_then(|t| serde_json::to_value(&t).ok())
                             .as_ref()
                             .and_then(token_data);
-                        match (&advanced, &target) {
-                            (Some(cur), Some(tgt)) if cur > tgt => return None,
-                            (_, None) => return None,
-                            _ => continue, // backlog still coming — poll again
+                        if idle_poll_stops(advanced.as_deref(), target.as_deref()) {
+                            return None;
                         }
+                        continue; // backlog still coming — poll again
                     }
                     Err(e) => return Some(Err(anyhow::Error::from(e))),
                 }
@@ -462,10 +504,7 @@ impl ChangeStream for MongoChangeStream {
             // Without it, sustained writes keep `next_if_any` returning events and
             // the run never terminates (the `_data` target only fires on an empty
             // poll, which never happens under continuous writes).
-            if until_current
-                && let (Some(ct), Some(bound)) = (cse.cluster_time, bound_ts)
-                && ct > bound
-            {
+            if past_time_bound(until_current, cse.cluster_time, bound_ts) {
                 return None;
             }
 
@@ -531,6 +570,45 @@ mod tests {
     // in the release profile that aborts the whole run on a corrupt/foreign
     // checkpoint. The decoder must return a clean error for any unrecognized
     // shape. (RED before the shape-guard: `decode_resume_token` panics here.)
+
+    /// The exact input libFuzzer crashed on (nightly Fuzz, run 31998520492,
+    /// 2026-08-17): a `_data` STRING sitting beside a dozen unrelated keys, one
+    /// of them deeply nested. The guard below checked that `_data` was a string
+    /// and then handed the WHOLE object to the deserializer, which PANICS
+    /// (`unreachable!` in bson's seeded visitor) instead of erroring — so the
+    /// precondition its own comment claimed ("Deserialize ONLY that exact
+    /// shape") was named but never established. `panic = "abort"` in release
+    /// makes that an aborted run on a foreign checkpoint file.
+    #[test]
+    fn decode_resume_token_survives_foreign_keys_beside_data() {
+        let raw = r##"{"rz~tt":"t'" ,    "/":{"":{"":{"":{"t":{}}}}},   " t":"t'" ,    "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR   ~vrtt":"t'" ,    "_data":"8" ,    " jjjjjjjjjjjr~tt":    "_data'" ,    "   rt":" E" }"##;
+        let v: serde_json::Value = serde_json::from_str(raw).expect("corpus input is valid JSON");
+        let token = decode_resume_token(&v)
+            .expect("a `_data` string is a resume token whatever else the file carries");
+        // Non-inert: the token really is the one `_data` named, not a default.
+        let round: serde_json::Value = serde_json::to_value(&token).unwrap();
+        assert_eq!(round.get("_data").and_then(|d| d.as_str()), Some("8"));
+    }
+
+    /// The `rt` branch is the SIBLING of the `_data` one and was never fuzzed
+    /// past the hex gate — libFuzzer cannot readily synthesise valid BSON, so a
+    /// well-formed document of the WRONG SHAPE is a hole the corpus cannot
+    /// reach. Probed directly with real BSON: it does NOT panic, because
+    /// `from_bson` decodes a `ResumeToken` as an opaque raw document rather than
+    /// through the serde_json visitor that blew up on the `_data` path. It is
+    /// ACCEPTED and rejected later by the server (`Bad resume token`, 40648) —
+    /// loud and lossless, which is why this asserts no-panic rather than `Err`.
+    #[test]
+    fn decode_resume_token_does_not_panic_on_wellformed_bson_of_the_wrong_shape() {
+        let mut doc = Document::new();
+        doc.insert("x", mongodb::bson::doc! { "y": 1i32 });
+        let mut buf = Vec::new();
+        doc.to_writer(&mut buf).unwrap();
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        // The point of the test is that this returns at all.
+        let _ = decode_resume_token(&json!({ "rt": hex }));
+    }
+
     #[test]
     fn decode_resume_token_rejects_malformed_shapes_without_panicking() {
         for bad in [
@@ -547,5 +625,35 @@ mod tests {
                 "malformed resume token must be a clean Err, not a panic: {bad}"
             );
         }
+    }
+
+    /// #161: Mongo's until_current stop rules as pure transitions, both
+    /// directions each — the one engine whose bound lived inline in the drain
+    /// loop (siblings: commit_past_bound / tx_disposition / fill_sql).
+    #[test]
+    fn idle_poll_stops_both_directions() {
+        // stop: token advanced past the open-time target — backlog drained.
+        assert!(idle_poll_stops(Some("82AB"), Some("8299")));
+        // stop: no target (fail OPEN on an unparseable boundary).
+        assert!(idle_poll_stops(None, None));
+        assert!(idle_poll_stops(Some("82AB"), None));
+        // poll: backlog still coming (at or below the target, or no token yet).
+        assert!(!idle_poll_stops(Some("8299"), Some("82AB")));
+        assert!(!idle_poll_stops(Some("82AB"), Some("82AB")));
+        assert!(!idle_poll_stops(None, Some("82AB")));
+    }
+
+    #[test]
+    fn past_time_bound_both_directions() {
+        use mongodb::bson::Timestamp;
+        let t = |time: u32| Some(Timestamp { time, increment: 0 });
+        // stop: bounded run, event after the open-time cluster time.
+        assert!(past_time_bound(true, t(101), t(100)));
+        // keep: at/before the bound, daemon mode, or no bound.
+        assert!(!past_time_bound(true, t(100), t(100)));
+        assert!(!past_time_bound(true, t(99), t(100)));
+        assert!(!past_time_bound(false, t(101), t(100)));
+        assert!(!past_time_bound(true, t(101), None));
+        assert!(!past_time_bound(true, None, t(100)));
     }
 }

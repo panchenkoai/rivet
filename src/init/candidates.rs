@@ -118,11 +118,13 @@ mod tests {
             is_nullable: nullable,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         }
     }
 
     fn table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "public".into(),
             table: "t".into(),
             row_estimate: 1_000,

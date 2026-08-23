@@ -16,10 +16,11 @@
 
 use crate::common::*;
 
-/// Helper: write a config YAML + `rivet_state.db` next to it, return cfg path.
-fn cfg_dir_with(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+/// Helper: materialize the rig's config into a dedicated dir (so the state DB
+/// lives next to it), return the dir + cfg path.
+fn cfg_dir_with(rig: &Rig) -> (tempfile::TempDir, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
+    let p = rig.config_in(d.path());
     (d, p)
 }
 
@@ -45,14 +46,13 @@ fn incremental_export_with_unwritable_state_db_fails_loud_not_silent() {
 
     let export_name = unique_name("state_wf_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!("SELECT id, updated_at FROM {table_name}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
+        .dest_path(out.path().to_path_buf());
     let cfgdir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfgdir, &yaml);
+    let cfg = rig.config_in(cfgdir.path());
 
     // Make the state-DB directory unwritable — rivet can neither create nor write
     // rivet_state.db, and must surface that loudly, not swallow it.
@@ -171,13 +171,12 @@ fn roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() 
 
     let export_name = unique_name("clobber_inc_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     // Each run inserts one new row (strictly increasing cursor) then exports just
     // that delta — back to back, no sleep, so multiple runs share a second.
@@ -249,14 +248,13 @@ fn pg_incremental_cursor_survives_a_non_utc_session_timezone() {
     // session is 16:00Z — so an un-pinned run 2 compares `> 16:00Z` and skips the
     // (12:00, 16:00] window. `options=-c timezone=…` sets it for this connection only.
     let ny_url = format!("{POSTGRES_URL}?options=-c%20timezone%3DAmerica/New_York");
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .source_url(&ny_url)
         .query(&format!("SELECT id, updated_at FROM {table_name}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     // Run 1 captures ids 1,2; stores cursor = 12:00Z (the max).
     assert!(
@@ -436,7 +434,7 @@ fn chunked_resume_without_prior_run_fails_with_actionable_message() {
     let table = seed_pg_numeric_table(20);
     let export_name = unique_name("qa12_chunk");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -445,9 +443,8 @@ fn chunked_resume_without_prior_run_fails_with_actionable_message() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 5")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let out = run_rivet(&[
         "run",
@@ -479,7 +476,7 @@ fn chunked_resume_with_completed_run_gives_actionable_message() {
     let table = seed_pg_numeric_table(20);
     let export_name = unique_name("qa12_resume_done");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -488,9 +485,8 @@ fn chunked_resume_with_completed_run_gives_actionable_message() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 5")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     // First: run the full export to completion.
     let first_run = run_rivet_export(&cfg, &export_name);
@@ -533,15 +529,14 @@ fn full_mode_resume_flag_is_rejected() {
     let table = seed_pg_numeric_table(10);
     let export_name = unique_name("qa12_full_norsm");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
         ))
         .mode("full")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let result = run_rivet(&[
         "run",
@@ -585,7 +580,7 @@ fn chunked_resume_force_overrides_success_gate() {
     let table = seed_pg_numeric_table(20);
     let export_name = unique_name("qa12_resume_force");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -594,9 +589,8 @@ fn chunked_resume_force_overrides_success_gate() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 5")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     // Run to completion → `_SUCCESS` written, every chunk completed.
     let first = run_rivet_export(&cfg, &export_name);
@@ -667,13 +661,12 @@ fn incremental_manifest_ships_contiguous_cursor_range() {
     let _guard = PgTable::adopt(table_name.clone());
     let export_name = unique_name("qa12_curmeta_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(r#"SELECT id, v FROM {table_name}"#))
         .mode("incremental")
         .export_line("cursor_column: id")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let read_ex = || -> serde_json::Value {
         let m: serde_json::Value = serde_json::from_str(
