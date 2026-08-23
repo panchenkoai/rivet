@@ -29,12 +29,25 @@ const MATRIX: &str = "docs/attestation-matrix.yaml";
 const UNVERIFIED_RATCHET: usize = 0;
 
 fn claims() -> Vec<Value> {
-    let s = fs::read_to_string(MATRIX).unwrap_or_else(|e| panic!("read {MATRIX}: {e}"));
+    let s = super::nonvacuity::subject_text(MATRIX);
     let doc: Value = serde_yaml_ng::from_str(&s).unwrap_or_else(|e| panic!("parse {MATRIX}: {e}"));
-    doc.get("claims")
+    let out: Vec<Value> = doc
+        .get("claims")
         .and_then(|c| c.as_sequence())
         .unwrap_or_else(|| panic!("{MATRIX} must have a `claims:` sequence"))
-        .clone()
+        .clone();
+    // A PRESENT but empty (or truncated) `claims:` is the dangerous shape: all
+    // five guards below iterate it, so zero rows means five green tests over a
+    // ledger asserting nothing — and this is the ledger whose rows read as
+    // GUARANTEES. 16 claims today.
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        10,
+        &format!("`claims:` rows in {MATRIX}"),
+        "Restore the rows or re-point this reader; an attestation ledger that parses to \
+         nothing still renders as `independence: independent` to every reader of the file.",
+    );
+    out
 }
 
 fn field(c: &Value, k: &str) -> Option<String> {

@@ -80,3 +80,9 @@ scenarios:
     what: "a CDC export's manifest declares the compression the part ACTUALLY has. The writer picks None for CSV and Zstd for Parquet; `build_manifest` wrote the literal \"zstd\" for both, so a `format: csv` CDC prefix shipped plain-text parts under a manifest advertising zstd (the batch leg records `plan.compression.label()` — the truth — so the two legs described the same artifact differently). Found by the format axis of the CDC sweep; the oracle is the FILE's own bytes (a zstd frame's 28 B5 2F FD magic vs the CSV header text), never the other arm of the same match."
     no_silent_loss:          { na: "the rows are all present and readable — the defect is in the SIDECAR's description of the file, not in the file" }
     no_corruption_on_escape: { test: a_cdc_manifest_declares_the_compression_the_part_actually_has }
+
+  - id: cdc_path_shares_the_writer
+    what: "the CDC sink's CSV output is the SAME writer as the batch sink's — both call `fmt.create_writer` (src/pipeline/sink/mod.rs and src/source/cdc/sink.rs), so every rendering/escaping row above already covers it and re-testing them on the CDC path would grade the same code twice while reading as new coverage. What is NOT shared is the WIRING: the CDC schema carries __op/__pos/__seq beside the source columns, CSV cannot serialize every Arrow type, and `rivet cdc --output --format csv` is documented but had never been run by any test. That combination is pinned by mysql_cdc_cli_csv_output_is_wired_and_readable (it runs, writes .csv not parquet, and DuckDB reads every id back)."
+    no_silent_loss:          { na: "shared seam — the value rendering is the batch writer's, proven by the rows above; the CDC path adds no rendering of its own" }
+    no_corruption_on_escape: { na: "same shared writer, so the RFC-4180 quoting is the same code the header/cell rows already pin" }
+

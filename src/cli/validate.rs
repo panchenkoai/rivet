@@ -13,23 +13,15 @@ use crate::error::Result;
 /// JSON depending on `--json-errors`.
 pub(super) fn validate_cli(cmd: &Commands) -> Result<()> {
     match cmd {
-        Commands::Run {
-            parallel_exports,
-            parallel_export_processes,
-            ..
-        } => {
-            if *parallel_exports && *parallel_export_processes {
+        Commands::Run(a) => {
+            if a.parallel_exports && a.parallel_export_processes {
                 anyhow::bail!(
                     "--parallel-exports and --parallel-export-processes are mutually exclusive; \
                      choose one parallelism mode"
                 );
             }
         }
-        Commands::Plan {
-            format: PlanFormat::Pretty,
-            output: Some(_),
-            ..
-        } => {
+        Commands::Plan(a) if matches!(a.format, PlanFormat::Pretty) && a.output.is_some() => {
             anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
         }
         Commands::Reconcile {
@@ -39,18 +31,14 @@ pub(super) fn validate_cli(cmd: &Commands) -> Result<()> {
         } => {
             anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
         }
-        Commands::Validate {
-            format: ValidateFormat::Pretty,
-            output: Some(_),
-            ..
-        } => {
+        Commands::Validate(a)
+            if matches!(a.format, ValidateFormat::Pretty) && a.output.is_some() =>
+        {
             anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
         }
-        Commands::Repair {
-            format: ReconcileFormat::Pretty,
-            output: Some(_),
-            ..
-        } => {
+        Commands::Repair(a)
+            if matches!(a.format, ReconcileFormat::Pretty) && a.output.is_some() =>
+        {
             anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
         }
         _ => {}
@@ -63,7 +51,7 @@ mod tests {
     use super::*;
 
     fn make_run(parallel_exports: bool, parallel_export_processes: bool) -> Commands {
-        Commands::Run {
+        Commands::Run(crate::cli::args::RunArgs {
             config: "c.yaml".into(),
             export: None,
             validate: false,
@@ -75,7 +63,7 @@ mod tests {
             summary_output: None,
             json: false,
             params: vec![],
-        }
+        })
     }
 
     #[test]
@@ -93,25 +81,27 @@ mod tests {
 
     #[test]
     fn validate_plan_rejects_output_with_pretty() {
-        let cmd = Commands::Plan {
+        let cmd = Commands::Plan(crate::cli::args::PlanArgs {
             config: "c.yaml".into(),
             export: None,
             params: vec![],
             output: Some("out.json".into()),
             format: PlanFormat::Pretty,
-        };
+            annotate_waves: false,
+        });
         assert!(validate_cli(&cmd).is_err());
     }
 
     #[test]
     fn validate_plan_accepts_output_with_json() {
-        let cmd = Commands::Plan {
+        let cmd = Commands::Plan(crate::cli::args::PlanArgs {
             config: "c.yaml".into(),
             export: None,
             params: vec![],
             output: Some("out.json".into()),
             format: PlanFormat::Json,
-        };
+            annotate_waves: false,
+        });
         assert!(validate_cli(&cmd).is_ok());
     }
 
@@ -141,7 +131,7 @@ mod tests {
 
     #[test]
     fn validate_repair_rejects_output_with_pretty() {
-        let cmd = Commands::Repair {
+        let cmd = Commands::Repair(crate::cli::args::RepairArgs {
             config: "c.yaml".into(),
             export: "e".into(),
             report: None,
@@ -149,13 +139,13 @@ mod tests {
             format: ReconcileFormat::Pretty,
             output: Some("out.json".into()),
             params: vec![],
-        };
+        });
         assert!(validate_cli(&cmd).is_err());
     }
 
     #[test]
     fn validate_repair_accepts_output_with_json() {
-        let cmd = Commands::Repair {
+        let cmd = Commands::Repair(crate::cli::args::RepairArgs {
             config: "c.yaml".into(),
             export: "e".into(),
             report: None,
@@ -163,7 +153,7 @@ mod tests {
             format: ReconcileFormat::Json,
             output: Some("out.json".into()),
             params: vec![],
-        };
+        });
         assert!(validate_cli(&cmd).is_ok());
     }
 }

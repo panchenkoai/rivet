@@ -62,7 +62,7 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 const GAP_RATCHET: usize = 10;
 
 fn load(path: &str) -> Value {
-    let s = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let s = super::nonvacuity::subject_text(path);
     serde_yaml_ng::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
@@ -75,11 +75,38 @@ fn scalar(v: &Value) -> String {
     }
 }
 
+/// A top-level sequence of the ledger, floor-checked per section.
+///
+/// The `unwrap_or_default()` is the vacuity: a renamed or re-nested key hands
+/// back the EMPTY vector, and then `every_gate_function_has_a_ledger_row_and_
+/// vice_versa` finds no ids to demand functions for, the column-completeness
+/// loop grades no scenarios, and the gap count is zero — under the ratchet. The
+/// release-gate ledger reports a clean sweep having read nothing.
+///
+/// Floors are the counts the ledger holds today (9 scenarios / 22 preflights /
+/// 7 infra) minus room for ordinary edits: they catch a lost SECTION, not a
+/// deleted row, and a section that legitimately shrinks past its floor is a
+/// deliberate diff on this line.
 fn seq<'a>(v: &'a Value, key: &str) -> Vec<&'a Value> {
-    v.get(key)
+    let out: Vec<&Value> = v
+        .get(key)
         .and_then(|s| s.as_sequence())
         .map(|s| s.iter().collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let floor = match key {
+        "scenarios" => 5,
+        "preflights" => 12,
+        "infra" => 4,
+        _ => 0,
+    };
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        floor,
+        &format!("`{key}:` rows in {GATE_MATRIX}"),
+        "Re-point this reader at the section's new name/nesting — the guards below cannot \
+         tell an empty ledger from a fully covered one.",
+    );
+    out
 }
 
 /// A cell is `test` (bare string) | `{na: ...}` | `{gap: ...}`.
@@ -99,6 +126,20 @@ fn grid_matches_the_oracle_matrix_versions() {
     let grid = gate.get("grid").expect("gate matrix has a `grid`");
     let engines = oracle.get("engines").expect("oracle matrix has `engines`");
 
+    // r5 bughunt: this hand-typed list is ungoverned by the generative
+    // column-completeness guard (it iterates only the non-EXEMPT MATRICES),
+    // so a new SourceType variant would leave this matrix un-forced. Assert
+    // the list IS the enum — add a variant to SourceType and this goes RED
+    // until the matrix (and this const) gain the column.
+    {
+        let derived = super::chunking_matrix_guard::source_engine_variants();
+        let listed: std::collections::HashSet<String> =
+            ENGINES.iter().map(|e| e.to_string()).collect();
+        assert_eq!(
+            listed, derived,
+            "ENGINES hand-list drifted from the SourceType enum: listed {listed:?} vs enum {derived:?}"
+        );
+    }
     for eng in ENGINES {
         let gated: BTreeSet<String> = grid
             .get(eng)

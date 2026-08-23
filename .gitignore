@@ -124,3 +124,20 @@ __pycache__/
 # committed. Its absence is what makes the tracked docker-compose.yaml the
 # single reproducible definition.
 /docker-compose.override.yaml
+
+# downloaded previous-release binary — the release gate's regression baseline
+/.gate-baseline/
+
+# Cross-compilation target dirs. `cargo` only ever ignores `target/` itself, so
+# a build driven with `--target-dir target-linux` (e.g. `docker run ... cargo
+# build --target-dir /w/target-amd64` when producing a Linux binary from a Mac)
+# lands 7.5k files and ~1.2 GB per arch INSIDE the crate — where `cargo
+# package` would happily pick them up. This covers the `target-<arch>` naming
+# the accident used (2ed9548b, 7546 files) and the sibling shapes cargo users
+# reach for; it does NOT cover every conceivable build dir (`build-linux/`,
+# `linux-target/`, `target_amd64/` are all still visible to `git add -A`).
+# Enumerating names cannot close that — the general case is guarded by CONTENT
+# in .githooks/pre-commit, which refuses a commit that stages .rlib/.rmeta/
+# fingerprint/incremental paths or an implausible number of files.
+/target-*/
+.mutants-cache/

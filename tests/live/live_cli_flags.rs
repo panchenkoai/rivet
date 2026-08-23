@@ -69,35 +69,18 @@ use crate::common::*;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-/// Write a minimal config for a single full-mode export of `table`.
-fn simple_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+/// Minimal rig for a single full-mode export of `table`.
+fn simple_rig(table: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .dest_path(out_dir.to_path_buf())
 }
 
-/// Run export, return stdout.  Panics if the export fails.
-fn run_export(cfg: &std::path::Path, export: &str, extra_args: &[&str]) -> std::process::Output {
-    let mut args = vec!["run", "--config", cfg.to_str().unwrap(), "--export", export];
+/// Run the rig's export, return the output. Panics if the export fails.
+fn run_export(rig: &Rig, export: &str, extra_args: &[&str]) -> std::process::Output {
+    let mut args = vec!["--export", export];
     args.extend_from_slice(extra_args);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(&args)
-        .output()
-        .expect("spawn rivet run");
+    let out = rig.run_args(&args);
     assert!(
         out.status.success(),
         "run_export helper failed; stderr:\n{}",
@@ -138,28 +121,15 @@ fn all_run_ids(cfg: &std::path::Path, export_name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Build a minimal incremental config for `table` with `cursor_column: created_at`.
+/// Minimal incremental rig for `table` with `cursor_column: created_at`.
 /// The query must NOT include a cursor WHERE clause — rivet wraps the base query
 /// automatically: `SELECT * FROM (base) AS _rivet WHERE created_at > $1 ORDER BY created_at`.
-fn incremental_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name, created_at FROM {table}"
-    mode: incremental
-    cursor_column: created_at
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+fn incremental_rig(table: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name, created_at FROM {table}"))
+        .mode("incremental")
+        .export_line("cursor_column: created_at")
+        .dest_path(out_dir.to_path_buf())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -173,20 +143,9 @@ fn run_json_flag_prints_aggregate_summary_to_stdout() {
 
     let table = seed_pg_numeric_table(20);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --json");
+    let result = rig.cli(&["run", "--export", table.name(), "--json"]);
 
     assert!(
         result.status.success(),
@@ -228,21 +187,16 @@ fn run_summary_output_writes_json_to_file() {
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
     let summary_path = cfg_dir.path().join("summary.json");
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--summary-output",
-            summary_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet run --summary-output");
+    let result = rig.cli(&[
+        "run",
+        "--export",
+        table.name(),
+        "--summary-output",
+        summary_path.to_str().unwrap(),
+    ]);
 
     assert!(
         result.status.success(),
@@ -278,41 +232,22 @@ fn run_param_flag_substitutes_in_query() {
     // Seed 50 rows; query will filter to id <= ${max_id} (30).
     let table = seed_pg_numeric_table(50);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!(
+            "SELECT id, name FROM {name} WHERE id <= ${{max_id}}",
+            name = table.name()
+        ))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name} WHERE id <= ${{max_id}}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--param",
-            "max_id=30",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --param");
+    let result = rig.cli(&[
+        "run",
+        "--export",
+        table.name(),
+        "--param",
+        "max_id=30",
+        "--json",
+    ]);
 
     assert!(
         result.status.success(),
@@ -345,43 +280,24 @@ fn run_multi_param_substitutes_multiple_variables() {
     // Seed 50 rows (ids 0–49); filter id >= ${min_id} AND id <= ${max_id}.
     let table = seed_pg_numeric_table(50);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!(
+            "SELECT id, name FROM {name} WHERE id >= ${{min_id}} AND id <= ${{max_id}}",
+            name = table.name()
+        ))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name} WHERE id >= ${{min_id}} AND id <= ${{max_id}}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--param",
-            "min_id=10",
-            "--param",
-            "max_id=20",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --param --param");
+    let result = rig.cli(&[
+        "run",
+        "--export",
+        table.name(),
+        "--param",
+        "min_id=10",
+        "--param",
+        "max_id=20",
+        "--json",
+    ]);
 
     assert!(
         result.status.success(),
@@ -413,21 +329,9 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
 
     let table = seed_pg_numeric_table(25);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--reconcile",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --reconcile");
+    let result = rig.cli(&["run", "--export", table.name(), "--reconcile", "--json"]);
 
     assert!(
         result.status.success(),
@@ -458,6 +362,66 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
         25,
         "destination must physically hold all 25 rows"
     );
+
+    // The COUNT(*) this run just paid for must be RECORDED, not discarded.
+    // `load::reconcile` checks the source→file leg only `if let Some(src) =
+    // …source_row_count`, and until 2026-08-17 every production writer passed
+    // `None` — so that bail, `LoadIntegrity.source_rows` and the whole
+    // `--allow-source-drift` flag were unreachable, and a loader's only
+    // evidence about the extract was rivet's own part arithmetic compared
+    // against itself. This asserts the value AT THE BOUNDARY, read out of the
+    // artifact the real producer wrote — not handed to a decider by a test.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json"))
+            .expect("run --reconcile must leave a manifest"),
+    )
+    .expect("manifest.json must parse");
+    assert_eq!(
+        manifest["source"]["extraction"]["source_row_count"].as_i64(),
+        Some(25),
+        "the source COUNT(*) --reconcile ran must reach the manifest, so the LOAD \
+         side can check source→file; manifest:\n{manifest:#}"
+    );
+}
+
+/// A run WITHOUT `--reconcile` must leave `source_row_count` absent.
+///
+/// The field's contract is "when cheaply known" — recording anything else would
+/// mean either a `COUNT(*)` nobody asked for on every export, or (worse) copying
+/// rivet's own extracted-row counter into the field the load side treats as the
+/// INDEPENDENT source number, which would make `load::reconcile`'s source→file
+/// leg compare rivet to itself while reading as a real check.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_without_reconcile_records_no_source_row_count() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(25);
+    let out = tempfile::tempdir().unwrap();
+    let rig = simple_rig(table.name(), out.path());
+
+    let result = rig.cli(&["run", "--export", table.name()]);
+    assert!(result.status.success(), "the plain run must succeed");
+
+    // Not inert: the run really did export, so an absent field is a decision,
+    // not a missing manifest.
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()),
+        25,
+        "the fixture must actually export before absence means anything"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("a manifest"),
+    )
+    .expect("manifest.json must parse");
+    assert_eq!(
+        manifest["source"]["extraction"]["source_row_count"].as_i64(),
+        None,
+        "no probe ran, so there is no independent source number to record — \
+         recording one anyway would hand the load side rivet's own counter \
+         dressed as the source's; manifest:\n{manifest:#}"
+    );
 }
 
 #[test]
@@ -466,60 +430,88 @@ fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
     // `run --reconcile` reconciles what it exported (a consistent source
     // snapshot) against a *fresh* source COUNT(*). There is no deterministic
     // single-snapshot mismatch — by construction the export and the recount read
-    // the same source moments apart — so a real mismatch is a concurrency event.
-    // We construct it deterministically: full mode holds one snapshot for the
-    // whole read; a throttle keeps the run alive while a writer inserts 50 rows
-    // *after* the snapshot opens but *before* the end-of-run recount. The export
-    // therefore sees 200 and reconcile sees 250 → MISMATCH.
+    // the same source moments apart — so a real mismatch is a concurrency event:
+    // 50 rows must land AFTER the snapshot opens and BEFORE the end-of-run
+    // recount.
+    //
+    // The window is constructed by the PRODUCT's own pause hook
+    // (`pg_after_snapshot_open`, src/source/postgres/mod.rs), not by racing it.
+    // This fixture's history is the argument for the hook: a 600 ms sleep in the
+    // writer lost to rivet's startup on a loaded box (rows landed BEFORE the
+    // snapshot, export read 250, no mismatch); the pg_stat_activity rewrite that
+    // replaced it turned a CI-green test red for a cause never identified and
+    // was reverted. A pause at the sequence point does not race anything: when
+    // the hook fires, the snapshot IS open, and the writer gets the whole pause
+    // to commit inside the window.
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(200);
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning: {{batch_size: 10, throttle_ms: 60}}
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {name}", name = table.name()))
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
-    // Writer: after the snapshot has opened (and while the throttled export is
-    // still running), commit 50 new rows the export's snapshot can't see.
+    // Writer: waits for the hook's MARKER FILE — the product touches it at the
+    // sequence point, right as the pause begins — then inserts inside the
+    // window. The first draft fired the writer immediately and re-created the
+    // startup race from the other side (rows landed BEFORE the snapshot; the
+    // window was pause-shaped but empty). The marker is a condition, not a
+    // clock: it appears exactly when the snapshot is pinned, and the insert
+    // takes milliseconds against a 5 s pause.
+    let marker = cfg_dir.path().join("snapshot_open.marker");
     let table_name = table.name().to_string();
+    let marker_for_writer = marker.clone();
     let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        let waited = (0..500).any(|_| {
+            if marker_for_writer.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(
+            waited,
+            "the pause marker never appeared within 10s — the hook did not fire, so the \
+             insert would race startup and the mismatch would be a coin flip"
+        );
         let mut c = pg_connect();
-        let _ = c.batch_execute(&format!(
+        c.batch_execute(&format!(
             "INSERT INTO {table_name} (id, name, amount) \
              SELECT g, 'late', 1.0 FROM generate_series(201, 250) g"
-        ));
+        ))
+        .expect("late insert");
     });
 
-    let result = run_rivet(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-        "--reconcile",
-    ]);
-    let _ = writer.join();
+    let result = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+            "--reconcile",
+        ],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:5000"),
+            ("RIVET_TEST_PAUSE_MARKER", marker.to_str().unwrap()),
+        ],
+    );
+    writer.join().expect("writer thread");
 
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("MISMATCH"),
         "run --reconcile must report MISMATCH when the source grew (250) past what \
          was exported (200); stderr:\n{stderr}"
+    );
+    // And the export itself must still be the SNAPSHOT's 200 rows — if the late
+    // rows are in the parquet, the pause fired before the snapshot opened and
+    // the MISMATCH above is measuring a different event than this test claims.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        200,
+        "the exported parquet must hold the snapshot's 200 rows, not the late 50"
     );
 }
 
@@ -535,8 +527,8 @@ fn run_reconcile_implies_validate_produces_manifest_verdict() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(25);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
+    let cfg = rig.config_path();
 
     let result = run_rivet(&[
         "run",
@@ -621,48 +613,14 @@ fn run_parallel_export_processes_flag_runs_both_exports() {
     let t1 = seed_pg_numeric_table(10);
     let t2 = seed_pg_numeric_table(10);
     let out1 = tempfile::tempdir().unwrap();
-    let out2 = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
+    let _out2 = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
 
-exports:
-  - name: {n1}
-    query: "SELECT id, name FROM {n1}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o1}
-  - name: {n2}
-    query: "SELECT id, name FROM {n2}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o2}
-"#,
-        n1 = t1.name(),
-        o1 = out1.path().display(),
-        n2 = t2.name(),
-        o2 = out2.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--parallel-export-processes",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --parallel-export-processes");
+    let result = rig.cli(&["run", "--parallel-export-processes", "--json"]);
 
     assert!(
         result.status.success(),
@@ -689,7 +647,7 @@ exports:
         "export 1 destination must hold 10 rows"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out2.path()),
+        duckdb_total_parquet_rows(&rig.out_dir_for(t2.name())),
         10,
         "export 2 destination must hold 10 rows"
     );
@@ -706,20 +664,9 @@ fn check_type_report_shows_column_table() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--type-report",
-        ])
-        .output()
-        .expect("spawn rivet check --type-report");
+    let result = rig.cli(&["check", "--export", table.name(), "--type-report"]);
 
     assert!(
         result.status.success(),
@@ -752,39 +699,12 @@ fn check_strict_exits_zero_for_safe_types() {
     // Our seeded table has id (BIGINT) and name (TEXT) — both have exact fidelity.
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     // Query only the safe columns.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {name}", name = table.name()))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--strict",
-        ])
-        .output()
-        .expect("spawn rivet check --strict");
+    let result = rig.cli(&["check", "--export", table.name(), "--strict"]);
 
     assert!(
         result.status.success(),
@@ -824,37 +744,11 @@ fn check_strict_exits_nonzero_for_unsafe_type() {
     );
 
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&name)
+        .query(&format!("SELECT id, val FROM {name}"))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, val FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &name,
-            "--strict",
-        ])
-        .output()
-        .expect("spawn rivet check --strict (unsafe type)");
+    let result = rig.cli(&["check", "--export", &name, "--strict"]);
 
     assert!(
         !result.status.success(),
@@ -889,20 +783,9 @@ fn check_json_flag_outputs_type_report_as_json() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet check --json");
+    let result = rig.cli(&["check", "--export", table.name(), "--json"]);
 
     assert!(
         result.status.success(),
@@ -954,21 +837,9 @@ fn check_target_flag_accepts_bigquery_target() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--target",
-            "bigquery",
-        ])
-        .output()
-        .expect("spawn rivet check --target bigquery");
+    let result = rig.cli(&["check", "--export", table.name(), "--target", "bigquery"]);
 
     // Exit 0 expected — our seeded table has int/text columns with no
     // BigQuery incompatibilities.
@@ -986,41 +857,22 @@ fn check_param_flag_substitutes_in_query() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!(
+            "SELECT id, name FROM {name} WHERE id <= ${{upper}}",
+            name = table.name()
+        ))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name} WHERE id <= ${{upper}}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--param",
-            "upper=100",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet check --param");
+    let result = rig.cli(&[
+        "check",
+        "--export",
+        table.name(),
+        "--param",
+        "upper=100",
+        "--json",
+    ]);
 
     assert!(
         result.status.success(),
@@ -1064,13 +916,9 @@ fn doctor_exits_zero_when_source_reachable() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet doctor");
+    let result = rig.cli(&["doctor"]);
 
     assert!(
         result.status.success(),
@@ -1098,14 +946,10 @@ fn state_show_displays_cursor_after_incremental_export() {
     // Full-mode exports leave LAST CURSOR = "-".
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &incremental_config(table.name(), out.path()));
-    run_export(&cfg, table.name(), &[]);
+    let rig = incremental_rig(table.name(), out.path());
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["state", "show", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet state show");
+    let result = rig.cli(&["state", "show"]);
 
     assert!(
         result.status.success(),
@@ -1152,21 +996,10 @@ fn state_files_shows_manifest_row() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
-    run_export(&cfg, table.name(), &[]);
+    let rig = simple_rig(table.name(), out.path());
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "files",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet state files");
+    let result = rig.cli(&["state", "files", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -1193,25 +1026,13 @@ fn state_files_last_flag_limits_file_count() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
+    let cfg = rig.config_path();
     // Two runs → two parquet files recorded in the manifest.
-    run_export(&cfg, table.name(), &[]);
-    run_export(&cfg, table.name(), &[]);
+    run_export(&rig, table.name(), &[]);
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "files",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--last",
-            "1",
-        ])
-        .output()
-        .expect("spawn rivet state files --last 1");
+    let result = rig.cli(&["state", "files", "--export", table.name(), "--last", "1"]);
 
     assert!(
         result.status.success(),
@@ -1247,21 +1068,11 @@ fn state_reset_clears_export_state() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
-    run_export(&cfg, table.name(), &[]);
+    let rig = simple_rig(table.name(), out.path());
+    let cfg = rig.config_path();
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "reset",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet state reset");
+    let result = rig.cli(&["state", "reset", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -1298,43 +1109,18 @@ fn state_chunks_shows_checkpoint_table() {
 
     let table = seed_pg_numeric_table(100);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
+    run_export(&rig, table.name(), &[]);
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    run_export(&cfg, table.name(), &[]);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "chunks",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet state chunks");
+    let result = rig.cli(&["state", "chunks", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -1384,43 +1170,18 @@ fn state_reset_chunks_clears_checkpoint() {
 
     let table = seed_pg_numeric_table(100);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
+    run_export(&rig, table.name(), &[]);
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    run_export(&cfg, table.name(), &[]);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "reset-chunks",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet state reset-chunks");
+    let result = rig.cli(&["state", "reset-chunks", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -1455,41 +1216,16 @@ fn state_reset_chunks_stuck_flag_is_idempotent() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 10")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 10
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "reset-chunks",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--stuck-checkpoints",
-        ])
-        .output()
-        .expect("spawn rivet state reset-chunks --stuck-checkpoints");
+    let result = rig.cli(&["state", "reset-chunks", "--stuck-checkpoints"]);
 
     assert!(
         result.status.success(),
@@ -1509,43 +1245,21 @@ fn state_reset_chunks_stuck_flag_resets_in_progress_runs() {
 
     let table = seed_pg_numeric_table(100);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // ── Step 1: inject crash after chunk 0's file is written ─────────────────
-    let crash_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
-        .output()
-        .expect("spawn rivet run (crash injection)");
+    let crash_out = rig.run_args_env(
+        &["--export", table.name()],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:0")],
+    );
 
     assert!(
         !crash_out.status.success(),
@@ -1569,16 +1283,7 @@ exports:
     drop(conn);
 
     // ── Step 3: reset stuck checkpoints ──────────────────────────────────────
-    let reset_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "reset-chunks",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--stuck-checkpoints",
-        ])
-        .output()
-        .expect("spawn rivet state reset-chunks --stuck-checkpoints");
+    let reset_out = rig.cli(&["state", "reset-chunks", "--stuck-checkpoints"]);
 
     assert!(
         reset_out.status.success(),
@@ -1614,43 +1319,17 @@ fn state_progression_shows_committed_boundary() {
 
     let table = seed_pg_numeric_table(100);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
+    run_export(&rig, table.name(), &[]);
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    run_export(&cfg, table.name(), &[]);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "state",
-            "progression",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet state progression");
+    let result = rig.cli(&["state", "progression", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -1681,14 +1360,10 @@ fn metrics_shows_run_history() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
-    run_export(&cfg, table.name(), &[]);
+    let rig = simple_rig(table.name(), out.path());
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["metrics", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet metrics");
+    let result = rig.cli(&["metrics"]);
 
     assert!(
         result.status.success(),
@@ -1714,24 +1389,13 @@ fn metrics_last_flag_limits_output() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
+    let cfg = rig.config_path();
     // Run twice so --last 1 actually filters.
-    run_export(&cfg, table.name(), &[]);
-    run_export(&cfg, table.name(), &[]);
+    run_export(&rig, table.name(), &[]);
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "metrics",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--last",
-            "1",
-        ])
-        .output()
-        .expect("spawn rivet metrics --last 1");
+    let result = rig.cli(&["metrics", "--export", table.name(), "--last", "1"]);
 
     assert!(
         result.status.success(),
@@ -1772,20 +1436,10 @@ fn journal_shows_run_summary() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
-    run_export(&cfg, table.name(), &[]);
+    let rig = simple_rig(table.name(), out.path());
+    run_export(&rig, table.name(), &[]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "journal",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet journal");
+    let result = rig.cli(&["journal", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -1811,11 +1465,11 @@ fn journal_last_flag_limits_output() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    let rig = simple_rig(table.name(), out.path());
+    let cfg = rig.config_path();
     // Two runs so --last 1 actually filters one out.
-    run_export(&cfg, table.name(), &[]);
-    run_export(&cfg, table.name(), &[]);
+    run_export(&rig, table.name(), &[]);
+    run_export(&rig, table.name(), &[]);
 
     // Collect run_ids oldest-first so we can assert which one is excluded.
     let run_ids = all_run_ids(&cfg, table.name());
@@ -1827,18 +1481,7 @@ fn journal_last_flag_limits_output() {
     );
     let (older_id, newer_id) = (&run_ids[0], &run_ids[1]);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "journal",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--last",
-            "1",
-        ])
-        .output()
-        .expect("spawn rivet journal --last 1");
+    let result = rig.cli(&["journal", "--export", table.name(), "--last", "1"]);
 
     assert!(
         result.status.success(),
@@ -1865,24 +1508,13 @@ fn journal_run_id_shows_specific_run() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
-    run_export(&cfg, table.name(), &[]);
+    let rig = simple_rig(table.name(), out.path());
+    let cfg = rig.config_path();
+    run_export(&rig, table.name(), &[]);
 
     let run_id = last_run_id(&cfg, table.name());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "journal",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--run-id",
-            &run_id,
-        ])
-        .output()
-        .expect("spawn rivet journal --run-id");
+    let result = rig.cli(&["journal", "--export", table.name(), "--run-id", &run_id]);
 
     assert!(
         result.status.success(),
@@ -1908,32 +1540,12 @@ fn doctor_exits_zero_when_mysql_source_reachable() {
 
     let table = seed_mysql_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
+    let rig = Rig::mysql_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet doctor (mysql)");
+    let result = rig.cli(&["doctor"]);
 
     assert!(
         result.status.success(),
@@ -1955,38 +1567,12 @@ fn check_mysql_basic_exits_zero() {
 
     let table = seed_mysql_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
+    let rig = Rig::mysql_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet check (mysql)");
+    let result = rig.cli(&["check", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -2054,48 +1640,15 @@ fn parallel_processes_one_child_failure_isolated_from_siblings() {
     let bad_name = unique_name("rivet_missing");
     let out_good = tempfile::tempdir().unwrap();
     let out_bad = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
     // The second export queries a table that does not exist — its child fails at
     // run time (not parent plan time), exercising parent-side failure aggregation.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {good}
-    query: "SELECT id, name FROM {good}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {og}
-  - name: {bad}
-    query: "SELECT id FROM {bad}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {ob}
-"#,
-        good = good.name(),
-        og = out_good.path().display(),
-        bad = bad_name,
-        ob = out_bad.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(good.name())
+        .query(&format!("SELECT id, name FROM {}", good.name()))
+        .also_export(&bad_name, &format!("SELECT id FROM {bad_name}"))
+        .dest_path(out_good.path().to_path_buf());
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--parallel-export-processes",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --parallel-export-processes");
+    let result = rig.cli(&["run", "--parallel-export-processes", "--json"]);
 
     // A failed child must surface as a non-zero parent exit.
     assert!(
@@ -2137,50 +1690,19 @@ fn parallel_processes_hard_crash_writes_no_partial_file() {
     let t1 = seed_pg_numeric_table(50);
     let t2 = seed_pg_numeric_table(50);
     let out1 = tempfile::tempdir().unwrap();
-    let out2 = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {n1}
-    query: "SELECT id, name FROM {n1}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o1}
-  - name: {n2}
-    query: "SELECT id, name FROM {n2}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o2}
-"#,
-        n1 = t1.name(),
-        o1 = out1.path().display(),
-        n2 = t2.name(),
-        o2 = out2.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
 
     // `after_source_read` panics each child mid-export — after the rows are read
     // but before the writer is finalized and the file is copied to the
     // destination. The env is inherited by every spawned child.
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--parallel-export-processes",
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_source_read")
-        .output()
-        .expect("spawn rivet run --parallel-export-processes");
+    let result = rig.run_args_env(
+        &["--parallel-export-processes"],
+        &[("RIVET_TEST_PANIC_AT", "after_source_read")],
+    );
 
     assert!(
         !result.status.success(),
@@ -2189,7 +1711,8 @@ exports:
     // I1 + NamedTempFile: the footerless/partial Parquet is written to a temp
     // file and only copied to the destination AFTER finalize — a crash before
     // that point must leave the destination empty (no corrupt file downstream).
-    for dir in [out1.path(), out2.path()] {
+    let out2_dir = rig.out_dir_for(t2.name());
+    for dir in [out1.path(), out2_dir.as_path()] {
         assert!(
             files_with_extension(dir, "parquet").is_empty(),
             "crashed export must leave no Parquet at the destination: {}",
@@ -2210,35 +1733,10 @@ fn parallel_processes_sigterm_reaps_children_no_orphans() {
     let t1 = seed_pg_numeric_table(5);
     let t2 = seed_pg_numeric_table(5);
     let out1 = tempfile::tempdir().unwrap();
-    let out2 = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {n1}
-    query: "SELECT id, name FROM {n1}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o1}
-  - name: {n2}
-    query: "SELECT id, name FROM {n2}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o2}
-"#,
-        n1 = t1.name(),
-        o1 = out1.path().display(),
-        n2 = t2.name(),
-        o2 = out2.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
 
     let children_of = |ppid: u32| -> Vec<u32> {
         std::process::Command::new("pgrep")
@@ -2266,19 +1764,13 @@ exports:
     // earlier 10s block let children die naturally inside the window, masking
     // the bug — the reaper run finished in ~2s, the unreaped run in ~12s, but
     // both "passed".) The env is inherited by every spawned child.
-    let mut parent = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--parallel-export-processes",
-        ])
-        .env("RIVET_TEST_BLOCK_AT", "after_source_read")
-        .env("RIVET_TEST_BLOCK_MS", "60000")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn parent rivet run --parallel-export-processes");
+    let mut parent = rig.spawn_args_env(
+        &["--parallel-export-processes"],
+        &[
+            ("RIVET_TEST_BLOCK_AT", "after_source_read"),
+            ("RIVET_TEST_BLOCK_MS", "60000"),
+        ],
+    );
     let ppid = parent.id();
 
     let mut kids: Vec<u32> = Vec::new();
@@ -2332,25 +1824,9 @@ fn sigkill_in_commit_window_leaves_no_committed_file() {
     require_alive(LiveService::Postgres);
     let t = seed_pg_numeric_table(20);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {n}
-    query: "SELECT id, name FROM {n}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o}
-"#,
-        n = t.name(),
-        o = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(t.name())
+        .query(&format!("SELECT id, name FROM {}", t.name()))
+        .dest_path(out.path().to_path_buf());
 
     let alive = |pid: u32| -> bool {
         std::process::Command::new("kill")
@@ -2368,20 +1844,13 @@ exports:
             .unwrap_or(false)
     };
 
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            t.name(),
-        ])
-        .env("RIVET_TEST_BLOCK_AT", "before_commit_rename")
-        .env("RIVET_TEST_BLOCK_MS", "60000")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn rivet run");
+    let mut child = rig.spawn_args_env(
+        &["--export", t.name()],
+        &[
+            ("RIVET_TEST_BLOCK_AT", "before_commit_rename"),
+            ("RIVET_TEST_BLOCK_MS", "60000"),
+        ],
+    );
     let pid = child.id();
 
     // Wait until the staged `.tmp` exists (process parked in the commit window).
@@ -2411,16 +1880,7 @@ exports:
     );
 
     // Recovery: a clean re-run (no block) produces exactly one real file.
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            t.name(),
-        ])
-        .output()
-        .expect("spawn recovery run");
+    let rec = rig.cli(&["run", "--export", t.name()]);
     assert!(
         rec.status.success(),
         "recovery run must succeed; stderr:\n{}",
@@ -2460,54 +1920,30 @@ fn check_strict_flags_csv_unserializable_column_consistently_with_run() {
     let _cleanup = DropTable(name.clone());
 
     let out = tempfile::tempdir().unwrap();
-    let mk = |fmt: &str| {
-        format!(
-            "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\n\
-             exports:\n  - {{name: {name}, query: \"SELECT id, arr FROM {name}\", \
-             mode: full, format: {fmt}, destination: {{type: local, path: {out}}}}}\n",
-            out = out.path().display()
-        )
+    let mk = |fmt: &'static str| {
+        Rig::pg_batch(&name)
+            .query(&format!("SELECT id, arr FROM {name}"))
+            .with_format(fmt)
+            .dest_path(out.path().to_path_buf())
     };
-    let csv_dir = tempfile::tempdir().unwrap();
-    let csv_cfg = write_config(&csv_dir, &mk("csv"));
+    let csv_rig = mk("csv");
 
     // CSV: `check --strict` flags the list column, AND the run fails the same way.
-    let chk = run_rivet(&[
-        "check",
-        "--config",
-        csv_cfg.to_str().unwrap(),
-        "--export",
-        &name,
-        "--strict",
-    ]);
+    let chk = csv_rig.cli(&["check", "--export", &name, "--strict"]);
     assert!(
         !chk.status.success(),
         "check --strict must flag an int[] column under CSV format; stderr:\n{}",
         String::from_utf8_lossy(&chk.stderr)
     );
-    let run = run_rivet(&[
-        "run",
-        "--config",
-        csv_cfg.to_str().unwrap(),
-        "--export",
-        &name,
-    ]);
+    let run = csv_rig.run_args(&["--export", &name]);
     assert!(
         !run.status.success(),
         "the CSV run of the same export must also fail (consistency)"
     );
 
     // Parquet: the SAME column is fine — the flag is format-specific.
-    let pq_dir = tempfile::tempdir().unwrap();
-    let pq_cfg = write_config(&pq_dir, &mk("parquet"));
-    let chk_pq = run_rivet(&[
-        "check",
-        "--config",
-        pq_cfg.to_str().unwrap(),
-        "--export",
-        &name,
-        "--strict",
-    ]);
+    let pq_rig = mk("parquet");
+    let chk_pq = pq_rig.cli(&["check", "--export", &name, "--strict"]);
     assert!(
         chk_pq.status.success(),
         "check --strict must pass the same int[] column under Parquet; stderr:\n{}",

@@ -358,7 +358,33 @@ def _cdc_mssql(url: str, work: Path) -> str | None:
     )
 
 
+def _mssql_max_lsn(url: str) -> str:
+    """The highest LSN the CDC capture job has PROCESSED, or 'NULL' if none yet.
+    Database-wide (`sys.fn_cdc_get_max_lsn`), so once the job ingests our
+    just-committed transaction it strictly advances past the value read before the
+    write — the precise "the capture job has caught up to my changes" signal that
+    a fixed `time.sleep` only guessed at."""
+    return _sqlcmd(
+        url,
+        q="SELECT ISNULL(CONVERT(varchar(64), sys.fn_cdc_get_max_lsn(), 1), 'NULL')",
+    ).stdout.strip()
+
+
+def _wait_mssql_captured(url: str, before: str) -> None:
+    """Poll until the capture job advances past `before` (the max-LSN read BEFORE
+    the write). Replaces a blind `time.sleep(8)`: it returns the instant the job
+    has captured our changes (often ~1-3s) and only waits out the full budget when
+    the Agent is genuinely slow — the same readiness-poll the fixture SETUP already
+    uses (`fn_cdc_get_min_lsn`), applied to the CHANGES too."""
+    wait_until(
+        lambda: _mssql_max_lsn(url) not in ("NULL", before),
+        tries=30,
+        delay=1.0,
+    )
+
+
 def _cdc_mssql_changes(url: str) -> None:
+    before = _mssql_max_lsn(url)
     _sqlcmd(
         url,
         sql=(
@@ -367,12 +393,13 @@ def _cdc_mssql_changes(url: str) -> None:
             "DELETE FROM dbo.orc_cdc_probe WHERE id=3;\n"
         ),
     )
-    time.sleep(8)  # let the CDC capture job populate the change table
+    _wait_mssql_captured(url, before)
 
 
 def _cdc_mssql_crashdelta(url: str) -> None:
+    before = _mssql_max_lsn(url)
     _sqlcmd(url, q='INSERT INTO dbo.orc_cdc_probe VALUES (4,4.4400,\'{"k":4}\');')
-    time.sleep(8)
+    _wait_mssql_captured(url, before)
 
 
 def _cdc_mssql_cleanup(url: str, work: Path) -> None:
@@ -477,17 +504,15 @@ def _store_readback(store: str, bkt: str, pfx: str, work: Path) -> str:
     return scenarios.store_readback(store, bkt, pfx, work)
 
 
-def _cdc_store_ids(store: str, bkt: str, pfx: str, idc: str) -> str:
-    """The INDEPENDENT distinct id-set the store holds (never rivet) — the
-    completeness oracle, as a bare comma-joined string so it can be quoted
-    verbatim into a failure reason."""
-    if store != "s3":
-        return ""
-    return _duckdb(
-        _S3_PREAMBLE
-        + f"SELECT string_agg(DISTINCT CAST({idc} AS VARCHAR),',') "
-        f"FROM read_parquet('s3://{bkt}/{pfx}/**/*.parquet')"
-    )
+def _cdc_store_ids(store: str, bkt: str, pfx: str, idc: str, work) -> str:
+    """The INDEPENDENT distinct id-set the store DELIVERS per its MANIFESTS (never rivet,
+    never RAW parquet) — the crash-recovery completeness oracle. Raw `**/*.parquet` would
+    count the crashed run's flushed-but-UNMANIFESTED orphan (the cdc_after_flush_before_ack
+    hook fires BEFORE write_manifest), so it could not tell a real re-read on recovery from
+    an orphan a consumer (rivet load) never sees — a recovery that re-anchored PAST the
+    un-acked change would still read as green. manifest_scoped_ids reads only what a consumer
+    consumes, so the orphan is invisible and the lost re-read goes RED."""
+    return scenarios.manifest_scoped_ids(store, bkt, pfx, work, idc)
 
 
 @dataclass(frozen=True)
@@ -607,6 +632,27 @@ def _state_populated(
 
 
 # ── the CDC end-to-end preflight (once, env-driven, SKIP-if-absent) ──────────
+def setup_with_retry(spec, url: str, work: Path, *, tries: int = 3, delay: float = 3.0):
+    """Run a CDC fixture's `setup`, retrying a transient failure.
+
+    SQL Server's `sp_cdc_enable_table` can fail while the PREVIOUS capture job is
+    still shutting down — six of eight mssql cells once failed exactly this way,
+    and it read as a source failure when it is a fixture race. `blessed_flow` had
+    absorbed it with an inline retry loop for MONTHS while `verify_cdc_e2e` called
+    `setup` ONCE — so the preflight CDC[mssql] cell went RED on the same race the
+    engine-matrix cell shrugged off (measured: min_lsn populated in ~5s, so the
+    None came from `not p.ok` on the enable, not the readiness poll). This is the
+    ONE definition both paths now share, so they cannot drift again. The other
+    engines succeed on the first try, so the retry is a no-op for them."""
+    blk = spec.setup(url, work)
+    for _ in range(max(0, tries - 1)):
+        if blk is not None:
+            return blk
+        time.sleep(delay)
+        blk = spec.setup(url, work)
+    return blk
+
+
 def verify_cdc_e2e(led: Ledger) -> None:
     any_engine = False
     _export_store_creds()
@@ -624,7 +670,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         )
         work = _workdir()
         idc = spec.id_col
-        cdc_block = spec.setup(url, work)
+        cdc_block = setup_with_retry(spec, url, work)
         if cdc_block is None:
             led.failed(eng, "cdc", "e2e", "-", f"cdc[{eng}]: source setup failed", "setup")
             continue
@@ -639,6 +685,12 @@ def verify_cdc_e2e(led: Ledger) -> None:
         before = _runs_seen()  # the key set this cell will subtract, see _state_populated
         rivet("run", "-c", str(cap.yaml))
         n = _store_readback("s3", cap.bucket, cap.prefix, work)  # INDEPENDENT (DuckDB)
+        # Per-column null profile, independent of rivet: the change set writes typed
+        # columns (amount numeric, meta jsonb), and a decode regression can null a WHOLE
+        # captured column while n stays 5 and validate re-reads its own null parts green —
+        # the exact uuid→FixedSizeBinary silent-loss class, on the CDC pipeline it
+        # occurred on. The batch legs guard this; CDC did not. Same helper.
+        cdc_null, _cdc_cols = scenarios.duckdb_allnull_cloud("s3", cap.bucket, cap.prefix, work)
         vout = rivet("validate", "-c", str(cap.yaml)).out
         vp = "passed" in vout.lower()
         spop = _state_populated(work / ".rivet_state.db", before=before)
@@ -646,9 +698,9 @@ def verify_cdc_e2e(led: Ledger) -> None:
         # 2. crash-recovery: an extra row (id=4) + crash at cdc_after_flush_before_ack →
         #    anchor held → recovery re-reads it (at-least-once, no loss).
         spec.crash_delta(url)
-        rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_FLUSH})  # crash
+        crashp = rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_FLUSH})  # crash
         rivet("run", "-c", str(cap.yaml))  # recover
-        ids = _cdc_store_ids("s3", cap.bucket, cap.prefix, idc)
+        ids = _cdc_store_ids("s3", cap.bucket, cap.prefix, idc, work)
         # An id-SET membership test. The bash `grep -q 4` was a substring match —
         # equivalent on this probe's {1,2,3,4}, a false pass on any wider set.
         crashok = "4" in [t.strip() for t in ids.split(",")]
@@ -661,8 +713,16 @@ def verify_cdc_e2e(led: Ledger) -> None:
             reasons.append("validate-not-PASSED")
         if not spop:
             reasons.append("state-not-populated")
+        if crashp.ok:
+            # The panic run MUST have crashed (non-zero exit). If it exited 0 the fault
+            # hook never fired — id=4 was acked normally, nothing was left un-acked, and
+            # the lost-tail invariant was never exercised: crashok would be green on a
+            # non-crash. (mirrors blessed_flow.py's `if c.ok: FAIL` for the batch path.)
+            reasons.append("crash-hook-inert[panic run exited 0 — cdc_after_flush_before_ack did not fire]")
         if not crashok:
             reasons.append(f"crash-lost-the-delta[ids={ids}]")
+        if cdc_null > 0:
+            reasons.append(f"cdc-allnull-column[{cdc_null} col(s) 100% NULL]")
         if not reasons:
             led.passed(
                 eng,
@@ -736,9 +796,9 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
     rivet("run", "-c", str(yaml))  # anchor
     # ONE transaction of 12 rows — larger than rollover 5. Must NOT split.
     _psql(url, sql="BEGIN;\nINSERT INTO orc_ltx SELECT g FROM generate_series(1,12) g;\nCOMMIT;\n")
-    rivet("run", "-c", str(yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_ACK})  # crash mid-flush
+    crashp = rivet("run", "-c", str(yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_ACK})  # crash mid-flush
     rivet("run", "-c", str(yaml))  # recover
-    ids = _cdc_store_ids("s3", bkt, pfx, "id")
+    ids = _cdc_store_ids("s3", bkt, pfx, "id", work)
     cnt = sum(1 for t in ids.split(",") if re.fullmatch(r"[0-9]+", t.strip()))
     _psql(
         url,
@@ -746,7 +806,9 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
         f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots WHERE slot_name='{slot}'; "
         "DROP TABLE IF EXISTS orc_ltx;",
     )
-    if cnt == 12:
+    # The crash MUST have fired: if the panic run exited 0 the hook never ran, no tail was
+    # left mid-flush, and 12/12 proves nothing about atomicity across a crash.
+    if cnt == 12 and not crashp.ok:
         led.passed(
             "postgres",
             "cdc",
@@ -754,6 +816,12 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
             "s3",
             "cdc large-tx-atomic: all 12 rows of the >rollover transaction survived the mid-flush crash",
             "12/12",
+        )
+    elif crashp.ok:
+        led.failed(
+            "postgres", "cdc", "large-tx-atomic", "s3",
+            "cdc large-tx-atomic: crash-hook INERT — the panic run exited 0, so no mid-flush "
+            f"crash was exercised (cnt={cnt}/12 proves nothing)", "crash-inert",
         )
     else:
         led.failed(

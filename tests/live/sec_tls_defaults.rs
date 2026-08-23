@@ -42,25 +42,15 @@
 
 use crate::common::*;
 
-/// Minimal Postgres export config with NO `tls:` block, pointed at `url`.
+/// Minimal Postgres export rig with NO `tls:` block, pointed at `url`.
 /// Inline `url:` (not `url_env:`) so the host the policy gate inspects is
 /// fully determined by this string.
-fn pg_no_tls_config(tmp: &tempfile::TempDir, url: &str, out_dir: &str) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{url}"
-exports:
-  - name: sec_tls_probe
-    query: "SELECT 1"
-    mode: full
-    format: csv
-    destination:
-      type: local
-      path: "{out_dir}"
-"#
-    );
-    write_config(tmp, &yaml)
+fn pg_no_tls_rig(url: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch("sec_tls_probe")
+        .query("SELECT 1")
+        .source_url(url)
+        .with_format("csv")
+        .dest_path(out_dir.to_path_buf())
 }
 
 /// Heuristic: does this stderr look like a *generic connection error* rather
@@ -120,9 +110,9 @@ fn sec_remote_plaintext_pg_is_loud() {
     // Non-loopback, unroutable host: the secure path refuses on policy before
     // the socket even matters; the vulnerable path attempts a cleartext dial.
     let remote_url = "postgresql://rivet:rivet@10.255.255.1:5432/rivet";
-    let cfg = pg_no_tls_config(&tmp, remote_url, out.to_str().unwrap());
+    let rig = pg_no_tls_rig(remote_url, &out);
 
-    let result = run_rivet_with_warn_log(&["doctor", "--config", cfg.to_str().unwrap()]);
+    let result = rig.cli_env(&["doctor"], &[("RUST_LOG", "warn")]);
     let stderr = String::from_utf8_lossy(&result.stderr).to_lowercase();
 
     // 1) It must fail (today a connection error also fails, so this alone is
@@ -170,9 +160,9 @@ fn sec_loopback_plaintext_pg_is_allowed() {
     std::fs::create_dir_all(&out).unwrap();
     // POSTGRES_URL is the 127.0.0.1 loopback docker DB with no TLS — the dev
     // case the secure policy explicitly permits.
-    let cfg = pg_no_tls_config(&tmp, POSTGRES_URL, out.to_str().unwrap());
+    let rig = pg_no_tls_rig(POSTGRES_URL, &out);
 
-    let result = run_rivet_with_warn_log(&["doctor", "--config", cfg.to_str().unwrap()]);
+    let result = rig.cli_env(&["doctor"], &[("RUST_LOG", "warn")]);
     let stderr = String::from_utf8_lossy(&result.stderr);
 
     assert!(
@@ -186,5 +176,54 @@ fn sec_loopback_plaintext_pg_is_allowed() {
     assert!(
         !names_tls_required_policy(&stderr.to_lowercase()),
         "loopback plaintext must NOT trigger a TLS-required refusal; stderr:\n{stderr}"
+    );
+}
+
+/// TLS-honesty (bug hunt 2026-08-08): an enforced `tls:` block must not be
+/// silently overridden by the URL's own `sslmode`.
+///
+/// The local stand runs Postgres with `ssl = off`, so `verify-full` is
+/// genuinely unsatisfiable here — which is the point. With `?sslmode=disable`
+/// in the URL, tokio-postgres used to hand back a raw PLAINTEXT stream and
+/// never touch the connector, so the export SUCCEEDED in cleartext under a
+/// `verify-full` claim. After the fix (`pg_config_ssl_forced` forces
+/// `ssl_mode(Require)`), TLS is attempted, the ssl-off server declines, and the
+/// run REFUSES. The assertion is "does not silently succeed in plaintext".
+///
+/// RED against `main`: there the run exits 0 with a written CSV part.
+fn pg_tls_rig(url: &str, out_dir: &std::path::Path, mode: &str) -> Rig {
+    Rig::pg_batch("sec_tls_honesty")
+        .query("SELECT 1")
+        .source_url(url)
+        .source_line(&format!("tls: {{ mode: {mode} }}"))
+        .with_format("csv")
+        .dest_path(out_dir.to_path_buf())
+}
+
+#[test]
+#[ignore = "live: requires the local ssl-off Postgres stand"]
+fn sec_enforced_tls_is_not_overridden_by_url_sslmode_disable() {
+    require_alive(LiveService::Postgres);
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    // Loopback host + an EXPLICIT sslmode=disable in the URL, plus an enforced
+    // tls block. The host is loopback so the require_tls_or_loopback gate does
+    // NOT fire — the ONLY thing that can refuse plaintext here is the driver
+    // actually honoring the enforced mode, which is what this pins.
+    let url = format!("{POSTGRES_URL}?sslmode=disable");
+    let rig = pg_tls_rig(&url, &out, "verify-full");
+
+    let r = rig.run_args(&[]);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        !r.status.success(),
+        "verify-full over an ssl-off server must REFUSE, not export in plaintext; \
+         the URL's sslmode=disable must not win. stderr:\n{stderr}"
+    );
+    // And it must fail for a TLS/connection reason, not some unrelated error.
+    let low = stderr.to_lowercase();
+    assert!(
+        low.contains("tls") || low.contains("ssl") || looks_like_connection_error(&low),
+        "refusal must be TLS/connection-shaped, not an unrelated failure; stderr:\n{stderr}"
     );
 }

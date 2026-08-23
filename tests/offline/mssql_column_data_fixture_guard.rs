@@ -24,7 +24,6 @@
 //! cannot see a wrong answer.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 const SRC: &str = "src/source/mssql/cdc.rs";
 
@@ -68,8 +67,7 @@ const ROW_BOUND: &[(&str, &str)] = &[
 ];
 
 fn source() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SRC);
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    super::nonvacuity::subject_text(SRC)
 }
 
 fn variants(text: &str) -> BTreeSet<String> {
@@ -101,6 +99,17 @@ fn branched_on(src: &str) -> BTreeSet<String> {
         let end = rest.find("\n}\n").unwrap_or(rest.len());
         out.extend(variants(&rest[..end]));
     }
+    // The BRANCHED-ON side is the requirement the fixture is graded against,
+    // and it is sliced by `find("\n}\n")` off each `fn` header — a formatting
+    // change that moves the first top-level `}` earlier truncates it, and a
+    // truncated requirement is satisfied by whatever the fixture happens to
+    // feed. 17 variants today.
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        10,
+        &format!("ColumnData variants parsed out of the two mappers in {SRC}"),
+        "Fix the slice (the mappers are still there) rather than the floor.",
+    );
     out
 }
 

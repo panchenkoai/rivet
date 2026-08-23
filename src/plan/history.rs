@@ -95,6 +95,7 @@ mod tests {
 
     fn metric(status: &str, duration_ms: i64, retries: i64) -> ExportMetric {
         ExportMetric {
+            bytes_read: 0,
             export_name: "orders".into(),
             run_id: Some("r".into()),
             run_at: "2026-04-18T00:00:00Z".into(),

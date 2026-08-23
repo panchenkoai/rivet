@@ -41,7 +41,11 @@ pub(crate) fn install_in_process_tx(tx: Sender<UiMessage>) {
 }
 
 pub(crate) fn clear_in_process_tx() {
-    *IN_PROCESS_TX.lock().expect("ipc tx mutex poisoned") = None;
+    // Poison-tolerant: this is called from a Drop guard during unwinding
+    // (run_pool panic-safety) — a sender that panicked while holding the lock
+    // must not turn cleanup into a double-panic abort. Clearing a poisoned
+    // slot is exactly the right recovery.
+    *IN_PROCESS_TX.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 pub(crate) fn in_process_events_enabled() -> bool {
@@ -97,6 +101,13 @@ pub enum ChildEvent {
         duration_ms: i64,
         peak_rss_mb: i64,
         error_message: Option<String>,
+        /// Transient destination retries the child's RetryLayer absorbed —
+        /// process-local in the child, so it must ride the event stream or the
+        /// parent's "dest retries" summary line silently reads 0 in exactly
+        /// the modes with the most upload concurrency (bughunt 2026-08-13).
+        /// `#[serde(default)]` so an older child's event still parses.
+        #[serde(default)]
+        dest_retries: u64,
     },
 }
 
@@ -224,6 +235,7 @@ mod tests {
             duration_ms: 1234,
             peak_rss_mb: 12,
             error_message: Some("connection reset".into()),
+            dest_retries: 3,
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: ChildEvent = serde_json::from_str(&s).unwrap();

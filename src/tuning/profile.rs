@@ -85,8 +85,16 @@ pub struct TuningConfig {
     /// Policy applied when a batch exceeds `max_batch_memory_mb`. Default: `warn`.
     pub on_batch_memory_exceeded: Option<BatchMemoryPolicy>,
     /// Enable real-time batch size adaptation based on DB pressure metrics.
-    /// Postgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.
-    /// Also arms the OPT-2 concurrency governor when `parallel > 1`.
+    /// The batch loop samples the export's OWN extraction pressure: Postgres
+    /// `pg_stat_bgwriter` checkpoint pressure; MySQL the read-spill pair
+    /// `Created_tmp_disk_tables` and `Innodb_buffer_pool_wait_free`. SQL Server
+    /// takes no batch sample — its batch size comes from the memory cap alone.
+    ///
+    /// It also arms the OPT-2 concurrency governor when `parallel > 1`. The
+    /// governor samples a DIFFERENT, write-driven signal on its own monitoring
+    /// connection — one a read-only export cannot inflate, so it can never shed
+    /// its own workers over its own reads: Postgres `checkpoints_req`, MySQL
+    /// `Innodb_log_waits`, SQL Server `Log Flush Waits/sec` (`_Total`).
     pub adaptive: Option<bool>,
     /// Floor for the concurrency governor (lowest parallelism under pressure).
     /// Default 1. Ceiling is the export's `parallel`.

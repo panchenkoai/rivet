@@ -13,6 +13,31 @@ use crate::state::StateStore;
 use super::ipc::{ChildEvent, ENV_IPC_EVENTS};
 use super::parent_ui::{ChildWaitStatus, UiMessage, sanitize_terminal};
 
+/// Decode one stdout line from a CHILD PROCESS and adopt the process-local
+/// counters it carries into this process's totals.
+///
+/// This is the **only** place a `ChildEvent` crosses a process boundary, and
+/// therefore the only place its counters are provably FOREIGN: the child's
+/// `RetryLayer` incremented its own `TRANSIENT_RETRIES` atomic, which this
+/// process never saw, so folding it in is what makes the parent's "dest
+/// retries" line cover the whole run instead of just the parent's own probes.
+///
+/// The fold used to live in `parent_ui::Renderer::handle_event` — but the
+/// renderer is also fed by the SAME-process channel (`ipc::emit_event`, which
+/// every `--parallel-exports` / `--pool` / plain sequential run installs), so
+/// it re-added this process's own counter to itself: a run with 3 real
+/// retries reported 6, and each further export doubled the total again
+/// (bughunt 2026-08-14, finding #4). Keeping the fold here makes the
+/// invariant structural — a counter is folded only after arriving over a
+/// pipe from another process.
+fn adopt_child_event(line: &str) -> serde_json::Result<ChildEvent> {
+    let ev: ChildEvent = serde_json::from_str(line)?;
+    if let ChildEvent::Finished { dest_retries, .. } = &ev {
+        crate::destination::add_transient_retries(*dest_retries);
+    }
+    Ok(ev)
+}
+
 /// Re-invoke this binary once per export. Children do not inherit parallel flags, so there is no recursion.
 ///
 /// Each child has `RIVET_IPC_EVENTS=1` set in its environment and runs with
@@ -79,6 +104,18 @@ pub(super) fn run_exports_as_child_processes(
 
     let (tx, rx) = mpsc::channel::<UiMessage>();
 
+    // #153 heartbeat: silence between spawn and the first child event is
+    // indistinguishable from a hang (the field: ~2.5 min blank terminal). Emit it
+    // BEFORE the UI thread starts drawing — a raw eprintln AFTER the renderer is
+    // live races its cursor and corrupts the card table in a TTY (roast
+    // 2026-08-09). Printed here, it scrolls above the cards the renderer then
+    // owns. Uses the intended count (exports.len()); per-child spawn failures
+    // surface as their own ✗ cards.
+    eprintln!(
+        "  … starting {} export process(es); waiting for the first child event",
+        exports.len()
+    );
+
     // `name_floor` (wave-wide max, from the caller) seeds the card table's name
     // column so it aligns from the first redraw and across batches.
     let n_cards = exports.len();
@@ -135,7 +172,25 @@ pub(super) fn run_exports_as_child_processes(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env(ENV_IPC_EVENTS, "1");
+            .env(ENV_IPC_EVENTS, "1")
+            // …and the claim that goes with it: THIS parent will emit the
+            // run-over-run throughput self-check for the child's exports, so the
+            // child must not (its stderr is captured to a file nobody reads).
+            // A separate, internal variable because `RIVET_IPC_EVENTS` is a
+            // documented user-facing switch — keying the deferral on it alone
+            // silenced the check in any environment that set it (see
+            // `run::ENV_PARENT_SELF_CHECK`).
+            .env(super::run::ENV_PARENT_SELF_CHECK, "1");
+        // Declare sibling concurrency to the child: it runs single-export in
+        // its own process, so MULTI_EXPORT_CONCURRENT reads false there and
+        // run_diagnosis would print the confident solo harm attribution while
+        // N sibling children share the same server-global counter window —
+        // the runner-bypass shape of the pool hedge fix (bughunt 2026-08-13).
+        // Only when this batch actually has siblings: a lone child (a heavy
+        // wave batch of one) keeps the truthful solo attribution.
+        if exports.len() > 1 {
+            cmd.env(super::run::ENV_CONCURRENT_SIBLINGS, "1");
+        }
         log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
         match cmd.spawn() {
             Ok(mut child) => {
@@ -163,7 +218,7 @@ pub(super) fn run_exports_as_child_processes(
                                 if trimmed.is_empty() {
                                     continue;
                                 }
-                                match serde_json::from_str::<ChildEvent>(trimmed) {
+                                match adopt_child_event(trimmed) {
                                     Ok(ev) => {
                                         let _ = tx.send(UiMessage::Event(ev));
                                     }
@@ -327,8 +382,111 @@ pub(super) fn run_exports_as_child_processes(
         }
     }
 
+    // #153: a common-mode startup failure — surface ONE representative excerpt
+    // NOW (before the caller's end-of-batch full dump), so the operator sees the
+    // one message that explains the flood instead of scanning 70 identical cards.
+    // Representative message per failed child = its last stderr line (the error),
+    // else the wait/spawn reason. `any_success` = at least one child produced no
+    // failure record.
+    let any_success = exports.iter().any(|e| !all_failures.contains_key(&e.name));
+    let failed_msgs: Vec<(String, String)> = all_failures
+        .iter()
+        .map(|(name, reason)| {
+            let msg = stderr_snapshot
+                .get(name)
+                .and_then(|lines| lines.iter().rev().find(|l| !l.trim().is_empty()))
+                .cloned()
+                .unwrap_or_else(|| reason.clone());
+            (name.clone(), msg)
+        })
+        .collect();
+    if let Some(banner) = representative_error(&failed_msgs, any_success, 3) {
+        eprint!("{banner}");
+    }
+
     let result = aggregate_child_result(&failures, &child_exit_codes);
     (result, all_failures, stderr_dump)
+}
+
+/// #153: when K+ children fail with the SAME error class before any success,
+/// surface ONE representative excerpt instead of a silent wait then a flood of
+/// identical ✗ cards (the field: 70+ children failed on absent dest creds; the
+/// operator saw a blank terminal then 70 cards, none of which explained why).
+///
+/// Pure so the dedup/threshold is unit-tested. `failed` is `(name, last_stderr
+/// line)` per failed child; `any_success` suppresses the banner (a mixed batch
+/// is not a common-mode failure). Class key = the message with digits/hex/paths
+/// blanked, so `token for host-1` and `token for host-2` collapse to one class.
+/// Returns `None` below the threshold or on a mixed/empty batch.
+/// The class KEY of one error message — variable tokens masked so per-child ids
+/// collapse to one common-mode class. A pure DIGIT run → `#` (host-1 / host-10
+/// are one class); a run mixing letters AND digits → `#` whole (a hex id, uuid,
+/// or random staging suffix like `aB3xQ9k` — digit-masking alone left `aB#xQ#k`,
+/// still per-child distinct, so the banner never fired: roast 2026-08-09). A
+/// pure-letter run (a real word) is KEPT. Whitespace normalized. Pure +
+/// directly unit-tested with exact expected strings.
+pub(super) fn error_class(msg: &str) -> String {
+    let mask_token = |tok: &str| -> String {
+        // Each token is a run of `is_ascii_alphanumeric()` chars, so every char is a digit or an
+        // ASCII letter; `has_alpha || all-digits` is therefore always true and the mask condition
+        // reduces to just `has_digit` (mask any token that carries a digit — an id/hash/token).
+        if tok.chars().any(|c| c.is_ascii_digit()) {
+            "#".to_string()
+        } else {
+            tok.to_string()
+        }
+    };
+    let mut out = String::with_capacity(msg.len());
+    let mut run = String::new();
+    for c in msg.chars() {
+        if c.is_ascii_alphanumeric() {
+            run.push(c);
+        } else {
+            if !run.is_empty() {
+                out.push_str(&mask_token(&run));
+                run.clear();
+            }
+            out.push(c);
+        }
+    }
+    if !run.is_empty() {
+        out.push_str(&mask_token(&run));
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(super) fn representative_error(
+    failed: &[(String, String)],
+    any_success: bool,
+    threshold: usize,
+) -> Option<String> {
+    if any_success || failed.len() < threshold {
+        return None;
+    }
+    let mut counts: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+    for (_, msg) in failed {
+        let m = msg.trim();
+        if m.is_empty() {
+            continue;
+        }
+        let e = counts.entry(error_class(m)).or_insert((0, m.to_string()));
+        e.0 += 1;
+    }
+    let (n, sample) = counts.into_values().max_by_key(|(n, _)| *n)?;
+    if n < threshold {
+        return None;
+    }
+    let more = failed.len().saturating_sub(n);
+    let tail = if more > 0 {
+        format!(" (and {more} more child failure(s), not all this class)")
+    } else {
+        format!(" (all {n} children failed alike)")
+    };
+    Some(format!(
+        "\n  ⚠ {n} children failed with the same error before any succeeded — \
+         representative:\n      {sample}{tail}\n      (full per-child stderr follows at batch end)\n"
+    ))
 }
 
 /// Build the parent's final result from the children's outcomes. When any child
@@ -450,6 +608,74 @@ mod child_reaper {
     pub(super) fn register(_pid: u32) {}
     pub(super) fn deregister(_pid: u32) {}
     pub(super) fn install_once() {}
+}
+
+#[cfg(test)]
+mod foreign_counter_tests {
+    use super::*;
+
+    /// The process boundary MUST still fold the child's retry counter — the
+    /// half of finding #4 that the fix could silently break by simply
+    /// deleting the fold from the renderer.
+    ///
+    /// The stdout reader thread needs a real spawned `rivet` child, so what is
+    /// pinned here is the decode-and-adopt seam the reader calls
+    /// ([`adopt_child_event`], its only call site) fed the exact wire bytes a
+    /// child writes — `serde_json::to_string(&ChildEvent)` is literally what
+    /// `ipc::emit` puts on stdout.
+    ///
+    /// TWO children, with different counts: the fold accumulates, so one
+    /// event cannot tell "added the child's count" from "assigned it".
+    ///
+    /// Mutant: drop the `add_transient_retries` call from
+    /// `adopt_child_event` → the counter does not move and `grew_by` is 0.
+    #[test]
+    fn a_child_processs_finished_line_folds_its_foreign_retry_counter() {
+        let _serial = super::super::parent_ui::retry_counter_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let line = |name: &str, dest_retries: u64| {
+            serde_json::to_string(&ChildEvent::Finished {
+                export_name: name.into(),
+                run_id: format!("{name}_20260814T000000"),
+                status: "success".into(),
+                total_rows: 10,
+                files_produced: 1,
+                bytes_written: 100,
+                duration_ms: 5,
+                peak_rss_mb: 7,
+                error_message: None,
+                dest_retries,
+            })
+            .unwrap()
+        };
+
+        let before = crate::destination::transient_retries_total();
+        for (name, n) in [("orders", 3u64), ("events", 4u64)] {
+            let ev = adopt_child_event(&line(name, n)).expect("child wire format must parse");
+            assert!(matches!(ev, ChildEvent::Finished { .. }));
+        }
+        let grew_by = crate::destination::transient_retries_total() - before;
+        // `>=` not `==`: `destination::cloud`'s interceptor test is outside
+        // this module's lock and adds 2. It cannot reach 7, so the mutant
+        // (growth 0..2) still goes RED.
+        assert!(
+            grew_by >= 7,
+            "both children's foreign counters must be folded (grew by {grew_by}, want >= 7)"
+        );
+    }
+
+    /// A line the child could not have written is rejected BEFORE the fold
+    /// (the `?` in `adopt_child_event`), so the reader keeps going and the
+    /// counter is untouched. Asserted on the return value rather than the
+    /// global counter — `destination::cloud`'s interceptor test runs outside
+    /// this lock, so an equality on a process-wide counter would flake.
+    #[test]
+    fn an_unparsable_line_is_rejected_before_the_fold() {
+        assert!(adopt_child_event("{not json").is_err());
+        assert!(adopt_child_event(r#"{"type":"nope"}"#).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -657,5 +883,112 @@ mod tests {
             "child stderr render leaked control bytes: {out:?}"
         );
         assert!(out.contains("pwned") && out.contains("boom"));
+    }
+}
+
+#[cfg(test)]
+mod representative_tests {
+    use super::{error_class, representative_error};
+
+    /// #197 (roast 2026-08-09): direct exact-string coverage of error_class, the
+    /// pure class-key masker. Each assertion pins a mutant the banner-level tests
+    /// couldn\'t (over-masking still collapses to one class): pure-letter words
+    /// KEPT (399 `&&`→`||` would mask them), the trailing run flushed (418
+    /// `delete !` would drop the last token), mid-token runs flushed at
+    /// separators (411 `delete !` would fuse tokens).
+    #[test]
+    fn error_class_masks_variable_tokens_exactly() {
+        // digit run → #; host-1 / host-10 are one class.
+        assert_eq!(error_class("token for host-42"), "token for host-#");
+        // mixed alnum (random suffix / hex) → whole run to #.
+        assert_eq!(
+            error_class("dir /tmp/rivet-stage-aB3xQ9k: denied"),
+            "dir /tmp/rivet-stage-#: denied"
+        );
+        // pure-letter words are KEPT (399 `&&`→`||` masks them → RED).
+        assert_eq!(error_class("plain words only"), "plain words only");
+        // trailing alnum run (no trailing separator) is flushed (418 `!` → RED,
+        // it would drop "here").
+        assert_eq!(error_class("ends here"), "ends here");
+        // mid runs flush at each separator (411 `!` → RED, it would fuse to "ab").
+        assert_eq!(error_class("a b"), "a b");
+        // whitespace normalized.
+        assert_eq!(error_class("two   spaces"), "two spaces");
+    }
+
+    #[test]
+    fn representative_collapses_a_common_mode_failure() {
+        // 70 children, same class (creds absent for different hosts) → ONE banner.
+        let failed: Vec<(String, String)> = (0..70)
+            .map(|i| {
+                (
+                    format!("t{i}"),
+                    format!("Error: could not obtain token for host-{i}"),
+                )
+            })
+            .collect();
+        let banner = representative_error(&failed, false, 3).expect("common-mode → banner");
+        assert!(banner.contains("70 children failed"), "{banner}");
+        assert!(banner.contains("could not obtain token"), "{banner}");
+    }
+
+    #[test]
+    fn representative_suppressed_on_mixed_or_below_threshold() {
+        let two: Vec<(String, String)> = (0..2)
+            .map(|i| (format!("t{i}"), "Error: x".into()))
+            .collect();
+        assert!(
+            representative_error(&two, false, 3).is_none(),
+            "below threshold"
+        );
+        let many: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("t{i}"), "Error: x".into()))
+            .collect();
+        assert!(
+            representative_error(&many, true, 3).is_none(),
+            "a batch with a success is not a common-mode failure"
+        );
+    }
+
+    /// #153 D2 (roast 2026-08-09): a per-child RANDOM ALPHANUMERIC token (a
+    /// staging-dir suffix, a hex id) must not defeat the common-mode banner —
+    /// the class key must collapse mixed alnum runs whole, not just digit runs.
+    /// RED against the digit-only class_of (which left aB#xQ#k per-child distinct).
+    #[test]
+    fn representative_collapses_random_alphanumeric_suffixes() {
+        let failed: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                // e.g. aB3xQ9k — LETTERS differ per child (not just digits), so
+                // digit-masking alone leaves distinct classes; only whole-run
+                // masking collapses them.
+                let a = (b'a' + (i % 20) as u8) as char;
+                let b = (b'A' + ((i * 3) % 20) as u8) as char;
+                let suffix = format!("{a}{i}x{b}{}k", i * 7 + 3);
+                (
+                    format!("child{i}"),
+                    format!("Error: could not create staging dir /tmp/rivet-stage-{suffix}: Permission denied (os error 13)"),
+                )
+            })
+            .collect();
+        let banner = representative_error(&failed, false, 3)
+            .expect("random suffixes must still collapse to ONE common-mode class");
+        assert!(banner.contains("40 children failed"), "{banner}");
+    }
+
+    #[test]
+    fn representative_picks_the_dominant_class_when_mixed() {
+        let mut failed: Vec<(String, String)> = (0..8)
+            .map(|i| (format!("a{i}"), format!("Error: token for host-{i}")))
+            .collect();
+        failed.push(("b".into(), "Error: disk full".into()));
+        let banner = representative_error(&failed, false, 3).unwrap();
+        assert!(
+            banner.contains("8 children failed"),
+            "dominant class: {banner}"
+        );
+        assert!(
+            banner.contains("more child failure(s)"),
+            "names the tail: {banner}"
+        );
     }
 }

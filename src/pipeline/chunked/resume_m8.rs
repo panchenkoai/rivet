@@ -256,11 +256,15 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
         summary.files_produced += rehydrated;
         summary.total_rows += rehydrated_rows;
         summary.bytes_written += rehydrated_bytes;
-        // These parts carry NO per-column checksum (file_log stores none), so the
-        // run-wide Form B XOR this run harvests cannot cover them. Mark it
-        // incomplete so harvest_column_checksums suppresses Form B rather than
-        // record a partial XOR that `validate` would flag as a false mismatch.
-        summary.column_checksums_incomplete = true;
+        // ADR-0029: these parts carry NO per-column checksum (file_log stores
+        // none), so the run-wide Form B this run harvests cannot cover them —
+        // and nothing here has to SAY so any more. They enter `manifest_parts`
+        // without going through `commit::record_part`, so the seam's coverage
+        // computation finds no commit unit for them and suppresses Form B by
+        // itself. The manual flag that used to live here was the vigilance
+        // ADR-0029 replaced; setting it now would only pre-empt a verdict the
+        // harvest reaches from the data (and would hide whether the shortfall
+        // was hydration or a runner's unit-id mismatch).
         log::info!(
             "resume: reconstructed {rehydrated} committed part(s) ({rehydrated_rows} rows, \
              {rehydrated_bytes} bytes) into the manifest from the state DB file_log (no \
@@ -366,6 +370,15 @@ pub(crate) fn apply_m8_resume_decisions(
             run_id,
             plan.export_name
         );
+        // A --split unit's canonical manifest.json is last-writer-wins → usually a SIBLING
+        // unit's (foreign run_id), so this branch is the norm for split resume, not a rare
+        // restore/collision. We still must NOT reset chunk_tasks off a foreign manifest — but
+        // we MUST rehydrate THIS run's OWN committed parts from file_log (run_id-scoped, so
+        // the foreign manifest is irrelevant to it), exactly as the no-manifest branch does.
+        // Without this, a resuming unit's pre-crash completed-chunk parts sit on disk but are
+        // dropped from the finalize manifest — silent, manifest-authoritative row loss that
+        // `rivet load` inherits (RED-proven: 225000/300000 declared after a crash+resume).
+        rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
         return Ok(M8Stats::default());
     }
 
@@ -445,12 +458,12 @@ pub(crate) fn apply_m8_resume_decisions(
                 // and the manifest-authoritative `rivet load` lost its rows.
                 if let Some(p) = manifest_part_by_path.get(path.as_str()) {
                     summary.manifest_parts.push((*p).clone());
-                    // A skipped part's per-column checksum contribution is gone
-                    // (the prior manifest kept only the run-wide XOR, not per-part),
-                    // so this run's harvested XOR would cover only the re-exported
-                    // parts. Mark Form B incomplete → suppressed at harvest, never a
-                    // partial XOR that `validate --depth full` false-flags.
-                    summary.column_checksums_incomplete = true;
+                    // ADR-0029: a skipped part's per-column checksum contribution
+                    // is gone (the prior manifest kept only the run-wide sum, not
+                    // per-part) — and, like the file_log rehydration above, this
+                    // clone never goes through `commit::record_part`, so the seam
+                    // sees a manifest part with no commit unit and suppresses Form
+                    // B itself. No flag to remember here any more.
                 }
             }
             // Rewrite / Quarantine RE-EXPORT the owning chunk, so they DO need
@@ -515,9 +528,24 @@ pub(crate) fn apply_m8_resume_decisions(
         .map(|f| f.file_name)
         .collect();
     let mut untracked_surplus = 0usize;
+    // #167: a `--split` unit SHARES its destination prefix with its N-1 siblings.
+    // A sibling's parts are untracked FROM THIS UNIT'S manifest and absent from
+    // THIS UNIT'S file_log, so the surplus scan would quarantine-MOVE them out of
+    // the prefix — silently dropping the sibling's committed rows (measured:
+    // 225k/300k, unit #0's resume moved unit #1's completed chunk to `_quarantine/`).
+    // A split unit owns only the objects named with ITS OWN part prefix
+    // (`<export_name>_…`); everything else under the prefix belongs to a sibling
+    // (or the pool) and is never this unit's surplus to move.
+    let own_part_prefix = plan.is_split_unit.then(|| format!("{}_", plan.export_name));
     for key in resume_plan.untracked.keys() {
         if committed_parts.contains(key.as_str()) {
             continue; // durably committed per file_log — not surplus, do not move
+        }
+        if let Some(prefix) = &own_part_prefix {
+            let base = key.rsplit('/').next().unwrap_or(key);
+            if !base.starts_with(prefix) {
+                continue; // a sibling split unit's part (shared prefix) — not ours
+            }
         }
         untracked_surplus += 1;
         quarantine_move(&*dest, key, run_id, &plan.export_name, &mut stats);
@@ -619,6 +647,7 @@ mod tests {
         let row_count = parts.iter().map(|p| p.rows).sum();
         let part_count = parts.len() as u32;
         RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
@@ -666,9 +695,12 @@ mod tests {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
+            split_window: None,
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
             compression: crate::config::CompressionType::None,
@@ -741,6 +773,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         state
@@ -752,11 +785,15 @@ mod tests {
                 bytes: 2048,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         let mut summary =
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
         let rows_before = summary.total_rows;
+        let committed_before = summary.files_committed;
+        let produced_before = summary.files_produced;
+        let bytes_before = summary.bytes_written;
 
         let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
 
@@ -788,12 +825,67 @@ mod tests {
             50,
             "row aggregate bumped by the union"
         );
-        // Finding #10: rehydrated parts carry no per-column checksum, so Form B
-        // must be flagged incomplete — harvest_column_checksums then suppresses it
-        // rather than record a partial XOR that `validate` would false-flag.
+        // Both FILE counters, in delta form, because the manifest this resume hands
+        // downstream is graded on them: `files_committed` feeds the reconcile gate
+        // and the run card, `files_produced` the coherence invariant. Asserting the
+        // parts alone left `files_produced += rehydrated` unguarded — a surviving
+        // `*=` mutant, and over a 0 base with 2 siblings that is a REAL divergence
+        // (0*2=0 vs 0+2=2): a manifest whose declared parts and whose own
+        // aggregates disagree. Delta form so a non-zero base cannot hide it.
+        assert_eq!(
+            summary.files_committed - committed_before,
+            2,
+            "both reconstructed siblings count as committed files"
+        );
+        // BYTES, the third aggregate this function folds and the one the first
+        // pass at these assertions MISSED — I read the surviving mutant's
+        // column as `files_produced` without opening the line, closed a real
+        // but different gap, and `+= -> *=` on THIS statement survived a second
+        // 73-minute run. 4096 + 2048 over a zero base, so the mutant computes 0
+        // and cannot hide behind the fold.
+        assert_eq!(
+            summary.bytes_written - bytes_before,
+            6144,
+            "byte aggregate is the SUM of both siblings' real sizes — a manifest \
+             whose declared parts and whose byte total disagree misreports every \
+             throughput number downstream"
+        );
+        assert_eq!(
+            summary.files_produced - produced_before,
+            2,
+            "…and as produced files — the two counters move together, or the \
+             manifest disagrees with its own aggregates"
+        );
+        // Finding #10 / ADR-0029: rehydrated parts carry no per-column checksum,
+        // so the run-wide Form B cannot cover the manifest. Pre-ADR-0029 this
+        // function SET `column_checksums_incomplete` and the assertion here read
+        // that flag back — a test of the flag, not of the outcome. Now the verdict
+        // is COMPUTED at the harvest from these parts having no commit unit, so
+        // assert the OUTCOME through the real seam: even with a full run-wide
+        // checksum accumulator in hand, Form B must come out suppressed.
+        //
+        // RED against restoring a coverage rule that trusts the feed (Form B is
+        // then recorded over a manifest whose two rehydrated parts it does not
+        // cover — the partial record `validate --depth full` false-flags).
+        let mut integrity = crate::pipeline::commit::Integrity::default();
+        integrity
+            .column_checksums
+            .insert("id".to_string(), 0xdead_beef_u64);
+        crate::pipeline::commit::harvest_column_checksums(&mut summary, integrity);
+        assert!(
+            summary.column_checksums.is_empty(),
+            "rehydrated pre-crash parts have no commit unit, so the harvest must SUPPRESS \
+             Form B rather than publish a record covering only the re-exported parts"
+        );
         assert!(
             summary.column_checksums_incomplete,
-            "rehydrating pre-crash parts must mark Form B incomplete (suppressed at harvest)"
+            "and the suppression must be RECORDED, so the Form-B telltale in \
+             check_post_run_invariants can tell it from a runner that harvested nothing"
+        );
+        assert!(
+            !summary.column_checksums_short_cover,
+            "a hydration is not a runner defect — short_cover must stay clear or every \
+             crash-recovery resume fails the ADR-0029 invariant"
         );
     }
 
@@ -807,7 +899,9 @@ mod tests {
     // manifest lists 80 rows.
     #[test]
     fn parallel_resume_accumulates_rows_onto_rehydrated_base_not_clobbers() {
-        use crate::pipeline::commit::{PartKind, PartRecord, accumulate_run_rows, record_part};
+        use crate::pipeline::commit::{
+            PartKind, PartRecord, UnitId, accumulate_run_rows, record_part,
+        };
 
         let state_dir = tempfile::tempdir().unwrap();
         let state =
@@ -825,6 +919,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         state
@@ -836,6 +931,7 @@ mod tests {
                 bytes: 2048,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         let mut summary =
@@ -863,6 +959,7 @@ mod tests {
                 md5: String::new(),
             },
             PartKind::Chunk { chunk_index: 2 },
+            UnitId::Chunk(2),
         );
 
         let parts_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
@@ -940,6 +1037,7 @@ mod tests {
                     bytes: 4096,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -999,6 +1097,7 @@ mod tests {
                     bytes: 4096,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -1068,6 +1167,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         // …and its part IS on record, which is exactly the trap: written, logged,
@@ -1081,6 +1181,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
 
@@ -1343,6 +1444,7 @@ mod tests {
                     bytes: if idx == 0 { 5 } else { 7 },
                     format: "parquet",
                     compression: Some("zstd"),
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -1407,6 +1509,7 @@ mod tests {
                 bytes: 5,
                 format: "parquet",
                 compression: Some("zstd"),
+                cursor_high: None,
             })
             .unwrap();
         state
@@ -1418,6 +1521,7 @@ mod tests {
                 bytes: 7,
                 format: "parquet",
                 compression: Some("zstd"),
+                cursor_high: None,
             })
             .unwrap();
 

@@ -16,14 +16,22 @@ Parquet schema's per-column `repetition` (`OPTIONAL` for nullable,
 `REQUIRED` for `NOT NULL`).
 
 The current implementation hardcodes `nullable: true` at every
-`SourceColumn` construction site:
+SQL-engine `SourceColumn` construction site:
 
 ```
-src/source/postgres/arrow_convert.rs:217   SourceColumn::simple(name, native, true)
-src/source/postgres/mod.rs:636             SourceColumn::simple(name, native, true)
-src/source/mysql/arrow_convert.rs:244     SourceColumn::simple(name, native, true)
-src/source/mysql/mod.rs:617                SourceColumn::simple(..,           true)
+src/source/postgres/arrow_convert.rs:269   SourceColumn::simple(name, native, true)
+src/source/postgres/mod.rs:789             SourceColumn::simple(name, native, true)
+src/source/mysql/arrow_convert.rs:271      SourceColumn::simple(name, native, true)
+src/source/mysql/mod.rs:774                SourceColumn::simple(..,           true)
+src/source/mssql/arrow_convert.rs:133      SourceColumn::simple(name, native, true)
+src/source/mssql/arrow_convert.rs:186      SourceColumn::simple(name, native, true)
 ```
+
+[Update: the list originally named four sites across PG/MySQL; MSSQL
+added two more, and MongoDB (`src/source/mongo/mod.rs:379`) passes
+`nullable=false` for `_id` (and `true` for `document`), so not every
+construction site hardcodes `true` — the deferral covers the SQL
+engines.]
 
 The first round of the type-roundtrip work (v0.7.8) accepted this as a
 conservative default. The Gap #5 invariant audit ("nullable values must
@@ -110,8 +118,9 @@ column with values `from_catalog: NOT NULL`, `from_catalog: NULL`, or
 ## Decision
 
 **Nullability propagation is explicitly deferred to v0.8 Phase A.**
-The current `nullable=true` hardcode at the four `SourceColumn::simple`
-call sites is acknowledged as a known limitation, not a design choice.
+The current `nullable=true` hardcode at the SQL-engine
+`SourceColumn::simple` call sites (six today — see Context) is
+acknowledged as a known limitation, not a design choice.
 
 The deferral is paper-trailed at the `SourceColumn::nullable` field
 documentation (`src/types/source_column.rs`) so the next contributor
@@ -155,8 +164,9 @@ ships:
   source happens to contain.
 - Source-engine introspection layer stays simple — no per-query
   `RowDescription` walk or query parsing.
-- The four `SourceColumn::simple(…, true)` call sites are uniform
-  across engines, easy to audit.
+- The SQL-engine `SourceColumn::simple(…, true)` call sites are
+  uniform, easy to audit. [Update: MongoDB's `_id` site passes `false`,
+  so uniformity now holds across the SQL engines, not all engines.]
 
 **Negative (during deferral):**
 
@@ -182,11 +192,13 @@ ships:
 
 - `src/types/source_column.rs::SourceColumn::nullable` — field with
   the limitation doc and a back-pointer to this ADR.
-- `src/source/postgres/arrow_convert.rs:217`,
-  `src/source/postgres/mod.rs:636`,
-  `src/source/mysql/arrow_convert.rs:244`,
-  `src/source/mysql/mod.rs:617` — the four `nullable=true` hardcode
-  sites.
+- `src/source/postgres/arrow_convert.rs:269`,
+  `src/source/postgres/mod.rs:789`,
+  `src/source/mysql/arrow_convert.rs:271`,
+  `src/source/mysql/mod.rs:774`,
+  `src/source/mssql/arrow_convert.rs:133` and `:186` — the six
+  SQL-engine `nullable=true` hardcode sites (`src/source/mongo/mod.rs:379`
+  passes `false` for `_id`).
 - ADR-0014 — target type materialization, including the Phase A
   type-report this work joins.
 - The session that surfaced this gap during its invariant audit:

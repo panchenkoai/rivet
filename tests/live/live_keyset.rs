@@ -116,22 +116,197 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
 
     // (2) validate (default depth Full → runs the Form B re-read) re-reads the
     // parts; the recorded checksums must MATCH.
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "rivet validate must PASS — the recorded Form B checksums must match the re-read parts; \
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&v.stdout),
         String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+/// The NEGATIVE control Form B never had on the batch path.
+///
+/// Every batch Form B test until now proved the POSITIVE direction: the manifest
+/// records checksums and a clean `validate` passes. That leaves the question the
+/// mechanism exists to answer unasked — would a corrupted part be DETECTED? CDC
+/// has its negative control (`live_cdc_mbt.rs` tampers the recorded sum); batch
+/// had none, on any runner (audit 2026-08-17).
+///
+/// The tamper is on the DATA, not on the manifest, and deliberately so. Editing
+/// the recorded checksum proves `validate` compares two numbers; corrupting the
+/// PART proves it detects the thing an operator actually fears. It is also the
+/// harder case to pass: the rewritten file must stay a VALID parquet with the
+/// SAME row count, or `validate` fails for a second reason and the test would be
+/// measuring the corruption's clumsiness rather than Form B — the exact
+/// "fails-for-another-reason" shape this session found in three other places.
+/// Both of those are asserted before the verdict is read.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_corrupted_part_fails_validate_on_the_value_checksum() {
+    use arrow::array::{Int64Array, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(500);
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 200")
+        .dest_path(out.path().to_path_buf());
+    let r = rig.run_args(&[]);
+    assert!(
+        r.status.success(),
+        "the export must succeed before anything is corrupted; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // The mechanism must be ARMED: no recorded checksums, nothing to detect
+    // with, and the tamper below would prove nothing.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "Form B must be recorded or this test grades nothing: {}",
+        manifest["column_checksums"]
+    );
+    let clean = rig.cli(&["validate", "--export", table.name()]);
+    assert!(
+        clean.status.success(),
+        "validate must PASS before the tamper, or the failure after it means nothing"
+    );
+
+    // Rewrite one part with a single `amount`… no: `id` is the keyed column, so
+    // change a NON-key value column. One cell, same schema, same row count.
+    let part = files_with_extension(out.path(), "parquet")
+        .into_iter()
+        .next()
+        .expect("at least one part");
+    let before = std::fs::read(&part).unwrap();
+    let batches: Vec<RecordBatch> = {
+        let f = std::fs::File::open(&part).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+    };
+    let rows_before: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let schema = batches[0].schema();
+    let idx = schema
+        .index_of("id")
+        .expect("the fixture's keyed column is `id`");
+    let tampered: Vec<RecordBatch> = batches
+        .iter()
+        .enumerate()
+        .map(|(bi, b)| {
+            if bi != 0 {
+                return b.clone();
+            }
+            let col = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            // +1 on ONE cell: the row count, the schema and every other column
+            // are untouched, so only a VALUE oracle can see it.
+            let mut v: Vec<i64> = col.iter().map(|x| x.unwrap_or(0)).collect();
+            v[0] += 1;
+            let mut cols = b.columns().to_vec();
+            cols[idx] = std::sync::Arc::new(Int64Array::from(v));
+            RecordBatch::try_new(b.schema(), cols).unwrap()
+        })
+        .collect();
+    {
+        let f = std::fs::File::create(&part).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        for b in &tampered {
+            w.write(b).unwrap();
+        }
+        w.close().unwrap();
+    }
+
+    // Re-encoding changes the FILE SIZE, and validate checks size first: the
+    // first run of this test failed on
+    // `[RIVET_VERIFY_PART_SIZE_MISMATCH] manifest 4371, dest 9813` and never
+    // reached the value leg — the "fails for another reason" trap, on my own
+    // test. Patching the recorded size is not cheating, it is the POINT: Form B
+    // exists for corruption the size and count checks cannot see, so isolating
+    // it means neutralising the gates that would fire first. (Locally only size
+    // applies — validate reports "0 md5, 1 size-only" for a local destination.)
+    let part_name = part.file_name().unwrap().to_string_lossy().into_owned();
+    let new_size = std::fs::metadata(&part).unwrap().len();
+    let mpath = out.path().join("manifest.json");
+    let mut m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    let mut patched = false;
+    for p in m["parts"].as_array_mut().expect("parts array") {
+        if p["path"].as_str().is_some_and(|x| x.ends_with(&part_name)) {
+            p["size_bytes"] = serde_json::json!(new_size);
+            patched = true;
+        }
+    }
+    assert!(patched, "the tampered part must be named in the manifest");
+    let manifest_bytes = serde_json::to_string_pretty(&m).unwrap().into_bytes();
+    std::fs::write(&mpath, &manifest_bytes).unwrap();
+    // `_SUCCESS` carries a fingerprint OF THE MANIFEST BYTES, so editing the
+    // manifest staled it and validate stopped there instead
+    // (`[RIVET_VERIFY_SUCCESS_STALE]`). Re-stamped with the product's own
+    // helper. That is three gates now standing between crude corruption and the
+    // value leg — size, marker freshness, and (on a store that surfaces one)
+    // md5. Each had to be satisfied to ask the question Form B answers, which is
+    // worth knowing on its own: the value checksum is the LAST line, not the
+    // first, and everything ahead of it works.
+    std::fs::write(
+        out.path().join("_SUCCESS"),
+        rivet::manifest::success_marker_body(&manifest_bytes),
+    )
+    .unwrap();
+
+    // NON-INERTNESS, both halves: the file changed, and it is still a readable
+    // parquet with the same row count. Without these two, a `validate` failure
+    // below could be a parse error or a count mismatch wearing Form B's clothes.
+    assert_ne!(
+        before,
+        std::fs::read(&part).unwrap(),
+        "the tamper must actually change the file"
+    );
+    let rows_after: usize = {
+        let f = std::fs::File::open(&part).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum()
+    };
+    assert_eq!(
+        rows_before, rows_after,
+        "the corrupted part must still hold the SAME number of rows — otherwise \
+         validate can fail on the count and Form B is never exercised"
+    );
+
+    let bad = rig.cli(&["validate", "--export", table.name()]);
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(
+        !bad.status.success(),
+        "a part whose VALUES were altered must fail validate — this is the whole \
+         point of recording per-column checksums; got:\n{err}"
+    );
+    assert!(
+        err.to_lowercase().contains("checksum") || err.contains("VALUE_CHECKSUM"),
+        "and it must fail on the VALUE leg, not incidentally: {err}"
     );
 }
 
@@ -318,16 +493,7 @@ fn chunked_export_records_form_b_checksums_and_validate_passes() {
         manifest["column_checksums"]
     );
 
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "rivet validate must PASS on the chunked export — recorded Form B must match the re-read; \
@@ -381,16 +547,7 @@ fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
         manifest["column_checksums"]
     );
 
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "rivet validate must PASS on the checkpoint chunked export — recorded Form B must match; \
@@ -689,17 +846,10 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
 
     // Run 1: HARD-EXIT (process dies) right after range 0's atomic checkpoint commit
     // — range 0 is durably `done`, ranges 1-3 wrote parts to disk but never committed.
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")],
+    );
     assert!(
         !crash.status.success(),
         "the injected hard-exit must make run 1 fail"
@@ -874,17 +1024,10 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
     let cfg = rig.config_path();
 
     // Crash after page 0 commits (300 rows durable, cursor advanced, no manifest).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_keyset_page:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_keyset_page:0")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Resume (keyset checkpoint auto-resumes from the cursor).
@@ -905,6 +1048,160 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
         Some(1000),
         "destination manifest must declare every row (pre-crash page not orphaned); got {}",
         m["row_count"]
+    );
+}
+
+/// Convergence round-1 finding #3 (MEASURED): a sequential-keyset `chunk_checkpoint`
+/// resume DUPLICATES a page when the crash lands in the `after_manifest_update` window —
+/// the file_log row is written but the cursor is NOT yet advanced (commit.rs:352). On resume
+/// the pre-crash page's part is rehydrated from file_log (a keyset name has no chunk-nonce, so
+/// the superseded-attempt filter is skipped and it is kept), AND the loop re-reads from the
+/// un-advanced cursor and writes the SAME rows under a NEW per-invocation stamp — so the
+/// manifest declares that page TWICE. The existing crash test above uses `after_keyset_page:0`
+/// (AFTER the advance), so it never exercised this window. This crashes at
+/// `after_manifest_update` and asserts the destination manifest declares EXACTLY the source
+/// row count — it currently declares MORE (the measured duplication). RED against the bug.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_crash_in_manifest_window_must_not_duplicate_a_page() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_dup");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_dup_exp");
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
+
+    // Crash in the I3 window: page 0's file_log row is written, cursor NOT advanced.
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_manifest_update")],
+    );
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Resume (NO panic env) — the cursor was never advanced, so it re-reads page 0.
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    let declared = m["row_count"].as_i64().unwrap_or(-1);
+    assert_eq!(
+        declared,
+        1000,
+        "the destination manifest must declare EXACTLY the 1000 source rows — it declared \
+         {declared} ({} duplicated), the after_manifest_update rehydrate+re-read dup",
+        declared - 1000
+    );
+}
+
+/// v25 cursor-atomic checkpoint under a CHANGED config on resume. The convergence-round-3
+/// review posited a multi-part-ROTATION dup (a keyset page re-read into a DIFFERENT number of
+/// parts). HONEST SCOPE: that is not readily reachable for keyset — `max_file_size` rotates on
+/// FLUSHED parquet bytes, and a sub-row-group page (chunk_size ≪ ~1M) never flushes, so it stays
+/// a SINGLE part (documented in audit_maxfile as a no-op). So this test exercises the reachable
+/// proxy: a resume whose config CHANGED between the crash and the resume (`max_file_size` 8KB →
+/// 128KB), which the seek_tag+dedup band-aid alone could mis-handle if the part shape ever did
+/// change. The v25 reconcile makes it moot — resume reconciles `last` from the committed part's
+/// cursor_high and NEVER re-reads the committed page, whatever the config. Manifest must declare
+/// EXACTLY the source rows.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_resume_survives_a_changed_max_file_size_config() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_mp");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    // HIGH-ENTROPY payload (concatenated SHA2 digests) so a 300-row page does NOT compress away —
+    // it must exceed a small max_file_size and genuinely rotate into MULTIPLE parts. A repetitive
+    // payload compresses to a single part and would test nothing (fixture below the rotation
+    // threshold). The value is generated ONCE at INSERT and stored, so re-reads are identical.
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload VARCHAR(600) NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), \
+                CONCAT(SHA2(n, 512), SHA2(CONCAT(n,'a'), 512), \
+                       SHA2(CONCAT(n,'b'), 512), SHA2(CONCAT(n,'c'), 512)) \
+         FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_mp_exp");
+    let mut rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300")
+        .export_line("max_file_size: 8KB"); // forces each 300-row page to rotate into several parts
+    let cfg = rig.config_path();
+
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_manifest_update")],
+    );
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // RESUME with a DIFFERENT max_file_size so the re-read would rotate the same page into a
+    // DIFFERENT number of parts — the exact multi-part-ROTATION the seek_tag+dedup band-aid cannot
+    // dedup (the re-read's part paths no longer match the rehydrated ones). Only the v25
+    // cursor-atomic reconcile survives it, because it never re-reads the committed page at all.
+    // Through the rig's sanctioned mutation path — a raw fs::write patch would
+    // now be refused by config_path's hand-edit guard (and was only ever safe
+    // here because the resume ran through a raw helper, not the rig).
+    rig.replace_export_line("max_file_size:", "max_file_size: 128KB");
+
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    let declared = m["row_count"].as_i64().unwrap_or(-1);
+    assert_eq!(
+        declared,
+        1000,
+        "a crash-resume whose config changed (max_file_size 8KB → 128KB) must declare EXACTLY the \
+         1000 source rows — it declared {declared} ({} duplicated); the v25 reconcile skips the \
+         committed page regardless of the resume config",
+        declared - 1000
     );
 }
 
@@ -1123,17 +1420,10 @@ fn keyset_fresh_run_crash_before_first_page_does_not_skip_the_table() {
     assert_eq!(count1, 1000, "run 1 must export all 1000");
 
     // Run 2: a FRESH run that crashes right after open (no page committed).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_after_open_before_first_page")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_after_open_before_first_page")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Run 3: recovery. It MUST re-read all 1000 (total across run1+run3 = 2000).
@@ -1192,17 +1482,10 @@ fn keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run()
 
     // Run 1: commits ALL 1000, then fails AFTER data-completion (a stand-in for a
     // post-data gate rejection). Data-completion has already cleared resume_run_id.
-    let fail = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")
-        .output()
-        .expect("spawn rivet");
+    let fail = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")],
+    );
     assert!(
         !fail.status.success(),
         "the post-data failure must exit non-zero"
@@ -1267,17 +1550,10 @@ fn keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest(
 
     // Run 1: commits all 1000 pages under R1, then crashes AFTER data-complete but
     // BEFORE finalize_manifest — so NO destination manifest for R1 is written.
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Run 2 (incremental): must REHYDRATE R1's committed pages into a complete
@@ -1887,19 +2163,151 @@ fn array_columns_reach_the_value_checksum() {
 
     // And the two sides must agree on them: `validate` re-reads the parts and
     // recomputes side B against the recorded side A.
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "validate must re-verify the ARRAY columns' checksums; stderr:\n{}",
         String::from_utf8_lossy(&v.stderr)
     );
+}
+
+/// `rivet validate --depth full` — the command the reconcile report TELLS the
+/// operator to run, never once run by the suite.
+///
+/// Its only reference anywhere in the tree is inside an assertion STRING
+/// (`live_mysql_reconcile_repair.rs`: the report must point at "rivet validate
+/// --depth full"). That report says, correctly, that reconcile compares the
+/// source to a number rivet RECORDED and that this is the check which re-reads
+/// the files — so the remediation the product hands out led to a code path no
+/// test executed. A remediation hint has to work from the state it is offered in.
+///
+/// `Full` is `Sample` plus the Form B value-checksum re-read, which DOWNLOADS the
+/// parts. Both halves are asserted: it passes on a clean export, and it FAILS on
+/// a part whose bytes were altered while every lighter level still passes — the
+/// difference between the depths is the whole point of naming one in a hint.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn validate_depth_full_rereads_the_parts_the_lighter_depths_never_open() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(300);
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100");
+    rig.run_ok();
+
+    // Clean: every depth passes.
+    for depth in ["light", "sample", "full"] {
+        let out = rig.cli(&["validate", "--depth", depth]);
+        assert!(
+            out.status.success(),
+            "validate --depth {depth} must pass on a clean export; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Corrupt a part's BYTES without touching its size: a value-level fault, which
+    // is exactly what the lighter depths cannot see (they check the manifest, the
+    // `_SUCCESS` marker, part presence and size — none of which move).
+    let parts = files_with_extension(&rig.out_dir(), "parquet");
+    assert!(!parts.is_empty(), "the export must have written a part");
+    let victim = &parts[0];
+    let before = std::fs::metadata(victim).expect("stat part").len();
+    let mut bytes = std::fs::read(victim).expect("read part");
+    // Flip bits in the middle of the data region, away from the header/footer, so
+    // the file stays a readable parquet whose VALUES changed.
+    let mid = bytes.len() / 2;
+    for b in bytes.iter_mut().skip(mid).take(64) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(victim, &bytes).expect("write corrupted part");
+    assert_eq!(
+        std::fs::metadata(victim).expect("re-stat part").len(),
+        before,
+        "the corruption must not change the SIZE — otherwise the lighter depths catch it \
+         on size alone and this test proves nothing about depth"
+    );
+
+    // The DEPTH distinction, measured rather than assumed: whatever the lighter
+    // levels do on this exact corruption is recorded below, because "full fails"
+    // alone would be satisfied by a failure for any reason at all.
+    let light = rig.cli(&["validate", "--depth", "light"]);
+    let sample = rig.cli(&["validate", "--depth", "sample"]);
+    // Measured 2026-08-18: light=true sample=true, full=false. `sample` adds a
+    // prefix listing (presence, size, surplus) and a byte flip moves none of
+    // those, which is what makes `--depth full` genuinely load-bearing rather than
+    // a slower spelling of the same check. Its verdict is REPORTED, not asserted:
+    // pinning "sample passes" would forbid ever strengthening it, and this test's
+    // subject is the depth the report recommends, not the ceiling of the one below.
+    eprintln!(
+        "depth verdicts on a byte-corrupted part: light={} sample={}",
+        light.status.success(),
+        sample.status.success()
+    );
+    assert!(
+        light.status.success(),
+        "`light` reads the manifest, `_SUCCESS` and self-consistency — none of which a \
+         byte flip moves. If it fails, the fixture broke something else and the depth \
+         comparison below is meaningless; stderr:\n{}",
+        String::from_utf8_lossy(&light.stderr)
+    );
+
+    let full = rig.cli(&["validate", "--depth", "full"]);
+    assert!(
+        !full.status.success(),
+        "validate --depth full must FAIL on a part whose bytes changed — it is the depth \
+         that re-reads them, and it is what `rivet reconcile` tells the operator to run \
+         when its own verdict is only rivet's recorded count; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&full.stdout),
+        String::from_utf8_lossy(&full.stderr)
+    );
+}
+
+/// PART-NAME NON-DOUBLING (field-run finding). The keyset part-name format
+/// prepends the export name, and the run_id it used for run-uniqueness is
+/// itself `<export>_<stamp>` — so real runs wrote `<export>_<export>_<stamp>_
+/// pk_w…`, the export name TWICE (the chunked/mongo siblings key off a fresh
+/// stamp and never doubled). Through the rig: a PARALLEL keyset export (the
+/// pk_w path, keyset.rs:605) whose part basenames must carry the export name
+/// exactly ONCE. RED before run_scoped_tag stripped the redundant prefix.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_part_names_do_not_double_the_export_name() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(2000);
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 200")
+        .export_line("parallel: 4")
+        .dest_path(out.path().to_path_buf());
+    assert!(
+        rig.run_args(&[]).status.success(),
+        "keyset export must succeed before its part names can be checked"
+    );
+
+    let parts = files_with_extension(out.path(), "parquet");
+    assert!(!parts.is_empty(), "keyset run produced no parts to name");
+
+    let doubled = format!("{}_{}", table.name(), table.name());
+    for p in &parts {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        // The part is a parallel-keyset part (proves we exercised the pk_w path).
+        assert!(
+            name.contains("_pk_w"),
+            "expected parallel-keyset (pk_w) parts; got {name}"
+        );
+        assert!(
+            !name.contains(&doubled),
+            "part name doubles the export name — '{doubled}' appears in '{name}' \
+             (the run_id-carries-the-export bug; run_scoped_tag must strip it)"
+        );
+        // ...and the export name is still present exactly once (dir + name both
+        // carry it, so a reader can attribute a stray file to its export).
+        assert!(
+            name.starts_with(&format!("{}_", table.name())),
+            "part name must still lead with the export name once: {name}"
+        );
+    }
 }

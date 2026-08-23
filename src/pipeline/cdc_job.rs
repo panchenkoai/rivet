@@ -117,7 +117,8 @@ pub(super) fn run_cdc_export(
     // marker that self-destructs is worse than none: it retires the known issue
     // while leaving the hole open.
 
-    let result = run_cdc_inner(config, export, &run_id, state);
+    let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes);
     let duration_ms = started.elapsed().as_millis() as i64;
 
     // The manifests describe what was made DURABLE; `outcome` says whether the
@@ -133,6 +134,7 @@ pub(super) fn run_cdc_export(
     // changes the log no longer has. Any tool summing metric rows under-counted
     // by the same amount.
     let (manifests, outcome) = result;
+    let bytes_read = read_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let bytes: u64 = manifests
         .iter()
         .flat_map(|m| &m.parts)
@@ -145,6 +147,7 @@ pub(super) fn run_cdc_export(
         manifests.iter().map(|m| m.row_count).sum(),
         manifests.iter().map(|m| m.part_count as usize).sum(),
         bytes,
+        bytes_read,
         duration_ms,
         outcome.as_ref().err().map(crate::redact::redact_error),
     );
@@ -406,6 +409,7 @@ fn run_cdc_inner(
     export: &ExportConfig,
     run_id: &str,
     state: &StateStore,
+    read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = match config.source.resolve_url() {
         Ok(u) => u,
@@ -468,10 +472,7 @@ fn run_cdc_inner(
             table: t.clone(),
             dest: d.as_ref(),
             dest_uri: u.clone(),
-            overrides: crate::types::overrides_for_table(
-                &all_overrides,
-                t.rsplit('.').next().unwrap_or(t),
-            ),
+            overrides: crate::types::overrides_for_unit(&all_overrides, Some(t)),
             row_hash: export.meta_columns.row_hash.clone(),
         })
         .collect();
@@ -490,7 +491,8 @@ fn run_cdc_inner(
         let shape = match config.source.source_type {
             crate::config::SourceType::Mysql => "blocks on the binlog and stays up until stopped",
             crate::config::SourceType::Mongo => {
-                "tails the change stream while writes continue, and exits on an idle poll"
+                "blocks on the change stream awaiting events and stays up until stopped \
+                 (it ends only if the stream is invalidated or closed)"
             }
             _ => {
                 concat!(
@@ -511,48 +513,49 @@ fn run_cdc_inner(
         );
     }
 
-    run_capture(CdcCapture {
-        export_name: export.name.clone(),
-        cdc_cfg: CdcConfig {
-            url,
-            checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
-            drain: DrainMode::from_until_current(cdc.until_current),
-            tls: config.source.tls.clone(),
-            engine: match config.source.source_type {
-                crate::config::SourceType::Mysql => CdcEngineOpts::Mysql {
-                    server_id: cdc
-                        .server_id
-                        .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
-                },
-                crate::config::SourceType::Postgres => CdcEngineOpts::Postgres {
-                    slot: cdc
-                        .slot
-                        .clone()
-                        .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
-                },
-                crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
-                    capture_instance: cdc.capture_instance.clone(),
-                    // The same strings the sink will route by — see the field's doc.
-                    configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
-                },
-                crate::config::SourceType::Mongo => {
-                    CdcEngineOpts::Mongo {
+    run_capture(
+        CdcCapture {
+            export_name: export.name.clone(),
+            cdc_cfg: CdcConfig {
+                url,
+                checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
+                drain: DrainMode::from_until_current(cdc.until_current),
+                tls: config.source.tls.clone(),
+                engine: match config.source.source_type {
+                    crate::config::SourceType::Mysql => CdcEngineOpts::Mysql {
+                        server_id: cdc
+                            .server_id
+                            .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
+                    },
+                    crate::config::SourceType::Postgres => CdcEngineOpts::Postgres {
+                        slot: cdc
+                            .slot
+                            .clone()
+                            .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
+                    },
+                    crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
+                        capture_instance: cdc.capture_instance.clone(),
+                        // The same strings the sink will route by — see the field's doc.
+                        configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
+                    },
+                    crate::config::SourceType::Mongo => CdcEngineOpts::Mongo {
                         canonical: config.source.mongo.as_ref().is_some_and(|m| {
                             matches!(m.json, crate::config::MongoJsonMode::Canonical)
                         }),
-                    }
-                }
+                    },
+                },
             },
+            outputs,
+            format: export.format,
+            max_events: cdc.max_events,
+            rollover: cdc.rollover.unwrap_or(100_000),
+            rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
+            run_id: run_id.to_string(),
+            started_at: now,
+            state: Some(state),
         },
-        outputs,
-        format: export.format,
-        max_events: cdc.max_events,
-        rollover: cdc.rollover.unwrap_or(100_000),
-        rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
-        run_id: run_id.to_string(),
-        started_at: now,
-        state: Some(state),
-    })
+        read_bytes,
+    )
 }
 
 /// Build the per-run summary (mirrors `synthetic_failed_summary`'s shape, for a
@@ -565,6 +568,7 @@ fn cdc_summary(
     total_rows: i64,
     files: usize,
     bytes: u64,
+    bytes_read: u64,
     duration_ms: i64,
     error_message: Option<String>,
 ) -> RunSummary {
@@ -580,6 +584,7 @@ fn cdc_summary(
         total_rows,
         files_produced: files,
         bytes_written: bytes,
+        bytes_read,
         files_committed: files,
         duration_ms,
         error_message,
@@ -594,16 +599,16 @@ fn cdc_summary(
 
 /// Write the `export_metrics` row (built directly — no plan coupling, unlike the
 /// batch `build_metric_row`) so a CDC run is queryable like a batch run.
-fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, summary: &RunSummary) {
-    let source_type = config
-        .source
-        .resolve_url()
-        .ok()
-        .and_then(|u| CdcEngine::from_url(&u).ok().map(CdcEngine::label))
-        .map(|s| s.to_string());
+/// The CDC `export_metrics` row, extracted PURE so its field mapping (notably
+/// bytes_read — #196) is unit-tested without a live state store / Config.
+fn cdc_metric_row(
+    summary: &RunSummary,
+    source_type: Option<String>,
+    destination_type: Option<String>,
+) -> crate::state::MetricRow {
     // Only the fields a CDC run actually has; the batch-specific rest (chunk_size,
     // cursor, quality, …) stay at their MetricRow::default() (None / 0).
-    let row = crate::state::MetricRow {
+    crate::state::MetricRow {
         export_name: summary.export_name.clone(),
         run_id: summary.run_id.clone(),
         duration_ms: summary.duration_ms,
@@ -616,13 +621,25 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
         mode: Some("cdc".to_string()),
         files_produced: summary.files_produced as i64,
         bytes_written: summary.bytes_written as i64,
+        bytes_read: summary.bytes_read as i64,
         files_committed: summary.files_committed as i64,
         source_type,
-        destination_type: Some(export.destination.destination_type.label().to_string()),
+        destination_type,
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         longest_chunk_ms: summary.journal.longest_chunk_ms(),
         ..Default::default()
-    };
+    }
+}
+
+fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, summary: &RunSummary) {
+    let source_type = config
+        .source
+        .resolve_url()
+        .ok()
+        .and_then(|u| CdcEngine::from_url(&u).ok().map(CdcEngine::label))
+        .map(|s| s.to_string());
+    let dest_type = Some(export.destination.destination_type.label().to_string());
+    let row = cdc_metric_row(summary, source_type, dest_type);
     if let Err(e) = state.record_metric_full(&row) {
         log::warn!(
             "cdc: failed to record metric for export '{}': {:#}",
@@ -640,6 +657,43 @@ mod tests {
     // A CDC export that requests batch-only meta_columns must WARN (the CDC sink
     // never injects them), not silently drop the request. Pure fn so this needs
     // no live stream.
+    /// #196: cdc_summary must carry bytes_read into the RunSummary (the CDC read
+    /// leg). RED against deleting the field (defaults to 0).
+    #[test]
+    fn cdc_summary_carries_bytes_read() {
+        let export = crate::config::sample_export("t");
+        let s = super::cdc_summary("r1", &export, "success", 100, 2, 5_000, 12_345, 50, None);
+        assert_eq!(s.bytes_read, 12_345, "read leg must reach the summary");
+        assert_eq!(s.bytes_written, 5_000);
+    }
+
+    /// #196: the CDC metrics row must carry bytes_read from the summary. RED
+    /// against deleting the field in cdc_metric_row (defaults to 0).
+    #[test]
+    fn cdc_metric_row_carries_bytes_read() {
+        let export = crate::config::sample_export("t");
+        let summary = super::cdc_summary("r1", &export, "success", 100, 2, 5_000, 98_765, 50, None);
+        let row = super::cdc_metric_row(&summary, Some("mysql".into()), Some("local".into()));
+        assert_eq!(
+            row.bytes_read, 98_765,
+            "read leg must reach the export_metrics row"
+        );
+        assert_eq!(row.bytes_written, 5_000);
+        // The engine labels are threaded straight through — pin them so the
+        // metric row is attributable (source/dest engine per CDC run), not just
+        // the byte counts. RED against deleting either field in cdc_metric_row.
+        assert_eq!(
+            row.source_type.as_deref(),
+            Some("mysql"),
+            "source engine must reach the export_metrics row"
+        );
+        assert_eq!(
+            row.destination_type.as_deref(),
+            Some("local"),
+            "destination engine must reach the export_metrics row"
+        );
+    }
+
     #[test]
     fn cdc_warns_when_meta_columns_are_requested_on_a_cdc_export() {
         let mut e = crate::config::sample_export("orders");

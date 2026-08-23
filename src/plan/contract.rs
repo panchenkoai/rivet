@@ -67,6 +67,19 @@ pub struct KeysetPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedRunPlan {
     pub export_name: String,
+    /// Run-wide counter of decoded bytes READ from the source (in-memory Arrow
+    /// batch size, summed by every `ExportSink::on_batch` this run creates).
+    ///
+    /// Lives on the PLAN — the one value every runner, worker thread, and
+    /// per-chunk sink already receives — so accumulation is runner-agnostic BY
+    /// CONSTRUCTION (`Clone` shares the `Arc`, so a worker's plan clone feeds the
+    /// same counter): no per-runner harvest to forget, the exact runner-bypass
+    /// trap a per-sink field had (#175). Harvested ONCE into
+    /// `summary.bytes_read` by `run_export_job` after the runner returns.
+    /// `serde(skip)`: a runtime counter, not part of the serialized plan; a
+    /// deserialized plan starts a fresh one.
+    #[serde(skip, default)]
+    pub bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The export's declared source table (`table:`), carried VERBATIM.
     ///
     /// The manifest's source identity is built from this. It used to be derived
@@ -82,6 +95,25 @@ pub struct ResolvedRunPlan {
     pub source_table: Option<String>,
     /// Final query string (params substituted, query_file loaded).
     pub base_query: String,
+    /// This plan is one range sub-export UNIT of a `--pool --split` (#167). Such
+    /// a unit shares its destination prefix with its N-1 siblings, so it must NOT
+    /// write the prefix-level `_SUCCESS` itself (that would falsely mark the whole
+    /// giant done the moment ONE unit finishes) and must NOT be blocked by the M8
+    /// resume guard on a sibling's `_SUCCESS`. The pool writes `_SUCCESS` once,
+    /// after ALL units complete. `#[serde(default)]` so old plan artifacts (no
+    /// field) deserialize as non-split.
+    #[serde(default)]
+    pub is_split_unit: bool,
+    /// For a `--pool --split` unit: the `(lo, hi]` key window it covers, threaded from the
+    /// export's `SplitSynth` so `finalize` records it in the manifest — the durable anchor
+    /// that lets `--split --resume` reconstruct the EXACT partition instead of re-sampling.
+    /// `#[serde(default)]` so old plan artifacts deserialize as `None`; `skip_serializing_if`
+    /// so a NON-split plan serializes BYTE-IDENTICALLY to before this field existed — the
+    /// plan.json integrity hash is unchanged, avoiding the cross-version plan-artifact break
+    /// the `finalize_manifest` docstring warns of (a split-unit plan is internal/ephemeral,
+    /// synthesized by the pool, never a released artifact).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_window: Option<crate::manifest::SplitWindow>,
     pub strategy: ExtractionStrategy,
     pub format: FormatType,
     pub compression: CompressionType,
@@ -332,11 +364,18 @@ pub fn build_time_window_query(
 
     let condition = match time_type {
         TimeColumnType::Timestamp => {
-            format!(
-                "{} >= '{}'",
-                quoted_col,
-                truncated.format("%Y-%m-%d %H:%M:%S")
-            )
+            // SQL Server parses a space-separated `'YYYY-MM-DD hh:mm:ss'` literal
+            // per the login's DATEFORMAT (which follows LANGUAGE) — on a non-
+            // us_english login '2026-03-03 …' can be read as 3 May, silently
+            // shifting the window or erroring when the swapped month exceeds 12.
+            // ISO-8601 with a 'T' is DATEFORMAT/LANGUAGE-immune on MSSQL (mirrors
+            // partition.rs's date-literal rule); PG/MySQL keep the space form,
+            // which they parse ISO-unambiguously (bug hunt 2026-08-09).
+            let lit = match source_type {
+                crate::config::SourceType::Mssql => truncated.format("%Y-%m-%dT%H:%M:%S"),
+                _ => truncated.format("%Y-%m-%d %H:%M:%S"),
+            };
+            format!("{quoted_col} >= '{lit}'")
         }
         TimeColumnType::Unix => {
             format!("{} >= {}", quoted_col, truncated.and_utc().timestamp())
@@ -492,6 +531,28 @@ mod tests {
         );
         assert!(q.contains("\"created_at\" >= '"), "got: {}", q);
         assert!(q.contains("_rivet WHERE"));
+    }
+
+    #[test]
+    fn build_time_window_query_timestamp_mssql_is_dateformat_immune() {
+        // MSSQL must get an ISO-8601 'T' literal — a space-separated literal is
+        // parsed per the login's DATEFORMAT/LANGUAGE and shifts the window on a
+        // non-us_english login (bug hunt 2026-08-09). RED against the space form.
+        let q = build_time_window_query(
+            "SELECT * FROM events",
+            "created_at",
+            TimeColumnType::Timestamp,
+            7,
+            SourceType::Mssql,
+        );
+        assert!(
+            q.contains("] >= '") && q.contains("T00:00:00'"),
+            "MSSQL literal must be ISO-8601 with a 'T' separator: {q}"
+        );
+        assert!(
+            !q.contains(" 00:00:00'"),
+            "MSSQL literal must NOT use the DATEFORMAT-dependent space form: {q}"
+        );
     }
 
     #[test]

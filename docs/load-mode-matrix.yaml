@@ -91,6 +91,12 @@ scenarios:
     incremental: { na: "incremental resumes from its cursor in the state DB, not a snapshot marker" }
     cdc:         { test: snapshot_plan_all_done_snapshots_nothing_but_keeps_resume_evidence }
 
+  - id: multiplex_tables_one_plan_per_table
+    what: "a multiplex `tables:` export (N source tables through ONE stream) builds one LoadPlan per TABLE — own warehouse table, own `<prefix>/<table>/` sub-prefix — not one per export"
+    full:        { na: "`tables:` is refused at config-load outside `mode: cdc` — a batch export is always one unit" }
+    incremental: { na: "`tables:` is refused at config-load outside `mode: cdc` — an incremental export is always one unit" }
+    cdc:         { test: build_plans_fans_a_multiplex_tables_export_out_to_one_plan_per_table }
+
   - id: cleanup_source_safe_end_to_end
     what: "cleanup_source: true wipes the staged Parquet after a recorded load without losing data — proven live end to end"
     full:        { test: smoke_batch_mysql }

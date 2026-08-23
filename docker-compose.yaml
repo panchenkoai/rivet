@@ -298,6 +298,44 @@ services:
       timeout: 5s
       retries: 20
 
+  # ---- SQL Server for the CONCURRENCY GOVERNOR canaries ----------------------
+  # A dedicated instance, not a convenience. The governor samples SQL Server's
+  # `Log Flush Waits/sec` with the `_Total` instance — an INSTANCE-WIDE counter,
+  # summed across every database on the server. Its two canaries assert opposite
+  # things about it (`..._never_loses_to_its_own_baseline_on_an_idle_source`:
+  # no shed on a quiet source; `..._backs_off_under_real_log_flush_pressure`: a
+  # shed under real pressure), and on the SHARED `mssql` service both were
+  # unreliable in opposite directions, because 72 of the 74 SQL Server live tests
+  # do not take the quiet-window lock and any of their commits move that counter.
+  #
+  # Measured 2026-08-16: the idle canary passes alone (12.98s) and FAILS under a
+  # concurrent commit driver with the identical CI message and shed pattern
+  # (4 -> 3 -> 2 -> 1); the pressure canary fails the other way, its own writer
+  # unable to reach 5 of 5 batches on a loaded runner — and it says so honestly
+  # ("fixture went inert ... any counter movement below belongs to a concurrent
+  # sibling"). Between them they were the dominant E2E flake.
+  #
+  # No Agent here: these tests do not use CDC, and a capture job would be one
+  # more thing moving the log.
+  mssql-governor:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["governor"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Rivet_Passw0rd!"
+      MSSQL_PID: Developer
+    ports:
+      - "1435:1433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # ---- MySQL primary → replica (replica profile) ----------------------------
   # Proves CDC can read a *replica's* binlog (the "no master access" case): the
   # replica re-logs replicated changes into its own binlog via log_replica_updates,

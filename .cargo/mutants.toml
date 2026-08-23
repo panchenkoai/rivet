@@ -11,9 +11,79 @@
 # `cargo test` suite the mutation gate runs — so a body-stub mutant on them is
 # uncatchable HERE by construction (the parsers they call ARE mutation-covered
 # via their normal code paths).
-exclude_globs = ["src/fuzz.rs"]
+# `src/bin/seed/*` is the DEV-ONLY test-fixture generator: `[[bin]] seed` is
+# `required-features = ["dev-seed"]`, off by default, so `cargo install
+# rivet-cli` never ships it. Mutating a fixture generator grades nothing a user
+# can be hurt by, and it is not free — 581 of the corpus's 18,794 mutants (3%)
+# lived there, 321 in `insert.rs` alone, at a measured ~90s each in CI.
+#
+# Named FILE BY FILE, not `src/bin/**`. That wildcard is what the first version
+# of this exclusion used, and `no_wildcard_file_exclusion_and_no_narrowing_
+# examine_keys` rejected it — correctly, twice over: a `**` silently drops
+# FUTURE files as well, and `src/bin/` also holds `rivet-mcp.rs`, which IS a
+# shipped binary (`[[bin]] rivet-mcp`, no feature gate). Naming files fails
+# toward GRADING: a new binary is in the corpus until someone argues it out.
+# `src/main.rs` stays in for the same reason — it is the shipped CLI's entry
+# point (2026-08-17).
+exclude_globs = [
+    "src/fuzz.rs",
+    # src/test_hook.rs is TEST INSTRUMENTATION: every primitive is env-gated
+    # (RIVET_TEST_PANIC_AT / _ERROR_AT / _PAUSE_AT) and a no-op in production,
+    # and the code that READS the env is exercised only by the LIVE
+    # fault-injection suites — not by the `--lib --bins` run this gate does, so
+    # every mutant here is born MISSED (maybe_pause_at scored 4/4 on PR #246).
+    # Live oracle proven by hand before excluding: stubbing maybe_pause_at and
+    # flipping its point comparison EACH fail run_reconcile_reports_mismatch_
+    # when_source_grows_after_snapshot loudly at the marker wait (the second
+    # after first catching a vacuous probe — the identical comparison exists in
+    # maybe_panic_at, and a blind replace mutated the wrong fn and passed).
+    # The panic/exit/error primitives are guarded the same way by the whole
+    # crash-injection suite: a hook that stops firing leaves those tests unable
+    # to construct their crash and they fail on "the run succeeded".
+    "src/test_hook.rs",
+    "src/bin/seed/main.rs",
+    "src/bin/seed/args.rs",
+    "src/bin/seed/insert.rs",
+    "src/bin/seed/fast.rs",
+    "src/bin/seed/copy_pg.rs",
+    "src/bin/seed/mssql.rs",
+]
 
 exclude_re = [
+    # The two chunk-CHECKPOINT runners' whole-body stubs. Both are live-only by
+    # construction (they need a real source, a destination and a state DB, so the
+    # `--lib --bins` run this gate does never executes a line of them), and the
+    # gate measured exactly that: reach = 0 executions, so the classifier put
+    # them in the report-only class. Then the offline suite CAUGHT them, and the
+    # coverage verdict correctly refused the contradiction (`P2_AUDIT:
+    # oracle-lied`, PR #273).
+    #
+    # The killer is `tests/offline/chunking_matrix_guard.rs`, which DERIVES the
+    # set of commit loops by scanning the TEXT of `src/pipeline` for
+    # `commit::record_part(` — deliberately, so a new runner cannot arrive
+    # without a matrix column. cargo-mutants rewrites the body ON DISK, the
+    # needle vanishes from the file, the derivation loses the name and the guard
+    # fails — WITHOUT executing one instruction of the mutant. That kill is an
+    # artifact of reading the source, not evidence any assertion noticed the
+    # behaviour change, and leaving it in place would let a text scan
+    # counterfeit execution coverage for every live-only runner it names.
+    #
+    # Live oracle, RED-proven by hand before excluding (2026-08-23), on ALL THREE
+    # engines, from the MAIN checkout so the independent DuckDB/ClickHouse oracle
+    # containers read the directory they bind-mount (from a worktree the mysql and
+    # mssql legs abort on that guard, so a proof run there covers postgres only —
+    # which is what the first pass at this entry wrongly generalised from):
+    #   * parallel  — `parallel_chunked_crash_after_chunk_complete_resume_
+    #     finishes_with_no_duplicates` × {postgres, mysql, mssql}: 3 passed ->
+    #     3 FAILED with the body stubbed to `Ok(())`;
+    #   * sequential — `chunked_crash_after_first_chunk_complete_resume_finishes_
+    #     export` × the same three: 3 passed -> 3 FAILED, and 3 passed again on
+    #     revert (a clean tree confirmed, so the red is the stub and not drift).
+    # The oracle is the destination re-read through DuckDB, not rivet's own exit
+    # status or summary — so "success with nothing exported" cannot pass as an
+    # outcome on any engine.
+    "replace run_chunked_parallel_checkpoint",
+    "replace run_chunked_sequential_checkpoint",
     # 64*1024 is a streaming READ BUFFER size in compute_part_checksums —
     # any chunking yields byte-identical digests; 64+1024 only changes I/O
     # granularity. Verified by hand (matrix audit, 2026-07-13).
@@ -37,6 +107,115 @@ exclude_re = [
     # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
     # min/max bounds exercised by the live planner suites).
     "replace scalar_to_string -> Option<String>",
+    # pg_run_export (source/postgres/mod.rs) is the PG batch export loop: it
+    # opens a real connection, BEGINs, declares the server-side cursor and
+    # drives the FETCH loop — unkillable OFFLINE end to end. It entered the
+    # in-diff scope via a three-line pause-hook insertion (PR #246) and scored
+    # 14/14 MISSED, which per the scope-honesty rule reads "no unit test
+    # executes this", not "14 gaps". Live oracle proven by hand on both
+    # representative shapes before excluding: the body stub `Ok((0, false))`
+    # fails run_reconcile_implies_validate_produces_manifest_verdict (an export
+    # that reads nothing has nothing to validate), and `delete !` on the hook's
+    # first-fetch flag fails run_reconcile_reports_mismatch_when_source_grows_
+    # after_snapshot (the marker never appears on the first fetch and the
+    # writer aborts loudly). Every PG batch live test transitively guards the
+    # rest of the loop — the whole live_suite runs through it.
+    "replace pg_run_export ->",
+    " in pg_run_export",
+    # run_plan_command (pipeline/plan_cmd.rs) is the whole `rivet plan` command:
+    # it builds a StateStore, opens a real source per export, runs preflight and
+    # the cost model, and emits artifacts — unkillable OFFLINE. It entered the
+    # in-diff scope via the read-only change (PR #254); cargo-mutants generated
+    # the whole-function `-> Ok(())` stub, which `--lib --bins` cannot reach
+    # (the "--lib on a live-only path" class; it is also a nightly-baseline
+    # entry). The DECISION logic the PR changed was EXTRACTED into pure helpers
+    # that ARE unit-tested and whose in-diff mutants are all caught:
+    # `fields_to_write` (plan_is_read_only_without_annotate_and_packs_the_whole_
+    # config_with_it) and `plan_write_report` (plan_write_report_maps_outcome_
+    # to_the_right_operator_message). The stub itself is live-guarded: `Ok(())`
+    # emits no plan artifact and writes no config, so it fails the live plan
+    # suite (e.g. plan_is_read_only_without_annotate_waves, which asserts the
+    # artifact/paths, and audit_plan_apply's plan.json reads).
+    "replace run_plan_command ->",
+    # execute_resolved_plan (pipeline/job.rs) is THE post-plan execution script
+    # both orchestrator entry points route through (arch-roast 2026-08-21): it
+    # opens a real source, drives a runner, brackets source-harm, finalizes the
+    # manifest and writes the metric row — live-only end to end, so its
+    # whole-function stub `(Ok(()), Default::default())` is unkillable under
+    # `--lib --bins` (the documented "--lib on a live-only path" class; the two
+    # entry points it replaced were excluded for the same reason before it).
+    # Every DECISION it makes is extracted and unit-tested next door and each
+    # was RED-proven against the exact mutant the in-diff gate reported:
+    # should_reconcile (the reconcile leg's three operators),
+    # resume_success_gate_applies / rerun_warning_applies (the --resume/--force
+    # truth table), dispatches_to_cdc_runner, plan_rejection_error. Live oracle:
+    # the stub exports nothing and writes no manifest, so it fails every batch
+    # live test — proven by hand on run_with_reconnect and
+    # run_export_job_with_chunk_source, which stub the same way.
+    "replace execute_resolved_plan ->",
+    # run_keyset / run_keyset_parallel (pipeline/keyset.rs) are the keyset export
+    # RUNNERS — each opens a real source, drives the seek-paged FETCH loop and
+    # streams parts to the sink. Unkillable OFFLINE (the --in-diff gate has no
+    # DB). They entered in-diff scope via a one-line `run_tag = run_scoped_tag(..)`
+    # change (PR #253); cargo-mutants then generated the whole-function `-> Ok(())`
+    # stub, which `--lib` cannot reach (the "--lib on a live-only path" class).
+    # The value logic that actually changed is `run_scoped_tag`, unit-tested and
+    # 4/4 mutants CAUGHT. Both runner stubs proven live-killed by hand: `Ok(())`
+    # produces ZERO parts, so run_keyset_parallel fails
+    # keyset_part_names_do_not_double_the_export_name and run_keyset fails
+    # keyset_varchar_pk_roundtrips_full_keyset_across_pages (both RED-verified
+    # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
+    "replace run_keyset ->",
+    "replace run_keyset_parallel ->",
+    # run_with_reconnect / run_mongo_parallel (ADR-0028 seam cut-over, PR: the
+    # finalize-export-seam branch) are live-only export runners: the first wraps
+    # run_single_export's retry loop over a real source connection, the second
+    # fans _id-range workers over a real MongoDB. Their whole-fn `Ok(())` stubs
+    # export nothing and are unkillable under `--lib --bins`. Both proven
+    # live-killed by hand 2026-08-21 (stub applied, test run, stub reverted):
+    # run_with_reconnect fails keyset_export_records_form_b_checksums_and_
+    # validate_passes; run_mongo_parallel fails mongo_parallel_export_records_
+    # form_b_checksum. The tail DECISION logic the cut-over moved is unit-killed
+    # (CommitLedger 4/4, finalize_export + shape guard, drain_tail_into).
+    "replace run_with_reconnect ->",
+    "replace run_mongo_parallel ->",
+    # run_export_job_with_chunk_source is the plan-ARTIFACT apply orchestration
+    # (apply_cmd.rs:215 is its only caller) — a real StateStore + source per
+    # export, live-only. Its stub `(Ok(()), Default::default())` is proven
+    # live-killed by hand 2026-08-21: plan_and_apply_full_export_round_trip
+    # FAILS (no export happens). Honest scope note: the .yaml wave-apply live
+    # test (resume_skips_completed_exports) stays GREEN under this stub — that
+    # path goes through run_export_job, not this fn; the artifact round-trip
+    # test is the one that owns it.
+    "replace run_export_job_with_chunk_source ->",
+    # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
+    # live engine connection, so its dispatch mutants (delete match arm
+    # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was
+    # extracted into `scan_step` (unit-tested, both guard mutants RED-proven);
+    # the dispatch itself is live-guarded, one schema-wide init test per arm:
+    # init_schema_flag_filters_to_schema (pg), init_mysql_schema_wide_discovers_
+    # seeded_table (mysql), init_mssql_schema_wide_discovers_seeded_table (mssql
+    # — added 2026-08-19 after THIS exclusion's first draft found the arm had no
+    # test at all: deleting it left 15 init tests green). Each proven by deleting
+    # the arm and watching its test go RED.
+    # The body stubs (`-> Ok(vec![])` / `Ok(vec![Default::default()])`) share the
+    # same live oracle: an empty scan scaffolds no exports, and the schema-wide
+    # init tests assert the seeded table APPEARS. Stub proven live-killed by hand
+    # (init_schema_flag_filters_to_schema goes RED on `return Ok(vec![])`).
+    "replace introspect_all -> Result<Vec<TableInfo>>",
+    "delete match arm \"postgres\" in introspect_all",
+    "delete match arm \"mysql\" in introspect_all",
+    "delete match arm \"mssql\" in introspect_all",
+    # density_probe (init/mysql.rs, init/postgres.rs) takes a live DB connection
+    # (mysql::PooledConn / postgres::Client) to run MIN/MAX + the windowed COUNTs
+    # — unkillable OFFLINE (the --in-diff gate has no DB). Its DECISION logic is
+    # extracted into pure, unit-tested helpers (stratified_offsets,
+    # estimate_from_windows, probe_trustworthy — all RED-proven), and the glue is
+    # live-guarded: init_probe_overrules_a_stale_table_rows_on_a_versioned_table
+    # (MySQL) + pg_density_probe_corrects_a_never_analyzed_table (PostgreSQL) fail
+    # against a stubbed probe or an inverted trustworthy guard on the real stand.
+    "replace density_probe with",
+    "delete ! in density_probe",
     # refuse_compressed_binlog takes a live `mysql::Conn` to read
     # @@global.binlog_transaction_compression — there is no offline caller, so a
     # body stub is unkillable HERE by construction. The DECISION it makes was
@@ -58,4 +237,159 @@ exclude_re = [
     # not depend on which arm renders it.
     "delete match arm .* in hash_value",
     "replace refuse_compressed_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # (An entry triaging `replace / with *` in `repack_from_history` lived here
+    # until 2026-08-14. It had been DEAD since the ms→s conversion moved out of
+    # that function into `pool::predict_secs_and_rss` — 0 matches in the corpus.
+    # It is NOT re-pointed at the new site: the old equivalence argument was
+    # "the factor is order-preserving for waves::pack's sort", and at the new
+    # site the seconds are also compared against POOL_PLACEHOLDER_SECS and fed
+    # to the makespan budget, so scaling them is not obviously unobservable. If
+    # those mutants survive, they get their own triage with its own evidence.)
+    # The DECISION whether an MSSQL TLS posture trusts an unverified cert lives
+    # in `mssql_trusts_cert_without_verify`, unit-tested in both directions and
+    # RED-proven (Require/VerifyFull/accept_invalid combos). The match GUARD at
+    # its call site (`connect_with_tls`) takes a live `tiberius::Config` and only
+    # matters against a real TLS handshake — there is no offline caller, so the
+    # `guard -> true`/`-> false` mutant is unkillable HERE by construction. It is
+    # live-guarded by the blessed-path `init --tls` + MSSQL connect scenarios.
+    # run_pool (pipeline/run.rs) is the bounded work-stealing pool executor — it
+    # needs a live source, real exports, and spawned worker threads; there is no
+    # offline caller, so a body stub / operator-inversion is unkillable HERE by
+    # construction (the same live-only class as density_probe). Its DECISIONS are
+    # pure and unit-tested + RED-proven: next_eligible (heavy-serialization) and
+    # advise_split (floor+shape gate). The executor glue — the HeavyGuard reset,
+    # the giant-lookup for the advisory log line — is live-guarded by
+    # live_pool_toxiproxy (exact rows + the makespan contract) and
+    # pool_apply_two_heavy_exports_both_complete (the HeavyGuard reset between two
+    # heavies; a stubbed drop / deleted `!` deadlocks the second heavy).
+    "replace run_pool -> Result",
+    "replace == with != in run_pool",
+    "impl Drop for HeavyGuard",
+    "delete ! in run_pool",
+    # `check` (preflight/mod.rs) connects to the source and diagnoses every
+    # export — no offline caller, so its body stub / the `==` in the overlay
+    # export-match loop are unkillable HERE (live-only). It is live-guarded by
+    # audit_preflight_table + the check scenarios (cli/blessed-flow). The overlay
+    # DECISIONS are unit-tested in overlay_measured_rows.
+    "replace check -> Result<bool> with Ok",
+    # NOTE the `$`: cargo-mutants names a mutant `<path>:<line>:<col>: <what> in
+    # <fn>`, so an UNANCHORED `in check` also matches every `check_*` function.
+    # Written without it, this entry removed 13 further mutants in six unrelated
+    # files — quality.rs::check_null_ratios / check_uniqueness,
+    # resource.rs::check_memory, cli/dispatch.rs::check_export_selection /
+    # check_plan_compatibility, preflight/analysis.rs::check_* — all of which
+    # have offline tests and are exactly what the gate exists to grade. Anchored
+    # it matches the three preflight/mod.rs::check sites and nothing else.
+    "replace == with != in check$",
+    # overlay_measured_rows: `est != before && est.is_some()` guards a RECOMPUTE
+    # that is IDEMPOTENT when the estimate is unchanged (recomputing verdict/
+    # profile from the same number yields the same values). `est` is None only
+    # when `before` is also None (choose_row_estimate returns the catalog when
+    # there is no measure), so `est != before && est.is_some()` never differs
+    # observably from the `||` form — the guard is a skip-redundant-work
+    # optimization, and the mutant is equivalent by construction.
+    # NOTE the escaping: `|` is regex ALTERNATION. Written as `||` this entry
+    # reads "replace && with " OR "" OR " in overlay_measured_rows" — the EMPTY
+    # alternative matches every mutant name, which silently disabled the whole
+    # gate (18,568 of 18,670 mutants excluded; the CI job reported "No mutants
+    # to filter" in 23s and, being continue-on-error, never complained).
+    # Guarded now by `exclude_patterns_are_not_over_broad`.
+    "replace && with \\|\\| in overlay_measured_rows",
+    # run_exports_as_child_processes SPAWNS child `rivet run` processes and drives
+    # the IPC card UI — it has no offline caller, so a body stub is unkillable
+    # HERE by construction (the live-only class, cf. run_pool / density_probe). Its
+    # pure decision — the common-mode representative-error class key — is extracted
+    # into `representative_error` (unit-tested + RED-proven, incl. random-alnum
+    # collapse), and the heartbeat + card flow are live-guarded by
+    # live_parallel_ux (common-mode banner + heartbeat) and the parallel-cards GIF.
+    "replace run_exports_as_child_processes ->",
+    # `elapsed() < sample_interval` vs `<=` in Governor::run's pacing check:
+    # the two differ only when the elapsed time equals the interval to the
+    # NANOSECOND, and even then the `<=` form merely defers that one sample by a
+    # single poll quantum — the sampler's own cadence is unchanged and no
+    # decision differs. Verified against the wall-clock pacing test
+    # (governor_run_samples_on_the_sample_interval_not_on_every_poll), which
+    # grades the cadence from below and cannot distinguish them (round-4
+    # mutation run, 2026-08-14).
+    "replace < with <= in Governor::run",
+    # `to < from` vs `<=` in decision_cause: the sole caller is Governor::run
+    # inside `if let Some((from, to))`, and GovernorState::observe never yields a
+    # step where `to == from` (a no-change decision is None, not Some) — so the
+    # boundary the mutant moves is unreachable by construction. The two REAL
+    # neighbours (a shed, a recovery) are pinned by
+    # governor_run_warns_once_and_steps_back_to_the_ceiling_when_the_signal_dies
+    # and the blind-trajectory tests.
+    # NOTE the QUALIFIED name: cargo-mutants prints an impl method as
+    # `Type::method`, so the obvious `in decision_cause` matched ZERO mutants —
+    # a dead entry triages nothing, and the survivor it claimed to explain was
+    # still graded. Dead entries are now caught by the gate-sanity CI job
+    # (.github/scripts/mutants_exclusions.py), which fails when an exclusion
+    # matches no real mutant.
+    "replace < with <= in Governor::decision_cause",
+    "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
+    # ── the `rivet load` ORCHESTRATOR (src/load/orchestrate.rs) ──────────────
+    # `run_loads` → `load_one*` → `execute_load` → `prepare_load` is the whole
+    # warehouse-load script, live-only end to end: it opens a real state DB,
+    # shells out to a `rivet check` subprocess for the type report, LISTS and
+    # parses run manifests out of a real bucket, builds a BigQuery/Snowflake
+    # loader and issues the LOAD. `cargo mutants -- --lib --bins` executes not
+    # one line of it, so every whole-function stub here is born MISSED — the
+    # documented "--lib on a live-only path" class, which reads as "no UNIT test
+    # runs this", not as N gaps. The whole file entered the in-diff scope at once
+    # because the arch-roast MOVED it out of cli/dispatch.rs (every line is a
+    # `+`), not because anything in it changed.
+    #
+    # Every DECISION these bodies used to make inline is now a named pure
+    # predicate next door with a truth table over it, and each was RED-proven
+    # against the exact mutant this gate reported alive at its old site (applied,
+    # test run, reverted — 2026-08-21): `needs_source_engine` (the `==` in
+    # run_loads), `conflicting_source_ident` (`delete !` + `!=` in prepare_load),
+    # `up_to_date_label` (the `==` in execute_load), `ledger_says_active` +
+    # `prefix_is_active` (the `||` in maybe_gc_orphans), `cleanup_verdict`
+    # (`delete !` in cleanup_target), `consumable_run_ids` + `active_run_note`
+    # (both `!`s in LoadCtx::record), `append_done_line` + `full_done_line` (the
+    # success traces, against hand-written expected strings). run_loads' mode
+    # ROUTER is exhaustive over `LoadMode` now, so its two `delete match arm`
+    # mutants no longer compile (unviable, verified by hand — `non-exhaustive
+    # patterns: LoadMode::Cdc not covered`) instead of surviving under a `_`.
+    # The three guards on a DESTRUCTIVE delete — `prefix_has_active_run`,
+    # `cleanup_target`, `maybe_gc_orphans` — are deliberately NOT excluded: they
+    # take the caller's store now and are unit-tested against a filesystem-backed
+    # one (`GcsStore::open_fs`) plus an in-memory ledger, so their body stubs die
+    # offline. A guard on a recursive delete should not be gradable only against
+    # a real bucket.
+    #
+    # HONEST ORACLE NOTE — this is a recorded COVERAGE GAP, not a triage. There
+    # is no live test in this repo that these stubs fail. `rivet load`'s only
+    # end-to-end coverage is the warehouse matrix (tests/oracle_fixture_matrix.rs
+    # → tests/harness, which runs `rivet load -c …` into BigQuery/Snowflake and
+    # re-queries the warehouse), and it needs BIGQUERY_TEST_PROJECT /
+    # RIVET_SF_* / RIVET_TEST_GCS_BUCKET — credentials the docker stand does not
+    # have. MEASURED rather than assumed: with `run_loads` stubbed to `Ok(())`,
+    # all 12 live tests matching `load` stay GREEN — they match on NAME
+    # (live_oltp_load, live_content_load, pg_load_ledger_round_trip, …) and not
+    # one of them invokes the `load` subcommand. So these entries buy silence on
+    # the in-diff gate for bodies whose only oracle is credential-gated. The fix
+    # is a live `rivet load` cell against a local warehouse (DuckDB is already
+    # the CDC suite's independent reader); until that exists this says so out
+    # loud rather than naming an oracle that does not grade it.
+    "replace run_loads ->",
+    "replace prepare_load ->",
+    "replace execute_load ->",
+    "replace load_one ->",
+    "replace load_one_cdc ->",
+    "replace load_one_incremental ->",
+    # `dispatch` (cli/dispatch.rs) is the CLI ROUTER — one match over every
+    # subcommand, each arm building a real config/state/source and calling the
+    # command it adapts. There is no offline caller (`--lib --bins` runs unit
+    # tests, never the binary), so the whole-function `Ok(())` stub is unkillable
+    # HERE by construction; it entered the in-diff scope because the Load arm
+    # shrank to one call. Its own decisions are already extracted and unit-tested
+    # (`check_export_selection`, `check_plan_compatibility` — both graded, and
+    # deliberately NOT covered by this entry).
+    # Live oracle proven by hand 2026-08-21 (stub applied, test run, reverted):
+    # `Ok(())` makes EVERY subcommand a silent no-op, so
+    # audit_cli_dispatch::run_unknown_export_lists_available_names FAILS — the
+    # run exits 0 and prints none of the message it asserts on.
+    "replace dispatch -> Result",
 ]

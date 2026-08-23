@@ -29,8 +29,9 @@ exports:
 
     skip_empty: true                # no file on runs with no new orders
 
-    # MySQL does not expose `DECIMAL` precision/scale via column metadata;
-    # declare it explicitly so the export schema is stable run-to-run.
+    # Rivet derives `DECIMAL` precision/scale from the MySQL wire column
+    # metadata automatically; declaring it here is an optional pin, needed
+    # only if the wire derivation fails.
     columns:
       price: decimal(10,2)
 

@@ -1,6 +1,6 @@
 # Cross-tool, cross-engine benchmark
 
-How rivet compares to seven other extraction tools — `duckdb`, `clickhouse-local`,
+How rivet compares to six other extraction tools — `duckdb`, `clickhouse-local`,
 `sling`, `ingestr`, `dlt`, `odbc2parquet` — reading **Postgres / MySQL / SQL Server
 / MongoDB → Parquet** on the same fixture, and how to reproduce it.
 
@@ -30,7 +30,7 @@ while also checksumming every value). It is **not** the throughput leader —
 ingestr and clickhouse beat its rows/s, and the report says so. Full numbers and
 the honest tradeoffs are in [`report.html`](report.html).
 
-Engine coverage: Postgres (8 tools) · MySQL (7) · SQL Server (6 — duckdb/clickhouse
+Engine coverage: Postgres (8 tools) · MySQL (8) · SQL Server (6 — duckdb/clickhouse
 have no native reader) · MongoDB (3 — rivet/sling/ingestr only).
 
 ## Reproducing

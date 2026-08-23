@@ -248,3 +248,106 @@ fn init_unreachable_url_exits_nonzero_with_actionable_message() {
         "stderr must contain an actionable message; got:\n{stderr}"
     );
 }
+
+// ─── I8: a broken view must not abort the whole schema-wide MySQL init ────────
+
+/// The MySQL arm of the schema scan was the ONE of three that aborted on a
+/// table it could list but not introspect — PG and MSSQL already skipped those
+/// ("dropped between list and introspect"). Two real inputs hit the MySQL gap:
+/// the suite's own parallelism (a sibling's RAII drop mid-scan — how
+/// `init_mysql_schema_wide_discovers_seeded_table` flaked on 2026-08-18), and
+/// this test's deterministic shape: `list_tables` includes VIEWs, and a view
+/// whose base table is gone stays listed in `information_schema.tables` with
+/// ZERO columns. One stale view therefore failed every schema-wide `rivet init`
+/// against that database — no race required.
+///
+/// RED against the pre-fix arm: exit non-zero with "not found or has no
+/// columns" before the seeded table is ever reached.
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn init_mysql_schema_wide_survives_a_broken_view() {
+    require_alive(LiveService::Mysql);
+
+    let table = seed_mysql_numeric_table(10);
+    // A view over a base table that then disappears — listed, zero columns.
+    let base = unique_name("rivet_qa_vbase");
+    let view = unique_name("rivet_qa_vbroken");
+    {
+        use mysql::prelude::Queryable as _;
+        let mut c = mysql_connect();
+        for stmt in [
+            format!("DROP VIEW IF EXISTS {view}"),
+            format!("DROP TABLE IF EXISTS {base}"),
+            format!("CREATE TABLE {base} (id INT)"),
+            format!("CREATE VIEW {view} AS SELECT * FROM {base}"),
+            format!("DROP TABLE {base}"),
+        ] {
+            c.query_drop(stmt).expect("seed broken view");
+        }
+    }
+    let _cleanup = MysqlViewGuard(view.clone());
+
+    let out = run_rivet(&["init", "--source", MYSQL_URL]);
+    assert!(
+        out.status.success(),
+        "schema-wide init must SKIP the broken view, not abort the scan; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        yaml.contains(table.name()),
+        "the seeded table must still be discovered around the broken view; got:\n{yaml}"
+    );
+    assert!(
+        !yaml.contains(&view),
+        "the zero-column view must be skipped, not scaffolded as an export; got:\n{yaml}"
+    );
+}
+
+/// RAII for the broken view — a bare trailing DROP is skipped by every panic
+/// path, and a stale broken view then fails EVERY later schema-wide init test
+/// on the shared server (exactly the failure this test exists to prevent).
+struct MysqlViewGuard(String);
+impl Drop for MysqlViewGuard {
+    fn drop(&mut self) {
+        use mysql::prelude::Queryable as _;
+        if let Ok(mut c) = std::panic::catch_unwind(mysql_connect) {
+            let _ = c.query_drop(format!("DROP VIEW IF EXISTS {}", self.0));
+        }
+    }
+}
+
+// ─── I9: schema-wide MSSQL init — the arm no test entered ─────────────────────
+
+/// Schema-wide `rivet init` against SQL Server had NO test at any level: the
+/// only MSSQL init test is single-table (`--table dbo.…`, audit_init_deferred),
+/// which never enters `introspect_all`'s engine dispatch. Found by the mutation
+/// gate on PR #245 and then PROVEN empirically — with the whole `"mssql"` match
+/// arm DELETED, all 15 init live tests stayed green. Its PG twin
+/// (`init_schema_flag_filters_to_schema`) goes RED on the same mutation of its
+/// own arm, which is the difference between a live-guarded arm and an unguarded
+/// one.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn init_mssql_schema_wide_discovers_seeded_table() {
+    require_alive(LiveService::Mssql);
+
+    let table = seed_mssql_numeric_table(10);
+
+    let out = run_rivet(&["init", "--source", MSSQL_URL]);
+    assert!(
+        out.status.success(),
+        "schema-wide rivet init (mssql) must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        yaml.contains("type: mssql"),
+        "emitted YAML must declare the mssql source; got:\n{yaml}"
+    );
+    assert!(
+        yaml.contains(table.name()),
+        "seeded table '{}' must be discovered by the schema-wide scan; got:\n{yaml}",
+        table.name()
+    );
+}

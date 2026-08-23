@@ -233,23 +233,24 @@ fn i3_state_store_does_not_enforce_cursor_monotonicity() {
 fn i4_metric_records_terminal_status_success() {
     let state = StateStore::open_in_memory().unwrap();
     state
-        .record_metric(
-            "exp",
-            "run-a",
-            1000,
-            500,
-            None,
-            "success",
-            None,
-            None,
-            Some("parquet"),
-            Some("full"),
-            1,
-            4096,
-            0,
-            None,
-            None,
-        )
+        .record_metric_full(&rivet::state::MetricRow {
+            export_name: "exp".to_string(),
+            run_id: "run-a".to_string(),
+            duration_ms: 1000,
+            total_rows: 500,
+            peak_rss_mb: None,
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: None,
+            format: Some("parquet".to_string()),
+            mode: Some("full".to_string()),
+            files_produced: 1,
+            bytes_written: 4096,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
     let m = &state.get_metrics(Some("exp"), 1).unwrap()[0];
@@ -266,23 +267,24 @@ fn i4_metric_records_terminal_status_success() {
 fn i4_metric_records_terminal_status_failed() {
     let state = StateStore::open_in_memory().unwrap();
     state
-        .record_metric(
-            "exp",
-            "run-b",
-            200,
-            0,
-            None,
-            "failed",
-            Some("connection refused"),
-            None,
-            Some("parquet"),
-            Some("full"),
-            0,
-            0,
-            2,
-            None,
-            None,
-        )
+        .record_metric_full(&rivet::state::MetricRow {
+            export_name: "exp".to_string(),
+            run_id: "run-b".to_string(),
+            duration_ms: 200,
+            total_rows: 0,
+            peak_rss_mb: None,
+            status: "failed".to_string(),
+            error_message: Some("connection refused".to_string()),
+            tuning_profile: None,
+            format: Some("parquet".to_string()),
+            mode: Some("full".to_string()),
+            files_produced: 0,
+            bytes_written: 0,
+            retries: 2,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
     let m = &state.get_metrics(Some("exp"), 1).unwrap()[0];
@@ -315,6 +317,7 @@ fn i2_manifest_absent_before_record_file_is_called() {
             bytes: 4096,
             format: "parquet",
             compression: Some("zstd"),
+            cursor_high: None,
         })
         .unwrap();
 
@@ -338,6 +341,7 @@ fn i2_distinct_files_produce_distinct_manifest_entries() {
             bytes: 2048,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
     state
@@ -349,6 +353,7 @@ fn i2_distinct_files_produce_distinct_manifest_entries() {
             bytes: 2048,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
 
@@ -389,6 +394,7 @@ fn i7_prior_manifest_entries_survive_subsequent_record_file_calls() {
             bytes: 4096,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
 
@@ -403,6 +409,7 @@ fn i7_prior_manifest_entries_survive_subsequent_record_file_calls() {
         bytes: 8192,
         format: "parquet",
         compression: None,
+        cursor_high: None,
     });
 
     // The first manifest entry must still be present — SQLite row-level durability

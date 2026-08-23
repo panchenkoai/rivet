@@ -38,10 +38,22 @@ mod examples_parse;
 mod extension_seam;
 #[path = "offline/format_fuzz.rs"]
 mod format_fuzz;
+#[path = "offline/harness_metrics_guard.rs"]
+mod harness_metrics_guard;
 #[path = "offline/mssql_column_data_fixture_guard.rs"]
 mod mssql_column_data_fixture_guard;
+#[path = "offline/mutation_gate_config.rs"]
+mod mutation_gate_config;
+#[path = "offline/mutation_gate_priority_guard.rs"]
+mod mutation_gate_priority_guard;
 #[path = "offline/mysql_wire_type_fixture_guard.rs"]
 mod mysql_wire_type_fixture_guard;
+// Not a test module: the shared non-vacuity rule the grep-shaped guards call so
+// a moved subject fails LOUDLY instead of grading the empty set.
+#[path = "offline/nonvacuity.rs"]
+mod nonvacuity;
+#[path = "offline/oracle_read_scope_guard.rs"]
+mod oracle_read_scope_guard;
 #[path = "offline/perf_matrix_guard.rs"]
 mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
@@ -50,12 +62,25 @@ mod planner_fuzz;
 mod redaction_invariant;
 #[path = "offline/release_gate_matrix_guard.rs"]
 mod release_gate_matrix_guard;
+#[path = "offline/release_oracle_entrypoint_guard.rs"]
+mod release_oracle_entrypoint_guard;
 #[path = "offline/resource_smoke.rs"]
 mod resource_smoke;
 #[path = "offline/retry_integration.rs"]
 mod retry_integration;
 #[path = "offline/run_summary_contract.rs"]
 mod run_summary_contract;
+
+#[path = "offline/cli_flag_coverage_guard.rs"]
+mod cli_flag_coverage_guard;
+#[path = "offline/live_only_purity_gate.rs"]
+mod live_only_purity_gate;
+#[path = "offline/live_service_ports_guard.rs"]
+mod live_service_ports_guard;
+#[path = "offline/rig_adoption_guard.rs"]
+mod rig_adoption_guard;
+#[path = "offline/runner_frame_gate.rs"]
+mod runner_frame_gate;
 #[path = "offline/scenario_artifact_matrix_guard.rs"]
 mod scenario_artifact_matrix_guard;
 #[path = "offline/schema_drift.rs"]
@@ -72,3 +97,5 @@ mod trust_artifacts_integration;
 mod validate_historical;
 #[path = "offline/validate_regression.rs"]
 mod validate_regression;
+#[path = "offline/workflow_stack_guard.rs"]
+mod workflow_stack_guard;

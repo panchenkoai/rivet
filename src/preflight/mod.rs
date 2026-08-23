@@ -5,6 +5,7 @@ mod analysis;
 // the two drifted unnoticed in the first place.
 #[cfg(test)]
 pub(crate) use analysis::diagnose_mode_str;
+pub(crate) use analysis::overlay_measured_rows;
 mod cdc_health;
 pub(crate) mod cursor_expr;
 mod doctor;
@@ -70,6 +71,11 @@ pub(crate) struct ExportDiagnostic {
     pub mode: String,
     pub cursor_column: Option<String>,
     pub row_estimate: Option<i64>,
+    /// WHERE the row figure came from (#149): `measured YYYY-MM-DD` when the
+    /// state store's freshest successful actual replaced the catalog, else
+    /// `catalog estimate` (with the set-aside said when a stale divergent
+    /// actual was skipped). None = overlay not run (no state in scope).
+    pub row_source: Option<String>,
     /// Average bytes per row from catalog/plan stats (PG EXPLAIN `width`,
     /// MSSQL `dm_db_partition_stats` pages/row). `None` when unavailable
     /// (e.g. MySQL, with no trustworthy scan-free estimate). Feeds the
@@ -84,6 +90,14 @@ pub(crate) struct ExportDiagnostic {
     pub recommended_parallel: (u32, &'static str),
     pub warnings: Vec<analysis::Warning>,
     pub suggestion: Option<String>,
+    /// The three `collect_warnings` inputs NOT otherwise on the diagnostic —
+    /// stored so the #149 overlay can RE-RUN the row-estimate-scaled warnings
+    /// after it moves `row_estimate` (else the warnings keep quoting the catalog
+    /// figure while the verdict/row line stands on the measure — #202). Not
+    /// serialized (internal recompute inputs, not part of the JSON surface).
+    pub chunk_min: Option<String>,
+    pub chunk_max: Option<String>,
+    pub db_max_connections: Option<u32>,
 }
 
 // Hand-rolled `Serialize` (rather than `#[derive]`) so the JSON shape stays
@@ -123,6 +137,9 @@ impl Serialize for ExportDiagnostic {
         }
         if let Some(v) = &self.row_estimate {
             map.serialize_entry("row_estimate", v)?;
+            if let Some(src) = &self.row_source {
+                map.serialize_entry("row_source", src)?;
+            }
         }
         if let Some(v) = &self.avg_row_bytes {
             map.serialize_entry("avg_row_bytes", v)?;
@@ -206,6 +223,59 @@ fn target_fail_note(n: usize, target_label: &str) -> String {
     format!(
         "Note: {n} {col} FAIL {target_label} compatibility; exit code is gated only with --strict (currently exit 0)"
     )
+}
+
+/// The `--target` epilogue's inputs, folded across every REPORT of every export.
+///
+/// Extracted from [`check`]'s render loop rather than accumulated inline,
+/// because the sum IS the epilogue's honesty: `check` prints "N column(s) FAIL
+/// …" and still exits 0 without `--strict`, so an under-count silently retracts
+/// the warning the "fail ✗" glyph already made — and inline in a function that
+/// needs a live database, no offline test can observe the arithmetic at all (the
+/// in-diff mutation gate graded `+=` → `*=`/`-=` on that line as MISSED).
+///
+/// The fold now crosses TABLES as well as exports: a multiplex `tables:` export
+/// contributes one report PER CAPTURED TABLE, so a tally that stopped at the
+/// first report of an export would under-count a whole schema to one table's
+/// worth.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TargetFailTally {
+    /// Columns the target refuses outright, summed over every report.
+    columns: usize,
+    /// The label of the FIRST target that refused anything — the note names one
+    /// warehouse, and a config can set `target:` per export.
+    label: Option<&'static str>,
+    /// Any fatal policy violation, or any target-refused column: what `--strict`
+    /// bails on.
+    any_fatal: bool,
+}
+
+impl TargetFailTally {
+    /// Fold ONE export's reports in — all of them, `target` being the export's
+    /// effective target (`None` when nothing was resolved against one, in which
+    /// case a report can carry no target failure to count).
+    fn add_export(
+        &mut self,
+        target: Option<ExportTarget>,
+        reports: &[type_report::ExportTypeReport],
+    ) {
+        for report in reports {
+            if report.has_fatal() {
+                self.any_fatal = true;
+            }
+            if let Some(t) = target
+                && report.has_target_fail()
+            {
+                self.any_fatal = true;
+                self.columns += report
+                    .columns
+                    .iter()
+                    .filter(|c| c.target_status == Some(TargetStatus::Fail))
+                    .count();
+                self.label.get_or_insert(t.label());
+            }
+        }
+    }
 }
 
 /// Build one [`ExportDiagnostic`] per export via `diagnose`, collecting them (or
@@ -307,6 +377,16 @@ pub fn check(
         SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
         SourceType::Mongo => mongo::check_mongo(&url, tls, &exports)?,
     };
+    // #149: measured beats declared — overlay the state store's actuals and
+    // label every row figure with its source. Best-effort (no state = catalog).
+    let mut diagnostics = diagnostics;
+    if let Ok(state) = crate::state::StateStore::open(config_path) {
+        for d in &mut diagnostics {
+            if let Some(e) = exports.iter().find(|e| e.name == d.export_name) {
+                analysis::overlay_measured_rows(d, e, &state);
+            }
+        }
+    }
     if !json_output {
         for diag in &diagnostics {
             print_diagnostic(diag);
@@ -374,14 +454,12 @@ pub fn check(
             TypePolicy::warn_only()
         };
 
-        let mut any_fatal = false;
         // Count hard target-FAIL columns (and remember which target) so that —
         // when --strict was NOT passed and the exit code is therefore 0 — we can
         // print a note. The "fail ✗" glyph in the table implies a hard failure,
         // but exit is gated only by --strict; without this note an operator or CI
         // reading the glyph alone would be misled into thinking rc != 0.
-        let mut target_fail_cols = 0usize;
-        let mut target_fail_label: Option<&'static str> = None;
+        let mut tally = TargetFailTally::default();
         for export in &exports {
             let column_overrides =
                 crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
@@ -406,7 +484,10 @@ pub fn check(
             let config_dir = std::path::Path::new(config_path)
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
-            match type_report::collect_report(
+            // One report per UNIT, not per export: a multiplex `tables:` CDC
+            // export resolves one document per captured table (#252), each of
+            // which is a separate warehouse table downstream.
+            match type_report::collect_reports(
                 &config,
                 export,
                 &column_overrides,
@@ -415,41 +496,30 @@ pub fn check(
                 config_dir,
                 params,
             ) {
-                Ok(report) => {
-                    if report.has_fatal() {
-                        any_fatal = true;
-                    }
-                    if let Some(t) = eff_target
-                        && report.has_target_fail()
-                    {
-                        any_fatal = true;
-                        target_fail_cols += report
-                            .columns
-                            .iter()
-                            .filter(|c| c.target_status == Some(TargetStatus::Fail))
-                            .count();
-                        target_fail_label.get_or_insert(t.label());
-                    }
-                    if json_output {
-                        // `--json` + `--type-report` interaction (DESIGN):
-                        // emit BOTH, nested. Each export gets ONE JSON object
-                        // (NDJSON, one per line, unchanged) keeping the
-                        // top-level type-report keys (`export`/`columns`/
-                        // `violations`) so existing consumers and the
-                        // `check_json_flag_outputs_type_report_as_json` test
-                        // stay green — and we attach the per-export DIAGNOSTIC
-                        // verdict under a new `"diagnostic"` key. This is the
-                        // least-surprising shape because `check --json` already
-                        // emitted one type-report object per export; we simply
-                        // enrich each with its verdict rather than printing a
-                        // second, separate JSON value (which would break a
-                        // single-`from_str` parse of stdout).
-                        print_report_json_with_diagnostic(
-                            &report,
-                            diag_by_export.get(export.name.as_str()).copied(),
-                        )?;
-                    } else {
-                        type_report::print_table(&report, eff_target);
+                Ok(reports) => {
+                    tally.add_export(eff_target, &reports);
+                    for report in &reports {
+                        if json_output {
+                            // `--json` + `--type-report` interaction (DESIGN):
+                            // emit BOTH, nested. Each export gets ONE JSON object
+                            // (NDJSON, one per line, unchanged) keeping the
+                            // top-level type-report keys (`export`/`columns`/
+                            // `violations`) so existing consumers and the
+                            // `check_json_flag_outputs_type_report_as_json` test
+                            // stay green — and we attach the per-export DIAGNOSTIC
+                            // verdict under a new `"diagnostic"` key. This is the
+                            // least-surprising shape because `check --json` already
+                            // emitted one type-report object per export; we simply
+                            // enrich each with its verdict rather than printing a
+                            // second, separate JSON value (which would break a
+                            // single-`from_str` parse of stdout).
+                            print_report_json_with_diagnostic(
+                                report,
+                                diag_by_export.get(export.name.as_str()).copied(),
+                            )?;
+                        } else {
+                            type_report::print_table(report, eff_target);
+                        }
                     }
                 }
                 Err(e) => {
@@ -467,16 +537,16 @@ pub fn check(
             }
         }
 
-        if strict && any_fatal {
+        if strict && tally.any_fatal {
             anyhow::bail!("strict mode: unsafe type mappings found (see report above)");
-        } else if !strict && target_fail_cols > 0 && !json_output {
+        } else if !strict && tally.columns > 0 && !json_output {
             // The table showed "fail ✗" but rc is 0 — say so explicitly. Skipped
             // under --json so NDJSON output stays one object per line.
             clean = false;
             println!();
             println!(
                 "{}",
-                target_fail_note(target_fail_cols, target_fail_label.unwrap_or("target"))
+                target_fail_note(tally.columns, tally.label.unwrap_or("target"))
             );
         }
     }
@@ -497,6 +567,70 @@ pub fn check(
     // `clean` = the type check surfaced no fatal mapping. The caller ANDs this
     // with the plan-compatibility gate before printing the success epilogue.
     Ok(clean)
+}
+
+/// One type report per export against `target`, **collected and returned rather
+/// than printed** — the in-process form of `rivet check --target <t> --json` for
+/// a caller that needs the DATA instead of the rendering (the warehouse load
+/// planner, `load::plan::plan_loads`).
+///
+/// It goes through the same [`type_report::collect_report`] that [`check`]
+/// renders from, including the `columns:` override parse, so the types a load
+/// declares to the warehouse cannot differ from the ones `rivet check` shows for
+/// the same config. `rivet load` used to obtain them by SPAWNING `rivet check
+/// --target X --json` and parsing its stdout; which binary that was depended on
+/// `--rivet-bin` / `current_exe()`, so a version-skewed resolver was a real
+/// (mitigated, never eliminated) failure mode — in-process it is impossible by
+/// construction, and the load planner becomes testable without a subprocess.
+///
+/// Two deliberate differences from the `check` command, both because this is a
+/// data path and not a diagnostic:
+/// - the policy is always `warn_only` (`--strict`'s whole effect is a non-zero
+///   exit code; the load's own `validate_specs` is what refuses a `Fail` column);
+/// - a report that cannot be collected is an ERROR, not a logged warning. `check`
+///   can afford to skip an export it could not type; for a load, a missing report
+///   is a table that silently does not load.
+///
+/// The source-connection DIAGNOSTICS and the destination-credential probe the
+/// `check` COMMAND also runs are not part of a type report and are not collected
+/// here: the load reads Parquet an extract already wrote, so a `run`-shaped
+/// verdict about the source read path has nothing to say about it.
+pub fn collect_type_reports(
+    config: &Config,
+    config_path: &str,
+    target: ExportTarget,
+) -> Result<Vec<type_report::ExportTypeReport>> {
+    let policy = TypePolicy::warn_only();
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut out = Vec::with_capacity(config.exports.len());
+    for export in &config.exports {
+        let column_overrides =
+            crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
+        // One report per UNIT: a multiplex `tables:` CDC export yields one per
+        // captured table, because each is a separate warehouse table with its own
+        // sub-prefix and its own column set (#252). Flattened rather than nested
+        // so the load planner keeps mapping report → plan one-to-one.
+        let reports = type_report::collect_reports(
+            config,
+            export,
+            &column_overrides,
+            &policy,
+            Some(target),
+            config_dir,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "export '{}': resolving column types for the {} load: {e:#}",
+                export.name,
+                target.label()
+            )
+        })?;
+        out.extend(reports);
+    }
+    Ok(out)
 }
 
 /// Emit one export's `--json` line: the type report (`export`/`columns`/
@@ -525,13 +659,18 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
     println!("Export: {}", diag.export_name);
     println!("  Strategy:     {}", diag.strategy);
     println!("  Mode:         {}", diag.mode);
+    let src_suffix = diag
+        .row_source
+        .as_deref()
+        .map(|s| format!("  ({s})"))
+        .unwrap_or_default();
     if let Some(est) = diag.row_estimate {
         if est >= 1_000_000 {
-            println!("  Row estimate: ~{}M", est / 1_000_000);
+            println!("  Row estimate: ~{}M{src_suffix}", est / 1_000_000);
         } else if est >= 1_000 {
-            println!("  Row estimate: ~{}K", est / 1_000);
+            println!("  Row estimate: ~{}K{src_suffix}", est / 1_000);
         } else {
-            println!("  Row estimate: ~{}", est);
+            println!("  Row estimate: ~{}{src_suffix}", est);
         }
     }
     if let Some(w) = diag.avg_row_bytes {
@@ -653,6 +792,7 @@ mod tests {
     /// is true), and a couple of warnings.
     fn sample_diagnostic(name: &str) -> ExportDiagnostic {
         ExportDiagnostic {
+            row_source: None,
             export_name: name.to_string(),
             strategy: "incremental(updated_at)".to_string(),
             mode: "incremental".to_string(),
@@ -671,6 +811,9 @@ mod tests {
                 analysis::Warning::new(analysis::Severity::High, "memory risk".to_string()),
             ],
             suggestion: Some("create an index".to_string()),
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         }
     }
 
@@ -785,11 +928,96 @@ mod tests {
     fn empty_report(export: &str) -> type_report::ExportTypeReport {
         type_report::ExportTypeReport {
             export: export.to_string(),
+            table: None,
             columns: Vec::new(),
             violations: Vec::new(),
             target_failures: false,
             recovery_sql: None,
         }
+    }
+
+    /// A report of one multiplex TABLE with `n` target-refused columns.
+    fn failing_table_report(export: &str, table: &str, n: usize) -> type_report::ExportTypeReport {
+        let columns = (0..n)
+            .map(|i| type_report::TypeReportRow {
+                column: format!("c{i}"),
+                source_type: "-".into(),
+                rivet_type: "-".into(),
+                arrow_type: "-".into(),
+                fidelity: crate::types::TypeFidelity::Exact,
+                warnings: vec![],
+                target_type: Some("BIGNUMERIC".into()),
+                target_status: Some(TargetStatus::Fail),
+                target_note: None,
+                autoload_type: None,
+                cast_sql: None,
+            })
+            .collect();
+        type_report::ExportTypeReport {
+            table: Some(table.into()),
+            columns,
+            target_failures: true,
+            ..empty_report(export)
+        }
+    }
+
+    /// The `--target` epilogue's count must be the EXACT number of refused
+    /// columns across every report of every export.
+    ///
+    /// `check` prints "N column(s) FAIL <target> compatibility" and still exits 0
+    /// without `--strict`, so the number IS the warning — an under-count retracts
+    /// what the "fail ✗" glyph already promised, and a zero suppresses the note
+    /// entirely. The arithmetic used to live inline in `check`, which needs a live
+    /// database: the in-diff mutation gate graded `+=` → `*=` and `+=` → `-=`
+    /// there as MISSED, and both are silent (`*=` pins the total at 0 forever,
+    /// since it starts at 0).
+    ///
+    /// The fixture crosses BOTH folds — two exports, and two reports within the
+    /// first, because a multiplex `tables:` export now contributes one report per
+    /// captured table. A single-report fixture cannot distinguish the operators.
+    #[test]
+    fn target_fail_tally_sums_every_refused_column_across_tables_and_exports() {
+        let mut tally = TargetFailTally::default();
+        // One export, two TABLES (a multiplex stream): 2 + 1 refused columns.
+        tally.add_export(
+            Some(ExportTarget::BigQuery),
+            &[
+                failing_table_report("cdc", "orders", 2),
+                failing_table_report("cdc", "customers", 1),
+            ],
+        );
+        assert_eq!(
+            tally.columns, 3,
+            "every captured table's refused columns count — stopping at the first \
+             report under-counts a whole schema to one table"
+        );
+        // A second export adds to the same total.
+        tally.add_export(
+            Some(ExportTarget::BigQuery),
+            &[failing_table_report("events", "events", 4)],
+        );
+        assert_eq!(
+            tally,
+            TargetFailTally {
+                columns: 7,
+                label: Some("bigquery"),
+                any_fatal: true
+            },
+            "7 refused columns, the FIRST target's label, and --strict must bail"
+        );
+
+        // A clean export adds nothing and does not clear what came before.
+        tally.add_export(Some(ExportTarget::BigQuery), &[empty_report("clean")]);
+        assert_eq!(tally.columns, 7, "a clean export is a no-op, not a reset");
+
+        // No target resolved ⇒ nothing to refuse, whatever the report says.
+        let mut untargeted = TargetFailTally::default();
+        untargeted.add_export(None, &[failing_table_report("cdc", "orders", 2)]);
+        assert_eq!(
+            untargeted,
+            TargetFailTally::default(),
+            "without a target there is no target-compatibility verdict to report"
+        );
     }
 
     #[test]

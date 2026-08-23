@@ -66,11 +66,12 @@ fn stage_metrics(dir: &std::path::Path) -> (i64, i128, HashSet<i64>) {
 }
 
 fn run_cfg(cfg: &std::path::Path) {
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .status()
-        .unwrap();
-    assert!(st.success(), "batch run failed");
+    let out = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "batch run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 const T0: &str = "2026-01-15 12:00:00";
@@ -107,7 +108,7 @@ fn batch_full_to_incremental_switch_golden_math() {
         if mode == "incremental" {
             rig = rig.export_line("cursor_column: id");
         }
-        write_config(&d, &rig.yaml())
+        rig.config_in(d.path())
     };
 
     let out_full = d.path().join("full");
@@ -175,7 +176,7 @@ fn batch_incremental_datetime_cursor_captures_updates_golden_math() {
             .mode("incremental")
             .export_line("cursor_column: updated_at")
             .dest_path(out.to_path_buf());
-        write_config(&d, &rig.yaml())
+        rig.config_in(d.path())
     };
 
     let out1 = d.path().join("r1");

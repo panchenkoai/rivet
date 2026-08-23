@@ -95,7 +95,8 @@ impl PostgresSource {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = build_native_tls(cfg)?;
                 let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-                let mut client = Client::connect(url, make_tls)?;
+                // Forced ssl_mode overrides the URL's sslmode; see connect_client.
+                let mut client = pg_config_ssl_forced(url)?.connect(make_tls)?;
                 let transaction_pooler = detect_pg_transaction_pooler(&mut client);
                 if transaction_pooler {
                     log::warn!(
@@ -180,52 +181,6 @@ pub(crate) fn sample_temp_bytes(url: &str, tls: Option<&TlsConfig>) -> Option<i6
         .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
 
-/// Snapshot the broader source-harm counters from `pg_stat_database` for the
-/// current database — a superset of [`sample_temp_bytes`] (which the run summary
-/// tracks on its own). Returns `(metric, cumulative_value)` pairs; the pipeline
-/// captures these before and after the export and stores the per-metric delta in
-/// `export_harm`.
-///
-/// All counters live in `pg_stat_database` and are readable by **any** role — no
-/// `pg_monitor` membership or superuser needed (unlike `pg_stat_activity`'s view
-/// of other sessions). These are cluster-level cumulative counters, so concurrent
-/// activity inflates the delta; on a single-tenant pilot box it is the run's own
-/// footprint. `None` on connect/query failure — informational, never blocks the
-/// export.
-pub(crate) fn sample_harm_counters(
-    url: &str,
-    tls: Option<&TlsConfig>,
-) -> Option<Vec<(String, i64)>> {
-    let mut client = connect_client(url, tls).ok()?;
-    // `tup_returned` (rows the engine had to scan) is the read-amplification
-    // signal; `blks_read`/`blks_hit` the I/O vs cache split; `temp_files` the
-    // spill count; `deadlocks` contention. temp_bytes is intentionally omitted —
-    // it's already on the run summary (export_metrics.pg_temp_bytes_delta).
-    let row = client
-        .query_one(
-            "SELECT blks_read::bigint, blks_hit::bigint, tup_returned::bigint, \
-             tup_fetched::bigint, temp_files::bigint, deadlocks::bigint \
-             FROM pg_stat_database WHERE datname = current_database()",
-            &[],
-        )
-        .ok()?;
-    let names = [
-        "pg_blks_read",
-        "pg_blks_hit",
-        "pg_tup_returned",
-        "pg_tup_fetched",
-        "pg_temp_files",
-        "pg_deadlocks",
-    ];
-    let mut out = Vec::with_capacity(names.len());
-    for (i, name) in names.iter().enumerate() {
-        if let Ok(v) = row.try_get::<_, i64>(i) {
-            out.push(((*name).to_string(), v));
-        }
-    }
-    Some(out)
-}
-
 /// Probe `SHOW work_mem` and return the value in bytes.
 ///
 /// PostgreSQL spills FETCH-cursor output to `pgsql_tmp/` once the in-flight
@@ -277,15 +232,85 @@ fn parse_work_mem(raw: &str) -> Option<i64> {
     (bytes > 0).then_some(bytes)
 }
 
-/// Sample `checkpoints_req` from `pg_stat_bgwriter`.
+/// Sample requested-checkpoint pressure, version-portably.
 ///
 /// PostgreSQL caches the statistics snapshot at the start of each transaction.
 /// We call `pg_stat_clear_snapshot()` first to discard that cache so every
 /// adaptive sample sees fresh counters rather than the frozen value from BEGIN.
+///
+/// PG 17 moved the counter: `pg_stat_bgwriter.checkpoints_req` was removed and
+/// lives on as `pg_stat_checkpointer.num_requested` (bughunt 2026-08-13,
+/// proven on postgres:18). The old query on PG17+ is not merely a `None` —
+/// the batch loop samples INSIDE the export's cursor transaction, and any
+/// ERROR aborts that transaction, killing the next FETCH: every
+/// `adaptive: true` PG17+ export hard-failed. A probe-then-query pair avoids
+/// ever ERRORing on either vintage (a one-statement CASE still plans the dead
+/// branch and errors — proven on postgres:18).
+/// The requested-checkpoint query for this server vintage.
+///
+/// Split out as a pure fn so the BRANCH is unit-testable: the live suite runs
+/// on postgres:16, where both spellings resolve, so nothing offline could see a
+/// swapped arm — and a swapped arm is not a `None`, it is an ERROR inside the
+/// export's cursor transaction, which kills the next FETCH (verified on
+/// postgres:18, 2026-08-14: `SELECT checkpoints_req FROM pg_stat_bgwriter`
+/// there answers `column "checkpoints_req" does not exist`, and the following
+/// FETCH gets `current transaction is aborted`).
+///
+/// `true` ⇒ the server has `pg_stat_checkpointer` (PG 17+).
+fn checkpoints_req_sql(has_checkpointer: bool) -> &'static str {
+    if has_checkpointer {
+        "SELECT num_requested FROM pg_stat_checkpointer"
+    } else {
+        "SELECT checkpoints_req FROM pg_stat_bgwriter"
+    }
+}
+
+/// Read the requested-checkpoint counter off a LIVE server connection.
+///
+/// LIVE-ONLY BY CONSTRUCTION: it takes a `postgres::Client`, which no offline
+/// test can build, so every constant-return mutant of it (`None`, `Some(-1)`,
+/// `Some(0)`, `Some(1)` — all four survived the 2026-08-16 mutation run, which
+/// exercised the OFFLINE suite only) is unkillable here. Writing a unit test
+/// against a fake client would grade the fake, not the one thing that matters:
+/// WHICH catalog this connection is asked for, and that the answer really moves.
+///
+/// Its oracles are live, and each of the four dies on them:
+/// * `governor_backs_off_under_concurrent_write_pressure`
+///   (`tests/live/live_governor.rs`) drives real foreign write pressure and
+///   requires a `backed off` line. `GovernorState::observe` reads pressure ONLY
+///   as `cur > prev`, so a constant `Some(-1)`/`Some(0)`/`Some(1)` never rises
+///   and never sheds; `None` fails open by design and also never sheds. (The
+///   same argument, verified by hand against the `Some(0)` mutant on
+///   2026-08-14, is recorded on `impl PressureSource for Box<dyn Source>`, the
+///   bridge one layer up.)
+/// * `pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source` asserts
+///   `assert_governor_awake`, whose "provides no pressure signal" check is RED
+///   specifically against the `None` mutant — the deaf-governor state a rename
+///   of this counter produces.
+/// * `pg18_governor_samples_the_modern_checkpointer_catalog` covers the ARM the
+///   pure [`checkpoints_req_sql`] picks: on a real PG 17+ server a swapped arm
+///   is not a `None` but an ERROR that aborts the export's cursor transaction,
+///   so that test requires the run to SUCCEED and the governor to be awake.
+///
+/// The pure half — which SQL each vintage gets — is [`checkpoints_req_sql`],
+/// unit-tested offline by `checkpoints_req_sql_matches_the_servers_catalog`.
 fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
     let _ = client.execute("SELECT pg_stat_clear_snapshot()", &[]);
+    // Two steps, because PG plans a whole statement up front: a CASE whose
+    // dead branch references the missing column still ERRORs (proven on
+    // postgres:18), and an ERROR inside the export's cursor transaction
+    // aborts it. The existence probe can never error; only the matching
+    // query is then sent.
+    let has_checkpointer = client
+        .query_one(
+            "SELECT to_regclass('pg_catalog.pg_stat_checkpointer') IS NOT NULL",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.try_get::<_, bool>(0).ok())?;
+    let sql = checkpoints_req_sql(has_checkpointer);
     client
-        .query_one("SELECT checkpoints_req FROM pg_stat_bgwriter", &[])
+        .query_one(sql, &[])
         .ok()
         .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
@@ -438,6 +463,58 @@ pub(crate) fn introspect_pg_table_for_chunking(
 /// `crate::init::postgres::connect`). `tls = None` or `mode: disable` falls
 /// back to the insecure `NoTls` transport — a warning is logged from
 /// `create_source` so operators know TLS is off.
+/// Parse `url` into a `postgres::Config` and FORCE `ssl_mode(Require)`.
+///
+/// The bug this closes: `Client::connect(url, connector)` lets tokio-postgres
+/// decide TLS from the URL's own `sslmode` — so `?sslmode=disable`, or the
+/// driver's DEFAULT `prefer` against a server that declines TLS, returns a raw
+/// PLAINTEXT stream and never touches the connector we built. An operator who
+/// wrote `tls: { mode: verify-full }` (or `--tls verify-full`) then ships
+/// credentials and every row in cleartext under exit 0. Mongo fixed the
+/// identical class by overriding `opts.tls`; this is Postgres's override.
+///
+/// `ssl_mode(Require)` only forces TLS to be USED; the CONNECTOR
+/// (`build_native_tls`) still decides how strictly the cert is checked
+/// (require = accept-invalid, verify-ca = chain, verify-full = chain+host), so
+/// the four modes keep their meanings — this just stops `disable`/`prefer` in
+/// the URL from silently winning over an enforced `tls:` block.
+fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
+    use std::str::FromStr;
+    // Strip the URL's own `sslmode` before parsing: we force Require below, so
+    // its value is irrelevant — AND tokio-postgres only accepts disable/prefer/
+    // require, rejecting the libpq-valid `verify-ca`/`verify-full` with a parse
+    // error (bug hunt 2026-08-08: init derived verify-full from such a URL and
+    // then failed to parse it, erroring every time). Dropping it makes any
+    // sslmode the operator wrote parseable; the connector decides verification.
+    let cleaned = strip_url_query_key(url, "sslmode");
+    let mut config = postgres::Config::from_str(&cleaned).map_err(|e| {
+        anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
+    })?;
+    config.ssl_mode(postgres::config::SslMode::Require);
+    Ok(config)
+}
+
+/// Remove a single query parameter (case-insensitive key) from a URL, leaving
+/// the rest of the query intact. Used to drop `sslmode` before handing the URL
+/// to a parser that would reject some of its values.
+fn strip_url_query_key(url: &str, key: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split('=').next().unwrap_or(pair);
+            !k.eq_ignore_ascii_case(key)
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
@@ -445,7 +522,10 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
         Some(cfg) if cfg.mode.is_enforced() => {
             let connector = build_native_tls(cfg)?;
             let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-            Ok(Client::connect(url, make_tls)?)
+            // Config::connect, NOT Client::connect(url, …): the forced
+            // ssl_mode(Require) overrides the URL's sslmode so the connector is
+            // actually used (see pg_config_ssl_forced).
+            Ok(pg_config_ssl_forced(url)?.connect(make_tls)?)
         }
         _ => Ok(Client::connect(url, NoTls)?),
     }
@@ -531,10 +611,21 @@ fn pg_run_export(
     // the buffer. Same source of truth as the sink's backstop guard.
     let max_value_bytes = tuning.max_value_bytes();
 
+    let mut first_fetch_done = false;
     loop {
         let requested = ctl.target();
         let fetch_sql = format!("FETCH {} FROM _rivet", requested);
         let rows = guard.client_mut().query(&fetch_sql, &[])?;
+        if !first_fetch_done {
+            first_fetch_done = true;
+            // The cursor's snapshot is pinned as of the FIRST FETCH, not the
+            // DECLARE — measured, not assumed: with the pause placed after
+            // DECLARE, a row committed during it was VISIBLE to the export
+            // (250 of 200). A paused window here is the race-free way for a
+            // test to commit writes strictly invisible to this read but
+            // visible to anything after it (the reconcile recount).
+            crate::test_hook::maybe_pause_at("pg_after_snapshot_open");
+        }
         if rows.is_empty() {
             break;
         }
@@ -737,10 +828,58 @@ impl super::Source for PostgresSource {
         Ok(mappings)
     }
 
-    /// Governor pressure proxy: `pg_stat_bgwriter.checkpoints_req` — the same
-    /// monotonic counter the adaptive batch loop samples. Rising between samples
-    /// means the source is checkpointing harder under write pressure.
-    fn sample_pressure(&mut self) -> Option<u64> {
+    /// Snapshot the source-harm counters from `pg_stat_database` for the current
+    /// database. Returns `(metric, cumulative_value)` pairs; the pipeline captures
+    /// these before and after the export and stores the per-metric delta in
+    /// `export_harm`.
+    ///
+    /// Every counter here is readable by **any** role — no `pg_monitor` membership
+    /// or superuser needed (unlike `pg_stat_activity`'s view of other sessions).
+    /// They are CLUSTER-level cumulative counters, so concurrent activity inflates
+    /// the delta; on a single-tenant box it is the run's own footprint. `None` on
+    /// connect/query failure — observability, never a gate.
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        let client = &mut self.client;
+        // `tup_returned` (rows the engine had to scan) is the read-amplification
+        // signal; `blks_read`/`blks_hit` the I/O vs cache split; `temp_files` the
+        // spill count; `deadlocks` contention. temp_bytes is intentionally omitted —
+        // it's already on the run summary (export_metrics.pg_temp_bytes_delta).
+        let row = client
+            .query_one(
+                "SELECT blks_read::bigint, blks_hit::bigint, tup_returned::bigint, \
+             tup_fetched::bigint, temp_files::bigint, deadlocks::bigint \
+             FROM pg_stat_database WHERE datname = current_database()",
+                &[],
+            )
+            .ok()?;
+        let names = [
+            "pg_blks_read",
+            "pg_blks_hit",
+            "pg_tup_returned",
+            "pg_tup_fetched",
+            "pg_temp_files",
+            "pg_deadlocks",
+        ];
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            if let Ok(v) = row.try_get::<_, i64>(i) {
+                out.push(((*name).to_string(), v));
+            }
+        }
+        Some(out)
+    }
+
+    /// Governor pressure proxy: `checkpoints_req` — WAL volume forcing
+    /// checkpoints. Rising between samples means the source is checkpointing
+    /// harder under WRITE pressure, which a read-only export cannot cause; that
+    /// is why the governor may share this counter with the batch loop while the
+    /// other engines need a separate one.
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
+        // `checkpoints_req` is WRITE-driven (WAL volume forcing checkpoints):
+        // a read-only export cannot move it, so the governor may share it
+        // with PG's batch loop (which samples it engine-internally) — unlike
+        // MySQL/MSSQL, whose batch loops listen to spill counters the
+        // export's own reads inflate.
         pg_sample_checkpoints_req(&mut self.client).map(|v| v.max(0) as u64)
     }
 
@@ -886,7 +1025,81 @@ fn catalog_numeric_to_decimal_params(precision: i32, scale: i32) -> Option<(u8, 
 
 #[cfg(test)]
 mod tests {
+
+    /// The version branch of the checkpoint sampler, pinned offline.
+    ///
+    /// The live stack runs postgres:16, where `pg_stat_bgwriter.checkpoints_req`
+    /// still resolves — so every governor test takes the LEGACY arm and no live
+    /// test can see the modern one. Verified by hand against the postgres:18
+    /// stand (2026-08-14): `pg_stat_checkpointer` exists there, the bgwriter
+    /// column does NOT, and sending the legacy query inside a cursor
+    /// transaction answers `column "checkpoints_req" does not exist` and then
+    /// `current transaction is aborted, commands ignored` on the next FETCH —
+    /// i.e. a swapped arm does not degrade to `None`, it kills the export.
+    ///
+    /// Scope honesty: this pins the SQL each vintage gets, not that the probe
+    /// classifies a real server correctly — that half needs a live PG 17+ and
+    /// is covered by `pg18_governor_samples_the_modern_checkpointer_catalog`
+    /// in the live suite (skipped unless the stand is up).
+    #[test]
+    fn checkpoints_req_sql_matches_the_servers_catalog() {
+        use super::checkpoints_req_sql;
+        // PG 17+: the counter lives on pg_stat_checkpointer.
+        let modern = checkpoints_req_sql(true);
+        assert!(
+            modern.contains("pg_stat_checkpointer") && modern.contains("num_requested"),
+            "a PG17+ server must be asked for num_requested: {modern}"
+        );
+        assert!(
+            !modern.contains("pg_stat_bgwriter"),
+            "the removed relation must never be named on PG17+: {modern}"
+        );
+        // PG 16 and older: the column is still on pg_stat_bgwriter.
+        let legacy = checkpoints_req_sql(false);
+        assert!(
+            legacy.contains("pg_stat_bgwriter") && legacy.contains("checkpoints_req"),
+            "a pre-17 server must be asked for checkpoints_req: {legacy}"
+        );
+        assert!(
+            !legacy.contains("pg_stat_checkpointer"),
+            "the not-yet-existing relation must never be named pre-17: {legacy}"
+        );
+    }
     use super::catalog_numeric_to_decimal_params;
+
+    /// The TLS-honesty fix (bug hunt 2026-08-08): under an enforced `tls:`
+    /// block the connection's ssl_mode must be forced to Require REGARDLESS of
+    /// what the URL's own `sslmode` says — otherwise `?sslmode=disable` (or the
+    /// driver's default `prefer` against a TLS-declining server) silently wins
+    /// and the connector we built is never used, shipping cleartext under a
+    /// `verify-full` claim.
+    #[test]
+    fn enforced_tls_forces_ssl_mode_require_over_the_urls_sslmode() {
+        use postgres::config::SslMode;
+        // Every URL sslmode an operator might write — all must come out Require.
+        for url in [
+            "postgresql://u:p@h/db?sslmode=disable",
+            "postgresql://u:p@h/db?sslmode=prefer",
+            "postgresql://u:p@h/db", // no param → driver default is `prefer`
+            "postgresql://u:p@h/db?sslmode=require",
+            // libpq-valid but tokio-postgres-REJECTED values: stripped, not fatal
+            "postgresql://u:p@h/db?sslmode=verify-ca",
+            "postgresql://u:p@h/db?sslmode=verify-full",
+            // sslmode alongside another param — only sslmode is dropped
+            "postgresql://u:p@h/db?application_name=x&sslmode=verify-full&connect_timeout=5",
+        ] {
+            let cfg =
+                super::pg_config_ssl_forced(url).unwrap_or_else(|e| panic!("parse {url}: {e}"));
+            assert_eq!(
+                cfg.get_ssl_mode(),
+                SslMode::Require,
+                "enforced TLS must force Require, but {url} yielded {:?}",
+                cfg.get_ssl_mode()
+            );
+        }
+        // A malformed URL is a loud parse error, not a silent plaintext fallback.
+        assert!(super::pg_config_ssl_forced("not a url").is_err());
+    }
 
     // FROM-clause parser tests live in `from_parse.rs` alongside the parser.
 

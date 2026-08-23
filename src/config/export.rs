@@ -52,6 +52,26 @@ pub enum SchemaDriftPolicy {
     /// next run will detect the same change again.
     Fail,
 }
+/// The synthesis marker a range sub-export carries under `apply --pool --split`
+/// (#167). Never deserialized from YAML — set only by the pool's synthesizer, so
+/// it needs no `JsonSchema`/`Deserialize`. The key window is HALF-OPEN `(lo, hi]`
+/// so N adjacent windows partition the key gap-free with no overlap (the same
+/// convention `keyset::partition_ranges` uses): `lo = None` is the run's floor
+/// (first window), `hi = None` is the ceil (last window).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitSynth {
+    /// The parent export's FAMILY — every sub-export folds to it so the load view
+    /// recombines them as one table.
+    pub parent: String,
+    /// The key column the window is expressed over (the export's `chunk_by_key` /
+    /// `chunk_column`).
+    pub key_column: String,
+    /// Exclusive lower bound (`key > lo`); `None` for the first window (no floor).
+    pub lo: Option<String>,
+    /// Inclusive upper bound (`key <= hi`); `None` for the last window (no ceil).
+    pub hi: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
@@ -73,6 +93,18 @@ pub struct ExportConfig {
     /// config reference.
     #[serde(skip)]
     pub snapshot_parent: Option<String>,
+    /// Set ONLY on a range sub-export the pool synthesizes under `apply --pool
+    /// --split` (#167): a single dominating export is emitted as N units over its
+    /// key span, each a first-class scheduler unit the pool places concurrently,
+    /// so the giant stops being the makespan floor. Carries the parent FAMILY and
+    /// this unit's half-open key window `(lo, hi]`. `None` on every ordinary
+    /// export.
+    ///
+    /// `skip` (not `skip_serializing_if`): an internal synthesis marker like
+    /// [`snapshot_parent`](Self::snapshot_parent), never a user-writable key — it
+    /// must not appear in the schema or the config reference.
+    #[serde(skip)]
+    pub split: Option<SplitSynth>,
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
@@ -115,12 +147,14 @@ pub struct ExportConfig {
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
     /// Target memory budget per chunk in MB. When set, `chunk_size` is derived
-    /// from this budget at plan-build time using a `pg_class` row-size estimate
-    /// (`pg_relation_size / reltuples`), clamped to `[10_000, 5_000_000]` rows.
+    /// from this budget at plan-build time using the engine's row-size estimate
+    /// (PostgreSQL `pg_relation_size / reltuples`; MySQL `information_schema`
+    /// average row length; a defensive 512 B/row default when no estimate
+    /// exists, e.g. SQL Server), clamped to `[10_000, 5_000_000]` rows.
     ///
-    /// Mutually exclusive with an explicit non-default `chunk_size:`. Only
-    /// applies to `mode: chunked` on a Postgres source using the `table:`
-    /// shortcut (the row-size probe needs a known relation).
+    /// Mutually exclusive with an explicit non-default `chunk_size:`. Requires
+    /// `mode: chunked` and the `table:` shortcut (the row-size probe needs a
+    /// known relation); any SQL engine works.
     ///
     /// ```yaml
     /// exports:
@@ -229,8 +263,8 @@ pub struct ExportConfig {
     /// `size` (default) accepts size-only verification; `content` requires every
     /// part's content MD5 to be checked against the store's listing (no
     /// download) and **fails** validation for any part that could only be
-    /// size-verified — e.g. a part too large to upload as a single PUT (raise
-    /// `max_file_size` down so it fits), or a backend that exposes no checksum.
+    /// size-verified — e.g. a part too large to upload as a single PUT (lower
+    /// `max_file_size` so it fits), or a backend that exposes no checksum.
     #[serde(default)]
     pub verify: VerifyMode,
     #[serde(default)]
@@ -348,16 +382,44 @@ pub struct ExportConfig {
 impl ExportConfig {
     /// The export FAMILY this export's runs belong to: the RECORDED
     /// `snapshot_parent` for the CDC snapshot leg `cdc_job` synthesizes, the
+    /// parent family for a range sub-export the pool `--split` synthesizes, the
     /// export's own name for everything else.
     ///
     /// The single place this is decided. It used to be re-derived at each
     /// writer by folding the name on `__snapshot_`, which merged a user export
     /// literally named `daily__snapshot_v2` into family `daily` — silently
     /// disarming the load's shared-prefix guard against its sibling `daily`.
+    ///
+    /// A `--split` sub-export named `daily#0` MUST fold to family `daily` so the
+    /// load view recombines the N range units as ONE logical table (the
+    /// shared-prefix merge-back, #167) — the same fold `snapshot_parent` gives the
+    /// CDC snapshot leg, via a dedicated field so neither path triggers the
+    /// other's behaviour.
     pub fn family(&self) -> String {
+        if let Some(s) = &self.split {
+            return s.parent.clone();
+        }
         self.snapshot_parent
             .clone()
             .unwrap_or_else(|| self.name.clone())
+    }
+
+    /// The tables of a MULTIPLEX capture — a `mode: cdc` export whose `tables:`
+    /// list drives several tables through one change stream — or `None` when this
+    /// export is a single unit (one `table:`/`query:`, or any batch mode).
+    ///
+    /// Every consumer of the multiplex layout answers the same question first
+    /// ("is this export one table or N?"), and they must answer it identically:
+    /// `rivet validate` descends one sub-prefix per table, the type resolver
+    /// produces one document per table, and `rivet load` builds one plan per
+    /// table. A `tables:` list on a non-CDC export is already refused at
+    /// config-load, and an empty one is refused too — the filter here is
+    /// belt-and-suspenders so a caller can never fan out over nothing.
+    pub fn multiplex_tables(&self) -> Option<&[String]> {
+        if self.mode != ExportMode::Cdc {
+            return None;
+        }
+        self.tables.as_deref().filter(|t| !t.is_empty())
     }
 
     /// Resolve the effective `(CompressionType, level)` for this export.
@@ -702,6 +764,7 @@ pub enum CdcInitialMode {
 /// `destination`, and `format` come from the export itself; this carries only the
 /// CDC-specific knobs (resume + per-engine stream params).
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CdcExportConfig {
     /// First-run behaviour: `snapshot` = anchor → full snapshot → drain (see
     /// [`CdcInitialMode`]). Omitted ⇒ capture changes only, with no anchor step
@@ -725,8 +788,12 @@ pub struct CdcExportConfig {
     /// streaming indefinitely — ideal for a scheduler. For MySQL this is a
     /// non-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.
     /// **Defaults to `true`** (bounded): the OSS model is scheduler-driven, and
-    /// omitting this must NOT silently start a never-terminating stream. Set it to
-    /// `false` to opt into continuous streaming explicitly.
+    /// omitting this must NOT silently start a never-terminating stream. Setting
+    /// `false` opts into the continuous model, which is engine-specific: a true
+    /// daemon on MySQL (blocking binlog dump) and MongoDB (the change stream
+    /// blocks awaiting events; ends only if the stream is invalidated/closed);
+    /// PostgreSQL / SQL Server still exit on catch-up — one unbounded pass, run
+    /// it under a supervisor.
     #[serde(default = "default_true")]
     pub until_current: bool,
     /// Stop at the first COMMIT BOUNDARY once N change events have been
@@ -815,6 +882,7 @@ pub enum PartitionGranularity {
 pub(crate) fn sample_export(name: &str) -> ExportConfig {
     ExportConfig {
         snapshot_parent: None,
+        split: None,
         name: name.into(),
         target: None,
         load: None,
@@ -872,6 +940,70 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #167: a `--split` sub-export named `daily#0` must fold to family `daily`
+    /// so the load view recombines the N range units as one logical table. RED
+    /// against a `family()` that ignores `split` (returns the unit name `daily#0`,
+    /// which would give each range its own family and defeat the merge-back).
+    #[test]
+    fn split_subexport_folds_to_parent_family() {
+        let mut e = sample_export("daily#0");
+        assert_eq!(
+            e.family(),
+            "daily#0",
+            "no split marker → family is the name"
+        );
+        e.split = Some(SplitSynth {
+            parent: "daily".into(),
+            key_column: "id".into(),
+            lo: Some("1000".into()),
+            hi: Some("2000".into()),
+        });
+        assert_eq!(
+            e.family(),
+            "daily",
+            "a split sub-export must fold to the parent family for the merge-back"
+        );
+    }
+
+    // ── ExportConfig::multiplex_tables ──────────────────────────────────────
+
+    /// The one decision "is this export ONE unit or N?" — read by `rivet
+    /// validate` (descend a sub-prefix per table), the type resolver (one
+    /// resolver document per table) and `rivet load` (one plan per table). All
+    /// three must answer the same, which is why they all call THIS.
+    ///
+    /// Both negative arms matter: a `tables:` list on a non-CDC export is not a
+    /// multiplex (config-load refuses it outright), and an empty list must never
+    /// present as one — a fan-out over zero tables produces zero plans and loads
+    /// nothing, silently.
+    #[test]
+    fn multiplex_tables_is_some_only_for_a_cdc_export_with_a_non_empty_list() {
+        let mut e = sample_export("cdc");
+        assert_eq!(e.multiplex_tables(), None, "no `tables:` → not a multiplex");
+
+        e.tables = Some(vec!["orders".into(), "customers".into()]);
+        assert_eq!(
+            e.multiplex_tables(),
+            None,
+            "`mode: full` is never a multiplex, whatever `tables:` says"
+        );
+
+        e.mode = ExportMode::Cdc;
+        assert_eq!(
+            e.multiplex_tables(),
+            Some(&["orders".to_string(), "customers".to_string()][..]),
+            "a `mode: cdc` export with `tables:` is N units"
+        );
+
+        e.tables = Some(vec![]);
+        assert_eq!(
+            e.multiplex_tables(),
+            None,
+            "an EMPTY list must not present as a multiplex — fanning out over zero \
+             tables plans zero loads and moves no data, silently"
+        );
+    }
 
     // ── ExportConfig::max_file_size_bytes ───────────────────────────────────
 

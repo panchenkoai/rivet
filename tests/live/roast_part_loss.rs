@@ -69,28 +69,18 @@ fn roast_chunked_split_parts_all_rows_reach_destination() {
 
     let export = unique_name("roast_chunk_split");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, payload FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 1000
-    format: csv
-    compression: none
-    max_file_size: 64KB
-    destination: {{type: local, path: {dir}}}
-    tuning: {{batch_size: 250}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, payload FROM {}", table.name()))
+        .mode("chunked")
+        .with_format("csv")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("tuning: {batch_size: 250}")
+        .dest_path(out.path().to_path_buf());
 
-    let run = run_rivet_export(&cfg, &export);
+    let run = rig.run_args(&["--export", &export]);
     assert!(
         run.status.success(),
         "chunked export must succeed; stderr:\n{}",
@@ -147,26 +137,17 @@ fn roast_keyset_split_parts_all_rows_reach_destination() {
 
     let export = unique_name("roast_keyset_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export}
-    table: {table}
-    mode: chunked
-    chunk_size: 500
-    format: csv
-    compression: none
-    max_file_size: 64KB
-    destination: {{type: local, path: {dir}}}
-    tuning: {{batch_size: 250}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .with_format("csv")
+        .export_line("chunk_size: 500")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("tuning: {batch_size: 250}")
+        .dest_path(out.path().to_path_buf());
 
-    let run = run_rivet_export(&cfg, &export);
+    let run = rig.run_args(&["--export", &export]);
     assert!(
         run.status.success(),
         "keyset export must succeed; stderr:\n{}",
@@ -228,29 +209,19 @@ fn roast_keyset_split_parts_parquet_all_rows_reach_destination() {
 
     let export = unique_name("roast_keyset_pq_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export}
-    table: {table}
-    mode: chunked
-    chunk_size: 500
-    format: parquet
-    compression: none
-    max_file_size: 64KB
-    parquet:
-      row_group_strategy: fixed_rows
-      row_group_rows: 100
-    destination: {{type: local, path: {dir}}}
-    tuning: {{batch_size: 250}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_size: 500")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("parquet:")
+        .export_line("  row_group_strategy: fixed_rows")
+        .export_line("  row_group_rows: 100")
+        .export_line("tuning: {batch_size: 250}")
+        .dest_path(out.path().to_path_buf());
 
-    let run = run_rivet_export(&cfg, &export);
+    let run = rig.run_args(&["--export", &export]);
     assert!(
         run.status.success(),
         "keyset parquet export must succeed; stderr:\n{}",

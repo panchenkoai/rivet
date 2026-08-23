@@ -73,20 +73,17 @@ fn diagnose_mysql(
 ) -> Result<ExportDiagnostic> {
     use mysql::prelude::Queryable;
 
-    let mode_str = diagnose_mode_str(export);
-
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    // The column the run actually reads on: chunk_column for range chunking,
-    // chunk_by_key for keyset (seek) — a keyset table has neither chunk_column
-    // nor cursor_column, so without chunk_by_key here range_col is None and every
-    // downstream probe (min/max, the index override) silently degrades keyset to
-    // a false unindexed full-scan verdict. cursor_column last for incremental.
-    let range_col = export
-        .chunk_column
-        .as_deref()
-        .or(export.chunk_by_key.as_deref())
-        .or(export.cursor_column.as_deref());
+    let base_table = preflight_base_table(export, base_query);
+    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
+    // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
+    // probe target the SAME column, not a `?` placeholder on a PK-indexed table.
+    let auto_pk: Option<String> =
+        auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_mysql(conn, t));
+    // The column the run actually reads on: chunk_column for range chunking, chunk_by_key for
+    // keyset (seek), cursor_column for incremental, or the auto-resolved PK above.
+    let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Mysql) {
         format!(
             "SELECT * FROM ({}) AS _rivet ORDER BY {}",
@@ -173,71 +170,34 @@ fn diagnose_mysql(
         }
     };
 
-    // Same logic as the PG side: EXPLAIN of the base query reports `ALL`
-    // (full table scan) for a no-WHERE read, even on tables where the
-    // chunk_column is a perfect PK with a btree. The chunk runner actually
-    // issues `WHERE chunk_col >= $lo AND chunk_col < $hi`, which would use
-    // the index. Override `uses_index` from the catalog when the column is
-    // the leading key of some index on the table.
-    let uses_index = if (matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
-        || export.chunk_by_key.is_some())
-        && let Some(col) = range_col
-        && let Some(table) = export
-            .table
-            .as_deref()
-            .or_else(|| super::postgres::table_from_simple_query(base_query))
-    {
-        match column_has_index_mysql(conn, table, col) {
-            Some(true) => true,
-            Some(false) => plan_uses_index,
-            None => plan_uses_index,
-        }
-    } else {
-        plan_uses_index
-    };
+    // Same logic as the PG side: EXPLAIN of the base query reports `ALL` (full
+    // table scan) for a no-WHERE read, even on tables where the chunk_column is
+    // a perfect PK with a btree. The chunk runner actually issues
+    // `WHERE chunk_col >= $lo AND chunk_col < $hi`, which would use the index —
+    // so answer from the catalog and let `assemble_diagnostic` apply the shared
+    // override policy.
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
+        .and_then(|(table, col)| column_has_index_mysql(conn, table, col));
 
-    let strategy = derive_strategy(export);
-    let verdict = compute_verdict(
-        row_estimate,
-        uses_index,
-        export.cursor_column.is_some(),
-        None, // MySQL exposes no reliable avg_row_bytes pre-run → can't predict RSS
-        export.parallel,
-    );
-    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
-    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
-    // MySQL has no trustworthy scan-free row-width estimate (information_schema
-    // AVG_ROW_LENGTH shares the same InnoDB random-dive statistics as TABLE_ROWS,
-    // which #1 already declined to trust), so the oversized-chunk check is skipped
-    // here by passing `None` — same stance as the row-estimate density diagnostic.
-    let avg_row_bytes: Option<i64> = None;
-    let warnings = collect_warnings(
+    Ok(assemble_diagnostic(
         export,
-        row_estimate,
-        avg_row_bytes,
-        range_min.as_deref(),
-        range_max.as_deref(),
-        db_max_connections,
-    );
-    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
-
-    Ok(ExportDiagnostic {
-        export_name: export.name.clone(),
-        strategy,
-        mode: mode_str,
-        cursor_column: export.cursor_column.clone(),
-        row_estimate,
-        avg_row_bytes,
-        cursor_min: range_min,
-        cursor_max: range_max,
-        scan_type,
-        uses_index,
-        verdict,
-        recommended_profile,
-        recommended_parallel,
-        warnings,
-        suggestion,
-    })
+        ProbeFacts {
+            auto_pk,
+            row_estimate,
+            // MySQL has no trustworthy scan-free row-width estimate
+            // (information_schema AVG_ROW_LENGTH shares the same InnoDB random-dive
+            // statistics as TABLE_ROWS, which #1 already declined to trust), so the
+            // oversized-chunk check and the RSS prediction are skipped here by
+            // passing `None` — same stance as the row-estimate density diagnostic.
+            avg_row_bytes: None,
+            range_min,
+            range_max,
+            scan_type,
+            plan_uses_index,
+            catalog_index,
+            db_max_connections,
+        },
+    ))
 }
 
 fn mysql_row_get_string(row: &mysql::Row, col: &str) -> Option<String> {
@@ -266,6 +226,58 @@ fn mysql_row_get_string(row: &mysql::Row, col: &str) -> Option<String> {
 /// catalog probe ran cleanly and found none, `None` when the probe
 /// itself failed. Callers fall back to the EXPLAIN-based heuristic on
 /// `None`.
+/// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to — so
+/// the diagnostic ranges/probes on the SAME column the run will, not a `?` placeholder
+/// (post-0.24.3 review MED). FAITHFUL mirror of the `single_int_pk` probe in
+/// `source::mysql::introspect_mysql_table_for_chunking` — keep the int-type set in sync
+/// (tinyint/smallint/mediumint/int/bigint). `None` on composite / non-int / absent PK or a
+/// probe error (the planner then does NOT auto-resolve either).
+fn single_int_pk_mysql(conn: &mut mysql::PooledConn, qualified_table: &str) -> Option<String> {
+    use mysql::prelude::Queryable;
+    let (schema, table) = match qualified_table.split_once('.') {
+        Some((s, t)) => (s.to_string(), t.to_string()),
+        None => {
+            let db: Option<String> = conn.query_first("SELECT DATABASE()").ok().flatten();
+            (db.unwrap_or_default(), qualified_table.to_string())
+        }
+    };
+    let pk_first: Option<(String,)> = conn
+        .exec_first(
+            "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY' AND SEQ_IN_INDEX = 1",
+            (&schema, &table),
+        )
+        .ok()
+        .flatten();
+    let (col,) = pk_first?;
+    let composite: Option<(String,)> = conn
+        .exec_first(
+            "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY' AND SEQ_IN_INDEX = 2 \
+             LIMIT 1",
+            (&schema, &table),
+        )
+        .ok()
+        .flatten();
+    if composite.is_some() {
+        return None; // composite PK → the planner does not auto-resolve
+    }
+    let ty: Option<(String,)> = conn
+        .exec_first(
+            "SELECT DATA_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (&schema, &table, &col),
+        )
+        .ok()
+        .flatten();
+    let ty = ty.map(|(t,)| t.to_ascii_lowercase())?;
+    matches!(
+        ty.as_str(),
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+    )
+    .then_some(col)
+}
+
 pub(crate) fn column_has_index_mysql(
     conn: &mut mysql::PooledConn,
     qualified_table: &str,

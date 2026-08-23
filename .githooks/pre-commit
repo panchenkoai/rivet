@@ -34,6 +34,53 @@ if [ -d target/package ]; then
     rm -rf target/package
 fi
 
+# STEP 0.5, still before anything slow: refuse STAGED cargo build artifacts.
+#
+# `.gitignore` carries `/target-*/` because a cross-compile driven with
+# `--target-dir target-linux` lands ~7.5k files inside the crate. That pattern
+# covers the sibling dirs cargo users actually name, and nothing more: a
+# `build-linux/`, `linux-target/` or `target_amd64/` reproduces the identical
+# accident (2ed9548b: 7546 files, one `git add -A`) with no ignore rule and, until
+# now, no check. An ignore list can only enumerate names someone thought of; this
+# grades the CONTENT of what is actually staged, so a new dir name is caught on its
+# first commit instead of after it lands.
+#
+# Two signals, both computed from the staged NAME list alone (one `git diff
+# --cached`, milliseconds — it must not cost anything on a normal commit):
+#   1. Files that only a build produces (`.rlib` / `.rmeta` / `*.rcgu.o`, or a path
+#      through `.fingerprint/` / `incremental/` / `<anything>target<anything>/{debug,
+#      release}/`). Zero of these are tracked today, so any is a mistake.
+#   2. A file COUNT far past anything this repo commits. Measured over every
+#      first-parent commit in history: the largest REAL one is 326 files (37e918b4,
+#      a docs/matrix sweep), the next 163; the two accident commits are 7546 and
+#      7556. The ceiling is 1000 — 3x the largest honest commit, 7x below the
+#      accident — so it costs nobody a false alarm and still catches the class.
+# Deliberate escape hatch for a genuinely huge commit: `git commit --no-verify`.
+echo "pre-commit: staged build-artifact guard"
+staged_list=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -n "$staged_list" ]; then
+    artifacts=$(printf '%s\n' "$staged_list" | grep -E \
+        '\.(rlib|rmeta)$|\.rcgu\.o$|(^|/)(\.fingerprint|incremental)/|(^|/)[^/]*target[^/]*/(debug|release)/|(^|/)(debug|release)/[^/]*\.d$' \
+        || true)
+    if [ -n "$artifacts" ]; then
+        echo "pre-commit: REFUSING — staged files are cargo build output, not source:" >&2
+        printf '%s\n' "$artifacts" | head -10 | sed 's/^/           /' >&2
+        echo "           ($(printf '%s\n' "$artifacts" | wc -l | tr -d ' ') matching path(s).)" >&2
+        echo "           Unstage them (git restore --staged <path>) and add the dir to" >&2
+        echo "           .gitignore — a build dir cargo does not name 'target/' is not" >&2
+        echo "           ignored by default. Override: git commit --no-verify." >&2
+        exit 1
+    fi
+    staged_count=$(printf '%s\n' "$staged_list" | wc -l | tr -d ' ')
+    if [ "$staged_count" -gt 1000 ]; then
+        echo "pre-commit: REFUSING — $staged_count staged files. The largest real commit in" >&2
+        echo "           this repo's history is 326; 7546 was the cross-compile target dir a" >&2
+        echo "           'git add -A' swept in (2ed9548b). Check 'git diff --cached --stat'." >&2
+        echo "           If this really is intended: git commit --no-verify." >&2
+        exit 1
+    fi
+fi
+
 echo "pre-commit: cargo fmt --all -- --check"
 cargo fmt --all -- --check
 

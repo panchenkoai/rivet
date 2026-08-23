@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Make database extraction boring.</strong></p>
 
-<p align="center">One Rust binary, ~18 MB. Extracts PostgreSQL, MySQL, SQL Server, and MongoDB to Parquet/CSV — locally or to S3 / GCS / Azure — without holding long queries open on your production database (chunked/keyset reads keep each query short; on PostgreSQL a full export still runs inside one snapshot transaction for consistency — for multi-hour fulls, read from a replica). <strong>Batch snapshots or log-based change data capture.</strong> Resumable, auditable, source-safe.</p>
+<p align="center">One Rust binary, ~30 MB. Extracts PostgreSQL, MySQL, SQL Server, and MongoDB to Parquet/CSV — locally or to S3 / GCS / Azure — without holding long queries open on your production database (chunked/keyset reads keep each query short; on PostgreSQL a full export still runs inside one snapshot transaction for consistency — for multi-hour fulls, read from a replica). <strong>Batch snapshots or log-based change data capture.</strong> Resumable, auditable, source-safe.</p>
 
 > Not sure if Rivet fits your problem? [docs/who-is-this-for.md](docs/who-is-this-for.md) is a 60-second fit-check.
 
@@ -89,7 +89,7 @@ exports:
 ```
 
 - **Source-safe, like the batch path** — reads the log, never a long `SELECT`: no locks, no snapshot. Catches changes that don't touch an `updated_at` (which a watermark sync silently misses).
-- **At-least-once** on all three engines — commit-boundary checkpoint; PostgreSQL advances its slot only after a durable write.
+- **At-least-once** on all four engines — commit-boundary checkpoint; PostgreSQL advances its slot only after a durable write.
 - **Typed output matches the batch export** — real `Timestamp` / `Decimal` / `json` / `uuid`, not strings (same `build_arrow_field` pipeline).
 - The upsert output shape (`[__op, __pos]` + after-image), the grants each engine needs, the per-engine retention/ack model, and current limitations are in **[docs/reference/cdc.md](docs/reference/cdc.md)**.
 
@@ -139,7 +139,7 @@ How Rivet wins these axes is not magic — it's the deliberately boring extracti
 
 **As of 0.12.0, fast as well as gentle.** Source-safety never meant slow. Rivet now sizes each batch to a ~32 MB memory target instead of a fixed 10,000 rows — which on narrow tables (many rows, few/small columns) sped up extraction **~7.5× on MySQL and ~6× on SQL Server** (rivet 0.11 → 0.12, same 10.24M-row fixture, row-exact). The target is *shape-aware*: narrow tables get large batches, wide tables stay near the old size (so they don't regress). And it's source-neutral *by construction*: batch size governs only how fast Rivet drains its **client-side** buffer, never the SQL it issues — so the source query is held open *less* time, not more (verified: identical server-side rows scanned, zero extra temp-table spills). The trade is bounded *client* memory: narrow-table peak RSS rises to ~70 MB (MySQL) / ~90 MB (SQL Server) — capped by a 150k-row batch ceiling, still an order of magnitude under the multi-GB a giant client buffer needs, and `profile: safe` lowers it further. Measured as an A/B on the same 10.24M-row fixture (0.11 vs 0.12); the benchmark harness in the tree today is [`dev/bench/smoke.py`](dev/bench/smoke.py), which reports throughput, source-harm and type fidelity in one pass.
 
-The numbers above use each tool **at its defaults**. We also published a [**steelman**](docs/bench/reports/REPORT_steelman.md) re-run that gives each competitor its best plausible configuration. Short version: on narrow tables the gap closes; on the wide `content_items` fixture Rivet's edge survives largely intact.
+The numbers above use each tool **at its defaults**. We also ran a **steelman** configuration that gives each competitor its best plausible configuration (steelman configs in [docs/bench/matrix.yaml](docs/bench/matrix.yaml)). Short version: on narrow tables the gap closes; on the wide `content_items` fixture Rivet's edge survives largely intact.
 
 Methodology, exact configs, raw `gtime -v` output, and DB-side counter deltas: [docs/bench/](docs/bench/) — one-command repro.
 
@@ -211,7 +211,7 @@ rivet run       # execute the plan; checkpoint each chunk
 rivet validate  # verify row counts and manifest against the destination
 ```
 
-Branch commands: `rivet apply` (replay a saved plan, **or** run a config's exports wave-by-wave), `rivet reconcile` (compare manifest vs destination), `rivet repair` (re-upload orphaned chunks), `rivet state` (inspect progression and checkpoints).
+Branch commands: `rivet apply` (replay a saved plan, **or** run a config's exports wave-by-wave), `rivet reconcile` (per-partition re-count on the source vs what was exported; requires a chunked run with `chunk_checkpoint: true` — manifest-vs-destination checks are `rivet validate`), `rivet repair` (re-upload orphaned chunks), `rivet state` (inspect progression and checkpoints).
 
 For a first run, `rivet init + rivet run` is enough. The full workflow is for production pipelines where "it ran" is not sufficient — you need a verifiable record of what was written.
 

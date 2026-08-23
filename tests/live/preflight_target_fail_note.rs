@@ -54,39 +54,14 @@ fn check_target_fail_without_strict_notes_ungated_exit() {
 
     let table = seed_bq_failing_table();
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, huge FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, huge FROM {}", table.name()))
+        .dest_path(out.path().to_path_buf());
 
     // `--target bigquery` turns on the type report (dispatch wires
     // `tgt.is_some()` into show_type_report); no `--strict`, so the exit is NOT
     // gated even though `huge` resolves to a hard FAIL.
-    let result = run_rivet(&[
-        "check",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-        "--target",
-        "bigquery",
-    ]);
+    let result = rig.cli(&["check", "--export", table.name(), "--target", "bigquery"]);
 
     let combined = format!(
         "{}{}",
@@ -119,31 +94,12 @@ fn check_target_fail_with_strict_gates_exit_nonzero() {
 
     let table = seed_bq_failing_table();
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, huge FROM {}", table.name()))
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, huge FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = run_rivet(&[
+    let result = rig.cli(&[
         "check",
-        "--config",
-        cfg.to_str().unwrap(),
         "--export",
         table.name(),
         "--target",

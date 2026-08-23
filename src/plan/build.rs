@@ -37,7 +37,24 @@ pub fn build_plan(
             export.name
         );
     }
-    let base_query = export.resolve_query(config_dir, params)?;
+    let base_query = {
+        let q = export.resolve_query(config_dir, params)?;
+        // #167: a `--split` range sub-export restricts the whole export to its key
+        // window `(lo, hi]`. Injected HERE (on the base query every runner wraps)
+        // so the bound is runner-agnostic by construction — full/chunked/keyset
+        // all page over the already-bounded set, the exact runner-bypass trap a
+        // per-runner filter would reintroduce.
+        match &export.split {
+            Some(s) => crate::source::query::wrap_key_range(
+                &q,
+                &s.key_column,
+                s.lo.as_deref(),
+                s.hi.as_deref(),
+                config.source.source_type,
+            ),
+            None => q,
+        }
+    };
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
     // When no `tuning.profile:` is set, fall back to the env-derived default —
@@ -114,8 +131,17 @@ pub fn build_plan(
     let (compression, compression_level) = export.effective_compression();
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
+        bytes_read: Default::default(),
         source_table: export.table.clone(),
         base_query,
+        is_split_unit: export.split.is_some(),
+        // Thread the split window into the plan so finalize records it in the manifest —
+        // the durable anchor for exact-partition resume (SplitSynth → manifest::SplitWindow).
+        split_window: export.split.as_ref().map(|s| crate::manifest::SplitWindow {
+            key_column: s.key_column.clone(),
+            lo: s.lo.clone(),
+            hi: s.hi.clone(),
+        }),
         strategy,
         format: export.format,
         compression,
@@ -123,7 +149,12 @@ pub fn build_plan(
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
-        destination: expand_destination_templates(export.destination.clone(), &export.name),
+        // #167: a `--split` sub-export named `daily#0` must resolve `{export}` /
+        // `{table}` to its FAMILY (`daily`), not the unit name — so all N range
+        // units write into ONE shared prefix and the load view recombines them as
+        // one logical table (the merge-back). An ordinary export's family IS its
+        // name, so this is a no-op off the split path.
+        destination: expand_destination_templates(export.destination.clone(), &export.family()),
         quality: export.quality.clone(),
         tuning,
         tuning_profile_label,
@@ -141,15 +172,10 @@ pub fn build_plan(
         // Batch exports have at most one table; narrow qualified override keys
         // ("table.column") to it — bare keys pass through unchanged. Query
         // exports carry no table (validation already rejects qualified keys).
-        column_overrides: {
-            let all = parse_column_overrides(&export.columns, &export.name)?;
-            match export.table.as_deref() {
-                Some(t) => {
-                    crate::types::overrides_for_table(&all, t.rsplit('.').next().unwrap_or(t))
-                }
-                None => all,
-            }
-        },
+        column_overrides: crate::types::overrides_for_unit(
+            &parse_column_overrides(&export.columns, &export.name)?,
+            export.table.as_deref(),
+        ),
         schema_drift_policy: export.on_schema_drift,
         shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
         parquet: export.parquet.clone(),
@@ -890,6 +916,67 @@ mod tests {
         assert!(!plan.validate);
         assert!(!plan.reconcile);
         assert!(!plan.resume);
+    }
+
+    /// #167 Slice C: a `--split` sub-export's plan restricts `base_query` to its
+    /// key window `(lo, hi]`, injection-safe, on the base every runner wraps. RED
+    /// against a build_plan that ignores `export.split` (base_query stays the raw
+    /// query, so every range unit scans the WHOLE table — N× duplication, the
+    /// split's whole point defeated).
+    #[test]
+    fn split_subexport_plan_bounds_the_base_query_to_its_key_window() {
+        // Interior window (both bounds): WHERE id > 1000 AND id <= 2000.
+        let mut mid = minimal_export();
+        mid.name = "daily#1".into();
+        mid.query = Some("SELECT * FROM t".into());
+        mid.split = Some(crate::config::SplitSynth {
+            parent: "daily".into(),
+            key_column: "id".into(),
+            lo: Some("1000".into()),
+            hi: Some("2000".into()),
+        });
+        let plan = build_plan(
+            &minimal_config(),
+            &mid,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan.base_query.contains("SELECT * FROM t")
+                && plan.base_query.contains("> E'1000'")
+                && plan.base_query.contains("<= E'2000'"),
+            "interior window must bound both sides (PG literal form): {}",
+            plan.base_query
+        );
+
+        // First window (no floor): only the upper bound.
+        let mut first = mid.clone();
+        first.name = "daily#0".into();
+        first.split = Some(crate::config::SplitSynth {
+            parent: "daily".into(),
+            key_column: "id".into(),
+            lo: None,
+            hi: Some("1000".into()),
+        });
+        let plan0 = build_plan(
+            &minimal_config(),
+            &first,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan0.base_query.contains("<= E'1000'") && !plan0.base_query.contains(" > "),
+            "first window must have no floor: {}",
+            plan0.base_query
+        );
     }
 
     #[test]

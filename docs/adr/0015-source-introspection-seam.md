@@ -74,13 +74,14 @@ The bodies share no extractable implementation logic:
 | Client crate | `postgres` | `mysql` |
 | SQL dialect | PG (`$1`/`$2`, `regclass`) | MySQL (`?`, no `regclass`) |
 
-Per the [deletion test](https://github.com/panchenkoai/rivet/blob/main/.claude/skills/improve-codebase-architecture/LANGUAGE.md):
+Per the deletion test (deleting an abstraction must concentrate
+complexity somewhere; if nothing concentrates, it was ceremony):
 deleting the hypothetical trait concentrates no complexity — the two
 free functions remain, the shared struct remains, the dispatch match
 remains. The trait was pure ceremony around two functions whose only
 shared property is "produce the same data shape."
 
-The two-adapters-for-a-real-seam guideline (also in LANGUAGE.md)
+The two-adapters-for-a-real-seam guideline
 expects the adapters to share implementation logic the seam can hide.
 Here the adapters share no implementation logic, only their result
 type — which is the actual seam, and it is already in place.

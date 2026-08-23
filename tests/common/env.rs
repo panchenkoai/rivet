@@ -19,6 +19,21 @@ pub const POSTGRES_PASSWORD: &str = "rivet";
 pub const POSTGRES_DB: &str = "rivet";
 pub const POSTGRES_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
 
+/// The PG **18** batch stand (`dev/stand`, :5518) — a MODERN catalog where
+/// `pg_stat_bgwriter.checkpoints_req` no longer exists and the counter lives on
+/// `pg_stat_checkpointer.num_requested`. The main stack is postgres:16, so this
+/// is the only place a test can exercise the governor sampler's PG17+ arm.
+/// Optional: tests using it SKIP when the stand is down (see `pg_modern_alive`).
+pub const POSTGRES_MODERN_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5518/rivet";
+
+/// Is the optional PG 17+ stand reachable? Unlike [`require_alive`], a missing
+/// stand is not a failure — `dev/stand` is opt-in (`make stand-up`), so a test
+/// that needs a modern catalog reports SKIPPED instead of failing a developer
+/// who only brought up the main stack.
+pub fn pg_modern_alive() -> bool {
+    tcp_alive("127.0.0.1", 5518, Duration::from_millis(500))
+}
+
 /// Same Postgres as `POSTGRES_URL` but routed through Toxiproxy on :15432.
 /// Use this for retry / chaos tests that need to inject latency, timeouts or
 /// RST mid-connection.
@@ -43,6 +58,20 @@ pub const MSSQL_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet
 pub const POSTGRES_CDC_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
 pub const MYSQL_CDC_URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
 pub const MSSQL_CDC_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet";
+
+/// SQL Server for the CONCURRENCY GOVERNOR canaries (`service: mssql-governor`,
+/// port :1435, `governor` profile).
+///
+/// Dedicated because the governor's SQL Server signal is `Log Flush Waits/sec`
+/// read with the `_Total` instance — INSTANCE-WIDE, across every database on the
+/// server. On the shared `mssql` service the two canaries failed in OPPOSITE
+/// directions and both were wrong about the product: the idle one blamed the
+/// governor for a shed a sibling's commits had genuinely earned, and the
+/// pressure one could not get its own writer enough of the machine to move the
+/// counter at all. 72 of the 74 SQL Server live tests do not take the
+/// quiet-window lock, so "idle" was never a property of the fixture — only of
+/// the schedule (audit 2026-08-16).
+pub const MSSQL_GOVERNOR_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1435/rivet";
 
 /// ProxySQL in transaction-persistent mode, port :6033.
 /// Opt in: docker compose --profile pool up -d proxysql
@@ -111,9 +140,27 @@ pub const CLICKHOUSE_CONTAINER: &str = "rivet-clickhouse";
 /// and `rivet-clickhouse`. Tests write Parquet here from Rust, then read the
 /// same path from inside the container.
 pub fn live_shared_tmp_host() -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".live-tmp");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // LOUD worktree footgun (bug hunt 2026-08-08). `docker compose` bind-mounts
+    // `./tests/.live-tmp` of the checkout it was STARTED from. A git WORKTREE
+    // has a different CARGO_MANIFEST_DIR, so a test run from a worktree writes
+    // Parquet into the worktree's tests/.live-tmp while the containers read the
+    // MAIN checkout's — the DuckDB oracle then sees 0 rows or another run's
+    // stale data and "fails" a correct build. Cost an hour of forensics once;
+    // never again silently. A worktree's `.git` is a FILE ("gitdir: …"), a real
+    // checkout's is a DIR — that is the cheap, reliable tell.
+    let git = root.join(".git");
+    if git.is_file() && std::env::var_os("RIVET_ALLOW_WORKTREE_LIVE").is_none() {
+        panic!(
+            "live tests are running from a git WORKTREE ({}), but the duckdb/clickhouse \
+             containers bind-mount tests/.live-tmp of the checkout `docker compose up` was \
+             started from — the paths diverge and the oracle reads the wrong directory. \
+             Run live tests from the main checkout (where you started the stand); or, if you \
+             genuinely started the stand from THIS worktree, set RIVET_ALLOW_WORKTREE_LIVE=1.",
+            root.display()
+        );
+    }
+    let dir = root.join("tests").join(".live-tmp");
     std::fs::create_dir_all(&dir).expect("create tests/.live-tmp");
     dir
 }
@@ -254,6 +301,9 @@ pub enum LiveService {
     MysqlToxi,
     /// SQL Server source engine. TCP :1433.
     Mssql,
+    /// SQL Server dedicated to the concurrency-governor canaries. TCP :1435.
+    /// See [`MSSQL_GOVERNOR_URL`] for why it is not the shared instance.
+    MssqlGovernor,
     /// MongoDB standalone source engine (batch JSON-blob). TCP :27017.
     Mongo,
     /// MongoDB single-node replica set (change-stream CDC). TCP :27018.
@@ -294,6 +344,11 @@ impl LiveService {
             ),
             LiveService::Mysql => ("127.0.0.1", 3306, "service `mysql` in docker-compose.yaml"),
             LiveService::Mssql => ("127.0.0.1", 1433, "service `mssql` in docker-compose.yaml"),
+            LiveService::MssqlGovernor => (
+                "127.0.0.1",
+                1435,
+                "service `mssql-governor` — run: docker compose --profile governor up -d mssql-governor",
+            ),
             LiveService::Mongo => ("127.0.0.1", 27017, "service `mongo` in docker-compose.yaml"),
             LiveService::MongoRs => (
                 "127.0.0.1",
@@ -347,12 +402,33 @@ impl LiveService {
     }
 }
 
-/// Deterministic, collision-free binlog server id for a test, derived from
-/// its unique table name. (Was copy-pasted into four live files before the
-/// rig standardization pass.)
+/// Binlog server id for a test — STABLE within a process (so a resume
+/// reopening the checkpoint keeps the same replica id), DISTINCT across
+/// processes (so the canonical nextest one-process-per-test parallel runner
+/// cannot land two live mysql_cdc tests on one id and have MySQL reject the
+/// second `COM_REGISTER_SLAVE`). Derived from the PID xor the table-name
+/// hash: an FNV hash of the name ALONE reduced into a 50k window can collide
+/// by pigeonhole across ~35 concurrent tests (~1% per run, cumulative), and
+/// the old doc's "collision-free" was aspirational (r5 bughunt). The PID term
+/// makes a cross-test collision require BOTH a name and a PID clash — never in
+/// practice. Same process-keyed shape as the `stage_p{pid}` staging fix.
 pub fn server_id_for(tbl: &str) -> u32 {
     let h = tbl.bytes().fold(2_166_136_261u32, |a, b| {
         (a ^ b as u32).wrapping_mul(16_777_619)
     });
-    10_000 + (h % 50_000)
+    // PID xor THREAD-id: nextest gives each test its own PROCESS (distinct pid),
+    // but `cargo test --test-threads N` runs them as THREADS in one process
+    // (shared pid) — so fold the thread id too, covering both runners. Both are
+    // stable for the life of one test (a resume reopens on the same thread), so
+    // the checkpoint's replica id stays put; across tests either the pid or the
+    // tid differs, so two concurrent mysql_cdc tests never share an id.
+    let pid = std::process::id() as u64;
+    let tid = {
+        let s = format!("{:?}", std::thread::current().id());
+        s.bytes().filter(u8::is_ascii_digit).fold(0u64, |a, b| {
+            a.wrapping_mul(10).wrapping_add((b - b'0') as u64)
+        })
+    };
+    let mix = (h as u64) ^ pid.wrapping_mul(2_654_435_761) ^ tid.wrapping_mul(40_503);
+    10_000 + (mix % 50_000) as u32
 }

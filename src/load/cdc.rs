@@ -107,7 +107,11 @@ impl SourceEngine {
         let pos: Vec<String> = match (warehouse, self) {
             // ── BigQuery: JSON_VALUE + SPLIT(...)[OFFSET(n)] + CAST(... AS INT64)
             (Warehouse::BigQuery, SourceEngine::MySql) => vec![
-                "JSON_VALUE(__pos,'$.file')".into(),
+                // Order by the binlog file's NUMERIC ordinal, not the raw string:
+                // '…999999' sorts AFTER '…1000000' lexically, so at a rollover the
+                // current-state view picked a stale row (bug hunt 2026-08-09, the
+                // load-view sibling of the validate PosKey ordinal fix #169).
+                "CAST(REGEXP_EXTRACT(JSON_VALUE(__pos,'$.file'), r'[0-9]+$') AS INT64)".into(),
                 "CAST(JSON_VALUE(__pos,'$.pos') AS INT64)".into(),
             ],
             (Warehouse::BigQuery, SourceEngine::Postgres) => vec![
@@ -122,7 +126,9 @@ impl SourceEngine {
             }
             // ── Snowflake: PARSE_JSON(__pos):path::type + SPLIT_PART(...,n)
             (Warehouse::Snowflake, SourceEngine::MySql) => vec![
-                "PARSE_JSON(__pos):file::string".into(),
+                // Numeric binlog ordinal, not the raw string (rollover — see the
+                // BigQuery arm; bug hunt 2026-08-09, sibling of #169).
+                "TO_NUMBER(REGEXP_SUBSTR(PARSE_JSON(__pos):file::string, '[0-9]+$'))".into(),
                 "PARSE_JSON(__pos):pos::integer".into(),
             ],
             (Warehouse::Snowflake, SourceEngine::Postgres) => vec![
@@ -394,7 +400,10 @@ mod tests {
     #[test]
     fn bigquery_uses_json_value_and_except() {
         let sql = dedup_view_sql(Warehouse::BigQuery, "v", "c", &["id"], SourceEngine::MySql);
-        assert!(sql.contains("JSON_VALUE(__pos,'$.file') DESC"));
+        // numeric binlog ordinal, not the raw string (rollover fix, sibling #169)
+        assert!(sql.contains(
+            "CAST(REGEXP_EXTRACT(JSON_VALUE(__pos,'$.file'), r'[0-9]+$') AS INT64) DESC"
+        ));
         assert!(sql.contains("CAST(JSON_VALUE(__pos,'$.pos') AS INT64) DESC"));
         assert!(sql.contains("EXCEPT (__op, __pos, __seq, __rn)"));
     }
@@ -402,7 +411,11 @@ mod tests {
     #[test]
     fn snowflake_uses_parse_json_and_exclude() {
         let sql = dedup_view_sql(Warehouse::Snowflake, "v", "c", &["id"], SourceEngine::MySql);
-        assert!(sql.contains("PARSE_JSON(__pos):file::string DESC"));
+        assert!(
+            sql.contains(
+                "TO_NUMBER(REGEXP_SUBSTR(PARSE_JSON(__pos):file::string, '[0-9]+$')) DESC"
+            )
+        );
         assert!(sql.contains("PARSE_JSON(__pos):pos::integer DESC"));
         assert!(sql.contains("EXCLUDE (__op, __pos, __seq, __rn)"));
     }

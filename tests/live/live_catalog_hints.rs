@@ -28,27 +28,14 @@ fn catalog_hints_decimals_resolve_without_column_overrides() {
     let tbl = seed_pg_numeric_table(50);
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(tbl.name())
+        .query(&format!("SELECT * FROM public.{}", tbl.name()))
+        .mode("full")
+        .export_line("compression: snappy")
+        .export_named("nohint_decimal")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: nohint_decimal
-    query: "SELECT * FROM public.{name}"
-    mode: full
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "rivet run must succeed without `columns:` overrides — \
@@ -110,27 +97,13 @@ fn table_shortcut_runs_end_to_end_with_catalog_hints() {
     let tbl = seed_pg_numeric_table(20);
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&format!("public.{}", tbl.name()))
+        .mode("full")
+        .export_line("compression: snappy")
+        .export_named("shortcut_run")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: shortcut_run
-    table: public.{name}
-    mode: full
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "`table:` shortcut export must succeed end-to-end:\n\
@@ -175,28 +148,14 @@ fn chunked_auto_resolves_chunk_column_from_pk() {
     let tbl = seed_pg_numeric_table(2_000);
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&format!("public.{}", tbl.name()))
+        .mode("chunked")
+        .export_line("chunk_size: 500")
+        .export_line("compression: snappy")
+        .export_named("chunked_auto_pk")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: chunked_auto_pk
-    table: public.{name}
-    mode: chunked
-    chunk_size: 500
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "chunked + table: with no explicit chunk_column must auto-resolve from PK:\n\
@@ -237,28 +196,14 @@ fn chunked_small_table_downgrades_to_snapshot() {
 
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&format!("public.{}", tbl.name()))
+        .mode("chunked")
+        .export_line("chunk_size: 100000")
+        .export_line("compression: snappy")
+        .export_named("small_chunked")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: small_chunked
-    table: public.{name}
-    mode: chunked
-    chunk_size: 100000
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(out.status.success(), "small chunked run must succeed");
 
     // Exactly one parquet file proves the downgrade fired (chunked would
@@ -288,28 +233,14 @@ fn chunked_memory_budget_derives_chunk_size() {
 
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&format!("public.{}", tbl.name()))
+        .mode("chunked")
+        .export_line("chunk_size_memory_mb: 4")
+        .export_line("compression: snappy")
+        .export_named("budgeted")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: budgeted
-    table: public.{name}
-    mode: chunked
-    chunk_size_memory_mb: 4
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "mem-budgeted chunked run must succeed:\n\
@@ -343,29 +274,15 @@ fn source_environment_local_runs_fast_profile_by_default() {
     let tbl = seed_pg_numeric_table(50);
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  environment: local
+    let rig = Rig::pg_batch(&format!("public.{}", tbl.name()))
+        .source_line("environment: local")
+        .mode("full")
+        .export_line("compression: snappy")
+        .export_named("env_local")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: env_local
-    table: public.{name}
-    mode: full
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    // Use the warn-level wrapper so the profile decision appears in stderr.
-    let out = run_rivet_with_warn_log(&["run", "-c", cfg.to_str().unwrap()]);
+    // RUST_LOG=warn so the profile decision appears in stderr.
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         out.status.success(),
         "`environment: local` run must succeed:\n\
@@ -395,7 +312,7 @@ fn chunked_nonsimple_query_resolves_numeric_via_base_catalog_hint() {
     require_alive(LiveService::Postgres);
     let tbl = seed_pg_numeric_table(60);
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let yaml = Rig::pg_batch(tbl.name())
+    let rig = Rig::pg_batch(tbl.name())
         .query(&format!(
             r#"SELECT id, amount FROM {name}"#,
             name = tbl.name()
@@ -404,10 +321,8 @@ fn chunked_nonsimple_query_resolves_numeric_via_base_catalog_hint() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 25")
         .export_line("chunk_checkpoint: true")
-        .dest_path(tmp.path().join("o").to_path_buf())
-        .yaml();
-    let cfg = write_config(&tmp, &yaml);
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
+        .dest_path(tmp.path().join("o").to_path_buf());
+    let out = rig.run_args(&["--export", tbl.name()]);
     assert!(
         out.status.success(),
         "chunked non-simple query with an undeclared NUMERIC must resolve via the \
@@ -426,17 +341,15 @@ fn chunked_dense_resolves_numeric_via_base_catalog_hint() {
     require_alive(LiveService::Postgres);
     let tbl = seed_pg_numeric_table(60);
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let yaml = Rig::pg_batch(tbl.name())
+    let rig = Rig::pg_batch(tbl.name())
         .query(&format!(r#"SELECT * FROM {name}"#, name = tbl.name()))
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line("chunk_size: 25")
         .export_line("chunk_dense: true")
         .export_line("chunk_checkpoint: true")
-        .dest_path(tmp.path().join("o").to_path_buf())
-        .yaml();
-    let cfg = write_config(&tmp, &yaml);
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
+        .dest_path(tmp.path().join("o").to_path_buf());
+    let out = rig.run_args(&["--export", tbl.name()]);
     assert!(
         out.status.success(),
         "chunked dense export with an undeclared NUMERIC must resolve via the \
@@ -455,7 +368,7 @@ fn time_window_resolves_numeric_via_base_catalog_hint() {
     require_alive(LiveService::Postgres);
     let tbl = seed_pg_numeric_table(40);
     let tmp = tempfile::tempdir().expect("tmpdir");
-    let yaml = Rig::pg_batch(tbl.name())
+    let rig = Rig::pg_batch(tbl.name())
         .query(&format!(
             r#"SELECT id, amount, created_at FROM {name}"#,
             name = tbl.name()
@@ -463,10 +376,8 @@ fn time_window_resolves_numeric_via_base_catalog_hint() {
         .mode("time_window")
         .export_line("time_column: created_at")
         .export_line("days_window: 1")
-        .dest_path(tmp.path().join("o").to_path_buf())
-        .yaml();
-    let cfg = write_config(&tmp, &yaml);
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap(), "--export", tbl.name()]);
+        .dest_path(tmp.path().join("o").to_path_buf());
+    let out = rig.run_args(&["--export", tbl.name()]);
     assert!(
         out.status.success(),
         "time_window export with an undeclared NUMERIC must resolve via the \

@@ -86,9 +86,10 @@ claims:
 
   - id: run_row_count
     what: "the run's total row count."
-    verified_by: "the release oracle counts rows with the STORE's own client plus DuckDB and compares — 150000 per engine per store."
+    verified_by: "the release oracle asks the SOURCE engine's own client for count+distinct and compares it to DuckDB's read of the parts the MANIFEST declares — the set a consumer (`rivet load`, `validate`) sees, not the set the destination happens to hold."
     independence: independent
-    evidence: "dev/release_oracle/scenarios.py::sc_integrity_types"
+    evidence: "dev/release_oracle/scenarios.py::sc_integrity_types and ::sc_keyset_parallel, both via `_declared_read`."
+    note: "manifest-scoped since 2026-08-23, and the distinction is load-bearing rather than tidy. Both cells previously globbed `**/*.parquet`, which reads what the destination HOLDS; a run that under-declares its own delivery then agrees with the source while a consumer reads short. RED-proven against a real product mutant (finalize.rs dropping the last part from the manifest, so `part_count` and the `_SUCCESS` fingerprint stayed coherent — the shape a hand-edited manifest cannot produce): source 1000, glob 1000 (PASSED, blind), declared 800 (caught); mutant reverted, declared 1000 and 5 parts = 5 declared. `rivet validate` also fails that mutant, but names it RIVET_VERIFY_VALUE_CHECKSUM — 'post-write corruption / Arrow→Parquet encode fault' — when the bytes are intact and the manifest is what is short, so it is not a substitute for this row: it sends the operator after corruption that is not there."
 
   - id: success_marker
     what: "`_SUCCESS` — the run-completed marker, carrying a fingerprint of the manifest."

@@ -24,6 +24,7 @@
 //! the warehouse* is the paid last mile.
 
 use crate::destination::gcs::GcsStore;
+use crate::manifest::census::{ManifestCensus, dedupe_by_run_id, ensure_single_generation};
 use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, RunManifest};
 use crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES;
 use anyhow::{Context, Result, bail};
@@ -98,7 +99,8 @@ pub fn fetch_manifests_keyed(
                 .with_context(|| format!("parsing manifest {key}"))?;
             Ok((key, m))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()
+        .map(dedupe_by_run_id)
 }
 
 /// Full `gs://` URIs of the parquet to load for `new` (the not-yet-loaded run
@@ -216,9 +218,11 @@ pub fn gc_orphans(
     // Success parts → keep. Failed/Interrupted parts → terminal (their run is
     // done, so deletable regardless of `active`). A part in NEITHER set has no
     // manifest at all — the ambiguous case `active` gates.
+    let census = ManifestCensus::new(keyed);
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (key, m) in keyed {
+    for run in census.runs() {
+        let (key, m) = (run.key, run.manifest);
         match m.status {
             ManifestStatus::Success => keep.extend(resolve_parts(key, m)),
             // A `running` manifest is a LIVE run's marker (schema-less, no parts).
@@ -227,7 +231,21 @@ pub fn gc_orphans(
             // spares the run's unmanifested in-flight parts below.
             ManifestStatus::Running => {}
             ManifestStatus::Failed | ManifestStatus::Interrupted => {
-                terminal.extend(resolve_parts(key, m))
+                // A Failed/Interrupted run's parts are USUALLY dead crash debris — but NOT
+                // always. A chunk-checkpoint resume ADOPTS the crashed run's run_id and
+                // REUSES its already-committed parts (rehydrate_manifest_parts_from_file_log
+                // references them into the resumed run's manifest rather than re-exporting),
+                // so while a LIVE run of the SAME export is in flight — a newer, non-superseded
+                // `Running` marker — those "terminal" parts may be getting adopted. Deleting
+                // them mid-resume loses the completed chunks and the resume finalizes Success
+                // referencing parts that are gone (post-0.24.3 review HIGH). Spare exactly those
+                // (KEEP); everything else stays terminal debris, deletable even while an
+                // UNRELATED export's run is active (no over-defer of genuine crash leftovers).
+                if census.adopted_by_active_running(run) {
+                    keep.extend(resolve_parts(key, m));
+                } else {
+                    terminal.extend(resolve_parts(key, m));
+                }
             }
         }
     }
@@ -258,10 +276,10 @@ pub fn gc_orphans(
     // run's marker would accumulate forever. A NON-superseded running manifest is
     // the ACTIVE signal and MUST survive — deletion here is gated on SUPERSESSION,
     // never on `active`.
-    for (key, m) in keyed {
-        if m.status == ManifestStatus::Running && is_superseded(m, keyed) {
-            removed_bytes += store.stat_size(key).unwrap_or(0);
-            store.remove(key)?;
+    for run in census.runs() {
+        if run.manifest.status == ManifestStatus::Running && census.superseded(run) {
+            removed_bytes += store.stat_size(run.key).unwrap_or(0);
+            store.remove(run.key)?;
             removed += 1;
         }
     }
@@ -271,61 +289,43 @@ pub fn gc_orphans(
 /// Is a LIVE run's `running` MARKER manifest present under the prefix — the
 /// bucket-side projection of the run-status ledger, for a cross-boundary load
 /// (Airflow / a foreign-host `rivet load`) that cannot read the extract's state
-/// DB? True iff some `running` manifest is NOT superseded by a NEWER manifest
-/// (any status) of the SAME export — the same clock-free supersession the ledger
-/// uses (a newer `started_at` means the old running run crashed and its successor
-/// already re-ran). `gc_orphans`'s `active` is `ledger_active OR this`, so the two
-/// signals are belt-and-suspenders: the ledger is precise co-located, the marker
-/// covers cross-host.
+/// DB? `gc_orphans`'s `active` is `ledger_active OR this`, so the two signals are
+/// belt-and-suspenders: the ledger is precise co-located, the marker covers
+/// cross-host. The supersession rule it reads is the census's
+/// ([`ManifestCensus::active_running`]) — the same one gc's marker sweep deletes
+/// by, so the two can never disagree about which marker is live.
 pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
-    keyed
-        .iter()
-        .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
-}
-
-/// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
-/// (a higher `started_at`) — it crashed and its successor already re-ran, so it
-/// no longer protects anything. The ONE clock-free staleness predicate, shared by
-/// [`has_active_running_manifest`] (spare the non-superseded) and `gc_orphans`'s
-/// marker-GC sweep (delete the superseded). The ledger enforces the same rule in
-/// SQL — that copy cannot share this Rust.
-fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
-    // FAMILY, not name: a CDC run's `running` marker carries the EXPORT name
-    // while the drain's terminal manifest carries the TABLE string, so with
-    // `name:` ≠ `table:` a name-only compare never matched — a crashed marker
-    // stayed "active" forever and gc over-deferred cleanup permanently. Same
-    // recorded-identity seam as `ensure_single_export`.
-    keyed.iter().any(|(_, o)| {
-        crate::manifest::identity_family(o, keyed) == crate::manifest::identity_family(m, keyed)
-            && o.started_at > m.started_at
-    })
+    ManifestCensus::new(keyed).active_running()
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
-/// manifests under the prefix) pick the newest by `finished_at`. Full loads
-/// OVERWRITE, so exactly ONE snapshot may be loaded (loading every accumulated
-/// run would duplicate rows). Deliberately **not** ledger-gated: full
+/// manifests under the prefix) pick the newest run of each split unit
+/// ([`ManifestCensus::latest_generation`], which owns the grouping rule). Full
+/// loads OVERWRITE, so exactly ONE generation may be loaded (loading every
+/// accumulated run would duplicate rows). Deliberately **not** ledger-gated: full
 /// re-materializes the latest snapshot on *every* load, so a re-load self-heals a
 /// drifted target and stays resilient to hidden in-place source updates. An empty
 /// input (no staged run — e.g. the staging was cleaned) yields an empty
 /// selection, so the caller no-ops WITHOUT truncating the target.
-///
-/// Ordering parses `finished_at` as an instant — a lexical byte compare mis-picks
-/// on mixed RFC3339 precision (`…00.5Z` sorts before `…00Z`) — and falls back to
-/// lexical only if a timestamp fails to parse, so a malformed manifest can't panic.
 pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
-    keyed
-        .into_iter()
-        .max_by(|a, b| {
-            match (
-                chrono::DateTime::parse_from_rfc3339(&a.1.finished_at).ok(),
-                chrono::DateTime::parse_from_rfc3339(&b.1.finished_at).ok(),
-            ) {
-                (Some(x), Some(y)) => x.cmp(&y),
-                _ => a.1.finished_at.cmp(&b.1.finished_at),
-            }
-        })
-        .into_iter()
+    let picked: Vec<usize> = ManifestCensus::new(&keyed)
+        .latest_generation()
+        .iter()
+        .map(|r| r.index)
+        .collect();
+    take_in_order(keyed, &picked)
+}
+
+/// Move the entries at `picked` out of `keyed`, in `picked`'s order — the census
+/// selects by INDEX into the caller's slice, so materialising it costs no clone.
+fn take_in_order(
+    keyed: Vec<(String, RunManifest)>,
+    picked: &[usize],
+) -> Vec<(String, RunManifest)> {
+    let mut slots: Vec<Option<(String, RunManifest)>> = keyed.into_iter().map(Some).collect();
+    picked
+        .iter()
+        .filter_map(|&i| slots.get_mut(i).and_then(Option::take))
         .collect()
 }
 
@@ -342,7 +342,7 @@ pub fn select_runs(
     keyed: Vec<(String, RunManifest)>,
     loaded: &std::collections::HashSet<String>,
     mode: crate::load::plan::LoadMode,
-) -> Vec<(String, RunManifest)> {
+) -> Result<Vec<(String, RunManifest)>> {
     // Only a `Success` run is loadable, so drop every other status BEFORE
     // selection. `Running` is a live run's in-flight marker (no committed
     // parts); `Failed`/`Interrupted` is an ABORTED run whose parts are partial —
@@ -367,11 +367,18 @@ pub fn select_runs(
         .filter(|(_, m)| m.status == ManifestStatus::Success)
         .collect();
     match mode {
-        crate::load::plan::LoadMode::Full => latest_full(keyed),
-        _ => keyed
+        crate::load::plan::LoadMode::Full => {
+            let sel = latest_full(keyed);
+            // ...and that selection must be ONE coherent split generation — the
+            // other half of the census's split classification, so the grouping
+            // above and the coherence check here read the SAME unit identity.
+            ensure_single_generation(&ManifestCensus::new(&sel).runs().iter().collect::<Vec<_>>())?;
+            Ok(sel)
+        }
+        _ => Ok(keyed
             .into_iter()
             .filter(|(_, m)| !loaded.contains(&m.run_id))
-            .collect(),
+            .collect()),
     }
 }
 
@@ -382,23 +389,13 @@ fn list_manifest_keys(store: &GcsStore, base: &str) -> Result<Vec<String>> {
         .into_iter()
         .filter(|k| is_manifest_key(k))
         .collect();
-    // A run into a shared prefix leaves BOTH the canonical `manifest.json`
-    // (last-writer-wins — a pointer to the LATEST run) and an immutable
-    // `manifest-<run_id>.json` copy (one per run). Sum the per-run copies so a
-    // prefix that accumulated several CDC/incremental cycles counts EVERY run;
-    // counting the canonical pointer too would double-count the latest. Fall
-    // back to the canonical name only when no per-run copy exists (a single
-    // batch run, or a legacy prefix predating the run-unique copy).
-    let run_unique: Vec<String> = all
-        .iter()
-        .filter(|k| is_run_unique_manifest(k.rsplit('/').next().unwrap_or("")))
-        .cloned()
-        .collect();
-    Ok(if run_unique.is_empty() {
-        all
-    } else {
-        run_unique
-    })
+    // Return EVERY manifest key — the canonical `manifest.json` pointer AND the
+    // immutable `manifest-<run_id>.json` copies. The double-count guard is a
+    // RUN-ID dedupe in `fetch_manifests_keyed` (post-parse), not a name filter
+    // here: the old "copies win when any exist" rule silently DROPPED a legacy
+    // run whose only record is the canonical name on a prefix that later gained
+    // run-unique copies — an upgrade-compat under-count (roast 2026-08-09, #173).
+    Ok(all)
 }
 
 /// A listed key is a run manifest iff its final path segment is the canonical
@@ -480,10 +477,42 @@ fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
     // filter that required a table dropped both sides and the guard stayed
     // silent on the very case it was written for. Only a manifest with no engine
     // at all has nothing to compare.
+    //
+    // …and that same `table: null` is why a coarser identity must not count as
+    // a DIFFERENT one. The CDC `initial: snapshot` leg is a synthesized BATCH
+    // export writing into the drain's own prefix by design, so it records
+    // `table: null` → `mysql`, while the drain records the table →
+    // `mysql:cashback_versions`. Comparing the two strings refused the
+    // ordinary snapshot → drain → load flow at the load step, on a prefix
+    // holding one table from one database (reproduced on the CDC pilot against
+    // 0.24.3: 5 drain manifests + 2 snapshot-leg manifests). `mysql` there
+    // means "this engine, table unrecorded" — an UNKNOWN, and an unknown is
+    // not evidence of a second source. Refuse only on evidence: a different
+    // engine, or two different NAMED tables. (The same blind spot as the
+    // export-family fold in #138, in the identity this guard added.)
     let sources: std::collections::BTreeSet<String> = keyed
         .iter()
         .map(|(_, m)| crate::manifest::identity_source(m))
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            // Drop an identity that is the BARE ENGINE (no table recorded — the
+            // synthesized batch leg's `table: null`, #144) when a fuller
+            // identity for that engine is present: it is the same source with
+            // less detail. Only the colon-FREE engine folds — a `:`-bearing
+            // identity is a concrete engine:table and must never be treated as
+            // a coarser prefix of another, or two DIFFERENT tables/collections
+            // whose names share a `:` boundary (a Mongo collection literally
+            // named `orders:archive` vs `orders`) would silently fold into one
+            // source and the two-source guard would wrongly pass (bug hunt
+            // 2026-08-08).
+            if s.contains(':') {
+                return true; // concrete engine:table — never a coarsening
+            }
+            !keyed.iter().any(|(_, other)| {
+                let o = crate::manifest::identity_source(other);
+                o.len() > s.len() && o.starts_with(s.as_str()) && o.as_bytes()[s.len()] == b':'
+            })
+        })
         .collect();
     if sources.len() > 1 {
         let listed: Vec<&str> = sources.iter().map(String::as_str).collect();
@@ -613,6 +642,7 @@ mod tests {
     /// optionally, a probed `source_row_count`.
     fn manifest(run: &str, rows: i64, source: Option<i64>) -> RunManifest {
         RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             manifest_version: crate::manifest::MANIFEST_VERSION,
@@ -732,6 +762,101 @@ mod tests {
             ensure_single_export(&[keyed(pg), keyed(again)]).is_ok(),
             "repeated runs of one export must not be refused — that is the normal load"
         );
+    }
+
+    /// A `:` in a collection/table name must not fold two DIFFERENT sources
+    /// into one (bug hunt 2026-08-08). Mongo collection `orders:archive` →
+    /// identity `mongo:orders:archive`; collection `orders` → `mongo:orders`.
+    /// The bare-engine fold used to treat `mongo:orders` as a coarsening of
+    /// `mongo:orders:archive` (both at a `:` boundary) and pass — two distinct
+    /// collections under one export name loading as one source.
+    #[test]
+    fn ensure_single_source_does_not_fold_two_colon_named_collections() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut a = manifest("r1", 10, None);
+        a.source.engine = "mongo".into();
+        a.source.table = Some("orders".into());
+        let mut b = manifest("r2", 10, None);
+        b.source.engine = "mongo".into();
+        b.source.table = Some("orders:archive".into());
+        b.export_name = a.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(a.clone()), keyed(b.clone())]).is_err(),
+            "two collections whose names share a `:` boundary are TWO sources"
+        );
+        // …and the bare-engine fold it must NOT have broken still works:
+        // engine `mongo` (no table) folds into `mongo:orders`.
+        let mut bare = manifest("r3", 10, None);
+        bare.source.engine = "mongo".into();
+        bare.source.table = None;
+        bare.export_name = a.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(a), keyed(bare)]).is_ok(),
+            "a bare engine is still the same source, less detail"
+        );
+    }
+
+    /// Regression (0.24.3, found on the CDC pilot): the SOURCE guard had the
+    /// same blind spot the export guard had — and refused the same flow, one
+    /// check later.
+    ///
+    /// The `initial: snapshot` leg is a synthesized BATCH export, and a batch
+    /// manifest records `table: null` (the table lives in the plan), so its
+    /// identity is the bare engine `mysql` while the drain's is
+    /// `mysql:orders`. Two strings, one source. Measured on a real prefix: 5
+    /// drain manifests + 2 snapshot-leg manifests ⇒ "manifests from 2
+    /// DIFFERENT SOURCES (mysql, mysql:cashback_versions)", and the pilot's
+    /// documented snapshot → drain → load flow could not load.
+    ///
+    /// A coarser identity is an UNKNOWN, not a second source. Refuse on
+    /// evidence — a different engine, or two different NAMED tables.
+    #[test]
+    fn ensure_single_source_admits_the_batch_legs_unrecorded_table() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut drain = manifest("r1", 10, None);
+        drain.source.engine = "mysql".into();
+        drain.source.table = Some("orders".into());
+        // The snapshot leg: same engine, table unrecorded (batch manifest).
+        let mut snap = manifest("r2", 10, None);
+        snap.source.engine = "mysql".into();
+        snap.source.table = None;
+        snap.export_name = drain.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(drain.clone()), keyed(snap.clone())]).is_ok(),
+            "the batch leg's unrecorded table is the SAME source, less detail"
+        );
+        // Order must not matter.
+        assert!(ensure_single_export(&[keyed(snap.clone()), keyed(drain.clone())]).is_ok());
+
+        // What the guard was written for still fires: a different ENGINE…
+        let mut pg = manifest("r3", 10, None);
+        pg.source.engine = "postgres".into();
+        pg.source.table = Some("orders".into());
+        pg.export_name = drain.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(drain.clone()), keyed(pg)]).is_err(),
+            "two engines under one name is still two sources"
+        );
+        // …and two different NAMED tables of one engine.
+        let mut other_tbl = manifest("r4", 10, None);
+        other_tbl.source.engine = "mysql".into();
+        other_tbl.source.table = Some("customers".into());
+        other_tbl.export_name = drain.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(drain), keyed(other_tbl)]).is_err(),
+            "two named tables under one name is still two sources"
+        );
+        // A bare engine that is a prefix of NOTHING present is still its own
+        // identity — two unrecorded-table manifests from different engines
+        // must not silently pass.
+        let mut bare_my = manifest("r5", 10, None);
+        bare_my.source.engine = "mysql".into();
+        bare_my.source.table = None;
+        let mut bare_pg = manifest("r6", 10, None);
+        bare_pg.source.engine = "postgres".into();
+        bare_pg.source.table = None;
+        bare_pg.export_name = bare_my.export_name.clone();
+        assert!(ensure_single_export(&[keyed(bare_my), keyed(bare_pg)]).is_err());
     }
 
     /// Regression: the CDC `initial: snapshot` leg shares the drain's prefix BY
@@ -945,7 +1070,8 @@ mod tests {
             vec![keyed(failed), keyed(ok8), keyed(ok9)],
             &std::collections::HashSet::new(),
             crate::load::plan::LoadMode::Cdc,
-        );
+        )
+        .unwrap();
         let ids: Vec<&str> = sel.iter().map(|(_, m)| m.run_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1212,6 +1338,36 @@ mod tests {
     }
 
     #[test]
+    fn gc_orphans_spares_a_terminal_runs_parts_that_an_active_resume_is_reusing() {
+        // Post-0.24.3 review HIGH: a chunk-checkpoint resume ADOPTS a crashed run's run_id
+        // and REUSES its already-committed parts (rehydrate_manifest_parts_from_file_log),
+        // so a Failed manifest's parts are NOT dead debris while a LIVE run of the SAME export
+        // is in flight (a newer, non-superseded Running marker). Deleting them mid-resume loses
+        // the completed chunks. gc must SPARE them. RED against the pre-fix unconditional
+        // terminal delete (which returned removed=1 even with the live resume present).
+        let (store, _g) = fs_store(&[("base/chunk0.parquet", b"x".to_vec())]);
+        // r0: the crashed run, Failed, referencing the completed chunk (both default export "orders").
+        let mut failed = keyed("base/manifest-r0.json", "r0", "chunk0.parquet");
+        failed.1.status = ManifestStatus::Failed;
+        failed.1.started_at = "2026-01-01T00:00:00Z".into();
+        // r1: the live resume of the SAME export — a newer Running marker adopting r0's parts.
+        let live = running("r1", "2026-01-02T00:00:00Z");
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[failed, live], true).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a terminal run's parts that an active same-export resume is reusing must be spared"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("chunk0.parquet")),
+            "the reused chunk part must survive gc while the resume is live"
+        );
+    }
+
+    #[test]
     fn gc_orphans_spares_an_unmanifested_part_while_a_run_is_active() {
         // The concurrent-extract guard. A part with NO manifest, while a run is
         // ACTIVE on this prefix (the run-status ledger says so), is probably that
@@ -1273,6 +1429,46 @@ mod tests {
     }
 
     #[test]
+    fn a_later_started_split_sibling_finishing_first_does_not_mask_a_live_sibling() {
+        // Post-0.24.3 convergence HIGH: `--pool --split` fans `orders` into siblings that run
+        // CONCURRENTLY under the shared family "orders". orders#2 started LAST (T2) but its window
+        // is smallest so it finishes FIRST (Success); orders#0/#1 are still Running with in-flight
+        // parts. Supersession keyed on (family, started_at) alone would mark #0/#1 superseded by
+        // #2 → has_active_running_manifest=false → a cross-host gc_orphans deletes #0/#1's live
+        // parts. The sibling exclusion must keep the two live markers ACTIVE. RED against the
+        // pre-fix predicate (which returned false here).
+        let unit = |name: &str, status, started: &str| {
+            let mut m = manifest(name, 0, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.status = status;
+            m.started_at = started.into();
+            m.finished_at = String::new();
+            m.parts.clear();
+            (format!("base/manifest-{name}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z"),
+            unit("orders#1", ManifestStatus::Running, "2026-01-01T00:00:01Z"),
+            unit("orders#2", ManifestStatus::Success, "2026-01-01T00:00:02Z"),
+        ];
+        assert!(
+            has_active_running_manifest(&keyed),
+            "two still-Running split siblings must count as active even when a later-started \
+             sibling has already finished — else a cross-host gc deletes their in-flight parts"
+        );
+        // A crash SUCCESSOR (same export_name, newer start) MUST still supersede the crashed marker.
+        let crashed = unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z");
+        let successor = unit("orders#0", ManifestStatus::Running, "2026-01-02T00:00:00Z");
+        let rerun = [crashed, successor];
+        let census = ManifestCensus::new(&rerun);
+        assert!(
+            census.superseded(&census.runs()[0]),
+            "a re-run of the SAME unit (orders#0) must still supersede its crashed marker"
+        );
+    }
+
+    #[test]
     fn has_active_running_manifest_false_when_none_is_running() {
         // A Success manifest is not a live-run marker.
         assert!(!has_active_running_manifest(&[keyed(
@@ -1307,7 +1503,8 @@ mod tests {
             vec![run_marker, ok],
             &std::collections::HashSet::new(),
             crate::load::plan::LoadMode::Incremental,
-        );
+        )
+        .unwrap();
         assert_eq!(sel.len(), 1, "only the Success run is selected");
         assert_eq!(sel[0].1.run_id, "r_ok");
         assert!(sel.iter().all(|(_, m)| m.status != ManifestStatus::Running));
@@ -1359,6 +1556,188 @@ mod tests {
     }
 
     #[test]
+    fn latest_full_over_a_split_family_selects_every_unit_not_just_the_last() {
+        // A `--pool --split` snapshot: 3 units {family}#0..#2, each its own run_id and a
+        // slightly different finished_at. Full load must select ALL THREE (the whole
+        // snapshot), not just whichever unit finished last — the old max_by-over-all
+        // dropped 2 of 3 units silently.
+        let unit = |name: &str, run: &str, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "r0", "2026-01-01T00:00:01Z"),
+            unit("orders#1", "r1", "2026-01-01T00:00:02Z"),
+            unit("orders#2", "r2", "2026-01-01T00:00:03Z"),
+        ];
+        let mut sel = latest_full(keyed);
+        sel.sort_by(|a, b| a.1.export_name.cmp(&b.1.export_name));
+        let names: Vec<&str> = sel.iter().map(|(_, m)| m.export_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["orders#0", "orders#1", "orders#2"],
+            "a Full load over a split prefix must select EVERY unit — one per {{family}}#i — \
+             not just the unit that finished last"
+        );
+    }
+
+    #[test]
+    fn latest_full_over_a_split_family_takes_the_newest_run_per_unit() {
+        // Repeated Full runs into a split prefix: each unit has TWO runs. Per unit, only
+        // the newest is selected (replace semantics), and all units are present.
+        let unit = |name: &str, run: &str, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "r0a", "2026-01-01T00:00:00Z"),
+            unit("orders#0", "r0b", "2026-01-02T00:00:00Z"), // newer #0
+            unit("orders#1", "r1a", "2026-01-01T00:00:00Z"),
+            unit("orders#1", "r1b", "2026-01-02T00:00:00Z"), // newer #1
+        ];
+        let mut sel = latest_full(keyed);
+        sel.sort_by(|a, b| a.1.export_name.cmp(&b.1.export_name));
+        let picked: Vec<(&str, &str)> = sel
+            .iter()
+            .map(|(_, m)| (m.export_name.as_str(), m.run_id.as_str()))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![("orders#0", "r0b"), ("orders#1", "r1b")],
+            "each unit contributes its NEWEST run; no unit is dropped and no stale run loaded"
+        );
+    }
+
+    #[test]
+    fn select_runs_full_refuses_a_mixed_generation_split_prefix() {
+        // Two split generations accumulated under one prefix: gen A split into 3
+        // (orders#0..#2), a later clean run gen B into 2 (orders#0..#1). Nothing deletes gen
+        // A's copies, so latest_full's group-by-name picks B#0, B#1, and STALE A#2 — TWO top
+        // (hi=None) units → overlapping coverage → a Full (replace) load would DUPLICATE the
+        // (700, ∞) rows. select_runs must REFUSE, not silently duplicate.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "b0", None, Some("500"), "2026-01-02T00:00:00Z"),
+            unit("orders#1", "b1", Some("500"), None, "2026-01-02T00:00:01Z"),
+            unit("orders#2", "a2", Some("700"), None, "2026-01-01T00:00:00Z"), // stale gen A top
+        ];
+        let err = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .expect_err("a mixed-generation split prefix must be refused, not silently loaded");
+        assert!(
+            err.to_string().contains("more than one split generation")
+                || err.to_string().contains("DUPLICATE"),
+            "error must name the multi-generation duplication hazard: {err}"
+        );
+    }
+
+    #[test]
+    fn select_runs_full_refuses_an_equal_count_split_generation_with_an_interior_hole() {
+        // The subtler mixed-generation case the bottom/top COUNT guard misses (post-0.24.3
+        // review HIGH). Gen A and gen B both split into 4, so there is exactly ONE bottom
+        // (lo=None) and ONE top (hi=None) — bottoms==1/tops==1/plain==0 all pass. But gen B
+        // re-sampled to DIFFERENT boundaries (200/400/600 vs A's 250/500/750) and its interior
+        // unit #2 crashed, so latest_full substitutes STALE gen A #2 (window (500,750]). The
+        // four selected windows no longer tile: (400,500] is in NO unit (LOST) and (600,750] is
+        // in BOTH A#2 and B#3 (DUPLICATED). Every count/sum still passes. Must REFUSE.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "b0", None, Some("200"), "2026-01-02T00:00:00Z"),
+            unit(
+                "orders#1",
+                "b1",
+                Some("200"),
+                Some("400"),
+                "2026-01-02T00:00:01Z",
+            ),
+            // gen B #2 crashed → stale gen A #2 (500,750] substituted (older finished_at):
+            unit(
+                "orders#2",
+                "a2",
+                Some("500"),
+                Some("750"),
+                "2026-01-01T00:00:00Z",
+            ),
+            unit("orders#3", "b3", Some("600"), None, "2026-01-02T00:00:03Z"),
+        ];
+        let err = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .expect_err(
+            "an equal-count split generation with a gap+overlap must be refused, not loaded",
+        );
+        assert!(
+            err.to_string().contains("tile") || err.to_string().contains("INCOHERENT"),
+            "error must name the non-tiling (gap+overlap) hazard: {err}"
+        );
+    }
+
+    #[test]
+    fn select_runs_full_accepts_one_coherent_split_generation() {
+        // A single clean split generation (one bottom lo=None, one top hi=None) loads all its
+        // units — the headline fix — without tripping the guard.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "r0", None, Some("500")),
+            unit("orders#1", "r1", Some("500"), None),
+        ];
+        let sel = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .unwrap();
+        assert_eq!(
+            sel.len(),
+            2,
+            "both units of one coherent generation must load"
+        );
+    }
+
+    #[test]
     fn latest_full_re_materializes_even_when_the_latest_is_already_loaded() {
         // Full is NOT ledger-skipped: a re-load re-OVERWRITEs from the latest
         // snapshot, self-healing a drifted target and staying resilient to hidden
@@ -1407,12 +1786,12 @@ mod tests {
         ];
         // Stateful, r2 already loaded → still selects r2 (re-materialize/self-heal).
         let loaded = HashSet::from(["r2".to_string()]);
-        let sel = select_runs(keyed.clone(), &loaded, LoadMode::Full);
+        let sel = select_runs(keyed.clone(), &loaded, LoadMode::Full).unwrap();
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].1.run_id, "r2", "Full picks latest, loaded or not");
         // STATELESS (empty loaded) → the latest, NEVER a blanket load of both
         // snapshots (the duplicate-rows bug this fix closes).
-        let sel = select_runs(keyed, &HashSet::new(), LoadMode::Full);
+        let sel = select_runs(keyed, &HashSet::new(), LoadMode::Full).unwrap();
         assert_eq!(sel.len(), 1, "stateless Full is not a blanket load");
         assert_eq!(sel[0].1.run_id, "r2");
     }
@@ -1427,12 +1806,14 @@ mod tests {
         ];
         let loaded = HashSet::from(["r1".to_string()]);
         for mode in [LoadMode::Incremental, LoadMode::Cdc] {
-            let sel = select_runs(keyed.clone(), &loaded, mode);
+            let sel = select_runs(keyed.clone(), &loaded, mode).unwrap();
             assert_eq!(sel.len(), 1, "{mode:?}: only the unloaded run");
             assert_eq!(sel[0].1.run_id, "r2");
             // Stateless → empty loaded → load all (at-least-once, dedup absorbs).
             assert_eq!(
-                select_runs(keyed.clone(), &HashSet::new(), mode).len(),
+                select_runs(keyed.clone(), &HashSet::new(), mode)
+                    .unwrap()
+                    .len(),
                 2,
                 "{mode:?}: stateless loads every run"
             );
@@ -1492,24 +1873,58 @@ mod tests {
     }
 
     #[test]
-    fn list_manifest_keys_prefers_run_unique_copies_over_the_canonical_pointer() {
-        // A shared prefix that accumulated two runs holds the last-writer-wins
-        // `manifest.json` pointer AND one immutable per-run copy each. Summing
-        // must count the two run copies, never the pointer (double-count guard).
-        let (store, _g) = fs_store(&[
-            ("base/manifest.json", b"{}".to_vec()),
-            ("base/manifest-r1.json", b"{}".to_vec()),
-            ("base/manifest-r2.json", b"{}".to_vec()),
-            ("base/part-0.parquet", b"x".to_vec()), // data file: not a manifest
-        ]);
-        let mut keys = list_manifest_keys(&store, "base").unwrap();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
+    fn dedupe_drops_the_pointer_but_keeps_a_legacy_canonical_only_run() {
+        // The double-count guard moved from the KEY level to the RUN-ID level
+        // (#173): the canonical pointer is dropped when its run_id also exists
+        // as an immutable copy — but a LEGACY run whose only record IS the
+        // canonical name (pre-copy prefix that later gained copies) must
+        // survive. The old "copies win when any exist" key filter silently
+        // dropped it (upgrade-compat under-count); RED against that filter.
+        //
+        // Case 1: pointer's run_id (r2) is covered by a copy → pointer dropped.
+        let keyed = vec![
+            (
+                "base/manifest.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r2", 40, Some(40))).unwrap(),
+            ),
+            (
                 "base/manifest-r1.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r1", 100, Some(100)))
+                    .unwrap(),
+            ),
+            (
                 "base/manifest-r2.json".to_string(),
-            ]
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r2", 40, Some(40))).unwrap(),
+            ),
+        ];
+        let mut ids: Vec<String> = dedupe_by_run_id(keyed)
+            .into_iter()
+            .map(|(_, m)| m.run_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["r1".to_string(), "r2".to_string()]);
+
+        // Case 2: the canonical names a LEGACY run (r0) no copy covers → kept.
+        let keyed = vec![
+            (
+                "base/manifest.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r0", 7, Some(7))).unwrap(),
+            ),
+            (
+                "base/manifest-r1.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r1", 100, Some(100)))
+                    .unwrap(),
+            ),
+        ];
+        let mut ids: Vec<String> = dedupe_by_run_id(keyed)
+            .into_iter()
+            .map(|(_, m)| m.run_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["r0".to_string(), "r1".to_string()],
+            "a legacy canonical-only run must not be silently dropped"
         );
     }
 

@@ -1068,6 +1068,7 @@ exports:
                 bytes: 4096,
                 format: "parquet",
                 compression: Some("zstd"),
+                cursor_high: None,
             })
             .unwrap();
         drop(state);
@@ -1116,43 +1117,45 @@ exports:
         let state = open_state(&dir);
         // ≥1000 ms → "X.Xs" branch; retries + validated + schema_changed flags
         state
-            .record_metric(
-                "orders",
-                "r1",
-                1_500,
-                50_000,
-                Some(42),
-                "success",
-                None,
-                Some("balanced"),
-                Some("parquet"),
-                Some("full"),
-                1,
-                4096,
-                3,
-                Some(true),
-                Some(true),
-            )
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "orders".to_string(),
+                run_id: "r1".to_string(),
+                duration_ms: 1_500,
+                total_rows: 50_000,
+                peak_rss_mb: Some(42),
+                status: "success".to_string(),
+                error_message: None,
+                tuning_profile: Some("balanced".to_string()),
+                format: Some("parquet".to_string()),
+                mode: Some("full".to_string()),
+                files_produced: 1,
+                bytes_written: 4096,
+                retries: 3,
+                validated: Some(true),
+                schema_changed: Some(true),
+                ..Default::default()
+            })
             .unwrap();
         // <1000 ms → "Xms" branch; error_message line
         state
-            .record_metric(
-                "orders",
-                "r2",
-                800,
-                0,
-                None,
-                "failed",
-                Some("timeout"),
-                None,
-                None,
-                None,
-                0,
-                0,
-                0,
-                Some(false),
-                None,
-            )
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "orders".to_string(),
+                run_id: "r2".to_string(),
+                duration_ms: 800,
+                total_rows: 0,
+                peak_rss_mb: None,
+                status: "failed".to_string(),
+                error_message: Some("timeout".to_string()),
+                tuning_profile: None,
+                format: None,
+                mode: None,
+                files_produced: 0,
+                bytes_written: 0,
+                retries: 0,
+                validated: Some(false),
+                schema_changed: None,
+                ..Default::default()
+            })
             .unwrap();
         drop(state);
         assert!(show_metrics(&config_path, Some("orders"), 10, false).is_ok());
@@ -1165,23 +1168,24 @@ exports:
         let (dir, config_path) = setup_dir(); // declares orders + transactions
         let state = open_state(&dir);
         let seed = |s: &StateStore, export: &str, run: &str| {
-            s.record_metric(
-                export,
-                run,
-                100,
-                10,
-                None,
-                "success",
-                None,
-                None,
-                Some("parquet"),
-                Some("full"),
-                1,
-                0,
-                0,
-                None,
-                None,
-            )
+            s.record_metric_full(&crate::state::MetricRow {
+                export_name: export.to_string(),
+                run_id: run.to_string(),
+                duration_ms: 100,
+                total_rows: 10,
+                peak_rss_mb: None,
+                status: "success".to_string(),
+                error_message: None,
+                tuning_profile: None,
+                format: Some("parquet".to_string()),
+                mode: Some("full".to_string()),
+                files_produced: 1,
+                bytes_written: 0,
+                retries: 0,
+                validated: None,
+                schema_changed: None,
+                ..Default::default()
+            })
             .unwrap();
         };
         seed(&state, "orders", "r1"); // declared in this config
@@ -1221,6 +1225,7 @@ exports:
                     bytes: 100,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         };

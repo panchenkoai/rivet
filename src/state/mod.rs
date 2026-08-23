@@ -441,6 +441,30 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX IF NOT EXISTS idx_strategy_snapshot_export
              ON strategy_snapshot(export_name, id DESC);",
     ),
+    // v23: decoded bytes READ from the source per run (in-memory Arrow batch
+    // size summed on the plan's shared counter by every sink) — the read-leg
+    // counterpart to bytes_written, so read-vs-write throughput is visible (#175).
+    (
+        23,
+        "ALTER TABLE export_metrics ADD COLUMN bytes_read INTEGER;",
+    ),
+    // v24: the first-run density probe's audit trail (#148) — where the
+    // snapshot's row figure CAME from (probed/counted/catalog-*/unverified),
+    // the catalog's original claim, and the probe shape.
+    (
+        24,
+        "ALTER TABLE strategy_snapshot ADD COLUMN catalog_rows INTEGER;
+        ALTER TABLE strategy_snapshot ADD COLUMN density REAL;
+        ALTER TABLE strategy_snapshot ADD COLUMN estimate_method TEXT;
+        ALTER TABLE strategy_snapshot ADD COLUMN probe_k INTEGER;
+        ALTER TABLE strategy_snapshot ADD COLUMN probe_w INTEGER;",
+    ),
+    // v25: cursor-atomic keyset checkpoint. The page's high-water key, written in the SAME
+    // file_log row as its part(s), so a crash-recovery resume reconciles the cursor from the
+    // COMMITTED parts and never re-reads a committed page — closing the after_manifest_update
+    // dup and its multi-part-rotation variant at the root (a re-read that never happens can't
+    // duplicate). Nullable: only the sequential keyset checkpoint path writes it.
+    (25, "ALTER TABLE file_log ADD COLUMN cursor_high TEXT;"),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -592,25 +616,25 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     // Additive + nullable; BOOLEAN for the bool flags, BIGINT for counts.
     (
         9,
-        "ALTER TABLE export_metrics ADD COLUMN files_committed BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN reconciled BOOLEAN;
-        ALTER TABLE export_metrics ADD COLUMN source_count BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN quality_passed BOOLEAN;
-        ALTER TABLE export_metrics ADD COLUMN pg_temp_bytes_delta BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN batch_size BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN batch_size_memory_mb BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN skip_reason TEXT;
-        ALTER TABLE export_metrics ADD COLUMN schema_fingerprint TEXT;
-        ALTER TABLE export_metrics ADD COLUMN chunk_size BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN parallel BIGINT;
-        ALTER TABLE export_metrics ADD COLUMN source_type TEXT;
-        ALTER TABLE export_metrics ADD COLUMN destination_type TEXT;
-        ALTER TABLE export_metrics ADD COLUMN rivet_version TEXT;",
+        "ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS files_committed BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS reconciled BOOLEAN;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS source_count BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS quality_passed BOOLEAN;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS pg_temp_bytes_delta BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS batch_size BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS batch_size_memory_mb BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS skip_reason TEXT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS schema_fingerprint TEXT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS chunk_size BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS parallel BIGINT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS source_type TEXT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS destination_type TEXT;
+        ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS rivet_version TEXT;",
     ),
     // v10: longest single-chunk wall time (ms). See the SQLite array.
     (
         10,
-        "ALTER TABLE export_metrics ADD COLUMN longest_chunk_ms BIGINT;",
+        "ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS longest_chunk_ms BIGINT;",
     ),
     // v11: per-run source-harm deltas (see the SQLite array for rationale).
     (
@@ -626,7 +650,10 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_export_harm_run ON export_harm(run_id);",
     ),
     // v12: chunking diagnostics (see the SQLite array for rationale).
-    (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
+    (
+        12,
+        "ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS chunk_key TEXT;",
+    ),
     // v13: load ledger (see the SQLite array for rationale). rows_loaded is BIGINT.
     (
         13,
@@ -693,7 +720,7 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     // rehydrate every committed page from file_log; cleared when the run finalizes.
     (
         16,
-        "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
+        "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS resume_run_id TEXT;",
     ),
     // v17: central run-status ledger. The AUTHORITATIVE record of each export
     // run's lifecycle — `running` at start, terminal at finalize. The bucket
@@ -718,12 +745,12 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     // holds the same JSON/scalar payloads.
     (
         18,
-        "ALTER TABLE export_metrics ADD COLUMN error_class TEXT;
-         ALTER TABLE export_metrics ADD COLUMN cursor_min TEXT;
-         ALTER TABLE export_metrics ADD COLUMN cursor_max TEXT;
-         ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
-         ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
-         ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
+        "ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS error_class TEXT;
+         ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS cursor_min TEXT;
+         ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS cursor_max TEXT;
+         ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS key_descriptor_json TEXT;
+         ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS offending_value TEXT;
+         ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS server_context_json TEXT;",
     ),
     // v19: parallel-keyset crash-recovery ranges (see the SQLite v19 comment).
     // range_index/done are BIGINT (not the SQLite INTEGER): the state layer binds
@@ -794,6 +821,29 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
          );
          CREATE INDEX IF NOT EXISTS idx_strategy_snapshot_export
              ON strategy_snapshot(export_name, id DESC);",
+    ),
+    (
+        23,
+        "ALTER TABLE export_metrics ADD COLUMN IF NOT EXISTS bytes_read BIGINT;",
+    ),
+    (
+        24,
+        // IDEMPOTENT (ADD COLUMN IF NOT EXISTS): the gate's shared rivet_state
+        // reached a columns-present / version-23 state (a stale golden-state
+        // snapshot carried the v24 columns while its version row lagged), and a
+        // plain ADD COLUMN then failed \"column already exists\", breaking EVERY
+        // PG-state cell (concurrent-writers, keyset, parity, pool e2e) — roast
+        // 2026-08-10. PG supports IF NOT EXISTS; a migration must be re-runnable.
+        "ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS catalog_rows BIGINT;
+        ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS density DOUBLE PRECISION;
+        ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS estimate_method TEXT;
+        ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS probe_k BIGINT;
+        ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS probe_w BIGINT;",
+    ),
+    // v25: cursor-atomic keyset checkpoint — see the SQLite ladder. IDEMPOTENT (`IF NOT EXISTS`).
+    (
+        25,
+        "ALTER TABLE file_log ADD COLUMN IF NOT EXISTS cursor_high TEXT;",
     ),
 ];
 
@@ -969,6 +1019,10 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
                 "run_id TEXT",
             ];
             for col_def in &metrics_cols {
+                // SQLite has NO `ADD COLUMN IF NOT EXISTS` (unlike PostgreSQL) —
+                // idempotency here is the `let _ =` swallow of the duplicate-column
+                // error. Do NOT add IF NOT EXISTS: SQLite rejects the syntax and
+                // the whole legacy upgrade fails (roast 2026-08-10).
                 let sql = format!("ALTER TABLE export_metrics ADD COLUMN {}", col_def);
                 let _ = conn.execute(&sql, []);
             }
@@ -1456,6 +1510,32 @@ mod tests {
                     pg_tables,
                     "migration v{v}: SQLite and Postgres define different tables"
                 );
+            }
+        }
+    }
+
+    /// Every PG `ALTER TABLE … ADD COLUMN` must be IDEMPOTENT (`IF NOT EXISTS`).
+    /// A migration must be re-runnable: the gate's shared rivet_state reached a
+    /// columns-present / version-behind state (a stale golden-state snapshot) and
+    /// a plain ADD COLUMN then failed "column already exists", breaking EVERY
+    /// PG-state cell (roast 2026-08-10, v24). PostgreSQL supports IF NOT EXISTS;
+    /// this guards the whole class going forward. (SQLite ADD COLUMN has no
+    /// IF NOT EXISTS and is per-file fresh, so this applies to PG only.)
+    #[test]
+    fn every_pg_add_column_is_idempotent() {
+        for &(v, sql) in PG_MIGRATIONS {
+            for line in sql.lines() {
+                let l = line.trim();
+                if l.starts_with("//") || l.starts_with("--") {
+                    continue; // a comment, not a statement
+                }
+                if l.contains("ADD COLUMN") {
+                    assert!(
+                        l.contains("ADD COLUMN IF NOT EXISTS"),
+                        "PG migration v{v} has a non-idempotent ADD COLUMN — must be \
+                         `ADD COLUMN IF NOT EXISTS` so the migration is re-runnable: {l}"
+                    );
+                }
             }
         }
     }

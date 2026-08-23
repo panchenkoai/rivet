@@ -38,8 +38,17 @@ impl PositionCheck {
 /// `Ord`'s discriminant tie-break is irrelevant).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PosKey {
-    /// MySQL binlog `{file, pos}` — zero-padded filename sorts lexically, then pos.
-    Binlog(String, u64),
+    /// MySQL binlog: the file's numeric ORDINAL, then pos. Stored as the
+    /// ordinal (not the filename) because a lexical filename compare inverts at
+    /// the 999999 → 1000000 suffix-width rollover — the exact break the engine's
+    /// `commit_past_bound` parses the ordinal to avoid (bug hunt 2026-08-08).
+    /// A binlog name with no numeric suffix keeps its filename via `BinlogRaw`
+    /// so two such never compare equal by accident.
+    Binlog(u64, u64),
+    /// A binlog file whose name has no parseable ordinal — ordered by name,
+    /// then pos. Never mixed with `Binlog` in a real run (one server, one
+    /// basename), but kept distinct so the fallback is not silently equal.
+    BinlogRaw(String, u64),
     /// PostgreSQL LSN `hi/lo` (hex) → a single u64.
     PgLsn(u64),
     /// SQL Server LSN — fixed-width hex, lexically comparable.
@@ -52,7 +61,13 @@ fn parse_pos(s: &str) -> Option<PosKey> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     if let (Some(file), Some(pos)) = (v.get("file").and_then(|x| x.as_str()), v.get("pos")) {
         let pos = pos.as_u64()?;
-        return Some(PosKey::Binlog(file.to_string(), pos));
+        // Order by the numeric ordinal (shared parser with the engine's
+        // commit_past_bound), falling back to the raw name only when there is
+        // no suffix to parse.
+        return Some(match crate::source::mysql::cdc::binlog_file_ordinal(file) {
+            Some(ord) => PosKey::Binlog(ord, pos),
+            None => PosKey::BinlogRaw(file.to_string(), pos),
+        });
     }
     // MongoDB change-stream position `{"_data": <hex>, "rt": <hex>}`: `_data` is
     // the resume-token keystring, order-preserving under lexical compare (oplog
@@ -107,31 +122,59 @@ fn read_pos_column(body: Vec<u8>) -> Result<Vec<String>> {
 /// at `dest`/`prefix`. Returns the range covered and any ordering violations.
 pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<PositionCheck> {
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
-    // Round-4: the canonical manifest.json can be ABSENT on a CDC prefix that
-    // crashed before its terminal write (the per-roll durability write now emits
-    // only the run-unique copy). Skip the position check gracefully — an empty,
-    // violation-free result — rather than propagating an opaque I/O error on a
-    // prefix whose data is intact (the run-unique manifests + parts are still there).
-    if dest.head(&manifest_key)?.is_none() {
+    // The canonical manifest.json is ABSENT on a daemon/crashed CDC prefix (the
+    // per-roll durability write emits only the run-unique copy). Do NOT report a
+    // false-clean OK over ZERO parts (roast 2026-08-09, #173): fall back to the
+    // run-unique copies (manifest-<run_id>.json) — the same set `load` reconciles
+    // — so validate actually checks the parts that are physically present. Only
+    // an empty result when there is NO manifest of any kind.
+    let manifests: Vec<RunManifest> = if dest.head(&manifest_key)?.is_some() {
+        vec![serde_json::from_slice(&dest.read(&manifest_key)?)?]
+    } else {
+        let mut copies = Vec::new();
+        for m in dest.list_prefix(prefix)? {
+            let base = m.key.rsplit('/').next().unwrap_or("");
+            if crate::manifest::is_run_unique_manifest_name(base) {
+                copies.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
+            }
+        }
+        copies
+    };
+    if manifests.is_empty() {
         return Ok(PositionCheck::default());
     }
-    let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
 
-    // IO half: read every part's __pos in part→row order.
-    let mut items: Vec<(u32, String)> = Vec::new();
-    for part in &manifest.parts {
-        let body = dest.read(&join_key(prefix, &part.path))?;
-        items.extend(
-            read_pos_column(body)?
-                .into_iter()
-                .map(|p| (part.part_id, p)),
-        );
+    // Check each manifest's parts INDEPENDENTLY: a run-unique copy is one run's
+    // full manifest, and __pos is one monotonic sequence WITHIN a run — not
+    // across runs — so concatenating parts from different runs would forge false
+    // backwards-violations. Sum parts/rows; collect every run's violations.
+    let (mut parts, mut rows) = (0usize, 0usize);
+    let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
+    let mut violations = Vec::new();
+    for manifest in &manifests {
+        let mut items: Vec<(u32, String)> = Vec::new();
+        for part in &manifest.parts {
+            let body = dest.read(&join_key(prefix, &part.path))?;
+            items.extend(
+                read_pos_column(body)?
+                    .into_iter()
+                    .map(|p| (part.part_id, p)),
+            );
+        }
+        let (f, l, v) = check_order(&items);
+        parts += manifest.parts.len();
+        rows += items.len();
+        if first.is_none() {
+            first = f;
+        }
+        if l.is_some() {
+            last = l;
+        }
+        violations.extend(v);
     }
-
-    let (first, last, violations) = check_order(&items);
     Ok(PositionCheck {
-        parts: manifest.parts.len(),
-        rows: items.len(),
+        parts,
+        rows,
         first,
         last,
         violations,
@@ -199,7 +242,7 @@ mod v016_checkpoint_compat {
         let raw = serde_json::to_string(&p.0).expect("serialize");
         assert_eq!(
             parse_pos(&raw),
-            Some(PosKey::Binlog("binlog.000004".into(), 150_838_422)),
+            Some(PosKey::Binlog(4, 150_838_422)),
             "the 0.16 MySQL checkpoint must still resume at the SAME file+pos;              a renamed or newly-required field re-anchors the stream instead"
         );
     }
@@ -240,6 +283,20 @@ mod tests {
         assert!(
             parse_pos(r#"{"file":"binlog.000046","pos":999}"#).unwrap()
                 < parse_pos(r#"{"file":"binlog.000047","pos":4}"#).unwrap()
+        );
+        // ROLLOVER (bug hunt 2026-08-08): binlog.1000000 comes AFTER
+        // binlog.999999 ordinally, though "1000000" < "999999" lexically. The
+        // old String-keyed PosKey ordered these backwards, so validate's
+        // monotonicity check misjudged a rotation across the width boundary.
+        assert!(
+            parse_pos(r#"{"file":"binlog.999999","pos":10}"#).unwrap()
+                < parse_pos(r#"{"file":"binlog.1000000","pos":1}"#).unwrap(),
+            "ordinal order: .1000000 is newer than .999999 despite lexical order"
+        );
+        // A no-suffix name falls back to BinlogRaw and never equals an ordinal key.
+        assert_ne!(
+            parse_pos(r#"{"file":"binlog","pos":1}"#).unwrap(),
+            parse_pos(r#"{"file":"binlog.000001","pos":1}"#).unwrap()
         );
         // PostgreSQL LSN: hi/lo hex parsed numerically (not string — "9" > "1A" as
         // strings would be wrong).

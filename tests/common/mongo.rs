@@ -185,6 +185,19 @@ impl MongoTest {
         })
     }
 
+    /// How many documents actually CARRY `field` — MongoDB's own answer, for a
+    /// per-field presence profile against a captured CDC change log. `$exists`
+    /// rather than a non-null test: the question is whether the key is there at
+    /// all, which is exactly what a renderer that drops a field would change.
+    pub fn count_field_present(&self, name: &str, field: &str) -> u64 {
+        self.rt.block_on(async {
+            self.coll(name)
+                .count_documents(doc! { field: { "$exists": true } })
+                .await
+                .expect("mongo: count field present")
+        })
+    }
+
     /// Current `_id → field` state (integer `_id`) — the oracle a dedup of the
     /// captured CDC change log must reproduce exactly.
     pub fn current_state_i64(&self, name: &str, field: &str) -> BTreeMap<i64, String> {

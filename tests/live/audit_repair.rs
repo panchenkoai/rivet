@@ -29,60 +29,21 @@ use crate::common::*;
 /// Seed a `row_count`-row table, write a chunked-checkpoint config, run the
 /// export, and return the table guard plus the output dir, config dir, and
 /// config path. The state DB lands at `<config_dir>/.rivet_state.db`.
-fn seed_and_run_chunked(
-    row_count: i64,
-    chunk_size: u32,
-) -> (
-    PgTable,
-    tempfile::TempDir,
-    tempfile::TempDir,
-    std::path::PathBuf,
-) {
+fn seed_and_run_chunked(row_count: i64, chunk_size: u32) -> (PgTable, Rig) {
     let table = seed_pg_numeric_table(row_count);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {chunk_size}
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display()
-    );
-
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let run_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet run (setup)");
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {chunk_size}"))
+        .export_line("chunk_checkpoint: true");
+    let run_out = rig.run_args(&["--export", table.name()]);
     assert!(
         run_out.status.success(),
         "setup export must succeed; stderr:\n{}",
         String::from_utf8_lossy(&run_out.stderr)
     );
-
-    (table, out_dir, cfg_dir, cfg)
+    (table, rig)
 }
 
 /// Run a SQL statement against the on-disk SQLite state DB via the `sqlite3`
@@ -103,19 +64,8 @@ fn sqlite3_exec(state_db: &std::path::Path, sql: &str) {
 }
 
 /// `rivet reconcile --format json` → (exit success, parsed report).
-fn reconcile_json(cfg: &std::path::Path, export: &str) -> (bool, serde_json::Value) {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            export,
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json");
+fn reconcile_json(rig: &Rig, export: &str) -> (bool, serde_json::Value) {
+    let out = rig.cli(&["reconcile", "--export", export, "--format", "json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
@@ -136,8 +86,8 @@ fn reconcile_json(cfg: &std::path::Path, export: &str) -> (bool, serde_json::Val
 #[ignore = "live: requires docker compose up -d postgres"]
 fn audit_repair_then_reconcile_converges() {
     require_alive(LiveService::Postgres);
-    let (table, _out, cfg_dir, cfg) = seed_and_run_chunked(100, 50);
-    let state_db = cfg_dir.path().join(".rivet_state.db");
+    let (table, rig) = seed_and_run_chunked(100, 50);
+    let state_db = rig.config_path().parent().unwrap().join(".rivet_state.db");
 
     // Force a chunk mismatch the way the audit did: corrupt the stored
     // exported count for chunk 0 directly in the state DB. The source still
@@ -148,7 +98,7 @@ fn audit_repair_then_reconcile_converges() {
     );
 
     // Precondition: reconcile detects the mismatch and gates (exit non-zero).
-    let (ok_before, before) = reconcile_json(&cfg, table.name());
+    let (ok_before, before) = reconcile_json(&rig, table.name());
     assert!(
         !ok_before,
         "precondition: reconcile must exit non-zero on the forced mismatch; report:\n{before:#}"
@@ -160,17 +110,7 @@ fn audit_repair_then_reconcile_converges() {
     );
 
     // Repair the mismatch.
-    let repair = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--execute",
-        ])
-        .output()
-        .expect("spawn rivet repair --execute");
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
     assert!(
         repair.status.success(),
         "repair --execute must exit 0; stderr:\n{}",
@@ -179,7 +119,7 @@ fn audit_repair_then_reconcile_converges() {
 
     // CORRECT behavior: having repaired the only mismatched chunk, a fresh
     // reconcile must now report a clean MATCH and exit 0 — the loop converges.
-    let (ok_after, after) = reconcile_json(&cfg, table.name());
+    let (ok_after, after) = reconcile_json(&rig, table.name());
     let mismatches = after["summary"]["mismatches"].as_u64().unwrap_or(u64::MAX);
     assert_eq!(
         mismatches, 0,
@@ -204,12 +144,12 @@ fn audit_repair_then_reconcile_converges() {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn audit_repair_keeps_validate_clean() {
     require_alive(LiveService::Postgres);
-    let (table, out_dir, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
     // After the clean run, manifest.json + _SUCCESS + 2 chunk parts are at the
     // prefix; validate should be clean.
     let count_parquet = |dir: &std::path::Path| files_with_extension(dir, "parquet").len();
-    let parts_before = count_parquet(out_dir.path());
+    let parts_before = count_parquet(&rig.out_dir());
     assert_eq!(
         parts_before, 2,
         "100 rows / chunk_size 50 → 2 chunk parts after the initial export"
@@ -222,17 +162,7 @@ fn audit_repair_keeps_validate_clean() {
         .expect("drift source");
 
     // Repair: re-exports chunk 0 as a NEW file alongside the originals.
-    let repair = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--execute",
-        ])
-        .output()
-        .expect("spawn rivet repair --execute");
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
     assert!(
         repair.status.success(),
         "repair --execute must exit 0; stderr:\n{}",
@@ -241,7 +171,7 @@ fn audit_repair_keeps_validate_clean() {
 
     // Sanity: the repair actually wrote a new parquet file at the prefix —
     // that file is the candidate the manifest must learn about.
-    let parts_after = count_parquet(out_dir.path());
+    let parts_after = count_parquet(&rig.out_dir());
     assert!(
         parts_after > parts_before,
         "repair --execute must write a new chunk file at the prefix (before {parts_before}, \
@@ -249,18 +179,7 @@ fn audit_repair_keeps_validate_clean() {
     );
 
     // Validate the prefix as a machine-readable report.
-    let validate = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("spawn rivet validate --format json");
+    let validate = rig.cli(&["validate", "--export", table.name(), "--format", "json"]);
     let stdout = String::from_utf8_lossy(&validate.stdout);
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(

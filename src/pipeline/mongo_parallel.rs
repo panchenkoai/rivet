@@ -25,7 +25,6 @@ use crate::error::Result;
 use crate::plan::{IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan};
 use crate::source::mongo::MongoSource;
 use crate::state::StateStore;
-use crate::{destination, format};
 
 pub(crate) fn run_mongo_parallel(
     plan: &ResolvedRunPlan,
@@ -71,6 +70,11 @@ pub(crate) fn run_mongo_parallel(
 
     // Fan out: each worker reads its disjoint slice, writes its parts, returns
     // (rows, PartRecords). Errors surface per worker and fail the whole run.
+    // ONE guarded open at run start (the cross-shape manifest GET), shared into
+    // every worker — N workers used to open GUARDED frames concurrently: N remote
+    // GETs for an answer that cannot change mid-run (roast 2026-08-09, #173; the
+    // chunked sibling was fixed the same way).
+    let (shared_dest, shared_ext) = super::frame::RunnerFrame::open_shared(plan)?;
     let results: Vec<(WorkerOutput, Result<()>)> = std::thread::scope(|s| {
         let handles: Vec<_> = ranges
             .iter()
@@ -81,7 +85,9 @@ pub(crate) fn run_mongo_parallel(
                 let stamp = &stamp;
                 // Bson bounds aren't Copy — clone the slice into the worker.
                 let (lo, hi) = (range.0.clone(), range.1.clone());
-                s.spawn(move || range_worker(url, plan, key_plan, kp, stamp, w, lo, hi))
+                let dest = std::sync::Arc::clone(&shared_dest);
+                let ext = &shared_ext;
+                s.spawn(move || range_worker(url, plan, key_plan, kp, stamp, w, lo, hi, dest, ext))
             })
             .collect();
         handles
@@ -108,13 +114,6 @@ pub(crate) fn run_mongo_parallel(
 
     // Drain on the main thread: sum rows + record every part through the shared
     // commit path (single-threaded → the counter/journal ordering is race-free).
-    let mut drift_schema: Option<arrow::datatypes::Schema> = None;
-    // Form B: fold each worker's XOR-combined checksums run-wide (order-independent
-    // across workers), then harvest once — so a parallel-Mongo manifest records
-    // Form B like every other runner.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
     // Errors are COLLECTED, not propagated mid-drain. `let out = res?` used to sit
     // here, above the record_part calls below — so a worker failure abandoned both
     // its OWN durable pages and every later worker's, and handed
@@ -128,16 +127,21 @@ pub(crate) fn run_mongo_parallel(
             errs.push(format!("worker {w}: {e}"));
         }
         summary.total_rows += out.rows;
+        // ADR-0028: feed the run ledger per worker — the seam pins the
+        // fingerprint, runs the drift gate and harvests Form B once, at the
+        // dispatcher. No application in this runner.
         if let Some(sc) = &out.schema {
-            super::manifest_writer::record_run_schema_fingerprint(summary, sc);
-            if drift_schema.is_none() {
-                drift_schema = Some(sc.clone());
-            }
+            summary.ledger.note_schema(sc);
         }
-        super::commit::accumulate_column_checksums(&mut checksums_acc, &out.column_checksums);
-        if checksum_key_column.is_none() {
-            checksum_key_column = out.checksum_key_column;
-        }
+        // ADR-0029: the worker RANGE is this runner's commit unit, and a worker
+        // hands back what it made durable even when it failed part-way — so the
+        // feed and the record_part drain below pair on the same unit and a
+        // failed worker's parts are covered by the checksums it did compute.
+        summary.ledger.contribute_checksums(
+            commit::UnitId::Chunk(w as i64),
+            &out.column_checksums,
+            out.checksum_key_column,
+        );
         if plan.validate && out.rows > 0 {
             summary.validated = Some(true);
         }
@@ -150,11 +154,10 @@ pub(crate) fn run_mongo_parallel(
                 commit::PartKind::Chunk {
                     chunk_index: w as i64,
                 },
+                commit::UnitId::Chunk(w as i64),
             );
         }
     }
-    super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
-
     // Only now — every durable part is recorded and the counters are truthful.
     if !errs.is_empty() {
         anyhow::bail!(
@@ -172,18 +175,8 @@ pub(crate) fn run_mongo_parallel(
         summary.total_rows
     );
 
-    // on_schema_drift gate — mirror single/keyset: this runner also bypasses
-    // run_single_export, so without this an opted-in `on_schema_drift: fail`
-    // returned exit 0 on a drifted schema for a parallel Mongo export.
-    if let Some(sc) = &drift_schema {
-        super::schema_drift::check_from_sink_schema(
-            state,
-            &plan.export_name,
-            sc,
-            plan.schema_drift_policy,
-            summary,
-        )?;
-    }
+    // ADR-0028: fingerprint/drift/Form-B application lives in the ONE seam
+    // (`finalize::finalize_export`), fed from the ledger above.
     Ok(())
 }
 
@@ -218,6 +211,8 @@ fn range_worker(
     worker: usize,
     lo: mongodb::bson::Bson,
     hi: mongodb::bson::Bson,
+    dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
+    ext: &str,
 ) -> (WorkerOutput, Result<()>) {
     let mut out = WorkerOutput {
         rows: 0,
@@ -226,7 +221,9 @@ fn range_worker(
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_column: None,
     };
-    let res = range_worker_pages(url, plan, key_plan, kp, stamp, worker, lo, hi, &mut out);
+    let res = range_worker_pages(
+        url, plan, key_plan, kp, stamp, worker, lo, hi, dest, ext, &mut out,
+    );
     (out, res)
 }
 
@@ -240,15 +237,12 @@ fn range_worker_pages(
     worker: usize,
     lo: mongodb::bson::Bson,
     hi: mongodb::bson::Bson,
+    dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
+    ext: &str,
     out: &mut WorkerOutput,
 ) -> Result<()> {
     let mut src = MongoSource::connect(url, plan.source.tls.as_ref(), plan.source.mongo.as_ref())?
         .with_id_range(lo, hi);
-    let dest = destination::create_destination(&plan.destination)?;
-    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
-    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
-        .file_extension()
-        .to_string();
 
     let mut last: Option<String> = None;
     let mut page = 0usize;
@@ -277,7 +271,7 @@ fn range_worker_pages(
             key_plan,
             kp.chunk_size,
             last.as_deref(),
-            dest.as_ref(),
+            &**dest,
             &base,
         )?
         else {

@@ -32,7 +32,7 @@ It does not cover database / network / disk failures whose mode is external to R
 | **Chunk** | A row range (chunked mode) processed as one unit. Produces one output file. Has a checkpoint row in the state DB. |
 | **Cursor** | The last extracted value for incremental exports. Stored in `export_state.last_cursor_value`. |
 | **File log** | The per-export ledger of files written to the destination (`file_log` table, renamed from `file_manifest` in schema v8). |
-| **Journal** | A per-run event log (`*.jsonl`). Authoritative for "what happened when" during one run. |
+| **Journal** | A per-run event log, persisted as a single JSON document in the state DB (`run_journal` table); inspect with `rivet journal`. Authoritative for "what happened when" during one run. |
 | **Progression** | The committed / verified boundary per export (`export_progression` table). Advisory only. |
 
 ---
@@ -161,7 +161,7 @@ Rivet runs two distinct parallel engines — see **[ADR-0010 — Two Parallel En
 | In-process scoped threads | Chunked export of a single table, split into N concurrent chunks | None — a panicking worker can fail the run |
 | Subprocess fan-out (`--parallel-export-processes`) | Many independent exports concurrently, one child per export | OS-level — a failing child exits non-zero; the parent aggregates and returns non-zero |
 
-Both engines honour the same state invariants. Chunk checkpoints serialise the parallel threads' state writes; subprocess children write to independent state files unless explicitly pointed at a shared one (not recommended).
+Both engines honour the same state invariants. Chunk checkpoints serialise the parallel threads' state writes; subprocess children share one state DB — the parent migrates it once before spawning, and SQLite WAL (or the PostgreSQL state backend) handles the children's concurrent writes.
 
 ---
 
@@ -190,14 +190,14 @@ Rivet does **not** currently guarantee:
 - **Exactly-once delivery to the destination.** Crashes between destination write and cursor advancement can produce duplicate files. Plan downstream dedup or idempotent ingestion — the manifest's per-part `content_fingerprint` is the supported dedup key: identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint. See [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md).
 - **Continuous / near-real-time replication.** Rivet *does* capture CDC to files (`mode: cdc` — inserts/updates/deletes via a Postgres logical replication slot / MySQL binlog / SQL Server CDC change tables / MongoDB change streams, into typed Parquet/CSV — or the JSON-blob document image for MongoDB — resuming from the last committed log position each run), but it is not a continuously-running stream — changes are captured per invocation, not delivered live. For always-on near-real-time replication use Debezium or Estuary.
 - **Completeness of incremental cursors that can tie.** Incremental resume uses a strict `WHERE cursor > last_value`. If two rows share the high-watermark value and the second becomes visible only *after* the run that advanced the watermark past it — e.g. a low-resolution `updated_at` (second granularity) or rows committed at the same timestamp after the read snapshot — the next run skips them and they are never exported. (Keyset pagination is unaffected: its key is planner-enforced unique + NOT NULL.) Use a **strictly per-row-distinct, monotonic** cursor (a sequence/identity id, or a timestamp with sub-value uniqueness); when the cursor can tie, re-snapshot the affected window with `full`/`chunked` mode.
-- **Dense-chunking stability on a tied, concurrently-written `chunk_column`.** `chunk_dense: true` pages by `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query per chunk. The ordinal partition itself never gaps or overlaps, but the ordinal→row mapping is only stable if the `ORDER BY` is deterministic. On a column with a large **tied** peer group straddling a chunk boundary *while the source is being written concurrently*, two chunk queries could order the tied band differently — duplicating or dropping a boundary row. Against a **static** table this does not occur on any tested engine (PG 16 / MySQL 8 / SQL Server 2022 — verified by `tests/live_chunked_dense.rs`). Prefer a `chunk_column` with no large tied groups, or **keyset** (`chunk_by_key`) on a unique key, when chunking a live-writing table.
+- **Dense-chunking stability on a tied, concurrently-written `chunk_column`.** `chunk_dense: true` pages by `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query per chunk. The ordinal partition itself never gaps or overlaps, but the ordinal→row mapping is only stable if the `ORDER BY` is deterministic. On a column with a large **tied** peer group straddling a chunk boundary *while the source is being written concurrently*, two chunk queries could order the tied band differently — duplicating or dropping a boundary row. Against a **static** table this does not occur on any tested engine (PG 16 / MySQL 8 / SQL Server 2022 — verified by `tests/live/live_chunked_dense.rs`). Prefer a `chunk_column` with no large tied groups, or **keyset** (`chunk_by_key`) on a unique key, when chunking a live-writing table.
 - **Automatic cleanup of an interrupted write's temp file.** A crash mid-write on the local destination may leave a dot-prefixed temp file in the target directory — never a partial *final* file (the commit is an atomic `rename`, so the final path is the complete file or absent). The stray temp file is harmless and can be removed manually.
-- **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live_schema_drift.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_schema_drift.rs)).
+- **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live/live_schema_drift.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_schema_drift.rs)).
 - **Correctness of user-authored SQL.** Rivet executes `query:` verbatim. A query that omits a `WHERE` clause or selects from the wrong table will export the wrong data — there is no semantic validation.
 - **Protection from poorly indexed source queries.** Preflight (`rivet doctor`, `rivet check`) warns about missing cursor indexes and unbounded `ORDER BY`, but it does not refuse to run. The operator decides.
 - **Stdout state safety.** Using stdout with cursor or manifest state is technically allowed but not meaningful; plan validation rejects `stdout + chunked` and `stdout + max_file_size` before execution (ADR-0004 Known Gap).
 - **Atomicity across exports in one run.** If a run has three exports and the second fails, the first export's writes are already committed — the run does not roll back.
-- **Cross-run ordering when running in parallel from multiple machines** against the same state DB. The state DB is SQLite and is designed for a single Rivet process at a time.
+- **Cross-run ordering when running in parallel from multiple machines** against the same state DB. The default state DB is a local SQLite file; concurrent processes on one machine are handled via WAL, but multi-machine deployments should point `RIVET_STATE_URL` at a shared PostgreSQL state backend — cross-run ordering across machines is still not guaranteed.
 
 ---
 
@@ -208,9 +208,9 @@ The invariants on this page are exercised by:
 - [tests/invariants.rs](https://github.com/panchenkoai/rivet/blob/main/tests/invariants.rs) — ADR-0001 I1–I7 structural contracts.
 - [tests/journal_invariants.rs](https://github.com/panchenkoai/rivet/blob/main/tests/journal_invariants.rs) — RunJournal event ordering.
 - [tests/recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/recovery.rs) — chunk checkpoint resume semantics (I5, I6).
-- [tests/live_crash_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_crash_recovery.rs) — crash-and-resume against a live database.
-- [tests/live_chunked_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_chunked_recovery.rs) — chunked resume after partial completion.
-- [tests/live_retry_and_faults.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_retry_and_faults.rs) — retry classification under injected faults.
-- [tests/live_reconcile_repair.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_reconcile_repair.rs) — reconcile / repair end-to-end.
+- [tests/live/live_crash_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_crash_recovery.rs) — crash-and-resume against a live database.
+- [tests/live/live_chunked_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_chunked_recovery.rs) — chunked resume after partial completion.
+- [tests/live/live_retry_and_faults.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_retry_and_faults.rs) — retry classification under injected faults.
+- [tests/live/live_reconcile_repair.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_reconcile_repair.rs) — reconcile / repair end-to-end.
 
 Invariants and recovery suites run as **named semantic gates** in PR CI ([.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml)). Branch protection blocks merges on regression. See [reliability-matrix.md](reliability-matrix.md) for the full coverage matrix.

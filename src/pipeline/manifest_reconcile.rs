@@ -218,6 +218,7 @@ mod tests {
 
     fn manifest(parts: Vec<ManifestPart>) -> RunManifest {
         RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),

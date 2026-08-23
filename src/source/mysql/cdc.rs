@@ -105,19 +105,13 @@ impl MysqlChangeStream {
     /// Hence a refusal rather than a warning: there is no partially-correct outcome
     /// to let the operator choose. The check is one query at open, on the connection
     /// that is about to dump.
-    pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
+    /// Pure verdict half of [`Self::row_image`] (#161, the compression_refusal
+    /// split): `@@global.binlog_row_image` → keep or refuse. `None` (older
+    /// MySQL / MariaDB without the variable) is NOT evidence of a bad setting —
+    /// refusing on absence would lock out binlogs that are fine. Unit-tested in
+    /// both directions; the connect+query half stays live-guarded.
+    pub(crate) fn row_image_verdict(image: Option<&str>) -> super::super::cdc::RowImage {
         use super::super::cdc::RowImage;
-        use mysql::prelude::Queryable;
-
-        let Ok(mut conn) = connect_conn(url, tls) else {
-            return RowImage::Whole;
-        };
-        let image: Option<String> = conn
-            .query_first("SELECT @@global.binlog_row_image")
-            .unwrap_or(None);
-        // An older MySQL / a MariaDB does not expose the variable. Absence is not
-        // evidence of a bad setting, and refusing on it would lock out binlogs
-        // that are fine.
         let Some(image) = image else {
             return RowImage::Whole;
         };
@@ -133,6 +127,19 @@ impl MysqlChangeStream {
                  server default) and re-run"
             ),
         }
+    }
+
+    pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
+        use super::super::cdc::RowImage;
+        use mysql::prelude::Queryable;
+
+        let Ok(mut conn) = connect_conn(url, tls) else {
+            return RowImage::Whole;
+        };
+        let image: Option<String> = conn
+            .query_first("SELECT @@global.binlog_row_image")
+            .unwrap_or(None);
+        Self::row_image_verdict(image.as_deref())
     }
 
     pub(crate) fn open(
@@ -364,19 +371,51 @@ impl MysqlChangeStream {
                     return Ok(false);
                 }
                 let commit = Position(json!({ "file": self.file, "pos": log_pos }));
-                let tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
+                let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
                 self.tx_bytes = 0;
-                let n = tx.len();
-                for (i, mut ev) in tx.into_iter().enumerate() {
-                    ev.position = commit.clone();
-                    ev.committed = i + 1 == n;
+                // #158: the shared close — commit position on all, committed on
+                // the last only (the XID marks the whole transaction's boundary).
+                crate::source::cdc::TxnFramer::close_group(&mut tx, &commit);
+                for ev in tx {
                     self.pending.push_back(ev);
                 }
+            }
+            // #200-2: a compressed transaction. `binlog_transaction_compression`
+            // can be turned on AFTER this run opened (the open-time
+            // `refuse_compressed_binlog` guard saw it OFF and passed), or a
+            // compressed span can already sit in the binlog before the checkpoint
+            // (written while it was ON, then turned OFF). Either way a
+            // `Transaction_payload_event` reaches here, and this reader cannot
+            // expand it. The `_ => {}` arm below would SILENTLY skip it —
+            // capturing NOTHING for that transaction while the checkpoint advances
+            // past it (an at-least-once break, and the open-time refusal's
+            // remediation replays over the already-skipped span). Refuse loudly
+            // instead; the un-acked span is re-read from the checkpoint once
+            // compression is off.
+            Some(EventData::TransactionPayloadEvent(_)) => {
+                return Err(compressed_payload_refusal());
             }
             _ => {}
         }
         Ok(true)
     }
+}
+
+/// The stream-time sibling of [`compression_refusal`]: a `Transaction_payload_event`
+/// reached the reader even though the OPEN-time check passed. Pure so both the
+/// message and the fact that it IS an error are testable offline — deleting the
+/// match arm that calls it (falling through to `_ => {}`) is exactly the silent-skip
+/// bug, which only a live compressed server would otherwise flip.
+fn compressed_payload_refusal() -> anyhow::Error {
+    anyhow::anyhow!(
+        "mysql cdc: encountered a Transaction_payload_event in the binlog — the source has \
+         binlog_transaction_compression enabled (turned on after this run opened, or a compressed \
+         span already in the binlog written while it was on), and this reader cannot expand it. \
+         Skipping it would capture NOTHING for that transaction while the checkpoint advanced past \
+         it — a silent data loss. Turn compression off for the replica rivet reads \
+         (SET GLOBAL binlog_transaction_compression = OFF; and remove it from my.cnf), then \
+         re-run: the un-acked span is re-read from the checkpoint."
+    )
 }
 
 /// Refuse to stream when the source packs transactions into
@@ -486,7 +525,7 @@ fn commit_past_bound(file: &str, pos: u64, bound: Option<&(String, u64)>) -> boo
 }
 
 /// The numeric suffix of a binlog file name (`mysql-bin.000042` → 42).
-fn binlog_file_ordinal(name: &str) -> Option<u64> {
+pub(crate) fn binlog_file_ordinal(name: &str) -> Option<u64> {
     name.rsplit_once('.')?.1.parse().ok()
 }
 
@@ -622,6 +661,24 @@ mod tests {
                 "{ok:?} is not a compressed binlog — the run must proceed"
             );
         }
+    }
+
+    /// #200-2: the open-time guard is not the whole story — compression turned on
+    /// AFTER open (or a compressed span already in the binlog) reaches `fill()` as
+    /// a `Transaction_payload_event`, which the reader cannot expand. Its arm must
+    /// REFUSE (naming the setting + the harm), never fall through to `_ => {}` and
+    /// silently skip the transaction while the checkpoint advances past it. Pure
+    /// message check here; the routing (arm calls this, not `_ => {}`) is proven
+    /// live by `mysql_cdc_compressed_payload_in_stream_refuses_not_skips`.
+    #[test]
+    fn compressed_payload_refusal_names_the_setting_and_the_harm() {
+        let msg = compressed_payload_refusal().to_string();
+        assert!(
+            msg.contains("Transaction_payload_event")
+                && msg.contains("binlog_transaction_compression")
+                && msg.contains("capture NOTHING"),
+            "the stream-time refusal must name the event, the setting, and the harm: {msg}"
+        );
     }
 
     // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.
@@ -828,5 +885,32 @@ mod tests {
             RivetValue::Int(2),
             "resumed stream must start after the checkpoint, not re-read A"
         );
+    }
+
+    /// #161: both directions of the pure row-image verdict, RED against an
+    /// inverted/`Ok(())`-style mutant (the compression_refusal precedent).
+    #[test]
+    fn row_image_verdict_both_directions() {
+        use crate::source::cdc::RowImage;
+        // keep: FULL (any case) and ABSENT (older MySQL / MariaDB).
+        assert!(matches!(
+            MysqlChangeStream::row_image_verdict(Some("FULL")),
+            RowImage::Whole
+        ));
+        assert!(matches!(
+            MysqlChangeStream::row_image_verdict(Some("full")),
+            RowImage::Whole
+        ));
+        assert!(matches!(
+            MysqlChangeStream::row_image_verdict(None),
+            RowImage::Whole
+        ));
+        // refuse: MINIMAL / NOBLOB write partial rows.
+        for bad in ["MINIMAL", "noblob"] {
+            match MysqlChangeStream::row_image_verdict(Some(bad)) {
+                RowImage::Partial { why } => assert!(why.contains(bad), "{why}"),
+                other => panic!("{bad} must refuse, got {other:?}"),
+            }
+        }
     }
 }

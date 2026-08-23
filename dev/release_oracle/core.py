@@ -33,7 +33,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -80,22 +82,88 @@ class Ledger:
         if colour is None:
             colour = sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
         self._colour = colour
+        # Per-phase wall-clock, so the gate self-reports WHERE the 30–60 min goes
+        # (each `phase()` closes the previous one; `report()` prints the breakdown
+        # sorted slowest-first). Answers "what takes so long" every run, cheaply.
+        self._phase_times: list[tuple[str, float]] = []
+        self._cur_phase: str | None = None
+        self._phase_start: float = time.perf_counter()
+        # Buffered mode: a per-ENGINE sub-ledger under parallel `engine_loop`
+        # collects its lines here instead of printing them, so concurrent engines
+        # do not interleave into an unreadable stream. The parent `flush_into`s
+        # each engine's block in engine order after the join. `None` = print live.
+        self._buf: list[str] | None = None
+        # Named sub-spans INSIDE a phase — the granularity `phase()` cannot give
+        # under the PARALLEL engine matrix, where every engine collapses into one
+        # wrapping phase and the buffered children's `_phase_times` are dropped at
+        # merge (summing overlapping child phases would overcount). A `span` is a
+        # single wall-clock ("mssql: blessed_flow", "postgres: seed"); `flush_into`
+        # folds a child's spans into the parent, and `report()` prints them as a
+        # SEPARATE breakdown that is honest about the overlap — spans in different
+        # engines run concurrently, so they are ranked, never summed into a total.
+        self._spans: list[tuple[str, float]] = []
 
     # ── printing ──
     def _c(self, code: str, text: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self._colour else text
 
+    def _emit(self, line: str) -> None:
+        if self._buf is None:
+            print(line, flush=True)
+        else:
+            self._buf.append(line)
+
     def phase(self, msg: str) -> None:
-        print(self._c("1;34", f"▸ {msg}"), flush=True)
+        # Close the previous phase's wall-clock before opening this one.
+        now = time.perf_counter()
+        if self._cur_phase is not None:
+            self._phase_times.append((self._cur_phase, now - self._phase_start))
+        self._cur_phase = msg
+        self._phase_start = now
+        self._emit(self._c("1;34", f"▸ {msg}"))
 
     def ok(self, msg: str) -> None:
-        print(self._c("1;32", f"  ✓ {msg}"), flush=True)
+        self._emit(self._c("1;32", f"  ✓ {msg}"))
 
     def bad(self, msg: str) -> None:
-        print(self._c("1;31", f"  ✗ {msg}"), flush=True)
+        self._emit(self._c("1;31", f"  ✗ {msg}"))
 
     def skip(self, msg: str) -> None:
-        print(self._c("1;33", f"  ⊘ {msg}"), flush=True)
+        self._emit(self._c("1;33", f"  ⊘ {msg}"))
+
+    @contextmanager
+    def span(self, name: str):
+        """Time a named step inside a phase (e.g. one scenario of one engine).
+        Records a single wall-clock into `_spans`; survives the buffered-child
+        merge that drops `_phase_times`, so the parallel engine matrix's internals
+        are visible in the final timing breakdown. Nesting is fine — a span and a
+        sub-span it contains are ranked independently, not netted."""
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._spans.append((name, time.perf_counter() - t0))
+
+    def buffered_child(self) -> "Ledger":
+        """A sub-ledger that BUFFERS output (for one parallel engine). Its cells +
+        buffered lines are folded back with `flush_into` after the engine finishes."""
+        child = Ledger(colour=self._colour)
+        child._buf = []
+        return child
+
+    def flush_into(self, parent: "Ledger") -> None:
+        """Fold this buffered child into `parent`: print its collected block (in one
+        contiguous run, so an engine's output is not interleaved with a sibling's)
+        and merge its cells. Per-phase timings are NOT merged — the parent's
+        wrapping phase already holds the parallel wall-clock; summing overlapping
+        child phases would overcount."""
+        for line in self._buf or []:
+            parent._emit(line)
+        parent.cells.extend(self.cells)
+        # Spans DO travel (unlike _phase_times): each is a per-engine wall-clock
+        # the parent reports ranked, not summed, so overlap across engines is not
+        # double-counted. This is the only window into the parallel matrix.
+        parent._spans.extend(self._spans)
 
     # ── recording ──
     def add(
@@ -137,6 +205,48 @@ class Ledger:
                 f"{c.status.value} {c.detail}"
             )
         print()
+        # Wall-clock breakdown — the phases that actually cost the 30–60 min,
+        # slowest first. `phase("Release Oracle result")` above closed the last
+        # real phase, so `_phase_times` now holds every phase but this report line.
+        timed = [t for t in self._phase_times if not t[0].startswith("Release Oracle result")]
+        if timed:
+            total = sum(d for _, d in timed)
+            self.phase("Timing (wall-clock, slowest first)")
+            for name, dur in sorted(timed, key=lambda p: p[1], reverse=True)[:15]:
+                pct = (dur / total * 100.0) if total > 0 else 0.0
+                print(f"  {dur / 60.0:6.1f} min  {pct:4.0f}%  {name}")
+            print(f"  {total / 60.0:6.1f} min  total (sum of phases)")
+            print()
+        # Inside-the-phase breakdown — the per-engine / per-scenario spans that the
+        # opaque "Engine matrix" phase hides. Ranked slowest-first; NOT summed,
+        # because spans in different engines overlap under `--engine-parallel`. This
+        # is the "where does the time go INSIDE the calls" view.
+        if self._spans:
+            self.phase("Timing — inside the parallel stages (per span; concurrent, so ranked not summed)")
+            for name, dur in sorted(self._spans, key=lambda p: p[1], reverse=True)[:40]:
+                print(f"  {dur / 60.0:6.1f} min  {name}")
+            print()
+            # Per-CELL rollup: a matrix cell span is named "cell <engine> <kind> …".
+            # There are too many to list flat, and the distribution — not any one
+            # cell — is what decides whether cell-level parallelism would pay. Bucket
+            # by "<engine> <kind>" and show count / sum / mean / max / slowest. Sums
+            # are within ONE engine's SEQUENTIAL cell loop, so they ARE additive; the
+            # gap between a group's SUM and its MAX is exactly the wall-clock a
+            # parallel cell loop could reclaim.
+            cells = [(n, d) for n, d in self._spans if n.startswith("cell ")]
+            if cells:
+                groups: dict[str, list[tuple[str, float]]] = {}
+                for n, d in cells:
+                    key = " ".join(n.split()[1:3])  # "<engine> <kind>"
+                    groups.setdefault(key, []).append((n, d))
+                self.phase("Timing — matrix cells per engine×kind (SUM is sequential; SUM−MAX = parallelisable slack)")
+                for key in sorted(groups, key=lambda k: sum(d for _, d in groups[k]), reverse=True):
+                    members = groups[key]
+                    tot = sum(d for _, d in members)
+                    mx_name, mx = max(members, key=lambda p: p[1])
+                    print(f"  {tot / 60.0:6.1f} min  {key:22} n={len(members):<3} "
+                          f"mean={tot / len(members):4.1f}s  max={mx:4.1f}s ({mx_name.split(maxsplit=3)[-1]})")
+                print()
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1
@@ -209,6 +319,36 @@ def docker_exec(container: str, *args: str, stdin: str | None = None, **kw) -> P
 
 def have(tool: str) -> bool:
     return shutil.which(tool) is not None
+
+
+# ── matrix cell concurrency ──────────────────────────────────────────────────────
+# The engine matrix is I/O-wait-bound (measured: ~62% CPU idle on 12 cores while
+# 4 engines run), so its many small, INDEPENDENT cells (own work-dir/prefix each)
+# can run concurrently to fill the idle cores. Engines ALSO run in parallel, so a
+# per-engine cell pool alone would oversubscribe (engines × pool); this ONE global
+# semaphore, shared by every engine's cell pool, caps TOTAL in-flight cells so the
+# shared state DB and source containers are not stampeded. Tune with --cell-parallel.
+_cell_parallel_n = 8
+_cell_gate = threading.BoundedSemaphore(_cell_parallel_n)
+
+
+def set_cell_parallel(n: int) -> None:
+    """Resize the global cell-concurrency cap (called once from main after arg parse)."""
+    global _cell_gate, _cell_parallel_n
+    _cell_parallel_n = max(1, n)
+    _cell_gate = threading.BoundedSemaphore(_cell_parallel_n)
+
+
+def cell_parallel() -> int:
+    """The configured cap value — for sizing a per-engine pool (the semaphore is the
+    real global limiter; this just avoids spawning far more threads than can ever run)."""
+    return _cell_parallel_n
+
+
+def cell_gate() -> threading.BoundedSemaphore:
+    """The shared limiter. Use as `with cell_gate(): run_cell(...)`. Read via a
+    function, not a captured value, so `set_cell_parallel` is honoured after import."""
+    return _cell_gate
 
 
 def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:

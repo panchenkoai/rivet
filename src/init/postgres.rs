@@ -12,12 +12,31 @@ use super::{ColumnInfo, TableInfo};
 /// config), so the transport-security policy comes from the URL's `sslmode`
 /// parameter; the connection itself goes through the same
 /// [`crate::source::postgres::connect_client`] path as doctor/check/run.
-pub(super) fn connect(url: &str) -> Result<Client> {
-    let tls = tls_mode_from_url(url).map(|mode| TlsConfig {
+pub(super) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    // An explicit `--tls` flag WINS over the URL's `sslmode` — the flag is the
+    // operator's direct statement, the URL parameter an inherited convention.
+    let from_url;
+    let tls = match tls {
+        Some(t) => Some(t),
+        None => {
+            from_url = tls_from_url(url);
+            from_url.as_ref()
+        }
+    };
+    crate::source::postgres::connect_client(url, tls)
+}
+
+/// The URL's `sslmode`, as the [`TlsConfig`] the connection actually uses.
+///
+/// Split from `connect` (which needs a live server) so the CONSTRUCTION is
+/// unit-testable: the mutation gate showed `mode` could be dropped from this
+/// struct and nothing offline noticed — the URL's posture would silently fall
+/// back to the default.
+fn tls_from_url(url: &str) -> Option<TlsConfig> {
+    tls_mode_from_url(url).map(|mode| TlsConfig {
         mode,
         ..TlsConfig::default()
-    });
-    crate::source::postgres::connect_client(url, tls.as_ref())
+    })
 }
 
 /// Map the URL's `sslmode` query parameter to the [`TlsMode`] the shared TLS
@@ -101,6 +120,21 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
     let pk_cols: std::collections::HashSet<String> =
         pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
+    // Any indexed column (PK, unique, or secondary) — same shape as pk_rows
+    // minus `indisprimary`. Feeds ColumnInfo.is_indexed so the density probe
+    // (#199) samples only an indexed key, never an unindexed fallback.
+    let indexed_rows = client.query(
+        "SELECT a.attname
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid
+             AND a.attnum = ANY(i.indkey)
+         WHERE i.indrelid = to_regclass($1 || '.' || $2)
+           AND i.indrelid IS NOT NULL",
+        &[&schema, &table],
+    )?;
+    let indexed_cols: std::collections::HashSet<String> =
+        indexed_rows.iter().map(|r| r.get::<_, String>(0)).collect();
+
     // Column metadata — including NULL-ability and numeric precision/scale for decimal columns.
     let col_rows = client.query(
         "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale
@@ -126,7 +160,9 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
             let numeric_precision: Option<i32> = row.get(3);
             let numeric_scale: Option<i32> = row.get(4);
             let is_primary_key = pk_cols.contains(&name);
+            let is_indexed = indexed_cols.contains(&name);
             ColumnInfo {
+                is_indexed,
                 name,
                 data_type,
                 is_primary_key,
@@ -138,6 +174,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
         .collect();
 
     Ok(TableInfo {
+        density: None,
         schema: schema.to_string(),
         table: table.to_string(),
         row_estimate,
@@ -146,8 +183,134 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
     })
 }
 
+/// First-run density probe (#148), PostgreSQL leg: `reltuples` after
+/// autovacuum is usually within a few %, so the probe runs only on LARGE
+/// tables (> 5M estimated), where a % error still moves absolute decisions
+/// (parallel scaling, duration prediction). Same stratified method as MySQL;
+/// best-effort (any error keeps the catalog figure, marked unverified only
+/// when we attempted and failed — an un-probed small table keeps density=None,
+/// i.e. "the catalog is trusted here by policy").
+pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
+    use super::density::*;
+
+    const PG_PROBE_LINE: i64 = 5_000_000;
+    let catalog = info.row_estimate;
+    // #148 (roast 2026-08-09): a never-analyzed table has reltuples -1, clamped
+    // to 0 at introspect — `0 < 5M` would skip the probe and trust 0 on a table
+    // that may hold 100M rows (the just-restored/just-migrated moment users run
+    // init). Probe when the figure is 0/unknown OR large; trust only a REAL
+    // small figure (1..5M) where reltuples is a fresh ANALYZE.
+    if (1..PG_PROBE_LINE).contains(&catalog) {
+        return;
+    }
+    let q_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let rel = format!("{}.{}", q_ident(&info.schema), q_ident(&info.table));
+    let Some(key) = info.best_indexed_chunk_column().map(str::to_string) else {
+        // No integer-indexed chunk key to probe density with — a uuid/text PK is keysettable but
+        // not density-probeable here. If the catalog figure is the clamped/unknown 0 (the
+        // just-restored/just-migrated moment we probe FOR), trusting it scaffolds `mode: full` on
+        // a possibly-huge table. Match MySQL's leg: an honest COUNT(*) when the catalog is
+        // small/unknown (< 1M) — correct-but-slow beats fast-but-wrong; a genuinely large catalog
+        // (>= 5M, the only other way to reach here) is trusted as-is (no scan of a huge table).
+        let counted = (catalog < 1_000_000)
+            .then(|| {
+                client
+                    .query_one(&format!("SELECT COUNT(*)::bigint FROM {rel}"), &[])
+                    .ok()
+                    .and_then(|r| r.try_get::<_, i64>(0).ok())
+            })
+            .flatten();
+        info.density = Some(match counted {
+            Some(n) => {
+                info.row_estimate = n;
+                DensityProbe {
+                    rows: n,
+                    density: 0.0,
+                    method: EstimateMethod::Counted,
+                    catalog_rows: catalog,
+                    k: 0,
+                    w: 0,
+                }
+            }
+            None => DensityProbe {
+                rows: catalog,
+                density: 0.0,
+                method: EstimateMethod::Unverified,
+                catalog_rows: catalog,
+                k: 0,
+                w: 0,
+            },
+        });
+        return;
+    };
+    let kq = q_ident(&key);
+    let Ok(row) = client.query_one(
+        &format!("SELECT MIN({kq})::bigint, MAX({kq})::bigint FROM {rel}"),
+        &[],
+    ) else {
+        return;
+    };
+    let (Some(min), Some(max)): (Option<i64>, Option<i64>) = (row.get(0), row.get(1)) else {
+        return;
+    };
+    let offsets = stratified_offsets(min, max, PROBE_K, PROBE_W);
+    if offsets.is_empty() {
+        return;
+    }
+    let mut counts = Vec::with_capacity(offsets.len());
+    for off in &offsets {
+        let hi = off.saturating_add(PROBE_W - 1);
+        match client.query_one(
+            &format!("SELECT COUNT(*) FROM {rel} WHERE {kq} BETWEEN {off} AND {hi}"),
+            &[],
+        ) {
+            Ok(r) => counts.push(r.get::<_, i64>(0)),
+            Err(_) => return,
+        }
+    }
+    let sampled: i64 = counts.iter().sum();
+    if !super::density::probe_trustworthy(sampled, offsets.len()) {
+        // #148 sparse-key guard: too few sampled rows to trust the extrapolation.
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::Unverified,
+            catalog_rows: catalog,
+            k: offsets.len(),
+            w: PROBE_W,
+        });
+        return;
+    }
+    let (rows, density) = estimate_from_windows(min, max, &counts, PROBE_W);
+    info.row_estimate = rows;
+    info.density = Some(DensityProbe {
+        rows,
+        density,
+        method: EstimateMethod::Probed,
+        catalog_rows: catalog,
+        k: offsets.len(),
+        w: PROBE_W,
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    /// The struct the URL's sslmode becomes must CARRY the mode — dropping the
+    /// field compiles (struct-update syntax fills the default) and silently
+    /// downgrades the posture. Named by the mutation gate on #154.
+    #[test]
+    fn url_sslmode_lands_in_the_config_it_builds() {
+        use crate::config::TlsMode;
+        // `require`, deliberately NOT `verify-full`: VerifyFull is TlsMode's
+        // `#[default]`, so a fixture equal to the default cannot see the
+        // delete-field mutant (struct-update fills the default back in) — the
+        // below-activation-threshold fixture lesson, caught on the first try.
+        let t = super::tls_from_url("postgresql://u:p@h/db?sslmode=require").expect("require maps");
+        assert_eq!(t.mode, TlsMode::Require);
+        assert!(!t.accept_invalid_certs && t.ca_file.is_none());
+        assert!(super::tls_from_url("postgresql://u:p@h/db").is_none());
+    }
+
     use super::tls_mode_from_url;
     use crate::config::TlsMode;
 

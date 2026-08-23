@@ -16,57 +16,27 @@
 use crate::common::*;
 
 /// Seed a 100-row table with chunk_size 50 (→ chunk 0 and chunk 1), run the
-/// chunked export, and return the table guard, output dir, and config path.
-fn seed_and_run_two_chunks() -> (
-    PgTable,
-    tempfile::TempDir,
-    tempfile::TempDir,
-    std::path::PathBuf,
-) {
+/// chunked export, and return the table guard, output dir, and rig.
+fn seed_and_run_two_chunks() -> (PgTable, tempfile::TempDir, Rig) {
     let table = seed_pg_numeric_table(100);
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out_dir.path().to_path_buf());
 
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let run_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet run (setup)");
+    let run_out = rig.run_args(&["--export", table.name()]);
     assert!(
         run_out.status.success(),
         "setup export must succeed; stderr:\n{}",
         String::from_utf8_lossy(&run_out.stderr)
     );
 
-    (table, out_dir, cfg_dir, cfg)
+    (table, out_dir, rig)
 }
 
 /// Parquet files in `dir` whose name contains the given `_chunk{n}_` token.
@@ -88,7 +58,7 @@ fn parts_for_chunk(dir: &std::path::Path, n: usize) -> Vec<std::path::PathBuf> {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn repair_execute_names_repaired_file_after_original_chunk_index() {
     require_alive(LiveService::Postgres);
-    let (table, out_dir, _cfg_dir, cfg) = seed_and_run_two_chunks();
+    let (table, out_dir, rig) = seed_and_run_two_chunks();
 
     // After a clean run: exactly one part for chunk 0 and one for chunk 1.
     assert_eq!(
@@ -108,17 +78,7 @@ fn repair_execute_names_repaired_file_after_original_chunk_index() {
     c.batch_execute(&format!("DELETE FROM {} WHERE id >= 80", table.name()))
         .expect("drift source under chunk 1");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--execute",
-        ])
-        .output()
-        .expect("spawn rivet repair --execute");
+    let out = rig.cli(&["repair", "--export", table.name(), "--execute"]);
     assert!(
         out.status.success(),
         "repair --execute must succeed; stderr:\n{}",

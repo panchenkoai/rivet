@@ -369,9 +369,7 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
     }
 
     let bg_db = db.clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let w = MongoTest::connect(PORT, &bg_db);
         let mut i = 10_000;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -381,11 +379,16 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
         }
     });
 
-    let start = std::time::Instant::now();
-    rig.run_ok(); // must return at the time bound, not hang until the writer stops
-    let elapsed = start.elapsed();
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    // BOUNDED, like every peer of this test shape (pg/mysql/mssql sustained-
+    // writes all use run_rivet_bounded): Mongo is the LOAD-BEARING engine for
+    // the open-bound — its tailable stream never empty-polls under sustained
+    // writes, so a regression here HANGS run_ok forever, fed by the 15ms
+    // upserter below (r3 bughunt: the one unbounded drain among four peers).
+    let elapsed = run_rivet_bounded(&rig.config_path(), std::time::Duration::from_secs(30));
+    bg.stop();
+    let elapsed = elapsed.unwrap_or_else(|| {
+        panic!("until_current drain HUNG past the 30s watchdog under sustained writes")
+    });
 
     assert!(
         elapsed < std::time::Duration::from_secs(6),
@@ -447,9 +450,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     // A writer floods _id 10000+ THROUGH run 1, so run 1's open-time cluster-time
     // bound falls mid-stream and it must terminate on a PREFIX, deferring the tail.
     let bg_db = db.clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let w = MongoTest::connect(PORT, &bg_db);
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -463,8 +464,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     // Run 1 must TERMINATE under sustained writes (the cluster-time bound clips
     // it); killed at 30s if it hangs.
     let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     assert!(
         elapsed.is_some(),
         "run 1 must terminate at the open-time cluster-time bound under sustained writes (killed at 30s)"
@@ -633,6 +633,96 @@ fn mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch() {
             "nested unicode + array must be VERBATIM in the CDC document (op '{}'); got: {}",
             ch.op,
             ch.document
+        );
+    }
+}
+
+/// Per-FIELD presence profile against MONGODB ITSELF — the schemaless analogue
+/// of the per-column NULL profile the SQL engines carry.
+///
+/// Mongo's CDC image is a JSON BLOB (`_id` + `document`), so "a column silently
+/// became NULL" has no direct shape here. The equivalent silent loss is a FIELD
+/// vanishing from the rendered document while every count still balances: the
+/// change count matches, `_id`s all present, and one key is simply gone from the
+/// post-images. The existing oracles cannot see it — the soak test deduplicates
+/// on ONE field (`v`) and the tricky-BSON test reads a SINGLE document, so a
+/// fault that drops a different field, or drops it in only some documents, is
+/// invisible to both.
+///
+/// The oracle is MongoDB's own per-field presence count, compared against
+/// DuckDB's `json_extract` over the captured `document` column — two readers
+/// that share no code with rivet's renderer.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_per_field_presence_matches_the_source() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    use mongodb::bson::doc;
+    let db = unique_name("cdc_fields");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("f");
+
+    let rig = cdc(&db, "f");
+    rig.run_ok(); // anchor over the empty collection
+
+    // A POPULATION, not one document: a fault that drops a field in only some
+    // renderings needs more than one to be distinguishable from a fixture typo.
+    // `opt` is deliberately present on only half the documents, so the profile
+    // has to match a NON-TRIVIAL number on at least one field — a check where
+    // every field is present everywhere passes just as well when the extraction
+    // is broken and returns everything.
+    const DOCS: i64 = 24;
+    let docs: Vec<_> = (1..=DOCS)
+        .map(|i| {
+            let mut d = doc! { "_id": i, "always": format!("a{i}"), "nested": doc!{ "k": i } };
+            if i % 2 == 0 {
+                d.insert("opt", format!("o{i}"));
+            }
+            d
+        })
+        .collect();
+    m.insert_many("f", docs);
+    for _ in 0..3 {
+        rig.run_ok();
+    }
+
+    let captured = read_mongo_cdc_changes(&rig.out_dir()).len() as i64;
+    assert!(
+        captured >= DOCS,
+        "fixture inert: only {captured} change(s) captured for {DOCS} inserted documents"
+    );
+
+    // Every post-image must CARRY its document. A delete has none by design, so
+    // the profile is taken over the non-delete ops only.
+    let missing_doc = duckdb_dir_scalar(
+        &rig.out_dir(),
+        "count(*) - count(\"document\")",
+        Some("__op <> 'delete'"),
+    );
+    assert_eq!(
+        missing_doc, 0,
+        "{missing_doc} captured post-image(s) carry no document at all — a blob that \
+         degrades to NULL is this model's whole-row silent loss"
+    );
+
+    for (field, expected) in [("always", DOCS), ("opt", DOCS / 2), ("nested", DOCS)] {
+        // MongoDB's own answer, not a number this test assumes.
+        let src = m.count_field_present("f", field) as i64;
+        assert_eq!(
+            src, expected,
+            "fixture drifted: MongoDB reports {src} document(s) with '{field}', the fixture \
+             builds {expected} — the comparison below would then grade the wrong population"
+        );
+        let dst = duckdb_dir_scalar(
+            &rig.out_dir(),
+            &format!("count(json_extract(\"document\", '$.{field}'))"),
+            Some("__op <> 'delete'"),
+        );
+        assert_eq!(
+            src, dst,
+            "field '{field}': presence parity against MongoDB itself — source {src}, \
+             captured {dst}. A renderer that drops a field moves this and nothing else; \
+             the change count, the `_id` set and a single-field dedup all still balance."
         );
     }
 }

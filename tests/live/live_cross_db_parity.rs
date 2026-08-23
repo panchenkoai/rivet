@@ -24,27 +24,19 @@ fn export_to_parquet_local(
     out_dir: &std::path::Path,
 ) -> std::path::PathBuf {
     let export_name = unique_name("qa33");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: {source_type}
-  url: "{url}"
-exports:
-  - name: {export_name}
-    query: "{query}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {dir}
-    columns:
-      amount: decimal(12,2)
-"#,
-        dir = out_dir.display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_export(&cfg_path, &export_name);
+    let base = match source_type {
+        "postgres" => Rig::pg_batch(&export_name),
+        "mysql" => Rig::mysql_batch(&export_name),
+        other => panic!("parity helper knows postgres|mysql, got {other}"),
+    };
+    let rig = base
+        .source_url(url)
+        .query(query)
+        .mode("full")
+        .export_line("columns:")
+        .export_line("  amount: decimal(12,2)")
+        .dest_path(out_dir.to_path_buf());
+    let out = rig.run_args(&["--export", &export_name]);
     assert!(
         out.status.success(),
         "rivet ({source_type}) exited {}; stderr:\n{}",
@@ -161,41 +153,19 @@ fn pg_and_mysql_empty_exports_behave_identically() {
     // (documented behaviour: zero rows → no file, see live_parquet_roundtrip.rs).
     {
         let export_name = unique_name("qa33pg_empty");
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {}}}
-"#,
-            pg_table.name(),
-            pg_out.path().display(),
-        );
-        let cfg_path = write_config(&cfg_dir, &yaml);
-        assert!(run_rivet_export(&cfg_path, &export_name).status.success());
+        let rig = Rig::pg_batch(&export_name)
+            .query(&format!("SELECT id FROM {}", pg_table.name()))
+            .mode("full")
+            .dest_path(pg_out.path().to_path_buf());
+        assert!(rig.run_args(&["--export", &export_name]).status.success());
     }
     {
         let export_name = unique_name("qa33my_empty");
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {}}}
-"#,
-            my_table.name(),
-            my_out.path().display(),
-        );
-        let cfg_path = write_config(&cfg_dir, &yaml);
-        assert!(run_rivet_export(&cfg_path, &export_name).status.success());
+        let rig = Rig::mysql_batch(&export_name)
+            .query(&format!("SELECT id FROM {}", my_table.name()))
+            .mode("full")
+            .dest_path(my_out.path().to_path_buf());
+        assert!(rig.run_args(&["--export", &export_name]).status.success());
     }
 
     assert!(files_with_extension(pg_out.path(), "parquet").is_empty());
@@ -244,29 +214,21 @@ fn pg_and_mysql_chunked_exports_agree_on_row_count_and_id_set() {
         ),
     ] {
         let export_name = unique_name(&format!("qa33_{tag}_chunk"));
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source:
-  type: {src}
-  url: "{url}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 7
-    format: parquet
-    destination:
-      type: local
-      path: {dir}
-    columns:
-      amount: decimal(12,2)
-"#,
-            dir = out_dir.display()
-        );
-        let cfg_path = write_config(&cfg_dir, &yaml);
-        let out = run_rivet_export(&cfg_path, &export_name);
+        let base = match src {
+            "postgres" => Rig::pg_batch(&export_name),
+            "mysql" => Rig::mysql_batch(&export_name),
+            other => panic!("parity loop knows postgres|mysql, got {other}"),
+        };
+        let rig = base
+            .source_url(url)
+            .query(&format!("SELECT id, name, amount FROM {table_name}"))
+            .mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 7")
+            .export_line("columns:")
+            .export_line("  amount: decimal(12,2)")
+            .dest_path(out_dir.clone());
+        let out = rig.run_args(&["--export", &export_name]);
         assert!(
             out.status.success(),
             "rivet ({src}) chunked exited {}; stderr:\n{}",
@@ -337,20 +299,19 @@ fn pg_and_mssql_full_exports_agree_on_row_count_and_id_set() {
         pg_out.path(),
     );
 
-    // MSSQL needs the tls opt-in, which `export_to_parquet_local` doesn't render.
+    // MSSQL through its own constructor (mssql_batch already carries the tls
+    // opt-in the old inline yaml spelled by hand).
     let ms_out = tempfile::tempdir().unwrap();
     let ms_path = {
         let export_name = unique_name("qa33ms");
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true\n\
-             exports:\n  - name: {export_name}\n    query: \"SELECT id, name, amount FROM dbo.{tbl}\"\n    \
-             mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-            tbl = ms_table.name(),
-            out = ms_out.path().display(),
-        );
-        let cfg = write_config(&cfg_dir, &yaml);
-        let out = run_rivet_export(&cfg, &export_name);
+        let rig = Rig::mssql_batch(&export_name)
+            .query(&format!(
+                "SELECT id, name, amount FROM dbo.{}",
+                ms_table.name()
+            ))
+            .mode("full")
+            .dest_path(ms_out.path().to_path_buf());
+        let out = rig.run_args(&["--export", &export_name]);
         assert!(
             out.status.success(),
             "mssql export failed; stderr:\n{}",

@@ -19,6 +19,9 @@ pub fn pg_connect() -> PgClient {
 /// table behind, polluting the next run.
 pub struct PgTable {
     name: String,
+    /// The instance the table LIVES on — Drop must connect here, not to a
+    /// hardcoded primary (r4 bughunt: CDC-instance tables were never dropped).
+    url: String,
 }
 
 impl PgTable {
@@ -30,7 +33,19 @@ impl PgTable {
     /// in the RAII drop guard, so tests that need a non-canonical shape don't
     /// roll their own `DropPgTable`. The table is dropped on guard drop.
     pub fn adopt(name: String) -> Self {
-        PgTable { name }
+        Self::adopt_on(POSTGRES_URL, name)
+    }
+
+    /// Adopt a table living on a NON-primary instance (pg-cdc :5434). The Drop
+    /// guard connects to the STORED url — it hardcoded :5432 for years, so
+    /// every CDC-instance table was "dropped" on the wrong server where IF
+    /// EXISTS made it a silent no-op and the isolation instance accumulated
+    /// fixtures unboundedly (r4 bughunt; the Slot guard always did this right).
+    pub fn adopt_on(url: &str, name: String) -> Self {
+        PgTable {
+            name,
+            url: url.to_string(),
+        }
     }
 }
 
@@ -38,7 +53,7 @@ impl Drop for PgTable {
     fn drop(&mut self) {
         // Best-effort cleanup: if the drop fails we've already caused more
         // damage than this can unwind.  Do NOT panic from Drop.
-        if let Ok(mut c) = PgClient::connect(POSTGRES_URL, NoTls) {
+        if let Ok(mut c) = PgClient::connect(&self.url, NoTls) {
             let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.name), &[]);
         }
     }
@@ -80,7 +95,7 @@ pub fn seed_pg_numeric_table(row_count: i64) -> PgTable {
         c.batch_execute(&sql).expect("seed rows");
     }
 
-    PgTable { name }
+    PgTable::adopt(name)
 }
 
 /// Seed a wide-text Postgres table: `(id BIGINT, payload TEXT, updated_at TIMESTAMPTZ)`
@@ -112,7 +127,7 @@ pub fn seed_pg_wide_table(row_count: i64, payload_len: usize) -> PgTable {
         .expect("seed wide table rows");
     }
 
-    PgTable { name }
+    PgTable::adopt(name)
 }
 
 /// RAII guard for a logical replication slot — drops it on scope exit so an

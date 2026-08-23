@@ -299,6 +299,7 @@ mod tests {
 
     fn base_diag(mode: &str) -> ExportDiagnostic {
         ExportDiagnostic {
+            row_source: None,
             export_name: "t".into(),
             strategy: mode.into(),
             mode: mode.into(),
@@ -314,6 +315,9 @@ mod tests {
             recommended_parallel: (1, "small dataset"),
             warnings: vec![],
             suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         }
     }
 

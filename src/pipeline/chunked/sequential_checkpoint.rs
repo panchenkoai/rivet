@@ -23,9 +23,9 @@ use super::{ChunkSource, chunked_plan, config_hint, ensure_chunk_checkpoint_plan
 use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ResolvedRunPlan};
+use crate::resource;
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
@@ -97,9 +97,12 @@ fn export_one_chunk_range(
         return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
     }
 
-    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let base = super::chunk_part_filename(&plan.export_name, chunk_index, fmt.file_extension());
-    let dest = destination::create_destination(&plan.destination)?;
+    // Per-chunk writer: the cross-shape guard already fired at run start
+    // (the probe frame in run_chunked_sequential_checkpoint). open_unguarded
+    // avoids a manifest GET per chunk — restores main's behavior here.
+    let frame = crate::pipeline::frame::RunnerFrame::open_unguarded(plan)?;
+    let base = super::chunk_part_filename(&plan.export_name, chunk_index, &frame.ext);
+    let dest = frame.dest;
     // Worker-safe half of commit (I1 + dest.write + fingerprint), draining
     // every part the sink produced (max_file_size rotation included).
     let recs = super::super::commit::write_sink_parts(
@@ -230,8 +233,8 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
     // A resume of our own batch manifest matches mode and passes.
     {
-        let dest = destination::create_destination(&plan.destination)?;
-        crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+        // Probe-only open: the guard must fire before any chunk work starts.
+        let _ = crate::pipeline::frame::RunnerFrame::open(plan)?;
     }
 
     let chunks = if plan.resume {
@@ -268,9 +271,6 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // Form B: XOR-combine each chunk's checksums run-wide (order-independent), then
     // harvest once — so the CHECKPOINT chunked path records Form B like exec.rs.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
 
     if !plan.resume && !resource::check_memory(plan.tuning.memory_threshold_mb) {
         log::warn!("memory threshold exceeded before chunk export; pausing 5s");
@@ -329,13 +329,16 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             Ok((rows, parts, chunk_checksums, key)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
-                super::super::commit::accumulate_column_checksums(
-                    &mut checksums_acc,
+                // ADR-0028: feed the run ledger; the seam harvests once, at
+                // the dispatcher (chunked's drift gate stays pre-chunk, ADR-0021,
+                // so no schema is fed here).
+                // ADR-0029: contributed under the chunk this loop iteration
+                // just committed — the unit its record_part calls use below.
+                summary.ledger.contribute_checksums(
+                    super::super::commit::UnitId::Chunk(chunk_index),
                     &chunk_checksums,
+                    key,
                 );
-                if checksum_key_column.is_none() {
-                    checksum_key_column = key;
-                }
                 // Shared commit path for the non-empty branch (I2/M1 + counters
                 // + ChunkCompleted journal + I7 file-log + fault hooks).
                 // Empty chunks have no file to record but still need to journal
@@ -356,6 +359,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                             Some(state),
                             rec,
                             super::super::commit::PartKind::Chunk { chunk_index },
+                            super::super::commit::UnitId::Chunk(chunk_index),
                         );
                     }
                     // chunk_task carries one file name; for a rotation-split
@@ -401,9 +405,6 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             plan.export_name
         );
     }
-
-    // Form B: record the run-wide checksums before finalize writes the manifest.
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;

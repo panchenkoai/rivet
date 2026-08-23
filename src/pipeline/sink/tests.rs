@@ -377,6 +377,7 @@ fn value_ceiling_ignores_null_cells() {
 
 fn minimal_sink() -> ExportSink {
     ExportSink {
+        bytes_read: Default::default(),
         writer: None,
         format_type: crate::config::FormatType::Csv,
         compression: crate::config::CompressionType::None,
@@ -386,6 +387,7 @@ fn minimal_sink() -> ExportSink {
         part_rows: 0,
         cursor_column: None,
         last_cursor_value: None,
+        first_cursor_value: None,
         source_cursor: None,
         schema: None,
         dest_schema: None,
@@ -1185,5 +1187,63 @@ fn unique_cap_exact_boundary_trailing_nulls_do_not_trip_cap() {
             .iter()
             .map(|i| i.message.as_str())
             .collect::<Vec<_>>()
+    );
+}
+
+/// #175: bytes_read accumulates on the RUN-wide shared counter — two sinks
+/// sharing one `Arc` (the per-chunk / per-worker shape every runner produces)
+/// must SUM into it, and the count is the batch's in-memory Arrow size as
+/// received. RED against dropping the `fetch_add` in `on_batch`.
+#[test]
+fn bytes_read_accumulates_across_sinks_sharing_the_plan_counter() {
+    use crate::source::BatchSink;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["alice", "bob"]))],
+    )
+    .unwrap();
+    let expect_one = batch.get_array_memory_size() as u64;
+    assert!(expect_one > 0, "fixture batch must have a non-zero size");
+
+    // Two sinks share the counter — the per-chunk shape (chunked builds a fresh
+    // sink per chunk; workers clone the plan, sharing the Arc).
+    for _ in 0..2 {
+        let mut sink = minimal_sink();
+        sink.bytes_read = Arc::clone(&counter);
+        sink.on_schema(schema.clone()).unwrap();
+        sink.on_batch(&batch).unwrap();
+        if let Some(w) = sink.writer.take() {
+            w.finish().unwrap();
+        }
+    }
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        expect_one * 2,
+        "both sinks must sum into the ONE run-wide counter"
+    );
+}
+
+/// #173: PipelinedSink must FORWARD `set_source_cursor` — the trait's no-op
+/// default silently swallowed the source's lossless keyset token, a latent
+/// wrong-cursor bug the moment a cursor-reporting runner is pipelined. RED
+/// against removing the override / the worker's SourceCursor arm.
+#[test]
+fn pipelined_forwards_the_source_cursor_to_the_inner_sink() {
+    use crate::source::BatchSink;
+    let mut p = PipelinedSink::spawn_with_sink(minimal_sink());
+    p.set_source_cursor("bson:int64:42".to_string());
+    let sink = p.finish().expect("worker joins clean");
+    assert_eq!(
+        sink.source_cursor.as_deref(),
+        Some("bson:int64:42"),
+        "the token must reach the inner ExportSink through the decorator"
     );
 }

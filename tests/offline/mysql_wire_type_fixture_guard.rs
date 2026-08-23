@@ -30,7 +30,6 @@
 //! blind spots and neither replaces the other.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 const SRC: &str = "src/source/mysql/arrow_convert.rs";
 
@@ -47,8 +46,7 @@ const UNREACHABLE: &[(&str, &str)] = &[(
 )];
 
 fn source() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SRC);
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    super::nonvacuity::subject_text(SRC)
 }
 
 /// Every `MYSQL_TYPE_*` token inside `fn <name>`, up to the next top-level `}`.
@@ -99,6 +97,18 @@ fn required() -> BTreeSet<String> {
     let src = source();
     let mut r = types_named_by_fn(&src, "mysql_native_type_name");
     r.extend(types_named_by_fn(&src, "mysql_type_to_rivet"));
+    // The REQUIRED side is where this guard can go blind: both functions are
+    // sliced by `find("\n}\n")` off their `fn` header, so a formatting change
+    // that moves the first top-level `}` earlier truncates the branch list —
+    // and a truncated requirement is trivially satisfied by whatever the
+    // fixture happens to cover. 29 types today.
+    super::nonvacuity::require_enumerated(
+        r.len(),
+        20,
+        &format!("MYSQL_TYPE_* branches parsed out of the two mappers in {SRC}"),
+        "Fix the slice (the mappers are still there) rather than the floor — this set IS the \
+         requirement the fixture is graded against.",
+    );
     r
 }
 

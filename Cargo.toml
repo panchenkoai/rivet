@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.24.3"
+version = "0.24.5"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -138,6 +138,15 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # materialising whole — bounds RSS independent of `chunk_size`. Same 0.3.x
 # tiberius already pulls in.
 futures-util = "0.3"
+# RS256 signing for the Google service-account (`jwt-bearer`) token grant —
+# `src/destination/gcs_auth.rs`. Chosen because it is ALREADY in the tree and
+# already compiled: `reqsign` (a direct dependency, right below) pulls
+# jsonwebtoken 9 for its own Google signer, so naming it here adds zero crates,
+# zero build time and zero new audit surface. `rsa` + `sha2` would have been the
+# same tree from a different angle; `ring` alone would mean hand-rolling the JWT
+# framing this crate gets for free. Version tracks reqsign's — a resolution to
+# two majors would duplicate the crate, which the offline lock guard would show.
+jsonwebtoken = "9"
 reqsign = "0.16"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
 # in. Keeping one HTTP+TLS stack avoids duplicating rustls / hyper / h2 in the
@@ -155,6 +164,17 @@ zeroize = "1"
 mach2 = "0.6"
 
 [dev-dependencies]
+# Used by tests/offline/mutation_gate_config.rs to compile the mutation gate's own
+# exclusion patterns and prove none of them is over-broad. Already in the tree
+# transitively; pinned here so the guard cannot silently lose its engine.
+regex = "1"
+# INDEPENDENT oracle for the service-account assertion
+# (`src/destination/gcs_auth.rs`): RustCrypto VERIFIES the RS256 signature that
+# `jsonwebtoken`/`ring` produced, so the test is not one library round-tripping
+# itself. Both crates are already in the tree via `reqsign`; dev-only, so the
+# feature additions never reach the release binary (resolver v2).
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = { version = "0.10", features = ["oid"] }
 bytes = "1"
 csv = "1"
 serde_json = "1"

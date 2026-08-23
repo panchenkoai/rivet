@@ -31,18 +31,11 @@ const SEEDED_ROWS: i64 = 2500;
 /// Run `rivet check --config <cfg> --export <name>` against the live Postgres
 /// and return captured stdout. `check` exits 0 on a successful diagnostic, so
 /// we assert success and surface stderr on failure.
-fn run_check(config_path: &std::path::Path, export_name: &str) -> String {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--export",
-            export_name,
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet check");
+fn run_check(rig: &Rig, export_name: &str) -> String {
+    let out = rig.cli_env(
+        &["check", "--export", export_name],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         out.status.success(),
@@ -68,7 +61,12 @@ fn parse_row_estimate(stdout: &str) -> i64 {
         .split('~')
         .nth(1)
         .unwrap_or_else(|| panic!("malformed Row estimate line: {line:?}"))
-        .trim();
+        // #149 appends a source label — `~5M  (catalog estimate)` /
+        // `(measured YYYY-MM-DD)`; take only the leading count token
+        // (split_whitespace also trims leading space).
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
     if let Some(k) = raw.strip_suffix('K') {
         k.trim().parse::<i64>().expect("K-suffixed number") * 1_000
     } else if let Some(m) = raw.strip_suffix('M') {
@@ -78,46 +76,24 @@ fn parse_row_estimate(stdout: &str) -> i64 {
     }
 }
 
-/// Build a `table:`-shortcut config (form A) for the seeded `orders` table.
-fn config_table_form(out_dir: &std::path::Path, name: &str, mode_block: &str) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {name}
-    table: {SEEDED_TABLE}
-    {mode_block}
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
-}
-
-/// Build a `query:`-form config (form B) for the same seeded `orders` table.
-fn config_query_form(out_dir: &std::path::Path, name: &str, mode_block: &str) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {name}
-    query: "SELECT * FROM {SEEDED_TABLE}"
-    {mode_block}
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+/// The two config FORMS this file compares, as one rig constructor: form A is
+/// the `table:` shortcut, form B the `query:` spelling of the same relation.
+/// `mode_lines` is the strategy block (first line is the `mode:`, the rest are
+/// export lines) — the same shapes the old string builders interpolated.
+fn form_rig(table_form: bool, name: &str, mode_lines: &str) -> Rig {
+    let mut rig = if table_form {
+        Rig::pg_batch(SEEDED_TABLE).export_named(name)
+    } else {
+        Rig::pg_batch(name).query(&format!("SELECT * FROM {SEEDED_TABLE}"))
+    };
+    rig = rig.source_url_env("DATABASE_URL");
+    for line in mode_lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        rig = match line.strip_prefix("mode: ") {
+            Some(m) => rig.mode(m),
+            None => rig.export_line(line),
+        };
+    }
+    rig
 }
 
 // ─── finding #3: row estimate for the `table:` shortcut ───────────────────────
@@ -128,14 +104,10 @@ exports:
 fn audit_table_shortcut_row_estimate_matches_real_table() {
     require_alive(LiveService::Postgres);
 
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
     let name_a = unique_name("orders_table_form");
-    let yaml = config_table_form(out_dir.path(), &name_a, "mode: full");
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = form_rig(true, &name_a, "mode: full");
 
-    let stdout = run_check(&cfg, &name_a);
+    let stdout = run_check(&rig, &name_a);
     let est = parse_row_estimate(&stdout);
 
     // The `table: orders` shortcut points at a 2500-row table. Preflight must
@@ -154,21 +126,13 @@ fn audit_table_shortcut_row_estimate_matches_real_table() {
 fn audit_table_and_query_forms_agree_on_row_estimate() {
     require_alive(LiveService::Postgres);
 
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
     let name_a = unique_name("orders_table_form");
     let name_b = unique_name("orders_query_form");
-    let yaml_a = config_table_form(out_dir.path(), &name_a, "mode: full");
-    let yaml_b = config_query_form(out_dir.path(), &name_b, "mode: full");
-    let cfg_a = write_config(&cfg_dir, &yaml_a);
+    let rig_a = form_rig(true, &name_a, "mode: full");
+    let rig_b = form_rig(false, &name_b, "mode: full");
 
-    // Separate cfg dir for B so the two rivet.yaml files don't collide.
-    let cfg_dir_b = tempfile::tempdir().unwrap();
-    let cfg_b = write_config(&cfg_dir_b, &yaml_b);
-
-    let est_a = parse_row_estimate(&run_check(&cfg_a, &name_a));
-    let est_b = parse_row_estimate(&run_check(&cfg_b, &name_b));
+    let est_a = parse_row_estimate(&run_check(&rig_a, &name_a));
+    let est_b = parse_row_estimate(&run_check(&rig_b, &name_b));
 
     // Same physical table, so the two diagnostics must agree. Today form A
     // reports ~1 (the "SELECT 1" placeholder) while form B reports ~2K.
@@ -193,15 +157,14 @@ fn audit_table_and_query_forms_agree_on_row_estimate() {
 fn audit_chunked_table_shortcut_reports_cursor_range() {
     require_alive(LiveService::Postgres);
 
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
     let name_a = unique_name("orders_table_chunked");
-    let mode_block = "mode: chunked\n    chunk_column: id\n    chunk_size: 500";
-    let yaml = config_table_form(out_dir.path(), &name_a, mode_block);
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = form_rig(
+        true,
+        &name_a,
+        "mode: chunked\nchunk_column: id\nchunk_size: 500",
+    );
 
-    let stdout = run_check(&cfg, &name_a);
+    let stdout = run_check(&rig, &name_a);
 
     // `orders.id` spans 1..2500. The `query:` form prints "Cursor range: 1 .. 2500";
     // the `table:` form must do the same. Current code drops the line because the
@@ -218,12 +181,8 @@ fn audit_chunked_table_shortcut_reports_cursor_range() {
 /// Run `rivet plan` on a config and report whether it was accepted, with the
 /// reason when it was not. `plan` is the runner's own gate: `apply` executes the
 /// artifact it produces, so a config `plan` rejects is a config that cannot run.
-fn plan_verdict(config_path: &std::path::Path) -> Result<(), String> {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["plan", "--config", config_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+fn plan_verdict(rig: &Rig) -> Result<(), String> {
+    let out = rig.cli_env(&["plan"], &[("DATABASE_URL", POSTGRES_URL)]);
     if out.status.success() {
         return Ok(());
     }
@@ -237,20 +196,13 @@ fn plan_verdict(config_path: &std::path::Path) -> Result<(), String> {
 
 /// Like [`run_check`] but reports the exit status instead of asserting it, so
 /// the two commands can be COMPARED rather than one of them assumed green.
-fn check_accepts(config_path: &std::path::Path, export_name: &str) -> bool {
-    std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--export",
-            export_name,
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet check")
-        .status
-        .success()
+fn check_accepts(rig: &Rig, export_name: &str) -> bool {
+    rig.cli_env(
+        &["check", "--export", export_name],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    )
+    .status
+    .success()
 }
 
 /// Every config `check` blesses must be one `plan` will accept.
@@ -285,44 +237,42 @@ fn check_accepts(config_path: &std::path::Path, export_name: &str) -> bool {
 #[ignore = "live: postgres"]
 fn check_must_not_accept_a_config_the_planner_refuses() {
     require_alive(LiveService::Postgres);
-    let dir = tempfile::tempdir().expect("tempdir");
-    let out = dir.path().join("out");
 
     // (label, config body) — every shape an operator plausibly writes around the
     // width-aware knob, in both source forms.
-    let shapes: Vec<(&str, String)> = vec![
+    let shapes: Vec<(&str, Rig)> = vec![
         (
             "table: + chunk_column + chunk_size_memory_mb",
-            config_table_form(
-                &out,
+            form_rig(
+                true,
                 "t",
                 "mode: chunked\n    chunk_column: id\n    chunk_size_memory_mb: 64",
             ),
         ),
         (
             "query: + chunk_column + chunk_size_memory_mb",
-            config_query_form(
-                &out,
+            form_rig(
+                false,
                 "t",
                 "mode: chunked\n    chunk_column: id\n    chunk_size_memory_mb: 64",
             ),
         ),
         (
             "table: + chunk_by_key + chunk_size_memory_mb",
-            config_table_form(
-                &out,
+            form_rig(
+                true,
                 "t",
                 "mode: chunked\n    chunk_by_key: id\n    chunk_size_memory_mb: 64",
             ),
         ),
         (
             "query: + chunk_by_key (keyset needs the relation)",
-            config_query_form(&out, "t", "mode: chunked\n    chunk_by_key: id"),
+            form_rig(false, "t", "mode: chunked\n    chunk_by_key: id"),
         ),
         (
             "table: + plain chunk_size (the shape init emits)",
-            config_table_form(
-                &out,
+            form_rig(
+                true,
                 "t",
                 "mode: chunked\n    chunk_column: id\n    chunk_size: 500",
             ),
@@ -330,11 +280,9 @@ fn check_must_not_accept_a_config_the_planner_refuses() {
     ];
 
     let mut disagreements = Vec::new();
-    for (label, body) in &shapes {
-        let cfg = dir.path().join("c.yaml");
-        std::fs::write(&cfg, body).expect("write config");
-        let checked = check_accepts(&cfg, "t");
-        let planned = plan_verdict(&cfg);
+    for (label, rig) in &shapes {
+        let checked = check_accepts(rig, "t");
+        let planned = plan_verdict(rig);
         if let (true, Err(why)) = (checked, &planned) {
             disagreements.push(format!("  {label}\n      plan: {why}"));
         }

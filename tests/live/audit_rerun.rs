@@ -24,48 +24,21 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-/// Full-mode parquet→local config for `table` at `out_dir`.
-fn full_config(table: &str, out_dir: &Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+/// Full-mode parquet→local rig for `table` at `out_dir`.
+fn full_rig(table: &str, out_dir: &Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .dest_path(out_dir.to_path_buf())
 }
 
-/// Chunked parquet→local config for `table` at `out_dir`.
-fn chunked_config(table: &str, out_dir: &Path, chunk_size: i64) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {chunk_size}
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+/// Chunked parquet→local rig for `table` at `out_dir`.
+fn chunked_rig(table: &str, out_dir: &Path, chunk_size: i64) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {chunk_size}"))
+        .dest_path(out_dir.to_path_buf())
 }
 
 /// Total Parquet rows across every `*.parquet` file directly under `dir`.
@@ -115,17 +88,10 @@ fn audit_full_rerun_does_not_orphan_parts() {
 
     let table = seed_pg_numeric_table(120);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &full_config(table.name(), out.path()));
+    let rig = full_rig(table.name(), out.path());
 
     // First run: lands one timestamp-named part + manifest.json + _SUCCESS.
-    let first = run_rivet_with_warn_log(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let first = rig.run_args_env(&["--export", table.name()], &[("RUST_LOG", "warn")]);
     assert!(
         first.status.success(),
         "first full run must succeed; stderr:\n{}",
@@ -137,13 +103,7 @@ fn audit_full_rerun_does_not_orphan_parts() {
     // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Second run to the SAME prefix, no --resume.
-    let second = run_rivet_with_warn_log(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let second = rig.run_args_env(&["--export", table.name()], &[("RUST_LOG", "warn")]);
     let second_stderr = String::from_utf8_lossy(&second.stderr);
 
     // SAFE fix shape #1: the second run refuses (non-zero) to overwrite a
@@ -184,20 +144,10 @@ fn audit_chunked_rerun_does_not_double() {
 
     let table = seed_pg_numeric_table(ROWS);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(
-        &cfg_dir,
-        &chunked_config(table.name(), out.path(), CHUNK_SIZE),
-    );
+    let rig = chunked_rig(table.name(), out.path(), CHUNK_SIZE);
 
     // First chunked run: 3 nonce-named part files.
-    let first = run_rivet_with_warn_log(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let first = rig.run_args_env(&["--export", table.name()], &[("RUST_LOG", "warn")]);
     assert!(
         first.status.success(),
         "first chunked run must succeed; stderr:\n{}",
@@ -212,13 +162,7 @@ fn audit_chunked_rerun_does_not_double() {
     // Second chunked run to the SAME prefix, no --resume.  Chunk filenames carry
     // a random nonce, so even within the same second they land ALONGSIDE the
     // first set rather than overwriting it.
-    let second = run_rivet_with_warn_log(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let second = rig.run_args_env(&["--export", table.name()], &[("RUST_LOG", "warn")]);
     let second_stderr = String::from_utf8_lossy(&second.stderr);
 
     // SAFE fix shape #1: the second run refuses (non-zero) into a _SUCCESS prefix.
@@ -288,30 +232,14 @@ fn audit_a_healthy_noop_run_does_not_invalidate_the_prefix() {
 
     let table = seed_pg_numeric_table(10);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&format!("public.{}", table.name()))
+        .export_named(table.name())
+        .mode("incremental")
+        .export_line("cursor_column: created_at")
+        .export_line("skip_empty: true")
+        .dest_path(out.path().to_path_buf());
 
-exports:
-  - name: {name}
-    table: "public.{name}"
-    mode: incremental
-    cursor_column: created_at
-    skip_empty: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let first = run_rivet_with_warn_log(&["run", "--config", cfg.to_str().unwrap()]);
+    let first = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         first.status.success(),
         "first run must succeed; stderr:\n{}",
@@ -325,7 +253,7 @@ exports:
     );
 
     // Second run: nothing new past the cursor. This is the healthy path.
-    let second = run_rivet_with_warn_log(&["run", "--config", cfg.to_str().unwrap()]);
+    let second = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         second.status.success(),
         "the no-op run must succeed; stderr:\n{}",
@@ -339,10 +267,7 @@ exports:
         "the no-op run changed the data on disk"
     );
 
-    let v = std::process::Command::new(RIVET_BIN)
-        .args(["validate", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate"]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&v.stdout),

@@ -173,6 +173,45 @@ impl TxnSeq {
     }
 }
 
+/// Closes a buffered source transaction (#158): the at-least-once contract's
+/// load-bearing rule, previously four inline copies inside live-server `fill`
+/// loops (mysql/pg/mssql), each re-deriving the same loss argument in prose —
+/// the exact shape that shipped the PG/MSSQL `committed:true`-on-every-event
+/// bugs (see CLAUDE.md's committed-flag section).
+///
+/// The rule: stamp the group's commit `position` on EVERY event, and mark ONLY
+/// its LAST event `committed`. The sink rolls (flush → checkpoint → ack) on a
+/// `committed` event, so marking every event committed would roll + checkpoint
+/// MID-transaction and a crash before the tail's flush would advance the resume
+/// position past the commit — resume reads strictly after it and skips the tail
+/// (an at-least-once break). Each engine's group DETECTION stays engine-side
+/// (XID / BEGIN…COMMIT / __$start_lsn run); only the CLOSE is shared here.
+pub(crate) struct TxnFramer;
+
+impl TxnFramer {
+    /// Frame one committed source transaction: `position = commit` on all,
+    /// `committed = true` on the last event only. Empty group is a no-op.
+    pub(crate) fn close_group(events: &mut [ChangeEvent], commit: &Position) {
+        let n = events.len();
+        for (i, ev) in events.iter_mut().enumerate() {
+            ev.position = commit.clone();
+            ev.committed = i + 1 == n;
+        }
+    }
+
+    /// Mark a stand-alone event as its own commit boundary (#158 — a NAMED decision, not a
+    /// divergence). Correct where each event's write is a distinct commit (Mongo single-document
+    /// writes). A Mongo MULTI-document transaction shares one commit across N events; each is still
+    /// marked committed here (so a large one can roll the sink mid-transaction) — safe ONLY because
+    /// Mongo's per-event, consume-free resume token re-reads a mid-transaction tail rather than
+    /// skipping it (see `mongo/cdc.rs`). Engines whose resume position skips (PG slot / MSSQL
+    /// from-LSN) must frame the TRUE boundary instead. `position` is already per-event, so this
+    /// only sets the flag.
+    pub(crate) fn single_event_commit(event: &mut ChangeEvent) {
+        event.committed = true;
+    }
+}
+
 impl ChangeEvent {
     /// Rough in-memory footprint of this buffered change — drives the sink's
     /// memory-budget rollover (`rollover_memory_mb`). The before/after value
@@ -291,7 +330,15 @@ pub(crate) fn run(
         if committed && let Some(p) = &checkpoint {
             ev.position.save(p)?;
         }
-        if max_events.is_some_and(|m| emitted >= m) {
+        // A SOFT cap, landing on the commit boundary — the same semantics the file
+        // sink already had (`max_events_stops_at_a_commit_boundary_never_inside_a_
+        // transaction`). Breaking on the count alone lost nothing (the save above is
+        // gated on `committed`, so a cut transaction re-emits on resume), but a
+        // transaction LONGER than the cap then held no boundary to save: every run
+        // re-read the same position, re-printed the same prefix, and stopped in the
+        // same place. `--checkpoint ck --max-events 100` against a bulk load made no
+        // progress, ever. Overshooting to the boundary is the price of progressing.
+        if committed && max_events.is_some_and(|m| emitted >= m) {
             break;
         }
     }
@@ -905,7 +952,12 @@ pub(crate) fn resolve_cdc_columns(
 /// The table name is interpolated into `SELECT * FROM {table}` for the schema
 /// probe — refuse anything but a plain `[schema.]table` identifier (no quote,
 /// paren, semicolon, or space can break out).
-fn validate_table_ident(table: &str) -> Result<()> {
+///
+/// `pub(crate)` because the type-report resolver builds the SAME probe query for
+/// each table of a `tables:` stream: config-load only gates those names for
+/// FILENAME safety (they become destination path segments), which is a weaker
+/// alphabet than SQL interpolation needs.
+pub(crate) fn validate_table_ident(table: &str) -> Result<()> {
     if table.is_empty()
         || !table
             .chars()
@@ -966,7 +1018,10 @@ pub(crate) struct CdcCapture<'a> {
 /// `outputs` order — PAIRED with the outcome, so a run that failed after
 /// committing parts still hands the caller what it made durable. Returning a
 /// bare `Result` discarded exactly that, and the caller recorded zeros.
-pub(crate) fn run_capture(cap: CdcCapture<'_>) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
+pub(crate) fn run_capture(
+    cap: CdcCapture<'_>,
+    read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
@@ -1042,12 +1097,95 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> (Vec<crate::manifest::RunManif
         started_at: cap.started_at,
         run_id: cap.run_id,
         state: cap.state,
+        read_bytes: std::sync::Arc::clone(read_bytes),
     };
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// `--max-events` must not be able to WEDGE a checkpointed NDJSON run, and
+    /// must still CAP.
+    ///
+    /// The two drivers of the same flag disagreed. The file sink defers the cap
+    /// to a commit boundary (`max_events_stops_at_a_commit_boundary_never_inside_
+    /// a_transaction`); this NDJSON loop broke on the event count alone. That
+    /// loses nothing — the checkpoint save is gated on `committed`, so a cut
+    /// transaction re-emits — but a transaction LONGER than the cap held no
+    /// boundary to save, so every run re-read the same position, re-printed the
+    /// same prefix, and stopped in the same place. `rivet cdc --checkpoint ck
+    /// --max-events 100` against a 10k-row bulk load made no progress, ever.
+    ///
+    /// TWO transactions, deliberately. A single-transaction fixture cannot tell
+    /// "stopped at the boundary" from "ran to the end of the stream", because its
+    /// only commit IS the end — the `>=`→`<` mutant survived exactly that shape
+    /// (CI mutation gate, PR #238). With a second transaction the saved position
+    /// distinguishes them: stopping at tx1's boundary saves tx1's commit, running
+    /// on saves tx2's.
+    #[test]
+    fn max_events_stops_at_the_first_boundary_past_the_cap_and_checkpoints_there() {
+        use super::*;
+        use std::collections::VecDeque;
+
+        struct Fake(VecDeque<ChangeEvent>);
+        impl ChangeStream for Fake {
+            fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+                self.0.pop_front().map(Ok)
+            }
+        }
+        let ev = |id: i64, committed: bool| ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "s".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vec![crate::source::cdc::value::RivetValue::Int(id)]),
+            position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
+            committed,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        };
+        // tx1 = 1,2,3 (boundary at 3) and tx2 = 4,5,6 (boundary at 6). The cap is
+        // 2, so it lands INSIDE tx1 — the shape with no boundary to stop at.
+        let mut stream = Fake(
+            [
+                ev(1, false),
+                ev(2, false),
+                ev(3, true),
+                ev(4, false),
+                ev(5, false),
+                ev(6, true),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ck");
+        run(&mut stream, Some(ckpt.clone()), Vec::new(), Some(2)).expect("run");
+
+        assert!(
+            ckpt.exists(),
+            "a cap landing inside a transaction must still reach the boundary and \
+             checkpoint — otherwise the next run resumes at the same place and the \
+             export never progresses"
+        );
+        let saved = Position::load(&ckpt).expect("load").expect("some");
+        assert_eq!(
+            saved.0["lsn"], "00000003",
+            "the cap must stop at tx1's COMMIT — 00000006 means it ran to the end of \
+             the stream and capped nothing, 00000001/2 would mean it saved a \
+             mid-transaction position"
+        );
+        assert_eq!(
+            stream.0.len(),
+            3,
+            "tx2 must be left UNCONSUMED for the next run; draining it means the cap \
+             stopped nothing"
+        );
+    }
+
     // The offline mutation guard for the DrainMode glue: both helpers are
     // otherwise exercised only through I/O paths (dispatch, cdc_job, adapter
     // opens), so an inverted mapping would survive the CI mutants gate's
@@ -1221,6 +1359,71 @@ mod tests {
                 "{bad:?} → {err}"
             );
         }
+    }
+
+    fn framer_ev(id: i64) -> super::ChangeEvent {
+        super::ChangeEvent {
+            op: super::ChangeOp::Insert,
+            schema: "public".into(),
+            table: "orders".into(),
+            before: None,
+            after: Some(vec![RivetValue::Int(id)]),
+            position: Position(serde_json::json!({ "lsn": "stale" })),
+            committed: false,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        }
+    }
+
+    /// #158: the shared transaction close — commit position on ALL, committed on
+    /// the LAST only. RED against a `committed:true`-on-every-event mutant (the
+    /// exact shape that shipped the PG/MSSQL bugs).
+    #[test]
+    fn txn_framer_close_group_marks_only_the_last_committed() {
+        let commit = Position(serde_json::json!({ "lsn": "COMMIT" }));
+
+        // N-event group: every event gets the commit position; only the last
+        // is committed.
+        let mut g: Vec<super::ChangeEvent> = (0..4).map(framer_ev).collect();
+        super::TxnFramer::close_group(&mut g, &commit);
+        assert!(g.iter().all(|e| e.position == commit), "commit on all");
+        assert_eq!(
+            g.iter().map(|e| e.committed).collect::<Vec<_>>(),
+            vec![false, false, false, true],
+            "only the last event of a transaction is committed"
+        );
+
+        // 1-event group: that single event IS the boundary.
+        let mut one = vec![framer_ev(9)];
+        super::TxnFramer::close_group(&mut one, &commit);
+        assert!(one[0].committed && one[0].position == commit);
+
+        // Two groups back-to-back: each ends with exactly one committed.
+        let c1 = Position(serde_json::json!({ "lsn": "C1" }));
+        let c2 = Position(serde_json::json!({ "lsn": "C2" }));
+        let mut a: Vec<super::ChangeEvent> = (0..2).map(framer_ev).collect();
+        let mut b: Vec<super::ChangeEvent> = (0..3).map(framer_ev).collect();
+        super::TxnFramer::close_group(&mut a, &c1);
+        super::TxnFramer::close_group(&mut b, &c2);
+        assert_eq!(a.iter().filter(|e| e.committed).count(), 1);
+        assert_eq!(b.iter().filter(|e| e.committed).count(), 1);
+        assert!(a.iter().all(|e| e.position == c1));
+        assert!(b.iter().all(|e| e.position == c2));
+
+        // Empty group: no-op, no panic.
+        let mut empty: Vec<super::ChangeEvent> = Vec::new();
+        super::TxnFramer::close_group(&mut empty, &commit);
+        assert!(empty.is_empty());
+    }
+
+    /// Mongo's named single-event-commit model.
+    #[test]
+    fn txn_framer_single_event_commit_marks_the_event() {
+        let mut e = framer_ev(1);
+        assert!(!e.committed);
+        super::TxnFramer::single_event_commit(&mut e);
+        assert!(e.committed);
     }
 
     #[test]

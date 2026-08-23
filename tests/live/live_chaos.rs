@@ -31,24 +31,12 @@ fn high_latency_does_not_cause_false_positive_transient_classification() {
 
     let table = seed_pg_numeric_table(3);
     let export_name = unique_name("qa4A4_hilat");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_TOXI_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning: {{max_retries: 0}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out_run = run_rivet_export(&cfg, &export_name);
+    let rig = Rig::pg_batch(&export_name)
+        .source_url(POSTGRES_TOXI_URL)
+        .query(&format!("SELECT id FROM {}", table.name()))
+        .mode("full")
+        .export_line("tuning: {max_retries: 0}");
+    let out_run = rig.run_args(&["--export", &export_name]);
     toxi_reset_toxics("postgres");
 
     assert!(
@@ -74,26 +62,15 @@ fn chunked_export_completes_through_temporary_proxy_disable() {
 
     let table = seed_pg_numeric_table(40);
     let export_name = unique_name("qa4A4_chunk");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_TOXI_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 10
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    tuning: {{max_retries: 3, retry_backoff_ms: 200}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .source_url(POSTGRES_TOXI_URL)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 10")
+        .export_line("chunk_checkpoint: true")
+        .export_line("tuning: {max_retries: 3, retry_backoff_ms: 200}");
+    let cfg = rig.config_path();
 
     let bg = std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(60));
@@ -102,7 +79,7 @@ exports:
         toxi_enable("postgres");
     });
 
-    let out_run = run_rivet_export(&cfg, &export_name);
+    let out_run = rig.run_args(&["--export", &export_name]);
     let _ = bg.join();
     toxi_reset_toxics("postgres");
 
@@ -163,40 +140,19 @@ fn s3_export_fails_cleanly_when_bucket_does_not_exist() {
     let bucket = unique_name("rivet-qa-nope"); // never created
     let export_name = unique_name("qa62_nobucket");
 
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination:
-      type: s3
-      bucket: {bucket}
-      region: us-east-1
-      endpoint: {MINIO_ENDPOINT}
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK
-    tuning: {{max_retries: 0}}
-"#,
-        table_name = table.name()
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id FROM {}", table.name()))
+        .mode("full")
+        .export_line("tuning: {max_retries: 0}")
+        .dest_s3(&bucket, "qa62-nobucket", MINIO_ENDPOINT);
+    let out = rig.run_args_env(
+        &["--export", &export_name],
+        &[
+            ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+            ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ],
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export_name,
-        ])
-        .env("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY)
-        .env("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY)
-        .env("AWS_EC2_METADATA_DISABLED", "true")
-        .output()
-        .expect("spawn rivet");
 
     assert!(
         !out.status.success(),
@@ -228,40 +184,19 @@ fn s3_export_recovers_when_destination_comes_back_after_transient_outage() {
     // Attempt #1: wrong endpoint.
     {
         let export_name = unique_name("qa62_wrong");
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination:
-      type: s3
-      bucket: {bucket}
-      region: us-east-1
-      endpoint: http://127.0.0.1:1
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK
-    tuning: {{max_retries: 0}}
-"#,
-            table_name = table.name()
+        let rig = Rig::pg_batch(&export_name)
+            .query(&format!("SELECT id FROM {}", table.name()))
+            .mode("full")
+            .export_line("tuning: {max_retries: 0}")
+            .dest_s3(bucket, "qa62-wrong", "http://127.0.0.1:1");
+        let out = rig.run_args_env(
+            &["--export", &export_name],
+            &[
+                ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+                ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+                ("AWS_EC2_METADATA_DISABLED", "true"),
+            ],
         );
-        let cfg = write_config(&cfg_dir, &yaml);
-        let out = std::process::Command::new(RIVET_BIN)
-            .args([
-                "run",
-                "--config",
-                cfg.to_str().unwrap(),
-                "--export",
-                &export_name,
-            ])
-            .env("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY)
-            .env("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY)
-            .env("AWS_EC2_METADATA_DISABLED", "true")
-            .output()
-            .expect("spawn rivet");
         assert!(!out.status.success(), "export to wrong endpoint must fail");
     }
 
@@ -269,41 +204,19 @@ exports:
     {
         let export_name = unique_name("qa62_right");
         let prefix = unique_name("qa62_intermittent");
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination:
-      type: s3
-      bucket: {bucket}
-      prefix: {prefix}
-      region: us-east-1
-      endpoint: {MINIO_ENDPOINT}
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK
-    tuning: {{max_retries: 0}}
-"#,
-            table_name = table.name()
+        let rig = Rig::pg_batch(&export_name)
+            .query(&format!("SELECT id FROM {}", table.name()))
+            .mode("full")
+            .export_line("tuning: {max_retries: 0}")
+            .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+        let out = rig.run_args_env(
+            &["--export", &export_name],
+            &[
+                ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+                ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+                ("AWS_EC2_METADATA_DISABLED", "true"),
+            ],
         );
-        let cfg = write_config(&cfg_dir, &yaml);
-        let out = std::process::Command::new(RIVET_BIN)
-            .args([
-                "run",
-                "--config",
-                cfg.to_str().unwrap(),
-                "--export",
-                &export_name,
-            ])
-            .env("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY)
-            .env("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY)
-            .env("AWS_EC2_METADATA_DISABLED", "true")
-            .output()
-            .expect("spawn rivet");
         assert!(
             out.status.success(),
             "recovery run must succeed; stderr:\n{}",

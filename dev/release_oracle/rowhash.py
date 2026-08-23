@@ -141,6 +141,15 @@ def _manifest_coverage(dest: Path) -> object | None:
 
 
 def _rows(dest: Path, cols: list[str]) -> list[dict]:
+    """Rows + row hash, read with a GLOB on purpose.
+
+    Deliberately NOT manifest-scoped, unlike the completeness readers. The claim
+    here is about VALUES — can two different inputs canonicalize to one hash —
+    and it is graded over a prefix this module exports fresh, so declared and
+    present coincide. Scoping would narrow what the injectivity check can see
+    for no gain; if this ever reads a prefix that a crash could have left
+    orphans in, it becomes a completeness reader and must switch.
+    """
     sel = ", ".join([*cols, "_rivet_row_hash"])
     q = f"SELECT {sel} FROM read_parquet('{dest}/**/*.parquet') ORDER BY 1"
     p = subprocess.run(["duckdb", "-json", "-c", q], capture_output=True, text=True)

@@ -104,7 +104,7 @@ GROUP BY 1;
 - **Index the partition column.** Expansion runs three probes over the base
   query (`min`, `max`, NULL-count). Without an index on `partition_by` those are
   up to three full scans before the first row is exported.
-- **Time zones.** Bucket bounds are emitted as `YYYY-MM-DD` literals. For a
+- **Time zones.** Bucket bounds are emitted as `YYYY-MM-DD` literals on PostgreSQL and MySQL; SQL Server gets the unseparated `YYYYMMDD` form, which T-SQL parses as ISO regardless of the session's `DATEFORMAT`/language. For a
   `TIMESTAMPTZ` column the comparison happens at the session time zone — pin it
   (e.g. MySQL `SET time_zone = '+00:00'`) when the exact day boundary matters.
 - **Not compatible with `mode: time_window`** (time_window already filters by a
@@ -138,7 +138,7 @@ rows**:
 | `mode: chunked`, range `chunk_column`, key **dense/correlated** within the partition (e.g. the day ≈ the whole table) | One logical pass: `ceil(key_span / chunk_size)` indexed range scans, bounded memory. **Good.** | The common big-partition case. Keep `chunk_size` ≈ 100 k+. |
 | `mode: chunked`, range `chunk_column`, key **sparse** within the partition (rows interleaved with other days across the key range) | Chunk windows are computed over the partition's `[min,max]` of the key, **not** its row count → many windows read key-range rows then discard out-of-partition ones. **Query + I/O amplification.** | Avoid — pick a key correlated with the partition, or a finer `partition_granularity` so each partition's key range tightens. |
 | `chunk_dense: true` | Each chunk re-runs `ROW_NUMBER()` over the **whole** partition → `O(chunks × partition_rows)`. Fine for *small* sparse partitions, **catastrophic at 100 M**. | Small partitions with a sparse key only. |
-| `mode: full` (no chunking) | One streaming `SELECT`. **Postgres:** server-side cursor, bounded memory, but a single long-running transaction (watch vacuum / replication lag). **MySQL:** buffers the whole result client-side — **OOM on 100 M**. **SQL Server:** streams one batch at a time server-side, bounded memory (like Postgres). **MongoDB** (full/cdc only): native cursor, keyset-paged on `_id`, bounded memory. | PG / SQL Server partitions that fit a long read; never MySQL at this scale. |
+| `mode: full` (no chunking) | One streaming `SELECT`. **Postgres:** server-side cursor, bounded memory, but a single long-running transaction (watch vacuum / replication lag). **MySQL:** one streaming `SELECT` over the wire (`exec_iter`); rivet accumulates only one adaptive batch at a time, so memory stays bounded — the cost is the query staying visible (`Sending data`) for the whole drain. **SQL Server:** streams one batch at a time server-side, bounded memory (like Postgres). **MongoDB** (full/cdc only): native cursor, keyset-paged on `_id`, bounded memory. | PG / SQL Server partitions that fit a long read. MySQL is memory-safe too, but the single query stays visible for the whole drain — prefer `chunked` there so each query is short. |
 
 Row counts are always exact regardless of the choice — these trade-offs are about
 source load and file fan-out, not correctness. There is **no keyset/seek option

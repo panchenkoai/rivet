@@ -15,50 +15,25 @@
 
 use crate::common::*;
 
-/// Single-export Postgres config whose destination is **stdout** and whose mode
+/// Single-export Postgres rig whose destination is **stdout** and whose mode
 /// is **chunked** — the [stdout-no-chunked] combination that `run`/`plan` reject
 /// but `check` used to pass silently.
-fn stdout_chunked_config(table: &str) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 1000
-    format: parquet
-    destination:
-      type: stdout
-"#
-    )
+fn stdout_chunked_rig(table: &str) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .dest_stdout()
 }
 
-/// Single-export Postgres config with a local destination — used to drive the
+/// Single-export Postgres rig with a local destination — used to drive the
 /// `--export <typo>` path (the config is otherwise valid; only the CLI flag is
 /// wrong).
-fn simple_local_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+fn simple_local_rig(table: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .dest_path(out_dir.to_path_buf())
 }
 
 // L22 — `rivet check` on a stdout+chunked config must exit non-zero, agreeing
@@ -70,16 +45,9 @@ fn check_on_stdout_chunked_exits_nonzero() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(5);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &stdout_chunked_config(table.name()));
+    let rig = stdout_chunked_rig(table.name());
 
-    let result = run_rivet(&[
-        "check",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let result = rig.cli(&["check", "--export", table.name()]);
 
     assert!(
         !result.status.success(),
@@ -99,16 +67,9 @@ fn check_on_stdout_chunked_names_the_rule() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(5);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &stdout_chunked_config(table.name()));
+    let rig = stdout_chunked_rig(table.name());
 
-    let result = run_rivet(&[
-        "check",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let result = rig.cli(&["check", "--export", table.name()]);
 
     let combined = format!(
         "{}{}",
@@ -132,18 +93,11 @@ fn check_unknown_export_lists_available_names() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_local_config(table.name(), out.path()));
+    let rig = simple_local_rig(table.name(), out.path());
 
     // A deliberate typo of the real export name (the table name).
     let typo = format!("{}_typo", table.name());
-    let result = run_rivet(&[
-        "check",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        &typo,
-    ]);
+    let result = rig.cli(&["check", "--export", &typo]);
 
     let combined = format!(
         "{}{}",
@@ -180,11 +134,10 @@ fn run_unknown_export_lists_available_names() {
 
     let table = seed_pg_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_local_config(table.name(), out.path()));
+    let rig = simple_local_rig(table.name(), out.path());
 
     let typo = format!("{}_typo", table.name());
-    let result = run_rivet(&["run", "--config", cfg.to_str().unwrap(), "--export", &typo]);
+    let result = rig.run_args(&["--export", &typo]);
 
     let combined = format!(
         "{}{}",

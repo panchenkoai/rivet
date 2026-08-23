@@ -16,7 +16,7 @@
 //! `ensure_chunk_checkpoint_plan`, `record_chunked_commit`) live in
 //! [`super`]. The sequential runner lives in [`super::sequential_checkpoint`].
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::super::{RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink};
@@ -130,7 +130,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // records Form B like exec.rs's parallel path (graph-surfaced runner-bypass).
     #[allow(clippy::type_complexity)]
     let checksums_shared: std::sync::Mutex<
-        Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>,
+        Vec<(i64, std::collections::BTreeMap<String, u64>, Option<String>)>,
     > = std::sync::Mutex::new(Vec::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
@@ -147,14 +147,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let comp_label = plan.compression.label();
     let mode_label = plan.strategy.mode_label();
 
-    let shared_destination =
-        std::sync::Arc::new(destination::create_destination(&plan.destination)?);
-    // Same cross-shape guard as single/keyset/exec: refuse to overwrite a CDC
-    // manifest with this batch export's manifest (they would silently destroy
-    // each other's audit trail). The two checkpoint runners were the ones that
-    // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
-    // A resume of our own batch manifest matches mode and passes.
-    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
+    // The frame IS the fix for the history this file used to narrate here: the
+    // two checkpoint runners once bypassed the cross-shape guard entirely
+    // (runner-bypass class). Now the guard rides in the only door to a
+    // destination.
+    let (shared_destination, _frame_ext) = crate::pipeline::frame::RunnerFrame::open_shared(plan)?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,
@@ -162,7 +159,31 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         plan.tuning.max_retries,
     );
 
+    // OPT-2 adaptive concurrency governor, through the SHARED seam (identical wiring in
+    // `chunked/exec.rs` and `keyset.rs`; #152). This runner shipped WITHOUT it, so
+    // `tuning.adaptive: true` was a silent no-op on exactly the shape `rivet init` scaffolds
+    // (`chunk_checkpoint: true` + `parallel: N`): job.rs dispatches a RESUMABLE chunked plan
+    // here, so dropping `chunk_checkpoint` from an otherwise identical config was the
+    // difference between a governed run and an ungoverned one — with nothing in the log to
+    // tell them apart (bughunt 2026-08-14, finding 0).
+    //
+    // Pool shape, not spawner shape: `parallel` long-lived workers claim tasks in a loop, so
+    // the permit is taken PER CLAIMED TASK (`TaskPermit`, acquired before the claim) and the
+    // governor's stop predicate counts WORKERS that exited (`WorkerFinished`), i.e. `total`
+    // is the pool size, not the task count. Disarmed (the default) the semaphore starts with
+    // one permit per worker and never resizes, so no worker ever parks — the run behaves
+    // exactly as it did before.
+    let semaphore = resource::Semaphore::new(parallel.max(1));
+    let finished = AtomicUsize::new(0);
+    let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
+
     std::thread::scope(|s| {
+        // Governor thread (shared seam): samples source pressure on its own monitoring
+        // connection and resizes the permit ceiling within [floor, ceiling], self-terminating
+        // once every pool worker has FINISHED (drained, errored, or panicked) so a failing
+        // worker can't strand it and deadlock the scope.
+        governor.spawn_into(s, &semaphore, &finished, parallel, &plan.export_name);
+
         for _ in 0..parallel {
             let state_ref = state_ref.clone();
             let shared_destination = std::sync::Arc::clone(&shared_destination);
@@ -181,10 +202,21 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let mode_label_w = mode_label;
             let pb_w = pb_cp_handle.clone();
             let streamed_rows = std::sync::Arc::clone(&streamed_rows);
+            let semaphore = &semaphore;
+            let finished = &finished;
 
             s.spawn(move || {
+                // Count this worker as FINISHED on every exit path (drained queue, claim
+                // error, unwinding panic) — the governor thread's only exit is
+                // `finished >= total`, so a missed bump hangs `thread::scope` forever.
+                let _finish = crate::pipeline::governor::WorkerFinished::new(finished);
                 let shared_destination = shared_destination;
                 loop {
+                    // One permit per claimed task, taken BEFORE the claim: a shed then
+                    // parks this worker without leaving a chunk_task pinned `running`
+                    // while it waits. The guard releases at the end of THIS iteration on
+                    // every path (`break`, `continue`, panic).
+                    let _permit = crate::pipeline::governor::TaskPermit::acquire(semaphore);
                     let claimed = match StateStore::claim_next_chunk_task_at_ref(
                         &state_ref,
                         run_id_arc.as_str(),
@@ -208,26 +240,28 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     let start: i64 = match sk.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::fail_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                "invalid start_key",
-                                false, // a malformed key parses the same way every time
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.fail_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    "invalid start_key",
+                                    false, // a malformed key parses the same way every time
+                                )
+                            });
                             continue;
                         }
                     };
                     let end: i64 = match ek.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::fail_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                "invalid end_key",
-                                false, // a malformed key parses the same way every time
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.fail_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    "invalid end_key",
+                                    false, // a malformed key parses the same way every time
+                                )
+                            });
                             continue;
                         }
                     };
@@ -426,6 +460,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                                     format: fmt_label_w,
                                                     compression: Some(comp_label_w),
                                                     mode: mode_label_w,
+                                                    cursor_high: None, // chunked runner, not keyset pages
                                                 },
                                             ) {
                                                 log::warn!(
@@ -458,9 +493,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     records.push((rec, chunk_index));
                                 }
                                 drop(records);
-                                // Form B: hand this chunk's checksums to the parent.
-                                poison::lock_recover(checksums_shared)
-                                    .push((chunk_checksums, chunk_key));
+                                // Form B: hand this chunk's checksums to the parent,
+                                // tagged with the chunk — ADR-0029's coverage unit,
+                                // the same one the parent's record_part drain uses.
+                                poison::lock_recover(checksums_shared).push((
+                                    chunk_index,
+                                    chunk_checksums,
+                                    chunk_key,
+                                ));
                                 Some(first)
                             };
                             // Mirror of the sequential checkpoint hooks (search for
@@ -471,13 +511,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             // crashing the process and leaving any in-flight workers'
                             // chunk_task rows as 'running' for the resume path to reset.
                             crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
-                            let _ = StateStore::complete_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                rows as i64,
-                                fname_for_state.as_deref(),
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.complete_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    rows as i64,
+                                    fname_for_state.as_deref(),
+                                )
+                            });
                             crate::test_hook::maybe_panic_at_chunk(
                                 "after_chunk_complete",
                                 chunk_index,
@@ -486,13 +527,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         }
                         Err(e) => {
                             let msg = crate::redact::redact_error(&e);
-                            let _ = StateStore::fail_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                &msg,
-                                crate::pipeline::retry::is_transient(&e),
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.fail_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    &msg,
+                                    crate::pipeline::retry::is_transient(&e),
+                                )
+                            });
                             poison::lock_recover(errors)
                                 .push(format!("chunk {}: {}", chunk_index, msg));
                         }
@@ -507,6 +549,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // `= agg_rows` clobbered it, so total_rows under-reported while parts/bytes/
     // files stayed cumulative — see accumulate_run_rows.
     super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
+    // Drain the governor's decisions (buffered off-thread) into the run journal — BEFORE the
+    // worker-error / pending-task bails below, so a FAILED run still journals its
+    // ParallelismAdjusted events. That ordering is the drift the keyset copy re-introduced
+    // once; it is why this is the shared seam's contract and not a local convention.
+    governor.drain_into(summary);
     summary.retries = summary
         .retries
         .saturating_add(agg_retries.load(Ordering::Relaxed));
@@ -539,6 +586,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             None,
             &rec,
             super::super::commit::PartKind::Chunk { chunk_index },
+            super::super::commit::UnitId::Chunk(chunk_index),
         );
     }
 
@@ -564,18 +612,17 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         );
     }
 
-    // Form B: XOR-combine every worker's chunk checksums run-wide + harvest once,
-    // before finalize writes the manifest.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
-    for (part, key) in poison::into_recover(checksums_shared) {
-        super::super::commit::accumulate_column_checksums(&mut checksums_acc, &part);
-        if checksum_key_column.is_none() {
-            checksum_key_column = key;
-        }
+    // ADR-0028/0029: feed every worker's chunk checksums into the run ledger under
+    // the SAME chunk unit the drain above recorded that chunk's parts with; the
+    // seam harvests once, at the dispatcher, before finalize writes the manifest,
+    // and computes the coverage rather than trusting this feed's order.
+    for (chunk_index, part, key) in poison::into_recover(checksums_shared) {
+        summary.ledger.contribute_checksums(
+            super::super::commit::UnitId::Chunk(chunk_index),
+            &part,
+            key,
+        );
     }
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     state.finalize_chunk_run_completed(&run_id)?;
     // ADR-0008 PG2 committed boundary via the shared finalize seam.

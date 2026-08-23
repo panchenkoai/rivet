@@ -75,7 +75,7 @@ Responsible for: surfacing what happened without affecting execution or state.
 | Module | Responsibility |
 |--------|---------------|
 | `pipeline/summary.rs` | `RunSummary` — data accumulator for run metrics, printed at end-of-run |
-| `pipeline/journal.rs` | `RunJournal` — typed event log answering the four DoD observability questions |
+| `journal.rs` (top-level) | `RunJournal` — typed event log answering the four DoD observability questions |
 | `pipeline/progress.rs` | Terminal progress bar for chunked exports |
 | `pipeline/cli.rs` | CLI display of state, metrics, files, chunk checkpoints |
 | `notify/` | Slack notifications triggered by run outcome |
@@ -95,7 +95,7 @@ Responsible for: surfacing what happened without affecting execution or state.
 
 `pipeline/mod.rs` is the only module permitted to touch all three layers. It must remain thin: its role is orchestration, not logic ownership.
 
-**`RunOptions<'a>`** is defined in `pipeline/mod.rs` and passed through the execution stack. It bundles the per-run CLI flags (`validate`, `reconcile`, `resume`, `force`, `params`) as a named struct, replacing a sequence of positional `bool` arguments that were invisible at call sites and prone to transposition bugs. The coordinator constructs `RunOptions` once from the public `run()` signature, then passes it to `run_export_job` and (via individual fields) to `run_exports_as_child_processes`.
+**`RunOptions<'a>`** is defined in `pipeline/run.rs` (the extracted `rivet run` orchestrator — `pipeline/mod.rs` is a thin facade that re-exports it as `pipeline::RunOptions` / `pipeline::run`) and passed through the execution stack. It bundles the per-run CLI flags (`validate`, `reconcile`, `resume`, `force`, `params`) as a named struct, replacing a sequence of positional `bool` arguments that were invisible at call sites and prone to transposition bugs. The coordinator constructs `RunOptions` once from the public `run()` signature, then passes it to `run_export_job` and (via individual fields) to `run_exports_as_child_processes`.
 
 ### Trust contract types (no layer — shared schema)
 

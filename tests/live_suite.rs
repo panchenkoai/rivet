@@ -97,6 +97,8 @@ mod live_crash_recovery;
 mod live_crash_soak;
 #[path = "live/live_cross_db_parity.rs"]
 mod live_cross_db_parity;
+#[path = "live/live_density_probe.rs"]
+mod live_density_probe;
 #[path = "live/live_destination_parity.rs"]
 mod live_destination_parity;
 #[path = "live/live_governor.rs"]
@@ -109,6 +111,8 @@ mod live_init;
 mod live_init_extended;
 #[path = "live/live_keyset.rs"]
 mod live_keyset;
+#[path = "live/live_keyset_metrics.rs"]
+mod live_keyset_metrics;
 #[path = "live/live_keyset_parallel.rs"]
 mod live_keyset_parallel;
 #[path = "live/live_metrics_persist.rs"]
@@ -149,6 +153,8 @@ mod live_mysql_retry_and_faults;
 mod live_mysql_schema_drift;
 #[path = "live/live_oltp_load.rs"]
 mod live_oltp_load;
+#[path = "live/live_parallel_ux.rs"]
+mod live_parallel_ux;
 #[path = "live/live_parquet_roundtrip.rs"]
 mod live_parquet_roundtrip;
 #[path = "live/live_partition_by.rs"]
@@ -165,6 +171,8 @@ mod live_plan_apply;
 mod live_plan_output_ux;
 #[path = "live/live_pool_safety.rs"]
 mod live_pool_safety;
+#[path = "live/live_pool_toxiproxy.rs"]
+mod live_pool_toxiproxy;
 #[path = "live/live_reconcile_repair.rs"]
 mod live_reconcile_repair;
 #[path = "live/live_resume.rs"]

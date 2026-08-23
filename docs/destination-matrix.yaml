@@ -15,7 +15,7 @@
 # ratcheted>" }. Same drift-guard as the sibling ledgers
 # (tests/offline/chunking_matrix_guard.rs).
 
-engines: [local, gcs, s3, azure]
+engines: [local, gcs, s3, azure, stdout]
 
 scenarios:
   - id: prefix_no_trailing_slash_normalized
@@ -24,13 +24,15 @@ scenarios:
     gcs:   { test: normalize_prefix_appends_a_trailing_slash_only_when_needed }
     s3:    { test: normalize_prefix_appends_a_trailing_slash_only_when_needed }
     azure: { test: normalize_prefix_appends_a_trailing_slash_only_when_needed }
+    stdout:  { na: "stdout has no prefix and no object key — `WriteCommitProtocol::Streaming` writes the byte stream and never composes a path, so there is nothing to normalize" }
 
   - id: full_export_round_trips_and_reads_back
     what: "an export LANDS at the destination and reads back COMPLETE (content, not just object presence) — the emulator round-trip. Representative-engine cells (the stand runs one engine per backend; the read-back is via the store's own list/get, an independent oracle, not rivet's counter)."
     local: { na: "local round-trip is the implicit default of every batch stand/live test (count_parquet_rows re-reads the written files)." }
     gcs:   { test: stand_dest_gcs_mysql }
     s3:    { test: stand_dest_s3_mysql }
-    azure: { gap: "no azurite full-round-trip stand test yet — the CloudDestination path is shared with S3/GCS (proven above), but an azure-specific emulator round-trip is unwritten." }
+    azure: { test: stand_dest_azure_mysql, note: "was this ledger's last gap. The CloudDestination path is shared with S3/GCS and proven there; what these add is the AZURE leg — the account/key/endpoint config shape, the blob naming, and a read-back over the store's own list+get. CONTENT, not presence: `azure_parquet_total_rows` downloads every blob and sums rows, and it is the SAME reader live_azure_multipart.rs uses (moved into tests/common/storage.rs rather than copied, so there is one definition of delivered per backend). Twin on postgres: stand_dest_azure_postgres." }
+    stdout:  { na: "nothing to read BACK — the bytes go to the caller's pipe, there is no addressable destination to re-open. The stdout happy path is covered as a GOLDEN instead: dev/path_matrix p05_stdout diffs the literal CSV rivet emits" }
 
   - id: row_count_parity_across_backends
     what: "the SAME export to local vs S3 vs GCS yields IDENTICAL row counts — an independent cross-backend oracle (dogfood confirmed the fake-gcs count == real-GCS count == source via a DuckDB re-read, so the emulator does not lie about the real backend)."
@@ -38,6 +40,7 @@ scenarios:
     gcs:   { test: destination_parity_row_counts_match_across_local_s3_gcs }
     s3:    { test: destination_parity_row_counts_match_across_local_s3_gcs }
     azure: { na: "the parity harness compares local/s3/gcs; azure joins the same CloudDestination seam, so its parity is covered by the shared round-trip + prefix cells, not a fourth column here." }
+    stdout:  { na: "the parity harness re-reads each backend and compares counts; a pipe cannot be re-read. Its equivalent is the path_matrix golden, which pins the exact bytes rather than a count" }
 
   - id: validate_verdict_is_advisory_not_a_run_gate
     what: "dogfood A (design, ADR-0001 §I7 MFN): `run --validate` populates the report/metrics verdict but is NON-fatal — the run exits 0 even on a verified-wrong verdict; the HARD gate is the standalone `rivet validate` command (exit 3) and `--reconcile` (COUNT mismatch). A dogfood verify-agent mis-flagged this as a bug not knowing the ADR; the roast test pins the documented contract. Destination-agnostic (the verdict path is the same for every backend)."
@@ -45,3 +48,4 @@ scenarios:
     gcs:   { na: "the --validate-is-advisory contract is destination-agnostic; the roast test exercises it on local, which is sufficient (the verdict path does not branch on backend)." }
     s3:    { na: "destination-agnostic — see the local cell." }
     azure: { na: "destination-agnostic — see the local cell." }
+    stdout:  { na: "destination-agnostic — see the local cell. (rivet skips the manifest entirely for a streaming destination, so there is no verdict to gate on either.)" }

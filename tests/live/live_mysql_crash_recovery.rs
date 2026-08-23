@@ -28,6 +28,18 @@ use mysql::prelude::Queryable;
 
 /// Open the state DB that rivet wrote next to the given config file.
 fn open_state_db(cfg: &std::path::Path) -> rusqlite::Connection {
+    // This test's ORACLE is the SQLite state file — valid only if rivet wrote
+    // SQLite. The harness only ADDS env (no env_clear), so an ambient
+    // RIVET_STATE_URL=postgres would route rivet's state to Postgres while this
+    // reads a fresh empty .rivet_state.db (silent wrong verdict). Assert the
+    // precondition loudly (r7 bughunt; the un-migrated sibling of the parity
+    // tests' RIVET_STATE_URL pin). No-op under default CI (var unset).
+    assert!(
+        std::env::var("RIVET_STATE_URL").map_or(true, |u| !u.starts_with("postgres")),
+        "recovery test reads the SQLite .rivet_state.db, but RIVET_STATE_URL \
+         points at Postgres — rivet wrote its state there, not to this file. \
+         Unset RIVET_STATE_URL for the crash/chunked-recovery suite."
+    );
     let db = cfg.parent().unwrap().join(".rivet_state.db");
     rusqlite::Connection::open(db).expect("open state db")
 }
@@ -122,45 +134,22 @@ fn seed_mysql_cursor_table(rows: i64) -> MysqlCursorTable {
     MysqlCursorTable { name }
 }
 
-fn write_cfg(
-    out_dir: &std::path::Path,
-    table_name: &str,
-    export_name: &str,
-    cfg_dir: &tempfile::TempDir,
-) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, updated_at FROM {table_name}"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out_dir.display()
-    );
-    write_config(cfg_dir, &yaml)
+/// The one incremental-cursor shape every crash cell here uses, through the
+/// canonical Rig (rig-adoption ratchet: this file carried its own YAML builder
+/// plus five raw binary invocations).
+fn crash_rig(table_name: &str, export_name: &str) -> Rig {
+    Rig::mysql_batch(export_name)
+        .query(&format!("SELECT id, updated_at FROM {table_name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
 }
 
 /// Run rivet with the given panic-point injected, expecting a non-zero exit.
-fn run_rivet_crash(
-    cfg_path: &std::path::Path,
-    export_name: &str,
-    crash_at: &str,
-) -> std::process::Output {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "--export",
-            export_name,
-        ])
-        .env("RIVET_TEST_PANIC_AT", crash_at)
-        .output()
-        .expect("spawn rivet");
+fn run_rivet_crash(rig: &Rig, export_name: &str, crash_at: &str) -> std::process::Output {
+    let out = rig.run_args_env(
+        &["--export", export_name],
+        &[("RIVET_TEST_PANIC_AT", crash_at)],
+    );
     assert!(
         !out.status.success(),
         "rivet run with RIVET_TEST_PANIC_AT={crash_at} must exit non-zero; stderr:\n{}",
@@ -179,15 +168,14 @@ fn mysql_crash_after_source_read_leaves_state_completely_clean() {
     // file, no manifest entry, no cursor advance.
     require_alive(LiveService::Mysql);
     let table = seed_mysql_cursor_table(10);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     let export = unique_name("qa11my_src");
-    let cfg = write_cfg(out.path(), table.name(), &export, &cfg_dir);
+    let rig = crash_rig(table.name(), &export);
+    let cfg = rig.config_path();
 
-    run_rivet_crash(&cfg, &export, "after_source_read");
+    run_rivet_crash(&rig, &export, "after_source_read");
 
     assert!(
-        files_with_extension(out.path(), "parquet").is_empty(),
+        files_with_extension(&rig.out_dir(), "parquet").is_empty(),
         "after_source_read crash must not produce a file"
     );
     assert_eq!(manifest_count(&cfg, &export), 0);
@@ -196,19 +184,10 @@ fn mysql_crash_after_source_read_leaves_state_completely_clean() {
     // the panic unwinds — either way, the resume logic does not depend on it.
 
     // Recovery: re-run without the crash. Full row count must surface.
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = rig.run_args(&["--export", &export]);
     assert!(rec.status.success(), "recovery run must succeed");
     assert_eq!(
-        files_with_extension(out.path(), "parquet").len(),
+        files_with_extension(&rig.out_dir(), "parquet").len(),
         1,
         "recovery run must produce the single expected file"
     );
@@ -216,12 +195,12 @@ fn mysql_crash_after_source_read_leaves_state_completely_clean() {
     // Re-read the destination (not the state DB): the recovery file holds every
     // source row exactly once.
     assert_eq!(
-        duckdb_total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         10,
         "recovery file must hold all 10 rows"
     );
     assert_eq!(
-        duckdb_dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (1..=10).collect::<std::collections::BTreeSet<i64>>(),
         "recovery must surface every source id (1..=10)"
     );
@@ -235,14 +214,13 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     // no cursor and re-exports — at-least-once delivery for that file.
     require_alive(LiveService::Mysql);
     let table = seed_mysql_cursor_table(8);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     let export = unique_name("qa11my_file");
-    let cfg = write_cfg(out.path(), table.name(), &export, &cfg_dir);
+    let rig = crash_rig(table.name(), &export);
+    let cfg = rig.config_path();
 
-    run_rivet_crash(&cfg, &export, "after_file_write");
+    run_rivet_crash(&rig, &export, "after_file_write");
 
-    let files_after_crash = files_with_extension(out.path(), "parquet");
+    let files_after_crash = files_with_extension(&rig.out_dir(), "parquet");
     assert_eq!(
         files_after_crash.len(),
         1,
@@ -258,16 +236,7 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = rig.run_args(&["--export", &export]);
     assert!(rec.status.success());
 
     // Post-recovery: manifest has one entry for the recovery run, cursor is
@@ -275,7 +244,7 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     // the documented at-least-once-delivery corollary.
     assert_eq!(manifest_count(&cfg, &export), 1);
     assert!(cursor_value(&cfg, &export).is_some());
-    let total = files_with_extension(out.path(), "parquet").len();
+    let total = files_with_extension(&rig.out_dir(), "parquet").len();
     assert!(
         total >= 2,
         "orphaned pre-crash file + recovery file: expected >=2, got {total}"
@@ -284,12 +253,12 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     // source (every id present — no loss across orphan+recovery), with
     // at-least-once duplication the only surplus.
     assert_eq!(
-        duckdb_dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (1..=8).collect::<std::collections::BTreeSet<i64>>(),
         "recovery must leave every source id (1..=8) — a missing id is row LOSS"
     );
     assert!(
-        duckdb_total_parquet_rows(out.path()) as i64 >= 8,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64 >= 8,
         "at-least-once: physical destination rows must be >= source (8)"
     );
 }
@@ -299,14 +268,13 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
 fn mysql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     require_alive(LiveService::Mysql);
     let table = seed_mysql_cursor_table(7);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     let export = unique_name("qa11my_mani");
-    let cfg = write_cfg(out.path(), table.name(), &export, &cfg_dir);
+    let rig = crash_rig(table.name(), &export);
+    let cfg = rig.config_path();
 
-    run_rivet_crash(&cfg, &export, "after_manifest_update");
+    run_rivet_crash(&rig, &export, "after_manifest_update");
 
-    assert_eq!(files_with_extension(out.path(), "parquet").len(), 1);
+    assert_eq!(files_with_extension(&rig.out_dir(), "parquet").len(), 1);
     assert_eq!(
         manifest_count(&cfg, &export),
         1,
@@ -322,27 +290,18 @@ fn mysql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = rig.run_args(&["--export", &export]);
     assert!(rec.status.success());
     assert_eq!(manifest_count(&cfg, &export), 2);
     assert!(cursor_value(&cfg, &export).is_some());
     // Destination re-read: complete superset of the source (no loss).
     assert_eq!(
-        duckdb_dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (1..=7).collect::<std::collections::BTreeSet<i64>>(),
         "recovery must leave every source id (1..=7) — a missing id is row LOSS"
     );
     assert!(
-        duckdb_total_parquet_rows(out.path()) as i64 >= 7,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64 >= 7,
         "at-least-once: physical destination rows must be >= source (7)"
     );
 }
@@ -355,14 +314,13 @@ fn mysql_crash_after_cursor_commit_is_recoverable_with_full_state() {
     // The next run must see the cursor and export zero new rows.
     require_alive(LiveService::Mysql);
     let table = seed_mysql_cursor_table(6);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     let export = unique_name("qa11my_curs");
-    let cfg = write_cfg(out.path(), table.name(), &export, &cfg_dir);
+    let rig = crash_rig(table.name(), &export);
+    let cfg = rig.config_path();
 
-    run_rivet_crash(&cfg, &export, "after_cursor_commit");
+    run_rivet_crash(&rig, &export, "after_cursor_commit");
 
-    assert_eq!(files_with_extension(out.path(), "parquet").len(), 1);
+    assert_eq!(files_with_extension(&rig.out_dir(), "parquet").len(), 1);
     assert_eq!(manifest_count(&cfg, &export), 1);
     let cursor_after_crash = cursor_value(&cfg, &export);
     assert!(
@@ -378,20 +336,11 @@ fn mysql_crash_after_cursor_commit_is_recoverable_with_full_state() {
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = rig.run_args(&["--export", &export]);
     assert!(rec.status.success());
 
     assert_eq!(
-        files_with_extension(out.path(), "parquet").len(),
+        files_with_extension(&rig.out_dir(), "parquet").len(),
         1,
         "second run on unchanged source must not produce a new file (cursor saw no new rows)"
     );
@@ -403,12 +352,12 @@ fn mysql_crash_after_cursor_commit_is_recoverable_with_full_state() {
     // Destination re-read: the durably-committed file holds every source row
     // exactly once (cursor committed before the crash → no re-export, no dup).
     assert_eq!(
-        duckdb_total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         6,
         "committed file must hold all 6 rows once"
     );
     assert_eq!(
-        duckdb_dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (1..=6).collect::<std::collections::BTreeSet<i64>>(),
         "committed file must hold every source id (1..=6)"
     );

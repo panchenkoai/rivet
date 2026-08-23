@@ -96,6 +96,305 @@ impl Eng {
             Eng::Ms => Rig::mssql_batch(&format!("dbo.{table}")),
         }
     }
+
+    /// The schema-qualified table name to embed in a raw `also_export` query —
+    /// same qualification [`Eng::rig`] applies to the main export's `table:`.
+    fn qualified(self, table: &str) -> String {
+        match self {
+            Eng::Pg => format!("public.{table}"),
+            Eng::My => table.to_string(),
+            Eng::Ms => format!("dbo.{table}"),
+        }
+    }
+}
+
+/// As [`insert_dense_range`], but also fills the `pad` column — for the SEEDING
+/// leg of a split fixture, whose giant must carry bytes across its whole span.
+/// The grow leg deliberately keeps using the narrow twin: `pad` is NULLable, and
+/// the width is only needed for the PRIMING run that sets the split ratio.
+fn insert_dense_range_padded(eng: Eng, table: &str, lo: i64, hi: i64, pad_bytes: usize) {
+    let (pg, my, ms) = (
+        format!("repeat('x', {pad_bytes})"),
+        format!("REPEAT('x', {pad_bytes})"),
+        format!("REPLICATE('x', {pad_bytes})"),
+    );
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "INSERT INTO {table} (id, payload, pad) \
+                 SELECT g, g, {pg} FROM generate_series({lo}, {hi}) g"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                hi - lo + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, payload, pad) \
+                 WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+                 SELECT n, n, {my} FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, payload, pad) \
+                 SELECT value, value, {ms} FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
+            ));
+        }
+    }
+}
+
+/// Append `id`s `lo..=hi` (payload = id) to a `(id BIGINT PK, payload INT)` stand
+/// table — the source-GROWTH leg of the split-resume scenario, per engine.
+fn insert_dense_range(eng: Eng, table: &str, lo: i64, hi: i64) {
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "INSERT INTO {table} (id, payload) SELECT g, g FROM generate_series({lo}, {hi}) g"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                hi - lo + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, payload) \
+                 WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+                 SELECT n, n FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, payload) \
+                 SELECT value, value FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
+            ));
+        }
+    }
+}
+
+/// Seed a GAPPY (but not sparse) `(id BIGINT PK, payload INT)` table at split
+/// scale: two dense blocks of `block` rows separated by a `block`-wide hole
+/// (`1..=block` and `2*block+1..=3*block`), `2*block` rows over a span of
+/// `3*block` (ratio ~1.5, below the sparse floor so the split is not refused).
+/// The interior split boundaries land in or beside the hole — the exact shape a
+/// re-sample would place differently after growth. Returns the table, cleanup,
+/// and the full id set.
+fn seed_gappy_split(
+    eng: Eng,
+    block: i64,
+) -> (String, StandCleanup, std::collections::BTreeSet<i64>) {
+    // WIDE, for the same reason the dense split fixture is (see `seed_dense_wide`):
+    // this is a `_split_` fixture, and a narrow giant does not beat the sibling's
+    // fixed connect+plan floor by R=3.0. Widening the dense fixture on 08-17 left
+    // this one narrow — and `stand_pool_split_gappy_key_mssql` was one of the four
+    // nightly failures the next morning (giant 612 ms vs sibling 403 ms, ratio
+    // 1.52). Both blocks are padded, so the giant carries the bytes across the
+    // whole span rather than only its first half.
+    let (table, guard) = seed_dense_wide(eng, block, SPLIT_PAD_BYTES); // 1..=block
+    insert_dense_range_padded(eng, &table, 2 * block + 1, 3 * block, SPLIT_PAD_BYTES);
+    let ids: std::collections::BTreeSet<i64> =
+        (1..=block).chain(2 * block + 1..=3 * block).collect();
+    (table, guard, ids)
+}
+
+/// Split+pool crash-resume across a stand shape — the engine-agnostic proof of
+/// finding 2 (split-window persistence). `table` holds `original_ids`; a small
+/// sibling export makes the giant the clear long pole so `advise_split` realizes
+/// the split into the pool. Run 1 splits and crashes a unit mid-way; if `grow`
+/// is set the source then GAINS rows `grow.0..=grow.1` (the input that shifts a
+/// re-sampled partition); run 2 resumes. The manifest must DECLARE every
+/// ORIGINAL id afterwards — read with the orphan-immune `dir_manifest_copy_id_set`
+/// (a crash leaves pre-shift orphans a raw read would miscount). Whether the new
+/// rows also land depends on which unit held the open window, so only the
+/// original-snapshot guarantee is asserted.
+fn run_pool_split_resume(
+    eng: Eng,
+    table: &str,
+    original_ids: &std::collections::BTreeSet<i64>,
+    grow: Option<(i64, i64)>,
+) {
+    // Default arm: RANGE chunking (`chunk_column`), crashed mid-chunk via the chunked
+    // runner's `chunk_export` error hook.
+    run_pool_split_resume_with(
+        eng,
+        table,
+        original_ids,
+        grow,
+        "chunk_column: id",
+        ("RIVET_TEST_ERROR_AT", "chunk_export:1"),
+    );
+}
+
+/// As [`run_pool_split_resume`] but with the key STRATEGY line and the mid-run crash
+/// hook parameterised, so the identical split→crash→(grow)→resume proof runs over BOTH
+/// range chunking (`chunk_column` + `chunk_export` error) AND keyset (`chunk_by_key` +
+/// the `after_keyset_page` PANIC — the keyset runner has no `chunk_export` hook, and a
+/// panic is the hard-crash-with-no-manifest shape the reconstruct fill must survive).
+fn run_pool_split_resume_with(
+    eng: Eng,
+    table: &str,
+    original_ids: &std::collections::BTreeSet<i64>,
+    grow: Option<(i64, i64)>,
+    key_line: &str,
+    crash: (&str, &str),
+) {
+    let n = original_ids.len() as i64;
+    let chunk = (n / 4).max(1); // 2 units of n/2 → 2 chunks/pages each → the hook fires
+    let sibling_q = format!("SELECT id FROM {} WHERE id <= 100", eng.qualified(table));
+    let rig = eng
+        .rig(table)
+        .mode("chunked")
+        .export_line(key_line)
+        .export_line(&format!("chunk_size: {chunk}"))
+        .export_line("parallel_safe: true")
+        .also_export("split_sibling", &sibling_q)
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+
+    // Prime durations, clear, so the split fires on run 1.
+    assert!(
+        run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[])
+            .status
+            .success(),
+        "priming run must succeed"
+    );
+    for d in [rig.out_dir(), rig.out_dir_for("split_sibling")] {
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+    }
+
+    // Run 1: split + crash a unit mid-way.
+    let crashed = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &[crash],
+    );
+    // PRECONDITION before the product assertion. `--split` is purely ADVISORY:
+    // `pool::advise_split` declines unless the giant beats the next-longest by
+    // more than R (3.0 at the `apply --pool --split` call site in run.rs) on
+    // PREDICTED seconds, which come from the priming run's recorded durations.
+    // The sibling is 100 rows but still pays a full connect + plan + write, so
+    // on a fast engine or a loaded runner the ratio can fall under 3 and NO
+    // units are produced — nothing to error, run 1 succeeds, and the assertion
+    // below then blames the product for an inert fixture. That is exactly how
+    // this read in CI (`stand_pool_split_gappy_key_{mysql,mssql}` and
+    // `..._resume_grows_mssql`, red on the 2026-08-16 nightly while green
+    // locally, and green on postgres in the same run — a ratio, not a bug).
+    //
+    // So: check the fixture FIRST, and when it is inert say so with the numbers
+    // the advisor actually used, rather than reporting a product failure.
+    {
+        let db = StateDb::next_to_config(&cfg);
+        let runs = db.export_runs();
+        // ANY status: this run crashes its units on purpose, so a unit that did
+        // its job records a FAILED row, not a successful one.
+        let units = runs.iter().filter(|(n, ..)| n.contains('#')).count();
+        {
+            // The priming run's successes are what the advisor predicted from.
+            // ONE entry per export NAME (its longest run): the advisor compares
+            // the longest export to the next-longest OTHER export, so a list
+            // that repeats one name would report it dominating ITSELF — ratio
+            // 1.00 on a giant that in fact dominates 15x (caught RED-proving
+            // this guard, 2026-08-16).
+            let mut best: std::collections::BTreeMap<String, (i64, i64)> =
+                std::collections::BTreeMap::new();
+            for (n, st, ms, rows) in &runs {
+                if n.contains('#') || st != "success" {
+                    continue;
+                }
+                let e = best.entry(n.clone()).or_insert((0, 0));
+                if *ms > e.0 {
+                    *e = (*ms, *rows);
+                }
+            }
+            let mut primed: Vec<_> = best
+                .into_iter()
+                .map(|(n, (ms, rows))| (n, ms, rows))
+                .collect();
+            primed.sort_by_key(|(_, ms, _)| -*ms);
+            let ratio = match primed.as_slice() {
+                [(_, a, _), (_, b, _), ..] if *b > 0 => *a as f64 / *b as f64,
+                _ => f64::NAN,
+            };
+            // Report the MARGIN on every run, not only on the failing one. The
+            // ratio is a property of the machine as much as the fixture (local
+            // 15x, CI 1.52), so a nightly that passes at 3.1 is one slow disk
+            // away from the failure this guard exists to explain — and without
+            // this line the log says nothing until it is already red.
+            eprintln!(
+                "split fixture margin: ratio {ratio:.2} vs R=3.0, {units} unit(s), primed {primed:?}"
+            );
+            assert!(
+                units >= 2,
+                "FIXTURE INERT, not a product failure: `--split` produced {units} unit(s), so no \
+                 unit could error and run 1 was always going to succeed — the assertion below \
+                 would blame the product for the fixture's own failure to set up. \
+                 `pool::advise_split` declines unless the giant beats the next-longest by more \
+                 than R=3.0 on PREDICTED seconds (from the priming run) AND the split lowers the \
+                 predicted wall. The priming run measured {primed:?} (ratio {ratio:.2} vs R=3.0). \
+                 If the ratio is comfortably past 3, the decline came from another gate — read \
+                 `pool::advise_split`. Do not relax the assertion below."
+            );
+        }
+    }
+
+    assert!(
+        !crashed.status.success(),
+        "run 1 must fail (a unit errored mid-split):\n{}",
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    let partial = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert!(
+        partial < n,
+        "run 1 must leave the split INCOMPLETE (a unit crashed), got {partial} of {n}"
+    );
+
+    // Optional source growth between the crash and the resume.
+    if let Some((lo, hi)) = grow {
+        insert_dense_range(eng, table, lo, hi);
+    }
+
+    // Run 2: split + resume — must reconstruct the ORIGINAL partition.
+    let resumed = run_rivet_env(
+        &[
+            "apply",
+            cfg.to_str().unwrap(),
+            "--pool",
+            "2",
+            "--split",
+            "--resume",
+        ],
+        &[],
+    );
+    assert!(
+        resumed.status.success(),
+        "resume run must succeed:\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+
+    let declared = dir_manifest_copy_id_set(&rig.out_dir());
+    let missing: Vec<i64> = original_ids
+        .iter()
+        .copied()
+        .filter(|id| !declared.contains(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "resume must preserve every ORIGINAL id in the manifest: {} of {n} missing (e.g. {:?})",
+        missing.len(),
+        &missing[..missing.len().min(8)]
+    );
 }
 
 /// Drops the stand's temp table on scope exit, per engine.
@@ -379,14 +678,66 @@ fn stand_keyset_decimal_key_bails_mssql() {
 /// Seed a DENSE contiguous integer-PK table (`id` = 1..rows), the well-behaved
 /// shape for range chunking / chunk_count.
 fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    seed_dense_wide(eng, rows, 0)
+}
+
+/// The dense fixture the `apply --pool --split` tests need.
+///
+/// 200 bytes a row, so the giant's export is dominated by BYTES WRITTEN rather
+/// than by how fast the machine gets through 300k narrow ints. That is what
+/// makes `pool::advise_split`'s R=3.0 threshold clear on a fast runner as well
+/// as a slow laptop — see [`seed_dense_wide`] for the measurements that forced
+/// it. The width is the only thing that changes: the id space, `dense_ids`, the
+/// grow ranges and every caller stay exactly as they were.
+fn seed_dense_wide_for_split(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    seed_dense_wide(eng, rows, SPLIT_PAD_BYTES)
+}
+
+/// One width for every split fixture. Named rather than repeated so widening it
+/// again (if a future runner still lands under R=3.0) is one edit, and so a
+/// reader can see the dense and gappy fixtures are deliberately the same shape.
+const SPLIT_PAD_BYTES: usize = 200;
+
+/// `seed_dense` with a `pad` column of `pad_bytes` characters.
+///
+/// The split fixtures need it. `pool::advise_split` declines unless the giant
+/// beats the next-longest by more than R=3.0 on PREDICTED SECONDS, and the
+/// sibling — 100 rows — costs whatever a connect + plan + tiny write costs on
+/// that machine, a FIXED floor that does not shrink with the fixture. Measured
+/// on CI 2026-08-17: the giant did 300k narrow rows in 601 ms while the sibling
+/// took 201-403 ms, so the ratio landed at 1.52-2.99 against a threshold of 3.0
+/// and `--split` produced no units at all. Locally the same fixture reads 15x,
+/// because the local giant takes 3.3 s — the ratio was measuring the machine.
+///
+/// Widening the ROW rather than adding rows is deliberate: export time is
+/// dominated by bytes written, so this buys the giant seconds without touching
+/// `dense_ids(300_000)`, the grow ranges, or anything else every caller passes,
+/// and the seed stays one bulk INSERT.
+fn seed_dense_wide(eng: Eng, rows: i64, pad_bytes: usize) -> (String, StandCleanup) {
     let table = unique_name("stand_dense");
     let guard = StandCleanup(eng, table.clone());
+    let (pad_col, pad_val_pg, pad_val_my, pad_val_ms) = if pad_bytes == 0 {
+        (String::new(), String::new(), String::new(), String::new())
+    } else {
+        (
+            format!(
+                // NULLable on purpose: `insert_dense_range` (the GROW step) inserts
+                // (id, payload) only, and the width is needed just for the PRIMING
+                // run, whose durations set the split ratio — the grow happens after.
+                ", pad VARCHAR({pad_bytes})"
+            ),
+            format!(", repeat('x', {pad_bytes})"),
+            format!(", REPEAT('x', {pad_bytes})"),
+            format!(", REPLICATE('x', {pad_bytes})"),
+        )
+    };
+    let cols = if pad_bytes == 0 { "" } else { ", pad" };
     match eng {
         Eng::Pg => {
             let mut c = pg_connect();
             c.batch_execute(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
-                 INSERT INTO {table} (id, payload) SELECT g, g FROM generate_series(1, {rows}) g;
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL{pad_col});
+                 INSERT INTO {table} (id, payload{cols}) SELECT g, g{pad_val_pg} FROM generate_series(1, {rows}) g;
                  ANALYZE {table};"
             ))
             .unwrap();
@@ -394,7 +745,7 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
         Eng::My => {
             let mut c = mysql_connect();
             c.query_drop(format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL{pad_col})"
             ))
             .unwrap();
             c.query_drop(format!(
@@ -403,19 +754,19 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
             ))
             .unwrap();
             c.query_drop(format!(
-                "INSERT INTO {table} (id, payload) \
+                "INSERT INTO {table} (id, payload{cols}) \
                  WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
-                 SELECT n, n FROM seq"
+                 SELECT n, n{pad_val_my} FROM seq"
             ))
             .unwrap();
         }
         Eng::Ms => {
             mssql_exec(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL{pad_col})"
             ));
             mssql_exec(&format!(
-                "INSERT INTO {table} (id, payload) \
-                 SELECT value, value FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+                "INSERT INTO {table} (id, payload{cols}) \
+                 SELECT value, value{pad_val_ms} FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
@@ -462,9 +813,11 @@ fn seed_mysql_unsigned_key(rows: i64) -> (String, StandCleanup) {
 /// on a dense key. Assert the run succeeds and emits exactly N parquet parts.
 fn run_chunk_count(eng: Eng, n: usize) {
     eng.require();
-    let (table, _guard) = seed_dense(eng, 4000);
+    const ROWS: i64 = 4000;
+    let (table, _guard) = seed_dense(eng, ROWS);
     let rig = eng
         .rig(&table)
+        .duckdb_oracle()
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line(&format!("chunk_count: {n}"));
@@ -485,6 +838,17 @@ fn run_chunk_count(eng: Eng, n: usize) {
         "chunk_count: {n} must emit exactly {n} part files on a dense key; got {}: {files:?}",
         files.len()
     );
+    // The file COUNT is the shape; the ROWS are the point. `chunk_count` divides
+    // the key range into N windows, so the failure this knob can produce is a
+    // divisor that drops or double-covers a boundary — and that leaves the part
+    // count untouched. Until 2026-08-17 nothing anywhere in the tree read a row
+    // from a `chunk_count` export, on any engine (audit).
+    //
+    // DuckDB, not `count_parquet_rows`: the arrow helper decodes with the same
+    // crate rivet encodes with, so a fault in that shared path cancels out.
+    // Distinct-on-`id` is what separates the two failures — a lost window and a
+    // double-covered one can both leave the row total looking plausible.
+    rig.assert_complete("id", ROWS, "chunk_count over a dense key");
 }
 
 /// Seed a table keyed by a DATE column `d` spanning `days` distinct days
@@ -552,9 +916,11 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
 /// the run succeeds and emits exactly 5 parts on every engine.
 fn run_chunk_by_days(eng: Eng) {
     eng.require();
-    let (table, _guard) = seed_dated(eng, 350, 35, false);
+    const ROWS: i64 = 350;
+    let (table, _guard) = seed_dated(eng, ROWS, 35, false);
     let rig = eng
         .rig(&table)
+        .duckdb_oracle()
         .mode("chunked")
         .export_line("chunk_column: d")
         .export_line("chunk_by_days: 7");
@@ -575,6 +941,15 @@ fn run_chunk_by_days(eng: Eng) {
         "chunk_by_days: 7 over a 35-day span must emit 5 weekly parts; got {}: {files:?}",
         files.len()
     );
+    // Five files is the shape; the rows are the point. Date windows are the
+    // likeliest place in the tree for an off-by-one — an inclusive/exclusive
+    // slip at a week boundary loses a day's rows or emits them twice, and both
+    // leave FIVE parts sitting there looking correct. Until 2026-08-17 no test
+    // on any engine read a row out of a `chunk_by_days` export (audit).
+    //
+    // Distinct-on-`id` separates the two: a dropped boundary day shows up in the
+    // row total, a double-covered one only in the distinct count.
+    rig.assert_complete("id", ROWS, "chunk_by_days over a 35-day span");
 }
 
 /// `mode: time_window` — a bounded date scan (`time_column` + `days_window`)
@@ -950,6 +1325,18 @@ fn stand_chunked_nondefault_schema_probe_degrades_and_exports_all_postgres() {
         40,
         "all 40 rows must export via the degrade fast-path"
     );
+}
+
+/// PostgreSQL was the one engine with no `chunk_count` EXPORT at all. The
+/// chunking matrix pointed its `chunk_count_n x postgres` cell at
+/// `roast_small_table_escape_respects_explicit_chunk_count`, which runs `rivet
+/// plan` and asserts the resolved strategy — planning, not data. So the knob's
+/// row-level behaviour was unproven on PG in both directions: no export ran, and
+/// the cell read `test` (audit 2026-08-17).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_chunk_count_postgres() {
+    run_chunk_count(Eng::Pg, 4);
 }
 
 #[test]
@@ -1345,34 +1732,22 @@ fn stand_format_csv_mssql() {
 }
 
 /// `source.environment: local` → the tuning profile defaults to `fast`; the run
-/// summary names the env-derived profile on stderr. Source-level, so raw YAML
-/// (the Rig has no environment knob). PG is covered in live_catalog_hints.
+/// summary names the env-derived profile on stderr. Through the rig's
+/// source_line (the "Rig has no environment knob" era ended with it). PG is
+/// covered in live_catalog_hints.
 fn run_environment_profile(eng: Eng) {
     eng.require();
     let (table, _guard) = seed_dense(eng, 50);
-    let (src, tbl_ref) = match eng {
-        Eng::My => (
-            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\n  environment: local"),
-            table.clone(),
-        ),
-        Eng::Ms => (
-            format!(
-                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    \
-                 accept_invalid_certs: true\n  environment: local"
-            ),
-            format!("dbo.{table}"),
-        ),
-        Eng::Pg => unreachable!("PG environment→profile is covered in live_catalog_hints"),
-    };
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: env_prof\n    table: {tbl_ref}\n    mode: full\n    \
-         format: parquet\n    destination: {{ type: local, path: {out} }}\n",
-        out = out_dir.path().display(),
+    assert!(
+        !matches!(eng, Eng::Pg),
+        "PG environment→profile is covered in live_catalog_hints"
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_with_warn_log(&["run", "-c", cfg.to_str().unwrap()]);
+    let rig = eng
+        .rig(&table)
+        .source_line("environment: local")
+        .export_named("env_prof")
+        .mode("full");
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
@@ -1413,27 +1788,6 @@ fn run_codec_matrix(eng: Eng) {
     }
 }
 
-/// The source YAML block + the table reference for `eng` (for raw-YAML tests that
-/// the Rig can't render — cloud destinations, environment).
-fn source_block(eng: Eng, table: &str) -> (String, String) {
-    match eng {
-        Eng::Pg => (
-            format!("source:\n  type: postgres\n  url: \"{POSTGRES_URL}\""),
-            format!("public.{table}"),
-        ),
-        Eng::My => (
-            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\""),
-            table.to_string(),
-        ),
-        Eng::Ms => (
-            format!(
-                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true"
-            ),
-            format!("dbo.{table}"),
-        ),
-    }
-}
-
 /// Count `.parquet` objects fake-gcs holds under `bucket/prefix` (its JSON list API).
 fn count_gcs_parquet(bucket: &str, prefix: &str) -> usize {
     use std::io::{Read, Write};
@@ -1452,21 +1806,15 @@ fn run_dest_gcs(eng: Eng) {
     eng.require();
     require_alive(LiveService::FakeGcs);
     let (table, _guard) = seed_dense(eng, 100);
-    let (src, tbl) = source_block(eng, &table);
     let bucket = "rivet-qa-stand-gcs";
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("stand_gcs");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: cg\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
-         destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n      \
-         endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
+    let rig = eng.rig(&table).export_named("cg").mode("full").dest_gcs(
+        bucket,
+        &prefix,
+        FAKE_GCS_ENDPOINT,
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
-        &[("RUST_LOG", "warn")],
-    );
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         out.status.success(),
         "gcs run failed; stderr:\n{}",
@@ -1488,20 +1836,16 @@ fn run_dest_s3(eng: Eng) {
     eng.require();
     require_alive(LiveService::Minio);
     let (table, _guard) = seed_dense(eng, 100);
-    let (src, tbl) = source_block(eng, &table);
     let bucket = "rivet-qa-stand-s3";
     ensure_minio_bucket(bucket);
     let prefix = unique_name("stand_s3");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: cs\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
-         destination:\n      type: s3\n      bucket: {bucket}\n      prefix: {prefix}\n      \
-         region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
-         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
+    let rig =
+        eng.rig(&table)
+            .export_named("cs")
+            .mode("full")
+            .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let out = rig.run_args_env(
+        &[],
         &[
             ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
             ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
@@ -1532,6 +1876,62 @@ fn run_dest_s3(eng: Eng) {
         100,
         "all rows: the downloaded s3 parquet must hold every seeded row (presence is not content)"
     );
+}
+
+/// The azure twin of [`run_dest_s3`] — the destination matrix's last `gap:`.
+///
+/// The `CloudDestination` path is shared with S3/GCS and proven there, so what
+/// this adds is the AZURE-specific leg: the account/key/endpoint config shape,
+/// the blob naming, and a read-back over the store's own list+get. The cell asked
+/// for CONTENT rather than object presence, so it sums the downloaded parquet's
+/// rows through the shared `azure_parquet_total_rows` — the same reader
+/// `live_azure_multipart.rs` uses, not a second definition of delivered.
+fn run_dest_azure(eng: Eng) {
+    eng.require();
+    require_alive(LiveService::Azurite);
+    let (table, _guard) = seed_dense(eng, 100);
+    let container = unique_name("stand-az").to_lowercase().replace('_', "-");
+    ensure_azure_container(&container);
+    let prefix = unique_name("stand_az");
+    let rig = eng
+        .rig(&table)
+        .export_named("ca")
+        .mode("full")
+        .dest_azure(&container, &prefix);
+    let out = rig.run_args_env(
+        &[],
+        &[
+            ("RIVET_TEST_AZURITE_KEY", AZURITE_KEY),
+            ("RUST_LOG", "warn"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "azure run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let blobs = azure_blob_names(&container, &prefix);
+    assert!(
+        blobs.iter().any(|b| b.ends_with(".parquet")),
+        "azurite must hold >=1 parquet under {prefix}; got: {blobs:?}"
+    );
+    assert_eq!(
+        azure_parquet_total_rows(&container, &prefix),
+        100,
+        "all rows: the downloaded azure blobs must hold every seeded row (presence is not content)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql azurite"]
+fn stand_dest_azure_mysql() {
+    run_dest_azure(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres azurite"]
+fn stand_dest_azure_postgres() {
+    run_dest_azure(Eng::Pg);
 }
 
 #[test]
@@ -1629,21 +2029,15 @@ fn stand_dest_gcs_mongo() {
     require_alive(LiveService::Mongo);
     require_alive(LiveService::FakeGcs);
     let db = mongo_seed(100);
-    let url = MongoTest::url(MONGO_PORT, &db);
     let bucket = "rivet-qa-stand-gcs";
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("stand_gcs_mg");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cg\n    table: c\n    \
-         mode: full\n    format: parquet\n    destination:\n      type: gcs\n      bucket: {bucket}\n      \
-         prefix: {prefix}\n      endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
-        &[("RUST_LOG", "warn")],
-    );
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .export_named("cg")
+        .mode("full")
+        .dest_gcs(bucket, &prefix, FAKE_GCS_ENDPOINT);
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         out.status.success(),
         "mongo gcs run failed; stderr:\n{}",
@@ -1666,20 +2060,16 @@ fn stand_dest_s3_mongo() {
     require_alive(LiveService::Mongo);
     require_alive(LiveService::Minio);
     let db = mongo_seed(100);
-    let url = MongoTest::url(MONGO_PORT, &db);
     let bucket = "rivet-qa-stand-s3";
     ensure_minio_bucket(bucket);
     let prefix = unique_name("stand_s3_mg");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cs\n    table: c\n    \
-         mode: full\n    format: parquet\n    destination:\n      type: s3\n      bucket: {bucket}\n      \
-         prefix: {prefix}\n      region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
-         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .export_named("cs")
+        .mode("full")
+        .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let out = rig.run_args_env(
+        &[],
         &[
             ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
             ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
@@ -2013,4 +2403,393 @@ fn stand_partial_unique_index_is_not_a_keyset_key_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_partial_unique_index_is_not_a_keyset_key_mssql() {
     run_partial_unique_index_is_not_a_keyset_key(Eng::Ms);
+}
+
+// ─── Split+pool crash-resume across engines, on GOOD and JUNK stand data ───────
+//
+// Finding 2 (split-window persistence) is engine-agnostic in the code but the
+// RESUME mechanism is per-engine (PG slot-free chunk checkpoint, MySQL, MSSQL
+// from-LSN-free chunk checkpoint), so it is proven empirically on each. GOOD
+// data = a dense contiguous key (`seed_dense`); JUNK data = a gappy key with a
+// hole the interior split boundaries fall into (`seed_gappy_split`). BOTH the
+// dense and the gappy runs GROW the source between crash and resume — the input
+// that shifts a re-sampled partition and drops the crashed unit's original range.
+// The growth is what makes these go RED against the finding-2 mutant: on an
+// UNCHANGED source the re-sample (`sample_key_boundaries`, pure over the row set)
+// reproduces the persisted partition byte-for-byte, so a no-growth resume cannot
+// tell reconstruct from re-sample and the test would be vacuous.
+//
+// 300k rows so the giant's scan time DECISIVELY dominates fixed per-export overhead
+// and `advise_split` reliably realizes the split, matching the proven-stable size of
+// the `pool_split_resume_*` toxiproxy tests. A smaller giant is mostly fixed overhead
+// (its predicted duration does not clear 3× the sibling's), so the split — and thus
+// the crash the test needs — becomes timing-flaky across engines/CI runners.
+
+fn dense_ids(n: i64) -> std::collections::BTreeSet<i64> {
+    (1..=n).collect()
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_resume_grows_postgres() {
+    Eng::Pg.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, 300_000);
+    run_pool_split_resume(
+        Eng::Pg,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_resume_grows_mysql() {
+    Eng::My.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::My, 300_000);
+    run_pool_split_resume(
+        Eng::My,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_resume_grows_mssql() {
+    Eng::Ms.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::Ms, 300_000);
+    run_pool_split_resume(
+        Eng::Ms,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_gappy_key_postgres() {
+    Eng::Pg.require();
+    let (table, _g, ids) = seed_gappy_split(Eng::Pg, 150_000);
+    run_pool_split_resume(Eng::Pg, &table, &ids, Some((450_001, 525_000)));
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_gappy_key_mysql() {
+    Eng::My.require();
+    let (table, _g, ids) = seed_gappy_split(Eng::My, 150_000);
+    run_pool_split_resume(Eng::My, &table, &ids, Some((450_001, 525_000)));
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_gappy_key_mssql() {
+    Eng::Ms.require();
+    let (table, _g, ids) = seed_gappy_split(Eng::Ms, 150_000);
+    run_pool_split_resume(Eng::Ms, &table, &ids, Some((450_001, 525_000)));
+}
+
+// ─── Split+pool crash-resume on a KEYSET key (chunk_by_key), across engines ─────
+//
+// The runner-bypass check the review demanded: `chunk_by_key` (keyset) IS splittable
+// (splittable_key returns Some for it — only CDC and cursor_column/incremental are
+// refused), and the split window is applied at the SHARED build_plan seam
+// (wrap_key_range), so it composes with the keyset runner exactly as with range
+// chunking. These prove keyset pool-split works END-TO-END across a crash (split →
+// crash → grow → resume → every original id declared), per engine via the Rig + DuckDB
+// manifest oracle.
+//
+// SCOPE (honest): these do NOT isolate the finding-2 reconstruct mutant. The single
+// keyset runner has only PANIC hooks (`after_keyset_page`), no returning-error hook
+// like the chunked runner's `chunk_export`; a panic kills the whole pool process with
+// both giant units mid-page, so NO completed giant unit survives to misalign against a
+// re-sample — with reconstruct disabled the resume simply re-runs both fresh and still
+// completes (verified: the mutant stays GREEN here). The finding-2 reconstruct
+// guarantee is RUNNER-AGNOSTIC (it operates on the manifests, not the runner) and is
+// RED-proven by the unit tests `reconstruct_{covers_a_leading,fills_an_interior}_
+// adjacent_crash_*`; the RANGE stand tests above (`stand_pool_split_resume_grows_*`,
+// `stand_pool_split_gappy_key_*`) are the live finding-2 guards that DO bite the mutant.
+//
+// A TRAILING adjacent crash needs NO extra guard: it lowers `max_pos`, so the reconstruct's
+// tail unit becomes an OPEN `(b, None]` window baked into `base_query` as `WHERE key > b` (no
+// upper bound). The crashed unit's PERSISTED ranges record `ceil = None` for their last range
+// (a split unit is non-incremental → floor/ceil are None; the window lives in `base_query`, not
+// the range endpoints), so on resume that last range re-runs `WHERE key > last_bound` under the
+// WIDENED base_query and naturally covers everything up to the current max — the widened tail is
+// complete, not dropped. (A post-0.24.3 bughunt finding claimed this dropped `(b', None]` by
+// assuming the persisted last `hi = b'`; it is `None`, and the widened base_query covers the top
+// — verified by reading `partition_ranges` + the `(None, None)` floor/ceil for split units.)
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_keyset_recovers_a_crash_postgres() {
+    Eng::Pg.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, 300_000);
+    run_pool_split_resume_with(
+        Eng::Pg,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_keyset_recovers_a_crash_mysql() {
+    Eng::My.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::My, 300_000);
+    run_pool_split_resume_with(
+        Eng::My,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_keyset_recovers_a_crash_mssql() {
+    Eng::Ms.require();
+    let (table, _g) = seed_dense_wide_for_split(Eng::Ms, 300_000);
+    run_pool_split_resume_with(
+        Eng::Ms,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+/// `apply --pool --split` into a CLOUD prefix — the combination with zero
+/// coverage, and the one where every silent-loss class this repo has paid for
+/// meets at once.
+///
+/// Locally, `stand_pool_split_*` prove split (and split+resume) on a filesystem.
+/// On a bucket the same run has three extra ways to lose data, all already
+/// bitten here: split UNITS write into ONE shared prefix (part-name collision),
+/// each unit writes its own manifest SIDECAR there (the fixed-name clobber that
+/// under-counted 30 parts as 55 rows), and the read-back has historically been a
+/// DIFFERENT reader from the local one (the cloud oracle that counted every
+/// object under the prefix, orphans included, and read 2000 rows from 1000).
+///
+/// So the oracle is deliberately NOT cloud-specific: the prefix is PULLED whole
+/// and graded by `dir_manifest_copy_id_set`, the identical function the local
+/// tests use. One definition of "what was delivered", not two that drift.
+///
+/// `crash` injects a unit failure into run 1; the resume then has to reconstruct
+/// the original partition with run 1's ORPHAN parts already sitting in the
+/// bucket — unmanifested objects a prefix-wide reader would happily count.
+fn pool_split_cloud(crash: Option<(&str, &str)>) {
+    Eng::Pg.require();
+    require_alive(LiveService::Minio);
+    const ROWS: i64 = 300_000;
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, ROWS);
+
+    let bucket = "rivet-qa-parity";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("pool_split_cloud");
+
+    let sibling_q = format!(
+        "SELECT id FROM {} WHERE id <= 100",
+        Eng::Pg.qualified(&table)
+    );
+    let rig = Eng::Pg
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {}", ROWS / 4))
+        .export_line("parallel_safe: true")
+        .also_export("split_sibling", &sibling_q)
+        .also_export_line("parallel_safe: true")
+        .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let cfg = rig.config_path();
+    let creds = [
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+
+    // Prime: `advise_split` predicts from RECORDED durations, so a first run must
+    // exist before `--split` can decide anything.
+    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &creds);
+    assert!(
+        prime.status.success(),
+        "priming run failed:\n{}",
+        String::from_utf8_lossy(&prime.stderr)
+    );
+
+    let mut env: Vec<(&str, &str)> = creds.to_vec();
+    if let Some(c) = crash {
+        env.push(c);
+    }
+    let run1 = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &env,
+    );
+
+    // PRECONDITION, before any product assertion: `--split` is ADVISORY, and on a
+    // machine where the giant does not beat the sibling by R=3.0 it declines and
+    // produces no units at all — then the assertion below would pass while
+    // grading a plain pool run. (The same guard the local siblings carry, for the
+    // same reason: it fired for real on CI at ratio 1.52.)
+    let units = {
+        let db = StateDb::next_to_config(&cfg);
+        db.export_runs()
+            .iter()
+            .filter(|(n, ..)| n.contains('#'))
+            .count()
+    };
+    assert!(
+        units >= 2,
+        "FIXTURE INERT: `--split` produced {units} unit(s), so nothing was written by two \
+         writers into one prefix and the union below proves nothing about the class"
+    );
+
+    if crash.is_some() {
+        assert!(
+            !run1.status.success(),
+            "run 1 must FAIL (a unit errored mid-split) — a green run here means the crash \
+             hook never fired and the resume below has nothing to reconstruct:\n{}",
+            String::from_utf8_lossy(&run1.stderr)
+        );
+        let resumed = run_rivet_env(
+            &[
+                "apply",
+                cfg.to_str().unwrap(),
+                "--pool",
+                "2",
+                "--split",
+                "--resume",
+            ],
+            &creds,
+        );
+        assert!(
+            resumed.status.success(),
+            "resume run must succeed:\n{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+    } else {
+        assert!(
+            run1.status.success(),
+            "split run failed:\n{}",
+            String::from_utf8_lossy(&run1.stderr)
+        );
+    }
+
+    // The GIANT's sub-prefix only. The class under test is several split UNITS
+    // writing into ONE export's prefix; the sibling export has its own prefix and
+    // its own `_SUCCESS`, so pulling both would collide on marker names and grade
+    // a population the assertion does not describe.
+    let pulled = tempfile::tempdir().unwrap();
+    let giant_prefix = format!("{prefix}/{}", rig.export_name());
+    let objects = minio_pull_prefix(bucket, &giant_prefix, pulled.path());
+    assert!(
+        objects > 0,
+        "nothing was pulled from s3://{bucket}/{giant_prefix} — the run reported success, so an \
+         empty prefix means the destination wiring, not the data"
+    );
+    // MEASURED, not assumed. This variant was written expecting the crashed run to
+    // leave ORPHANS — parts written before the unit died, named by no manifest —
+    // and the first run of the assertion disproved it: 9 parts pulled, all 9
+    // DECLARED, zero unmanifested. The resume re-declares what attempt 1 had
+    // already written rather than stranding it.
+    //
+    // So the check is inverted into the property that measurement found, because
+    // it is worth keeping: a resumed split must not leave unmanifested objects in
+    // a bucket. They cost storage forever, they are what `gc_orphans` then has to
+    // reason about, and a prefix-wide reader counts them as delivered rows.
+    if crash.is_some() {
+        let declared: std::collections::BTreeSet<String> =
+            files_with_extension(pulled.path(), "json")
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("manifest-"))
+                        .unwrap_or(false)
+                })
+                .filter_map(|p| std::fs::read(p).ok())
+                .filter_map(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .flat_map(|v| {
+                    v.get("parts")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|part| {
+                    part.get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                })
+                .collect();
+        let parts = files_with_extension(pulled.path(), "parquet");
+        let orphans: Vec<String> = parts
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|n| !declared.contains(n))
+            .collect();
+        assert!(
+            parts.len() >= 2 && !declared.is_empty(),
+            "fixture inert: {} part(s) pulled, {} declared — nothing to check",
+            parts.len(),
+            declared.len()
+        );
+        assert!(
+            orphans.is_empty(),
+            "the resumed split left {} unmanifested part(s) in the bucket (e.g. {:?}) — a \
+             crashed attempt's parts must be re-declared by the resume, not stranded: an \
+             orphan is billed forever and reads as delivered to any prefix-wide counter",
+            orphans.len(),
+            orphans.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
+    let ids = dir_manifest_copy_id_set(pulled.path());
+    // Report the SHAPE of the gap, never the sets: a 300k-element set printed on
+    // failure buries the one number a reader needs under screenfuls of ids.
+    let expected = dense_ids(ROWS);
+    let missing: Vec<i64> = expected.difference(&ids).take(5).copied().collect();
+    let extra: Vec<i64> = ids.difference(&expected).take(5).copied().collect();
+    assert!(
+        ids == expected,
+        "every source id must be DECLARED by a manifest copy in the cloud prefix: {} of \
+         {ROWS} present, {objects} object(s) pulled. First missing: {missing:?}; unexpected: \
+         {extra:?}. A gap here is the split units overwriting each other's parts or each \
+         other's manifest sidecar — the shapes that survive every row count because the \
+         surviving artifacts stay self-consistent. (RED-proven: a non-run-unique manifest \
+         copy name leaves 150001 of 300000.)",
+        ids.len()
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres minio"]
+fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
+    pool_split_cloud(None);
+}
+
+/// The same prefix, entered TWICE — once by a run that died mid-split.
+///
+/// The crash is what makes this different from its sibling above: run 1 leaves
+/// ORPHAN parts in the bucket (written, never manifested), and the resume writes
+/// its own parts and manifest copies beside them. `dir_manifest_copy_id_set` is
+/// orphan-immune by construction — it reads only what a manifest DECLARES — which
+/// is exactly the property a prefix-wide object count does not have, and exactly
+/// why the cloud read-back once reported 2000 rows for a 1000-row table.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres minio"]
+fn stand_pool_split_cloud_crash_then_resume_declares_every_id_postgres() {
+    pool_split_cloud(Some(("RIVET_TEST_ERROR_AT", "chunk_export:1")));
 }

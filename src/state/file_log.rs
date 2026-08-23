@@ -36,6 +36,8 @@ pub struct FilePart<'a> {
     pub bytes: i64,
     pub format: &'a str,
     pub compression: Option<&'a str>,
+    /// v25: page high-water key (keyset cursor-atomic checkpoint); `None` for non-keyset parts.
+    pub cursor_high: Option<&'a str>,
 }
 
 /// One part of one run, as it lands. A named value rather than eight
@@ -53,6 +55,10 @@ pub struct DurablePart<'a> {
     /// recorded on the run's aggregate, which may not exist yet when the first
     /// part lands.
     pub mode: &'a str,
+    /// v25: the page's high-water key, for the keyset checkpoint's cursor-atomic resume — written
+    /// in this SAME row as the part, so a resume reconciles the cursor from committed parts and
+    /// never re-reads a committed page. `None` for every non-keyset-checkpoint part.
+    pub cursor_high: Option<&'a str>,
 }
 
 impl StateStore {
@@ -85,6 +91,7 @@ impl StateStore {
             format,
             compression,
             mode,
+            cursor_high,
         } = p;
         // A part is identified by its NAME within its run. Recording it twice is the
         // same fact stated twice, not two parts — and `file_log` has no uniqueness
@@ -102,6 +109,7 @@ impl StateStore {
             bytes,
             format,
             compression,
+            cursor_high,
         })?;
         self.project_running_aggregate(run_id, export_name, mode, format)
     }
@@ -126,10 +134,11 @@ impl StateStore {
             bytes,
             format,
             compression,
+            cursor_high,
         } = p;
         self.execute(
-            "INSERT INTO file_log (run_id, export_name, file_name, row_count, bytes, format, compression, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO file_log (run_id, export_name, file_name, row_count, bytes, format, compression, created_at, cursor_high) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             &[
                 run_id.into(),
                 export_name.into(),
@@ -139,6 +148,7 @@ impl StateStore {
                 format.into(),
                 compression.into(),
                 chrono::Utc::now().to_rfc3339().into(),
+                cursor_high.into(),
             ],
         )?;
         Ok(())
@@ -177,6 +187,21 @@ impl StateStore {
             &[run_id.into()],
             file_record,
         )
+    }
+
+    /// v25: the high-water key of the LAST committed keyset page for `run_id` — the resume point
+    /// for the cursor-atomic checkpoint. Keyset pages commit in KEY ORDER (monotonic), so the
+    /// highest-`id` row carrying a `cursor_high` holds the max key; `ORDER BY id DESC LIMIT 1`
+    /// deliberately avoids a LEXICAL SQL `MAX()` (which mis-orders numeric-as-text keys — "999" >
+    /// "1000"). `None` when this run committed no keyset page (a non-keyset or first-page-crash run).
+    pub fn last_committed_cursor_high(&self, run_id: &str) -> Result<Option<String>> {
+        let rows = self.query(
+            "SELECT cursor_high FROM file_log \
+             WHERE run_id = ?1 AND cursor_high IS NOT NULL ORDER BY id DESC LIMIT 1",
+            &[run_id.into()],
+            |r| r.text(0),
+        )?;
+        Ok(rows.into_iter().next())
     }
 }
 
@@ -221,6 +246,7 @@ mod tests {
                 format: "parquet",
                 compression: Some("zstd"),
                 mode: "chunked",
+                cursor_high: None,
             })
             .expect("record");
         }
@@ -250,6 +276,7 @@ mod tests {
             format: "parquet",
             compression: Some("zstd"),
             mode: "chunked",
+            cursor_high: None,
         })
         .expect("re-record");
         let again = s.get_metrics(Some("orders"), 10).expect("metrics");
@@ -277,6 +304,7 @@ mod tests {
             bytes: 4096,
             format: "parquet",
             compression: Some("zstd"),
+            cursor_high: None,
         })
         .unwrap();
         s.record_file(FilePart {
@@ -287,6 +315,7 @@ mod tests {
             bytes: 2048,
             format: "parquet",
             compression: Some("zstd"),
+            cursor_high: None,
         })
         .unwrap();
         s.record_file(FilePart {
@@ -297,6 +326,7 @@ mod tests {
             bytes: 500,
             format: "csv",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
 
@@ -321,6 +351,7 @@ mod tests {
                 bytes: i * 100,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         }

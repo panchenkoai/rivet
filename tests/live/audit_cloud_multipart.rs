@@ -53,38 +53,19 @@ fn seed_distinct_payload() -> (String, PgTable) {
 /// BETWEEN flushes — one batch per chunk would never split mid-chunk), aligned
 /// with row_group_rows 100 so each ~100 KB closed group exceeds the 64 KB cap →
 /// maybe_split rotates every group → `_p0`, `_p1`, … per chunk.
-fn chunked_cloud_yaml(table: &str, export: &str, dest_yaml: &str) -> String {
-    format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, payload FROM {table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 500
-    format: parquet
-    compression: none
-    max_file_size: 64KB
-    parquet:
-      row_group_strategy: fixed_rows
-      row_group_rows: 100
-    tuning: {{batch_size: 100}}
-{dest_yaml}
-"#
-    )
-}
-
-fn run_rivet_with_env(
-    cfg: &std::path::Path,
-    export: &str,
-    env: &[(&str, &str)],
-) -> std::process::Output {
-    let mut cmd = std::process::Command::new(RIVET_BIN);
-    cmd.args(["run", "--config", cfg.to_str().unwrap(), "--export", export]);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.output().expect("spawn rivet")
+fn chunked_cloud_rig(table: &str, export: &str) -> Rig {
+    Rig::pg_batch(table)
+        .export_named(export)
+        .query(&format!("SELECT id, payload FROM {table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 500")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("parquet:")
+        .export_line("  row_group_strategy: fixed_rows")
+        .export_line("  row_group_rows: 100")
+        .export_line("tuning: {batch_size: 100}")
 }
 
 /// Assert the listed keys prove a rotation reached the wire: at least two
@@ -115,24 +96,13 @@ fn cloud_multipart_s3_rotation_distinct_keys_and_all_rows() {
     let prefix = unique_name("s3mp");
     let (table, _g) = seed_distinct_payload();
 
-    let dest = format!(
-        r#"    destination:
-      type: s3
-      bucket: {bucket}
-      prefix: {prefix}
-      region: us-east-1
-      endpoint: {MINIO_ENDPOINT}
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK"#
-    );
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &chunked_cloud_yaml(&table, &prefix, &dest));
+    let rig = chunked_cloud_rig(&table, &prefix).dest_s3(bucket, &prefix, MINIO_ENDPOINT);
     let env = [
         ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
         ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
         ("AWS_EC2_METADATA_DISABLED", "true"),
     ];
-    let run = run_rivet_with_env(&cfg, &prefix, &env);
+    let run = rig.run_args_env(&["--export", &prefix], &env);
     assert!(
         run.status.success(),
         "s3 multipart export must succeed; stderr:\n{}",
@@ -204,17 +174,8 @@ fn cloud_multipart_gcs_rotation_distinct_keys_and_all_rows() {
     let prefix = unique_name("gcsmp");
     let (table, _g) = seed_distinct_payload();
 
-    let dest = format!(
-        r#"    destination:
-      type: gcs
-      bucket: {bucket}
-      prefix: {prefix}
-      endpoint: {FAKE_GCS_ENDPOINT}
-      allow_anonymous: true"#
-    );
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &chunked_cloud_yaml(&table, &prefix, &dest));
-    let run = run_rivet_with_env(&cfg, &prefix, &[]);
+    let rig = chunked_cloud_rig(&table, &prefix).dest_gcs(bucket, &prefix, FAKE_GCS_ENDPOINT);
+    let run = rig.run_args(&["--export", &prefix]);
     assert!(
         run.status.success(),
         "gcs multipart export must succeed; stderr:\n{}",

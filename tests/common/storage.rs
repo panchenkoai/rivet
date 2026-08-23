@@ -181,3 +181,115 @@ pub fn ensure_azure_container(container: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Pull every object under `prefix` into a LOCAL directory, preserving base
+/// names, and return how many were written.
+///
+/// This exists so a cloud destination can be graded by the SAME oracle as a
+/// local one. The alternative — a store-specific "what was delivered" reader —
+/// is a second definition of delivered, and it drifts on the first fix: the
+/// local read-back was corrected to count only manifest-DECLARED parts (a crash
+/// leaves orphans no manifest names) while the cloud reader kept summing every
+/// object under the prefix, so resume cells on s3/gcs read 2000 rows from a
+/// 1000-row table. Pull the prefix, then run `dir_manifest_copy_id_set` /
+/// `dir_manifest_copy_total_rows` over it exactly as the local tests do.
+///
+/// Base names are preserved because that is what a manifest's `parts[].path`
+/// resolves to; a collision would silently drop an object, so it PANICS instead.
+pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> usize {
+    std::fs::create_dir_all(into).expect("create pull dir");
+    let ls_script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket} 2>/dev/null"
+    );
+    let ls = Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
+        .output()
+        .expect("mc ls");
+    assert!(ls.status.success(), "mc ls failed");
+    let mut pulled = 0usize;
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&ls.stdout).lines() {
+        let Some(name) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let base = name.rsplit('/').next().unwrap_or(name).to_string();
+        assert!(
+            seen.insert(base.clone()),
+            "two objects under {prefix} share the base name {base} — flattening would \
+             silently drop one, and the manifest oracle resolves parts by base name"
+        );
+        let cat_script = format!(
+            "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+             mc cat local/{bucket}/{name}"
+        );
+        let cat = Command::new("docker")
+            .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])
+            .output()
+            .expect("mc cat");
+        assert!(cat.status.success(), "mc cat {name} failed");
+        std::fs::write(into.join(&base), cat.stdout).expect("write pulled object");
+        pulled += 1;
+    }
+    pulled
+}
+
+/// Blob names under `prefix` in an azurite container, via anonymous HTTP
+/// `List Blobs` (the container is provisioned public-read by
+/// [`ensure_azure_container`]).
+///
+/// Shared rather than private to one test: `live_azure_multipart.rs` grew this
+/// XML walk locally, and a second azure test copying it would be the two-readers
+/// problem the cloud read-back already paid for once — a store-specific "what
+/// was delivered" drifts on the first fix.
+pub fn azure_blob_names(container: &str, prefix: &str) -> Vec<String> {
+    let url = format!(
+        "{}/{container}?restype=container&comp=list&prefix={prefix}",
+        super::env::AZURITE_ENDPOINT
+    );
+    let xml = reqwest::blocking::Client::new()
+        .get(&url)
+        .send()
+        .expect("azure list request")
+        .text()
+        .expect("azure list body");
+    azure_blob_names_from_list_xml(&xml)
+}
+
+/// Extract blob names from an Azure "List Blobs" XML body: each blob is
+/// `<Blob><Name>…</Name>…</Blob>`. Split out so a caller that already holds the
+/// XML (a test asserting on the listing itself) parses it the same way.
+pub fn azure_blob_names_from_list_xml(xml: &str) -> Vec<String> {
+    xml.split("<Name>")
+        .skip(1)
+        .filter_map(|seg| seg.split("</Name>").next())
+        .map(String::from)
+        .collect()
+}
+
+/// The independent read-back oracle for azurite: download every `.parquet` blob
+/// under `prefix` and sum its row count — CONTENT, not object presence, which is
+/// the distinction the destination matrix's round-trip row asks for.
+pub fn azure_parquet_total_rows(container: &str, prefix: &str) -> usize {
+    let http = reqwest::blocking::Client::new();
+    azure_blob_names(container, prefix)
+        .iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .map(|key| {
+            let bytes = http
+                .get(format!(
+                    "{}/{container}/{key}",
+                    super::env::AZURITE_ENDPOINT
+                ))
+                .send()
+                .expect("azure blob download")
+                .bytes()
+                .expect("azure blob body")
+                .to_vec();
+            super::parquet_rows_from_bytes(bytes)
+        })
+        .sum()
+}

@@ -22,12 +22,6 @@
 
 use crate::common::*;
 
-fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
-    (d, p)
-}
-
 /// A quality-gate failure (`row_count_min` above the real row count) must exit
 /// with the **data-integrity** code `3` — the scheduler's signal to STOP, not
 /// retry. The export wrote a (potentially wrong-shaped) dataset; blindly
@@ -40,24 +34,13 @@ fn quality_gate_failure_exits_data_integrity_3() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("xc_quality_3");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 100
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id FROM {}", table.name()))
+        .export_line("quality:")
+        .export_line("  row_count_min: 100")
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert_eq!(
         result.status.code(),
@@ -91,25 +74,16 @@ fn keyset_quality_gate_failure_exits_data_integrity_3() {
 
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("keyset_quality_3_exp");
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    table: {table_name}
-    mode: chunked
-    chunk_by_key: k
-    chunk_size: 2
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 100
-"#,
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&table_name)
+        .export_named(&export_name)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 2")
+        .export_line("quality:")
+        .export_line("  row_count_min: 100")
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert_eq!(
         result.status.code(),
@@ -136,26 +110,16 @@ fn reconcile_mismatch_exits_data_integrity_3() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("xc_reconcile_3");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
 
     // Export records each chunk's row count in the manifest.
-    let run = run_rivet_export(&cfgpath, &export_name);
+    let run = rig.run_args(&["--export", &export_name]);
     assert!(
         run.status.success(),
         "setup export must succeed; stderr:\n{}",
@@ -171,13 +135,7 @@ exports:
             .expect("delete one source row to force a reconcile mismatch");
     }
 
-    let result = run_rivet(&[
-        "reconcile",
-        "--config",
-        cfgpath.to_str().unwrap(),
-        "--export",
-        &export_name,
-    ]);
+    let result = rig.cli(&["reconcile", "--export", &export_name]);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert_eq!(
         result.status.code(),
@@ -197,24 +155,13 @@ fn clean_export_still_exits_0() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("xc_clean_0");
 
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-    quality:
-      row_count_min: 1
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id FROM {}", table.name()))
+        .export_line("quality:")
+        .export_line("  row_count_min: 1")
+        .dest_path(out.path().to_path_buf());
 
-    let result = run_rivet_export(&cfgpath, &export_name);
+    let result = rig.run_args(&["--export", &export_name]);
     assert_eq!(
         result.status.code(),
         Some(0),

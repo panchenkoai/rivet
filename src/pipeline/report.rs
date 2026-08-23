@@ -59,6 +59,9 @@ pub struct RunReport {
     pub retries: u32,
 
     /// Postgres temp-spill delta in bytes (None on non-PG or when probe failed).
+    /// DATABASE-wide, so it is a WINDOW delta: under any concurrent-sibling mode
+    /// every concurrent export reports the same shared window (see
+    /// `RunSummary::pg_temp_bytes_delta`) — never sum it across exports.
     pub pg_temp_bytes_delta: Option<i64>,
 
     pub validation: Option<ValidationOutcome>,

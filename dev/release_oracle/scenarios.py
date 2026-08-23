@@ -48,12 +48,13 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import HERE, ROOT, Ledger, Status, docker, docker_exec, have, rivet, rivet_bin, run
+    from .core import HERE, ROOT, Ledger, Proc, Status, docker, docker_exec, have, rivet, rivet_bin, run
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
         ROOT,
         Ledger,
+        Proc,
         Status,
         docker,
         docker_exec,
@@ -69,6 +70,8 @@ __all__ = [
     "store_readback",
     "store_up",
     "verify_coverage_matrices",
+    "verify_pool_e2e",
+    "verify_pool_split",
     "verify_replica_read",
     "verify_state_migrations",
 ]
@@ -96,6 +99,16 @@ GOLDEN_DUCKDB = _asset("golden/duckdb_type_matrix.json")
 # here rather than a lookup with no default.
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
+
+# The httpfs session every s3 read here opens, as ONE definition. It was written
+# out three times, and a readback that differs from its neighbour by a forgotten
+# `SET s3_url_style` fails in a way that reads like a delivery defect.
+S3_HTTPFS_PREAMBLE = (
+    "INSTALL httpfs; LOAD httpfs; SET s3_endpoint='127.0.0.1:9000'; "
+    "SET s3_use_ssl=false; SET s3_url_style='path'; "
+    f"SET s3_access_key_id='{MINIO_ACCESS_KEY}'; "
+    f"SET s3_secret_access_key='{MINIO_SECRET_KEY}'; "
+)
 AZURITE_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 AZURITE_CONN = os.environ.get(
     "AZURITE_CONN",
@@ -220,6 +233,152 @@ def _duckdb_list(sql: str) -> str:
     return run(["duckdb", "-noheader", "-list", "-c", sql]).stdout.strip()
 
 
+def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
+    """Independent per-column null profile via DuckDB (never rivet's own summary).
+
+    Takes a GLOB, and stays one on purpose while `store_readback` and the loss/dup
+    cells are manifest-scoped. The distinction is what the number MEANS: an
+    all-null column is a property of the DECODE path, and every part a run wrote
+    went through the same decode — an undeclared orphan is a copy of the same
+    fault, so including it cannot turn a null column non-null or the reverse. A
+    completeness count is the opposite: there the undeclared part is exactly the
+    difference between what was held and what was delivered.
+
+    Returns (n_all_null, n_cols): how many columns are 100% NULL while rows > 0, and
+    the total column count. That is the documented silent-loss class — a decode
+    regression (e.g. the FixedSizeBinary uuid path) nulling a WHOLE column while the
+    row count stays green and every count/sum check passes. `count(COLUMNS(*))` yields
+    one non-null count per column generically, so this needs no per-engine schema
+    knowledge and no column names. (-1, -1) = unreadable/empty (the row-count oracle
+    already SKIPs those); a genuinely present all-null column returns n_all_null > 0.
+    """
+    return _allnull_parse(
+        _duckdb_list(f"SELECT count(*), count(COLUMNS(*)) FROM read_parquet('{path_glob}')")
+    )
+
+
+def _allnull_parse(out: str) -> tuple[int, int]:
+    """Parse `count(*), count(COLUMNS(*))` (one `|`-joined row) into (n_all_null, n_cols)."""
+    if not out:
+        return (-1, -1)
+    vals = out.splitlines()[0].split("|")
+    try:
+        nums = [int(v) for v in vals]
+    except ValueError:
+        return (-1, -1)
+    rows, cols = nums[0], nums[1:]
+    if rows <= 0 or not cols:
+        return (-1, -1)
+    return (sum(1 for c in cols if c == 0), len(cols))
+
+
+def duckdb_allnull_cloud(store: str, bucket: str, prefix: str, work: Path) -> tuple[int, int]:
+    """Per-column null profile of a CLOUD prefix, read the SAME store-native way as
+    `store_readback` (s3 over httpfs, gcs via the JSON-API pull) — an INDEPENDENT DuckDB
+    oracle for the object-store path, where the documented uuid→FixedSizeBinary silent
+    loss actually happened. Returns (n_all_null, n_cols); (-1,-1) if unreadable/empty or
+    a store not profiled here (azure). Mirrors store_readback so the two agree on reads."""
+    cols = "count(*), count(COLUMNS(*))"
+    if store == "s3":
+        return _allnull_parse(_duckdb_list(
+            S3_HTTPFS_PREAMBLE
+            + f"SELECT {cols} FROM read_parquet('s3://{bucket}/{prefix}/**/*.parquet')"
+        ))
+    if store == "gcs":
+        dl = work / f"nullprof_gcs_{random.randint(0, 32767)}"
+        dl.mkdir(parents=True, exist_ok=True)
+        got = run([PY, str(_asset("lib/gcs_pull.py")),
+                   "http://127.0.0.1:4443", bucket, prefix, str(dl)]).stdout.strip()
+        try:
+            if int(got) <= 0:
+                return (-1, -1)
+        except ValueError:
+            return (-1, -1)
+        return _allnull_parse(_duckdb_list(f"SELECT {cols} FROM read_parquet('{dl}/**/*.parquet')"))
+    return (-1, -1)
+
+
+def _manifest_declared_parts(root: Path) -> list[str]:
+    """Absolute paths of the parts the manifest(s) under `root` DECLARE as committed — the
+    union across immutable manifest-*.json copies (plus the canonical manifest.json), i.e.
+    exactly what a consumer (`rivet load`) reads. Mirrors blessed_flow._manifest_files;
+    lives here so cdc.py can share it without a circular import."""
+    copies = sorted(root.rglob("manifest-*.json"))
+    docs = copies or ([root / "manifest.json"] if (root / "manifest.json").is_file() else [])
+    out: list[str] = []
+    for d in docs:
+        try:
+            art = json.loads(d.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for f in art.get("parts", []) or []:
+            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
+                continue
+            name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
+            if not name:
+                continue
+            cand = Path(name)
+            if not cand.is_absolute():
+                cand = d.parent / cand
+            if cand.is_file():
+                out.append(str(cand))
+    return sorted(set(out))
+
+
+def _declared_read(root: Path, suffix: str) -> str | None:
+    """A DuckDB source LIST over only the parts the manifest DECLARES, or None.
+
+    The difference from a `**/*<suffix>` glob is the whole point of this oracle:
+    a glob reads what the destination HOLDS, and a consumer (`rivet load`,
+    `validate`, `reconcile`) reads what the run DECLARED. When those two
+    disagree, a glob-based compare against the source agrees with the source and
+    reports delivery that no consumer will ever see.
+
+    Measured 2026-08-23 on a real 5-part keyset export of `users` (1000 rows):
+    with one part removed from the manifests and its FILE left on disk, the glob
+    still read 1000/1000 and passed, while this list read 800 and diverged from
+    the source. That is the manifest-clobber / harvest-gap class, and it is the
+    one this file's own history says every "repeated run" test missed by
+    re-reading the parquet — the artifact that survives — instead of the
+    manifest.
+
+    None means the manifest declares nothing readable, which is itself an
+    outcome ("nothing was delivered"), never a reason to fall back to the glob:
+    a fallback would restore exactly the blindness this exists to remove.
+    """
+    parts = [f for f in _manifest_declared_parts(root) if f.endswith(suffix)]
+    if not parts:
+        return None
+    return "[" + ", ".join(f"'{f}'" for f in parts) + "]"
+
+
+def manifest_scoped_ids(store: str, bucket: str, prefix: str, work: Path, idc: str) -> str:
+    """Distinct id-set the store DELIVERS per its MANIFESTS (not raw parquet), comma-joined.
+
+    For the CDC crash oracle: at cdc_after_flush_before_ack the crashed run's part is durable
+    but UNMANIFESTED (the hook fires BEFORE write_manifest), so a raw `**/*.parquet` id-set is
+    fooled by that orphan — it cannot tell 'recovery re-read id=4' from 'id=4 left as an orphan
+    that rivet load never sees'. Reading only manifest-declared committed parts (what a consumer
+    reads) makes the orphan invisible, so a recovery that re-anchored PAST the un-acked change
+    reads back WITHOUT it. s3 only (the CDC store); '' if mc or a manifest is absent."""
+    if store != "s3" or not have("mc"):
+        return ""
+    dl = work / f"cdcmanifest_{random.randint(0, 32767)}"
+    shutil.rmtree(dl, ignore_errors=True)
+    dl.mkdir(parents=True, exist_ok=True)
+    alias = "rivetcdcmani"
+    run(["mc", "alias", "set", alias, "http://127.0.0.1:9000", MINIO_ACCESS_KEY, MINIO_SECRET_KEY])
+    if not run(["mc", "cp", "--recursive", f"{alias}/{bucket}/{prefix}/", str(dl)]).ok:
+        return ""
+    parts = _manifest_declared_parts(dl)
+    if not parts:
+        return ""
+    lst = ", ".join(f"'{f}'" for f in parts)
+    return _duckdb_list(
+        f"SELECT string_agg(DISTINCT CAST({idc} AS VARCHAR), ',') FROM read_parquet([{lst}])"
+    )
+
+
 def _duckdb_json_normalized(sql: str) -> str:
     """`duckdb -json -c SQL | lib/normalize_bq.py` — the canonical golden form.
 
@@ -309,18 +468,35 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
     """
     dl = work / f"dl_{store}_{random.randint(0, 32767)}"
     if store == "s3":
+        # DECLARED, not globbed. The prefix is read twice: once for the manifests
+        # (DuckDB reads JSON over httpfs, so this needs no `mc` and no pull), then
+        # for exactly the parts they name. A glob answers "what does the bucket
+        # HOLD", and every caller of this helper compares the answer to the SOURCE
+        # — so a run that under-declares its own delivery agreed with the source
+        # while `rivet load` read short.
+        paths = _duckdb_list(
+            S3_HTTPFS_PREAMBLE
+            + "SELECT DISTINCT p.path FROM ("
+            f"  SELECT unnest(parts) AS p FROM read_json_auto('s3://{bucket}/{prefix}/manifest-*.json')"
+            ") WHERE p.status IS NULL OR p.status = 'committed'"
+        )
+        names = [ln.strip() for ln in paths.splitlines() if ln.strip()]
+        if not names:
+            return ""
+        lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)
         return _duckdb_list(
-            "INSTALL httpfs; LOAD httpfs; SET s3_endpoint='127.0.0.1:9000'; "
-            "SET s3_use_ssl=false; SET s3_url_style='path'; "
-            "SET s3_access_key_id='minioadmin'; SET s3_secret_access_key='minioadmin'; "
-            f"SELECT count(*) FROM read_parquet('s3://{bucket}/{prefix}/**/*.parquet')"
+            S3_HTTPFS_PREAMBLE + f"SELECT count(*) FROM read_parquet([{lst}])"
         )
     if store == "gcs":
         # No gsutil needed — the fake-gcs JSON API is enough, and it keeps the
         # readback independent of rivet.
         dl.mkdir(parents=True, exist_ok=True)
+        # `--all` because the manifests ARE the oracle here: the default mode pulls
+        # only parquet and flattens it to `part_N.parquet`, which cannot answer what
+        # the run declared and breaks the names a manifest uses.
         got = run(
-            [PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket, prefix, str(dl)]
+            [PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket, prefix,
+             str(dl), "--all"]
         ).stdout.strip()
         try:
             pulled = int(got)
@@ -328,7 +504,8 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
             pulled = 0
         if pulled <= 0:
             return ""
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet('{dl}/**/*.parquet')")
+        src = _declared_read(dl, ".parquet")
+        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
     if store == "azure":
         if not have("az"):
             return ""
@@ -342,7 +519,8 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
                 "-d", str(dl),
             ]
         )
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet('{dl}/**/*.parquet')")
+        src = _declared_read(dl, ".parquet")
+        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
     return ""
 
 
@@ -502,8 +680,13 @@ def _export_local(
     mode: str,
     fmt: str = "parquet",
     parallel: int | None = None,
-) -> bool:
-    """Export one table to a LOCAL dir. mode: chunked|full, fmt: parquet|csv."""
+) -> Proc:
+    """Export one table to a LOCAL dir. mode: chunked|full, fmt: parquet|csv.
+
+    Returns the Proc (not a bool) so a caller can tell an intended REFUSAL (rivet exits
+    non-zero with a specific message, e.g. CSV cannot serialize an array column) from a
+    real export FAILURE — conflating the two let a broken CSV export read as the golden
+    refusal. Callers that only need success use `.ok`."""
     yaml_path = work_dir() / f"ex_{os.getpid()}_{table.replace('.', '_')}_{fmt}.yaml"
     shutil.rmtree(dest_dir, ignore_errors=True)
     if engine == "mongo":
@@ -526,7 +709,7 @@ def _export_local(
         f"    format: {fmt}\n"
         f"    destination: {{type: local, path: {dest_dir}/}}\n"
     )
-    return rivet("run", "-c", str(yaml_path), env={"ORACLE_URL": url}, timeout=NO_TIMEOUT).ok
+    return rivet("run", "-c", str(yaml_path), env={"ORACLE_URL": url}, timeout=NO_TIMEOUT)
 
 
 # ── verdicts: init+check → {table: {strategy, verdict}} == GOLDEN ────────────
@@ -627,15 +810,19 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     # (1) users loss/dup — all engines.
-    if _export_local(engine, url, "users", out / "users", "chunked"):
+    if _export_local(engine, url, "users", out / "users", "chunked").ok:
         scnt = _source_count_distinct(engine, url, "users", "id")
         id_col = "_id" if engine == "mongo" else "id"
-        dcnt = _duckdb_list(
-            f"SELECT count(*)||' '||count(DISTINCT {id_col}) "
-            f"FROM read_parquet('{out}/users/**/*.parquet')"
-        )
-        if scnt != dcnt:
-            fails += f"users src[{scnt}]!=parquet[{dcnt}] "
+        src = _declared_read(out / "users", ".parquet")
+        if src is None:
+            fails += "users-nothing-declared "
+        else:
+            dcnt = _duckdb_list(
+                f"SELECT count(*)||' '||count(DISTINCT {id_col}) "
+                f"FROM read_parquet({src})"
+            )
+            if scnt != dcnt:
+                fails += f"users src[{scnt}]!=declared[{dcnt}] "
     else:
         fails += "users-export-failed "
 
@@ -645,9 +832,14 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     #     tests/type_roundtrip/fixtures/<eng>_schema.sql.
     if engine != "mongo":
         for tmt in ("rivet_type_matrix",):
-            if _export_local(engine, url, tmt, out / tmt, "full"):
-                got = _duckdb_json_normalized(
-                    f"SELECT * FROM read_parquet('{out}/{tmt}/**/*.parquet') ORDER BY id"
+            if _export_local(engine, url, tmt, out / tmt, "full").ok:
+                psrc = _declared_read(out / tmt, ".parquet")
+                got = (
+                    _duckdb_json_normalized(
+                        f"SELECT * FROM read_parquet({psrc}) ORDER BY id"
+                    )
+                    if psrc
+                    else ""
                 )
                 if not got:
                     fails += f"{tmt}-readback "
@@ -663,23 +855,44 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
             # way a fixed truth the compare asserts, and a regression that starts
             # emitting a corrupted array flips it.
             csv_dir = out / f"{tmt}_csv"
-            exported = _export_local(engine, url, tmt, csv_dir, "full", "csv")
+            pc = _export_local(engine, url, tmt, csv_dir, "full", "csv")
             # bash 3.2 has no globstar, so its `**/*.csv` was really one level
             # deep — mirrored here rather than an unbounded rglob.
             has_csv = bool(list(csv_dir.glob("*/*.csv")) or list(csv_dir.glob("*.csv")))
-            if exported and has_csv:
-                gotc = _duckdb_json_normalized(
-                    f"SELECT * FROM read_csv('{csv_dir}/**/*.csv', all_varchar=true, header=true) "
-                    f"ORDER BY id"
+            # rivet's INTENDED refusal exits non-zero with a specific message
+            # (src/format/csv.rs: "CSV cannot serialize column ..."). Only THAT is the
+            # golden refusal; any other non-zero exit is a real export FAILURE and must
+            # not read as the refusal sentinel (the old elif conflated the two, so a
+            # broken csv export on postgres — whose golden IS the refusal — passed green).
+            refused = (not pc.ok) and re.search(r"cannot serialize|unrepresentable", pc.out, re.IGNORECASE)
+            if pc.ok and has_csv:
+                # `has_csv` still asks the DISK, because it distinguishes the
+                # intended refusal (no csv written at all) from a real failure;
+                # the READ is manifest-scoped like every other one here, so a
+                # csv part on disk that no manifest declares reads as undelivered
+                # rather than as fidelity evidence.
+                csrc = _declared_read(csv_dir, ".csv")
+                gotc = (
+                    _duckdb_json_normalized(
+                        f"SELECT * FROM read_csv({csrc}, all_varchar=true, header=true) "
+                        f"ORDER BY id"
+                    )
+                    if csrc
+                    else ""
                 )
                 if not gotc:
                     fails += f"{tmt}-csv-readback "
                 elif not _fidelity_check(engine, f"{tmt}__csv", gotc):
                     fails += f"{tmt}-CSV-DIVERGED "
-            elif not _fidelity_check(
-                engine, f"{tmt}__csv", '{"csv_writer":"refused-unrepresentable-column"}'
-            ):
-                fails += f"{tmt}-CSV-REFUSAL-CHANGED "
+            elif refused:
+                if not _fidelity_check(
+                    engine, f"{tmt}__csv", '{"csv_writer":"refused-unrepresentable-column"}'
+                ):
+                    fails += f"{tmt}-CSV-REFUSAL-CHANGED "
+            else:
+                # not the intended refusal, yet no readable csv: a real export failure
+                # (or an empty write) — a bug, not the golden refusal.
+                fails += f"{tmt}-CSV-EXPORT-FAILED[exit={pc.returncode}] "
 
     if _bless("BLESS_DUCKDB"):
         _passed(led, engine, tag, "integrity_types", "-", f"blessed duckdb-types[{engine}]", "blessed")
@@ -714,18 +927,25 @@ def sc_keyset_parallel(led: Ledger, engine: str, tag: str, url: str) -> None:
         return
     out = work_dir() / f"kp_{engine}_{_tag(tag)}"
     out.mkdir(parents=True, exist_ok=True)
-    if not _export_local(engine, url, "users", out / "users", "chunked", "parquet", 4):
+    if not _export_local(engine, url, "users", out / "users", "chunked", "parquet", 4).ok:
         _failed(led, engine, tag, "keyset_parallel", "-", f"keyset_parallel[{engine}]: export failed", "export")
         return
 
     fails = ""
-    # (1) loss/dup — the SAME independent oracle integrity_types uses.
+    # (1) loss/dup — the SAME independent oracle integrity_types uses, and it stays
+    #     the same only if it is manifest-scoped here too: a glob here with a
+    #     declared-parts read there would make the shared claim false on the
+    #     runner that fans out the most parts.
     scnt = _source_count_distinct(engine, url, "users", "id")
-    dcnt = _duckdb_list(
-        f"SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet('{out}/users/**/*.parquet')"
-    )
-    if scnt != dcnt:
-        fails += f"loss/dup src[{scnt}]!=parquet[{dcnt}] "
+    src = _declared_read(out / "users", ".parquet")
+    if src is None:
+        fails += "loss/dup-nothing-declared "
+    else:
+        dcnt = _duckdb_list(
+            f"SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet({src})"
+        )
+        if scnt != dcnt:
+            fails += f"loss/dup src[{scnt}]!=declared[{dcnt}] "
     # (2) fan-out — distinct `_pk_w{ridx}_` stamps across the part names.
     workers = len(
         {m for p in (out / "users").rglob("*.parquet") for m in re.findall(r"_pk_w[0-9]+_", str(p))}
@@ -792,7 +1012,17 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
     if n and n == scnt:
         _passed(led, engine, tag, "load", store, f"load→{store} gcloud-verified {n} rows", n)
     elif not n:
-        _skipped(led, engine, tag, "load", store, f"{store} readback tool unavailable", "no readback tool")
+        # An EMPTY readback is a delivery failure, not an absent tool, on the stores that
+        # need no extra CLI: s3 (DuckDB httpfs) and gcs (the JSON-API pull) are always
+        # available, so "" there means the destination holds ZERO parts after a run that
+        # exited 0 — the exact "success but delivered nothing → release-ready" shape
+        # blessed_path already FAILs. Only azure (needs `az`) keeps the SKIP.
+        if store in ("s3", "gcs"):
+            _failed(led, engine, tag, "load", store,
+                    f"load→{store} delivered 0 rows (source {scnt}) — empty destination after a "
+                    f"0-exit run", "empty-destination")
+        else:
+            _skipped(led, engine, tag, "load", store, f"{store} readback tool unavailable", "no readback tool")
     else:
         _failed(
             led, engine, tag, "load", store,
@@ -824,7 +1054,8 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     # nothing — skip them.
     if _bless("BLESS_VERDICTS") or _bless("BLESS_DUCKDB"):
         return
-    sc_keyset_parallel(led, engine, tag, url)
+    with led.span(f"{engine}: keyset_parallel"):
+        sc_keyset_parallel(led, engine, tag, url)
     # The one integrity column a reader is asked to trust, checked by something
     # that is not rivet — see rowhash.py for why the in-tree auditor cannot.
     from . import corruption, rowhash
@@ -841,10 +1072,12 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     from . import schema_drift
 
     schema_drift.verify_schema_fingerprint_moves_with_the_schema(led, engine, tag, url)
-    for store in cfg("stores").split():
-        sc_load(led, engine, tag, url, store)
+    with led.span(f"{engine}: load (all stores)"):
+        for store in cfg("stores").split():
+            sc_load(led, engine, tag, url, store)
     if engine == "postgres":
-        sc_gc_survival(led, engine, tag, url)
+        with led.span(f"{engine}: gc_survival"):
+            sc_gc_survival(led, engine, tag, url)
     # The COMMAND CHAIN, end to end. Both of these were registered in
     # docs/release-gate-matrix.yaml as `test` while `verify_blessed_path` had no
     # caller anywhere in the tree — the matrix guard checks that a gate function
@@ -855,8 +1088,10 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     state_url = os.environ.get("RIVET_GATE_STATE_URL", "") or os.environ.get(
         "RIVET_CDC_STATE_URL", ""
     )
-    blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
-    blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
+    with led.span(f"{engine}: blessed_path"):
+        blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
+    with led.span(f"{engine}: blessed_flow"):
+        blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
     # Does the chain above have working oracles at all? Breaks each artifact
     # class and requires the matching stage to go RED — a green stage that was
     # never red is unverified, and this module's own first draft had one.
@@ -1126,6 +1361,102 @@ def verify_replica_read(led: Ledger) -> None:
         _failed(
             led, "replica", "read", "-", "-",
             f"replica read FAILED — rivet could not read from the replica (see {log_path})",
+            _first_match(p.out, r"FAILED|panic|assert|error"),
+        )
+
+
+def verify_pool_e2e(led: Ledger) -> None:
+    """The pool scheduler's e2e flow AS A GATE STAGE (#166 GA): drives the
+    dedicated toxiproxy scenario — `apply --pool 2` on a multi-export config
+    (one heavy + three parallel_safe) through a BANDWIDTH-CAPPED source link,
+    exact per-export rows via independent DuckDB readback, plus the
+    predicted-vs-actual makespan contract on stdout, and the --resume
+    defer-not-drop twin. The shared-link cap is the field pathology (60 workers
+    splitting one ~0.25 MB/s tunnel), so this is the honest shape to gate the
+    LPT model in — not an uncontended localhost.
+
+    Needs toxiproxy (:8474) and the main postgres (:5432); SKIP when down.
+    """
+    if not have("cargo"):
+        _skipped(led, "pool", "e2e", "-", "-", "pool e2e: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 8474):
+        _skipped(
+            led, "pool", "e2e", "-", "-",
+            "pool e2e: no toxiproxy :8474 (docker compose up -d toxiproxy)",
+            "no toxiproxy",
+        )
+        return
+    _run_pool_module(
+        led,
+        test_filter="live_pool_toxiproxy::pool_apply",
+        scenario="e2e",
+        phase="Pool scheduler e2e (apply --pool through a bandwidth-capped link — "
+        "exact rows + the predicted-vs-actual makespan contract)",
+        ok_detail="pool e2e: bandwidth-capped --pool run exact + self-grading; resume defers, drops nothing",
+    )
+
+
+def verify_pool_split(led: Ledger) -> None:
+    """The `--pool --split` scenarios AS THEIR OWN GATE CELLS (#167): a dominating
+    export is broken into N range sub-exports over its key span. Three scenarios,
+    each an independent live oracle in tests/live/live_pool_toxiproxy.rs
+    (`pool_split_*`):
+
+      * realize — the split fires, the units share one prefix + fold to one
+        family, and the DuckDB union reads back every row once (no seam gap/dup);
+      * manifest coherence — validate does not flag a sibling unit's parts as
+        untracked, yet a true foreign orphan still is;
+      * per-unit resume — a crashed split re-runs ONLY the incomplete units on
+        `--resume` (skip complete, resume crashed), no gap/no dup.
+
+    Separate from `verify_pool_e2e` so the split coverage is a NAMED matrix cell,
+    not bundled invisibly into the pool cell. Needs toxiproxy (:8474) + postgres
+    (:5432); SKIP when down.
+    """
+    _run_pool_module(
+        led,
+        test_filter="live_pool_toxiproxy::pool_split",
+        scenario="split",
+        phase="Pool --split range sub-exports (#167): realize + manifest coherence "
+        "+ per-unit crash resume, each an independent DuckDB oracle",
+        ok_detail="pool split: units share one prefix/family (union exact), validate "
+        "coherent, per-unit resume recovers a crash with no gap/dup",
+    )
+
+
+def _run_pool_module(
+    led: Ledger, *, test_filter: str, scenario: str, phase: str, ok_detail: str
+) -> None:
+    """Run one `live_pool_toxiproxy` filter as a gate cell + emit a per-TEST ledger
+    row for each `pool_*` case the filter matched, so every scenario is visible in
+    the report (not just an aggregate pass/fail)."""
+    led.phase(phase)
+    log_path = work_dir() / f"pool_{scenario}.log"
+    p = run(
+        # `--ignored` is REQUIRED: the pool e2e tests carry #[ignore] (they need
+        # the live stand). The pass check is count-agnostic (0 failed AND at least
+        # one passed) so adding a pool test never silently breaks the gate the way
+        # pinning "N passed" did (roast 2026-08-10).
+        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
+         "--", "--ignored", "--test-threads=1", test_filter],
+        env={"RIVET_BIN": str(rivet_bin())},
+        timeout=NO_TIMEOUT,
+    )
+    log_path.write_text(p.out)
+    # Per-test visibility: one ledger row per matched case (`test <mod>::<name> ... ok`).
+    for m in re.finditer(r"test live_pool_toxiproxy::(\w+) \.\.\. (ok|FAILED)", p.out):
+        name, res = m.group(1), m.group(2)
+        if res == "ok":
+            led.add("pool", scenario, name[:16], "-", Status.PASS, name)
+        else:
+            led.failed("pool", scenario, name[:16], "-", f"pool {scenario}: {name} FAILED")
+    if p.ok and "0 failed" in p.out and "0 passed" not in p.out:
+        _passed(led, "pool", scenario, "-", "-", ok_detail)
+    else:
+        _failed(
+            led, "pool", scenario, "-", "-",
+            f"pool {scenario} FAILED (see {log_path})",
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 

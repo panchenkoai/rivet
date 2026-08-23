@@ -54,43 +54,20 @@ fn seed_partition_source() -> (String, PgCleanup) {
 }
 
 /// Run a partitioned export of `table` (by `created_at`, day) with `--reconcile`
-/// through `destination_yaml`. Returns `(success, stderr)`.
+/// through the destination the `dest` closure attaches. Returns `(success, stderr)`.
 fn run_partitioned_reconcile(
     table: &str,
-    destination_yaml: &str,
+    dest: impl FnOnce(Rig) -> Rig,
     env: &[(&str, &str)],
 ) -> (bool, String) {
     let export_name = unique_name("ci_part_cloud");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, title, created_at FROM {table}"
-    partition_by: created_at
-    partition_granularity: day
-    format: parquet
-    {destination_yaml}
-"#
+    let rig = dest(
+        Rig::pg_batch(&export_name)
+            .query(&format!("SELECT id, title, created_at FROM {table}"))
+            .export_line("partition_by: created_at")
+            .export_line("partition_granularity: day"),
     );
-    let cfg_path = write_config(&cfg_dir, &yaml);
-
-    let mut cmd = std::process::Command::new(RIVET_BIN);
-    cmd.args([
-        "run",
-        "--config",
-        cfg_path.to_str().unwrap(),
-        "--export",
-        &export_name,
-        "--reconcile",
-    ]);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let out = cmd.output().expect("spawn rivet");
+    let out = rig.run_args_env(&["--export", &export_name, "--reconcile"], env);
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -108,23 +85,17 @@ fn partition_to_s3_minio_with_reconcile() {
     ensure_minio_bucket(bucket);
     let base = unique_name("ci_part_s3");
 
-    let dest = format!(
-        r#"destination:
-      type: s3
-      bucket: {bucket}
-      prefix: {base}/{{partition}}/
-      region: us-east-1
-      endpoint: {MINIO_ENDPOINT}
-      access_key_env: RIVET_TEST_MINIO_AK
-      secret_key_env: RIVET_TEST_MINIO_SK"#
-    );
     let env = [
         ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
         ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
         ("AWS_EC2_METADATA_DISABLED", "true"),
     ];
 
-    let (ok, stderr) = run_partitioned_reconcile(&table, &dest, &env);
+    let (ok, stderr) = run_partitioned_reconcile(
+        &table,
+        |r: Rig| r.dest_s3(bucket, &format!("{base}/{{partition}}"), MINIO_ENDPOINT),
+        &env,
+    );
     assert!(
         ok,
         "partitioned export → S3 with --reconcile failed (reconcile/validate mismatch?):\n{stderr}"
@@ -163,16 +134,11 @@ fn partition_to_gcs_with_reconcile() {
     ensure_gcs_bucket(bucket);
     let base = unique_name("ci_part_gcs");
 
-    let dest = format!(
-        r#"destination:
-      type: gcs
-      bucket: {bucket}
-      prefix: {base}/{{partition}}/
-      endpoint: {FAKE_GCS_ENDPOINT}
-      allow_anonymous: true"#
+    let (ok, stderr) = run_partitioned_reconcile(
+        &table,
+        |r: Rig| r.dest_gcs(bucket, &format!("{base}/{{partition}}"), FAKE_GCS_ENDPOINT),
+        &[],
     );
-
-    let (ok, stderr) = run_partitioned_reconcile(&table, &dest, &[]);
     assert!(
         ok,
         "partitioned export → GCS with --reconcile failed (reconcile/validate mismatch?):\n{stderr}"

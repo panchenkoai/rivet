@@ -73,6 +73,14 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
         // E.g. scale=-2 means the column stores whole hundreds: "1200" → 12.
         let divisor = 10i128.pow(scale.unsigned_abs() as u32);
         let int_val: i128 = s.split('.').next()?.trim().parse().ok()?;
+        // A negative scale stores multiples of 10^|scale|; a value not divisible
+        // by the divisor cannot be represented at this scale WITHOUT loss. Refuse
+        // (return None) rather than silently drop the remainder — mirrors the
+        // positive-scale keep/dropped split (bug hunt 2026-08-09: decimal(5,-2)
+        // over "1250" returned 12, dropping "50" — wrong money).
+        if int_val % divisor != 0 {
+            return None;
+        }
         let result = int_val.checked_div(divisor)?;
         return Some(if negative { -result } else { result });
     }
@@ -226,6 +234,20 @@ fn pow10_i256(n: u32) -> Option<i256> {
 
 #[cfg(test)]
 mod tests {
+    use super::decimal_str_to_scaled_i128;
+
+    /// A NEGATIVE scale refuses a lossy down-scale, mirroring the positive-scale
+    /// arm. `decimal(_,-2)` stores whole hundreds; "1250" is not a multiple of
+    /// 100, so it cannot be represented without dropping "50" — must be None, not
+    /// a silent 12 (bug hunt 2026-08-09: wrong money on a run that exited 0).
+    #[test]
+    fn negative_scale_refuses_a_lossy_down_scale() {
+        // exact multiple → representable
+        assert_eq!(decimal_str_to_scaled_i128("1200", -2), Some(12));
+        // NOT a multiple of 100 → lossy → None (RED against checked_div dropping it)
+        assert_eq!(decimal_str_to_scaled_i128("1250", -2), None);
+        assert_eq!(decimal_str_to_scaled_i128("-1250", -2), None);
+    }
 
     /// Scale 0 refuses a lossy down-scale like every other scale.
     ///

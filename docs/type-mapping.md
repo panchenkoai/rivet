@@ -16,7 +16,8 @@ out?" — the short answer is no:
 - **UUID and JSON keep native types** — Parquet gets native `LogicalType::Uuid` /
   `LogicalType::Json`, not opaque strings.
 - **Timestamps preserve the instant** — the point in time round-trips (Parquet
-  keeps the zone; CSV deliberately emits the instant without an offset).
+  keeps the zone; CSV emits the instant normalised to UTC with a trailing `Z`,
+  while naive timestamps render bare).
 - **Rivet fails loud, not silent** — a lossy or unmapped type is named by
   `rivet check` and aborts the run, never quietly truncated.
 
@@ -61,7 +62,7 @@ know" is a config knob).
 |----------|------------|-------|------------|---------|
 | `JSON` / `JSONB` | **auto** — `Type::JSON` (OID 114) and `Type::JSONB` (OID 3802) are native PG wire types. | **auto** — `MYSQL_TYPE_JSON` is native since MySQL 5.7. | **manual override required** — SQL Server stores JSON in `nvarchar`; the catalog reports only `nvarchar`. | **always** — the whole document exports as one `document` column (`Utf8` + `arrow.json`), typed downstream by `PARSE_JSON`. |
 | `UUID` | **auto** — `Type::UUID` (OID 2950) is a native PG type. | **manual override required.** MySQL has no native UUID; they are stored in `VARCHAR(36)` or `BINARY(16)`. The catalog reports only `varchar`/`binary` — semantic UUID information is gone before the driver ever sees the column. Operators add an explicit override (see below). | **auto** — `uniqueidentifier` is a native type; exports as `FixedSizeBinary(16)` + `LogicalType::Uuid`. | n/a — MongoDB does no per-field typing; `_id` is a stringified `Utf8` key, values live inside the blob. |
-| `DECIMAL(p,s)` | **auto when declared** — PG's catalog returns `numeric_precision`/`numeric_scale` for table-qualified queries; ad-hoc `numeric` expressions need an override. | **manual override required** for ad-hoc queries — the mysql wire protocol does not expose precision/scale on the column descriptor. Required for any column the user wants exact-decimal for. | **auto** — precision/scale recovered from the data (tiberius drops the declared scale). | n/a — numbers stay inside the JSON `document` blob. |
+| `DECIMAL(p,s)` | **auto when declared** — PG's catalog returns `numeric_precision`/`numeric_scale` for table-qualified queries; ad-hoc `numeric` expressions need an override. | **auto** — precision/scale derive from the wire column definition (display width + decimals), including ad-hoc queries; a `columns:` override is needed only in the rare case derivation fails (Rivet then reports the column Unsupported and names the override). | **auto** — precision/scale recovered from the data (tiberius drops the declared scale). | n/a — numbers stay inside the JSON `document` blob. |
 
 Adding overrides looks like:
 
@@ -211,7 +212,7 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `timestamp` | `timestamp(microsecond)` | `Timestamp(µs, None)` | datetime text | naive wall clock | live matrix |
 | `timestamptz` | `timestamp_tz(µs, UTC)` | `Timestamp(µs, UTC)` | datetime text | | live matrix |
 | `text` / `varchar` | `string` | `Utf8` | escaped UTF-8 | newlines/quotes escaped | live matrix |
-| `bytea` | `binary` | `Binary` | hex or base64 per writer | | live matrix |
+| `bytea` | `binary` | `Binary` | lowercase hex | | live matrix |
 | `json` / `jsonb` | `json` | `Utf8` + Parquet `LogicalType::Json` (via `arrow.json` extension) | JSON string | | live matrix |
 | `uuid` | `uuid` | `FixedSizeBinary(16)` + Parquet `LogicalType::Uuid` (via `arrow.uuid` extension) | canonical UUID text | downstream readers autoload as native UUID type | golden |
 | `boolean` | `bool` | `Boolean` | true/false | | type_roundtrip |
@@ -234,7 +235,7 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `int` | `int32` | `Int32` | integer text | | golden |
 | `bigint` | `int64` | `Int64` | integer text | signed | golden |
 | `bigint unsigned` | `u_int64` → `UInt64` | `UInt64` | integer text | values &gt; i64::MAX | type_roundtrip |
-| `decimal(p,s)` | `decimal(p,s)` | `DECIMAL(p,s)` | exact decimal text | requires `columns:` override | live matrix |
+| `decimal(p,s)` | `decimal(p,s)` | `DECIMAL(p,s)` | exact decimal text | p/s auto-resolved from the wire column definition (override only as fallback) | live matrix |
 | `float` / `double` | `float32` / `float64` | `Float32` / `Float64` | float text | | golden |
 | `date` | `date` | `Date32` | ISO date | | golden |
 | `datetime` | `timestamp(µs, none)` | `Timestamp(µs, None)` | datetime text | naive | live matrix |
@@ -248,7 +249,7 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
 | `tinyint unsigned` | `int16` | `Int16` | integer text | 0–255 | type_roundtrip |
 | `smallint unsigned` | `int32` | `Int32` | integer text | up to 65535 | type_roundtrip |
 | `int unsigned` | `int64` | `Int64` | integer text | up to 4294967295 | type_roundtrip |
-| `decimal(10,2)` | `decimal(10,2)` | `DECIMAL(10,2)` | exact decimal text | `columns:` override | type_roundtrip |
+| `decimal(10,2)` | `decimal(10,2)` | `DECIMAL(10,2)` | exact decimal text | p/s auto-resolved from the wire column definition (override only as fallback) | type_roundtrip |
 | `char` | `string` | `Utf8` | escaped | fixed `CHAR(n)` | type_roundtrip |
 | `mediumtext` / `longtext` | `text` | `Utf8` | escaped | large payloads | type_roundtrip |
 | `enum` / `set` | `enum` | `Utf8` + logical=enum | label text | SET comma-separated | type_roundtrip |
@@ -374,7 +375,7 @@ only the text rendering differs ([`src/format/csv.rs`](https://github.com/panche
 | `uuid` | canonical hyphenated lowercase (`a0eebc99-…`) |
 | `binary` (`bytea` / `BLOB`) | lowercase hex (`deadbeef`) |
 | `date` / `time` / `timestamp` | ISO 8601 (`2026-01-01T12:00:00.000000`) |
-| `timestamp_tz` | same ISO text as a naive timestamp — the UTC offset is **not** rendered (the instant is preserved, but a reader can't distinguish it from a naive value) |
+| `timestamp_tz` | ISO 8601 normalised to UTC with a trailing `Z` (`2026-01-01T12:00:00.000000Z`) — distinguishable from a naive timestamp, which renders bare |
 
 CSV has **no cell representation** for `list` (arrays), `Decimal256`
 (precision > 38), or non-UUID fixed binary. Rather than silently write an empty

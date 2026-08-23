@@ -39,12 +39,34 @@ fn matrix() -> Value {
     serde_yaml_ng::from_str(&s).unwrap_or_else(|e| panic!("parse {MATRIX}: {e}"))
 }
 
+/// One section of the ledger, floor-checked.
+///
+/// A missing section already panics; a PRESENT but empty one did not, and that
+/// is the direction that passes: `every_cdc_config_field_has_a_row` compares
+/// declared ids against parsed source, and with zero declared ids the
+/// `difference` in the stale direction is empty while the missing direction is
+/// answered by whatever the source scan found. The floors are today's counts
+/// (9 / 6 / 11) minus room for ordinary edits.
 fn rows(section: &str) -> Vec<Value> {
-    matrix()
+    let out: Vec<Value> = matrix()
         .get(section)
         .and_then(|v| v.as_sequence())
         .unwrap_or_else(|| panic!("{MATRIX} must have a `{section}:` sequence"))
-        .clone()
+        .clone();
+    let floor = match section {
+        "config_fields" => 5,
+        "crash_hooks" => 4,
+        "shape_axes" => 6,
+        _ => 0,
+    };
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        floor,
+        &format!("`{section}:` rows in {MATRIX}"),
+        "Restore the rows or re-point this reader — an empty axis section reads as full \
+         coverage of an axis nothing is graded on.",
+    );
+    out
 }
 
 fn all_rows() -> Vec<Value> {

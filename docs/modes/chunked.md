@@ -11,7 +11,7 @@ Use `mode: chunked` when the table is too large for a single `full` export. Rive
 
 ## Required fields
 
-- `chunk_column` -- a numeric, date, or timestamp column to partition by (typically the primary key). **Auto-resolved from the primary key** if you use the `table: schema.name` shortcut on a Postgres source — log line: `auto-resolved chunk_column = 'id' from primary key on public.orders`.
+- `chunk_column` -- a numeric, date, or timestamp column to partition by (typically the primary key). **Auto-resolved from the single-integer primary key** if you use the `table: schema.name` shortcut (works on Postgres, MySQL, and SQL Server) — warn-level log line: `` export 'orders_chunked': chunk_column not set — auto-resolved to 'id' from the single-integer primary key on public.orders. Set `chunk_column:` explicitly to pin the choice and silence this warning. ``
 
 ## Chunking strategies — pick one
 
@@ -23,7 +23,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 | **Fixed count** | `chunk_count: 16` | Range divided into exactly `N` equal slices; per-chunk size derived dynamically | You want exactly *N* workers / files (e.g. = CPU cores) | `chunk_dense`, `chunk_by_days` |
 | **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs — UUIDs as `BIGINT`, deleted rows, hashed keys | `chunk_by_days` |
 | **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_dense` |
-| **Memory-target** (PG only) | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from a `pg_class` / `reltuples` row-size estimate; clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
+| **Memory-target** | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from the engine's row-size estimate (PG `pg_class`/`reltuples`, MySQL `information_schema` avg row length; SQL Server has no estimate and falls back to 512 B/row); clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut. Works on Postgres, MySQL, and SQL Server | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
 | **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential by default; `parallel: N` fans it into N disjoint key ranges** — each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_dense`, `chunk_by_days`, `chunk_count` |
 
 **Orthogonal options that combine with any strategy:**
@@ -32,7 +32,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 |---|---|
 | `parallel: N` | Up to `N` chunks execute concurrently (separate DB connections). Default `1`. `rivet init` scaffolds a row-scaled value (≤500 K → 1, <5 M → 2, ≥5 M → 4) |
 | `chunk_checkpoint: true` | Per-chunk row in state DB → `rivet run --resume` skips completed chunks after a crash |
-| `chunk_max_attempts: 3` | Retry failed chunks up to N times before bailing the run |
+| `chunk_max_attempts: 3` | **Requires `chunk_checkpoint: true`.** Total attempt budget per chunk (first attempt + retries): `3` means each failed chunk is retried up to 2 times before the run bails. The budget is stored on the checkpoint run and enforced when a chunk task is claimed, so without `chunk_checkpoint` it has no effect — the non-checkpointed runners have no per-chunk retry and a failed chunk fails the run. Defaults to `tuning.max_retries + 1` |
 
 > **Picking `parallel`.** Extraction is I/O-bound, so the win comes from
 > overlapping FETCH round-trips, not from CPU. Measured on a 10-core host,
@@ -44,7 +44,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 > heuristic is a good starting point; tune from there if memory or source
 > connection count is constrained.
 
-**Each chunk runs a query of the form:** `SELECT … FROM (<base_query>) WHERE <chunk_column> >= $lo AND <chunk_column> < $hi`. The exact rendering for dense and date-native variants is documented further down.
+**Each integer-range chunk runs:** `SELECT * FROM (<base_query>) AS _rivet WHERE <chunk_column> BETWEEN <lo> AND <hi>` — inclusive bounds (hi = lo + chunk_size - 1) inlined as literals, not bind parameters. The subquery wrap applies to `query:` exports; a `table:` shortcut renders the unwrapped `SELECT * FROM <table> WHERE <chunk_column> BETWEEN <lo> AND <hi>`. The date variant (`chunk_by_days`) uses half-open `WHERE col >= '<start>' AND col < '<end>'`; dense uses `ROW_NUMBER()` (documented further down).
 
 ## Minimal config
 
@@ -66,7 +66,7 @@ exports:
       path: ./output
 ```
 
-Output files: one per chunk, e.g. `orders_chunked_20260406_120000_chunk0.parquet`
+Output files: one per chunk, named `{export}_{YYYYMMDD_HHMMSS}_chunk{N}_{16-hex-nonce}.parquet`, e.g. `orders_chunked_20260406_120000_chunk0_a1b2c3d4e5f60718.parquet`. The random nonce makes retried/re-run parts additive (never overwriting); match on `*_chunk{N}_*.parquet`, not on an exact stem.
 
 ## Run it
 
@@ -102,7 +102,7 @@ rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_cont
 
 1. Rivet queries `SELECT MIN(id), MAX(id) FROM orders` to determine the range
 2. Splits into chunks: `[min..min+chunk_size)`, `[min+chunk_size..min+2*chunk_size)`, ...
-3. Each chunk runs independently: `SELECT ... WHERE id >= $lo AND id < $hi`
+3. Each chunk runs independently: `SELECT ... WHERE id BETWEEN <lo> AND <hi>` (inclusive, hi = lo + chunk_size - 1)
 4. With `parallel: 4`, up to 4 chunks execute concurrently
 5. Each chunk writes a separate output file
 
@@ -119,7 +119,7 @@ exports:
     chunk_size: 100000
     parallel: 4
     chunk_checkpoint: true          # persist progress per chunk
-    chunk_max_attempts: 3           # retry failed chunks up to 3 times
+    chunk_max_attempts: 3           # total attempt budget per chunk (3 attempts = 2 retries)
     format: parquet
     destination:
       type: local
@@ -239,7 +239,8 @@ exports:
 > — but prefer a column with no large tied groups, or use **keyset** on a unique
 > key, when exporting a live-writing table. (The analog for incremental cursors
 > is in [semantics.md § Known non-guarantees](../semantics.md#known-non-guarantees).
-> Regression-guarded by `tests/live_chunked_dense.rs`.)
+> Regression-guarded by `tests/live/live_chunked_dense.rs`, compiled into the
+> live suite via `tests/live_suite.rs`.)
 
 ## Keyset (seek) pagination — the safe shape without an integer PK
 
@@ -282,7 +283,7 @@ exports:
       path: ./output
 ```
 
-Output files: one per page, e.g. `events_20260529_120000_keyset0.parquet`.
+Output files: one per page, named `{export}_{run_id}_keyset_{tag}.parquet` where run_id is `{export}_YYYYMMDDTHHMMSS.mmm` (filename sanitization maps the `.` to `_`) and the tag is `start` for the first page, then a 16-hex hash of that page's seek cursor — e.g. `events_events_20260529T120000_123_keyset_start.parquet`. The run_id/seek-based name makes a crash-resume overwrite its own page idempotently.
 
 **Auto-resolution (MySQL).** With the `table:` shortcut and **no** `chunk_by_key`,
 if the table has no single-integer PK but *does* have a usable single-column
@@ -299,10 +300,12 @@ single-column, NOT NULL, `UNIQUE`/`PRIMARY` key rather than emit such a query:
 
 ```
 chunk_by_key 'payload' is not a usable keyset key on app.events — it must be a
-single-column, NOT NULL, UNIQUE or PRIMARY key. Without a unique index,
-`ORDER BY payload LIMIT n` would full-scan + filesort the table. Add a unique
-index on it, pick another key, or use `mode: full` to accept one long snapshot
-query.
+single-column, NOT NULL, UNIQUE or PRIMARY key WHOSE TYPE the keyset cursor can
+read (integer / float / string / timestamp / date / uuid). A `decimal`/`numeric`
+key is excluded: the cursor cannot advance past it (it would fail mid-run after
+a partial write). Without a usable key, `ORDER BY payload LIMIT n` would also
+full-scan + filesort. Add a unique index of a supported type, pick another key,
+use a range `chunk_column:` (integer), or `mode: full`.
 ```
 
 **Required privileges:** read-only is sufficient — the introspection probe reads
@@ -366,9 +369,11 @@ with `N`.
 **Limitations (current):**
 
 - **Single-column keys only** — composite unique keys are not yet supported.
-- **Decimal / `partition_by` keys are rejected** for parallel keyset (the
-  percentile sampler needs an orderable, evenly-sliceable key) — Rivet fails
-  loudly at plan time rather than emit a skewed split.
+- **Decimal (`numeric`) keys and `partition_by` are rejected for ALL keyset
+  exports, sequential included**: a decimal key is refused at plan time because
+  the keyset cursor cannot read/advance past it, and `partition_by` is
+  incompatible with `chunk_by_key` at config validation. (Parallel keyset adds
+  no extra key-type restriction beyond these.)
 
 ## Troubleshooting
 

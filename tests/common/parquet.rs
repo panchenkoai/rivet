@@ -48,17 +48,31 @@ fn stage_for_duckdb(dir: &Path) -> String {
     // A per-thread name is stable across the thousands of calls one test binary
     // makes, so the container resolves each path once and keeps seeing it.
     let tid = format!("{:?}", std::thread::current().id());
+    // PID + thread id: ThreadId is a PER-PROCESS counter, and the canonical
+    // runner (`make test-live` = nextest) runs every test in its OWN process
+    // with an identical startup sequence — so every concurrent test got the
+    // SAME small N and they cleared/graded each other's staged files (r3
+    // bughunt; the identical class rig::unique_name already fixed for oracle
+    // labels). The per-thread inode-stability property the comment above
+    // demands is preserved: within one process the label is still stable.
     let label = format!(
-        "stage_t{}",
+        "stage_p{}_t{}",
+        std::process::id(),
         tid.chars()
             .filter(|c| c.is_ascii_digit())
             .collect::<String>()
     );
     let (host, container) = super::live_shared_workdir(&label);
-    for f in files_with_extension(dir, "parquet") {
-        let name = f.file_name().expect("parquet file has a name");
-        std::fs::copy(&f, host.join(name))
-            .unwrap_or_else(|e| panic!("stage {} for duckdb: {e}", f.display()));
+    // Both output formats rivet ships. Staging only parquet made every TEXT
+    // output unreadable through this seam — a CSV destination staged to an empty
+    // directory and DuckDB failed with "no files match", which reads as a broken
+    // test rather than a helper that cannot see the format under test.
+    for ext in ["parquet", "csv"] {
+        for f in files_with_extension(dir, ext) {
+            let name = f.file_name().expect("output file has a name");
+            std::fs::copy(&f, host.join(name))
+                .unwrap_or_else(|e| panic!("stage {} for duckdb: {e}", f.display()));
+        }
     }
     container
 }
@@ -76,6 +90,39 @@ pub fn duckdb_total_parquet_rows(dir: &Path) -> usize {
     }
     let c = stage_for_duckdb(dir);
     super::duckdb_parquet_rows(&c) as usize
+}
+
+/// One scalar aggregate over every parquet under `dir`, read by DuckDB.
+///
+/// `expr` is the SELECT list (e.g. `count(*) - count("uid")`) and `filter` an
+/// optional WHERE (e.g. `__op = 'insert'` — a CDC part holds one row per CHANGE,
+/// so only the insert images correspond to source rows).
+///
+/// The seam a per-column NULL/distinct profile needs. rivet's own decoder is the
+/// thing under suspicion in that class — a lenient per-cell fallback that nulls
+/// what it cannot parse — so the count has to come from a reader that shares no
+/// code with the writer. Measured cost of not having one: 100% of a uuid column
+/// rendered NULL through PostgreSQL CDC while every count and sum check passed,
+/// found by a human eye on a real bucket.
+pub fn duckdb_dir_scalar(dir: &Path, expr: &str, filter: Option<&str>) -> i64 {
+    assert!(
+        !files_with_extension(dir, "parquet").is_empty(),
+        "duckdb_dir_scalar on a directory with no parquet — an empty destination \
+         cannot answer a per-column question, and reading 0 as the answer is how \
+         this class hides"
+    );
+    let c = stage_for_duckdb(dir);
+    let where_ = filter.map(|f| format!(" WHERE {f}")).unwrap_or_default();
+    let sql = format!("SELECT {expr} FROM read_parquet('{c}/**/*.parquet'){where_}");
+    // `duckdb_run_sql_json` emits {columns:[..], rows:[[..]]} with every cell
+    // stringified, so the scalar is rows[0][0] parsed — not an object field.
+    let v = super::duckdb_run_sql_json(&sql);
+    v["rows"]
+        .get(0)
+        .and_then(|r| r.get(0))
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("duckdb returned no scalar for `{sql}`: {v}"))
 }
 
 /// Every `id` value under `dir`, WITH multiplicity, read by DuckDB.
@@ -298,6 +345,65 @@ pub fn dir_manifest_copy_total_rows(dir: &Path) -> i64 {
             .unwrap_or(0);
     }
     total
+}
+
+/// The set of `id` values DECLARED by the run-unique manifest copies under `dir`
+/// — the orphan-immune twin of [`duckdb_dir_parquet_id_set`]. A raw-disk id-set
+/// counts every `.parquet` present, INCLUDING crash orphans a manifest never
+/// referenced; this reads only the parts the manifest copies actually declare, so
+/// it answers "what would `rivet load` (manifest-authoritative) deliver". The
+/// oracle a split-RESUME completeness claim needs: a re-sampled resume that shifts
+/// the partition drops the crashed unit's ORIGINAL key range from the manifest
+/// while the raw disk still shows the orphaned pre-crash parts (false-clean).
+///
+/// Reads by BASENAME to match [`stage_for_duckdb`], which flattens all parquet
+/// into one staging dir by file name; part names are run-unique so basenames do
+/// not collide across units.
+pub fn dir_manifest_copy_id_set(dir: &Path) -> BTreeSet<i64> {
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    for path in files_with_extension(dir, "json") {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !(name.starts_with("manifest-") && name.ends_with(".json")) {
+            continue; // the bare `manifest.json` pointer, or a foreign file
+        }
+        let bytes = std::fs::read(&path).expect("read manifest copy");
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse manifest copy JSON");
+        for part in v
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(p) = part.get("path").and_then(serde_json::Value::as_str) {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                declared.insert(base.to_string());
+            }
+        }
+    }
+    if declared.is_empty() {
+        return BTreeSet::new();
+    }
+    let c = stage_for_duckdb(dir);
+    let list = declared
+        .iter()
+        .map(|b| format!("'{c}/{b}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT DISTINCT CAST(id AS BIGINT) FROM read_parquet([{list}])"
+    ));
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb returned no rows array for manifest id-set"))
+        .iter()
+        .map(|r| {
+            r[0].as_str()
+                .expect("id cell is not a string")
+                .parse::<i64>()
+                .expect("id does not parse as i64")
+        })
+        .collect()
 }
 
 /// Count the DISTINCT run-unique manifest copies (`manifest-<run_id>.json`) in
@@ -656,4 +762,30 @@ pub fn mongo_deduped_field(
         }
     }
     state
+}
+
+/// Every `id` under `dir` read from CSV by DuckDB — the CSV twin of
+/// [`duckdb_dir_parquet_id_set`], for the paths that write text.
+///
+/// A separate reader on purpose: `read_parquet` cannot open a `.csv`, so a test
+/// that meant to grade the CSV writer and used the parquet helper would panic on
+/// "no parquet here" rather than quietly grade nothing — but it also could not
+/// grade anything. This is the reader that can.
+pub fn duckdb_dir_csv_id_set(dir: &Path) -> BTreeSet<i64> {
+    assert!(
+        !files_with_extension(dir, "csv").is_empty(),
+        "duckdb_dir_csv_id_set on a directory with no .csv — reading an empty set as \
+         the answer is how a wrong-format wiring hides"
+    );
+    let c = stage_for_duckdb(dir);
+    let sql = format!("SELECT id FROM read_csv_auto('{c}/**/*.csv', header=true)");
+    let v = super::duckdb_run_sql_json(&sql);
+    v["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get(0)?.as_str()?.parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }

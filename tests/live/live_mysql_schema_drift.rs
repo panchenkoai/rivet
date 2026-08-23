@@ -68,24 +68,14 @@ fn mysql_schema_drift_added_column_is_detected_and_second_run_succeeds() {
 
     let export_name = unique_name("qa71my_add_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export_name}
-    # `SELECT *` so adding a column widens the schema observed by rivet.
-    query: "SELECT * FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // `SELECT *` so adding a column widens the schema observed by rivet.
+    let rig = Rig::mysql_batch(&export_name)
+        .query(&format!("SELECT * FROM {table_name}"))
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1"
     );
 
@@ -99,7 +89,7 @@ exports:
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
 
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         r2.status.success(),
         "second run must survive an added column; stderr:\n{}",
@@ -138,23 +128,13 @@ fn mysql_schema_drift_removed_column_is_detected() {
 
     let export_name = unique_name("qa71my_rm_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT * FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&export_name)
+        .query(&format!("SELECT * FROM {table_name}"))
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1"
     );
 
@@ -164,7 +144,7 @@ exports:
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
 
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         r2.status.success(),
         "second run must survive a removed column; stderr:\n{}",
@@ -188,29 +168,18 @@ fn mysql_stable_schema_across_runs_reports_no_drift() {
     let table = seed_mysql_numeric_table(5);
     let export_name = unique_name("qa71my_stable");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(12,2)"
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&export_name)
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
-    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    assert!(rig.run_args(&["--export", &export_name]).status.success());
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    assert!(rig.run_args(&["--export", &export_name]).status.success());
 
     let state_db = cfg.parent().unwrap().join(".rivet_state.db");
     assert_eq!(

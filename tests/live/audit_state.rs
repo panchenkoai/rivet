@@ -18,72 +18,31 @@
 
 use crate::common::*;
 
-use std::process::{Command, Output};
-
-/// Run `rivet state <args…>` and capture exit code + stdout/stderr.
-fn run_state(args: &[&str]) -> Output {
-    Command::new(RIVET_BIN)
-        .args(args)
-        .output()
-        .expect("spawn rivet state")
+/// Chunked-checkpoint rig for `table` so a real chunk run is recorded in the
+/// state DB (mirrors `state_reset_chunks_clears_checkpoint` in live_cli_flags).
+fn chunked_checkpoint_rig(table: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out_dir.to_path_buf())
 }
 
-/// Minimal chunked-checkpoint config for `table` so a real chunk run is
-/// recorded in the state DB (mirrors `state_reset_chunks_clears_checkpoint`
-/// in tests/live_cli_flags.rs).
-fn chunked_checkpoint_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+/// Incremental rig with `cursor_column: created_at` — an incremental run
+/// records a committed boundary in `export_progression`.
+fn incremental_rig(table: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(table)
+        .query(&format!("SELECT id, name, created_at FROM {table}"))
+        .mode("incremental")
+        .export_line("cursor_column: created_at")
+        .dest_path(out_dir.to_path_buf())
 }
 
-/// Minimal incremental config for `table` with `cursor_column: created_at`
-/// (mirrors `incremental_config` in tests/live_cli_flags.rs). An incremental
-/// run records a committed boundary in `export_progression`.
-fn incremental_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name, created_at FROM {table}"
-    mode: incremental
-    cursor_column: created_at
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
-}
-
-/// Run `rivet run --config <cfg> --export <name>` and assert it succeeded.
-fn run_export(cfg: &std::path::Path, export: &str) {
-    let out = Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap(), "--export", export])
-        .output()
-        .expect("spawn rivet run");
+/// Run the rig's export and assert it succeeded.
+fn run_export(rig: &Rig, export: &str) {
+    let out = rig.run_args(&["--export", export]);
     assert!(
         out.status.success(),
         "setup: rivet run must succeed; stderr:\n{}",
@@ -101,24 +60,13 @@ fn audit_reset_chunks_rejects_unknown_export() {
     // real export name; the typo'd name below is NOT in the config.
     let table = seed_pg_numeric_table(100);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(
-        &cfg_dir,
-        &chunked_checkpoint_config(table.name(), out.path()),
-    );
-    run_export(&cfg, table.name());
+    let rig = chunked_checkpoint_rig(table.name(), out.path());
+    run_export(&rig, table.name());
 
     // `<name>x` is a typo: not declared in the config. Parity with
     // `state reset` requires this to be rejected, not silently "Removed 0".
     let typo = format!("{}x", table.name());
-    let result = run_state(&[
-        "state",
-        "reset-chunks",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        &typo,
-    ]);
+    let result = rig.cli(&["state", "reset-chunks", "--export", &typo]);
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
@@ -146,20 +94,12 @@ fn audit_reset_clears_progression() {
     // in export_progression.
     let table = seed_pg_numeric_table(100);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &incremental_config(table.name(), out.path()));
-    run_export(&cfg, table.name());
+    let rig = incremental_rig(table.name(), out.path());
+    run_export(&rig, table.name());
 
     // Sanity: a committed boundary is recorded before the reset, otherwise the
     // post-reset assertion would pass vacuously.
-    let before = run_state(&[
-        "state",
-        "progression",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let before = rig.cli(&["state", "progression", "--export", table.name()]);
     assert!(
         before.status.success(),
         "setup: state progression must exit 0; stderr:\n{}",
@@ -173,14 +113,7 @@ fn audit_reset_clears_progression() {
     );
 
     // Reset the export's state.
-    let reset = run_state(&[
-        "state",
-        "reset",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let reset = rig.cli(&["state", "reset", "--export", table.name()]);
     assert!(
         reset.status.success(),
         "state reset must exit 0; stderr:\n{}",
@@ -190,14 +123,7 @@ fn audit_reset_clears_progression() {
     // CORRECT behavior: after reset, progression must NOT still report a
     // committed boundary for the export. Currently the export_progression row
     // survives, so the old boundary is shown — stale.
-    let after = run_state(&[
-        "state",
-        "progression",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-    ]);
+    let after = rig.cli(&["state", "progression", "--export", table.name()]);
     assert!(
         after.status.success(),
         "state progression must exit 0; stderr:\n{}",
@@ -225,7 +151,13 @@ fn audit_state_show_validates_config_path() {
     let missing_cfg = dir.path().join("does_not_exist.yaml");
     assert!(!missing_cfg.exists(), "precondition: config must be absent");
 
-    let result = run_state(&["state", "show", "--config", missing_cfg.to_str().unwrap()]);
+    // Raw invocation on purpose: the SUBJECT is a config path that does not
+    // exist, which a rig (whose config always exists) cannot express — the
+    // audit_observability precedent. Counted in the rig-adoption ratchet.
+    let result = std::process::Command::new(RIVET_BIN)
+        .args(["state", "show", "--config", missing_cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet state show");
 
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);

@@ -137,10 +137,23 @@ impl PgChangeStream {
         if tables.is_empty() {
             return RowImage::Whole;
         }
+        // Same CWE-319 gate open() applies (:188): refuse a REMOTE plaintext
+        // probe. This best-effort catalog read carries the same credentials, so
+        // an ungated remote-plaintext connection here would leak them exactly
+        // where open() forbids it (#161). On refusal, fall back to Whole rather
+        // than dialing plaintext — open() will bail the run on the same config.
+        if require_tls_or_loopback(conn_str, tls).is_err() {
+            return RowImage::Whole;
+        }
         let Ok(mut client) = (match tls {
             Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
                 .and_then(|c| {
-                    Client::connect(conn_str, postgres_native_tls::MakeTlsConnector::new(c))
+                    // Force ssl_mode(Require) so the connector is honored — the
+                    // same enforcement the batch path and open() use; without it
+                    // this catalog probe carries credentials in cleartext under
+                    // an enforced verify-full posture (roast 2026-08-09).
+                    super::pg_config_ssl_forced(conn_str)?
+                        .connect(postgres_native_tls::MakeTlsConnector::new(c))
                         .map_err(Into::into)
                 }),
             _ => Client::connect(conn_str, NoTls).map_err(Into::into),
@@ -159,10 +172,20 @@ impl PgChangeStream {
         ) else {
             return RowImage::Whole;
         };
-        if rows.is_empty() {
+        let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        Self::row_image_verdict(&named)
+    }
+
+    /// Pure verdict half of [`Self::row_image`] (#161, the compression_refusal
+    /// split): the captured tables whose REPLICA IDENTITY is not FULL — empty
+    /// means every table carries whole rows (keep); any named table downgrades
+    /// DELETEs to key-only (warn). Unit-tested in both directions; the
+    /// connect+query half stays live-guarded.
+    pub(crate) fn row_image_verdict(named: &[String]) -> crate::source::cdc::RowImage {
+        use crate::source::cdc::RowImage;
+        if named.is_empty() {
             return RowImage::Whole;
         }
-        let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
         RowImage::KeyOnlyDeletes {
             why: format!(
                 "{} of the captured table(s) ({}) have REPLICA IDENTITY other than FULL, so a \
@@ -189,10 +212,14 @@ impl PgChangeStream {
         let mut client = match tls {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = crate::source::tls::build_native_tls(cfg)?;
-                Client::connect(
-                    conn_str,
-                    postgres_native_tls::MakeTlsConnector::new(connector),
-                )?
+                // Force ssl_mode(Require) like the batch path — otherwise
+                // tokio-postgres picks TLS from the URL's sslmode and a
+                // `?sslmode=disable` (or a `prefer` downgrade) ships the CDC
+                // stream in cleartext, ignoring the connector we just built
+                // (roast 2026-08-09: the batch leg was fixed, the CDC leg was
+                // not — the exact posture verify-full is asked to forbid).
+                super::pg_config_ssl_forced(conn_str)?
+                    .connect(postgres_native_tls::MakeTlsConnector::new(connector))?
             }
             _ => Client::connect(conn_str, NoTls)?,
         };
@@ -202,7 +229,14 @@ impl PgChangeStream {
         // non-hex `bytea_output` corrupts every bytea, silently (verified via the
         // source-parity sweep under a flipped session). Immune to the DB default.
         client.batch_execute(
-            "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; SET intervalstyle = 'postgres';",
+            // extra_float_digits=3 pins SHORTEST-EXACT float text rendering. On a
+            // session where it is <= 0 (pre-PG12 default, or set for dump compat)
+            // float8out/float4out ROUND to ~15/~6 sig digits, so the text reader
+            // parses a lossy value while the batch binary path stays exact — a
+            // silent CDC-vs-batch float divergence (bug hunt 2026-08-09, same
+            // session-state-rendering class as datestyle/bytea/intervalstyle).
+            "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
+             SET intervalstyle = 'postgres'; SET extra_float_digits = 3;",
         )?;
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
         // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
@@ -324,21 +358,15 @@ impl PgChangeStream {
                             self.yielded_data = true;
                         }
                         let commit = Position(json!({ "lsn": lsn }));
-                        // `committed` marks the COMMIT BOUNDARY, and the sink
-                        // only rolls (flush → checkpoint → ack) on a committed
-                        // event — "never split a transaction across parts". Every
-                        // event `parse_test_decoding` builds carries
-                        // `committed: true`, but they all belong to ONE source
-                        // transaction here, so mark ONLY THE LAST one committed
-                        // (mirroring MySQL's XID model). Otherwise a transaction
-                        // larger than `rollover` rolls + acks MID-transaction,
-                        // and a crash between that ack and the tail's flush loses
-                        // the un-flushed tail (the slot advanced past the commit,
-                        // so resume never re-reads it — an at-least-once break).
-                        let n = tx.len();
-                        for (i, mut ev) in tx.drain(..).enumerate() {
-                            ev.position = commit.clone();
-                            ev.committed = i + 1 == n;
+                        // #158: the shared close — commit LSN on all, committed on
+                        // the last only (BEGIN…COMMIT frames one transaction here).
+                        // Otherwise a transaction larger than `rollover` rolls +
+                        // acks MID-transaction and a crash before the tail's flush
+                        // loses it (the slot advanced past the commit — resume
+                        // never re-reads it, an at-least-once break).
+                        let mut group: Vec<ChangeEvent> = std::mem::take(&mut tx);
+                        crate::source::cdc::TxnFramer::close_group(&mut group, &commit);
+                        for ev in group {
                             self.pending.push_back(ev);
                         }
                         self.frontier = commit_lsn;
@@ -1644,6 +1672,7 @@ mod tests {
 
 #[cfg(test)]
 mod slot_creation_warning_tests {
+    use super::PgChangeStream;
     use super::slot_created_warning;
 
     /// A created slot means capture starts at the CURRENT WAL position, so
@@ -1674,5 +1703,22 @@ mod slot_creation_warning_tests {
             w.contains("cdc.checkpoint"),
             "must name the setting that upgrades this to a hard error: {w}"
         );
+    }
+
+    /// #161: both directions of the replica-identity verdict.
+    #[test]
+    fn row_image_verdict_both_directions() {
+        use crate::source::cdc::RowImage;
+        assert!(matches!(
+            PgChangeStream::row_image_verdict(&[]),
+            RowImage::Whole
+        ));
+        match PgChangeStream::row_image_verdict(&["orders".into(), "items".into()]) {
+            RowImage::KeyOnlyDeletes { why } => {
+                assert!(why.contains("2 of the captured table(s)"), "{why}");
+                assert!(why.contains("orders, items"), "{why}");
+            }
+            other => panic!("non-FULL identity must warn, got {other:?}"),
+        }
     }
 }

@@ -46,8 +46,11 @@ pub(super) fn resolve_database_for_listing(url: &str, schema_cli: Option<&str>) 
 /// pool gets the lean constraints (no eager pre-connections). `init` runs
 /// before any YAML `tls:` block exists (it *generates* the config), so the
 /// connection stays plaintext, relying on the driver's own URL parsing.
-pub(super) fn connect(url: &str) -> Result<mysql::PooledConn> {
-    let pool = crate::source::mysql::connect_pool(url, None)?;
+pub(super) fn connect(
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+) -> Result<mysql::PooledConn> {
+    let pool = crate::source::mysql::connect_pool(url, tls)?;
     Ok(pool.get_conn()?)
 }
 
@@ -102,6 +105,7 @@ pub(super) fn introspect(conn: &mut mysql::PooledConn, table: &str) -> Result<Ta
         .map(
             |(name, data_type, column_key, nullable, numeric_precision, numeric_scale)| {
                 ColumnInfo {
+                    is_indexed: !column_key.is_empty(),
                     is_primary_key: column_key == "PRI",
                     is_nullable: nullable.eq_ignore_ascii_case("YES"),
                     name,
@@ -114,12 +118,149 @@ pub(super) fn introspect(conn: &mut mysql::PooledConn, table: &str) -> Result<Ta
         .collect();
 
     Ok(TableInfo {
+        density: None,
         schema: String::new(),
         table: table.to_string(),
         row_estimate,
         total_bytes,
         columns,
     })
+}
+
+/// First-run density probe (#148) — MySQL is the primary target: `TABLE_ROWS`
+/// is the least trustworthy of the four engines (field: a versioned table
+/// under-counted ~2.5×, flipping every threshold decision). Refines
+/// `info.row_estimate` IN PLACE (the catalog figure moves to
+/// `probe.catalog_rows`) so every downstream decision stands on the sample.
+/// Best-effort: any probe error keeps the catalog figure, marked `unverified`.
+pub(super) fn density_probe(conn: &mut mysql::PooledConn, info: &mut super::TableInfo) {
+    use super::density::*;
+    use mysql::prelude::Queryable;
+
+    let catalog = info.row_estimate;
+    let Some(key) = info.best_indexed_chunk_column().map(str::to_string) else {
+        // No integer key to stratify on: small → honest COUNT(*); large → keep
+        // the estimate but SAY so (never silently trust it).
+        let method = if catalog < 1_000_000 {
+            let tbl = info.table.replace('`', "``");
+            match conn.query_first::<i64, _>(format!("SELECT COUNT(*) FROM `{tbl}`")) {
+                Ok(Some(n)) => {
+                    info.row_estimate = n;
+                    info.density = Some(DensityProbe {
+                        rows: n,
+                        density: 0.0,
+                        method: EstimateMethod::Counted,
+                        catalog_rows: catalog,
+                        k: 0,
+                        w: 0,
+                    });
+                    return;
+                }
+                _ => EstimateMethod::Unverified,
+            }
+        } else {
+            EstimateMethod::Unverified
+        };
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method,
+            catalog_rows: catalog,
+            k: 0,
+            w: 0,
+        });
+        return;
+    };
+    let tbl = info.table.replace('`', "``");
+    let k_q = key.replace('`', "``");
+    // Read MIN/MAX as TEXT and parse — never as (Option<i64>, Option<i64>): a
+    // BIGINT UNSIGNED key past i64::MAX (18446744073709551615) makes the mysql
+    // crate's FromRow PANIC on the i64 conversion (not a catchable Err), crashing
+    // `rivet init` (roast 2026-08-10, gate exit 101). Text always converts; a
+    // value that does not fit i64 (unsigned overflow), a non-integer key, or NULL
+    // (empty table) → skip the probe, keep the catalog, mark unverified — the
+    // stratified offsets are i64 arithmetic and cannot span such a key anyway.
+    let min_max = conn
+        .query_first::<(Option<String>, Option<String>), _>(format!(
+            "SELECT MIN(`{k_q}`), MAX(`{k_q}`) FROM `{tbl}`"
+        ))
+        .ok()
+        .flatten()
+        .and_then(|(lo, hi)| Some((lo?.parse::<i64>().ok()?, hi?.parse::<i64>().ok()?)));
+    let Some((min, max)) = min_max else {
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::Unverified,
+            catalog_rows: catalog,
+            k: 0,
+            w: 0,
+        });
+        return;
+    };
+    // Tier 0 AFTER the two boundary seeks: a small claim is trusted only when
+    // the span agrees (TABLE_ROWS and DATA_LENGTH freeze TOGETHER — the span
+    // is the one cheap signal that is not statistics; live-proven here).
+    if catalog < TRIAGE_ROWS && span_agrees_with_claim(catalog, max.saturating_sub(min) + 1) {
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::CatalogTriaged,
+            catalog_rows: catalog,
+            k: 0,
+            w: 0,
+        });
+        return;
+    }
+    let offsets = stratified_offsets(min, max, PROBE_K, PROBE_W);
+    if offsets.is_empty() {
+        return;
+    }
+    let mut counts = Vec::with_capacity(offsets.len());
+    for off in &offsets {
+        let hi = off.saturating_add(PROBE_W - 1);
+        match conn.query_first::<i64, _>(format!(
+            "SELECT COUNT(*) FROM `{tbl}` WHERE `{k_q}` BETWEEN {off} AND {hi}"
+        )) {
+            Ok(Some(n)) => counts.push(n),
+            _ => {
+                info.density = Some(DensityProbe {
+                    rows: catalog,
+                    density: 0.0,
+                    method: EstimateMethod::Unverified,
+                    catalog_rows: catalog,
+                    k: 0,
+                    w: 0,
+                });
+                return;
+            }
+        }
+    }
+    // #148 sparse-key guard: if the windows barely sampled any rows the key is
+    // too sparse for a windowed estimate — keep the catalog, flag unverified,
+    // rather than replace a sane figure with ~0 garbage.
+    let sampled: i64 = counts.iter().sum();
+    if !super::density::probe_trustworthy(sampled, offsets.len()) {
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::Unverified,
+            catalog_rows: catalog,
+            k: offsets.len(),
+            w: PROBE_W,
+        });
+        return;
+    }
+    let (rows, density) = estimate_from_windows(min, max, &counts, PROBE_W);
+    info.row_estimate = rows;
+    info.density = Some(DensityProbe {
+        rows,
+        density,
+        method: EstimateMethod::Probed,
+        catalog_rows: catalog,
+        k: offsets.len(),
+        w: PROBE_W,
+    });
 }
 
 #[cfg(test)]
