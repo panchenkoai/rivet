@@ -327,9 +327,21 @@ impl Auth {
 /// dependency in this crate, so minting them in process would mean adding a
 /// crypto stack; the honest subset is to ask `gcloud` for the token it already
 /// knows how to mint. Nothing else about the transport is a subprocess.
+///
+/// THE VERB IS LOAD-BEARING: `auth application-default print-access-token`
+/// resolves the SAME credential chain the GCS leg uses, honouring
+/// `GOOGLE_APPLICATION_CREDENTIALS`. The bare `auth print-access-token` mints
+/// for whatever human account `gcloud` happens to be logged in as, so with a
+/// service-account credential configured rivet wrote GCS as the service
+/// account and called BigQuery as a PERSON — silently, because the load
+/// succeeds whenever that person happens to hold the rights. Measured
+/// 2026-08-23 against a real service account: the bare verb produced
+/// `user_email = <a human>` in INFORMATION_SCHEMA.JOBS_BY_PROJECT, the ADC
+/// verb produced the service account. A load must act as the identity the
+/// operator configured, or its audit trail is fiction.
 fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("gcloud")
-        .args(["auth", "print-access-token"])
+        .args(["auth", "application-default", "print-access-token"])
         .output()
         .context(
             "no ADC `authorized_user` credentials and `gcloud` is not on PATH — run \
@@ -337,7 +349,7 @@ fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
         )?;
     if !out.status.success() {
         bail!(
-            "`gcloud auth print-access-token` failed: {}",
+            "`gcloud auth application-default print-access-token` failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -550,6 +562,45 @@ fn is_transient_status(code: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gcloud fallback must ask for the APPLICATION-DEFAULT token, not the
+    /// logged-in user's.
+    ///
+    /// `gcloud auth print-access-token` mints for whatever human account gcloud
+    /// is logged in as and ignores `GOOGLE_APPLICATION_CREDENTIALS`; only
+    /// `gcloud auth application-default print-access-token` resolves the same
+    /// credential chain the GCS leg uses. With a service-account credential
+    /// configured, the bare verb made rivet write GCS as the service account
+    /// and call BigQuery as a PERSON — and the load still SUCCEEDED whenever
+    /// that person held the rights, so nothing surfaced the substitution.
+    /// Measured 2026-08-23 against a real service account: bare verb →
+    /// `user_email = <a human>` in INFORMATION_SCHEMA.JOBS_BY_PROJECT, ADC verb
+    /// → the service account.
+    ///
+    /// The source text is the subject because the verb is an argv, not a value
+    /// this crate can observe without spawning gcloud. RED against the
+    /// pre-fix argv.
+    #[test]
+    fn the_gcloud_fallback_asks_for_the_application_default_token() {
+        let src = include_str!("bq_rest.rs");
+        let at = src
+            .find("fn mint_token_via_gcloud_cli")
+            .expect("the fallback exists");
+        let body = &src[at..at + 600];
+        assert!(
+            body.contains(r#".args(["auth", "application-default", "print-access-token"])"#),
+            "the fallback must mint the APPLICATION-DEFAULT token — the bare verb \
+             authenticates as a human while the GCS leg uses the configured \
+             service account, so one load acts as two identities: {body}"
+        );
+        // Guard the guard: the bare verb must not survive anywhere in the body,
+        // which is what a careless "add the ADC call next to it" would leave.
+        let bare = body.matches(r#""auth", "print-access-token""#).count();
+        assert_eq!(
+            bare, 0,
+            "the human-account verb must be gone, not merely accompanied: {body}"
+        );
+    }
 
     fn labels() -> BTreeMap<String, String> {
         BTreeMap::from([
