@@ -493,9 +493,48 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicI64, CloudDestination, DEFAULT_ONESHOT_BUDGET_BYTES, Ordering, normalize_prefix,
-        resolve_oneshot_budget, take_from,
+        AtomicI64, CloudDestination, DEFAULT_ONESHOT_BUDGET_BYTES, OneShotPool, OneShotReservation,
+        Ordering, normalize_prefix, resolve_oneshot_budget, take_from,
     };
+    /// The RELEASE half. Both `OneShotPool::release` and the `Drop` that calls it
+    /// survived the mutation gate stubbed to `()` — every existing budget test
+    /// reserves and checks exhaustion, none checks that the budget comes BACK.
+    ///
+    /// The harm a stub causes is not a crash: the pool drains monotonically, so
+    /// after N parts every later part streams instead of one-shotting. Streaming is
+    /// size-only verified, so the run stays green while silently losing the
+    /// Content-MD5 the one-shot path exists to obtain — a verification-strength
+    /// regression no count or checksum can see.
+    ///
+    /// Two reservations of the WHOLE budget, sequentially: the second can only
+    /// succeed if the first was returned. One reservation cannot express that.
+    #[test]
+    fn a_finished_reservation_returns_its_bytes_so_the_next_part_can_one_shot() {
+        let pool = OneShotPool::Owned(AtomicI64::new(8 * 1024 * 1024));
+        let whole = 8 * 1024 * 1024;
+
+        assert!(
+            pool.reserve(whole),
+            "the whole budget is available to start with"
+        );
+        {
+            // The guard does not reserve — it RETURNS on drop what `reserve` took.
+            let _held = OneShotReservation(&pool, whole);
+            assert!(
+                !pool.reserve(whole),
+                "while the whole budget is held, a second part of the same size must \
+                 stream — otherwise the ceiling is not a ceiling"
+            );
+        } // _held drops here: the bytes must go back.
+
+        assert!(
+            pool.reserve(whole),
+            "after the first reservation finished, the next part must one-shot again. \
+             A release that does nothing drains the pool for the life of the process, \
+             and every later part silently degrades to size-only verification."
+        );
+    }
+
     use crate::config::{DestinationConfig, DestinationType};
     use crate::destination::gcs::GcsBackend;
 
