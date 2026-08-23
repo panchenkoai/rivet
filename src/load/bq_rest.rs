@@ -335,6 +335,18 @@ impl Auth {
     }
 }
 
+/// The fallback's argv, as a VALUE rather than a literal buried in the spawn.
+///
+/// A test that greps this file's TEXT would kill mutants here without ever
+/// executing the code — which contradicts the mutation gate's coverage-based
+/// classification (`mint_token_via_gcloud_cli` measures at zero executions and
+/// lands in the report-only class, yet a source-lint kills its mutants, and the
+/// gate's own P2 audit correctly flags that as an oracle that lied). Naming the
+/// argv makes the verb observable by VALUE, so the test executes real code and
+/// the classification stays honest.
+pub(crate) const GCLOUD_TOKEN_ARGV: [&str; 3] =
+    ["auth", "application-default", "print-access-token"];
+
 /// The ONE place rivet still shells out for BigQuery, and only for a token.
 ///
 /// Reached when the ADC file is absent, or holds a shape rivet cannot mint in
@@ -359,19 +371,6 @@ impl Auth {
 /// in INFORMATION_SCHEMA.JOBS_BY_PROJECT while the GCS leg wrote as the service
 /// account. A load must act as the identity the operator configured, or its
 /// audit trail is fiction.
-
-/// The fallback's argv, as a VALUE rather than a literal buried in the spawn.
-///
-/// A test that greps this file's TEXT would kill mutants here without ever
-/// executing the code — which contradicts the mutation gate's coverage-based
-/// classification (`mint_token_via_gcloud_cli` measures at zero executions and
-/// lands in the report-only class, yet a source-lint kills its mutants, and the
-/// gate's own P2 audit correctly flags that as an oracle that lied). Naming the
-/// argv makes the verb observable by VALUE, so the test executes real code and
-/// the classification stays honest.
-pub(crate) const GCLOUD_TOKEN_ARGV: [&str; 3] =
-    ["auth", "application-default", "print-access-token"];
-
 fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("gcloud")
         .args(GCLOUD_TOKEN_ARGV)
