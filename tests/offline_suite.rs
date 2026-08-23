@@ -52,6 +52,8 @@ mod mysql_wire_type_fixture_guard;
 // a moved subject fails LOUDLY instead of grading the empty set.
 #[path = "offline/nonvacuity.rs"]
 mod nonvacuity;
+#[path = "offline/oracle_read_scope_guard.rs"]
+mod oracle_read_scope_guard;
 #[path = "offline/perf_matrix_guard.rs"]
 mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
