@@ -5464,6 +5464,13 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
+    // Serialize with every other test that flips a GLOBAL on this shared server.
+    // Without it this test'''s PARTIAL_JSON window is visible to concurrent MySQL CDC
+    // tests, and rivet — correctly — refuses their runs too: measured on #281, where
+    // mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id failed while
+    // 634 others passed. A static Mutex would serialize NOTHING here (nextest runs
+    // each test in its own process — an r3 bughunt find recorded above).
+    let _serial = quiet_window_guard();
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("cdc_pj");
     let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
