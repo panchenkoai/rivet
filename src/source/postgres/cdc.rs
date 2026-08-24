@@ -91,6 +91,99 @@ pub(crate) fn slot_created_warning(slot: &str) -> String {
     )
 }
 
+/// What one CONFIGURED table can contribute to a `test_decoding` stream —
+/// the pure half of [`PgChangeStream::check_configured_tables_are_routable`].
+///
+/// `test_decoding` names the relation a row PHYSICALLY landed in, and the sink
+/// routes by byte-exact comparison against the config's `table:` string. When
+/// those two can never agree, capture is a silent 100% drop — and on PostgreSQL
+/// that is terminal, not a delay: the commit boundary is recorded BEFORE the
+/// routing filter (`cdc/sink.rs`), so the pass checkpoints and acks the slot over
+/// events it never captured, PostgreSQL frees the WAL, and the run writes
+/// `_SUCCESS` with `status: success` and zero rows.
+///
+/// Measured on a real partitioned table (2026-08-24, pg14 stand): 2 committed
+/// rows, `rows: 0`, slot `0/AE5F8BB8` → `0/AE6010D8`, peek empty afterwards, and
+/// re-running with the config corrected recovered NOTHING while the source still
+/// held both rows. That is worse than the SQL Server case this guard is modelled
+/// on (`mssql/cdc.rs`), where the change table's own retention made the same
+/// routing bug a delay.
+pub(crate) struct RelationRouting<'a> {
+    /// The `table:` string the config asked for — what the sink routes BY.
+    pub configured: &'a str,
+    /// `pg_class.relkind` of the relation that name resolves to.
+    pub relkind: char,
+    /// Relations that inherit from it — partitions, or legacy `INHERITS`
+    /// children — schema-qualified the way `test_decoding` renders them.
+    pub children: Vec<String>,
+}
+
+/// The verdict for one configured table. `Never` is a hard error (a guaranteed
+/// total, unrecoverable drop); `Partial` is a warning, because the parent's OWN
+/// rows do route and refusing would break a working config.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RoutingVerdict {
+    Routable,
+    Never(String),
+    Partial(String),
+}
+
+/// Classify one configured relation. Pure: the catalog read that fills
+/// [`RelationRouting`] needs a live PostgreSQL, so this — every decision the
+/// guard makes — is what an offline test can hold and mutants can grade.
+pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
+    let cfg = rel.configured;
+    match rel.relkind {
+        // A partitioned parent stores NO rows of its own: every change carries a
+        // PARTITION's name. Byte-exact routing can never match it.
+        'p' => {
+            let named = if rel.children.is_empty() {
+                "it has no partitions yet".to_string()
+            } else {
+                format!("currently {}", rel.children.join(", "))
+            };
+            RoutingVerdict::Never(format!(
+                "pg cdc: `{cfg}` is a PARTITIONED table — it stores no rows itself, and \
+                 test_decoding names the PARTITION a row landed in, never the parent. Routing is \
+                 byte-exact, so every change would be dropped AND the slot would advance past it: \
+                 PostgreSQL frees the WAL and the changes are gone from the log and the \
+                 destination alike, while the run reports success with 0 rows. Capture the \
+                 partitions by name ({named}) — a partition added later needs its own entry — or \
+                 snapshot the parent with `mode: full`, which reads through the parent normally."
+            ))
+        }
+        // A view/matview/foreign table has no WAL of its own. Verified on the
+        // pg14 stand: a `REFRESH MATERIALIZED VIEW` emits no `table …` line at
+        // all, so this is a guaranteed zero, not a rare one.
+        'v' | 'm' | 'f' => {
+            let what = match rel.relkind {
+                'v' => "a VIEW",
+                'm' => "a MATERIALIZED VIEW",
+                _ => "a FOREIGN TABLE",
+            };
+            RoutingVerdict::Never(format!(
+                "pg cdc: `{cfg}` is {what}, which writes no WAL under its own name — no change \
+                 event can ever carry it, so capture would drop everything while advancing the \
+                 slot past it (a success with 0 rows, unrecoverable). Capture the BASE table(s) it \
+                 reads instead."
+            ))
+        }
+        // A plain table with inheritance children routes its OWN rows correctly;
+        // only rows written directly to a child are dropped. A partial gap — loud
+        // enough to see, not fatal enough to refuse a config that works today.
+        'r' | 'P' if !rel.children.is_empty() => RoutingVerdict::Partial(format!(
+            "pg cdc: `{cfg}` has {} inheritance child table(s) ({}). test_decoding names the CHILD \
+             a row landed in, so changes written directly to a child route NOWHERE while the \
+             parent's own rows capture normally — a partial, silent gap whose size depends on how \
+             the writers address the table. List the children as captured tables if their changes \
+             matter.",
+            rel.children.len(),
+            rel.children.join(", ")
+        )),
+        _ => RoutingVerdict::Routable,
+    }
+}
+
 impl PgChangeStream {
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
     /// (idempotent — reuses an existing slot, which is how a real run resumes).
@@ -198,6 +291,60 @@ impl PgChangeStream {
         }
     }
 
+    /// Live half of the routing guard: ask the CATALOG what each configured
+    /// table actually is, and refuse a capture that could only ever drop
+    /// everything. Decisions live in [`classify_routing`]; this is glue.
+    ///
+    /// Runs on the stream's OWN connection, before the slot is created and long
+    /// before any ack — which is the whole point. A guard that fires after the
+    /// first roll has already let PostgreSQL free the WAL.
+    ///
+    /// `to_regclass` (not `::regclass`) so a name that resolves to nothing
+    /// returns NULL instead of raising: an absent table is the schema probe's
+    /// error to report (`SELECT * FROM {table}`, `cdc/mod.rs`), with a message
+    /// that already names it. Resolution follows the same SQL rules that probe
+    /// does, so the two agree about which relation a config string means.
+    fn check_configured_tables_are_routable(
+        client: &mut Client,
+        configured: &[String],
+    ) -> Result<()> {
+        use anyhow::Context as _;
+        for cfg in configured {
+            let Some(row) = client
+                .query_opt(
+                    "SELECT c.relkind::text, \
+                            coalesce(array_agg(n2.nspname || '.' || c2.relname) \
+                                     FILTER (WHERE c2.oid IS NOT NULL), '{}') \
+                     FROM pg_class c \
+                     LEFT JOIN pg_inherits i ON i.inhparent = c.oid \
+                     LEFT JOIN pg_class c2 ON c2.oid = i.inhrelid \
+                     LEFT JOIN pg_namespace n2 ON n2.oid = c2.relnamespace \
+                     WHERE c.oid = to_regclass($1) \
+                     GROUP BY c.relkind",
+                    &[&cfg.as_str()],
+                )
+                .with_context(|| {
+                    format!("pg cdc: reading pg_class to check that `{cfg}` is routable")
+                })?
+            else {
+                continue; // unresolvable here — the schema probe reports it, loudly
+            };
+            let relkind: String = row.get(0);
+            let children: Vec<String> = row.get(1);
+            let rel = RelationRouting {
+                configured: cfg,
+                relkind: relkind.chars().next().unwrap_or('?'),
+                children,
+            };
+            match classify_routing(&rel) {
+                RoutingVerdict::Routable => {}
+                RoutingVerdict::Partial(why) => log::warn!("{why}"),
+                RoutingVerdict::Never(why) => anyhow::bail!("{why}"),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn open(
         conn_str: &str,
         slot: &str,
@@ -205,6 +352,7 @@ impl PgChangeStream {
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
         mode: DrainMode,
+        configured_tables: &[String],
     ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
@@ -238,6 +386,11 @@ impl PgChangeStream {
             "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
              SET intervalstyle = 'postgres'; SET extra_float_digits = 3;",
         )?;
+        // BEFORE the slot exists and long before any ack: a configured table that
+        // no change event can ever name is a total, unrecoverable drop, and the
+        // slot advancing is what makes it unrecoverable.
+        Self::check_configured_tables_are_routable(&mut client, configured_tables)?;
+
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
         // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
         // creates the logical slot (also refused in recovery). Detect recovery
@@ -1165,6 +1318,65 @@ mod tests {
 
     use super::*;
 
+    /// The guard's whole decision surface, one case per relkind that behaves
+    /// differently. Every arm was MEASURED on the pg14 stand (2026-08-24) rather
+    /// than read off the docs — `REFRESH MATERIALIZED VIEW` in particular emits
+    /// no `table …` line at all, which is why 'm' sits with the never-routable
+    /// kinds instead of being assumed routable.
+    #[test]
+    fn classify_routing_refuses_only_the_relations_no_event_can_ever_name() {
+        let rel = |kind: char, children: &[&str]| RelationRouting {
+            configured: "public.t",
+            relkind: kind,
+            children: children.iter().map(|c| c.to_string()).collect(),
+        };
+
+        // A partitioned parent stores no rows: 100% drop, and the slot advances
+        // past it. This is the case measured live (2 rows in, 0 captured,
+        // unrecoverable).
+        let RoutingVerdict::Never(why) = classify_routing(&rel('p', &["public.t_2026_01"])) else {
+            panic!("a partitioned parent can never be routed — it must be refused");
+        };
+        assert!(
+            why.contains("public.t_2026_01"),
+            "the refusal must name the partitions, because listing them IS the \
+             remediation: {why}"
+        );
+
+        // …and with no partitions yet, it is still unroutable — the message just
+        // cannot name one. A guard that only fired when children exist would miss
+        // the empty-parent config entirely.
+        let RoutingVerdict::Never(why) = classify_routing(&rel('p', &[])) else {
+            panic!("a partitioned parent with no partitions yet is still unroutable");
+        };
+        assert!(why.contains("no partitions yet"), "{why}");
+
+        for (kind, word) in [
+            ('v', "VIEW"),
+            ('m', "MATERIALIZED VIEW"),
+            ('f', "FOREIGN TABLE"),
+        ] {
+            let RoutingVerdict::Never(why) = classify_routing(&rel(kind, &[])) else {
+                panic!("{kind} writes no WAL under its own name — it must be refused");
+            };
+            assert!(why.contains(word), "the refusal must say what it is: {why}");
+        }
+
+        // A plain table is routable, and stays routable — refusing it would break
+        // every working config.
+        assert_eq!(classify_routing(&rel('r', &[])), RoutingVerdict::Routable);
+
+        // Inheritance children are a PARTIAL gap: the parent's own rows route
+        // fine, so this warns rather than refusing.
+        let RoutingVerdict::Partial(why) = classify_routing(&rel('r', &["public.t_child"])) else {
+            panic!("an inheritance parent routes its OWN rows — warn, never refuse");
+        };
+        assert!(
+            why.contains("public.t_child") && why.contains('1'),
+            "the warning must name the children and how many: {why}"
+        );
+    }
+
     #[test]
     fn parse_pg_array_backslash_before_multibyte_does_not_panic() {
         // Round-6: a quoted array element with a backslash BEFORE a multi-byte UTF-8
@@ -1695,6 +1907,7 @@ mod tests {
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
             DrainMode::Continuous,
+            &[], // this test routes nothing — it reads the stream directly
         )
         .unwrap();
         admin

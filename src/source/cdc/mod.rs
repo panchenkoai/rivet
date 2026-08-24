@@ -354,9 +354,28 @@ pub(crate) fn run(
 #[derive(Debug, Clone)]
 pub(crate) enum CdcEngineOpts {
     /// MySQL replica id (the binlog `server_id`).
-    Mysql { server_id: u32 },
+    Mysql {
+        server_id: u32,
+        /// The `table:` values the CONFIG asked for.
+        ///
+        /// The binlog is ONE stream per server, so it carries every table's
+        /// changes. An UNDECODABLE rows event is checked against this set before
+        /// it is allowed to fail the run — otherwise one PARTIAL_JSON table is a
+        /// server-wide outage for exports that never read it.
+        configured_tables: Vec<String>,
+    },
     /// PostgreSQL logical slot name.
-    Postgres { slot: String },
+    Postgres {
+        slot: String,
+        /// The `table:` values the CONFIG asked for — the same cross-check the
+        /// SQL Server arm carries, for a different reason.
+        ///
+        /// `test_decoding` names the relation a row PHYSICALLY landed in. A
+        /// PARTITIONED parent stores none, so every change carries a PARTITION's
+        /// name and byte-exact routing drops all of it — while the slot advances,
+        /// which on PostgreSQL makes the loss terminal rather than a delay.
+        configured_tables: Vec<String>,
+    },
     /// SQL Server capture instance (required for `sqlserver://`).
     Mssql {
         capture_instance: Option<String>,
@@ -645,6 +664,15 @@ impl CdcEngine {
                     tls,
                     PeekBound::Unbounded,
                     DrainMode::Continuous, // anchor-only open — never read, no bound to pin
+                    // No routing cross-check here, deliberately. This open exists
+                    // to CREATE the slot and is dropped without reading or
+                    // acking, so it cannot lose anything; the capture open that
+                    // follows carries the tables and bails there. Refusing before
+                    // the anchor would be actively worse for the operator —
+                    // changes written between a bad config and its fix would have
+                    // no slot holding them, whereas a slot created first keeps
+                    // every one of them until the corrected run drains it.
+                    &[],
                 )?);
                 Ok(())
             }
@@ -712,7 +740,10 @@ pub(crate) fn create_change_stream(
     let tls = cfg.tls.as_ref();
     // The engine identity IS the opts variant — no re-resolution from the URL.
     match &cfg.engine {
-        CdcEngineOpts::Mysql { server_id } => {
+        CdcEngineOpts::Mysql {
+            server_id,
+            configured_tables,
+        } => {
             // Validate the checkpoint BEFORE open_or_resume so a corrupt/truncated
             // checkpoint (or a directory path) surfaces cleanly, not blanketed by
             // the MYSQL_CDC_HINT binlog-grants message — the same hoist PG/MSSQL
@@ -729,11 +760,15 @@ pub(crate) fn create_change_stream(
                     cfg.checkpoint.as_deref(),
                     cfg.drain,
                     tls,
+                    configured_tables.clone(),
                 )
                 .context(MYSQL_CDC_HINT)?,
             ))
         }
-        CdcEngineOpts::Postgres { slot } => {
+        CdcEngineOpts::Postgres {
+            slot,
+            configured_tables,
+        } => {
             // A persisted checkpoint proves a prior run happened — if the slot is
             // then MISSING, it was dropped/invalidated and silently recreating it
             // at the current position would skip everything since (a silent gap).
@@ -753,6 +788,7 @@ pub(crate) fn create_change_stream(
                     tls,
                     peek,
                     cfg.drain,
+                    configured_tables,
                 )
                 .context(PG_CDC_HINT)?,
             ))
@@ -1275,7 +1311,10 @@ mod tests {
             checkpoint: Some(ckpt),
             drain: DrainMode::BoundedAtOpen,
             tls: None,
-            engine: CdcEngineOpts::Mysql { server_id: 4321 },
+            engine: CdcEngineOpts::Mysql {
+                server_id: 4321,
+                configured_tables: Vec::new(),
+            },
         };
         let err = match create_change_stream(&cfg, PeekBound::Unbounded) {
             Ok(_) => panic!("a corrupt checkpoint must error, not open a stream"),

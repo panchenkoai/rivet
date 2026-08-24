@@ -248,8 +248,18 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         engine: match CdcEngine::from_url(&url)? {
             CdcEngine::Mysql => CdcEngineOpts::Mysql {
                 server_id: a.server_id,
+                // `--table` IS the routing filter on this path; empty means capture
+                // whatever the stream emits, which makes every event ours.
+                configured_tables: a.table.clone(),
             },
-            CdcEngine::Postgres => CdcEngineOpts::Postgres { slot: a.slot },
+            CdcEngine::Postgres => CdcEngineOpts::Postgres {
+                slot: a.slot,
+                // `--table` IS the routing filter on this path too, so it is
+                // exactly the set the guard must classify. Empty (`rivet cdc`
+                // with no `--table`) keeps it off: nothing named ⇒ nothing to
+                // cross-check — the same rule the SQL Server arm below states.
+                configured_tables: a.table.clone(),
+            },
             CdcEngine::Mssql => CdcEngineOpts::Mssql {
                 // `--table` IS the routing filter on this path too (the NDJSON leg
                 // passes it to `run(...)`, the `--output` leg requires exactly

@@ -61,6 +61,43 @@ shapes:
         the DuckDB oracle reads from inside a container and a resume destination it cannot
         see reads zero, which looks like data loss and is a harness bug." }
 
+  - id: configured_identity_is_cross_checked_before_the_first_ack
+    what: >
+      The config's `table:` is a LABEL; the catalog is truth. An engine whose wire
+      identity can differ from the configured string needs that compared AT OPEN,
+      because every routing filter here is byte-exact and the commit boundary is
+      recorded BEFORE it — so a mismatch drops 100% of the events while the run
+      checkpoints and advances the source cursor over them.
+    mutant: >
+      Delete the open-time cross-check (PG `check_configured_tables_are_routable`,
+      MSSQL's `cdc.change_tables` bail). A sound cell goes RED on a 0-row `success`;
+      a missing one ships the export green. MEASURED on PostgreSQL 2026-08-24:
+      a partitioned parent took 2 committed rows to `rows: 0, status: success`,
+      slot 0/AE5F8BB8 -> 0/AE6010D8, peek EMPTY after — and re-running with the
+      config corrected recovered NOTHING while the source still held both rows.
+    postgres:
+      sound: "roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot
+        (live_cdc.rs) — RED against three mutants: guard removed, Never downgraded
+        to a warn, and the partition names dropped from the message. Asserts the
+        slot did NOT move, which is the whole difference between a config error and
+        two rows nobody can get back."
+    mssql:
+      sound: "mssql_cdc_capture_instance_name_must_not_decide_the_table +
+        the two-table content variant (live_cdc_mssql.rs:622, :668) — RED against
+        the split-once name heuristic that routed 6 of 8 field tables wrong."
+    mysql:
+      na: "MySQL has no relation that emits under a name other than the configured
+        one: partitioning is a storage-engine concern and the binlog's table_map
+        carries the LOGICAL table. MEASURED 2026-08-24 rather than assumed — a
+        RANGE-partitioned `mpart` captured both inserted rows through a config
+        naming the parent, on the rivet-mysql-cdc-1 stand."
+    mongo:
+      na: "A change stream's `ns` is the collection the write addressed, and Mongo
+        has no parent/child relation whose events surface under a different name —
+        there is no second identity for a cross-check to compare against. The
+        engine's routing risk is the dotted-collection-name case, already covered by
+        table_matches' full-name-first arm (sink.rs:227-234)."
+
   - id: readback_is_manifest_scoped
     what: >
       The read-back oracle must read the parts the run DECLARED, not every parquet under

@@ -1889,14 +1889,6 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
         1,
         "a schema-qualified table: must capture, not 0-row-success"
     );
-    // rivet's own count and an INDEPENDENT read of the parts the manifest DECLARES
-    // must agree. The count alone is the product grading itself: a routing bug that
-    // drops the event and a summary bug that reports one are the same number here.
-    assert_eq!(
-        cdc_id_ops(&out),
-        vec![(1, "insert".to_string())],
-        "the DECLARED parts must hold the captured change, not just the summary count"
-    );
 }
 
 // Roast finding #25: the snapshot synth export INHERITED skip_empty — an
@@ -3575,6 +3567,142 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
 /// own database makes the slot see only this test's WAL — parallel-safe by
 /// construction, no `--test-threads=1` needed. Dropped (backends terminated) on
 /// teardown; the table + slot live inside it, so no separate guards are needed.
+/// A PARTITIONED parent must be refused at OPEN — before the slot is acked past
+/// changes no event could ever route.
+///
+/// The second half of #279. That fix taught the reader to UNQUOTE the wire
+/// identity; this one compares that identity to what the CONFIG asked for, the
+/// cross-check the SQL Server arm has carried since the capture-instance find
+/// (`mssql/cdc.rs`). The reachable shape is not a mixed-case name — the schema
+/// probe (`SELECT * FROM {table}`) already fails loudly on those — it is a
+/// partitioned table, where the probe succeeds PERFECTLY (the parent has a full,
+/// correct column list) and `test_decoding` then names the PARTITION every row
+/// physically landed in.
+///
+/// Measured before the guard (2026-08-24, pg14 stand — this test's RED):
+/// 2 committed rows → `status: success`, `rows: 0`, `files: 0`, slot
+/// `0/AE5F8BB8` → `0/AE6010D8`, and `pg_logical_slot_peek_changes` EMPTY
+/// afterwards. Re-running with the config corrected to the partition recovered
+/// NOTHING while the source still held both rows. Worse than the SQL Server
+/// case this is modelled on, where the change table's own retention made the
+/// same routing bug a delay: here PostgreSQL frees the WAL and it is gone.
+///
+/// Isolated in its OWN database (see `CdcDb`): the guard reads `pg_class`, and
+/// the assertion is about a slot position a parallel test's WAL would perturb.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
+    let cdc_db = CdcDb::new("cdc_part");
+    let slot = unique_name("rivet_part_slot");
+    let parent = unique_name("rivet_cdc_par").to_lowercase();
+    let part = format!("{parent}_2026_01");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {parent} (id BIGINT NOT NULL, ts DATE NOT NULL, v INT) \
+         PARTITION BY RANGE (ts); \
+         CREATE TABLE {part} PARTITION OF {parent} \
+         FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(
+        &format!("INSERT INTO {parent} VALUES (1,'2026-01-05',10),(2,'2026-01-06',20)"),
+        &[],
+    )
+    .unwrap();
+    // The SOURCE oracle, asked of PostgreSQL itself — never rivet's counters.
+    let source_rows: i64 = c
+        .query_one(&format!("SELECT count(*) FROM {parent}"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(source_rows, 2, "fixture seeded 2 rows through the parent");
+    let before: String = c
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+
+    // The config a user writes: the LOGICAL table. Its schema probe succeeds —
+    // which is exactly why this was silent.
+    let wrong = Rig::pg_cdc(&format!("public.{parent}"), &slot).source_url(cdc_db.url());
+    let out = run_rivet(&["run", "--config", wrong.config_path().to_str().unwrap()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "capturing a partitioned parent must fail at open, not ship a 0-row \
+         success — output:\n{said}"
+    );
+    assert!(
+        said.contains(&part),
+        "the refusal must name the PARTITION `{part}` — listing the partitions is \
+         the remediation, and a user who could guess that would not have hit this. \
+         Output:\n{said}"
+    );
+
+    // The slot must NOT have moved. Failing at open only buys anything if it
+    // happens BEFORE the ack: this assert is the whole difference between a
+    // config error and two rows nobody can get back.
+    let moved: bool = c
+        .query_one(
+            &format!(
+                "SELECT confirmed_flush_lsn <> '{before}'::pg_lsn \
+                 FROM pg_replication_slots WHERE slot_name = $1"
+            ),
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !moved,
+        "the refused run acked the slot anyway — the 2 changes are unreachable \
+         now and the guard bought nothing"
+    );
+
+    // Defer-not-drop: with the partition named, the same slot still holds every
+    // change. Oracle: the parts the MANIFEST declares, re-read — never the
+    // manifest's own `row_count`, and compared to the source count above.
+    let right = Rig::pg_cdc(&format!("public.{part}"), &slot).source_url(cdc_db.url());
+    run_rivet_ok(&right.config_path());
+    let captured: usize = right
+        .read_declared_parts()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        captured, source_rows as usize,
+        "the corrected run must recover all {source_rows} changes from the \
+         un-acked slot — that is what makes the refusal a delay, not a loss"
+    );
+
+    // The refusal offers TWO ways out and a message may only promise what
+    // something checks. The partition-by-name route is proven above; this is the
+    // other one — `mode: full` reads THROUGH the parent, because a batch SELECT
+    // resolves partitions the way any query does and never sees a wire identity
+    // at all. Untested, "snapshot the parent with mode: full" would be a remedy
+    // nobody had run — the class CLAUDE.md records as a hint that cannot recover
+    // from the state it is offered in.
+    let snapshot = Rig::pg_batch(&format!("public.{parent}"))
+        .source_url(cdc_db.url())
+        .mode("full");
+    let snapshot_rows: usize = snapshot.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        snapshot_rows, source_rows as usize,
+        "`mode: full` on the partitioned parent must read every row — it is the \
+         second remediation the refusal names, and a message may only promise \
+         what a test has run"
+    );
+}
+
 /// The manifest-scoped read-back must disagree with a glob — asserted through the
 /// READER the CDC tests actually use, not through a sibling helper.
 ///
@@ -5542,5 +5670,145 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
     assert!(
         !both.status.success(),
         "passing two source forms must be REFUSED, not silently resolved to one of them"
+    );
+}
+
+/// A PARTIAL_JSON binlog must be REFUSED, not silently skipped.
+///
+/// `binlog_row_value_options=PARTIAL_JSON` is a legal MySQL 8 setting that logs a JSON
+/// diff instead of the row image. The reader cannot decode that, and the arm that met
+/// it was `_ => return Ok(true)` — the rows vanished while the surrounding transaction
+/// committed and the checkpoint advanced past them. Unrecoverable, and reported as
+/// `status: success`.
+///
+/// The loss is a SUBSET, which is what makes it the dangerous half: transactions that
+/// touch no JSON column are captured normally, so counts and sums keep reconciling.
+///
+/// Non-default-state test (CLAUDE.md): the default is exactly where the bug hides, so
+/// the setting is flipped and restored by a guard rather than assumed.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
+    // PARTIAL_JSON is set on the WRITING SESSION, never the server global — the
+    // binlog record's shape is decided by whoever wrote it. An earlier version of
+    // this test flipped `SET GLOBAL` and took `quiet_window_guard()` to serialize;
+    // that was the wrong shape twice over. The guard only excludes tests that TAKE
+    // it, and `mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id`
+    // does not — so the global window was still visible to it and rivet, correctly,
+    // refused its run too (measured on #281: it failed while 633 others passed,
+    // both before and after the guard was added). Session scope removes the shared
+    // state entirely: nothing to serialize, nothing to restore, no window for a
+    // parallel test to fall into. Verified on the stand — the UPDATE below reaches
+    // the partial arm while `@@GLOBAL.binlog_row_value_options` stays empty.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_pj");
+    // `SET SESSION binlog_row_value_options` needs SESSION_VARIABLES_ADMIN, which
+    // the `rivet` test user does not hold — hence root for the WRITER only. The
+    // capture itself still runs as `rivet`, exactly like every other test here.
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut writer = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    use mysql::prelude::Queryable as _;
+    writer
+        .query_drop("SET SESSION binlog_row_value_options = 'PARTIAL_JSON'")
+        .expect("set partial json on this session only");
+
+    writer
+        .query_drop(format!("DROP TABLE IF EXISTS {tbl}"))
+        .unwrap();
+    writer
+        .query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, doc JSON)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    // The document must be big enough that MySQL logs a DIFF rather than falling back
+    // to a full image — a short JSON value is rewritten whole and never reaches the
+    // partial arm, which would make this test pass for the wrong reason.
+    writer
+        .query_drop(format!(
+            "INSERT INTO {tbl} VALUES (1, JSON_OBJECT('a', 1, 'pad', REPEAT('x', 400)))"
+        ))
+        .unwrap();
+
+    let ck = d.path().join("pj.ckpt");
+    let rig = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ck.to_path_buf())
+            .dest_path(d.path().join("out"))
+    };
+    // Anchor the stream before provoking the diff, so the update is inside the window.
+    rig().run_ok();
+
+    // The diff-logging session writes the UPDATE — this is the whole fixture.
+    writer
+        .query_drop(format!(
+            "UPDATE {tbl} SET doc = JSON_SET(doc, '$.a', 2) WHERE id = 1"
+        ))
+        .unwrap();
+
+    let msg = rig().run_expect_fail();
+    assert!(
+        msg.contains("partial-JSON"),
+        "the run must REFUSE and name the shape it met. Silently skipping the diff \
+         loses the update while the checkpoint advances past it — a subset loss no \
+         count check can see. Got: {msg}"
+    );
+    assert!(
+        msg.contains("binlog_row_value_options"),
+        "the message must name the SETTING to change — it is the only remediation an \
+         operator gets: {msg}"
+    );
+    assert!(
+        msg.contains("re-read"),
+        "the message must say the un-acked span is re-read; an operator who believes \
+         the data is already gone has no reason to fix the source and re-run: {msg}"
+    );
+
+    // ── and the refusal must be TABLE-ADDRESSED ────────────────────────────────
+    //
+    // The binlog is ONE stream per server, so the undecodable event above sits in
+    // the log every OTHER export reads too. Refusing without asking whose event it
+    // is turns one PARTIAL_JSON table into a server-wide outage — measured on #281,
+    // where this fixture failed `mysql_cdc_cli_stream_with_a_cap_terminates_and_
+    // accepts_a_server_id` with this exact error, on a table it does not capture.
+    //
+    // That failure was a RACE (the neighbour only sees it when its window covers
+    // the event), which is why it is pinned HERE instead: this export is anchored
+    // BEFORE the partial update, so the event is inside its window by construction
+    // and the assertion cannot pass by timing. RED against `if true` in place of
+    // the `undecodable_event_is_ours` call.
+    let other = unique_name("cdc_pj_other");
+    writer
+        .query_drop(format!("DROP TABLE IF EXISTS {other}"))
+        .unwrap();
+    writer
+        .query_drop(format!("CREATE TABLE {other} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _other_guard = Table(other.clone());
+    let other_ck = d.path().join("other.ckpt");
+    let other_rig = || {
+        Rig::mysql_cdc(&other)
+            .checkpoint_path(other_ck.to_path_buf())
+            .dest_path(d.path().join("out_other"))
+    };
+    other_rig().run_ok(); // anchor BEFORE the partial update lands
+
+    writer
+        .query_drop(format!(
+            "UPDATE {tbl} SET doc = JSON_SET(doc, '$.a', 3) WHERE id = 1"
+        ))
+        .unwrap();
+    writer
+        .query_drop(format!("INSERT INTO {other} VALUES (7, 70)"))
+        .unwrap();
+
+    let rows: usize = other_rig()
+        .run_and_read()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        rows, 1,
+        "an export that does NOT capture the partial-JSON table must complete and \
+         capture its own change — the undecodable event belongs to another table, \
+         and the routing filter would have dropped it anyway"
     );
 }

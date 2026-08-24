@@ -526,12 +526,16 @@ fn run_cdc_inner(
                         server_id: cdc
                             .server_id
                             .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
+                        // The same strings the sink will route by — see the field's doc.
+                        configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                     },
                     crate::config::SourceType::Postgres => CdcEngineOpts::Postgres {
                         slot: cdc
                             .slot
                             .clone()
                             .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
+                        // The same strings the sink will route by — see the field's doc.
+                        configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                     },
                     crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
                         capture_instance: cdc.capture_instance.clone(),
