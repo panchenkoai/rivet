@@ -63,14 +63,18 @@ impl Rig {
         // The leg number is derived from what is on disk rather than carried as
         // state: two calls in one test must not collide, and a rig that never
         // resumed must still get `out2`.
-        let mut n = 2;
-        while self.dir.path().join(format!("out{n}")).exists() {
-            n += 1;
-        }
-        let fresh = self.dir.path().join(format!("out{n}"));
-        std::fs::create_dir_all(&fresh).expect("create the resume leg's destination");
-        self.dest_override = Some(fresh.clone());
-        fresh
+        // A shared-workdir pair, not a tempdir path: the DuckDB oracle reads from
+        // INSIDE a container, so a resume destination it cannot see would make every
+        // assertion downstream read zero — the failure mode that looks like data loss
+        // and is a harness bug. `duckdb_oracle` sets both halves for the same reason;
+        // the first cut of this seam set only the host half and the oracle came back
+        // empty, which is how this comment exists.
+        let (host, container) = super::super::env::live_shared_workdir(&super::super::unique_name(
+            &format!("rig_{}_resume", self.name),
+        ));
+        self.dest_override = Some(host.clone());
+        self.oracle_container_dir = Some(container);
+        host
     }
 
     /// Read back ONLY the parts the manifest DECLARES, not every parquet under the dir.

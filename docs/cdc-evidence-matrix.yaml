@@ -53,12 +53,13 @@ shapes:
     postgres: { sound: "resumes into a fresh out2/ — live_cdc.rs:2849-2863" }
     mysql:    { sound: "resumes into a fresh out2/ — live_cdc.rs:474-486" }
     mssql:    { sound: "resumes into a fresh out2/ — live_cdc_mssql.rs:782-795" }
-    mongo:
-      vacuous: "one Rig at live_cdc_mongo.rs:83 drives both the crash (:91) and the resume
-        (:100); Rig::out_dir is fixed at construction (tests/common/rig/oracle.rs:9-13) and
-        the oracle is a **/*.parquet glob (tests/common/duckdb.rs:257). This is Mongo's ONLY
-        at-least-once evidence and the mongo cell of crash_before_ack in the gate."
-      kind: second-cause
+    mongo: { sound: "the resume leg takes its own destination via Rig::resume_into_fresh_dest
+        (live_cdc_mongo.rs, mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume).
+        RED-proven by deleting the resume run: `id 1 lost across the crash`, where the
+        shared-destination version stayed green because the crashed run's orphans satisfied
+        it. That seam also had to set the CONTAINER-visible path, not only the host one —
+        the DuckDB oracle reads from inside a container and a resume destination it cannot
+        see reads zero, which looks like data loss and is a harness bug." }
 
   - id: readback_is_manifest_scoped
     what: >
