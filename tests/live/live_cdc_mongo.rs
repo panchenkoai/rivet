@@ -80,7 +80,7 @@ fn mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
 
-    let rig = cdc(&db, "t");
+    let mut rig = cdc(&db, "t");
     rig.run_ok(); // pin
     for i in 1..=5 {
         m.upsert_set("t", i, "v", &format!("x{i}"));
@@ -94,9 +94,17 @@ fn mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume() {
         "the fault hook must crash the run"
     );
 
-    // Resume: the un-acked changes are RE-READ. The destination is a complete
-    // superset of the 5 source changes — no silent loss, at-least-once the only
-    // allowed surplus.
+    // Resume into its OWN destination. Sharing one with the crashed run made this
+    // assertion satisfiable by that run's ORPHANS: parts are durable BEFORE the hook
+    // fires (roll_all flushes, then panics, then saves and acks), so a resume that
+    // re-read NOTHING still found five ids under a `**/*.parquet` glob. This was
+    // Mongo's only at-least-once evidence, and it could not fail — the CDC audit's
+    // first finding, and the reason `resume_into_fresh_dest` exists on the rig.
+    //
+    // Scoped this way the assertion means what it says: every id below was captured
+    // by the RESUME. RED-proven by deleting the resume run — "id 1 lost across the
+    // crash", where the shared-destination version stayed green.
+    rig.resume_into_fresh_dest();
     rig.run_ok();
     let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
     for i in 1..=5 {
