@@ -50,6 +50,45 @@ def sh(*args, check=True):
     return r
 
 
+def run_scenario(name: str, sql, t: str) -> None:
+    """Drive one change pattern. Each is a shape the two tools could legitimately
+    disagree about, which is the only reason to run it through a differential
+    harness rather than a plain assertion."""
+    if name == "crud":
+        sql(f"INSERT INTO {t} VALUES (1,'a'),(2,'b')")
+        sql(f"UPDATE {t} SET v='B' WHERE id=2")
+        sql(f"DELETE FROM {t} WHERE id=1")
+    elif name == "key-update":
+        # An UPDATE that MOVES the primary key. PostgreSQL renders it as
+        # `old-key: … new-tuple: …` on one line and rivet has a dedicated split for
+        # it (finding #42); Debezium emits before/after. Whether the two agree on
+        # which key the event belongs to is exactly the kind of question this
+        # harness answers and a self-comparison cannot.
+        sql(f"INSERT INTO {t} VALUES (1,'a')")
+        sql(f"UPDATE {t} SET id=9 WHERE id=1")
+    elif name == "wide-txn":
+        # Many rows in ONE transaction. rivet buffers a transaction whole and never
+        # splits it across parts; the reference has no such constraint. A rollover
+        # boundary landing inside the transaction is where an at-least-once break
+        # would show up as a difference rather than as a count mismatch.
+        vals = ", ".join(f"({i},'v{i}')" for i in range(1, 51))
+        sql(f"INSERT INTO {t} VALUES {vals}")
+        sql(f"UPDATE {t} SET v='x' WHERE id <= 25")
+    elif name == "mid-stream-table":
+        # A table created AFTER both cursors were pinned — Airbyte's
+        # `newTableSnapshotTest`, which this repo has no equivalent of. rivet's
+        # config names one table, so the point is not that it captures the new one:
+        # it is that traffic on a table it does NOT capture must not disturb what it
+        # does. The reference sees only its own include-list too, so agreement here
+        # means both ignored the newcomer the same way.
+        sql(f"CREATE TABLE {t}_late (id int PRIMARY KEY, v text)")
+        sql(f"INSERT INTO {t}_late VALUES (1,'late')")
+        sql(f"INSERT INTO {t} VALUES (1,'a'),(2,'b')")
+        sql(f"UPDATE {t} SET v='B' WHERE id=2")
+    else:
+        raise SystemExit(f"unknown scenario {name}")
+
+
 def _write_cfg(work, a, t, ckpt, out) -> str:
     """One rivet config writer, used for both the MySQL anchoring run and the
     scenario run — two copies would drift and the anchor would stop anchoring the
@@ -78,6 +117,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", default="postgres", choices=["postgres", "mysql"])
     ap.add_argument("--table", default="oracle_t")
+    ap.add_argument("--scenario", default="crud",
+                    choices=["crud", "mid-stream-table", "key-update", "wide-txn"],
+                    help="which change pattern to drive through both tools")
     ap.add_argument("--work", default="/tmp/cdc-oracle")
     ap.add_argument("--keep", action="store_true", help="leave the stand fixtures in place")
     a = ap.parse_args()
@@ -87,7 +129,13 @@ def main() -> int:
     # `Source offset 'file' parameter is missing` — a message that names neither
     # the stale file nor the other engine. Found by running the two in sequence.
     t = a.table
-    work = os.path.join(a.work, a.engine)
+    # Per ENGINE **and** per TABLE. Sharing across engines made MySQL read a
+    # PostgreSQL offsets.dat; sharing across scenarios let one run's
+    # debezium.jsonl accumulate into the next, which surfaced as a `delete` in a
+    # scenario that has no delete. Both were harness artefacts wearing the costume
+    # of a finding, and the second was only obvious because the phantom row named
+    # an operation the scenario never performed.
+    work = os.path.join(a.work, a.engine, a.table)
     os.makedirs(work, exist_ok=True)
     dbz_slot, riv_slot, pub = f"dbz_{t}", f"riv_{t}", f"pub_{t}"
     # Hyphens, NOT underscores: an underscore is illegal in a hostname per RFC 952,
@@ -101,11 +149,11 @@ def main() -> int:
     def cleanup():
         sh("docker", "rm", "-f", sink, srv, check=False)
         if a.engine == "postgres":
-            psql(f"DROP TABLE IF EXISTS {t}; DROP PUBLICATION IF EXISTS {pub}")
+            psql(f"DROP TABLE IF EXISTS {t}, {t}_late; DROP PUBLICATION IF EXISTS {pub}")
             psql(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
                  f"WHERE slot_name IN ('{dbz_slot}','{riv_slot}')")
         else:
-            mysql(f"DROP TABLE IF EXISTS {t}")
+            mysql(f"DROP TABLE IF EXISTS {t}, {t}_late")
         subprocess.run(["rm", "-f", ckpt], check=False)
 
     cleanup()
@@ -219,9 +267,7 @@ quarkus.log.level=WARN
             subprocess.run([binary, "run", "--config", _anchor_cfg],
                            capture_output=True, text=True)
         exec_sql = psql if a.engine == "postgres" else mysql
-        exec_sql(f"INSERT INTO {t} VALUES (1,'a'),(2,'b')")
-        exec_sql(f"UPDATE {t} SET v='B' WHERE id=2")
-        exec_sql(f"DELETE FROM {t} WHERE id=1")
+        run_scenario(a.scenario, exec_sql, t)
         time.sleep(8)  # let the reference flush
 
         # 6. rivet over the same window
