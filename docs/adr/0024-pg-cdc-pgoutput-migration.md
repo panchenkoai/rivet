@@ -125,3 +125,34 @@ spike that answers (a) which streaming-replication crate is audit-clean today,
 and (b) whether a PUBLICATION can be made optional — capture without DDL rights
 was the original reason for this plugin, and if `pgoutput` cannot preserve it,
 the migration is a dual-mode adapter rather than a replacement.
+
+### What the rest of the ecosystem does (surveyed 2026-08-24)
+
+Checked because "are we reinventing the wheel" is the right question to ask
+before building the seventh parser. Answer: on the plugin choice, yes.
+
+- **Debezium** supports `decoderbufs` and `pgoutput` only. `test_decoding` is not
+  a supported plugin at all.
+- **PeerDB** takes the parent table name and nothing else — "you don't need to
+  specify the names of each partition" — via a publication with
+  `publish_via_partition_root` (PG 13-16; on PG 12, a publication FOR ALL TABLES).
+- **Sequin's** plugin guide states test_decoding's "output format is not designed
+  for production parsing" and calls it "mainly useful for understanding how
+  logical decoding works or for quick debugging".
+- PostgreSQL's own docs: "meant for testing that replication works rather than
+  for building robust production apps".
+
+Two design answers worth stealing regardless of which way this ADR goes:
+
+1. **TRUNCATE is a MODE, not a verdict.** Debezium's `truncate.handling.mode`
+   defaults to `skip` and can be set to `include`. rivet now REFUSES, which is
+   right for a file/warehouse sink (there is no consumer to interpret a truncate
+   event, and the divergence is permanent) — but it is a stricter answer than the
+   ecosystem's, and the difference should be a documented choice rather than an
+   accident of what we happened to implement.
+2. **Partition drop is documented, not detected.** PeerDB explicitly does NOT
+   propagate a dropped partition: "we don't delete data matching that partition."
+   That is the same class as the `SWITCH PARTITION` finding this session left
+   open on SQL Server — rows leaving the source with no events. The mature answer
+   is a stated contract, not a detector, and our ledger should record it that way
+   rather than carrying it as an unfilled gap forever.
