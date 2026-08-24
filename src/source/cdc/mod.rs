@@ -753,6 +753,14 @@ pub(crate) fn create_change_stream(
             if let Some(p) = cfg.checkpoint.as_deref() {
                 Position::load(std::path::Path::new(p))?;
             }
+            // Same hoist, same reason: a configured name the binlog can never carry
+            // (a VIEW, whose Table_map names the BASE table) is a CONFIG problem, and
+            // raising it inside open would prefix it with the binlog-grants hint.
+            crate::source::mysql::cdc::MysqlChangeStream::precheck_configured_tables(
+                url,
+                tls,
+                configured_tables,
+            )?;
             Ok(Box::new(
                 crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
                     url,
