@@ -170,7 +170,13 @@ pub fn duckdb_parquet_rows(container_dir: &str) -> i64 {
 const DECLARED_PARTS_PY: &str = r#"
 import json, glob as _g, os
 def _declared(root):
-    copies = sorted(_g.glob(root + "/**/manifest-*.json", recursive=True))
+    # NON-recursive, matching the Rust resolver (declared_parquet_parts) exactly.
+    # A multi-table CDC export writes one sub-prefix PER TABLE, each with its own
+    # manifest, so a recursive scan silently UNIONS tables that belong to separate
+    # exports — and then the two resolvers answer differently for the same
+    # directory, which is worse than either answer. Callers pass the prefix whose
+    # manifest they mean.
+    copies = sorted(_g.glob(root + "/manifest-*.json"))
     if not copies:
         c = os.path.join(root, "manifest.json")
         copies = [c] if os.path.isfile(c) else []
