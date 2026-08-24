@@ -5447,3 +5447,94 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
         "passing two source forms must be REFUSED, not silently resolved to one of them"
     );
 }
+
+/// A PARTIAL_JSON binlog must be REFUSED, not silently skipped.
+///
+/// `binlog_row_value_options=PARTIAL_JSON` is a legal MySQL 8 setting that logs a JSON
+/// diff instead of the row image. The reader cannot decode that, and the arm that met
+/// it was `_ => return Ok(true)` — the rows vanished while the surrounding transaction
+/// committed and the checkpoint advanced past them. Unrecoverable, and reported as
+/// `status: success`.
+///
+/// The loss is a SUBSET, which is what makes it the dangerous half: transactions that
+/// touch no JSON column are captured normally, so counts and sums keep reconciling.
+///
+/// Non-default-state test (CLAUDE.md): the default is exactly where the bug hides, so
+/// the setting is flipped and restored by a guard rather than assumed.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_pj");
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut admin = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    use mysql::prelude::Queryable as _;
+    let old: String = admin
+        .query_first("SELECT @@global.binlog_row_value_options")
+        .unwrap()
+        .unwrap_or_default();
+    admin
+        .query_drop("SET GLOBAL binlog_row_value_options = 'PARTIAL_JSON'")
+        .expect("set partial json");
+    struct OptGuard(String, String);
+    impl Drop for OptGuard {
+        fn drop(&mut self) {
+            // Restoring matters beyond tidiness: a stand left pinned to a non-default
+            // makes the DEFAULT path unreachable by every other test — the exact defect
+            // the CDC audit found in `binlog_row_metadata`.
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.1).unwrap()) {
+                use mysql::prelude::Queryable as _;
+                let _ = c.query_drop(format!(
+                    "SET GLOBAL binlog_row_value_options = '{}'",
+                    self.0
+                ));
+            }
+        }
+    }
+    let _opt = OptGuard(old, root_url);
+
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, doc JSON)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    // The document must be big enough that MySQL logs a DIFF rather than falling back
+    // to a full image — a short JSON value is rewritten whole and never reaches the
+    // partial arm, which would make this test pass for the wrong reason.
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, JSON_OBJECT('a', 1, 'pad', REPEAT('x', 400)))"
+    ))
+    .unwrap();
+
+    let ck = d.path().join("pj.ckpt");
+    let rig = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ck.to_path_buf())
+            .dest_path(d.path().join("out"))
+    };
+    // Anchor the stream before provoking the diff, so the update is inside the window.
+    rig().run_ok();
+
+    c.query_drop(format!(
+        "UPDATE {tbl} SET doc = JSON_SET(doc, '$.a', 2) WHERE id = 1"
+    ))
+    .unwrap();
+
+    let msg = rig().run_expect_fail();
+    assert!(
+        msg.contains("partial-JSON"),
+        "the run must REFUSE and name the shape it met. Silently skipping the diff \
+         loses the update while the checkpoint advances past it — a subset loss no \
+         count check can see. Got: {msg}"
+    );
+    assert!(
+        msg.contains("binlog_row_value_options"),
+        "the message must name the SETTING to change — it is the only remediation an \
+         operator gets: {msg}"
+    );
+    assert!(
+        msg.contains("re-read"),
+        "the message must say the un-acked span is re-read; an operator who believes \
+         the data is already gone has no reason to fix the source and re-run: {msg}"
+    );
+}
