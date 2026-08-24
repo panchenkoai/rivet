@@ -3792,6 +3792,185 @@ fn the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory() {
     assert_eq!(after.len(), 1, "exactly the still-declared part: {after:?}");
 }
 
+/// A configured MySQL VIEW must be refused at open — the binlog can never name it.
+///
+/// Found by an ADVERSARIAL re-check of a matrix cell this session had written as
+/// `na` ("no MySQL relation emits under a name other than the configured one").
+/// That cell generalized a correct, measured result — a RANGE-partitioned table
+/// DOES capture through a config naming the parent — into a false universal. An
+/// updatable view reproduces the PostgreSQL partitioned-parent shape exactly: the
+/// binlog `Table_map` names the BASE table, routing is byte-exact, and every
+/// change is dropped.
+///
+/// MEASURED before the guard (2026-08-24): 3 rows committed through a view gave
+/// `rows: 0, files: 0, status: success, exit 0`, with the checkpoint advanced
+/// 54945184 -> 54945514 past the commit, and fixing the config recovered NOTHING
+/// from that checkpoint.
+///
+/// Unlike PostgreSQL this is RECOVERABLE — MySQL binlog retention does not depend
+/// on the reader, so the events are still in the log and deleting the checkpoint
+/// re-reads them. The message says so, and this test asserts it does, because
+/// telling an operator to re-snapshot when a checkpoint reset would do is its own
+/// kind of wrong answer.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table() {
+    let d = tempfile::tempdir().unwrap();
+    let base = unique_name("cdc_vbase");
+    let view = format!("{base}_v");
+    let mut c = conn();
+    c.query_drop(format!("DROP VIEW IF EXISTS {view}")).unwrap();
+    c.query_drop(format!("DROP TABLE IF EXISTS {base}"))
+        .unwrap();
+    c.query_drop(format!("CREATE TABLE {base} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    c.query_drop(format!("CREATE VIEW {view} AS SELECT * FROM {base}"))
+        .unwrap();
+    let _g = Table(base.clone());
+    struct ViewGuard(String);
+    impl Drop for ViewGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(MYSQL_CDC_URL).unwrap()) {
+                use mysql::prelude::Queryable as _;
+                let _ = c.query_drop(format!("DROP VIEW IF EXISTS {}", self.0));
+            }
+        }
+    }
+    let _vg = ViewGuard(view.clone());
+
+    let msg = Rig::mysql_cdc(&view)
+        .checkpoint_path(d.path().join("v.ckpt"))
+        .dest_path(d.path().join("out"))
+        .run_expect_fail();
+    assert!(
+        msg.contains("VIEW") && msg.contains("base table"),
+        "the refusal must name what the relation IS and what to capture instead — \
+         shipping a 0-row success past an advanced checkpoint is the alternative. \
+         Got: {msg}"
+    );
+    assert!(
+        msg.contains("NOT lost"),
+        "MySQL binlog retention is reader-independent, so this is recoverable by \
+         deleting the checkpoint; an operator told to re-snapshot would do work they \
+         do not need. Got: {msg}"
+    );
+    // The refusal must NOT arrive wearing the binlog-grants hint. It is a config
+    // problem, and `create_change_stream` wraps the open call in MYSQL_CDC_HINT —
+    // the same trap the checkpoint validation was hoisted out of, which is why the
+    // routing precheck runs before that wrap rather than inside open.
+    assert!(
+        !msg.contains("REPLICATION SLAVE") && !msg.contains("binlog_format"),
+        "a routing/config refusal must not be prefixed with a permissions hint — an \
+         operator would go read the grants docs for a problem that is not there. \
+         Got: {msg}"
+    );
+
+    // Not too WIDE: the base table itself must still capture normally. Oracle is
+    // the manifest-declared parts re-read, compared to what the source holds.
+    let base_rig = || {
+        Rig::mysql_cdc(&base)
+            .checkpoint_path(d.path().join("b.ckpt"))
+            .dest_path(d.path().join("out_base"))
+    };
+    base_rig().run_ok(); // anchor
+    c.query_drop(format!("INSERT INTO {base} VALUES (1,10),(2,20),(3,30)"))
+        .unwrap();
+    let rows: usize = base_rig().run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 3,
+        "the guard must refuse only what the binlog cannot name — a base table has \
+         to keep working, or the fix is worse than the defect"
+    );
+}
+
+/// The three routing hazards an adversarial pass found in the FIRST version of
+/// this guard, which read only `relkind`.
+///
+/// All three end the same way — a run that reports success while capturing
+/// nothing, or worse — and all three are invisible to a relkind check:
+///
+/// 1. **A folded twin.** The config string is read by two resolvers with different
+///    case rules: the schema probe interpolates it into `SELECT * FROM {table}` and
+///    lets PostgreSQL FOLD it; the sink routes BYTE-EXACT. With both `"MixedCase"`
+///    and `mixedcase` present, MEASURED: exit 0 throughout, writes to `mixedcase`
+///    captured `rows: 0` with no warning, and writes to `"MixedCase"` landed under
+///    the WRONG table's schema — columns `id, other_col, extra`, the real `v`
+///    values absent entirely. Silent column loss on top of silent event loss.
+/// 2. **A 3-part name.** `to_regclass` accepts `db.schema.table` when `db` is the
+///    current database, so the probe resolves while `table_matches` splits on the
+///    FIRST dot and compares `db` against the schema — never matching.
+/// 3. **UNLOGGED.** No WAL at all, so no event can ever exist for it.
+///
+/// Isolated in its OWN database: the guard reads `pg_class`, and a case-collision
+/// fixture on the shared DB would be visible to every parallel test.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_config_whose_resolved_identity_routing_cannot_match() {
+    let cdc_db = CdcDb::new("cdc_ident");
+    let slot = unique_name("rivet_ident_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    // The case collision, spelled the way a real schema acquires one: a quoted
+    // relation plus an unquoted sibling. Different COLUMNS on purpose — that is
+    // what makes the wrong-schema write visible.
+    c.batch_execute(
+        "CREATE TABLE \"MixedCase\" (id int, v text); \
+         CREATE TABLE mixedcase (id int, other_col text, extra text); \
+         CREATE UNLOGGED TABLE unlg (id int primary key, v text)",
+    )
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+
+    for (cfg, must_say) in [
+        ("MixedCase", "public.mixedcase"),
+        ("rivet.public.mixedcase", "public.mixedcase"),
+        ("public.unlg", "SET LOGGED"),
+    ] {
+        let rig = Rig::pg_cdc(cfg, &slot).source_url(cdc_db.url());
+        let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "`{cfg}` must be refused — it either captures nothing or writes rows \
+             under another table's schema, silently. Output:\n{said}"
+        );
+        assert!(
+            said.contains(must_say),
+            "the refusal for `{cfg}` must name `{must_say}` — that is the whole \
+             remediation. Output:\n{said}"
+        );
+        // A config problem must NOT arrive wearing the wal_level/REPLICATION hint:
+        // an operator would go read the permissions docs for a problem that is not
+        // there. Same trap the MySQL side was hoisted out of.
+        assert!(
+            !said.contains("wal_level=logical and a role"),
+            "a routing refusal must not be prefixed with the permissions hint. \
+             Output:\n{said}"
+        );
+    }
+
+    // Not too WIDE: an ordinary table on the same database still captures. Oracle
+    // is the manifest-declared parts, compared to what the source holds.
+    c.batch_execute("CREATE TABLE plain_ok (id int primary key, v text)")
+        .unwrap();
+    c.execute("INSERT INTO plain_ok VALUES (1,'a'),(2,'b')", &[])
+        .unwrap();
+    let ok = Rig::pg_cdc("public.plain_ok", &slot).source_url(cdc_db.url());
+    let rows: usize = ok.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 2,
+        "the guard must refuse only what routing cannot match — an ordinary table \
+         has to keep working, or the fix is worse than the defect"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,

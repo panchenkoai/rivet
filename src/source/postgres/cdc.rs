@@ -113,9 +113,24 @@ pub(crate) struct RelationRouting<'a> {
     pub configured: &'a str,
     /// `pg_class.relkind` of the relation that name resolves to.
     pub relkind: char,
+    /// `pg_class.relpersistence` — `u` for UNLOGGED. An unlogged table writes no
+    /// WAL, so logical decoding never emits a single event for it.
+    pub relpersistence: char,
+    /// The CATALOG's spelling of the relation the config string resolved to, as
+    /// `(schema, table)`. The probe resolves through SQL rules (which FOLD an
+    /// unquoted name); the router compares BYTE-EXACT. When those two disagree the
+    /// config means one relation to the probe and another to routing.
+    pub resolved: (String, String),
     /// Relations that inherit from it — partitions, or legacy `INHERITS`
     /// children — schema-qualified the way `test_decoding` renders them.
     pub children: Vec<String>,
+    /// For a partitioned parent: the LEAF partitions, from `pg_partition_tree`.
+    ///
+    /// Not the same as `children` on a sub-partitioned table, and the difference is
+    /// a dead-end remediation: `children` there is the intermediate PARTITIONED
+    /// table, which stores no rows either and is refused by this same guard on the
+    /// next run. Only a leaf ever appears in the WAL.
+    pub leaves: Vec<String>,
 }
 
 /// The verdict for one configured table. `Never` is a hard error (a guaranteed
@@ -133,14 +148,53 @@ pub(crate) enum RoutingVerdict {
 /// guard makes — is what an offline test can hold and mutants can grade.
 pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
     let cfg = rel.configured;
+    let (rs, rt) = (&rel.resolved.0, &rel.resolved.1);
+
+    // FIRST, because it is the case where the schema is resolved from one relation
+    // and the events come from another. The config string is read by two resolvers
+    // with different case rules: the schema probe interpolates it into
+    // `SELECT * FROM {table}` and lets PostgreSQL FOLD it, while the sink routes
+    // byte-exact against the unquoted wire identity. They agree for an ordinary
+    // lowercase name and diverge the moment a folded twin exists.
+    //
+    // MEASURED (adversarial pass, 2026-08-24) with BOTH `"MixedCase"(id,v)` and
+    // `mixedcase(id,other_col,extra)` present and `table: MixedCase` configured:
+    // exit 0 and `status: success` throughout, while (a) writes to `mixedcase` —
+    // the relation the probe actually resolved — captured `rows: 0` with no
+    // warning, and (b) writes to `"MixedCase"` were written under the WRONG
+    // table's schema: columns `id, other_col, extra`, the real `v` values absent
+    // entirely and no `v` column in the output. Silent column loss on top of
+    // silent event loss.
+    //
+    // This also catches the 3-part `db.schema.table` form: PostgreSQL's
+    // `to_regclass` accepts it when `db` is the current database, so the probe
+    // resolves happily while `table_matches` splits on the FIRST dot and compares
+    // `db` against the schema — never matching.
+    if !crate::source::cdc::sink::table_matches(cfg, rs, rt) {
+        return RoutingVerdict::Never(format!(
+            "pg cdc: `{cfg}` resolves to the relation `{rs}.{rt}`, but routing compares the              config string BYTE-EXACT against the name test_decoding emits — and those two              disagree here. The schema probe would read `{rs}.{rt}`'s columns while events              carrying a different spelling route nowhere, so the run would either capture              NOTHING or write rows under the wrong table's schema, silently, past an              advancing slot. Set `table:` to `{rs}.{rt}` exactly as the catalog spells it."
+        ));
+    }
+
+    // An UNLOGGED table writes no WAL at all, so no logical-decoding event can ever
+    // exist for it — the same total, silent drop as a view, by a different route.
+    if rel.relpersistence == 'u' {
+        return RoutingVerdict::Never(format!(
+            "pg cdc: `{cfg}` is an UNLOGGED table. Unlogged tables write no WAL, so logical              decoding never produces a single event for them and the capture would report              success with zero rows forever while the slot advanced past other traffic.              `ALTER TABLE {rs}.{rt} SET LOGGED` to capture it, or drop it from the config."
+        ));
+    }
+
     match rel.relkind {
         // A partitioned parent stores NO rows of its own: every change carries a
         // PARTITION's name. Byte-exact routing can never match it.
         'p' => {
-            let named = if rel.children.is_empty() {
+            // LEAVES, not children. On a sub-partitioned table the immediate child
+            // is another partitioned table that stores no rows, so naming it sends
+            // the operator to a config this same guard refuses on the next run.
+            let named = if rel.leaves.is_empty() {
                 "it has no partitions yet".to_string()
             } else {
-                format!("currently {}", rel.children.join(", "))
+                format!("currently {}", rel.leaves.join(", "))
             };
             RoutingVerdict::Never(format!(
                 "pg cdc: `{cfg}` is a PARTITIONED table — it stores no rows itself, and \
@@ -291,6 +345,43 @@ impl PgChangeStream {
         }
     }
 
+    /// [`Self::check_configured_tables_are_routable`] on its own connection, for the
+    /// caller to run BEFORE the stream is opened.
+    ///
+    /// `create_change_stream` wraps the open call in `PG_CDC_HINT` (wal_level and
+    /// the REPLICATION attribute), so a routing refusal raised inside `open` reaches
+    /// the operator prefixed with "if this is a permissions/setup error" — for a
+    /// CONFIG problem with nothing to do with permissions. MEASURED on this branch,
+    /// and the same defect the MySQL side was just fixed for, which is why both now
+    /// run their check outside the wrap.
+    ///
+    /// A connect failure is swallowed on purpose: `open` is about to dial the same
+    /// server, and its error — WITH the hint — is the right one for that case.
+    pub(crate) fn precheck_configured_tables(
+        conn_str: &str,
+        tls: Option<&TlsConfig>,
+        configured: &[String],
+    ) -> Result<()> {
+        if configured.is_empty() {
+            return Ok(());
+        }
+        if require_tls_or_loopback(conn_str, tls).is_err() {
+            return Ok(()); // open() bails on the same posture, with the right message
+        }
+        let Ok(mut client) = (match tls {
+            Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
+                .and_then(|c| {
+                    super::pg_config_ssl_forced(conn_str)?
+                        .connect(postgres_native_tls::MakeTlsConnector::new(c))
+                        .map_err(Into::into)
+                }),
+            _ => Client::connect(conn_str, NoTls).map_err(Into::into),
+        }) else {
+            return Ok(());
+        };
+        Self::check_configured_tables_are_routable(&mut client, configured)
+    }
+
     /// Live half of the routing guard: ask the CATALOG what each configured
     /// table actually is, and refuse a capture that could only ever drop
     /// everything. Decisions live in [`classify_routing`]; this is glue.
@@ -304,7 +395,7 @@ impl PgChangeStream {
     /// error to report (`SELECT * FROM {table}`, `cdc/mod.rs`), with a message
     /// that already names it. Resolution follows the same SQL rules that probe
     /// does, so the two agree about which relation a config string means.
-    fn check_configured_tables_are_routable(
+    pub(crate) fn check_configured_tables_are_routable(
         client: &mut Client,
         configured: &[String],
     ) -> Result<()> {
@@ -312,15 +403,21 @@ impl PgChangeStream {
         for cfg in configured {
             let Some(row) = client
                 .query_opt(
-                    "SELECT c.relkind::text, \
+                    "SELECT c.relkind::text, c.relpersistence::text, \
+                            n.nspname::text, c.relname::text, \
                             coalesce(array_agg(n2.nspname || '.' || c2.relname) \
-                                     FILTER (WHERE c2.oid IS NOT NULL), '{}') \
+                                     FILTER (WHERE c2.oid IS NOT NULL), '{}'), \
+                            CASE WHEN c.relkind = 'p' THEN ( \
+                                SELECT coalesce(array_agg(pt.relid::regclass::text), '{}') \
+                                FROM pg_partition_tree(c.oid) pt WHERE pt.isleaf) \
+                            ELSE '{}' END \
                      FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
                      LEFT JOIN pg_inherits i ON i.inhparent = c.oid \
                      LEFT JOIN pg_class c2 ON c2.oid = i.inhrelid \
                      LEFT JOIN pg_namespace n2 ON n2.oid = c2.relnamespace \
                      WHERE c.oid = to_regclass($1) \
-                     GROUP BY c.relkind",
+                     GROUP BY c.relkind, c.relpersistence, n.nspname, c.relname, c.oid",
                     &[&cfg.as_str()],
                 )
                 .with_context(|| {
@@ -330,10 +427,17 @@ impl PgChangeStream {
                 continue; // unresolvable here — the schema probe reports it, loudly
             };
             let relkind: String = row.get(0);
-            let children: Vec<String> = row.get(1);
+            let relpersistence: String = row.get(1);
+            let resolved_schema: String = row.get(2);
+            let resolved_table: String = row.get(3);
+            let children: Vec<String> = row.get(4);
+            let leaves: Vec<String> = row.get(5);
             let rel = RelationRouting {
                 configured: cfg,
                 relkind: relkind.chars().next().unwrap_or('?'),
+                relpersistence: relpersistence.chars().next().unwrap_or('p'),
+                resolved: (resolved_schema, resolved_table),
+                leaves,
                 children,
             };
             match classify_routing(&rel) {
@@ -386,9 +490,11 @@ impl PgChangeStream {
             "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
              SET intervalstyle = 'postgres'; SET extra_float_digits = 3;",
         )?;
-        // BEFORE the slot exists and long before any ack: a configured table that
-        // no change event can ever name is a total, unrecoverable drop, and the
-        // slot advancing is what makes it unrecoverable.
+        // Also here, not only in the caller's precheck. The precheck exists so the
+        // refusal reaches the operator WITHOUT the wal_level/REPLICATION hint
+        // wrapped around it; this one keeps the guarantee for any path that opens a
+        // stream directly. The duplicate catalog read costs one round-trip on a
+        // config that is about to fail anyway.
         Self::check_configured_tables_are_routable(&mut client, configured_tables)?;
 
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
@@ -1328,6 +1434,11 @@ mod tests {
         let rel = |kind: char, children: &[&str]| RelationRouting {
             configured: "public.t",
             relkind: kind,
+            relpersistence: 'p',
+            // The catalog agrees with the config here, so these cases exercise the
+            // relkind arms rather than the identity check above them.
+            resolved: ("public".to_string(), "t".to_string()),
+            leaves: children.iter().map(|c| c.to_string()).collect(),
             children: children.iter().map(|c| c.to_string()).collect(),
         };
 
@@ -1341,6 +1452,27 @@ mod tests {
             why.contains("public.t_2026_01"),
             "the refusal must name the partitions, because listing them IS the \
              remediation: {why}"
+        );
+
+        // SUB-PARTITIONED: the remediation must name a LEAF, never the intermediate
+        // partitioned table. `children` there is `ml_2026`, which stores no rows
+        // either and is refused by this same guard on the next run — a dead-end
+        // remediation, found by an adversarial pass over the first version.
+        let sub = RelationRouting {
+            configured: "public.ml",
+            relkind: 'p',
+            relpersistence: 'p',
+            resolved: ("public".to_string(), "ml".to_string()),
+            children: vec!["public.ml_2026".to_string()], // intermediate, unroutable
+            leaves: vec!["public.ml_2026_01".to_string()], // the only relation in the WAL
+        };
+        let RoutingVerdict::Never(why) = classify_routing(&sub) else {
+            panic!("a sub-partitioned parent is still unroutable");
+        };
+        assert!(
+            why.contains("public.ml_2026_01") && !why.contains("public.ml_2026,"),
+            "the remediation must name the LEAF — naming the intermediate sends the \
+             operator to a config this same guard refuses next run: {why}"
         );
 
         // …and with no partitions yet, it is still unroutable — the message just
@@ -1364,6 +1496,70 @@ mod tests {
 
         // A plain table is routable, and stays routable — refusing it would break
         // every working config.
+        assert_eq!(classify_routing(&rel('r', &[])), RoutingVerdict::Routable);
+
+        // ── the identity check, which runs BEFORE any relkind arm ──────────────
+        //
+        // Both cases below were MEASURED by an adversarial pass over the first
+        // version of this guard, which read only relkind and passed them through.
+        let mismatched = RelationRouting {
+            configured: "MixedCase",
+            relkind: 'r',
+            relpersistence: 'p',
+            // What `SELECT * FROM MixedCase` actually resolves to: PostgreSQL folds
+            // the unquoted name, so the probe reads THIS relation's columns while
+            // events spelled `MixedCase` route nowhere.
+            resolved: ("public".to_string(), "mixedcase".to_string()),
+            leaves: vec![],
+            children: vec![],
+        };
+        let RoutingVerdict::Never(why) = classify_routing(&mismatched) else {
+            panic!(
+                "a config whose resolved identity differs from what routing compares \
+                 must be refused — measured, it wrote rows under the WRONG table's \
+                 schema with the real column absent entirely, exit 0"
+            );
+        };
+        assert!(
+            why.contains("public.mixedcase"),
+            "the refusal must name the CATALOG's spelling — that spelling is the \
+             remediation: {why}"
+        );
+
+        // The 3-part `db.schema.table` form: to_regclass accepts it when db is the
+        // current database, so the probe resolves while table_matches splits on the
+        // FIRST dot and compares `db` against the schema.
+        let three_part = RelationRouting {
+            configured: "rivet.public.orders",
+            relkind: 'r',
+            relpersistence: 'p',
+            resolved: ("public".to_string(), "orders".to_string()),
+            leaves: vec![],
+            children: vec![],
+        };
+        assert!(
+            matches!(classify_routing(&three_part), RoutingVerdict::Never(_)),
+            "a 3-part name resolves for the probe and never matches the router"
+        );
+
+        // UNLOGGED: writes no WAL, so no event can ever exist for it.
+        let unlogged = RelationRouting {
+            configured: "public.t",
+            relkind: 'r',
+            relpersistence: 'u',
+            resolved: ("public".to_string(), "t".to_string()),
+            leaves: vec![],
+            children: vec![],
+        };
+        let RoutingVerdict::Never(why) = classify_routing(&unlogged) else {
+            panic!("an UNLOGGED table writes no WAL — capture is a guaranteed zero");
+        };
+        assert!(
+            why.contains("SET LOGGED"),
+            "the refusal must name the one-line fix: {why}"
+        );
+        // …and a plain permanent table with a matching identity stays routable, or
+        // the guard would refuse every working config.
         assert_eq!(classify_routing(&rel('r', &[])), RoutingVerdict::Routable);
 
         // Inheritance children are a PARTIAL gap: the parent's own rows route
