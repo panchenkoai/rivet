@@ -271,6 +271,36 @@ impl MysqlChangeStream {
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
     /// ended; `Ok(true)` ⇒ consumed an event.
+    /// Release the buffered transaction at `log_pos`, or end the stream when the
+    /// commit sits past the open-time ceiling.
+    ///
+    /// Returns `false` when the caller must stop: a commit past the bound belongs to
+    /// the NEXT run, so the transaction is dropped un-released and the checkpoint
+    /// never advances past it — the resume re-reads it in full. `past_bound` is
+    /// sticky so the sink's re-drain pass returns `None` at once rather than
+    /// consuming (and re-deferring) more past-bound events.
+    ///
+    /// Shared by the `Xid` and `Query('COMMIT')` arms: two commit markers, one
+    /// framing. Duplicating it is how the second one drifts.
+    fn close_transaction_at(&mut self, log_pos: u64) -> bool {
+        if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
+            self.tx.clear();
+            self.tx_bytes = 0;
+            self.past_bound = true;
+            return false;
+        }
+        let commit = Position(json!({ "file": self.file, "pos": log_pos }));
+        let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
+        self.tx_bytes = 0;
+        // #158: the shared close — commit position on all, committed on the last
+        // only (the marker frames the whole transaction's boundary).
+        crate::source::cdc::TxnFramer::close_group(&mut tx, &commit);
+        for ev in tx {
+            self.pending.push_back(ev);
+        }
+        true
+    }
+
     fn fill(&mut self) -> Result<bool> {
         if self.past_bound {
             return Ok(false); // ended at the open-time ceiling — stay ended
@@ -375,26 +405,23 @@ impl MysqlChangeStream {
             // in the transaction and mark the last one committed, then release the
             // whole transaction atomically.
             Some(EventData::XidEvent(_)) => {
-                // A commit past the open-time ceiling belongs to the next run:
-                // end the stream WITHOUT releasing the transaction — the
-                // checkpoint never advances past it, so the resume re-reads it
-                // in full. `past_bound` is sticky so the sink's re-drain pass
-                // returns `None` at once rather than consuming (and re-deferring)
-                // more past-bound events.
-                if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
-                    self.tx.clear();
-                    self.tx_bytes = 0;
-                    self.past_bound = true;
+                if !self.close_transaction_at(log_pos) {
                     return Ok(false);
                 }
-                let commit = Position(json!({ "file": self.file, "pos": log_pos }));
-                let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
-                self.tx_bytes = 0;
-                // #158: the shared close — commit position on all, committed on
-                // the last only (the XID marks the whole transaction's boundary).
-                crate::source::cdc::TxnFramer::close_group(&mut tx, &commit);
-                for ev in tx {
-                    self.pending.push_back(ev);
+            }
+            // A commit that is NOT an Xid. `Xid` is written only by a
+            // transactional storage engine's own commit; a MyISAM/MEMORY write, and
+            // every `XA COMMIT`, close the transaction with a QUERY event instead.
+            // With no arm for it those rows fell to `_ => {}` and stayed buffered
+            // FOREVER: the run captured zero, exited 0, and the checkpoint never
+            // moved — silent, total, and indistinguishable from an idle source.
+            //
+            // `XA PREPARE` deliberately does NOT release: the transaction is not
+            // committed yet, and releasing there would publish rows a later
+            // `XA ROLLBACK` erases.
+            Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
+                if !self.close_transaction_at(log_pos) {
+                    return Ok(false);
                 }
             }
             // #200-2: a compressed transaction. `binlog_transaction_compression`
@@ -423,11 +450,6 @@ impl MysqlChangeStream {
 /// message and the fact that it IS an error are testable offline — deleting the
 /// match arm that calls it (falling through to `_ => {}`) is exactly the silent-skip
 /// bug, which only a live compressed server would otherwise flip.
-/// Refuse a rows event this reader cannot decode, naming WHICH one and what to do.
-///
-/// Silence here is worse than on most refusal paths: the transaction around the
-/// dropped rows still commits, so the checkpoint advances and the changes are gone
-/// from both the binlog window and the destination while the run reports success.
 /// Which undecodable shape a rows event is. Separated from the message so the
 /// message — the ONLY thing an operator sees, since the alternative was a green run
 /// with missing rows — is testable without constructing binlog events the crate does
@@ -594,6 +616,25 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
 /// (one server has one basename — rotation never changes it mid-stream). Fails
 /// open: an unparseable name is never "past" — the `BINLOG_DUMP_NON_BLOCK` EOF
 /// backstop still ends the run (delayed termination, never a dropped commit).
+/// Does this QUERY event close a transaction?
+///
+/// `COMMIT` on its own (the non-transactional-engine and binlog-format path) and
+/// `XA COMMIT <xid>`. Deliberately NOT `XA PREPARE` — prepared is not committed, and
+/// releasing there would publish rows a later `XA ROLLBACK` erases. Not `BEGIN`,
+/// `SAVEPOINT` or `ROLLBACK` either, none of which end a transaction with data to
+/// publish.
+fn is_commit_statement(sql: &str) -> bool {
+    let t = sql.trim().trim_end_matches(';').trim();
+    if t.eq_ignore_ascii_case("commit") {
+        return true;
+    }
+    let mut w = t.split_whitespace();
+    matches!(
+        (w.next(), w.next()),
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case("xa") && b.eq_ignore_ascii_case("commit")
+    )
+}
+
 fn commit_past_bound(file: &str, pos: u64, bound: Option<&(String, u64)>) -> bool {
     let Some((bound_file, bound_pos)) = bound else {
         return false;
@@ -699,7 +740,6 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
-
     /// The refusal message IS the remediation — an operator has nothing else to go
     /// on, because the alternative to this error was a green run with missing rows.
     #[test]
@@ -724,6 +764,48 @@ mod tests {
                 msg.contains("checkpoint advances"),
                 "must say WHY silence was unacceptable: the surrounding transaction \
                  commits and the checkpoint moves past the dropped rows: {msg}"
+            );
+        }
+    }
+
+    /// `Xid` is written only by a transactional engine's own commit. A MyISAM or
+    /// MEMORY write, and every `XA COMMIT`, close the transaction with a QUERY event
+    /// instead — and with no arm for those the rows stayed buffered FOREVER: the run
+    /// captured zero, exited 0, and the checkpoint never moved. Silent, total, and
+    /// indistinguishable from an idle source.
+    ///
+    /// The negative half is the load-bearing one. `XA PREPARE` must NOT release:
+    /// prepared is not committed, and publishing there hands downstream rows that a
+    /// later `XA ROLLBACK` erases — a fabrication, which is worse than the loss this
+    /// fixes.
+    #[test]
+    fn a_commit_query_closes_a_transaction_but_a_prepare_does_not() {
+        for yes in [
+            "COMMIT",
+            "commit",
+            "  COMMIT ;",
+            "XA COMMIT 'x1'",
+            "xa commit 0x01",
+        ] {
+            assert!(
+                is_commit_statement(yes),
+                "`{yes}` must close the transaction"
+            );
+        }
+        for no in [
+            "BEGIN",
+            "XA START 'x1'",
+            "XA PREPARE 'x1'",
+            "XA ROLLBACK 'x1'",
+            "ROLLBACK",
+            "SAVEPOINT s1",
+            "COMMIT_LOG_ENTRY",
+            "INSERT INTO commit VALUES (1)",
+        ] {
+            assert!(
+                !is_commit_statement(no),
+                "`{no}` must NOT release a transaction — releasing an uncommitted or \
+                 unrelated statement publishes rows that may never be committed"
             );
         }
     }
