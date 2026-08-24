@@ -588,7 +588,7 @@ fn unquote_ident(raw: &str) -> String {
     let t = raw.trim();
     match t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
         // Inside a quoted identifier PostgreSQL doubles an embedded quote.
-        Some(inner) if t.len() >= 2 => inner.replace("\"\"", "\""),
+        Some(inner) => inner.replace("\"\"", "\""),
         _ => t.to_string(),
     }
 }
@@ -1782,6 +1782,41 @@ mod tests {
             Some(&["userId".to_string()][..]),
             "the key column must carry its identifier, not its quoted rendering"
         );
+    }
+
+    /// The byte walk's ESCAPE branch, which the direct `unquote_ident` cases cannot
+    /// reach: a doubled quote must not be read as the END of the quoted part, or the
+    /// walker leaves quoted state early and the next `.` splits inside an identifier.
+    ///
+    /// Every one of these goes through `split_qualified_ident`, not the helper — the
+    /// mutation gate found the whole loop ungraded because the doubled-quote test
+    /// called the helper directly.
+    #[test]
+    fn the_qualifier_walk_treats_a_doubled_quote_as_an_escape_not_a_terminator() {
+        let cases: &[(&str, &str, &str)] = &[
+            // an escaped quote in the SCHEMA, then a real separator
+            ("\"a\"\"b\".t", "a\"b", "t"),
+            // an escaped quote in the TABLE
+            ("app.\"c\"\"d\"", "app", "c\"d"),
+            // a dot INSIDE a part that also carries an escaped quote — the walker must
+            // stay quoted across both
+            ("\"a\"\".b\".t", "a\".b", "t"),
+            // an escaped quote immediately before the separator
+            ("\"x\"\"\".t", "x\"", "t"),
+            // no qualifier at all
+            ("\"order\"", "", "order"),
+        ];
+        for (input, schema, table) in cases {
+            let ev = parse_test_decoding("0/9", &format!("table {input}: INSERT: id[integer]:1"))
+                .expect("parses")
+                .expect("an event");
+            assert_eq!(
+                (ev.schema.as_str(), ev.table.as_str()),
+                (*schema, *table),
+                "qualifier `{input}` split wrongly — a mis-split yields identifiers that \
+                 never existed, and the router then drops every event for the table"
+            );
+        }
     }
 }
 
