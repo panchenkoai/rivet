@@ -411,7 +411,7 @@ exclude_re = [
     # `Ok(())` makes EVERY subcommand a silent no-op, so
     # audit_cli_dispatch::run_unknown_export_lists_available_names FAILS — the
     # run exits 0 and prints none of the message it asserts on.
-    "replace dispatch -> Result",,
+    "replace dispatch -> Result",
     # `PgChangeStream::fill` / `MysqlChangeStream::fill` are the LIVE-ONLY poll
     # bodies: each opens a replication slot or a binlog dump against a real server,
     # so `--lib --bins` never executes a line of them and the whole-function stub is
