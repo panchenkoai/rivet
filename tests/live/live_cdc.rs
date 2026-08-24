@@ -3780,6 +3780,40 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
         "an export that does not capture the truncated table must complete and \
          capture its own change"
     );
+
+    // ── and a MULTI-relation truncate must be caught wherever ours sits ───────
+    //
+    // `TRUNCATE a, b` decodes as ONE line naming both
+    // (`table public.a, public.b: TRUNCATE: (no-flags)`), and so does every
+    // CASCADE that pulls in referencing tables. The FIRST version of this guard
+    // read that list as a single name and let the statement through: MEASURED,
+    // with the captured table configured, the source ended EMPTY while the run
+    // reported `status: success, rows: 1`. An adversarial pass found it; re-reading
+    // the code had not.
+    //
+    // Ours goes SECOND on purpose — a first-position-only fixture would pass
+    // against the very defect this exists to catch.
+    let third_slot = unique_name("rivet_trunc_slot_c").to_lowercase();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&third_slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (9,90)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {other}, {tbl}"), &[]).unwrap();
+    let multi = Rig::pg_cdc(&format!("public.{tbl}"), &third_slot).source_url(cdc_db.url());
+    let out2 = run_rivet(&["run", "--config", multi.config_path().to_str().unwrap()]);
+    let said2 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        !out2.status.success() && said2.contains(&tbl),
+        "a TRUNCATE naming our table SECOND in a list must still refuse, and name \
+         OUR table rather than whichever came first. Output:\n{said2}"
+    );
 }
 
 /// MySQL peer of `roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging`,
