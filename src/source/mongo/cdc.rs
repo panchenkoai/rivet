@@ -132,6 +132,90 @@ fn past_time_bound(
     until_current && matches!((cluster_time, bound), (Some(ct), Some(b)) if ct > b)
 }
 
+/// Run the server-identity command, tolerating servers that predate `hello`.
+///
+/// `hello` was introduced in MongoDB **4.4.2**. rivet's declared support window
+/// starts at 4.4, so 4.4.0 and 4.4.1 answer `CommandNotFound (59): no such
+/// command: 'hello'` — and every stand in this repo is 4.4.30+, which is why no
+/// test could have caught it. Found by an adversarial pass that read the version
+/// requirement rather than trusting the stands.
+///
+/// `isMaster` is the pre-4.4.2 spelling and returns the SAME `operationTime` and
+/// `setName` (verified on the 4.4 stand: both commands, identical values). Trying
+/// it second makes the probe work across the whole window at the cost of one
+/// extra round-trip on ancient servers only.
+///
+/// The driver error is RETURNED rather than swallowed: a caller that refuses on a
+/// missing answer must be able to say WHY, and `no such command: 'hello'` tells an
+/// operator in one line what a generic "the deployment does not report one" cannot.
+async fn server_identity(
+    client: &mongodb::Client,
+    db: &str,
+) -> std::result::Result<mongodb::bson::Document, mongodb::error::Error> {
+    match client.database(db).run_command(doc! { "hello": 1 }).await {
+        Ok(d) => Ok(d),
+        Err(hello_err) => client
+            .database(db)
+            .run_command(doc! { "isMaster": 1 })
+            .await
+            .map_err(|_| hello_err),
+    }
+}
+
+/// The open-time cluster-time bound a `until_current` run MUST have, or a loud
+/// refusal explaining why the run cannot be bounded.
+///
+/// The `.ok()` this replaces swallowed every failure of the `hello` command —
+/// a permission error, a transient network fault, a server that answers without
+/// `operationTime` — and left `until_current_ts` as `None`. That is not a
+/// harmless degradation on MongoDB, and the difference from the other engines is
+/// the whole point:
+///
+/// - PostgreSQL, MySQL and SQL Server keep a CATCH-UP exit (a short/empty peek,
+///   `BINLOG_DUMP_NON_BLOCK`'s EOF, the capture job's scan gap). With the bound
+///   unset they still terminate — late, not never — so failing OPEN there is the
+///   right call, as CLAUDE.md records.
+/// - MongoDB has NO such backstop. `past_time_bound` is `false` for every event
+///   once the bound is `None`, so the only remaining exit is the empty-poll check
+///   — and under sustained writes `next_if_any` keeps returning events, so it
+///   never fires. The run does not terminate late; it does not terminate.
+///
+/// The repo already measured that: disabling the cluster-time pin HANGS
+/// `roast_until_current_terminates_under_sustained_writes_and_keeps_backlog`
+/// (killed at its 30s ceiling). A silent `None` reaches the identical state by
+/// accident, on a config that explicitly asked for a bounded run.
+///
+/// So this refuses. `until_current: false` (the daemon) is unaffected and never
+/// consults the bound.
+pub(crate) fn until_current_bound(
+    until_current: bool,
+    operation_time: Option<mongodb::bson::Timestamp>,
+    probe_error: Option<String>,
+) -> Result<Option<mongodb::bson::Timestamp>> {
+    if !until_current {
+        return Ok(None);
+    }
+    operation_time.map(Some).ok_or_else(|| {
+        // The server's own words when we have them. A refusal that guesses at
+        // "the deployment does not report one" while the server actually said
+        // "not authorized on admin to execute command" sends the operator to fix
+        // the wrong thing.
+        let cause = match probe_error {
+            Some(e) => format!("the server answered: {e}"),
+            None => "the server answered without an `operationTime`".to_string(),
+        };
+        anyhow::anyhow!(
+            "mongo cdc: `until_current: true` needs the cluster time at open, and {cause}. \
+             Unlike the SQL engines, a MongoDB change stream has no catch-up exit to fall \
+             back on: without this bound the run would keep draining under any ongoing \
+             writes and NEVER terminate, so continuing would hang rather than finish late. \
+             Check the connection's permissions and that the source is a replica set / \
+             sharded cluster (a standalone reports no operationTime and cannot serve change \
+             streams at all), or set `until_current: false` to stream continuously."
+        )
+    })
+}
+
 /// Persist a resume token as a [`Position`] LOSSLESSLY. A token can carry a BSON
 /// binary `_typeBits` field (for typed sort keys — e.g. an integer `_id`), and a
 /// plain `serde_json` round-trip mangles that binary, so the server rejects it on
@@ -258,19 +342,23 @@ impl MongoChangeStream {
         } else {
             None
         };
-        let until_current_ts = if until_current {
+        // A `until_current` run that cannot pin its ceiling must FAIL, not degrade:
+        // MongoDB has no catch-up exit, so an unset bound means the run never ends.
+        // See `until_current_bound` for why this engine differs from the SQL ones.
+        let (operation_time, probe_err) = if until_current {
             session.block_on(async {
-                session
-                    .client()
-                    .database(&db_name)
-                    .run_command(doc! { "hello": 1 })
-                    .await
-                    .ok()
-                    .and_then(|d| d.get_timestamp("operationTime").ok())
+                match server_identity(session.client(), &db_name).await {
+                    Ok(d) => (d.get_timestamp("operationTime").ok(), None),
+                    // Keep the driver's own words. A refusal that says "the
+                    // deployment does not report one" when the server actually said
+                    // "not authorized on admin" sends the operator the wrong way.
+                    Err(e) => (None, Some(e.to_string())),
+                }
             })
         } else {
-            None
+            (None, None)
         };
+        let until_current_ts = until_current_bound(until_current, operation_time, probe_err)?;
         let this = Self {
             session,
             stream,
@@ -366,8 +454,11 @@ fn probe_capability_on(session: &MongoSession) -> MongoCdcCapability {
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let is_replica_set = db
-            .run_command(doc! { "hello": 1 })
+        // Through the same seam as the bound probe: `hello` does not exist before
+        // 4.4.2, and asking it alone made `rivet doctor` report a genuine replica
+        // set as a standalone on 4.4.0/4.4.1 — telling an operator to run
+        // rs.initiate() on a cluster that is already initiated.
+        let is_replica_set = server_identity(session.client(), session.db())
             .await
             .is_ok_and(|d| d.get_str("setName").is_ok());
         MongoCdcCapability {
@@ -641,6 +732,73 @@ mod tests {
         assert!(!idle_poll_stops(Some("8299"), Some("82AB")));
         assert!(!idle_poll_stops(Some("82AB"), Some("82AB")));
         assert!(!idle_poll_stops(None, Some("82AB")));
+    }
+
+    /// `until_current` must REFUSE without its bound, and only then.
+    ///
+    /// Honest about what this can and cannot reach: the live suite CANNOT produce
+    /// the failing input. Every stand is a healthy replica set that answers `hello`
+    /// with an `operationTime`, and making it not do so means faulting the server,
+    /// not the fixture. So the seam is asserted here, at the one function that
+    /// decides — and the branch it guards is pinned by an EXISTING live test from
+    /// the other direction: disabling the cluster-time bind hangs
+    /// `roast_until_current_terminates_under_sustained_writes_and_keeps_backlog`
+    /// (killed at its 30s ceiling), which is precisely the state a silent `None`
+    /// used to reach by accident.
+    #[test]
+    fn until_current_refuses_when_the_cluster_time_bound_is_unavailable() {
+        use mongodb::bson::Timestamp;
+        let ts = Timestamp {
+            time: 1_700_000_000,
+            increment: 3,
+        };
+
+        assert_eq!(
+            until_current_bound(true, Some(ts), None).unwrap(),
+            Some(ts),
+            "the ordinary case must pass the bound through untouched"
+        );
+        // The daemon never consults the bound, so a missing operationTime is not
+        // its problem — refusing here would break continuous streaming outright.
+        assert_eq!(
+            until_current_bound(false, None, None).unwrap(),
+            None,
+            "`until_current: false` streams forever by design and needs no ceiling"
+        );
+        assert_eq!(
+            until_current_bound(false, Some(ts), None).unwrap(),
+            None,
+            "the daemon must not carry a bound even when one is available — a stray \
+             ceiling would end a stream that is supposed to run continuously"
+        );
+
+        let err = until_current_bound(true, None, None)
+            .expect_err("a bounded run with no ceiling must refuse, not run forever")
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("never terminate") && err.contains("until_current: false"),
+            "the refusal must say what would happen (the run does not end — it does \
+             not merely finish late, the way the SQL engines would) AND name the \
+             setting that accepts continuous streaming instead: {err}"
+        );
+
+        // The server's OWN words when the probe failed. Without this the refusal
+        // guesses — and an adversarial pass found the guess would be wrong on a
+        // pre-4.4.2 server, where the real answer is `no such command: 'hello'`
+        // and the emitted text talked about replica-set membership instead.
+        let with_cause = until_current_bound(
+            true,
+            None,
+            Some("CommandNotFound (59): no such command: 'hello'".to_string()),
+        )
+        .expect_err("still a refusal")
+        .to_string();
+        assert!(
+            with_cause.contains("no such command: 'hello'"),
+            "the driver's own error must reach the operator — it names the cause in \
+             one line where a generic message sends them to check permissions they \
+             never had a problem with: {with_cause}"
+        );
     }
 
     #[test]
