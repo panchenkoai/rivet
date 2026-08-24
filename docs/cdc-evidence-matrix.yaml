@@ -168,8 +168,21 @@ shapes:
         (mysql/cdc.rs:360-398)" }
     mssql:    { absent: "a checkpoint JSON that parses but lacks its engine's key degrades to
         'no checkpoint' — MySQL uses ok_or_else here, MSSQL does not" }
-    mongo:    { absent: "a `hello` without operationTime leaves the load-bearing cluster-time
-        bound unset, so until_current degrades to nothing, silently (mongo/cdc.rs:261-273)" }
+    mongo:
+      sound: "until_current_bound (src/source/mongo/cdc.rs) replaces the `.ok()` that
+        swallowed every `hello` failure: a bounded run with no cluster-time ceiling now
+        REFUSES. Mongo is the engine where this matters — the SQL engines keep a
+        catch-up exit and terminate late without their bound, while past_time_bound is
+        false for every event once Mongo's is None, leaving only the empty-poll check
+        that sustained writes never trigger. Graded by
+        until_current_refuses_when_the_cluster_time_bound_is_unavailable, RED against
+        `return Ok(operation_time)` in place of the refusal. HONEST LIMIT: the live
+        suite cannot produce the failing input (every stand answers hello correctly;
+        faulting it means faulting the server, not the fixture), so the branch is
+        pinned from the other direction by the existing
+        roast_until_current_terminates_under_sustained_writes_and_keeps_backlog, which
+        HANGS at its 30s ceiling when the bound is disabled — the exact state a silent
+        None used to reach by accident."
 
   - id: fault_hook_has_a_crash_test
     what: >
