@@ -49,7 +49,22 @@ will report noise forever:
   silently dropping a field it does not understand — a lenient normaliser would
   reintroduce exactly the class this harness exists to catch.
 
+## Comparison runs in DuckDB, not Python
+
+`compare.py` hands BOTH captures to DuckDB — `read_json_auto` for Debezium's
+JSONL, `read_parquet` for rivet's parts — and the normalisation plus the symmetric
+difference are one SQL statement. The comparison engine is then independent of both
+tools being compared, which is the same reason every other oracle here uses DuckDB:
+a bug in a hand-rolled Python loop would be a bug in the oracle itself.
+
+rivet's side is read through the parts the MANIFEST DECLARES, never a glob.
+
+The Debezium normaliser handles the enveloped and the `transforms=unwrap` shapes,
+and an event matching NEITHER surfaces as `UNKNOWN-SHAPE` rather than being
+dropped — a lenient normaliser would reintroduce the exact class this exists to
+catch.
+
 ## Status
 
-Scaffolding only: sink + this contract. The compose service, the compare step and
-the first differential test are the next commits.
+Sink, contract and DuckDB comparison. The compose service and the first
+differential test are next.
