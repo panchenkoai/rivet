@@ -308,7 +308,24 @@ impl MysqlChangeStream {
                     RowsEventData::WriteRowsEvent(_) => ChangeOp::Insert,
                     RowsEventData::UpdateRowsEvent(_) => ChangeOp::Update,
                     RowsEventData::DeleteRowsEvent(_) => ChangeOp::Delete,
-                    _ => return Ok(true),
+                    // Anything else is a rows event this reader cannot decode, and the
+                    // old `return Ok(true)` DISCARDED it silently — the surrounding
+                    // transaction still committed, so the checkpoint advanced past
+                    // changes that never reached the destination. Unrecoverable, and
+                    // reported as success.
+                    //
+                    // Two real sources, neither exotic: MariaDB emits only the v1
+                    // rows events, so on MariaDB EVERY insert, update and delete was
+                    // dropped while the pipeline stayed green at zero rows; and MySQL
+                    // 8 with `binlog_row_value_options=PARTIAL_JSON` emits
+                    // `PartialUpdateRowsEvent` for JSON column updates, where the
+                    // surrounding transactions ARE captured — so the loss is a subset,
+                    // which is the shape no count check can see.
+                    //
+                    // Refuse loudly instead, exactly as the compressed-payload arm
+                    // below does: the un-acked span is re-read once the source is
+                    // configured for a reader that can decode it.
+                    other => return Err(undecodable_rows_event_refusal(other)),
                 };
                 let Some((tme, image_names)) = self.tables.get(&re.table_id()).cloned() else {
                     return Ok(true); // started mid-stream, no TABLE_MAP yet — skip
@@ -406,6 +423,70 @@ impl MysqlChangeStream {
 /// message and the fact that it IS an error are testable offline — deleting the
 /// match arm that calls it (falling through to `_ => {}`) is exactly the silent-skip
 /// bug, which only a live compressed server would otherwise flip.
+/// Refuse a rows event this reader cannot decode, naming WHICH one and what to do.
+///
+/// Silence here is worse than on most refusal paths: the transaction around the
+/// dropped rows still commits, so the checkpoint advances and the changes are gone
+/// from both the binlog window and the destination while the run reports success.
+/// Which undecodable shape a rows event is. Separated from the message so the
+/// message — the ONLY thing an operator sees, since the alternative was a green run
+/// with missing rows — is testable without constructing binlog events the crate does
+/// not let a test build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndecodableRows {
+    /// Pre-5.6 row format. MariaDB emits only these.
+    V1,
+    /// `binlog_row_value_options=PARTIAL_JSON` logs a JSON diff, not a row image.
+    PartialJson,
+    Other,
+}
+
+fn classify_rows_event(ev: &RowsEventData<'_>) -> UndecodableRows {
+    match ev {
+        RowsEventData::WriteRowsEventV1(_)
+        | RowsEventData::UpdateRowsEventV1(_)
+        | RowsEventData::DeleteRowsEventV1(_) => UndecodableRows::V1,
+        RowsEventData::PartialUpdateRowsEvent(_) => UndecodableRows::PartialJson,
+        _ => UndecodableRows::Other,
+    }
+}
+
+/// Refuse a rows event this reader cannot decode, naming WHICH one and what to do.
+///
+/// Silence here is worse than on most refusal paths: the transaction around the
+/// dropped rows still commits, so the checkpoint advances and the changes are gone
+/// from both the binlog window and the destination while the run reports success.
+pub(crate) fn undecodable_rows_refusal_message(kind: UndecodableRows) -> String {
+    let (what, cause) = match kind {
+        UndecodableRows::V1 => (
+            "a v1 rows event",
+            "the source writes the pre-5.6 row format — MariaDB emits only v1 rows events. \
+             Point rivet at a MySQL replica, or use a MariaDB-native CDC reader",
+        ),
+        UndecodableRows::PartialJson => (
+            "a partial-JSON update",
+            "the source has binlog_row_value_options=PARTIAL_JSON, which logs a JSON diff \
+             rather than the row image. Set binlog_row_value_options='' on the replica \
+             rivet reads, then re-run",
+        ),
+        UndecodableRows::Other => (
+            "an unrecognised rows event",
+            "this reader decodes only the v2 write/update/delete rows events",
+        ),
+    };
+    format!(
+        "mysql cdc: encountered {what} in the binlog and this reader cannot decode it. \
+         Skipping it would capture NOTHING for those rows while the surrounding \
+         transaction commits and the checkpoint advances past them — a silent, \
+         unrecoverable loss reported as success. {cause}: the un-acked span is re-read \
+         from the checkpoint."
+    )
+}
+
+fn undecodable_rows_event_refusal(ev: &RowsEventData<'_>) -> anyhow::Error {
+    anyhow::anyhow!(undecodable_rows_refusal_message(classify_rows_event(ev)))
+}
+
 fn compressed_payload_refusal() -> anyhow::Error {
     anyhow::anyhow!(
         "mysql cdc: encountered a Transaction_payload_event in the binlog — the source has \
@@ -618,6 +699,34 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// The refusal message IS the remediation — an operator has nothing else to go
+    /// on, because the alternative to this error was a green run with missing rows.
+    #[test]
+    fn an_undecodable_rows_event_refusal_names_the_cause_and_the_way_out() {
+        let v1 = undecodable_rows_refusal_message(UndecodableRows::V1);
+        assert!(v1.contains("v1 rows event"), "must name the variant: {v1}");
+        assert!(v1.contains("MariaDB"), "must name who emits it: {v1}");
+
+        let partial = undecodable_rows_refusal_message(UndecodableRows::PartialJson);
+        assert!(
+            partial.contains("binlog_row_value_options"),
+            "must name the SETTING to change, not just the symptom: {partial}"
+        );
+
+        for msg in [&v1, &partial] {
+            assert!(
+                msg.contains("re-read"),
+                "must say the un-acked span is re-read — an operator who believes the data \
+                 is already gone has no reason to fix the source and re-run: {msg}"
+            );
+            assert!(
+                msg.contains("checkpoint advances"),
+                "must say WHY silence was unacceptable: the surrounding transaction \
+                 commits and the checkpoint moves past the dropped rows: {msg}"
+            );
+        }
+    }
     use super::*;
 
     /// The compression guard's decision, offline. Anything unrecognized — an
