@@ -5565,3 +5565,143 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
         "passing two source forms must be REFUSED, not silently resolved to one of them"
     );
 }
+
+/// A PARTIAL_JSON binlog must be REFUSED, not silently skipped.
+///
+/// `binlog_row_value_options=PARTIAL_JSON` is a legal MySQL 8 setting that logs a JSON
+/// diff instead of the row image. The reader cannot decode that, and the arm that met
+/// it was `_ => return Ok(true)` — the rows vanished while the surrounding transaction
+/// committed and the checkpoint advanced past them. Unrecoverable, and reported as
+/// `status: success`.
+///
+/// The loss is a SUBSET, which is what makes it the dangerous half: transactions that
+/// touch no JSON column are captured normally, so counts and sums keep reconciling.
+///
+/// Non-default-state test (CLAUDE.md): the default is exactly where the bug hides, so
+/// the setting is flipped and restored by a guard rather than assumed.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
+    // PARTIAL_JSON is set on the WRITING SESSION, never the server global — the
+    // binlog record's shape is decided by whoever wrote it. An earlier version of
+    // this test flipped `SET GLOBAL` and took `quiet_window_guard()` to serialize;
+    // that was the wrong shape twice over. The guard only excludes tests that TAKE
+    // it, and `mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id`
+    // does not — so the global window was still visible to it and rivet, correctly,
+    // refused its run too (measured on #281: it failed while 633 others passed,
+    // both before and after the guard was added). Session scope removes the shared
+    // state entirely: nothing to serialize, nothing to restore, no window for a
+    // parallel test to fall into. Verified on the stand — the UPDATE below reaches
+    // the partial arm while `@@GLOBAL.binlog_row_value_options` stays empty.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_pj");
+    // `SET SESSION binlog_row_value_options` needs SESSION_VARIABLES_ADMIN, which
+    // the `rivet` test user does not hold — hence root for the WRITER only. The
+    // capture itself still runs as `rivet`, exactly like every other test here.
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut writer = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    use mysql::prelude::Queryable as _;
+    writer
+        .query_drop("SET SESSION binlog_row_value_options = 'PARTIAL_JSON'")
+        .expect("set partial json on this session only");
+
+    writer
+        .query_drop(format!("DROP TABLE IF EXISTS {tbl}"))
+        .unwrap();
+    writer
+        .query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, doc JSON)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    // The document must be big enough that MySQL logs a DIFF rather than falling back
+    // to a full image — a short JSON value is rewritten whole and never reaches the
+    // partial arm, which would make this test pass for the wrong reason.
+    writer
+        .query_drop(format!(
+            "INSERT INTO {tbl} VALUES (1, JSON_OBJECT('a', 1, 'pad', REPEAT('x', 400)))"
+        ))
+        .unwrap();
+
+    let ck = d.path().join("pj.ckpt");
+    let rig = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ck.to_path_buf())
+            .dest_path(d.path().join("out"))
+    };
+    // Anchor the stream before provoking the diff, so the update is inside the window.
+    rig().run_ok();
+
+    // The diff-logging session writes the UPDATE — this is the whole fixture.
+    writer
+        .query_drop(format!(
+            "UPDATE {tbl} SET doc = JSON_SET(doc, '$.a', 2) WHERE id = 1"
+        ))
+        .unwrap();
+
+    let msg = rig().run_expect_fail();
+    assert!(
+        msg.contains("partial-JSON"),
+        "the run must REFUSE and name the shape it met. Silently skipping the diff \
+         loses the update while the checkpoint advances past it — a subset loss no \
+         count check can see. Got: {msg}"
+    );
+    assert!(
+        msg.contains("binlog_row_value_options"),
+        "the message must name the SETTING to change — it is the only remediation an \
+         operator gets: {msg}"
+    );
+    assert!(
+        msg.contains("re-read"),
+        "the message must say the un-acked span is re-read; an operator who believes \
+         the data is already gone has no reason to fix the source and re-run: {msg}"
+    );
+
+    // ── and the refusal must be TABLE-ADDRESSED ────────────────────────────────
+    //
+    // The binlog is ONE stream per server, so the undecodable event above sits in
+    // the log every OTHER export reads too. Refusing without asking whose event it
+    // is turns one PARTIAL_JSON table into a server-wide outage — measured on #281,
+    // where this fixture failed `mysql_cdc_cli_stream_with_a_cap_terminates_and_
+    // accepts_a_server_id` with this exact error, on a table it does not capture.
+    //
+    // That failure was a RACE (the neighbour only sees it when its window covers
+    // the event), which is why it is pinned HERE instead: this export is anchored
+    // BEFORE the partial update, so the event is inside its window by construction
+    // and the assertion cannot pass by timing. RED against `if true` in place of
+    // the `undecodable_event_is_ours` call.
+    let other = unique_name("cdc_pj_other");
+    writer
+        .query_drop(format!("DROP TABLE IF EXISTS {other}"))
+        .unwrap();
+    writer
+        .query_drop(format!("CREATE TABLE {other} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _other_guard = Table(other.clone());
+    let other_ck = d.path().join("other.ckpt");
+    let other_rig = || {
+        Rig::mysql_cdc(&other)
+            .checkpoint_path(other_ck.to_path_buf())
+            .dest_path(d.path().join("out_other"))
+    };
+    other_rig().run_ok(); // anchor BEFORE the partial update lands
+
+    writer
+        .query_drop(format!(
+            "UPDATE {tbl} SET doc = JSON_SET(doc, '$.a', 3) WHERE id = 1"
+        ))
+        .unwrap();
+    writer
+        .query_drop(format!("INSERT INTO {other} VALUES (7, 70)"))
+        .unwrap();
+
+    let rows: usize = other_rig()
+        .run_and_read()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        rows, 1,
+        "an export that does NOT capture the partial-JSON table must complete and \
+         capture its own change — the undecodable event belongs to another table, \
+         and the routing filter would have dropped it anyway"
+    );
+}

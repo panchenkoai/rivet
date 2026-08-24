@@ -248,6 +248,9 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         engine: match CdcEngine::from_url(&url)? {
             CdcEngine::Mysql => CdcEngineOpts::Mysql {
                 server_id: a.server_id,
+                // `--table` IS the routing filter on this path; empty means capture
+                // whatever the stream emits, which makes every event ours.
+                configured_tables: a.table.clone(),
             },
             CdcEngine::Postgres => CdcEngineOpts::Postgres {
                 slot: a.slot,

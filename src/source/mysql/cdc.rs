@@ -65,6 +65,11 @@ pub(crate) struct MysqlChangeStream {
     /// indefinitely); `None` (daemon) streams forever. The contract lives on
     /// [`DrainMode`].
     bound: Option<(String, u64)>,
+    /// The `table:` values this run captures — the set an UNDECODABLE rows event is
+    /// checked against before it is allowed to fail the run. Empty means "capture
+    /// whatever the stream emits" (`rivet cdc` with no `--table`), which makes every
+    /// event ours. See [`undecodable_event_is_ours`].
+    configured_tables: Vec<String>,
     /// Bound tripped — the stream ended at the open-time ceiling. Sticky, so the
     /// sink's re-drain pass (which re-calls `next_change` after acking) returns
     /// `None` at once instead of consuming — and re-deferring — the past-bound
@@ -149,6 +154,7 @@ impl MysqlChangeStream {
         pos: u64,
         mode: DrainMode,
         tls: Option<&TlsConfig>,
+        configured_tables: Vec<String>,
     ) -> Result<Self> {
         // Snapshot the ceiling BEFORE the dump starts: every commit already in
         // the log is ≤ it, and anything racing in after is the next run's work.
@@ -169,6 +175,7 @@ impl MysqlChangeStream {
         let stream = conn.get_binlog_stream(req)?;
         Ok(Self {
             stream,
+            configured_tables,
             tables: HashMap::new(),
             pending: VecDeque::new(),
             tx: Vec::new(),
@@ -225,7 +232,10 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        Self::open(url, server_id, file, pos, mode, tls)
+        // No table filter: these tests read the stream directly rather than routing
+        // it, so every event is theirs — the same `configured.is_empty()` arm
+        // `rivet cdc` without `--table` takes.
+        Self::open(url, server_id, file, pos, mode, tls, Vec::new())
     }
 
     /// Resume from a persisted [`Position`] checkpoint, or start from the current
@@ -239,6 +249,7 @@ impl MysqlChangeStream {
         ckpt: Option<&Path>,
         mode: DrainMode,
         tls: Option<&TlsConfig>,
+        configured_tables: Vec<String>,
     ) -> Result<Self> {
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
@@ -254,7 +265,7 @@ impl MysqlChangeStream {
                 .get("pos")
                 .and_then(Json::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
-            return Self::open(url, server_id, file, p, mode, tls);
+            return Self::open(url, server_id, file, p, mode, tls, configured_tables);
         }
         // First run (no checkpoint yet): anchor at the current position and persist
         // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
@@ -266,7 +277,7 @@ impl MysqlChangeStream {
         if let Some(path) = ckpt {
             Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
         }
-        Self::open(url, server_id, file, pos, mode, tls)
+        Self::open(url, server_id, file, pos, mode, tls, configured_tables)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -338,7 +349,41 @@ impl MysqlChangeStream {
                     RowsEventData::WriteRowsEvent(_) => ChangeOp::Insert,
                     RowsEventData::UpdateRowsEvent(_) => ChangeOp::Update,
                     RowsEventData::DeleteRowsEvent(_) => ChangeOp::Delete,
-                    _ => return Ok(true),
+                    // Anything else is a rows event this reader cannot decode, and the
+                    // old `return Ok(true)` DISCARDED it silently — the surrounding
+                    // transaction still committed, so the checkpoint advanced past
+                    // changes that never reached the destination. Unrecoverable, and
+                    // reported as success.
+                    //
+                    // Two real sources, neither exotic: MariaDB emits only the v1
+                    // rows events, so on MariaDB EVERY insert, update and delete was
+                    // dropped while the pipeline stayed green at zero rows; and MySQL
+                    // 8 with `binlog_row_value_options=PARTIAL_JSON` emits
+                    // `PartialUpdateRowsEvent` for JSON column updates, where the
+                    // surrounding transactions ARE captured — so the loss is a subset,
+                    // which is the shape no count check can see.
+                    //
+                    // Refuse loudly instead, exactly as the compressed-payload arm
+                    // below does: the un-acked span is re-read once the source is
+                    // configured for a reader that can decode it.
+                    other => {
+                        // WHOSE event is it? The binlog carries every table on the
+                        // server, so refusing without asking turns one PARTIAL_JSON
+                        // table into a server-wide outage — measured: this refusal
+                        // failed a concurrent export on a table it does not capture.
+                        // The resolve is the same TABLE_MAP lookup the decode path
+                        // does below; `None` (no TABLE_MAP yet) deliberately counts
+                        // as OURS, because a silent skip is the one outcome this
+                        // path exists to prevent.
+                        let resolved = self.tables.get(&other.table_id());
+                        let named =
+                            resolved.map(|(tme, _)| (tme.database_name(), tme.table_name()));
+                        let named = named.as_ref().map(|(d, t)| (d.as_ref(), t.as_ref()));
+                        if undecodable_event_is_ours(named, &self.configured_tables) {
+                            return Err(undecodable_rows_event_refusal(other));
+                        }
+                        return Ok(true); // another table's — the routing filter would drop it anyway
+                    }
                 };
                 let Some((tme, image_names)) = self.tables.get(&re.table_id()).cloned() else {
                     return Ok(true); // started mid-stream, no TABLE_MAP yet — skip
@@ -433,6 +478,104 @@ impl MysqlChangeStream {
 /// message and the fact that it IS an error are testable offline — deleting the
 /// match arm that calls it (falling through to `_ => {}`) is exactly the silent-skip
 /// bug, which only a live compressed server would otherwise flip.
+/// Which undecodable shape a rows event is. Separated from the message so the
+/// message — the ONLY thing an operator sees, since the alternative was a green run
+/// with missing rows — is testable without constructing binlog events the crate does
+/// not let a test build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndecodableRows {
+    /// Pre-5.6 row format. MariaDB emits only these.
+    V1,
+    /// `binlog_row_value_options=PARTIAL_JSON` logs a JSON diff, not a row image.
+    PartialJson,
+    Other,
+}
+
+/// Does an UNDECODABLE rows event belong to a table this run captures?
+///
+/// The binlog is ONE stream per server, so it carries every table's changes,
+/// including tables nobody configured. Refusing on an undecodable event without
+/// asking whose it is turns one PARTIAL_JSON table into a server-wide outage:
+/// every other export refuses too, on data it was never going to read. Measured
+/// 2026-08-24 — the live PARTIAL_JSON fixture failed a concurrent, unrelated
+/// MySQL CDC test with this exact error, on a table it does not capture.
+///
+/// The asymmetry is deliberate and it is the whole safety argument:
+/// - a **captured** table: REFUSE. Skipping loses the change while the surrounding
+///   transaction commits and the checkpoint advances past it.
+/// - **another** table: skip. The run would have dropped it at the routing filter
+///   anyway, so skipping loses nothing.
+/// - table **unknown**: REFUSE. No TABLE_MAP means the stream started
+///   mid-transaction; guessing "not mine" there would be a silent drop of exactly
+///   the kind this path exists to prevent. Over-refusing is recoverable; a skip is
+///   not.
+/// - **nothing configured**: REFUSE. `rivet cdc` with no `--table` captures
+///   whatever the stream emits, so every event is "mine".
+///
+/// Pure so every branch is graded offline; the caller resolves the name.
+pub(crate) fn undecodable_event_is_ours(
+    resolved: Option<(&str, &str)>,
+    configured: &[String],
+) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+    match resolved {
+        None => true,
+        Some((schema, table)) => configured
+            .iter()
+            .any(|c| crate::source::cdc::sink::table_matches(c, schema, table)),
+    }
+}
+
+fn classify_rows_event(ev: &RowsEventData<'_>) -> UndecodableRows {
+    match ev {
+        RowsEventData::WriteRowsEventV1(_)
+        | RowsEventData::UpdateRowsEventV1(_)
+        | RowsEventData::DeleteRowsEventV1(_) => UndecodableRows::V1,
+        RowsEventData::PartialUpdateRowsEvent(_) => UndecodableRows::PartialJson,
+        _ => UndecodableRows::Other,
+    }
+}
+
+/// Refuse a rows event this reader cannot decode, naming WHICH one and what to do.
+///
+/// Silence here is worse than on most refusal paths: the transaction around the
+/// dropped rows still commits, so the checkpoint advances and the changes are gone
+/// from both the binlog window and the destination while the run reports success.
+pub(crate) fn undecodable_rows_refusal_message(kind: UndecodableRows) -> String {
+    let (what, cause) = match kind {
+        UndecodableRows::V1 => (
+            "a v1 rows event",
+            "the source writes the pre-5.6 row format — MariaDB emits only v1 rows events. \
+             Point rivet at a MySQL replica, or use a MariaDB-native CDC reader",
+        ),
+        UndecodableRows::PartialJson => (
+            "a partial-JSON update",
+            "the WRITING session had binlog_row_value_options=PARTIAL_JSON, which logs a \
+             JSON diff rather than the row image. That is usually the server global, but \
+             it is a SESSION variable too — so check `SELECT @@GLOBAL.binlog_row_value_options` \
+             first and, if it is already empty, the writer set it per-session. Clear it on \
+             the replica rivet reads (and on whatever writes to it), then re-run",
+        ),
+        UndecodableRows::Other => (
+            "an unrecognised rows event",
+            "this reader decodes only the v2 write/update/delete rows events",
+        ),
+    };
+    format!(
+        "mysql cdc: encountered {what} in the binlog and this reader cannot decode it. \
+         Skipping it would capture NOTHING for those rows while the surrounding \
+         transaction commits and the checkpoint advances past them — a silent, \
+         unrecoverable loss reported as success. {cause}: the un-acked span is re-read \
+         from the checkpoint."
+    )
+}
+
+fn undecodable_rows_event_refusal(ev: &RowsEventData<'_>) -> anyhow::Error {
+    anyhow::anyhow!(undecodable_rows_refusal_message(classify_rows_event(ev)))
+}
+
 fn compressed_payload_refusal() -> anyhow::Error {
     anyhow::anyhow!(
         "mysql cdc: encountered a Transaction_payload_event in the binlog — the source has \
@@ -664,6 +807,72 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+    /// The refusal message IS the remediation — an operator has nothing else to go
+    /// on, because the alternative to this error was a green run with missing rows.
+    /// The refusal must be TABLE-ADDRESSED. Every arm here was a live failure
+    /// first: the un-filtered refusal failed a concurrent, unrelated MySQL CDC
+    /// export on a table it does not capture (measured 2026-08-24 on #281 — the
+    /// PARTIAL_JSON fixture and `mysql_cdc_cli_stream_with_a_cap…` in one run,
+    /// which is how the over-refusal was found at all).
+    #[test]
+    fn an_undecodable_event_fails_only_the_runs_that_capture_that_table() {
+        let cfg = vec!["rivet.orders".to_string()];
+
+        assert!(
+            undecodable_event_is_ours(Some(("rivet", "orders")), &cfg),
+            "our own table must refuse — skipping loses the change while the \
+             transaction commits and the checkpoint advances past it"
+        );
+        assert!(
+            !undecodable_event_is_ours(Some(("rivet", "audit")), &cfg),
+            "another table must NOT fail this run: the routing filter would have \
+             dropped it anyway, so refusing turns one PARTIAL_JSON table into a \
+             server-wide outage"
+        );
+        assert!(
+            undecodable_event_is_ours(None, &cfg),
+            "an UNRESOLVED table must refuse — guessing 'not mine' with no TABLE_MAP \
+             is the silent drop this path exists to prevent"
+        );
+        assert!(
+            undecodable_event_is_ours(Some(("rivet", "audit")), &[]),
+            "`rivet cdc` with no --table captures whatever the stream emits, so \
+             every event is ours"
+        );
+        // A bare (schema-less) config entry matches any schema, exactly as the sink
+        // routes it — the guard must ask the SAME question the router does, or it
+        // protects a set the run does not actually capture.
+        assert!(
+            undecodable_event_is_ours(Some(("otherdb", "orders")), &["orders".to_string()]),
+            "a bare config name matches any schema, like sink::table_matches"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_rows_event_refusal_names_the_cause_and_the_way_out() {
+        let v1 = undecodable_rows_refusal_message(UndecodableRows::V1);
+        assert!(v1.contains("v1 rows event"), "must name the variant: {v1}");
+        assert!(v1.contains("MariaDB"), "must name who emits it: {v1}");
+
+        let partial = undecodable_rows_refusal_message(UndecodableRows::PartialJson);
+        assert!(
+            partial.contains("binlog_row_value_options"),
+            "must name the SETTING to change, not just the symptom: {partial}"
+        );
+
+        for msg in [&v1, &partial] {
+            assert!(
+                msg.contains("re-read"),
+                "must say the un-acked span is re-read — an operator who believes the data \
+                 is already gone has no reason to fix the source and re-run: {msg}"
+            );
+            assert!(
+                msg.contains("checkpoint advances"),
+                "must say WHY silence was unacceptable: the surrounding transaction \
+                 commits and the checkpoint moves past the dropped rows: {msg}"
+            );
+        }
+    }
 
     /// `Xid` is written only by a transactional engine's own commit. A MyISAM or
     /// MEMORY write, and every `XA COMMIT`, close the transaction with a QUERY event
@@ -888,6 +1097,7 @@ mod tests {
             Some(&ckpt),
             DrainMode::BoundedAtOpen,
             None,
+            Vec::new(),
         )
         .unwrap();
         assert!(
@@ -914,6 +1124,7 @@ mod tests {
             Some(&ckpt),
             DrainMode::BoundedAtOpen,
             None,
+            Vec::new(),
         )
         .unwrap();
         let got = s2
@@ -959,9 +1170,15 @@ mod tests {
             .unwrap();
 
         // Resuming from the checkpoint must yield B (id=2), never re-read A.
-        let mut s2 =
-            MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), DrainMode::Continuous, None)
-                .unwrap();
+        let mut s2 = MysqlChangeStream::open_or_resume(
+            URL,
+            4244,
+            Some(&ckpt),
+            DrainMode::Continuous,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let b = s2
             .by_ref()
             .map(|e| e.unwrap())

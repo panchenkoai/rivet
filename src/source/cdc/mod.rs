@@ -354,7 +354,16 @@ pub(crate) fn run(
 #[derive(Debug, Clone)]
 pub(crate) enum CdcEngineOpts {
     /// MySQL replica id (the binlog `server_id`).
-    Mysql { server_id: u32 },
+    Mysql {
+        server_id: u32,
+        /// The `table:` values the CONFIG asked for.
+        ///
+        /// The binlog is ONE stream per server, so it carries every table's
+        /// changes. An UNDECODABLE rows event is checked against this set before
+        /// it is allowed to fail the run — otherwise one PARTIAL_JSON table is a
+        /// server-wide outage for exports that never read it.
+        configured_tables: Vec<String>,
+    },
     /// PostgreSQL logical slot name.
     Postgres {
         slot: String,
@@ -731,7 +740,10 @@ pub(crate) fn create_change_stream(
     let tls = cfg.tls.as_ref();
     // The engine identity IS the opts variant — no re-resolution from the URL.
     match &cfg.engine {
-        CdcEngineOpts::Mysql { server_id } => {
+        CdcEngineOpts::Mysql {
+            server_id,
+            configured_tables,
+        } => {
             // Validate the checkpoint BEFORE open_or_resume so a corrupt/truncated
             // checkpoint (or a directory path) surfaces cleanly, not blanketed by
             // the MYSQL_CDC_HINT binlog-grants message — the same hoist PG/MSSQL
@@ -748,6 +760,7 @@ pub(crate) fn create_change_stream(
                     cfg.checkpoint.as_deref(),
                     cfg.drain,
                     tls,
+                    configured_tables.clone(),
                 )
                 .context(MYSQL_CDC_HINT)?,
             ))
@@ -1298,7 +1311,10 @@ mod tests {
             checkpoint: Some(ckpt),
             drain: DrainMode::BoundedAtOpen,
             tls: None,
-            engine: CdcEngineOpts::Mysql { server_id: 4321 },
+            engine: CdcEngineOpts::Mysql {
+                server_id: 4321,
+                configured_tables: Vec::new(),
+            },
         };
         let err = match create_change_stream(&cfg, PeekBound::Unbounded) {
             Ok(_) => panic!("a corrupt checkpoint must error, not open a stream"),
