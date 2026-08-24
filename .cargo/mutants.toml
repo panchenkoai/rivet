@@ -50,6 +50,26 @@ exclude_globs = [
 ]
 
 exclude_re = [
+    # The `escaped` guard in `split_qualified_ident` (src/source/postgres/cdc.rs):
+    # `b'"' if in_quotes && next == b'"'`. Stubbing the guard to `false` is
+    # EQUIVALENT, and the argument is short enough to check rather than trust.
+    #
+    # With the guard off, every quote toggles `in_quotes`. The two quotes of an
+    # escaped pair are ADJACENT, so toggling twice returns to the state the skip
+    # would have preserved — the two versions can only disagree at the position
+    # BETWEEN them, and that position always holds a quote, never the `.` the walk
+    # is looking for. Checked on the malformed case too (an odd number of quotes,
+    # e.g. `"a"".t`): both reach the end without splitting and hand the whole
+    # string to `unquote_ident`.
+    #
+    # So no input distinguishes them, which is what `exclude_re` is for. Noted
+    # because the tell of a WRONG exclusion here is an operator-shaped entry that
+    # should have been a function: this one is a semantic identity, not a decision
+    # someone declined to test. The escape flag's other three failure modes ARE
+    # graded — `the_qualifier_walk_treats_a_doubled_quote_as_an_escape_not_a_
+    # terminator` goes RED on the flag never clearing, the lookahead inverted, and
+    # the flag never set.
+    "replace match guard in_quotes && qual.as_bytes\\(\\).get\\(i \\+ 1\\) == Some\\(&b'\"'\\) with false in split_qualified_ident",
     # The two chunk-CHECKPOINT runners' whole-body stubs. Both are live-only by
     # construction (they need a real source, a destination and a state DB, so the
     # `--lib --bins` run this gate does never executes a line of them), and the

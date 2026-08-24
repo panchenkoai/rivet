@@ -569,6 +569,69 @@ impl ChangeStream for PgChangeStream {
     }
 }
 
+/// Undo `quote_ident` on ONE identifier: `"order"` -> `order`, `"a""b"` -> `a"b`,
+/// `plain` -> `plain`.
+///
+/// `test_decoding` prints relation and column names through PostgreSQL's own
+/// `quote_ident`, which quotes anything that is not a lowercase-only, non-reserved
+/// identifier. rivet consumed the result RAW, and every downstream comparison is
+/// byte-exact, so the quotes made the name unmatchable — while `validate_table_ident`
+/// refuses a config string containing `"`, so no spelling of the config could match
+/// either. The routing filter then dropped 100% of that table's events, and because
+/// the commit boundary is recorded BEFORE the filter the slot was acked past them:
+/// terminal loss, `status: success`, zero rows.
+///
+/// It is not an exotic input. `quote_ident` quotes reserved words (`order`, `user`,
+/// `desc`) AND mixed case, so every PascalCase table an ORM generates — `public."User"`,
+/// the Prisma and EF Core default — arrived unmatchable.
+fn unquote_ident(raw: &str) -> String {
+    let t = raw.trim();
+    match t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        // Inside a quoted identifier PostgreSQL doubles an embedded quote.
+        Some(inner) => inner.replace("\"\"", "\""),
+        _ => t.to_string(),
+    }
+}
+
+/// Split `schema.table` where EITHER part may be quoted and a quoted part may itself
+/// contain a dot (`"my.schema".t`). A plain `split_once('.')` cuts inside the quotes and
+/// yields two identifiers that never existed.
+fn split_qualified_ident(qual: &str) -> (String, String) {
+    // Walked by ITERATOR, not by a hand-rolled index. The index version was
+    // correct, and every mutation of its arithmetic either hung the process
+    // (`i += 1` -> `i -= 1` or `*= 1` never advances) or was equivalent — so the
+    // gate could neither kill those mutants nor learn anything from them. An
+    // advance the code does not write is an advance nothing can break.
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut split_at = None;
+    for (i, b) in qual.bytes().enumerate() {
+        if escaped {
+            // The second byte of a doubled quote: consumed as content, and it
+            // cannot open or close anything.
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'"' if in_quotes && qual.as_bytes().get(i + 1) == Some(&b'"') => {
+                // A doubled quote inside a quoted identifier is an escaped quote,
+                // not the end of it.
+                escaped = true;
+            }
+            b'"' => in_quotes = !in_quotes,
+            b'.' if !in_quotes => {
+                split_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    match split_at {
+        Some(i) => (unquote_ident(&qual[..i]), unquote_ident(&qual[i + 1..])),
+        None => (String::new(), unquote_ident(qual)),
+    }
+}
+
 /// Parse one `test_decoding` line into a canonical change, or `None` for the
 /// `BEGIN`/`COMMIT` transaction markers and anything unrecognised. The line shape
 /// is `table <schema>.<table>: <OP>: <columns…>`; pre-images / typed before-after
@@ -577,10 +640,7 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
     let Some((qual, tail)) = data.strip_prefix("table ").and_then(|s| s.split_once(": ")) else {
         return Ok(None);
     };
-    let (schema, table) = match qual.split_once('.') {
-        Some((s, t)) => (s.to_string(), t.to_string()),
-        None => (String::new(), qual.to_string()),
-    };
+    let (schema, table) = split_qualified_ident(qual);
     let op = if tail.starts_with("INSERT") {
         ChangeOp::Insert
     } else if tail.starts_with("UPDATE") {
@@ -695,7 +755,7 @@ fn parse_columns(s: &str) -> Vec<ParsedColumn> {
         };
         // The column NAME precedes '[' — it is DATA for key-only images
         // (finding #41): a DELETE's key must map by name, not position.
-        let name = rest[..lb].trim().to_string();
+        let name = unquote_ident(&rest[..lb]);
         let typ = &rest[lb + 1..lb + rel];
         let after_colon = &rest[lb + rel + 2..];
         let (val, quoted, consumed) = parse_value(after_colon);
@@ -1102,6 +1162,7 @@ fn parse_pg_timestamp(val: &str) -> RivetValue {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -1667,6 +1728,101 @@ mod tests {
             vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
             "logical slot must decode INSERT, UPDATE, DELETE in commit order"
         );
+    }
+
+    /// The class: `test_decoding` prints identifiers through `quote_ident`, rivet
+    /// consumed them raw, every downstream compare is byte-exact, and the config
+    /// validator refuses `"` — so a quoted table was unmatchable from BOTH sides.
+    /// The slot is acked past the dropped events, which makes the loss terminal.
+    #[test]
+    fn quoted_identifiers_are_unquoted_so_routing_can_match_them() {
+        // A reserved word — quote_ident quotes it.
+        let ev = parse_test_decoding("0/1", "table app.\"order\": INSERT: id[integer]:1")
+            .expect("parses")
+            .expect("an event");
+        assert_eq!(ev.schema, "app", "schema must be usable as a plain name");
+        assert_eq!(
+            ev.table, "order",
+            "the table name must be the IDENTIFIER, not its quoted rendering — a byte-exact \
+             router cannot match `\"order\"`, and no config string can spell it either"
+        );
+
+        // Mixed case — the ORM default (`public.\"User\"`), the same trap without a
+        // reserved word in sight.
+        let ev = parse_test_decoding("0/2", "table public.\"User\": INSERT: id[integer]:7")
+            .expect("parses")
+            .expect("an event");
+        assert_eq!((ev.schema.as_str(), ev.table.as_str()), ("public", "User"));
+    }
+
+    /// A dot INSIDE a quoted part is not a qualifier separator. `split_once('.')` cut
+    /// there and produced two identifiers that never existed.
+    #[test]
+    fn a_dot_inside_a_quoted_identifier_is_not_a_qualifier_split() {
+        let ev = parse_test_decoding("0/3", "table \"my.schema\".t: INSERT: id[integer]:1")
+            .expect("parses")
+            .expect("an event");
+        assert_eq!((ev.schema.as_str(), ev.table.as_str()), ("my.schema", "t"));
+    }
+
+    /// PostgreSQL doubles an embedded quote inside a quoted identifier.
+    #[test]
+    fn a_doubled_quote_inside_an_identifier_collapses_to_one() {
+        assert_eq!(unquote_ident("\"a\"\"b\""), "a\"b");
+        assert_eq!(unquote_ident("plain"), "plain");
+        assert_eq!(unquote_ident("\"\""), "");
+    }
+
+    /// The COLUMN twin. A key-only DELETE maps its image BY NAME (a positional rescue
+    /// needs full arity, which a key-only image never has), so a quoted key column made
+    /// every tombstone an all-NULL row — the load's merge then partitions by a NULL pk,
+    /// the tombstone never wins, and the deleted row survives in the warehouse forever
+    /// while counts and sums reconcile.
+    #[test]
+    fn a_quoted_column_name_is_unquoted_so_a_key_only_delete_maps_by_name() {
+        let ev = parse_test_decoding("0/4", "table app.t: DELETE: \"userId\"[integer]:7")
+            .expect("parses")
+            .expect("an event");
+        assert_eq!(
+            ev.image_names.as_deref(),
+            Some(&["userId".to_string()][..]),
+            "the key column must carry its identifier, not its quoted rendering"
+        );
+    }
+
+    /// The byte walk's ESCAPE branch, which the direct `unquote_ident` cases cannot
+    /// reach: a doubled quote must not be read as the END of the quoted part, or the
+    /// walker leaves quoted state early and the next `.` splits inside an identifier.
+    ///
+    /// Every one of these goes through `split_qualified_ident`, not the helper — the
+    /// mutation gate found the whole loop ungraded because the doubled-quote test
+    /// called the helper directly.
+    #[test]
+    fn the_qualifier_walk_treats_a_doubled_quote_as_an_escape_not_a_terminator() {
+        let cases: &[(&str, &str, &str)] = &[
+            // an escaped quote in the SCHEMA, then a real separator
+            ("\"a\"\"b\".t", "a\"b", "t"),
+            // an escaped quote in the TABLE
+            ("app.\"c\"\"d\"", "app", "c\"d"),
+            // a dot INSIDE a part that also carries an escaped quote — the walker must
+            // stay quoted across both
+            ("\"a\"\".b\".t", "a\".b", "t"),
+            // an escaped quote immediately before the separator
+            ("\"x\"\"\".t", "x\"", "t"),
+            // no qualifier at all
+            ("\"order\"", "", "order"),
+        ];
+        for (input, schema, table) in cases {
+            let ev = parse_test_decoding("0/9", &format!("table {input}: INSERT: id[integer]:1"))
+                .expect("parses")
+                .expect("an event");
+            assert_eq!(
+                (ev.schema.as_str(), ev.table.as_str()),
+                (*schema, *table),
+                "qualifier `{input}` split wrongly — a mis-split yields identifiers that \
+                 never existed, and the router then drops every event for the table"
+            );
+        }
     }
 }
 
