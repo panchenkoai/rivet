@@ -20,6 +20,8 @@ mod audit_validate_warning_label;
 mod cargo_manifest_chef;
 #[path = "offline/cdc_axis_matrix_guard.rs"]
 mod cdc_axis_matrix_guard;
+#[path = "offline/cdc_evidence_matrix_guard.rs"]
+mod cdc_evidence_matrix_guard;
 #[path = "offline/chunking_matrix_guard.rs"]
 mod chunking_matrix_guard;
 #[path = "offline/cli_contract.rs"]
