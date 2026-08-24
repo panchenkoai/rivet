@@ -3683,6 +3683,24 @@ fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
         "the corrected run must recover all {source_rows} changes from the \
          un-acked slot — that is what makes the refusal a delay, not a loss"
     );
+
+    // The refusal offers TWO ways out and a message may only promise what
+    // something checks. The partition-by-name route is proven above; this is the
+    // other one — `mode: full` reads THROUGH the parent, because a batch SELECT
+    // resolves partitions the way any query does and never sees a wire identity
+    // at all. Untested, "snapshot the parent with mode: full" would be a remedy
+    // nobody had run — the class CLAUDE.md records as a hint that cannot recover
+    // from the state it is offered in.
+    let snapshot = Rig::pg_batch(&format!("public.{parent}"))
+        .source_url(cdc_db.url())
+        .mode("full");
+    let snapshot_rows: usize = snapshot.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        snapshot_rows, source_rows as usize,
+        "`mode: full` on the partitioned parent must read every row — it is the \
+         second remediation the refusal names, and a message may only promise \
+         what a test has run"
+    );
 }
 
 struct CdcDb {
