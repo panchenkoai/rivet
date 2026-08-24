@@ -3794,6 +3794,94 @@ fn roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table() {
     );
 }
 
+/// The three routing hazards an adversarial pass found in the FIRST version of
+/// this guard, which read only `relkind`.
+///
+/// All three end the same way — a run that reports success while capturing
+/// nothing, or worse — and all three are invisible to a relkind check:
+///
+/// 1. **A folded twin.** The config string is read by two resolvers with different
+///    case rules: the schema probe interpolates it into `SELECT * FROM {table}` and
+///    lets PostgreSQL FOLD it; the sink routes BYTE-EXACT. With both `"MixedCase"`
+///    and `mixedcase` present, MEASURED: exit 0 throughout, writes to `mixedcase`
+///    captured `rows: 0` with no warning, and writes to `"MixedCase"` landed under
+///    the WRONG table's schema — columns `id, other_col, extra`, the real `v`
+///    values absent entirely. Silent column loss on top of silent event loss.
+/// 2. **A 3-part name.** `to_regclass` accepts `db.schema.table` when `db` is the
+///    current database, so the probe resolves while `table_matches` splits on the
+///    FIRST dot and compares `db` against the schema — never matching.
+/// 3. **UNLOGGED.** No WAL at all, so no event can ever exist for it.
+///
+/// Isolated in its OWN database: the guard reads `pg_class`, and a case-collision
+/// fixture on the shared DB would be visible to every parallel test.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_config_whose_resolved_identity_routing_cannot_match() {
+    let cdc_db = CdcDb::new("cdc_ident");
+    let slot = unique_name("rivet_ident_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    // The case collision, spelled the way a real schema acquires one: a quoted
+    // relation plus an unquoted sibling. Different COLUMNS on purpose — that is
+    // what makes the wrong-schema write visible.
+    c.batch_execute(
+        "CREATE TABLE \"MixedCase\" (id int, v text); \
+         CREATE TABLE mixedcase (id int, other_col text, extra text); \
+         CREATE UNLOGGED TABLE unlg (id int primary key, v text)",
+    )
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+
+    for (cfg, must_say) in [
+        ("MixedCase", "public.mixedcase"),
+        ("rivet.public.mixedcase", "public.mixedcase"),
+        ("public.unlg", "SET LOGGED"),
+    ] {
+        let rig = Rig::pg_cdc(cfg, &slot).source_url(cdc_db.url());
+        let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "`{cfg}` must be refused — it either captures nothing or writes rows \
+             under another table's schema, silently. Output:\n{said}"
+        );
+        assert!(
+            said.contains(must_say),
+            "the refusal for `{cfg}` must name `{must_say}` — that is the whole \
+             remediation. Output:\n{said}"
+        );
+        // A config problem must NOT arrive wearing the wal_level/REPLICATION hint:
+        // an operator would go read the permissions docs for a problem that is not
+        // there. Same trap the MySQL side was hoisted out of.
+        assert!(
+            !said.contains("wal_level=logical and a role"),
+            "a routing refusal must not be prefixed with the permissions hint. \
+             Output:\n{said}"
+        );
+    }
+
+    // Not too WIDE: an ordinary table on the same database still captures. Oracle
+    // is the manifest-declared parts, compared to what the source holds.
+    c.batch_execute("CREATE TABLE plain_ok (id int primary key, v text)")
+        .unwrap();
+    c.execute("INSERT INTO plain_ok VALUES (1,'a'),(2,'b')", &[])
+        .unwrap();
+    let ok = Rig::pg_cdc("public.plain_ok", &slot).source_url(cdc_db.url());
+    let rows: usize = ok.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 2,
+        "the guard must refuse only what routing cannot match — an ordinary table \
+         has to keep working, or the fix is worse than the defect"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,
