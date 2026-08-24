@@ -124,6 +124,13 @@ pub(crate) struct RelationRouting<'a> {
     /// Relations that inherit from it — partitions, or legacy `INHERITS`
     /// children — schema-qualified the way `test_decoding` renders them.
     pub children: Vec<String>,
+    /// For a partitioned parent: the LEAF partitions, from `pg_partition_tree`.
+    ///
+    /// Not the same as `children` on a sub-partitioned table, and the difference is
+    /// a dead-end remediation: `children` there is the intermediate PARTITIONED
+    /// table, which stores no rows either and is refused by this same guard on the
+    /// next run. Only a leaf ever appears in the WAL.
+    pub leaves: Vec<String>,
 }
 
 /// The verdict for one configured table. `Never` is a hard error (a guaranteed
@@ -181,10 +188,13 @@ pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
         // A partitioned parent stores NO rows of its own: every change carries a
         // PARTITION's name. Byte-exact routing can never match it.
         'p' => {
-            let named = if rel.children.is_empty() {
+            // LEAVES, not children. On a sub-partitioned table the immediate child
+            // is another partitioned table that stores no rows, so naming it sends
+            // the operator to a config this same guard refuses on the next run.
+            let named = if rel.leaves.is_empty() {
                 "it has no partitions yet".to_string()
             } else {
-                format!("currently {}", rel.children.join(", "))
+                format!("currently {}", rel.leaves.join(", "))
             };
             RoutingVerdict::Never(format!(
                 "pg cdc: `{cfg}` is a PARTITIONED table — it stores no rows itself, and \
@@ -396,14 +406,18 @@ impl PgChangeStream {
                     "SELECT c.relkind::text, c.relpersistence::text, \
                             n.nspname::text, c.relname::text, \
                             coalesce(array_agg(n2.nspname || '.' || c2.relname) \
-                                     FILTER (WHERE c2.oid IS NOT NULL), '{}') \
+                                     FILTER (WHERE c2.oid IS NOT NULL), '{}'), \
+                            CASE WHEN c.relkind = 'p' THEN ( \
+                                SELECT coalesce(array_agg(pt.relid::regclass::text), '{}') \
+                                FROM pg_partition_tree(c.oid) pt WHERE pt.isleaf) \
+                            ELSE '{}' END \
                      FROM pg_class c \
                      JOIN pg_namespace n ON n.oid = c.relnamespace \
                      LEFT JOIN pg_inherits i ON i.inhparent = c.oid \
                      LEFT JOIN pg_class c2 ON c2.oid = i.inhrelid \
                      LEFT JOIN pg_namespace n2 ON n2.oid = c2.relnamespace \
                      WHERE c.oid = to_regclass($1) \
-                     GROUP BY c.relkind, c.relpersistence, n.nspname, c.relname",
+                     GROUP BY c.relkind, c.relpersistence, n.nspname, c.relname, c.oid",
                     &[&cfg.as_str()],
                 )
                 .with_context(|| {
@@ -417,11 +431,13 @@ impl PgChangeStream {
             let resolved_schema: String = row.get(2);
             let resolved_table: String = row.get(3);
             let children: Vec<String> = row.get(4);
+            let leaves: Vec<String> = row.get(5);
             let rel = RelationRouting {
                 configured: cfg,
                 relkind: relkind.chars().next().unwrap_or('?'),
                 relpersistence: relpersistence.chars().next().unwrap_or('p'),
                 resolved: (resolved_schema, resolved_table),
+                leaves,
                 children,
             };
             match classify_routing(&rel) {
@@ -1422,6 +1438,7 @@ mod tests {
             // The catalog agrees with the config here, so these cases exercise the
             // relkind arms rather than the identity check above them.
             resolved: ("public".to_string(), "t".to_string()),
+            leaves: children.iter().map(|c| c.to_string()).collect(),
             children: children.iter().map(|c| c.to_string()).collect(),
         };
 
@@ -1435,6 +1452,27 @@ mod tests {
             why.contains("public.t_2026_01"),
             "the refusal must name the partitions, because listing them IS the \
              remediation: {why}"
+        );
+
+        // SUB-PARTITIONED: the remediation must name a LEAF, never the intermediate
+        // partitioned table. `children` there is `ml_2026`, which stores no rows
+        // either and is refused by this same guard on the next run — a dead-end
+        // remediation, found by an adversarial pass over the first version.
+        let sub = RelationRouting {
+            configured: "public.ml",
+            relkind: 'p',
+            relpersistence: 'p',
+            resolved: ("public".to_string(), "ml".to_string()),
+            children: vec!["public.ml_2026".to_string()], // intermediate, unroutable
+            leaves: vec!["public.ml_2026_01".to_string()], // the only relation in the WAL
+        };
+        let RoutingVerdict::Never(why) = classify_routing(&sub) else {
+            panic!("a sub-partitioned parent is still unroutable");
+        };
+        assert!(
+            why.contains("public.ml_2026_01") && !why.contains("public.ml_2026,"),
+            "the remediation must name the LEAF — naming the intermediate sends the \
+             operator to a config this same guard refuses next run: {why}"
         );
 
         // …and with no partitions yet, it is still unroutable — the message just
@@ -1472,6 +1510,7 @@ mod tests {
             // the unquoted name, so the probe reads THIS relation's columns while
             // events spelled `MixedCase` route nowhere.
             resolved: ("public".to_string(), "mixedcase".to_string()),
+            leaves: vec![],
             children: vec![],
         };
         let RoutingVerdict::Never(why) = classify_routing(&mismatched) else {
@@ -1495,6 +1534,7 @@ mod tests {
             relkind: 'r',
             relpersistence: 'p',
             resolved: ("public".to_string(), "orders".to_string()),
+            leaves: vec![],
             children: vec![],
         };
         assert!(
@@ -1508,6 +1548,7 @@ mod tests {
             relkind: 'r',
             relpersistence: 'u',
             resolved: ("public".to_string(), "t".to_string()),
+            leaves: vec![],
             children: vec![],
         };
         let RoutingVerdict::Never(why) = classify_routing(&unlogged) else {
