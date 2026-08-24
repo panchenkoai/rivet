@@ -3792,6 +3792,106 @@ fn the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory() {
     assert_eq!(after.len(), 1, "exactly the still-declared part: {after:?}");
 }
 
+/// A DML STATEMENT in the binlog must fail the run — the setting probe cannot see it.
+///
+/// `@@GLOBAL.binlog_format` is what a startup probe can read; `@@SESSION.binlog_format`
+/// is what decides. A writer that sets STATEMENT for itself (applications do, to shrink
+/// the log for big UPDATEs) produces a binlog rivet cannot reconstruct, while the global
+/// still reads ROW and every startup check passes.
+///
+/// MEASURED before the guard (2026-08-24): global left at ROW, one writer session on
+/// STATEMENT, 3 INSERTs — the SOURCE held 3 rows and `rivet run` reported
+/// `status: success, rows: 0`. Total, silent loss.
+///
+/// The fix detects the SYMPTOM, not the setting: a ROW binlog never carries a DML verb
+/// as text, so seeing one IS the evidence whatever any variable says. Oracles are the
+/// SOURCE (asked of MySQL) and the manifest-DECLARED parts — never rivet's own count.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_refuses_a_statement_logged_dml_instead_of_capturing_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_stmt");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _g = Table(tbl.clone());
+
+    let ck = d.path().join("s.ckpt");
+    let rig = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ck.to_path_buf())
+            .dest_path(d.path().join("out"))
+    };
+    rig().run_ok(); // anchor before the statement-logged writes
+
+    // The writer flips its OWN session only — the global stays ROW, which is exactly
+    // what makes this invisible to a setting probe. Needs SYSTEM_VARIABLES_ADMIN, so
+    // root writes; the capture still runs as `rivet`.
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut writer = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    use mysql::prelude::Queryable as _;
+    writer
+        .query_drop("SET SESSION binlog_format = STATEMENT")
+        .expect("session-scoped STATEMENT");
+    writer
+        .query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20),(3,30)"))
+        .unwrap();
+
+    // SOURCE oracle, asked of MySQL: the rows really are there, so anything the run
+    // fails to deliver is a real loss rather than an empty fixture.
+    let in_source: Option<i64> = c
+        .query_first(format!("SELECT count(*) FROM {tbl}"))
+        .unwrap();
+    assert_eq!(in_source, Some(3), "the fixture must have written 3 rows");
+    // And the global is still ROW — the half that makes a startup probe useless here.
+    let global: Option<String> = c.query_first("SELECT @@GLOBAL.binlog_format").unwrap();
+    assert_eq!(
+        global.as_deref(),
+        Some("ROW"),
+        "the GLOBAL must stay ROW, or this test is measuring the setting probe rather \
+         than the session trap it exists for"
+    );
+
+    let msg = rig().run_expect_fail();
+    assert!(
+        msg.contains("STATEMENT") && msg.contains("SET SESSION"),
+        "the refusal must name the format AND the session scope — an operator who only \
+         checks the global will find it correct and look no further. Got: {msg}"
+    );
+    assert!(
+        msg.contains("UNRECOVERABLE") && msg.contains("mode: full"),
+        "the refusal must be HONEST about recovery. A statement is not a row image, so no \
+         re-read reconstructs those rows — and the first version of this message promised \
+         `delete the checkpoint to re-read from the log`, which this very test measured as \
+         recovering ZERO. Two reasons it cannot work, both worth stating: the events are \
+         unreconstructable, and MySQL has no server-side anchor so a checkpoint-less open \
+         pins at CURRENT rather than re-reading. Got: {msg}"
+    );
+
+    // Not too WIDE: a NEW export, anchored past the statement window, captures normally
+    // once the writer is back on ROW. This is the shape the remediation actually
+    // describes — a fresh baseline, not a re-read. Oracle: the manifest-DECLARED parts.
+    writer
+        .query_drop("SET SESSION binlog_format = ROW")
+        .unwrap();
+    let fresh = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(d.path().join("fresh.ckpt"))
+            .dest_path(d.path().join("out_fresh"))
+    };
+    fresh().run_ok(); // anchors past the poisoned span
+    writer
+        .query_drop(format!("INSERT INTO {tbl} VALUES (4,40)"))
+        .unwrap();
+    let rows: usize = fresh().run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 1,
+        "a run anchored past the statement window must capture ROW-logged changes \
+         normally — the guard refuses the poisoned span, not the engine"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,

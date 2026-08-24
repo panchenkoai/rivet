@@ -447,6 +447,12 @@ impl MysqlChangeStream {
             // `XA PREPARE` deliberately does NOT release: the transaction is not
             // committed yet, and releasing there would publish rows a later
             // `XA ROLLBACK` erases.
+            // A DML statement in the binlog is PROOF the writer's session was not in
+            // ROW format. Checked here rather than only at open, because the setting
+            // that decides is per-SESSION and a startup probe reads the global.
+            Some(EventData::QueryEvent(qe)) if is_row_defeating_dml(&qe.query()) => {
+                anyhow::bail!(statement_binlog_refusal_message(&qe.query()));
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -674,6 +680,67 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
         );
     }
     Ok(conn)
+}
+
+/// Does this QUERY event carry ROW-DEFEATING DML — i.e. proof that the writer's
+/// session was in `STATEMENT` (or `MIXED`-falling-back-to-statement) binlog format?
+///
+/// This is the SYMPTOM detector, and it exists because the setting check cannot be
+/// trusted alone. `@@GLOBAL.binlog_format` is what a startup probe can read, but the
+/// value that decides what lands in the binlog is `@@SESSION.binlog_format`, which
+/// any writer may set for itself (applications do it to shrink the log for large
+/// UPDATEs). MEASURED 2026-08-24 on rivet-mysql-cdc-1 with the GLOBAL left at ROW:
+/// a writer doing `SET SESSION binlog_format=STATEMENT` then 3 INSERTs left the
+/// source holding 3 rows while `rivet run` reported `status: success, rows: 0`.
+/// Total, silent loss that no setting probe could have caught.
+///
+/// So: refuse on the STATEMENT itself. A row-based binlog never carries a DML
+/// statement as text — inserts, updates and deletes arrive as rows events — so
+/// seeing one IS the evidence, whatever any variable says.
+///
+/// Deliberately narrow. `BEGIN`/`COMMIT`/`XA COMMIT` are transaction control and
+/// appear in a ROW binlog routinely; DDL (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`)
+/// is ALWAYS logged as a statement even under ROW, so it must not trip this. Only
+/// the four data-manipulation verbs are proof.
+pub(crate) fn is_row_defeating_dml(sql: &str) -> bool {
+    // Skip a LEADING `/* … */` — sqlcommenter and friends prepend one, and the verb
+    // is what identifies the statement.
+    let mut t = sql.trim_start();
+    while let Some(rest) = t.strip_prefix("/*") {
+        match rest.find("*/") {
+            Some(end) => t = rest[end + 2..].trim_start(),
+            None => return false, // unterminated: nothing identifiable follows
+        }
+    }
+    let Some(first) = t.split_whitespace().next() else {
+        return false;
+    };
+    // `INSERT INTO`, `UPDATE t SET`, `DELETE FROM`, `REPLACE INTO` — and their
+    // low-priority/ignore variants, which MySQL logs with the verb first anyway.
+    matches!(
+        first.to_ascii_uppercase().as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+    )
+}
+
+/// Refuse a statement-logged DML event, naming the setting AND the session trap.
+pub(crate) fn statement_binlog_refusal_message(sql: &str) -> String {
+    let head: String = sql.chars().take(80).collect();
+    format!(
+        "mysql cdc: the binlog carries a DML STATEMENT (`{head}`), which means it was written \
+         in STATEMENT format — rivet reads ROW events and cannot reconstruct the changed rows \
+         from a statement, so those changes would be captured as NOTHING while the checkpoint \
+         advanced past them (measured: 3 inserts, `status: success, rows: 0`, source still \
+         holding all 3). Set `binlog_format = ROW`. Check BOTH scopes: a writer that runs \
+         `SET SESSION binlog_format = STATEMENT` produces this while \
+         `@@GLOBAL.binlog_format` still reads ROW, so the global setting alone is not evidence. \
+         These particular changes are UNRECOVERABLE from the log: a statement is not a row \
+         image, so no re-read can reconstruct them, and the event stays in the binlog where \
+         this run will meet it again. Put every writer on ROW, then re-snapshot the table \
+         (`mode: full`) to re-establish the baseline and restart CDC from a checkpoint past \
+         this point. Deleting the checkpoint alone does NOT help — MySQL has no server-side \
+         anchor, so a checkpoint-less open pins at the CURRENT position rather than re-reading."
+    )
 }
 
 /// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
