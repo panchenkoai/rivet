@@ -258,14 +258,26 @@ impl PgChangeStream {
             .iter()
             .map(|t| t.rsplit('.').next().unwrap_or(t).to_string())
             .collect();
+        // `keyless` = the DELETE will carry NO tuple data at all, not merely a key:
+        // REPLICA IDENTITY NOTHING, or DEFAULT on a table with no primary key.
+        // PostgreSQL then renders `table t: DELETE: (no-tuple-data)` and the row is
+        // unidentifiable — a different, worse verdict than key-only.
         let Ok(rows) = client.query(
-            "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+            "SELECT c.relname::text, \
+                    (c.relreplident = 'n' \
+                     OR (c.relreplident = 'd' AND NOT EXISTS ( \
+                          SELECT 1 FROM pg_index i \
+                          WHERE i.indrelid = c.oid AND i.indisprimary))) AS keyless \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind = 'r' AND c.relreplident <> 'f' AND c.relname = ANY($1)",
             &[&bare],
         ) else {
             return RowImage::Whole;
         };
-        let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        let named: Vec<(String, bool)> = rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, bool>(1)))
+            .collect();
         Self::row_image_verdict(&named)
     }
 
@@ -274,11 +286,44 @@ impl PgChangeStream {
     /// means every table carries whole rows (keep); any named table downgrades
     /// DELETEs to key-only (warn). Unit-tested in both directions; the
     /// connect+query half stays live-guarded.
-    pub(crate) fn row_image_verdict(named: &[String]) -> crate::source::cdc::RowImage {
+    pub(crate) fn row_image_verdict(named: &[(String, bool)]) -> crate::source::cdc::RowImage {
         use crate::source::cdc::RowImage;
         if named.is_empty() {
             return RowImage::Whole;
         }
+        // KEYLESS FIRST, and it REFUSES rather than warns. With REPLICA IDENTITY
+        // NOTHING — or DEFAULT on a table with no primary key — PostgreSQL logs no
+        // old tuple at all and test_decoding renders `DELETE: (no-tuple-data)`. The
+        // parser yields an empty column list, so the delete lands in the destination
+        // with EVERY column NULL and no key: it identifies nothing and can never be
+        // applied. MEASURED 2026-08-24: `status: success, rows: 2`, and the parquet
+        // held `delete | NULL | NULL`.
+        //
+        // Worse, the warning below used to cover this case and its text was FALSE
+        // for it — it said the DELETE "carries ONLY the primary key" about a table
+        // that has none. An operator reading that would conclude the key is there.
+        let keyless: Vec<&str> = named
+            .iter()
+            .filter(|(_, k)| *k)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if !keyless.is_empty() {
+            return RowImage::Partial {
+                why: format!(
+                    "{} of the captured table(s) ({}) have no usable REPLICA IDENTITY — either \
+                     NOTHING, or DEFAULT with no PRIMARY KEY. PostgreSQL logs NO old tuple for \
+                     their DELETEs, so a delete event would identify no row: every column NULL, \
+                     nothing to apply downstream, and the deleted row resurrected in the \
+                     destination forever by the documented latest-image MERGE. Give each table a \
+                     PRIMARY KEY, or `ALTER TABLE <t> REPLICA IDENTITY FULL` (or `USING INDEX \
+                     <unique-index>`), then re-run — the WAL already written for those deletes \
+                     cannot be repaired, so re-snapshot (`mode: full`) if any have happened.",
+                    keyless.len(),
+                    keyless.join(", ")
+                ),
+            };
+        }
+        let named: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
         RowImage::KeyOnlyDeletes {
             why: format!(
                 "{} of the captured table(s) ({}) have REPLICA IDENTITY other than FULL, so a \
@@ -2082,12 +2127,44 @@ mod slot_creation_warning_tests {
             PgChangeStream::row_image_verdict(&[]),
             RowImage::Whole
         ));
-        match PgChangeStream::row_image_verdict(&["orders".into(), "items".into()]) {
+        // key-only: DEFAULT identity WITH a primary key — the delete carries the key,
+        // which is applicable, so this stays a warning.
+        match PgChangeStream::row_image_verdict(&[
+            ("orders".to_string(), false),
+            ("items".to_string(), false),
+        ]) {
             RowImage::KeyOnlyDeletes { why } => {
                 assert!(why.contains("2 of the captured table(s)"), "{why}");
                 assert!(why.contains("orders, items"), "{why}");
             }
             other => panic!("non-FULL identity must warn, got {other:?}"),
+        }
+
+        // KEYLESS is a different verdict and it REFUSES. Measured: the delete lands
+        // with every column NULL and the old warning's text was FALSE for this case
+        // ("carries ONLY the primary key" about a table that has none).
+        match PgChangeStream::row_image_verdict(&[("nokey".to_string(), true)]) {
+            RowImage::Partial { why } => {
+                assert!(why.contains("nokey"), "{why}");
+                assert!(
+                    why.contains("no usable REPLICA IDENTITY") && why.contains("PRIMARY KEY"),
+                    "the refusal must say WHY the delete is unappliable and name both fixes: {why}"
+                );
+                assert!(
+                    !why.contains("ONLY the primary key"),
+                    "the false sentence must not survive into the keyless message: {why}"
+                );
+            }
+            other => panic!("a keyless DELETE identifies nothing — refuse, got {other:?}"),
+        }
+        // A keyless table among key-only ones must still refuse: the strictest
+        // verdict wins, or the run proceeds on the strength of its safer siblings.
+        match PgChangeStream::row_image_verdict(&[
+            ("ok".to_string(), false),
+            ("bad".to_string(), true),
+        ]) {
+            RowImage::Partial { why } => assert!(why.contains("bad"), "{why}"),
+            other => panic!("one keyless table must refuse the run, got {other:?}"),
         }
     }
 }

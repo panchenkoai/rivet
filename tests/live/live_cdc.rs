@@ -3892,6 +3892,117 @@ fn roast_mysql_cdc_refuses_a_statement_logged_dml_instead_of_capturing_nothing()
     );
 }
 
+/// A DELETE that identifies NO row must refuse — it is worse than a key-only delete,
+/// and the warning that used to cover it was factually FALSE.
+///
+/// With REPLICA IDENTITY NOTHING, or DEFAULT on a table with no PRIMARY KEY,
+/// PostgreSQL logs no old tuple and test_decoding renders `DELETE: (no-tuple-data)`.
+/// The parser yields an empty column list, so the event lands with every column NULL.
+///
+/// MEASURED before the fix (2026-08-24): `status: success, rows: 2`, and the parquet
+/// held `delete | NULL | NULL`. The only signal was a warn whose text said the DELETE
+/// "carries ONLY the primary key" — about a table that has none. An operator reading
+/// that concludes the key is present.
+///
+/// The downstream harm is specific: `docs/reference/cdc.md`'s latest-image MERGE
+/// partitions by key, so a keyless delete never reaches the row it deleted and the
+/// row is resurrected in the destination forever.
+///
+/// The boundary matters as much as the refusal — a table WITH a primary key still
+/// captures, because its delete carries the key and IS appliable.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_delete_that_identifies_no_row() {
+    let cdc_db = CdcDb::new("cdc_nokey");
+    let nokey = unique_name("rivet_cdc_nk").to_lowercase();
+    let haspk = unique_name("rivet_cdc_pk").to_lowercase();
+    let slot = unique_name("rivet_nk_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {nokey} (a int, b text); \
+         CREATE TABLE {haspk} (id int PRIMARY KEY, v text)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {nokey} VALUES (1,'x'); DELETE FROM {nokey} WHERE a=1; \
+         INSERT INTO {haspk} VALUES (1,'a'); DELETE FROM {haspk} WHERE id=1"
+    ))
+    .unwrap();
+    // SOURCE oracle: both deletes really happened, so a run that ships them as
+    // unidentifiable rows is losing something real.
+    let left: i64 = c
+        .query_one(&format!("SELECT count(*) FROM {nokey}"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0, "the fixture's DELETE must have removed the row");
+
+    let out = run_rivet(&[
+        "run",
+        "--config",
+        Rig::pg_cdc(&format!("public.{nokey}"), &slot)
+            .source_url(cdc_db.url())
+            .config_path()
+            .to_str()
+            .unwrap(),
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a keyless DELETE must fail the run — shipping it writes `delete` with every \
+         column NULL, which identifies nothing. Output:\n{said}"
+    );
+    assert!(
+        said.contains("no usable REPLICA IDENTITY") && said.contains("PRIMARY KEY"),
+        "the refusal must say why the delete is unappliable and name both fixes. \
+         Output:\n{said}"
+    );
+    assert!(
+        !said.contains("ONLY the primary key"),
+        "the FALSE sentence must not reach a keyless table — it tells an operator the \
+         key is there when the table has none. Output:\n{said}"
+    );
+
+    // The boundary: a table WITH a primary key still captures. Oracle is the
+    // manifest-DECLARED parts, and the delete must carry its key rather than NULL.
+    let pk_rig = Rig::pg_cdc(&format!("public.{haspk}"), &slot).source_url(cdc_db.url());
+    let batches = pk_rig.run_and_read();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 2,
+        "a keyed table's insert+delete must still capture — the guard refuses the \
+         unidentifiable delete, not every non-FULL identity"
+    );
+    // …and the key is actually present on the delete row, which is the whole
+    // difference between the two verdicts.
+    use arrow::array::AsArray;
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("id")
+                .expect("id column")
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "both rows must carry a non-NULL key — a key-only DELETE is appliable and that \
+         is why it warns instead of refusing: {ids:?}"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,
