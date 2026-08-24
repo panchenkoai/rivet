@@ -67,7 +67,13 @@ SELECT
     json_extract_string(j, '$.payload.before.__KEY__')
   ) AS VARCHAR) AS k
 FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
-      FROM read_text('__DBZ__')) WHERE j <> '';
+      FROM read_text('__DBZ__'))
+-- MySQL's connector also emits SCHEMA-CHANGE events (a `ddl` field, no `op`) on
+-- the same sink. They are DDL, not row changes, and PostgreSQL's connector does
+-- not send them — a legitimate asymmetry, so they are excluded EXPLICITLY here
+-- rather than swallowed by the UNKNOWN arm. Silencing them there would have
+-- disarmed the shape check for real unrecognised events too.
+WHERE j <> '' AND json_extract_string(j, '$.ddl') IS NULL;
 
 CREATE OR REPLACE VIEW riv AS
 SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k
@@ -157,8 +163,20 @@ ORDER BY 1, 2, 3;
         # Report the counts that were compared. "AGREE" over two captures whose
         # sizes are never printed is the same silence this guard exists to remove —
         # a reader must be able to see the comparison had something to compare.
+        # Report the size of the SET that was compared, not only the input sizes.
+        # Two captures can be non-empty and still compare a degenerate set — e.g.
+        # every event on one key — and "AGREE over 1 pair" deserves to look
+        # different from "AGREE over 40". Same reason the counts are printed at all.
+        cnt = subprocess.run(
+            ["duckdb", "-noheader", "-list", "-c",
+             sql.split("SELECT 'rivet-only'")[0] +
+             "SELECT (SELECT count(*) FROM (SELECT DISTINCT * FROM riv)) || '/' || "
+             "(SELECT count(*) FROM (SELECT DISTINCT * FROM dbz));"],
+            capture_output=True, text=True)
+        pairs = cnt.stdout.strip() or "?"
         print(f"AGREE: rivet and Debezium produced the same (op, key) set "
-              f"[{len(parts)} declared part(s) vs {dbz_lines} reference event(s)]")
+              f"[{len(parts)} declared part(s) / {dbz_lines} reference event(s) "
+              f"-> {pairs} distinct (op,key) pairs compared]")
         return 0
     print("DISAGREE — one of the two is wrong, and which is the finding:\n")
     print(body)
