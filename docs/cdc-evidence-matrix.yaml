@@ -162,10 +162,25 @@ shapes:
     mutant: >
       Feed the boundary its unknown value and assert a warning/error is produced. A silent
       arm passes today because nothing observes the degradation.
-    postgres: { absent: "any test_decoding line that is not INSERT/UPDATE/DELETE — TRUNCATE
-        above all — is dropped with no log, no counter, no test (cdc.rs:390,576-592)" }
-    mysql:    { absent: "a transaction group with no Xid marker is buffered and never emitted
-        (mysql/cdc.rs:360-398)" }
+    postgres:
+      sound: "TRUNCATE — the one that mattered — now bails: truncate_target +
+        truncate_is_ours + truncate_refusal_message (src/source/postgres/cdc.rs),
+        graded offline by a_truncate_is_recognised_and_refused_only_for_the_captured_tables
+        and live by roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging.
+        RED against two mutants on different asserts: the guard removed (back to the
+        measured `status: success, rows: 2` over an EMPTY source) and the refusal
+        un-addressed (`if true`, which fails a bystander export on the same slot).
+        Other non-DML lines stay unhandled and that is deliberate — TRUNCATE is the
+        one that removes rows without events, so it is the one that diverges."
+    mysql:
+      sound: "the Xid-less group is closed by is_commit_statement (COMMIT / XA COMMIT,
+        #ebc9d87), and the OTHER silent QUERY-event drop — TRUNCATE — now bails:
+        truncate_target + truncate_refusal_message (src/source/mysql/cdc.rs), graded by
+        a_mysql_truncate_statement_resolves_the_table_it_names offline and
+        roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging live. RED
+        against two mutants on different asserts: the guard disabled (back to the
+        measured `status: success, rows: 2` over an EMPTY source) and the addressing
+        removed (which fails a bystander export reading the same binlog)."
     mssql:    { absent: "a checkpoint JSON that parses but lacks its engine's key degrades to
         'no checkpoint' — MySQL uses ok_or_else here, MSSQL does not" }
     mongo:    { absent: "a `hello` without operationTime leaves the load-bearing cluster-time

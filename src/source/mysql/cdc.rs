@@ -447,6 +447,20 @@ impl MysqlChangeStream {
             // `XA PREPARE` deliberately does NOT release: the transaction is not
             // committed yet, and releasing there would publish rows a later
             // `XA ROLLBACK` erases.
+            // A TRUNCATE is a QUERY event, never rows — so the rows path below
+            // never sees it and the `_ => {}` arm dropped it silently, leaving the
+            // destination holding rows the source no longer has. Table-addressed
+            // for the reason #281 measured: the binlog carries every table on the
+            // server, so refusing without asking whose relation it is would make
+            // one truncated table an outage for exports that never read it.
+            Some(EventData::QueryEvent(qe))
+                if truncate_target(&qe.query(), &qe.schema()).is_some_and(|(sc, tb)| {
+                    undecodable_event_is_ours(Some((&sc, &tb)), &self.configured_tables)
+                }) =>
+            {
+                let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
+                anyhow::bail!(truncate_refusal_message(&sc, &tb));
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -676,6 +690,61 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     Ok(conn)
 }
 
+/// The table a `TRUNCATE` QUERY event names, as `(schema, table)` — schema from
+/// the statement's qualifier when it has one, else the event's own database.
+///
+/// A TRUNCATE is logged as a QUERY event, never as rows, so the rows-event path
+/// never sees it and the `_ => {}` arm dropped it in silence. Measured 2026-08-24
+/// on the rivet-mysql-cdc-1 stand: 2 inserts then a TRUNCATE left the source table
+/// EMPTY while the run reported `status: success, rows: 2` — the identical
+/// divergence PostgreSQL had, by a different route.
+///
+/// Parses `TRUNCATE [TABLE] [`db`.]`tbl`` with optional backticks. Deliberately
+/// permissive about whitespace and case (MySQL logs the statement as written) and
+/// deliberately NOT a general SQL parser: anything it cannot read confidently
+/// returns `None` and falls through to the old behaviour, which is what it was
+/// before this existed.
+pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, String)> {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let mut w = t.split_whitespace();
+    if !w.next()?.eq_ignore_ascii_case("truncate") {
+        return None;
+    }
+    let mut name = w.next()?;
+    if name.eq_ignore_ascii_case("table") {
+        name = w.next()?;
+    }
+    if w.next().is_some() {
+        return None; // trailing tokens — not a shape this reader claims to understand
+    }
+    let unq = |s: &str| s.trim_matches('`').to_string();
+    match name.split_once('.') {
+        Some((db, tbl)) => Some((unq(db), unq(tbl))),
+        None => Some((event_db.to_string(), unq(name))),
+    }
+}
+
+/// Refuse a TRUNCATE on a captured table. Same contract as the PostgreSQL arm —
+/// see `postgres::cdc::truncate_refusal_message` for why this bails rather than
+/// warns: the rows leave the source with no DELETE events to carry them, so the
+/// destination disagrees with its source permanently and no later capture can
+/// reconcile it.
+pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    format!(
+        "mysql cdc: `{qualified}` was TRUNCATEd, and this reader cannot represent that as a \
+         change. Skipping it would leave every row the truncate removed sitting in the \
+         destination with no DELETE to retract it — the source empty, the destination \
+         not, permanently, because those rows left the source without events and no \
+         later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
+         re-establish the baseline, then resume CDC from a fresh checkpoint."
+    )
+}
+
 /// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
 /// the bounded run's termination contract (see [`MysqlChangeStream::bound`]).
 /// Binlog files order by their numeric suffix (`binlog.000042`); a lexicographic
@@ -807,6 +876,63 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+    /// The MySQL TRUNCATE recogniser, graded offline.
+    ///
+    /// MySQL logs the statement AS WRITTEN, so the parser must survive the forms a
+    /// human or an ORM actually emits — with and without `TABLE`, with and without
+    /// backticks, qualified and bare — and must refuse to guess at anything else
+    /// rather than fire on a statement it half-understood.
+    #[test]
+    fn a_mysql_truncate_statement_resolves_the_table_it_names() {
+        let t = |sql: &str| truncate_target(sql, "appdb");
+        for form in [
+            "TRUNCATE TABLE orders",
+            "truncate table orders",
+            "TRUNCATE orders",
+            "TRUNCATE TABLE `orders`",
+            "TRUNCATE TABLE orders;",
+            "  TRUNCATE   TABLE   orders  ",
+        ] {
+            assert_eq!(
+                t(form),
+                Some(("appdb".to_string(), "orders".to_string())),
+                "a bare name takes the EVENT's database: {form}"
+            );
+        }
+        assert_eq!(
+            t("TRUNCATE TABLE `other`.`orders`"),
+            Some(("other".to_string(), "orders".to_string())),
+            "a qualified name carries its OWN schema — a cross-database truncate \
+             must not be attributed to the event's database"
+        );
+        assert_eq!(
+            t("TRUNCATE other.orders"),
+            Some(("other".to_string(), "orders".to_string()))
+        );
+
+        // Not a truncate, and — just as important — not a shape this reader claims
+        // to understand. Guessing would fail runs on statements it misread.
+        for other in [
+            "COMMIT",
+            "BEGIN",
+            "DELETE FROM orders",
+            "DROP TABLE orders",
+            "TRUNCATE TABLE orders PARTITION (p0)",
+        ] {
+            assert_eq!(t(other), None, "must not fire on: {other}");
+        }
+
+        let msg = truncate_refusal_message("appdb", "orders");
+        assert!(
+            msg.contains("appdb.orders") && msg.contains("mode: full"),
+            "the refusal must name the table AND the re-snapshot that recovers: {msg}"
+        );
+        assert!(
+            truncate_refusal_message("", "orders").contains("`orders`"),
+            "a schema-less identity must not render a leading dot"
+        );
+    }
+
     /// The refusal message IS the remediation — an operator has nothing else to go
     /// on, because the alternative to this error was a green run with missing rows.
     /// The refusal must be TABLE-ADDRESSED. Every arm here was a live failure

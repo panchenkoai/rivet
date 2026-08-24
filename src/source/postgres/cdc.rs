@@ -70,6 +70,9 @@ pub(crate) struct PgChangeStream {
     /// Rendered LSN of the last frontier advance — the zero-yield release
     /// target. `take()`n once at exhaust.
     frontier_text: Option<String>,
+    /// The `table:` values this run captures — what a TRUNCATE is checked against
+    /// before it is allowed to fail the run. See [`truncate_is_ours`].
+    configured_tables: Vec<String>,
 }
 
 /// The run-start warning emitted when a logical replication slot has to be
@@ -468,6 +471,7 @@ impl PgChangeStream {
             bound,
             yielded_data: false,
             frontier_text: None,
+            configured_tables: configured_tables.to_vec(),
         })
     }
 
@@ -540,6 +544,18 @@ impl PgChangeStream {
             } else if data.starts_with("BEGIN") {
                 tx.clear();
                 tx_bytes = 0;
+            } else if let Some((schema, table)) = truncate_target(&data) {
+                // A TRUNCATE carries no rows, so the parser below has nothing to
+                // build and dropped it silently — leaving the destination holding
+                // rows the source no longer has, with no DELETE to retract them
+                // and no later capture able to reconcile it.
+                if truncate_is_ours(&schema, &table, &self.configured_tables) {
+                    anyhow::bail!(truncate_refusal_message(&schema, &table));
+                }
+                // Another table's truncate: the routing filter would drop its rows
+                // anyway, so failing here would make one truncated table an outage
+                // for every export on this server — the MySQL undecodable-rows
+                // guard's measured lesson, applied before it could bite again.
             } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
                 tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
                 tx.push(ev);
@@ -783,6 +799,65 @@ fn split_qualified_ident(qual: &str) -> (String, String) {
         Some(i) => (unquote_ident(&qual[..i]), unquote_ident(&qual[i + 1..])),
         None => (String::new(), unquote_ident(qual)),
     }
+}
+
+/// The relation a `test_decoding` TRUNCATE line names, or `None` if the line is
+/// not a TRUNCATE.
+///
+/// `TRUNCATE` is decoded (PostgreSQL 11+) and rendered as
+/// `table public.t: TRUNCATE: (no-flags)`, but it carries NO rows — so
+/// [`parse_test_decoding`], which builds a change out of the column list, has
+/// nothing to return and dropped the line into its catch-all `None`. Measured
+/// 2026-08-24 on the pg14 stand: 2 inserts then a TRUNCATE left the source table
+/// EMPTY while the run reported `status: success, rows: 2` and wrote both inserts
+/// to the destination. Not one line about it at `RUST_LOG=trace` either — zero
+/// occurrences of the word.
+///
+/// That divergence is permanent. The rows left the source with no DELETE events
+/// to carry them, so no later capture can reconcile the destination back: the
+/// stream is now describing a table state that never existed.
+pub(crate) fn truncate_target(data: &str) -> Option<(String, String)> {
+    let (qual, tail) = data
+        .strip_prefix("table ")
+        .and_then(|s| s.split_once(": "))?;
+    tail.starts_with("TRUNCATE")
+        .then(|| split_qualified_ident(qual))
+}
+
+/// Refuse a TRUNCATE on a captured table, naming why re-running cannot fix it.
+///
+/// Loud, not a warning: this is an UNRECOVERABLE divergence, and the repo's rule
+/// is that those fail rather than degrade. A warning would leave a destination
+/// that silently disagrees with the source forever, which is the outcome the
+/// `unknown -> default` shape exists to prevent.
+pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    format!(
+        "pg cdc: `{qualified}` was TRUNCATEd, and this reader cannot represent that as a \
+         change. Skipping it would leave every row the truncate removed sitting in the \
+         destination with no DELETE to retract it — the source empty, the destination \
+         not, permanently, because those rows left the source without events and no \
+         later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
+         re-establish the baseline, then resume CDC from a fresh checkpoint."
+    )
+}
+
+/// Is a TRUNCATE this run's problem? Same asymmetry as the MySQL undecodable-rows
+/// guard, and for the same measured reason: one server's stream carries every
+/// table's changes, so refusing without asking whose relation it is makes one
+/// truncated table an outage for exports that never read it.
+///
+/// Empty `configured` means "capture whatever the stream emits", which makes every
+/// truncate ours.
+pub(crate) fn truncate_is_ours(schema: &str, table: &str, configured: &[String]) -> bool {
+    configured.is_empty()
+        || configured
+            .iter()
+            .any(|c| crate::source::cdc::sink::table_matches(c, schema, table))
 }
 
 /// Parse one `test_decoding` line into a canonical change, or `None` for the
@@ -1317,6 +1392,75 @@ fn parse_pg_timestamp(val: &str) -> RivetValue {
 mod tests {
 
     use super::*;
+
+    /// The TRUNCATE recogniser and its addressing, graded offline.
+    ///
+    /// The live test proves the seam; this proves the branches, including the two
+    /// that a live fixture cannot reach cheaply — a bare (schema-less) config name,
+    /// and the empty-config case `rivet cdc` without `--table` takes.
+    #[test]
+    fn a_truncate_is_recognised_and_refused_only_for_the_captured_tables() {
+        assert_eq!(
+            truncate_target("table public.orders: TRUNCATE: (no-flags)"),
+            Some(("public".to_string(), "orders".to_string())),
+            "the exact line test_decoding emits (measured on pg14) must be recognised"
+        );
+        assert_eq!(
+            truncate_target("table \"My Schema\".\"Odd.Name\": TRUNCATE: (no-flags)"),
+            Some(("My Schema".to_string(), "Odd.Name".to_string())),
+            "a quoted identifier must unquote like every other wire identity (#279) — \
+             a dot INSIDE quotes is part of the name, not the qualifier split"
+        );
+        assert_eq!(
+            truncate_target("table public.orders: INSERT: id[integer]:1"),
+            None,
+            "an ordinary change must NOT be mistaken for a truncate"
+        );
+        assert_eq!(
+            truncate_target("COMMIT 123"),
+            None,
+            "markers are not truncates"
+        );
+        // `TRUNCATED` would be a different word; the guard must not fire on a
+        // table whose row happens to start with the prefix in another position.
+        assert_eq!(
+            truncate_target("table public.t: DELETE: id[integer]:1"),
+            None,
+            "DELETE stays a change — the guard is for the op with NO rows"
+        );
+
+        let cfg = vec!["public.orders".to_string()];
+        assert!(
+            truncate_is_ours("public", "orders", &cfg),
+            "our own table must fail the run — the divergence it leaves is permanent"
+        );
+        assert!(
+            !truncate_is_ours("public", "audit", &cfg),
+            "another table's truncate must NOT fail this run: the slot decodes the \
+             whole database, so refusing would make one truncated table an outage \
+             for every export on it (the MySQL undecodable-rows lesson, #281)"
+        );
+        assert!(
+            truncate_is_ours("public", "audit", &[]),
+            "`rivet cdc` with no --table captures whatever the stream emits"
+        );
+        assert!(
+            truncate_is_ours("otherschema", "orders", &["orders".to_string()]),
+            "a bare config name matches any schema, exactly as sink::table_matches \
+             routes it — a guard asking a different question protects the wrong set"
+        );
+
+        let msg = truncate_refusal_message("public", "orders");
+        assert!(
+            msg.contains("public.orders") && msg.contains("mode: full"),
+            "the refusal must name the table AND the re-snapshot that recovers from \
+             it; a bail with no way forward just moves the operator's problem: {msg}"
+        );
+        assert!(
+            truncate_refusal_message("", "orders").contains("`orders`"),
+            "a schema-less identity must not render a leading dot"
+        );
+    }
 
     /// The guard's whole decision surface, one case per relkind that behaves
     /// differently. Every arm was MEASURED on the pg14 stand (2026-08-24) rather

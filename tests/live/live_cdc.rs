@@ -3685,6 +3685,183 @@ fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
     );
 }
 
+/// A TRUNCATE on a captured table must FAIL the run, not vanish.
+///
+/// `test_decoding` renders it as `table public.t: TRUNCATE: (no-flags)` — a line
+/// with no columns, so the parser that builds a change out of the column list had
+/// nothing to return and dropped it into its catch-all `None`. The
+/// `unknown -> default` shape the CDC evidence audit found on all four engines.
+///
+/// Measured before the guard (2026-08-24, pg14 stand — this test's RED):
+/// 2 inserts then a TRUNCATE left the source table EMPTY while the run reported
+/// `status: success, rows: 2` and wrote both inserts to the destination. Zero
+/// occurrences of the word at `RUST_LOG=trace` — not a quiet log, no log.
+///
+/// The divergence is PERMANENT, which is why this bails rather than warns: the
+/// rows left the source with no DELETE events to carry them, so no later capture
+/// can reconcile the destination back. A warning would leave a destination that
+/// disagrees with its source forever and call the run a success.
+///
+/// Isolated in its OWN database (see `CdcDb`): the slot decodes the whole DB, so
+/// a parallel test's TRUNCATE on the shared one would fail this run instead.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
+    let cdc_db = CdcDb::new("cdc_trunc");
+    let tbl = unique_name("rivet_cdc_tr").to_lowercase();
+    let other = unique_name("rivet_cdc_trother").to_lowercase();
+    let slot = unique_name("rivet_trunc_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {other} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {tbl}"), &[]).unwrap();
+    // The SOURCE oracle, asked of PostgreSQL: the truncate really emptied it, so
+    // any row in the destination is a row that does not exist.
+    let source_rows: i64 = c
+        .query_one(&format!("SELECT count(*) FROM {tbl}"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        source_rows, 0,
+        "the fixture's TRUNCATE must have emptied it"
+    );
+
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot).source_url(cdc_db.url());
+    let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a TRUNCATE on a captured table must fail the run — shipping the 2 inserts \
+         as a success leaves them in the destination with nothing to retract them. \
+         Output:\n{said}"
+    );
+    assert!(
+        said.contains("TRUNCATE") && said.contains("mode: full"),
+        "the refusal must name what happened AND the re-snapshot that recovers \
+         from it — a bail with no way forward just moves the operator's problem. \
+         Output:\n{said}"
+    );
+
+    // ── and it must be TABLE-ADDRESSED ────────────────────────────────────────
+    //
+    // The slot decodes the whole DATABASE, so this TRUNCATE is in the stream every
+    // other export on it reads. Failing without asking whose relation it is makes
+    // one truncated table an outage for exports that never touch it — the MySQL
+    // undecodable-rows guard's measured lesson (#281), pinned here before it could
+    // bite again. This export is anchored on the SAME slot span that holds the
+    // truncate, so the event is inside its window by construction.
+    let other_slot = unique_name("rivet_trunc_slot_b").to_lowercase();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&other_slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {other} VALUES (7,70)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {tbl}"), &[]).unwrap();
+    let bystander = Rig::pg_cdc(&format!("public.{other}"), &other_slot).source_url(cdc_db.url());
+    let rows: usize = bystander.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 1,
+        "an export that does not capture the truncated table must complete and \
+         capture its own change"
+    );
+}
+
+/// MySQL peer of `roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging`,
+/// and the same divergence by a DIFFERENT route: a TRUNCATE is logged as a QUERY
+/// event, never as rows, so the rows path never sees it and the `_ => {}` arm
+/// dropped it silently.
+///
+/// Measured before the guard (2026-08-24, rivet-mysql-cdc-1): 2 inserts then a
+/// TRUNCATE left the source table EMPTY while the run reported
+/// `status: success, rows: 2`.
+///
+/// The engines differ in the mechanism and agree on the outcome, which is why
+/// both cells are `test` in the fail-loud ledger rather than one being inferred
+/// from the other. SQL Server needs neither: it REFUSES the truncate itself
+/// (Msg 4711 on a CDC-enabled table), so the divergence cannot be created.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_mtr");
+    let other = unique_name("cdc_mtrother");
+    let mut c = conn();
+    for t in [&tbl, &other] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let _g1 = Table(tbl.clone());
+    let _g2 = Table(other.clone());
+
+    let ck = d.path().join("tr.ckpt");
+    let rig = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ck.to_path_buf())
+            .dest_path(d.path().join("out"))
+    };
+    rig().run_ok(); // anchor before the truncate lands
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+    c.query_drop(format!("TRUNCATE {tbl}")).unwrap();
+    // The SOURCE oracle: the truncate really emptied it, so any row the run ships
+    // is a row that does not exist.
+    let left: Option<i64> = c
+        .query_first(format!("SELECT count(*) FROM {tbl}"))
+        .unwrap();
+    assert_eq!(left, Some(0), "the fixture's TRUNCATE must have emptied it");
+
+    let msg = rig().run_expect_fail();
+    assert!(
+        msg.contains("TRUNCATE") && msg.contains("mode: full"),
+        "the run must refuse and name both what happened and the re-snapshot that \
+         recovers from it — shipping the 2 inserts as a success leaves them in the \
+         destination with nothing to retract them. Got: {msg}"
+    );
+
+    // Table-addressed, same as the undecodable-rows guard beside it (#281): the
+    // binlog carries every table on the server, so an export that does not capture
+    // the truncated table must still complete. Anchored BEFORE the truncate, so
+    // the event is inside its window by construction rather than by timing.
+    let other_ck = d.path().join("tr_other.ckpt");
+    let other_rig = || {
+        Rig::mysql_cdc(&other)
+            .checkpoint_path(other_ck.to_path_buf())
+            .dest_path(d.path().join("out_other"))
+    };
+    other_rig().run_ok();
+    c.query_drop(format!("INSERT INTO {other} VALUES (7,70)"))
+        .unwrap();
+    c.query_drop(format!("TRUNCATE {tbl}")).unwrap();
+    let rows: usize = other_rig()
+        .run_and_read()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        rows, 1,
+        "an export that does not capture the truncated table must complete and \
+         capture its own change"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,
