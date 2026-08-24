@@ -148,6 +148,115 @@ pub fn duckdb_parquet_rows(container_dir: &str) -> i64 {
     duckdb_scalar_or_empty(container_dir, "count(*)", "*").unwrap_or(0)
 }
 
+/// The python that resolves a destination's MANIFEST-DECLARED parts, shared by
+/// every `*_declared` helper below.
+///
+/// A `**/*.parquet` glob answers "what does the destination HOLD"; every
+/// consumer — `rivet load`, `rivet validate`, reconcile — reads what the run
+/// DECLARED. On a crash/resume cell that difference IS the test: a crashed run
+/// leaves durable parts no manifest names, and a glob counts them as delivered.
+///
+/// Measured 2026-08-23 on a 5-part keyset export of 1000 rows: with one part
+/// dropped from the manifests and its FILE left on disk, the glob read 1000/1000
+/// and PASSED while the declared list read 800 and diverged from the source.
+///
+/// Mirrors `dev/release_oracle/scenarios.py::_manifest_declared_parts` — the same
+/// union over the immutable `manifest-*.json` copies, falling back to the
+/// canonical `manifest.json` only when no copy exists (the sink writes copies for
+/// exactly the repeated-run case where the canonical one is last-writer-wins).
+///
+/// An empty result is an OUTCOME ("nothing was declared"), never a reason to fall
+/// back to the glob — a fallback would restore the blindness this removes.
+const DECLARED_PARTS_PY: &str = r#"
+import json, glob as _g, os
+def _declared(root):
+    copies = sorted(_g.glob(root + "/**/manifest-*.json", recursive=True))
+    if not copies:
+        c = os.path.join(root, "manifest.json")
+        copies = [c] if os.path.isfile(c) else []
+    out = set()
+    for d in copies:
+        try:
+            art = json.load(open(d))
+        except Exception:
+            continue
+        for f in art.get("parts") or []:
+            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
+                continue
+            name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
+            if not name:
+                continue
+            cand = name if os.path.isabs(name) else os.path.join(os.path.dirname(d), name)
+            if os.path.isfile(cand):
+                out.add(cand)
+    return sorted(out)
+"#;
+
+/// One aggregate over only the parts the manifest DECLARES, or `None` when it
+/// declares nothing readable. The manifest-scoped twin of
+/// [`duckdb_scalar_or_empty`] — see [`DECLARED_PARTS_PY`] for why both exist.
+fn duckdb_declared_scalar_or_empty(container_dir: &str, agg: &str, col: &str) -> Option<i64> {
+    let py = format!(
+        r#"{decl}
+import duckdb, json, sys
+files = _declared({dir_repr})
+if not files:
+    sys.stdout.write("null")
+else:
+    con = duckdb.connect()
+    v = con.execute("SELECT {agg} FROM read_parquet(" + repr(files) + ")").fetchone()[0]
+    sys.stdout.write(json.dumps(int(v)))
+"#,
+        decl = DECLARED_PARTS_PY,
+        dir_repr = python_repr(container_dir),
+        agg = agg.replace("{col}", col),
+    );
+    let out = duckdb_run_python(&py);
+    serde_json::from_str::<Option<i64>>(out.trim())
+        .unwrap_or_else(|e| panic!("duckdb declared scalar not an int/null: {e}; raw {out}"))
+}
+
+/// Exact row count AND exact distinct count over the manifest-DECLARED parts.
+///
+/// The manifest-scoped twin of [`duckdb_assert_rows_and_distinct`]. Use this on
+/// any cell where a run may have left parts no manifest names — every crash,
+/// resume, or repeated-run case — and the glob version only where the test is
+/// deliberately asking what the destination HOLDS (orphan/GC cells).
+pub fn duckdb_declared_assert_rows_and_distinct(
+    container_dir: &str,
+    column: &str,
+    expect_rows: i64,
+    expect_distinct: i64,
+    what: &str,
+) {
+    let rows = duckdb_declared_scalar_or_empty(container_dir, "count(*)", column).unwrap_or(0);
+    let distinct = duckdb_declared_scalar_or_empty(
+        container_dir,
+        &format!("count(DISTINCT {column})"),
+        column,
+    )
+    .unwrap_or(0);
+    assert_eq!(
+        (rows, distinct),
+        (expect_rows, expect_distinct),
+        "{what}: the MANIFEST-DECLARED parts under {container_dir} hold {rows} rows / \
+         {distinct} distinct {column}, expected {expect_rows}/{expect_distinct}. \
+         Declared, not globbed: a crashed run leaves durable parts no manifest names, \
+         and no consumer will ever read those"
+    );
+}
+
+/// [`duckdb_declared_assert_rows_and_distinct`] for the common "no loss AND no
+/// duplication" claim, where both numbers are the same.
+pub fn duckdb_declared_assert_complete(
+    container_dir: &str,
+    column: &str,
+    expected: i64,
+    what: &str,
+) {
+    duckdb_declared_assert_rows_and_distinct(container_dir, column, expected, expected, what);
+}
+
 /// One aggregate over every parquet under `container_dir`, or `None` when the
 /// directory holds NO parquet at all.
 ///

@@ -1889,6 +1889,14 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
         1,
         "a schema-qualified table: must capture, not 0-row-success"
     );
+    // rivet's own count and an INDEPENDENT read of the parts the manifest DECLARES
+    // must agree. The count alone is the product grading itself: a routing bug that
+    // drops the event and a summary bug that reports one are the same number here.
+    assert_eq!(
+        cdc_id_ops(&out),
+        vec![(1, "insert".to_string())],
+        "the DECLARED parts must hold the captured change, not just the summary count"
+    );
 }
 
 // Roast finding #25: the snapshot synth export INHERITED skip_empty — an
@@ -3567,6 +3575,59 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
 /// own database makes the slot see only this test's WAL — parallel-safe by
 /// construction, no `--test-threads=1` needed. Dropped (backends terminated) on
 /// teardown; the table + slot live inside it, so no separate guards are needed.
+/// The manifest-scoped oracle must DISAGREE with the glob when a manifest
+/// under-declares — otherwise adding it changed nothing.
+///
+/// A self-test of the harness, not of rivet, and deliberately so: every ledger in
+/// this repo grades whether a test EXISTS, and the CDC evidence audit's finding
+/// was that a glob-based read-back cannot fail against the defect it names. A new
+/// oracle asserted with no proof that it bites is the same defect one layer up.
+///
+/// The fixture is the shape a crash leaves behind: two durable parts, one of them
+/// named by no manifest. `duckdb_declared_*` must read only the declared part;
+/// the glob reads both. If these two ever agree here, the declared reader has
+/// silently fallen back to globbing and every cell that trusts it is vacuous.
+#[test]
+#[ignore = "live: requires the rivet-duckdb container"]
+fn the_declared_parts_oracle_reads_short_of_the_glob_when_a_manifest_under_declares() {
+    let (host, container) = live_shared_workdir(&unique_name("declared_selftest"));
+
+    // Two parts, ids 1..=3 and 4..=6 — both DURABLE on disk.
+    for (name, ids) in [("part-a.parquet", 1..=3i64), ("part-b.parquet", 4..=6i64)] {
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let col = std::sync::Arc::new(arrow::array::Int64Array::from(ids.collect::<Vec<_>>()));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let f = std::fs::File::create(host.join(name)).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+    // The manifest declares ONLY part-a — part-b is the orphan a crash leaves.
+    std::fs::write(
+        host.join("manifest.json"),
+        serde_json::json!({
+            "parts": [{ "path": "part-a.parquet", "status": "committed" }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        duckdb_parquet_rows(&container),
+        6,
+        "the glob must read BOTH parts — if it does not, the fixture is inert and \
+         the disagreement below proves nothing"
+    );
+    duckdb_declared_assert_complete(
+        &container,
+        "id",
+        3,
+        "the declared reader must see only the manifest's part",
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,
