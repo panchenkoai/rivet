@@ -152,11 +152,7 @@ async fn server_identity(
     client: &mongodb::Client,
     db: &str,
 ) -> std::result::Result<mongodb::bson::Document, mongodb::error::Error> {
-    match client
-        .database(db)
-        .run_command(doc! { "hello": 1 })
-        .await
-    {
+    match client.database(db).run_command(doc! { "hello": 1 }).await {
         Ok(d) => Ok(d),
         Err(hello_err) => client
             .database(db)
@@ -780,8 +776,7 @@ mod tests {
             .expect_err("a bounded run with no ceiling must refuse, not run forever")
             .to_string();
         assert!(
-            err.to_lowercase().contains("never terminate")
-                && err.contains("until_current: false"),
+            err.to_lowercase().contains("never terminate") && err.contains("until_current: false"),
             "the refusal must say what would happen (the run does not end — it does \
              not merely finish late, the way the SQL engines would) AND name the \
              setting that accepts continuous streaming instead: {err}"
