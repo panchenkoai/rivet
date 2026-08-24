@@ -690,6 +690,27 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     Ok(conn)
 }
 
+/// Remove `/* … */` comment spans, leaving a space so tokens never fuse.
+///
+/// Not a general SQL lexer: a `/*` inside a string literal is not something a
+/// TRUNCATE statement can contain (it takes only identifiers), so the simple scan
+/// is exact for this one shape and the parser refuses anything it cannot read
+/// confidently anyway.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => return out, // unterminated — everything after is comment
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The table a `TRUNCATE` QUERY event names, as `(schema, table)` — schema from
 /// the statement's qualifier when it has one, else the event's own database.
 ///
@@ -705,7 +726,17 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
 /// returns `None` and falls through to the old behaviour, which is what it was
 /// before this existed.
 pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, String)> {
-    let t = sql.trim().trim_end_matches(';').trim();
+    // Strip `/* … */` comments before tokenising. An adversarial pass predicted a
+    // hole here (sqlcommenter / Flyway / Rails append one to every statement) and
+    // MEASURING it did NOT reproduce: `SHOW BINLOG EVENTS` renders a trailing
+    // `/* xid=N */` that the QUERY event's own `query()` does not carry, and four
+    // live forms — trailing comment, leading comment, backticked, db-qualified —
+    // all refuse correctly on the 8.0 stand. Handled anyway because the cost is a
+    // few lines and the failure mode is a SILENT divergence: if any server version
+    // or client setting does deliver the text, this is the difference between a
+    // refusal and rows quietly left behind.
+    let stripped = strip_sql_comments(sql);
+    let t = stripped.trim().trim_end_matches(';').trim();
     let mut w = t.split_whitespace();
     if !w.next()?.eq_ignore_ascii_case("truncate") {
         return None;
@@ -908,6 +939,30 @@ mod tests {
         assert_eq!(
             t("TRUNCATE other.orders"),
             Some(("other".to_string(), "orders".to_string()))
+        );
+
+        // Comment forms. The prediction that these were a live hole did NOT
+        // reproduce (the QUERY event's `query()` does not carry the `/* xid=N */`
+        // that SHOW BINLOG EVENTS renders, and four live forms all refused
+        // correctly), so this is insurance rather than a fix — but it is the kind
+        // of insurance worth having, because the failure mode is a silent
+        // divergence rather than an error.
+        for form in [
+            "TRUNCATE TABLE orders /* xid=892514 */",
+            "TRUNCATE TABLE orders /*controller='orders',action='purge'*/",
+            "/*route=purge*/ TRUNCATE TABLE orders",
+            "TRUNCATE /*odd*/ TABLE orders",
+        ] {
+            assert_eq!(
+                t(form),
+                Some(("appdb".to_string(), "orders".to_string())),
+                "a comment must not hide a truncate: {form}"
+            );
+        }
+        // An UNTERMINATED comment must not resurrect the tail as a table name.
+        assert_eq!(
+            t("TRUNCATE TABLE orders /* never closed"),
+            Some(("appdb".to_string(), "orders".to_string()))
         );
 
         // Not a truncate, and — just as important — not a shape this reader claims
