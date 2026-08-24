@@ -43,22 +43,24 @@ def declared_parts(root: str) -> list[str]:
 
 
 SQL = """
--- Debezium's envelope: {payload:{op,before,after,source:{table,...}}}, or the
--- unwrapped form when `transforms=unwrap` is configured. Both are handled, and an
--- event matching NEITHER shape raises rather than being silently dropped — a
--- lenient normaliser would reintroduce the class this harness exists to catch.
+-- Debezium Server's http sink with `format.value=json` and schemas disabled emits
+-- the row envelope FLAT: {after, before, op, source}. The enveloped
+-- {payload:{...}} shape appears when schemas are enabled, so both are accepted —
+-- and an event matching NEITHER surfaces as UNKNOWN rather than being dropped. A
+-- normaliser that silently skips what it does not understand would reintroduce the
+-- exact class this harness exists to catch.
 CREATE OR REPLACE VIEW dbz AS
 SELECT
-  CASE coalesce(payload.op, op)
+  CASE op
     WHEN 'c' THEN 'insert' WHEN 'r' THEN 'insert'
     WHEN 'u' THEN 'update' WHEN 'd' THEN 'delete'
-    WHEN 't' THEN 'truncate' ELSE 'UNKNOWN' END           AS op,
-  CAST(coalesce(payload.after, after)[{key}] AS VARCHAR)   AS k
-FROM read_json_auto('{dbz}', union_by_name=true, ignore_errors=false);
+    WHEN 't' THEN 'truncate' ELSE 'UNKNOWN' END AS op,
+  CAST(coalesce(after.__KEY__, before.__KEY__) AS VARCHAR) AS k
+FROM read_json_auto('__DBZ__', union_by_name=true, ignore_errors=false);
 
 CREATE OR REPLACE VIEW riv AS
-SELECT __op AS op, CAST({key} AS VARCHAR) AS k
-FROM read_parquet({parts});
+SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k
+FROM read_parquet(__PARTS__);
 """
 
 
@@ -82,8 +84,10 @@ def main() -> int:
         ops = ", ".join(f"'{o}'" for o in a.exclude_op)
         where = f" WHERE op NOT IN ({ops})"
 
-    sql = SQL.format(dbz=a.debezium_jsonl, key=a.key,
-                     parts="[" + ", ".join(f"'{p}'" for p in parts) + "]")
+    # Explicit replace, not str.format: the SQL contains DuckDB struct braces.
+    sql = (SQL.replace("__DBZ__", a.debezium_jsonl)
+              .replace("__KEY__", a.key)
+              .replace("__PARTS__", "[" + ", ".join(f"'{p}'" for p in parts) + "]"))
     sql += f"""
 SELECT 'rivet-only' AS side, op, k FROM (SELECT * FROM riv{where} EXCEPT SELECT * FROM dbz{where})
 UNION ALL
