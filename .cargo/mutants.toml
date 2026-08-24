@@ -439,6 +439,17 @@ exclude_re = [
     # refusal half) — both run by hand on the same date. Excluded here rather than
     # left MISSED, because an operator-shaped entry that IS graded live is the
     # honest form; what would be wrong is an ungraded decision hiding in glue.
-    "replace match guard with true in MysqlChangeStream::fill",
-    "replace match guard with false in MysqlChangeStream::fill",
+    # The mutant NAME embeds the guard EXPRESSION between "match guard" and
+    # "with true/false", so a pattern written as `replace match guard with true in
+    # …` matches nothing. The gate caught that as a DEAD exclusion — which is the
+    # right verdict and exactly the failure mode a hand-written regex has here
+    # (an over-escaped one earlier in this session matched nothing too, and would
+    # have left the gate red while looking handled).
+    #
+    # Anchored on the guard's own call instead. Both directions are graded LIVE by
+    # roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging: `true`
+    # fails its bystander half (an export that does not capture the truncated
+    # table must still complete), `false` fails the refusal half. Run by hand
+    # 2026-08-24, mutant applied and reverted each time.
+    "replace match guard truncate_target.*MysqlChangeStream::fill",
 ]
