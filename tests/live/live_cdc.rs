@@ -3683,6 +3683,113 @@ fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
         "the corrected run must recover all {source_rows} changes from the \
          un-acked slot — that is what makes the refusal a delay, not a loss"
     );
+
+    // The refusal offers TWO ways out and a message may only promise what
+    // something checks. The partition-by-name route is proven above; this is the
+    // other one — `mode: full` reads THROUGH the parent, because a batch SELECT
+    // resolves partitions the way any query does and never sees a wire identity
+    // at all. Untested, "snapshot the parent with mode: full" would be a remedy
+    // nobody had run — the class CLAUDE.md records as a hint that cannot recover
+    // from the state it is offered in.
+    let snapshot = Rig::pg_batch(&format!("public.{parent}"))
+        .source_url(cdc_db.url())
+        .mode("full");
+    let snapshot_rows: usize = snapshot.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        snapshot_rows, source_rows as usize,
+        "`mode: full` on the partitioned parent must read every row — it is the \
+         second remediation the refusal names, and a message may only promise \
+         what a test has run"
+    );
+}
+
+/// The manifest-scoped read-back must disagree with a glob — asserted through the
+/// READER the CDC tests actually use, not through a sibling helper.
+///
+/// The first version of this test staged parquet and asserted on
+/// `duckdb_declared_assert_complete`. It never called `read_cdc_changes`,
+/// `cdc_id_ops` or `declared_parquet_parts`, so a mutant that undid the whole
+/// commit — `declared_parquet_parts(dir)` back to `files_with_extension(dir,
+/// "parquet")` — left it GREEN. Measured, by an adversarial pass, on exactly that
+/// mutant. It read like proof of the change and proved a different function.
+///
+/// This drives a real CDC run, then removes ONE part from the manifest while
+/// leaving the FILE on disk — the shape a crash leaves — and asserts the reader
+/// every crash/resume cell depends on reads short of the directory.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory() {
+    let cdc_db = CdcDb::new("cdc_declared");
+    let tbl = unique_name("rivet_cdc_decl").to_lowercase();
+    let slot = unique_name("rivet_decl_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    // Two SEPARATE transactions at rollover 1 ⇒ two parts. One part could not
+    // express the difference this test exists to measure.
+    for i in 1..=2i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+        .source_url(cdc_db.url())
+        .cdc("rollover: 1");
+    run_rivet_ok(&rig.config_path());
+    let out = rig.out_dir();
+
+    let before = cdc_id_ops(&out);
+    assert_eq!(
+        before.len(),
+        2,
+        "the fixture must produce TWO parts' worth of rows, or the manifest edit \
+         below cannot express under-declaration: {before:?}"
+    );
+    let files_on_disk = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .count();
+    assert_eq!(files_on_disk, 2, "two committed parts on disk");
+
+    // Under-declare: drop the LAST part from every manifest, leave the file. This
+    // is what a crash between the part write and the manifest write leaves behind.
+    for entry in std::fs::read_dir(&out).unwrap().flatten() {
+        let path = entry.path();
+        let is_manifest = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("manifest") && n.ends_with(".json"));
+        if !is_manifest {
+            continue;
+        }
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if let Some(parts) = doc.get_mut("parts").and_then(|p| p.as_array_mut())
+            && parts.len() > 1
+        {
+            parts.pop();
+        }
+        std::fs::write(&path, doc.to_string()).unwrap();
+    }
+
+    let after = cdc_id_ops(&out);
+    assert!(
+        after.len() < before.len(),
+        "the reader must follow the MANIFEST: both parquet files are still on disk, \
+         so a directory scan reads {} rows either way and reports delivery no \
+         consumer would ever see. Got {after:?} after under-declaring, {before:?} \
+         before",
+        before.len()
+    );
+    assert_eq!(after.len(), 1, "exactly the still-declared part: {after:?}");
 }
 
 /// A TRUNCATE on a captured table must FAIL the run, not vanish.

@@ -498,12 +498,80 @@ pub enum CdcEngine {
     SqlServer,
 }
 
+/// The parts the manifest(s) under `dir` DECLARE as committed — what a consumer
+/// (`rivet load`, `rivet validate`, reconcile) will actually read.
+///
+/// The union across the immutable `manifest-<run_id>.json` copies, falling back to
+/// the canonical `manifest.json` only when no copy exists — the sink writes copies
+/// for exactly the repeated-run case where the canonical one is last-writer-wins.
+///
+/// This is NOT the same set as every `.parquet` under `dir`, and the difference is
+/// the point: a crashed run leaves durable parts no manifest names, so a directory
+/// scan reports rows that no consumer will ever see. The CDC evidence audit graded
+/// three of four engines `glob only` on that read-back; this is what closes it.
+///
+/// A part listed with a non-`committed` status is skipped — in-flight is not
+/// delivered.
+pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut copies: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("manifest-") && n.ends_with(".json"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    copies.sort();
+    if copies.is_empty() && dir.join("manifest.json").is_file() {
+        copies.push(dir.join("manifest.json"));
+    }
+    let mut declared = Vec::new();
+    for m in &copies {
+        let Ok(text) = std::fs::read_to_string(m) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        for part in doc
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            let committed = part
+                .get("status")
+                .and_then(|s| s.as_str())
+                .is_none_or(|s| s == "committed");
+            if !committed {
+                continue;
+            }
+            if let Some(name) = part.get("path").and_then(|p| p.as_str()) {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    declared.push(cand);
+                }
+            }
+        }
+    }
+    declared.sort();
+    declared.dedup();
+    declared
+}
+
 /// Read every CDC change (`id, v, __op, __pos, __seq`) from the `.parquet`
 /// parts under `dir`.
 pub fn read_cdc_changes(dir: &Path) -> Vec<CdcChange> {
     use arrow::array::{Array, AsArray};
     let mut out = Vec::new();
-    for path in files_with_extension(dir, "parquet") {
+    // DECLARED, not globbed. A crashed run leaves durable parts no manifest names,
+    // and every consumer reads what the run declared — so a directory scan here
+    // reports rows nobody will ever see, which is exactly the defect the crash and
+    // resume cells using this reader exist to catch. See `declared_parquet_parts`.
+    for path in declared_parquet_parts(dir) {
         for batch in reader(&path) {
             let b = batch.unwrap();
             // Int32 OR Int64 → i64: an `INT` source column lands as Int32 in
@@ -699,7 +767,10 @@ pub struct MongoCdcChange {
 pub fn read_mongo_cdc_changes(dir: &Path) -> Vec<MongoCdcChange> {
     use arrow::array::{Array, AsArray};
     let mut out = Vec::new();
-    for path in files_with_extension(dir, "parquet") {
+    // DECLARED, not globbed — same reason as `read_cdc_changes`: this is Mongo's
+    // read-back on every crash and resume cell, and a crashed run's orphan parts
+    // are exactly what a directory scan would count as delivered.
+    for path in declared_parquet_parts(dir) {
         for batch in reader(&path) {
             let b = batch.unwrap();
             let s = |n: &str| {

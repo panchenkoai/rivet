@@ -177,7 +177,7 @@ fn a_sound_cell_cites_where_the_evidence_lives() {
 /// or the win is not banked and drifts back.
 #[test]
 fn unsound_cells_only_ever_shrink() {
-    const CEILING: usize = 24;
+    const CEILING: usize = 20;
     let engines = cdc_engines();
     let m = matrix();
     let mut unsound: BTreeMap<String, Vec<String>> = BTreeMap::new();
