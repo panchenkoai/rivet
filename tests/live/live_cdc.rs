@@ -3567,6 +3567,124 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
 /// own database makes the slot see only this test's WAL — parallel-safe by
 /// construction, no `--test-threads=1` needed. Dropped (backends terminated) on
 /// teardown; the table + slot live inside it, so no separate guards are needed.
+/// A PARTITIONED parent must be refused at OPEN — before the slot is acked past
+/// changes no event could ever route.
+///
+/// The second half of #279. That fix taught the reader to UNQUOTE the wire
+/// identity; this one compares that identity to what the CONFIG asked for, the
+/// cross-check the SQL Server arm has carried since the capture-instance find
+/// (`mssql/cdc.rs`). The reachable shape is not a mixed-case name — the schema
+/// probe (`SELECT * FROM {table}`) already fails loudly on those — it is a
+/// partitioned table, where the probe succeeds PERFECTLY (the parent has a full,
+/// correct column list) and `test_decoding` then names the PARTITION every row
+/// physically landed in.
+///
+/// Measured before the guard (2026-08-24, pg14 stand — this test's RED):
+/// 2 committed rows → `status: success`, `rows: 0`, `files: 0`, slot
+/// `0/AE5F8BB8` → `0/AE6010D8`, and `pg_logical_slot_peek_changes` EMPTY
+/// afterwards. Re-running with the config corrected to the partition recovered
+/// NOTHING while the source still held both rows. Worse than the SQL Server
+/// case this is modelled on, where the change table's own retention made the
+/// same routing bug a delay: here PostgreSQL frees the WAL and it is gone.
+///
+/// Isolated in its OWN database (see `CdcDb`): the guard reads `pg_class`, and
+/// the assertion is about a slot position a parallel test's WAL would perturb.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
+    let cdc_db = CdcDb::new("cdc_part");
+    let slot = unique_name("rivet_part_slot");
+    let parent = unique_name("rivet_cdc_par").to_lowercase();
+    let part = format!("{parent}_2026_01");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {parent} (id BIGINT NOT NULL, ts DATE NOT NULL, v INT) \
+         PARTITION BY RANGE (ts); \
+         CREATE TABLE {part} PARTITION OF {parent} \
+         FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(
+        &format!("INSERT INTO {parent} VALUES (1,'2026-01-05',10),(2,'2026-01-06',20)"),
+        &[],
+    )
+    .unwrap();
+    // The SOURCE oracle, asked of PostgreSQL itself — never rivet's counters.
+    let source_rows: i64 = c
+        .query_one(&format!("SELECT count(*) FROM {parent}"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(source_rows, 2, "fixture seeded 2 rows through the parent");
+    let before: String = c
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+
+    // The config a user writes: the LOGICAL table. Its schema probe succeeds —
+    // which is exactly why this was silent.
+    let wrong = Rig::pg_cdc(&format!("public.{parent}"), &slot).source_url(cdc_db.url());
+    let out = run_rivet(&["run", "--config", wrong.config_path().to_str().unwrap()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "capturing a partitioned parent must fail at open, not ship a 0-row \
+         success — output:\n{said}"
+    );
+    assert!(
+        said.contains(&part),
+        "the refusal must name the PARTITION `{part}` — listing the partitions is \
+         the remediation, and a user who could guess that would not have hit this. \
+         Output:\n{said}"
+    );
+
+    // The slot must NOT have moved. Failing at open only buys anything if it
+    // happens BEFORE the ack: this assert is the whole difference between a
+    // config error and two rows nobody can get back.
+    let moved: bool = c
+        .query_one(
+            &format!(
+                "SELECT confirmed_flush_lsn <> '{before}'::pg_lsn \
+                 FROM pg_replication_slots WHERE slot_name = $1"
+            ),
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !moved,
+        "the refused run acked the slot anyway — the 2 changes are unreachable \
+         now and the guard bought nothing"
+    );
+
+    // Defer-not-drop: with the partition named, the same slot still holds every
+    // change. Oracle: the parts the MANIFEST declares, re-read — never the
+    // manifest's own `row_count`, and compared to the source count above.
+    let right = Rig::pg_cdc(&format!("public.{part}"), &slot).source_url(cdc_db.url());
+    run_rivet_ok(&right.config_path());
+    let captured: usize = right
+        .read_declared_parts()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        captured, source_rows as usize,
+        "the corrected run must recover all {source_rows} changes from the \
+         un-acked slot — that is what makes the refusal a delay, not a loss"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,

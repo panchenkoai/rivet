@@ -356,7 +356,17 @@ pub(crate) enum CdcEngineOpts {
     /// MySQL replica id (the binlog `server_id`).
     Mysql { server_id: u32 },
     /// PostgreSQL logical slot name.
-    Postgres { slot: String },
+    Postgres {
+        slot: String,
+        /// The `table:` values the CONFIG asked for — the same cross-check the
+        /// SQL Server arm carries, for a different reason.
+        ///
+        /// `test_decoding` names the relation a row PHYSICALLY landed in. A
+        /// PARTITIONED parent stores none, so every change carries a PARTITION's
+        /// name and byte-exact routing drops all of it — while the slot advances,
+        /// which on PostgreSQL makes the loss terminal rather than a delay.
+        configured_tables: Vec<String>,
+    },
     /// SQL Server capture instance (required for `sqlserver://`).
     Mssql {
         capture_instance: Option<String>,
@@ -645,6 +655,15 @@ impl CdcEngine {
                     tls,
                     PeekBound::Unbounded,
                     DrainMode::Continuous, // anchor-only open — never read, no bound to pin
+                    // No routing cross-check here, deliberately. This open exists
+                    // to CREATE the slot and is dropped without reading or
+                    // acking, so it cannot lose anything; the capture open that
+                    // follows carries the tables and bails there. Refusing before
+                    // the anchor would be actively worse for the operator —
+                    // changes written between a bad config and its fix would have
+                    // no slot holding them, whereas a slot created first keeps
+                    // every one of them until the corrected run drains it.
+                    &[],
                 )?);
                 Ok(())
             }
@@ -733,7 +752,10 @@ pub(crate) fn create_change_stream(
                 .context(MYSQL_CDC_HINT)?,
             ))
         }
-        CdcEngineOpts::Postgres { slot } => {
+        CdcEngineOpts::Postgres {
+            slot,
+            configured_tables,
+        } => {
             // A persisted checkpoint proves a prior run happened — if the slot is
             // then MISSING, it was dropped/invalidated and silently recreating it
             // at the current position would skip everything since (a silent gap).
@@ -753,6 +775,7 @@ pub(crate) fn create_change_stream(
                     tls,
                     peek,
                     cfg.drain,
+                    configured_tables,
                 )
                 .context(PG_CDC_HINT)?,
             ))
