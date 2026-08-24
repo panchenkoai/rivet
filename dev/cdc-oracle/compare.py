@@ -51,12 +51,23 @@ SQL = """
 -- exact class this harness exists to catch.
 CREATE OR REPLACE VIEW dbz AS
 SELECT
-  CASE op
+  CASE coalesce(json_extract_string(j, '$.op'), json_extract_string(j, '$.payload.op'))
     WHEN 'c' THEN 'insert' WHEN 'r' THEN 'insert'
     WHEN 'u' THEN 'update' WHEN 'd' THEN 'delete'
     WHEN 't' THEN 'truncate' ELSE 'UNKNOWN' END AS op,
-  CAST(coalesce(after.__KEY__, before.__KEY__) AS VARCHAR) AS k
-FROM read_json_auto('__DBZ__', union_by_name=true, ignore_errors=false);
+  -- `before` is absent from an insert-only capture, and read_json_auto then does
+  -- not create the column at all — referencing it unconditionally is a BINDER
+  -- error, not a NULL. json_extract_string over the raw line is shape-agnostic:
+  -- it survives whichever fields the capture happens to contain, which is the
+  -- point. The harness must not depend on the reference having exercised every op.
+  CAST(coalesce(
+    json_extract_string(j, '$.after.__KEY__'),
+    json_extract_string(j, '$.before.__KEY__'),
+    json_extract_string(j, '$.payload.after.__KEY__'),
+    json_extract_string(j, '$.payload.before.__KEY__')
+  ) AS VARCHAR) AS k
+FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
+      FROM read_text('__DBZ__')) WHERE j <> '';
 
 CREATE OR REPLACE VIEW riv AS
 SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k
@@ -69,14 +80,46 @@ def main() -> int:
     ap.add_argument("--rivet-dir", required=True)
     ap.add_argument("--debezium-jsonl", required=True)
     ap.add_argument("--key", required=True, help="the key column, on both sides")
+    ap.add_argument("--allow-empty-reference", action="store_true",
+                    help="accept a zero-event Debezium capture (asserting BOTH are empty)")
     ap.add_argument("--exclude-op", action="append", default=[],
                     help="an op the two tools legitimately disagree on (see README)")
     a = ap.parse_args()
 
+    # ── the empty-capture guard, and it runs BEFORE any comparison ──────────
+    #
+    # An empty capture and "the two agree" produce the SAME output from a set
+    # difference: nothing. So a Debezium that never started, a sink that never
+    # received, or a rivet run that wrote nothing would all read as agreement —
+    # the harness would be green exactly when it is broken. This session hit that
+    # shape three times (a CI monitor reading "no checks" as pass, a self-test
+    # grading a function it never called, a mutants config whose parse failure
+    # printed an empty list), so it is checked first and refuses rather than warns.
+    #
+    # `--allow-empty-reference` exists for the one legitimate case: asserting that
+    # NEITHER tool captured anything. It must be explicit, because the default has
+    # to be that silence is a failure.
     parts = declared_parts(a.rivet_dir)
     if not parts:
         print(f"FAIL: no manifest-declared parts under {a.rivet_dir} — that is an "
               f"outcome ('nothing was delivered'), not a reason to glob", file=sys.stderr)
+        return 1
+
+    try:
+        dbz_lines = sum(1 for _ in open(a.debezium_jsonl))
+    except OSError as e:
+        print(f"FAIL: the reference capture is unreadable ({e}). An absent file is "
+              f"NOT agreement — it means Debezium never delivered, and comparing "
+              f"against it would report 'no differences' for a harness that did "
+              f"not run.", file=sys.stderr)
+        return 1
+    if dbz_lines == 0 and not a.allow_empty_reference:
+        print(f"FAIL: the reference captured ZERO events ({a.debezium_jsonl}). "
+              f"Empty and 'agrees' are the same set difference, so this refuses "
+              f"instead of passing. Check that Debezium started (config at "
+              f"/debezium/config/, `debezium.format.value` set) and that the sink "
+              f"is reachable from its network. Pass --allow-empty-reference only "
+              f"to assert that NEITHER side captured anything.", file=sys.stderr)
         return 1
 
     where = ""
@@ -111,7 +154,11 @@ ORDER BY 1, 2, 3;
     # DuckDB prints an empty box when a query returns no rows; agreement is the
     # absence of any differing row.
     if not body or "0 rows" in body or body.count("│") == 0:
-        print("AGREE: rivet and Debezium produced the same (op, key) set")
+        # Report the counts that were compared. "AGREE" over two captures whose
+        # sizes are never printed is the same silence this guard exists to remove —
+        # a reader must be able to see the comparison had something to compare.
+        print(f"AGREE: rivet and Debezium produced the same (op, key) set "
+              f"[{len(parts)} declared part(s) vs {dbz_lines} reference event(s)]")
         return 0
     print("DISAGREE — one of the two is wrong, and which is the finding:\n")
     print(body)
