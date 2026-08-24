@@ -109,11 +109,36 @@ shapes:
       `roll_all`). A manifest-scoped oracle reads short and diverges from the source; a
       glob oracle reads the full set and passes. Proven in the batch oracles 2026-08-23:
       source 1000, glob 1000 PASSED, declared 800 CAUGHT.
-    postgres: { gap: "glob only" }
-    mysql:    { sound: "manifest_driven_int_ids — live_cdc_mbt.rs:413 (one caller)" }
-    mssql:    { gap: "glob only" }
-    mongo:    { gap: "glob only" }
-
+    postgres:
+      sound: "the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory
+        (tests/live/live_cdc.rs) drives a real CDC run, removes one part from the
+        manifest while leaving the FILE on disk (the shape a crash leaves), and asserts
+        cdc_id_ops reads SHORT of the directory. It is RED against the mutant that
+        undoes this whole commit (declared_parquet_parts -> files_with_extension) —
+        which the FIRST version of this cell's evidence was not: that test asserted on
+        a sibling duckdb helper and never called the reader it claimed to prove, so the
+        mutant left it green. read_cdc_changes resolves via declared_parquet_parts — the union over the immutable manifest-<run_id>.json
+        copies — so every caller of cdc_id_ops/read_cdc_changes reads what the run
+        DECLARED. Proven to bite before it was wired in:
+        the_declared_parts_oracle_reads_short_of_the_glob_when_a_manifest_under_declares
+        stages two durable parts with one named by no manifest; the glob reads 6, the
+        declared reader 3. Whole CDC live suite re-run after the switch: 157/157."
+    mysql:
+      sound: "same shared reader as postgres (declared_parquet_parts), plus the
+        pre-existing manifest_driven_int_ids — live_cdc_mbt.rs:413."
+    mssql:
+      sound: "same shared reader — live_cdc_mssql.rs's cdc_id_ops/read_cdc_changes
+        call sites (:96, :193, :249) are manifest-scoped by construction now."
+    mongo:
+      sound: "BOTH halves, because an adversarial pass caught the first version of
+        this cell asserting something false. (a) read_mongo_cdc_changes
+        (tests/common/parquet.rs) resolves through declared_parquet_parts like its SQL
+        sibling. (b) The claim that this was 'Mongo's read-back on every crash and
+        resume cell' was WRONG — live_cdc_mongo.rs read through the duckdb GLOB
+        oracles, so the switch changed nothing for the cells that matter. Those nine
+        call sites are now duckdb_declared_distinct_set / duckdb_declared_rows, which
+        read the manifest-declared parts; 43 Mongo live tests green across the
+        4.4 / 5.0 / 8.0 stands afterwards."
   - id: fold_fixture_crosses_its_threshold
     what: >
       Anything that FOLDS or accumulates across parts must be graded over >= 2 parts.
