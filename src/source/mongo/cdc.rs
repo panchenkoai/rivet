@@ -132,6 +132,53 @@ fn past_time_bound(
     until_current && matches!((cluster_time, bound), (Some(ct), Some(b)) if ct > b)
 }
 
+/// The open-time cluster-time bound a `until_current` run MUST have, or a loud
+/// refusal explaining why the run cannot be bounded.
+///
+/// The `.ok()` this replaces swallowed every failure of the `hello` command —
+/// a permission error, a transient network fault, a server that answers without
+/// `operationTime` — and left `until_current_ts` as `None`. That is not a
+/// harmless degradation on MongoDB, and the difference from the other engines is
+/// the whole point:
+///
+/// - PostgreSQL, MySQL and SQL Server keep a CATCH-UP exit (a short/empty peek,
+///   `BINLOG_DUMP_NON_BLOCK`'s EOF, the capture job's scan gap). With the bound
+///   unset they still terminate — late, not never — so failing OPEN there is the
+///   right call, as CLAUDE.md records.
+/// - MongoDB has NO such backstop. `past_time_bound` is `false` for every event
+///   once the bound is `None`, so the only remaining exit is the empty-poll check
+///   — and under sustained writes `next_if_any` keeps returning events, so it
+///   never fires. The run does not terminate late; it does not terminate.
+///
+/// The repo already measured that: disabling the cluster-time pin HANGS
+/// `roast_until_current_terminates_under_sustained_writes_and_keeps_backlog`
+/// (killed at its 30s ceiling). A silent `None` reaches the identical state by
+/// accident, on a config that explicitly asked for a bounded run.
+///
+/// So this refuses. `until_current: false` (the daemon) is unaffected and never
+/// consults the bound.
+pub(crate) fn until_current_bound(
+    until_current: bool,
+    operation_time: Option<mongodb::bson::Timestamp>,
+) -> Result<Option<mongodb::bson::Timestamp>> {
+    if !until_current {
+        return Ok(None);
+    }
+    operation_time.map(Some).ok_or_else(|| {
+        anyhow::anyhow!(
+            "mongo cdc: `until_current: true` needs the cluster time at open, and the \
+             server's `hello` did not return `operationTime` (the command failed, or the \
+             deployment does not report one). Unlike the SQL engines, a MongoDB change \
+             stream has no catch-up exit to fall back on: without this bound the run \
+             would keep draining under any ongoing writes and NEVER terminate, so \
+             continuing would hang rather than finish late. Check the connection's \
+             permissions and that the source is a replica set / sharded cluster (a \
+             standalone reports no operationTime and cannot serve change streams at \
+             all), or set `until_current: false` to stream continuously."
+        )
+    })
+}
+
 /// Persist a resume token as a [`Position`] LOSSLESSLY. A token can carry a BSON
 /// binary `_typeBits` field (for typed sort keys — e.g. an integer `_id`), and a
 /// plain `serde_json` round-trip mangles that binary, so the server rejects it on
@@ -258,7 +305,10 @@ impl MongoChangeStream {
         } else {
             None
         };
-        let until_current_ts = if until_current {
+        // A `until_current` run that cannot pin its ceiling must FAIL, not degrade:
+        // MongoDB has no catch-up exit, so an unset bound means the run never ends.
+        // See `until_current_bound` for why this engine differs from the SQL ones.
+        let operation_time = if until_current {
             session.block_on(async {
                 session
                     .client()
@@ -271,6 +321,7 @@ impl MongoChangeStream {
         } else {
             None
         };
+        let until_current_ts = until_current_bound(until_current, operation_time)?;
         let this = Self {
             session,
             stream,
@@ -641,6 +692,56 @@ mod tests {
         assert!(!idle_poll_stops(Some("8299"), Some("82AB")));
         assert!(!idle_poll_stops(Some("82AB"), Some("82AB")));
         assert!(!idle_poll_stops(None, Some("82AB")));
+    }
+
+    /// `until_current` must REFUSE without its bound, and only then.
+    ///
+    /// Honest about what this can and cannot reach: the live suite CANNOT produce
+    /// the failing input. Every stand is a healthy replica set that answers `hello`
+    /// with an `operationTime`, and making it not do so means faulting the server,
+    /// not the fixture. So the seam is asserted here, at the one function that
+    /// decides — and the branch it guards is pinned by an EXISTING live test from
+    /// the other direction: disabling the cluster-time bind hangs
+    /// `roast_until_current_terminates_under_sustained_writes_and_keeps_backlog`
+    /// (killed at its 30s ceiling), which is precisely the state a silent `None`
+    /// used to reach by accident.
+    #[test]
+    fn until_current_refuses_when_the_cluster_time_bound_is_unavailable() {
+        use mongodb::bson::Timestamp;
+        let ts = Timestamp {
+            time: 1_700_000_000,
+            increment: 3,
+        };
+
+        assert_eq!(
+            until_current_bound(true, Some(ts)).unwrap(),
+            Some(ts),
+            "the ordinary case must pass the bound through untouched"
+        );
+        // The daemon never consults the bound, so a missing operationTime is not
+        // its problem — refusing here would break continuous streaming outright.
+        assert_eq!(
+            until_current_bound(false, None).unwrap(),
+            None,
+            "`until_current: false` streams forever by design and needs no ceiling"
+        );
+        assert_eq!(
+            until_current_bound(false, Some(ts)).unwrap(),
+            None,
+            "the daemon must not carry a bound even when one is available — a stray \
+             ceiling would end a stream that is supposed to run continuously"
+        );
+
+        let err = until_current_bound(true, None)
+            .expect_err("a bounded run with no ceiling must refuse, not run forever")
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("never terminate")
+                && err.contains("until_current: false"),
+            "the refusal must say what would happen (the run does not end — it does \
+             not merely finish late, the way the SQL engines would) AND name the \
+             setting that accepts continuous streaming instead: {err}"
+        );
     }
 
     #[test]
