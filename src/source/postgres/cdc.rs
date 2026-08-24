@@ -597,28 +597,34 @@ fn unquote_ident(raw: &str) -> String {
 /// contain a dot (`"my.schema".t`). A plain `split_once('.')` cuts inside the quotes and
 /// yields two identifiers that never existed.
 fn split_qualified_ident(qual: &str) -> (String, String) {
-    let bytes = qual.as_bytes();
+    // Walked by ITERATOR, not by a hand-rolled index. The index version was
+    // correct, and every mutation of its arithmetic either hung the process
+    // (`i += 1` -> `i -= 1` or `*= 1` never advances) or was equivalent — so the
+    // gate could neither kill those mutants nor learn anything from them. An
+    // advance the code does not write is an advance nothing can break.
     let mut in_quotes = false;
+    let mut escaped = false;
     let mut split_at = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
+    for (i, b) in qual.bytes().enumerate() {
+        if escaped {
+            // The second byte of a doubled quote: consumed as content, and it
+            // cannot open or close anything.
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'"' if in_quotes && qual.as_bytes().get(i + 1) == Some(&b'"') => {
                 // A doubled quote inside a quoted identifier is an escaped quote,
                 // not the end of it.
-                if in_quotes && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                    i += 1;
-                } else {
-                    in_quotes = !in_quotes;
-                }
+                escaped = true;
             }
+            b'"' => in_quotes = !in_quotes,
             b'.' if !in_quotes => {
                 split_at = Some(i);
                 break;
             }
             _ => {}
         }
-        i += 1;
     }
     match split_at {
         Some(i) => (unquote_ident(&qual[..i]), unquote_ident(&qual[i + 1..])),
