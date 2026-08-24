@@ -3575,57 +3575,93 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
 /// own database makes the slot see only this test's WAL — parallel-safe by
 /// construction, no `--test-threads=1` needed. Dropped (backends terminated) on
 /// teardown; the table + slot live inside it, so no separate guards are needed.
-/// The manifest-scoped oracle must DISAGREE with the glob when a manifest
-/// under-declares — otherwise adding it changed nothing.
+/// The manifest-scoped read-back must disagree with a glob — asserted through the
+/// READER the CDC tests actually use, not through a sibling helper.
 ///
-/// A self-test of the harness, not of rivet, and deliberately so: every ledger in
-/// this repo grades whether a test EXISTS, and the CDC evidence audit's finding
-/// was that a glob-based read-back cannot fail against the defect it names. A new
-/// oracle asserted with no proof that it bites is the same defect one layer up.
+/// The first version of this test staged parquet and asserted on
+/// `duckdb_declared_assert_complete`. It never called `read_cdc_changes`,
+/// `cdc_id_ops` or `declared_parquet_parts`, so a mutant that undid the whole
+/// commit — `declared_parquet_parts(dir)` back to `files_with_extension(dir,
+/// "parquet")` — left it GREEN. Measured, by an adversarial pass, on exactly that
+/// mutant. It read like proof of the change and proved a different function.
 ///
-/// The fixture is the shape a crash leaves behind: two durable parts, one of them
-/// named by no manifest. `duckdb_declared_*` must read only the declared part;
-/// the glob reads both. If these two ever agree here, the declared reader has
-/// silently fallen back to globbing and every cell that trusts it is vacuous.
+/// This drives a real CDC run, then removes ONE part from the manifest while
+/// leaving the FILE on disk — the shape a crash leaves — and asserts the reader
+/// every crash/resume cell depends on reads short of the directory.
 #[test]
-#[ignore = "live: requires the rivet-duckdb container"]
-fn the_declared_parts_oracle_reads_short_of_the_glob_when_a_manifest_under_declares() {
-    let (host, container) = live_shared_workdir(&unique_name("declared_selftest"));
-
-    // Two parts, ids 1..=3 and 4..=6 — both DURABLE on disk.
-    for (name, ids) in [("part-a.parquet", 1..=3i64), ("part-b.parquet", 4..=6i64)] {
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let col = std::sync::Arc::new(arrow::array::Int64Array::from(ids.collect::<Vec<_>>()));
-        let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
-        let f = std::fs::File::create(host.join(name)).unwrap();
-        let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-    }
-    // The manifest declares ONLY part-a — part-b is the orphan a crash leaves.
-    std::fs::write(
-        host.join("manifest.json"),
-        serde_json::json!({
-            "parts": [{ "path": "part-a.parquet", "status": "committed" }]
-        })
-        .to_string(),
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory() {
+    let cdc_db = CdcDb::new("cdc_declared");
+    let tbl = unique_name("rivet_cdc_decl").to_lowercase();
+    let slot = unique_name("rivet_decl_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
     )
     .unwrap();
+    // Two SEPARATE transactions at rollover 1 ⇒ two parts. One part could not
+    // express the difference this test exists to measure.
+    for i in 1..=2i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
 
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+        .source_url(cdc_db.url())
+        .cdc("rollover: 1");
+    run_rivet_ok(&rig.config_path());
+    let out = rig.out_dir();
+
+    let before = cdc_id_ops(&out);
     assert_eq!(
-        duckdb_parquet_rows(&container),
-        6,
-        "the glob must read BOTH parts — if it does not, the fixture is inert and \
-         the disagreement below proves nothing"
+        before.len(),
+        2,
+        "the fixture must produce TWO parts' worth of rows, or the manifest edit \
+         below cannot express under-declaration: {before:?}"
     );
-    duckdb_declared_assert_complete(
-        &container,
-        "id",
-        3,
-        "the declared reader must see only the manifest's part",
+    let files_on_disk = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .count();
+    assert_eq!(files_on_disk, 2, "two committed parts on disk");
+
+    // Under-declare: drop the LAST part from every manifest, leave the file. This
+    // is what a crash between the part write and the manifest write leaves behind.
+    for entry in std::fs::read_dir(&out).unwrap().flatten() {
+        let path = entry.path();
+        let is_manifest = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("manifest") && n.ends_with(".json"));
+        if !is_manifest {
+            continue;
+        }
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if let Some(parts) = doc.get_mut("parts").and_then(|p| p.as_array_mut())
+            && parts.len() > 1
+        {
+            parts.pop();
+        }
+        std::fs::write(&path, doc.to_string()).unwrap();
+    }
+
+    let after = cdc_id_ops(&out);
+    assert!(
+        after.len() < before.len(),
+        "the reader must follow the MANIFEST: both parquet files are still on disk, \
+         so a directory scan reads {} rows either way and reports delivery no \
+         consumer would ever see. Got {after:?} after under-declaring, {before:?} \
+         before",
+        before.len()
     );
+    assert_eq!(after.len(), 1, "exactly the still-declared part: {after:?}");
 }
 
 struct CdcDb {

@@ -54,7 +54,7 @@ fn mongo_cdc_capture_resume_and_until_current_drain() {
 
     // until_current must DRAIN the whole backlog and exit (the 4.4 race guard).
     rig.run_ok();
-    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
+    let ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
     assert!(
         ["1", "2", "3"].iter().all(|i| ids.contains(*i)),
         "until_current dropped part of the backlog: got {ids:?}"
@@ -65,7 +65,7 @@ fn mongo_cdc_capture_resume_and_until_current_drain() {
     let rig2 = cdc(&db, "t").checkpoint_path(rig.checkpoint());
     rig2.run_ok();
     assert_eq!(
-        duckdb_parquet_rows(rig2.oracle_dir()),
+        duckdb_declared_rows(rig2.oracle_dir()),
         0,
         "resume must capture only new changes"
     );
@@ -106,12 +106,12 @@ fn mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // crash", where the shared-destination version stayed green.
     rig.resume_into_fresh_dest();
     rig.run_ok();
-    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
+    let ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
     for i in 1..=5 {
         assert!(ids.contains(&i.to_string()), "id {i} lost across the crash");
     }
     assert!(
-        duckdb_parquet_rows(rig.oracle_dir()) >= 5,
+        duckdb_declared_rows(rig.oracle_dir()) >= 5,
         "crash + resume must be at-least-once (superset), not lose rows"
     );
 }
@@ -178,7 +178,7 @@ fn mongo_cdc_idle_first_run_then_change_is_captured() {
     m.upsert_set("t", 42, "v", "after_quiet_enable");
     rig.run_ok();
     assert!(
-        duckdb_distinct_set(rig.oracle_dir(), "_id").contains("42"),
+        duckdb_declared_distinct_set(rig.oracle_dir(), "_id").contains("42"),
         "the change made during a quiet first run must be captured on resume"
     );
 }
@@ -290,7 +290,7 @@ fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table() {
     m.txn_two_collections("orders", 1, "audit", 99);
 
     rig.run_ok();
-    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
+    let ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
     assert!(
         ids.contains("1"),
         "the captured-collection change must appear"
@@ -404,7 +404,7 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
     );
     // The whole pre-open backlog (0..29) must be present — termination must NOT
     // come from dropping the backlog.
-    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
+    let ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
     for i in 0..30 {
         assert!(
             ids.contains(&i.to_string()),
@@ -485,7 +485,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
         "run 2 (no writers) must drain the deferred tail and exit"
     );
 
-    let got = duckdb_distinct_set(rig.oracle_dir(), "_id");
+    let got = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
     let want: std::collections::BTreeSet<String> = m
         .current_state_i64("t", "v")
         .into_keys()
@@ -523,7 +523,7 @@ fn roast_uncaptured_collection_drop_does_not_wedge_capture() {
 
     // Must NOT bail on the drop — both orders changes captured.
     rig.run_ok();
-    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
+    let ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
     assert!(
         ids.contains("1") && ids.contains("2"),
         "captured collection must keep flowing across an uncaptured drop, got: {ids:?}"

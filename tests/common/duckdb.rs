@@ -216,6 +216,45 @@ else:
         .unwrap_or_else(|e| panic!("duckdb declared scalar not an int/null: {e}; raw {out}"))
 }
 
+/// [`duckdb_distinct_set`] over the manifest-DECLARED parts.
+///
+/// The set answers "WHICH", which is what a crash/resume cell needs — and it must
+/// come from what the run declared, not from what the directory holds, because a
+/// crashed run leaves durable parts no manifest names.
+pub fn duckdb_declared_distinct_set(
+    container_dir: &str,
+    column: &str,
+) -> std::collections::BTreeSet<String> {
+    let py = format!(
+        r#"{decl}
+import duckdb, json, sys
+files = _declared({dir_repr})
+if not files:
+    sys.stdout.write(json.dumps([]))
+else:
+    con = duckdb.connect()
+    rows = con.execute(
+        "SELECT DISTINCT CAST({column} AS VARCHAR) AS v FROM read_parquet(" + repr(files) +
+        ") WHERE {column} IS NOT NULL").fetchall()
+    sys.stdout.write(json.dumps([str(r[0]) for r in rows]))
+"#,
+        decl = DECLARED_PARTS_PY,
+        dir_repr = python_repr(container_dir),
+        column = column,
+    );
+    let out = duckdb_run_python(&py);
+    serde_json::from_str::<Vec<String>>(out.trim())
+        .unwrap_or_else(|e| panic!("duckdb declared distinct set: {e}; raw {out}"))
+        .into_iter()
+        .collect()
+}
+
+/// Row count over the manifest-DECLARED parts — the declared twin of
+/// [`duckdb_parquet_rows`].
+pub fn duckdb_declared_rows(container_dir: &str) -> i64 {
+    duckdb_declared_scalar_or_empty(container_dir, "count(*)", "*").unwrap_or(0)
+}
+
 /// Exact row count AND exact distinct count over the manifest-DECLARED parts.
 ///
 /// The manifest-scoped twin of [`duckdb_assert_rows_and_distinct`]. Use this on
