@@ -6968,7 +6968,7 @@ fn roast_pg_cdc_folded_twin_refusal_names_both_relations() {
 /// check (`bare_name_spans_databases`) stays as the backstop for what it cannot.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
-fn roast_mysql_cdc_ambiguity_refusal_matches_the_shared_sentence() {
+fn roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds() {
     let _serial = cross_process_serial("mysql_cdc_ambiguity");
     let table = unique_name("rivet_cdc_amb").to_lowercase();
     let mut c = conn();
@@ -7012,13 +7012,21 @@ fn roast_mysql_cdc_ambiguity_refusal_matches_the_shared_sentence() {
             let _ = rc.query_drop("DROP DATABASE IF EXISTS amb_other");
         }
     }
+    // The LOAD-BEARING parts, not the exact phrase. The shared sentence was the
+    // original goal, and MySQL earned a more precise one: on this engine the
+    // mechanism is a SERVER-WIDE binlog dump, not schema routing inside one
+    // database, and the message says so. Asserting the wording would make this a
+    // spelling checker; what an operator needs is the other relation's name and a
+    // fix they can type.
     assert!(
-        said.contains("could mean") && said.contains(&format!("amb_other.{table}")),
-        "MySQL must refuse with the SHARED sentence and name the other relation — an \
-         operator meeting this class on two engines should not have to learn it \
-         twice. Got:\n{said}"
+        said.contains(&format!("amb_other.{table}")),
+        "the refusal must name the other relation — an operator cannot qualify what \
+         they were not told about. Got:\n{said}"
     );
-    assert!(said.contains("Qualify it"), "and hand over the fix: {said}");
+    assert!(
+        said.to_lowercase().contains("qualify"),
+        "and hand over the fix in the form they must type: {said}"
+    );
 }
 
 /// A TRUNCATE in the SAME transaction as a row change must still refuse.
