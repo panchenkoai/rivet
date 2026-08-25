@@ -1592,6 +1592,29 @@ mod tests {
             vec![("public".to_string(), "odd,name".to_string())],
             "splitting on a quoted comma would invent two relations that do not exist"
         );
+        // A DOUBLED quote is an escaped quote INSIDE the name, not the end of it.
+        // Mutation testing found this: five mutants in `split_top_level_commas`'
+        // escape branch survived, because every quoted fixture above closes its
+        // quote immediately and the escape path was never taken. A name like
+        // `od"d` re-opens the quoted span if the doubling is mishandled, and the
+        // following comma is then read as part of the name — one relation instead
+        // of two, and OUR table silently not among them.
+        assert_eq!(
+            one("table public.\"od\"\"d\", public.b: TRUNCATE: (no-flags)"),
+            vec![
+                ("public".to_string(), "od\"d".to_string()),
+                ("public".to_string(), "b".to_string())
+            ],
+            "a doubled quote is an ESCAPE; mishandling it swallows the separator and \
+             loses every relation after it — including possibly ours"
+        );
+        // …and the same escape inside a name that also carries a comma, which is
+        // where the two rules interact.
+        assert_eq!(
+            one("table public.\"a\"\",b\": TRUNCATE: (no-flags)"),
+            vec![("public".to_string(), "a\",b".to_string())],
+            "escape then comma: still ONE relation"
+        );
 
         assert!(
             one("table public.orders: INSERT: id[integer]:1").is_empty(),

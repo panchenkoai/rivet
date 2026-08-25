@@ -431,7 +431,7 @@ exclude_re = [
     # the same test also RED against the list-parse mutant and the un-addressed
     # refusal. MySQL guard disabled -> roast_mysql_cdc_refuses_a_truncate_instead_of_
     # silently_diverging FAILS, and again against the un-addressed variant.
-    "replace PgChangeStream::fill -> Result",
+"replace PgChangeStream::fill -> Result",
     "replace MysqlChangeStream::fill -> Result",
     # The match GUARD on the MySQL TRUNCATE arm sits inside that same live-only body.
     # Flipping it to `true`/`false` is the addressed/un-addressed pair that the live
