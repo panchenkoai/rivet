@@ -935,3 +935,144 @@ fn mongo_cdc_warns_when_a_configured_collection_does_not_exist() {
         "an existing collection is the ordinary case and must not warn. Got:\n{out}"
     );
 }
+
+/// `rivet cdc --output --format csv` on Mongo — the SUBCOMMAND's text writer over
+/// a JSON document column.
+///
+/// The cdc-cli-surface ledger measured the subcommand's coverage as `mysql 11 of
+/// 13 flags · mssql 4 · postgres 3 · mongo 0`, and this is the Mongo cell worth
+/// closing first. Every other engine's CDC row is flat columns the CSV writer has
+/// seen a thousand times; Mongo's payload is one `document` column holding the
+/// whole BSON as JSON — braces, quotes, commas, and whatever the application put
+/// in a string. That is the CSV writer's hostile input, and the two ways it fails
+/// are the two this repo's csv-fidelity ledger already caught elsewhere: a value
+/// silently truncated, or an un-escaped delimiter splitting one row into two.
+///
+/// The oracle is DuckDB's `read_csv_auto` plus hard-coded expected values —
+/// deliberately NOT the `csv` crate, which is what rivet writes with (one library
+/// round-tripping itself grades the pair's agreement, not the file's correctness),
+/// and deliberately not rivet's own read-back.
+///
+/// FIVE flags are graded here, and each one BITES rather than merely appearing on
+/// the command line — the distinction the ledger's `test` state is worth nothing
+/// without:
+///   `--source`      wrong/absent → no connection, no rows
+///   `--table`       ignored → the neighbouring collection's write appears (5 rows)
+///   `--checkpoint`  ignored → run 2 re-anchors to now and captures 0
+///   `--output`      ignored → NDJSON on stdout, no file to read
+///   `--format csv`  ignored → parquet, and the CSV oracle finds nothing to open
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    use mongodb::bson::doc;
+    let db = unique_name("cdc_cli_csv");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("docs");
+    m.drop_collection("other");
+
+    let d = tempfile::tempdir().expect("tempdir");
+    let ckpt = d.path().join("cli.ckpt");
+    let url = MongoTest::url(PORT, &db);
+    // The destination is the SHARED workdir, not the tempdir: the DuckDB oracle
+    // reads from inside a container, and a path it cannot see reads as zero rows —
+    // the harness bug that looks exactly like data loss.
+    let (host, container) = live_shared_workdir(&unique_name("mongo_cli_csv"));
+
+    // Run 1 pins the resume token. Mongo without a checkpoint starts at the
+    // source's CURRENT position, so a bounded run's open-time snapshot IS its
+    // anchor and nothing written afterwards is in bound — without this leg the
+    // test could only ever capture zero, whatever the writer did.
+    let anchor = run_rivet_args_bounded_env(
+        &[
+            "cdc",
+            "--source",
+            &url,
+            "--table",
+            "docs",
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+        ],
+        &[],
+        std::time::Duration::from_secs(60),
+    );
+    assert!(anchor.is_some(), "the anchoring run did not terminate");
+    assert!(ckpt.is_file(), "run 1 wrote no checkpoint to resume from");
+
+    // The hostile payloads, one per CSV failure mode. The newline is the one that
+    // corrupts silently: un-escaped it splits a row in two, and every count still
+    // looks plausible.
+    m.insert_many(
+        "docs",
+        vec![
+            doc! { "_id": 11_i64, "note": "has,comma" },
+            doc! { "_id": 12_i64, "note": "has\"quote" },
+            doc! { "_id": 13_i64, "note": "line\nbreak" },
+            doc! { "_id": 14_i64, "nested": doc! { "a": 1_i64, "b": [1_i64, 2_i64] } },
+        ],
+    );
+    // A write the config did NOT ask for, so `--table` has something to exclude.
+    m.insert_many("other", vec![doc! { "_id": 99_i64, "note": "not mine" }]);
+
+    let out = run_rivet_args_bounded_env(
+        &[
+            "cdc",
+            "--source",
+            &url,
+            "--table",
+            "docs",
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--output",
+            host.to_str().unwrap(),
+            "--format",
+            "csv",
+        ],
+        &[],
+        std::time::Duration::from_secs(90),
+    );
+    assert!(out.is_some(), "the capturing run did not terminate");
+    assert!(
+        !files_with_extension(&host, "csv").is_empty(),
+        "no .csv here — an oracle that shrugged at an empty set would grade nothing. \
+         This one assert catches TWO of the graded flags, MEASURED: `--format \
+         parquet` leaves the directory holding parquet, and dropping `--checkpoint` \
+         re-anchors run 2 at now, so it captures zero events and the sink writes no \
+         file at all"
+    );
+
+    let v = duckdb_run_sql_json(&format!(
+        "SELECT _id, document FROM read_csv_auto('{container}/**/*.csv', header=true) ORDER BY _id"
+    ));
+    let rows = v["rows"].as_array().cloned().unwrap_or_default();
+    let got: std::collections::BTreeMap<i64, serde_json::Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get(0)?.as_str()?.parse::<i64>().ok()?;
+            let doc: serde_json::Value = serde_json::from_str(r.get(1)?.as_str()?).ok()?;
+            Some((id, doc))
+        })
+        .collect();
+
+    assert_eq!(
+        got.keys().copied().collect::<Vec<_>>(),
+        vec![11, 12, 13, 14],
+        "expected exactly the four documents written to the CONFIGURED collection. \
+         Id 99 is the neighbouring collection and means the routing filter let it \
+         through (`--table` cannot simply be dropped here — the subcommand refuses \
+         `--output` without exactly one, MEASURED, so the mutant that grades this \
+         line is pointing it at `other`, which yields [99]); zero means the \
+         checkpoint never resumed; a row lost or gained anywhere else means the CSV \
+         split. Got: {got:#?}"
+    );
+
+    // Hard-coded expectations, not a re-render of what rivet produced.
+    assert_eq!(got[&11]["note"], serde_json::json!("has,comma"));
+    assert_eq!(got[&12]["note"], serde_json::json!("has\"quote"));
+    assert_eq!(got[&13]["note"], serde_json::json!("line\nbreak"));
+    assert_eq!(got[&14]["nested"], serde_json::json!({"a": 1, "b": [1, 2]}));
+
+    m.drop_collection("docs");
+    m.drop_collection("other");
+}

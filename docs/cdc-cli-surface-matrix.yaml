@@ -28,8 +28,7 @@ flags:
     postgres: { test: "pg_cdc_column_types_match_batch_export and siblings" }
     mysql:    { test: "cdc_full_surface_cross_oracle_matches_literals and siblings" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
-    mongo:    { gap: "the subcommand ACCEPTS a mongodb:// url — verified, it reaches a real
-                connection error rather than an argument error — and no test drives it" }
+    mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column" }
 
   - id: "--source-env"
     postgres: { gap: "resolution is engine-agnostic but only proven on mysql" }
@@ -47,9 +46,11 @@ flags:
     postgres: { test: "driven in the pg cli tests" }
     mysql:    { test: "driven in six mysql cli tests" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
-    mongo:    { gap: "a Mongo collection has no schema qualifier and may contain dots, which is
-                exactly the routing shape that has produced defects on the other three
-                engines — and it is the one engine where the subcommand is unexercised" }
+    mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column — RED-proven by pointing
+                --table at the neighbouring collection (captures [99] instead of [11,12,13,14]).
+                NOTE the flag cannot be dropped on this path at all: the subcommand refuses
+                --output without exactly one --table (MEASURED), so the mutant that grades
+                this cell is a WRONG selection, not an absent flag" }
 
   - id: "--slot"
     postgres: { test: "driven in the pg cli tests" }
@@ -81,21 +82,25 @@ flags:
                 subcommand path deserves its own cell rather than inheriting mysql's" }
     mysql:    { test: "five mysql cli tests drive resume through it" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
-    mongo:    { gap: "Mongo's checkpoint holds a driver resume token that nobody can hand-repair,
-                which makes its subcommand path the one most worth proving" }
+    mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column — RED-proven: with
+                --checkpoint dropped, run 2 re-anchors at the source's current position,
+                captures zero, and the sink writes no file" }
 
   - id: "--output"
     postgres: { gap: "only proven on mysql and mssql" }
     mysql:    { test: "mysql_cdc_cli_csv_output_is_wired_and_readable" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
-    mongo:    { gap: "only proven on mysql and mssql" }
+    mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column" }
 
   - id: "--format"
     postgres: { gap: "the writer is shared, but CSV vs parquet is re-selected per invocation" }
     mysql:    { test: "mysql_cdc_cli_csv_output_is_wired_and_readable" }
     mssql:    { gap: "same" }
-    mongo:    { gap: "Mongo's `document` column is JSON, so its CSV rendering is the one that
-                differs most from the other three and is proven by nothing" }
+    mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column — RED-proven with
+                --format parquet: the directory then holds no .csv and the DuckDB oracle has
+                nothing to open. The document column is JSON, so this is the CSV writer's
+                hostile input; the oracle is DuckDB read_csv_auto + hard-coded expected
+                values, never the csv crate rivet writes with" }
 
   - id: "--max-events"
     postgres: { gap: "the cap is applied in shared driver code but only proven on mysql" }

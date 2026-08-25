@@ -215,7 +215,7 @@ fn every_test_cell_cites_a_test_that_exists() {
 /// pre-existing CLI ledgers were not asking. Lower it in the commit that closes one.
 #[test]
 fn cdc_cli_gaps_only_ever_shrink() {
-    const CEILING: usize = 24;
+    const CEILING: usize = 19;
     let m = matrix();
     let engines: Vec<String> = m["engines"]
         .as_sequence()
