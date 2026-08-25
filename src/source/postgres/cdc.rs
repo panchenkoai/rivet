@@ -429,6 +429,36 @@ impl PgChangeStream {
             else {
                 continue; // unresolvable here — the schema probe reports it, loudly
             };
+            // A BARE (unqualified) name matches ANY schema in the router: `cfg == table`
+            // in sink::table_matches, which exists because a MongoDB collection has no
+            // schema qualifier and may itself contain dots. On PostgreSQL that makes an
+            // unqualified `table: orders` capture EVERY schema's `orders` into one
+            // export, silently interleaved.
+            //
+            // MEASURED 2026-08-25: `table: bare` with `public.bare` and `s2.bare` both
+            // present captured 2 rows — one from each schema — into a single part, with
+            // nothing in the output distinguishing them.
+            //
+            // A warning, not a refusal: capturing one table under a bare name is the
+            // common and correct case, and `to_regclass` resolves it through search_path
+            // exactly as the schema probe does. What the operator cannot see is that a
+            // SECOND relation of that name will ride along.
+            if !cfg.contains('.') {
+                let others: Vec<String> = client
+                    .query(
+                        "SELECT n.nspname || '.' || c.relname                          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace                          WHERE c.relname = $1 AND c.relkind IN ('r','p')                            AND n.nspname NOT IN ('pg_catalog','information_schema')",
+                        &[&cfg.as_str()],
+                    )
+                    .map(|rows| rows.iter().map(|r| r.get::<_, String>(0)).collect())
+                    .unwrap_or_default();
+                if others.len() > 1 {
+                    log::warn!(
+                        "pg cdc: `{cfg}` is unqualified and {} relations share that name                          ({}). Routing matches a bare name in ANY schema, so changes from                          ALL of them land in this one export, interleaved and                          indistinguishable in the output. Qualify it (`schema.{cfg}`) to                          capture the one you mean.",
+                        others.len(),
+                        others.join(", ")
+                    );
+                }
+            }
             let relkind: String = row.get(0);
             let relpersistence: String = row.get(1);
             let resolved_schema: String = row.get(2);

@@ -229,6 +229,28 @@ impl Rig {
         );
     }
 
+    /// Run rivet; panic unless it succeeds, and return what it SAID.
+    ///
+    /// The oracle for a WARNING: a warning by definition rides on a successful run,
+    /// so `run_ok` (which throws the output away) and `run_expect_fail` (which
+    /// demands a non-zero exit) both grade the wrong thing. Tests that hand-rolled
+    /// `Command::new(RIVET_BIN)` to read stderr off a green run are what this
+    /// replaces.
+    pub fn run_ok_capture(&self) -> String {
+        let out = self.run_args(&[]);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "rig run failed for '{}':\n{said}",
+            self.name
+        );
+        said
+    }
+
     /// Run rivet expecting a loud failure; returns combined output.
     pub fn run_expect_fail(&self) -> String {
         let out = self.run_args(&[]);

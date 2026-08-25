@@ -4220,6 +4220,71 @@ fn roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     );
 }
 
+/// An unqualified `table:` captures EVERY schema's relation of that name.
+///
+/// `sink::table_matches` matches a bare config name against any schema — it has to,
+/// because a MongoDB collection has no schema qualifier and may itself contain dots.
+/// On PostgreSQL that means `table: orders` silently captures `public.orders` AND
+/// `archive.orders` into one export.
+///
+/// MEASURED before the warning (2026-08-25): `table: bare` with `public.bare` and
+/// `s2.bare` both present captured 2 rows — one from each schema — into a single
+/// part, with nothing in the output distinguishing them. Counts reconcile against
+/// neither table alone, and a reader of the parquet cannot tell which row came from
+/// where.
+///
+/// A WARNING, not a refusal: capturing one table under a bare name is the common and
+/// correct case. What the operator cannot see is the second relation riding along.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_warns_when_a_bare_table_name_matches_two_schemas() {
+    let cdc_db = CdcDb::new("cdc_bare");
+    let tbl = unique_name("rivet_cdc_bare").to_lowercase();
+    let slot = unique_name("rivet_bare_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id int PRIMARY KEY, v text); \
+         CREATE SCHEMA other; \
+         CREATE TABLE other.{tbl} (id int PRIMARY KEY, v text)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1,'public'); INSERT INTO other.{tbl} VALUES (2,'other')"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    let said = rig.run_ok_capture();
+    assert!(
+        said.contains("unqualified") && said.contains(&format!("other.{tbl}")),
+        "the run must WARN and name the other relation — the operator cannot see it \
+         in the output otherwise. Got:\n{said}"
+    );
+
+    let rows: usize = rig.read_declared_parts().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 2,
+        "both schemas' rows land in ONE export — that is the behaviour being warned \
+         about, and if it ever changes the warning should change with it"
+    );
+
+    // Not too WIDE: one matching relation is the ordinary case and must stay silent,
+    // or the warning becomes noise and gets ignored.
+    c.batch_execute("DROP SCHEMA other CASCADE").unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (3,'only')"), &[])
+        .unwrap();
+    let quiet = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    assert!(
+        !quiet.run_ok_capture().contains("unqualified"),
+        "a bare name with ONE matching relation must not warn"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,
