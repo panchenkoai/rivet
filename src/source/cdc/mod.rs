@@ -676,14 +676,23 @@ impl CdcEngine {
         ) {
             out.push(w);
         }
+        // ONE export's slot is all this seam knows: `CdcCapture` carries a single
+        // `cdc_cfg`, so a sibling export's slot — drained by the same `rivet run` a
+        // moment later — is indistinguishable from an abandoned one here. Hence
+        // `may_be_owned_elsewhere = true`: report the WAL, never the verdict, and
+        // never the drop command. `doctor` sees the whole config and does both.
         let ours = vec![slot];
         if let Ok(rows) = client.query(
-            "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+            "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, \
+                    slot_type \
              FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
             &[&ours],
         ) {
-            let foreign: Vec<(String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-            if let Some(w) = crate::preflight::cdc_health::pg_foreign_slots_warning(&foreign) {
+            let foreign: Vec<(String, i64, String)> = rows
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect();
+            if let Some(w) = crate::preflight::cdc_health::pg_foreign_slots_warning(&foreign, true) {
                 out.push(w);
             }
         }

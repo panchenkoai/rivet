@@ -127,27 +127,89 @@ pub(crate) fn pg_retained_wal_warning(
     ))
 }
 
-/// The same question for slots this config does NOT own. These are the dangerous
-/// ones: nobody is draining them, so the WAL they pin is pinned forever — measured
-/// live at 9 abandoned slots holding 1.5 GiB each on a dev stand.
-pub(crate) fn pg_foreign_slots_warning(foreign: &[(String, i64)]) -> Option<String> {
-    let worst = foreign.iter().max_by_key(|(_, b)| *b)?;
+/// The same question for slots the CALLER did not name as its own.
+///
+/// Two callers with different knowledge, so this reports a FACT and leaves the
+/// verdict to them. `doctor` sees the whole config and can name every CDC slot it
+/// owns, so a leftover really is a leftover and it offers the drop command. A
+/// `run` sees ONE export (`CdcCapture` carries a single `cdc_cfg`), so from there a
+/// sibling export's slot — drained by the same `rivet run` a moment later — is
+/// indistinguishable from an abandoned one. Telling that operator "nothing is
+/// draining them, drop it" destroys a live resume anchor, which is why the run
+/// path passes `may_be_owned_elsewhere` and gets wording without a verdict.
+///
+/// `NOT active` is not evidence of abandonment either, and specifically not for
+/// rivet: the PostgreSQL adapter reads through `pg_logical_slot_peek_changes`, so
+/// its own slots sit `active = false` between runs BY CONSTRUCTION. Whatever this
+/// says has to survive that.
+///
+/// The SUM matters as much as the max. The hazard is a filling disk, and a disk is
+/// filled by the total: eight slots at 334 MiB each is 2 GiB of pinned WAL that a
+/// max-only test calls "small". Measured on a dev stand, where exactly that set
+/// reported OK.
+///
+/// `slot_type` rides the listing because a PHYSICAL slot belongs to a standby, not
+/// to a CDC consumer — it pins WAL just the same and is worth reporting, but
+/// dropping one breaks replication, so it must be visibly not a leftover.
+pub(crate) fn pg_foreign_slots_warning(
+    foreign: &[(String, i64, String)],
+    may_be_owned_elsewhere: bool,
+) -> Option<String> {
     let bar = retained_wal_bar();
-    if worst.1 < bar {
+    let total: i64 = foreign.iter().map(|(_, b, _)| *b).sum();
+    let worst = foreign.iter().max_by_key(|(_, b, _)| *b)?;
+    if worst.1 < bar && total < bar {
         return None;
     }
-    let listing = foreign
+    // Everything that contributes to a total past the bar is worth naming; a
+    // listing pruned to the offenders is unreadable when the finding IS the count.
+    let mut sorted: Vec<&(String, i64, String)> = foreign.iter().collect();
+    sorted.sort_by_key(|(_, b, _)| -*b);
+    let listing = sorted
         .iter()
-        .filter(|(_, b)| *b >= bar)
-        .map(|(n, b)| format!("{n} ({})", mib(*b)))
+        .take(10)
+        .map(|(n, b, kind)| {
+            if kind == "physical" {
+                format!(
+                    "{n} ({}, PHYSICAL — a standby's, not a CDC leftover)",
+                    mib(*b)
+                )
+            } else {
+                format!("{n} ({})", mib(*b))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    Some(format!(
-        "inactive slot(s) NOT owned by this config are pinning WAL: {listing} — nothing is \
-         draining them, so this WAL is pinned until someone acts. If the consumer is gone \
-         for good: SELECT pg_drop_replication_slot('{}')",
-        worst.0
-    ))
+    let more = foreign.len().saturating_sub(10);
+    let tail = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "inactive slot(s) are pinning WAL: {listing}{tail} — {} across {} slot(s)",
+        mib(total),
+        foreign.len()
+    );
+    Some(if may_be_owned_elsewhere {
+        format!(
+            "{head}. This run drains ONE export's slot and cannot tell whether another \
+             export in your config, or another tool, owns the rest — `rivet doctor -c \
+             <your config>` sees them all and will say which are genuinely unclaimed. \
+             Do NOT drop a slot on this warning alone"
+        )
+    } else {
+        format!(
+            "{head}, and none belongs to this config. If the consumer is gone for good: \
+             SELECT pg_drop_replication_slot('{}') — but never for a slot marked \
+             PHYSICAL, which is a standby's",
+            sorted
+                .iter()
+                .find(|(_, _, k)| k != "physical")
+                .map(|(n, _, _)| n.as_str())
+                .unwrap_or("<slot>")
+        )
+    })
 }
 
 fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorCheck {
@@ -187,37 +249,29 @@ fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorChe
 
 /// Verdict over *other* inactive slots on the instance — not this config's,
 /// but they pin WAL on the same disk (the abandoned-slot foot-gun).
-fn pg_foreign_slots_verdict(foreign: &[(String, i64)]) -> DoctorCheck {
+fn pg_foreign_slots_verdict(foreign: &[(String, i64, String)]) -> DoctorCheck {
     let name = "CDC other inactive slots".to_string();
     if foreign.is_empty() {
         return check(name, true, Some("none".into()), None);
     }
-    let worst = foreign.iter().max_by_key(|(_, b)| *b).expect("non-empty");
-    let listing = foreign
-        .iter()
-        .map(|(n, b)| format!("{n} ({})", mib(*b)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if worst.1 < PG_RETAINED_WAL_FAIL_BYTES {
-        check(
-            name,
-            true,
-            Some(format!("inactive but small: {listing}")),
-            None,
-        )
-    } else {
-        check(
-            name,
-            false,
-            Some(format!(
-                "inactive slot(s) pinning WAL: {listing} — an abandoned slot prevents WAL \
-                 recycling and fills the source disk"
-            )),
-            Some(format!(
-                "if the consumer is gone for good: SELECT pg_drop_replication_slot('{}');",
-                worst.0
-            )),
-        )
+    // `may_be_owned_elsewhere = false`: doctor was handed the whole config and
+    // excluded every CDC slot in it, so what is left really is unclaimed by rivet
+    // and the drop command is safe to offer. The run path cannot say that.
+    match pg_foreign_slots_warning(foreign, false) {
+        None => {
+            let total: i64 = foreign.iter().map(|(_, b, _)| *b).sum();
+            check(
+                name,
+                true,
+                Some(format!(
+                    "inactive but small: {} across {} slot(s)",
+                    mib(total),
+                    foreign.len()
+                )),
+                None,
+            )
+        }
+        Some(why) => check(name, false, Some(why), None),
     }
 }
 
@@ -248,11 +302,15 @@ fn pg_checks(
         ours.push(slot);
     }
     let rows = client.query(
-        "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+        "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, \
+                slot_type \
          FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
         &[&ours],
     )?;
-    let foreign: Vec<(String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let foreign: Vec<(String, i64, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
     checks.push(pg_foreign_slots_verdict(&foreign));
     Ok(checks)
 }
@@ -664,12 +722,104 @@ mod tests {
     #[test]
     fn pg_foreign_inactive_slots_fail_only_when_pinning_wal() {
         assert!(pg_foreign_slots_verdict(&[]).ok);
-        let small = pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 1 << 20)]);
+        let small =
+            pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 1 << 20, "logical".into())]);
         assert!(small.ok, "a small inactive slot is a note, not a failure");
-        assert!(small.detail.unwrap().contains("ingestr_leftover"));
-        let big = pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 5 << 30)]);
+        assert!(
+            small.detail.unwrap().contains("1 slot(s)"),
+            "the healthy note reports the aggregate; naming each small slot is what \
+             made the 2 GiB-across-eight case read as OK"
+        );
+        let big =
+            pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 5 << 30, "logical".into())]);
         assert!(!big.ok, "an abandoned slot pinning GiBs fails");
-        assert!(big.hint.unwrap().contains("ingestr_leftover"));
+        assert!(big.detail.unwrap().contains("ingestr_leftover"));
+    }
+
+    /// The hazard is a FILLING DISK, and a disk is filled by the total. Measured on
+    /// a dev stand: eight inactive slots at ~334 MiB each — 1.96 GiB pinned — and
+    /// the max-only test called them "inactive but small", OK.
+    #[test]
+    fn a_fleet_of_sub_threshold_slots_still_fills_the_disk() {
+        let third = PG_RETAINED_WAL_FAIL_BYTES / 3;
+        let fleet: Vec<(String, i64, String)> = (0..8)
+            .map(|i| (format!("orphan_{i}"), third, "logical".to_string()))
+            .collect();
+        assert!(
+            fleet
+                .iter()
+                .all(|(_, b, _)| *b < PG_RETAINED_WAL_FAIL_BYTES),
+            "the fixture must be under the bar per-slot or it proves nothing about the sum"
+        );
+        let w = pg_foreign_slots_warning(&fleet, false)
+            .expect("8 slots at a third of the bar is 2.6x the bar in total");
+        assert!(
+            w.contains("8 slot(s)"),
+            "say how many, or an operator cannot tell an aggregate finding from a \
+             single fat slot: {w}"
+        );
+    }
+
+    /// A PHYSICAL slot belongs to a standby. It pins WAL like any other and is worth
+    /// reporting — but `pg_drop_replication_slot` on one breaks replication, so it
+    /// must never be the slot the hint names.
+    #[test]
+    fn a_physical_slot_is_reported_but_never_the_one_the_drop_hint_names() {
+        let w = pg_foreign_slots_warning(
+            &[
+                (
+                    "standby_1".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES * 4,
+                    "physical".into(),
+                ),
+                (
+                    "dead_logical".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES,
+                    "logical".into(),
+                ),
+            ],
+            false,
+        )
+        .expect("both are past the bar");
+        assert!(
+            w.contains("standby_1") && w.contains("PHYSICAL"),
+            "report it — it really is pinning WAL: {w}"
+        );
+        assert!(
+            w.contains("pg_drop_replication_slot('dead_logical')"),
+            "but the ready-to-paste command must name the LOGICAL one, even though the \
+             physical slot is the biggest: {w}"
+        );
+    }
+
+    /// A `run` sees ONE export, so a sibling export's slot is indistinguishable from
+    /// an abandoned one. Telling that operator to drop it destroys a live resume
+    /// anchor — and rivet's own PG slots sit `active = false` between runs by
+    /// construction, because the adapter reads through `pg_logical_slot_peek_changes`.
+    #[test]
+    fn the_run_path_reports_the_wal_but_never_the_verdict() {
+        let one = [(
+            "someone_elses".to_string(),
+            PG_RETAINED_WAL_FAIL_BYTES,
+            "logical".to_string(),
+        )];
+        let from_run = pg_foreign_slots_warning(&one, true).expect("past the bar");
+        assert!(
+            !from_run.contains("pg_drop_replication_slot"),
+            "a run must not hand over a command that can destroy a sibling export's \
+             resume anchor: {from_run}"
+        );
+        assert!(
+            from_run.contains("rivet doctor"),
+            "...it must point at the tool that CAN answer the ownership question: \
+             {from_run}"
+        );
+        let from_doctor = pg_foreign_slots_warning(&one, false).expect("past the bar");
+        assert!(
+            from_doctor.contains("pg_drop_replication_slot"),
+            "doctor was handed the whole config and excluded every slot in it, so it \
+             may say so: {from_doctor}"
+        );
     }
 
     // ── MySQL verdicts ──
@@ -849,10 +999,10 @@ mod slot_retention_warning_tests {
     /// WAL is pinned until a human acts. Measured live at 9 abandoned slots holding
     /// 1.5 GiB each on a dev stand.
     #[test]
-    fn foreign_slots_warn_only_past_the_bar_and_list_only_the_offenders() {
-        assert_eq!(pg_foreign_slots_warning(&[]), None);
+    fn foreign_slots_warn_past_the_bar_and_report_the_aggregate() {
+        assert_eq!(pg_foreign_slots_warning(&[], false), None);
         assert_eq!(
-            pg_foreign_slots_warning(&[("small".into(), 1024)]),
+            pg_foreign_slots_warning(&[("small".into(), 1024, "logical".into())], false),
             None,
             "an inactive slot holding a KiB is not a hazard; warning about it teaches \
              operators to ignore the message"
@@ -865,42 +1015,65 @@ mod slot_retention_warning_tests {
         // function's boundary and not its twin's is exactly the asymmetry mutation
         // testing exists to find; reading the two tests side by side does not show it.
         assert!(
-            pg_foreign_slots_warning(&[("at_the_bar".into(), PG_RETAINED_WAL_FAIL_BYTES)])
-                .is_some(),
+            pg_foreign_slots_warning(
+                &[(
+                    "at_the_bar".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES,
+                    "logical".into()
+                )],
+                false
+            )
+            .is_some(),
             "a slot sitting exactly ON the bar must be reported — `<=` here would let \
              the single most common boundary value through in silence"
         );
         assert_eq!(
-            pg_foreign_slots_warning(&[("under".into(), PG_RETAINED_WAL_FAIL_BYTES - 1)]),
+            pg_foreign_slots_warning(
+                &[(
+                    "under".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES - 1,
+                    "logical".into()
+                )],
+                false
+            ),
             None,
             "...and one byte under it must not be"
         );
 
         let big = PG_RETAINED_WAL_FAIL_BYTES + 1;
-        let w = pg_foreign_slots_warning(&[
-            ("small".into(), 4096),
-            ("orphan_a".into(), big),
-            ("orphan_b".into(), big * 2),
-        ])
+        let w = pg_foreign_slots_warning(
+            &[
+                ("small".into(), 4096, "logical".into()),
+                ("orphan_a".into(), big, "logical".into()),
+                ("orphan_b".into(), big * 2, "logical".into()),
+            ],
+            false,
+        )
         .expect("two slots past the bar must be reported");
         assert!(
             w.contains("orphan_a") && w.contains("orphan_b"),
             "list every offender, not just the worst — an operator fixing one and \
              re-running should not have to discover the rest one at a time: {w}"
         );
+        // The listing now INCLUDES sub-bar slots, deliberately: the hazard is a
+        // filling disk and the aggregate is the finding, so hiding the small ones
+        // is what let 1.96 GiB across eight slots read as "inactive but small". It
+        // is capped at ten with a "and N more" tail instead.
         assert!(
-            !w.contains("small"),
-            "and NOT the ones under the bar, or the list is unreadable at the scale \
-             where it matters: {w}"
+            w.contains("small"),
+            "every contributor is listed — the total is what matters: {w}"
         );
         assert!(
             w.contains("pg_drop_replication_slot('orphan_b')"),
             "the ready-to-paste command should name the WORST one: {w}"
         );
+        // The doctor form says none of these belongs to the config — it was handed
+        // the whole config and can. The run form deliberately does not: see
+        // `the_run_path_reports_the_wal_but_never_the_verdict`.
         assert!(
-            w.contains("nothing is draining them"),
-            "say why this differs from our own backlog — that distinction is the \
-             reason there are two warnings: {w}"
+            w.contains("none belongs to this config"),
+            "doctor's form may state ownership, which is what makes its drop hint \
+             safe to offer: {w}"
         );
     }
 }

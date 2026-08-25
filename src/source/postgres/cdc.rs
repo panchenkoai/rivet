@@ -1242,26 +1242,77 @@ fn recover_unchanged_toast(
 /// `0x20` can never be a UTF-8 continuation/lead byte), so the byte scan never
 /// false-matches inside a multi-byte column name.
 fn find_outside_quotes(haystack: &str, needle: &str) -> Option<usize> {
+    // TWO quoting worlds, and missing either one is a silent drop.
+    //
+    // `'` opens a string LITERAL — a value. `"` opens a quoted IDENTIFIER — a name.
+    // Both escape by doubling, and each is an ordinary character inside the other.
+    // This tracked only literals, so a legally-quoted identifier containing an
+    // apostrophe flipped it into "inside a literal" with nothing to close it:
+    //
+    //     table public.tord, public."o'brien": TRUNCATE: (no-flags)
+    //
+    // is real `test_decoding` output (measured on a pg16 stand) and the `: TRUNCATE:`
+    // marker was never found, so `truncate_targets` returned empty and the line fell
+    // through to `parse_test_decoding`, which drops it. MEASURED end to end: the
+    // source table held 0 rows after the truncate, and the run reported
+    // `status: success, rows: 2` with both rows still at the destination and no
+    // delete to retract them — the exact silent divergence the TRUNCATE guard was
+    // written to close, walked around by one apostrophe in a NEIGHBOURING relation.
+    //
+    // The same function splits ` new-tuple: ` out of an UPDATE body, where the harm
+    // is worse: the fallback labels the whole `old-key: … new-tuple: …` body as the
+    // after-image, `parse_columns` yields duplicate names, and the sink's by-name
+    // lookup hits the OLD value first — so a column named `"it's"` under REPLICA
+    // IDENTITY FULL records the PRE-image as the current value. MEASURED: source at
+    // 'NEWVAL', parquet at 'OLDVAL', status success. Permanent, because the row is
+    // never touched again.
+    //
+    // `split_top_level_commas` alongside already tracked identifier quotes; this one
+    // did not, and nothing compared them.
+    #[derive(PartialEq)]
+    enum In {
+        Nothing,
+        Literal,
+        Ident,
+    }
     let (b, nb) = (haystack.as_bytes(), needle.as_bytes());
     let mut i = 0;
-    let mut in_quote = false;
+    let mut state = In::Nothing;
     while i < b.len() {
-        if in_quote {
-            if b[i] == b'\'' {
-                if b.get(i + 1) == Some(&b'\'') {
-                    i += 2; // doubled quote → an escaped literal quote
-                    continue;
+        match state {
+            In::Literal => {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2; // doubled → an escaped quote INSIDE the literal
+                        continue;
+                    }
+                    state = In::Nothing;
                 }
-                in_quote = false;
+                i += 1;
             }
-            i += 1;
-        } else if b[i] == b'\'' {
-            in_quote = true;
-            i += 1;
-        } else if b[i..].starts_with(nb) {
-            return Some(i);
-        } else {
-            i += 1;
+            In::Ident => {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 2; // doubled → an escaped quote INSIDE the identifier
+                        continue;
+                    }
+                    state = In::Nothing;
+                }
+                i += 1;
+            }
+            In::Nothing => {
+                if b[i] == b'\'' {
+                    state = In::Literal;
+                    i += 1;
+                } else if b[i] == b'"' {
+                    state = In::Ident;
+                    i += 1;
+                } else if b[i..].starts_with(nb) {
+                    return Some(i);
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
     None
@@ -1672,6 +1723,30 @@ mod tests {
             ],
             "a name ending in an escaped quote must still close, or the following \
              comma is read as part of it and every later relation disappears"
+        );
+
+        // An APOSTROPHE inside a quoted IDENTIFIER — legal SQL, real wire output.
+        // The scanner tracked string literals only, so `"o'brien"` opened a literal
+        // that never closed and the `: TRUNCATE:` marker was never found: the line
+        // fell through and was dropped. MEASURED end to end on a pg16 stand — source
+        // 0 rows after the truncate, run reported `status: success, rows: 2` with
+        // both rows still at the destination. One apostrophe in a NEIGHBOURING
+        // relation walked around the whole guard.
+        assert_eq!(
+            one("table public.tord, public.\"o'brien\": TRUNCATE: (no-flags)"),
+            vec![
+                ("public".to_string(), "tord".to_string()),
+                ("public".to_string(), "o'brien".to_string())
+            ],
+            "a quoted identifier containing an apostrophe must not blind the marker \
+             scan — the truncate is then silently dropped and the destination keeps \
+             rows the source no longer has"
+        );
+        // ...and the same character inside a string VALUE must still hide a marker
+        // that occurs within it. Both quoting worlds, both directions.
+        assert!(
+            one("table public.t: INSERT: v[text]:'not a : TRUNCATE: marker'").is_empty(),
+            "a marker inside a string literal is data, not an operation"
         );
 
         assert!(
