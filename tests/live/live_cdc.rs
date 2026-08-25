@@ -6889,6 +6889,16 @@ fn roast_mysql_cdc_warns_on_a_minimal_backlog_a_full_server_would_hide() {
     );
 
     let said = rig.run_ok_capture();
+    // The capture must have DELIVERED — the conformance gate requires every live CDC
+    // test to assert an outcome, and it is right: a warning test whose run captured
+    // zero rows would be asserting log text over an empty export. The values are the
+    // KNOWN-swapped ones; that corruption is this scenario's measured reality and is
+    // asserted as such by the sibling MINIMAL test above.
+    assert_eq!(
+        duckdb_dir_parquet_i64(&rig.out_dir(), "id"),
+        vec![1],
+        "the MINIMAL backlog row must be delivered while the run warns"
+    );
     assert!(
         said.contains("mapped by POSITION"),
         "a nameless image must be announced from the WIRE — the server's current \
