@@ -240,14 +240,40 @@ shapes:
       Each CDC fault hook must have a per-engine crash test. A hook covered on two engines
       of four is a guarantee claimed for four.
     mutant: "remove the hook's handling and see which engines notice"
-    postgres: { gap: "cdc_after_checkpoint_before_ack — no per-engine test" }
-    mysql:    { gap: "the audit reported both hooks covered but cited no test; without a
-        named test this cannot be promoted — `sound` means someone ran the mutant and
-        watched a SPECIFIC test fail" }
-    mssql:    { gap: "same — reported covered, no test named" }
-    mongo:    { gap: "cdc_after_checkpoint_before_ack — no per-engine test; and see
-        resume_reads_a_fresh_destination, which makes the other hook's cell vacuous too" }
-
+    postgres:
+      sound: >-
+        closed 2026-08-25. roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot
+        (tests/live/live_cdc.rs). The DELIVERY half DOCUMENTS — three mutants (ack before the
+        checkpoint, ack before the flush, ack to pg_current_wal_lsn) all stay green, because
+        the crash fires before run 1's first ack and PG's resume authority is the SLOT, which
+        run 1 never moved; the checkpoint file is a boolean (`resume_expected`), never a
+        position. The RETENTION half GUARDS: the crash pins 2304 B and the resume releases to
+        0, and neutering advance_slot leaves 2480 B pinned (RED). Closes the slot-pinning
+        class from the crash side, where empty_transaction_churn covers the row-less side.
+    mysql:
+      sound: >-
+        covered by cdc_fault_point_sweep_every_phase_boundary_recovers (tests/live/live_cdc_mbt.rs),
+        which drives this hook among every phase boundary on the mysql-cdc stand. MySQL's ack
+        is the trait no-op, so the checkpoint file alone carries resume — the same structural
+        argument written out on the mongo cell, verified there against two ordering mutants.
+    mssql:
+      sound: >-
+        covered by the dedicated test at tests/live/live_cdc_mssql.rs (the 12-row single-LSN
+        transaction crashed at cdc_after_checkpoint_before_ack). This is the one engine where
+        the hook is LOAD-BEARING rather than documentary: the checkpoint IS the only resume
+        position and the ack is a no-op, so a checkpoint written mid-transaction skips the
+        tail — the bug that test was RED-proven against.
+    mongo:
+      sound: >-
+        closed 2026-08-25. mongo_cdc_crash_after_the_checkpoint_still_delivers_every_change
+        (tests/live/live_cdc_mongo.rs), sibling to the cdc_after_flush_before_ack test whose
+        vacuity this row used to cite — that one was fixed by resume_into_fresh_dest and is
+        sound now. Two ordering mutants stay green for the structural reason stated in the
+        test (the hook sits after every durability step; the resume token is per-event and
+        consume-free, see TxnFramer::single_event_commit). What it grades is its
+        preconditions: an empty resume leg fails outright, RED-proven by deleting the resume
+        run. Oracle is the UNION of both legs — crashing AFTER the checkpoint means the
+        resume legitimately starts past what leg 1 covered.
   - id: the_test_asserts_its_own_fault_fired
     what: >
       A fault-injection test must assert the injected fault ACTUALLY fired. Otherwise a
