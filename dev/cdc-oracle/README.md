@@ -290,3 +290,40 @@ Per engine, the reason each is worth running:
   whether the run reports failure or an EMPTY SUCCESS is untested.
 - **mongo** — the stream is tailable and the driver retries internally, which is
   precisely why a silent short read is plausible here rather than a loud one.
+
+
+## Wiring this into the release gate (plan item 7) — what stopped it
+
+The gate already HAS a CDC leg: `cdc.verify_cdc_e2e` compares the destination to
+the source (per-column null profile, distinct counts, over the cloud parts). It
+catches loss and degrade-to-null. It is structurally blind to rivet and its own
+oracle agreeing on a wrong SPEC, which is what this harness exists to catch.
+
+Adding a `cdc_differential_vs_debezium` row was ATTEMPTED and REVERTED, because
+`release_gate_matrix_guard` refused it twice, correctly:
+
+    gate matrix scenario `cdc_differential_vs_debezium` has no
+    sc_cdc_differential_vs_debezium() in the gate modules
+
+    release-gate-matrix has 14 gaps > ratchet 10 — you cannot ADD a gap;
+    wire the check and LOWER the ratchet
+
+Both are the right verdict. That ledger grades the CALL SITE, not the row — a
+lesson it learned from a `verify_blessed_path` registered `test` on four engines
+with no caller anywhere in the tree. A row describing intent is exactly what it
+exists to reject.
+
+Three things must be true before the row belongs there, and none is yet:
+
+1. **The gate must stand up the reference.** Pull `quay.io/debezium/server`, put a
+   receiver on the stand network, wait on the engine's own readiness signal. Every
+   config trap is in this README and each presents as "started and captured
+   nothing".
+2. **`--value` must be on.** The comparison projects to (op, key) today. `--value`
+   is proven to catch a fully NULLed column, but the DELETE path still compares
+   unequal, so it is opt-in. Wiring the harness in without it wires in a check that
+   cannot see cell corruption — the exact blind spot an adversarial pass found here.
+3. **The harness must stay quiet when nothing is wrong.** It produced four false
+   findings from its own defects (shared work dirs, a fixed flush wait, a lossy
+   HTTP sink) before producing a real one. A gate that reports its own races as
+   release blockers gets bypassed.
