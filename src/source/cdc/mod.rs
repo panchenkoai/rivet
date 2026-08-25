@@ -10,8 +10,10 @@
 //! command), which lives only in the binary crate; the library crate also
 //! compiles `source` for the integration tests but has no CDC consumer of its
 //! own. Same pattern as `source::mysql::cdc`.
+
 #![allow(dead_code)]
 
+pub(crate) mod identity;
 pub(crate) mod sink;
 pub(crate) mod validate;
 pub(crate) mod value;
