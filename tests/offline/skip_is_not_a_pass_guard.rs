@@ -103,3 +103,56 @@ fn the_guard_can_actually_see_a_runner_body() {
          here) or the parse is not reading bodies at all (not fine)"
     );
 }
+
+/// Every fault INJECTOR must verify its own injection landed.
+///
+/// A sibling of the class above, and the reason the toxiproxy tests survived the
+/// 2026-08-25 audit: `toxi_add_latency` asserts the admin API answered 200, so a
+/// toxic that fails to install panics the test instead of letting an ordinary,
+/// un-degraded export pass as "survived the fault". Move that assertion into the
+/// caller and eleven tests become vacuous at once; leave it in the helper and no
+/// caller can get it wrong.
+///
+/// Injectors only. `toxi_reset_toxics` is TEARDOWN — asserting there would fail
+/// tests during cleanup, reporting a fixture problem as a product one.
+#[test]
+fn every_toxiproxy_fault_injector_asserts_its_own_injection_landed() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/toxi.rs");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+
+    let mut injectors = 0;
+    let mut silent = Vec::new();
+    let mut rest = src.as_str();
+    while let Some(i) = rest.find("pub fn toxi_") {
+        let name: String = rest[i + "pub fn ".len()..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let end = rest[i + 5..]
+            .find("\npub fn ")
+            .map(|j| i + 5 + j)
+            .unwrap_or(rest.len());
+        let body = &rest[i..end];
+        rest = &rest[end..];
+        // An injector CHANGES the link; reset/teardown restores it.
+        if name.contains("reset") {
+            continue;
+        }
+        injectors += 1;
+        if !(body.contains("assert") && (body.contains("code") || body.contains("status"))) {
+            silent.push(name);
+        }
+    }
+    assert!(
+        injectors >= 5,
+        "derived only {injectors} injectors from tests/common/toxi.rs — a broken \
+         derivation grades nothing while looking green"
+    );
+    assert!(
+        silent.is_empty(),
+        "these fault injectors do not check that the fault was actually installed: \
+         {silent:?}. A toxic that fails to install leaves the export running over a \
+         healthy link, and the test then reports that rivet survived a fault that \
+         never happened."
+    );
+}

@@ -253,12 +253,74 @@ shapes:
       A fault-injection test must assert the injected fault ACTUALLY fired. Otherwise a
       hook that stops firing turns the test into a plain happy-path run that passes.
     mutant: "make the hook a no-op; a sound cell goes RED on 'the fault never fired'"
-    postgres: { gap: "not audited per-test; the class is proven on mysql" }
-    mysql:    { vacuous: "gremlin_cdc_sigkill_mid_drain_recovers_without_gap never asserts its
-        own fault fired (gremlin_cdc.rs)", kind: absence-only }
-    mssql:    { gap: "not audited per-test" }
-    mongo:    { gap: "not audited per-test" }
-
+    postgres:
+      sound: >-
+        audited 2026-08-25 across the whole live suite, not sampled — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    mysql:
+      sound: >-
+        closed 2026-08-25 — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    mssql:
+      sound: >-
+        audited 2026-08-25 across the whole live suite, not sampled — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    mongo:
+      sound: >-
+        audited 2026-08-25 across the whole live suite, not sampled — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
   - id: skip_is_not_a_pass
     what: >
       A test that SKIPS when its precondition is absent reports success. Where a CI job

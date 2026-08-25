@@ -138,11 +138,33 @@ fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap() {
             break;
         }
         if let Some(_status) = child.try_wait().unwrap() {
-            break; // drained before we could kill — too fast; still assert below
+            break; // drained before the kill landed — asserted against below
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let _ = child.wait();
+
+    // The fault must have FIRED. `killed_mid_drain` used to be computed and only
+    // interpolated into the failure message, so a run that drained before the kill
+    // landed passed having verified nothing about crash recovery — the test's own
+    // comment said "too fast; still assert below", and what it asserted below was
+    // an ordinary complete export.
+    assert!(
+        killed_mid_drain,
+        "the SIGKILL never landed — this run drained to completion, so nothing here \
+         says anything about recovery. Not a pass: a fault-injection test whose fault \
+         did not fire has no subject"
+    );
+    // ...and it must have MATTERED. A kill that lands at the finish line fires the
+    // flag while leaving a complete export behind, which grades the same as no kill
+    // at all. MEASURED 3/3: exactly 500 of 5000 rows survive, the first rollover.
+    let after_kill = distinct_ids(&out).len();
+    assert!(
+        after_kill < 5_000,
+        "the kill landed but left a COMPLETE export ({after_kill} of 5000) — the \
+         recovery legs below then have nothing to recover and would pass over a \
+         resume that captured zero"
+    );
 
     // Recovery run(s): drain whatever the killed run left behind.
     for _ in 0..3 {
