@@ -77,6 +77,18 @@ def sh(*args, check=True):
     return r
 
 
+def _value_cols(a) -> list:
+    """Which non-key columns to compare, per engine.
+
+    MongoDB is the exception and it is structural, not a TODO: the document is a
+    JSON STRING in the reference and a JSON string in rivet's `document` column,
+    so a text comparison of the two would grade JSON key ORDER and whitespace
+    rather than the values. The op/key comparison plus the per-column null-profile
+    check in the live suite covers that engine; a value diff here would be noise.
+    """
+    return [] if a.engine == "mongo" else ["v"]
+
+
 def run_scenario(name: str, sql, t: str) -> None:
     """Drive one change pattern. Each is a shape the two tools could legitimately
     disagree about, which is the only reason to run it through a differential
@@ -197,7 +209,14 @@ def main() -> int:
     # scenario that has no delete. Both were harness artefacts wearing the costume
     # of a finding, and the second was only obvious because the phantom row named
     # an operation the scenario never performed.
-    work = os.path.join(a.work, a.engine, a.table)
+    # engine / table / SCENARIO. The scenario was missing until 2026-08-25 and the
+    # table name is the same for all of them, so consecutive scenarios on one engine
+    # shared a dir and Debezium's `debezium.jsonl` ACCUMULATED: running crud then
+    # wide-txn reported wide-txn DISAGREE, listing crud's four events as
+    # debezium-only. The README already recorded this artefact as fixed — the fix
+    # covered the cross-ENGINE leak (MySQL reading a PostgreSQL offsets.dat) and not
+    # the cross-SCENARIO one, which reads identically at the call site.
+    work = os.path.join(a.work, a.engine, a.table, a.scenario)
     os.makedirs(work, exist_ok=True)
     dbz_slot, riv_slot, pub = f"dbz_{t}", f"riv_{t}", f"pub_{t}"
     # Hyphens, NOT underscores: an underscore is illegal in a hostname per RFC 952,
@@ -467,18 +486,23 @@ quarkus.log.level=WARN
                                # it under that name and Debezium's after-document
                                # carries it likewise.
                                "--key", "_id" if a.engine == "mongo" else "id",
-                               # Compare the VALUE too. Without it the harness is
-                               # blind to cell corruption: a parquet with 100%% of a
-                               # column NULLed reported AGREE (measured 2026-08-25).
-                               # NOTE: --value is NOT passed by default yet. It is
-                               # proven to catch cell corruption (a parquet with 100%
-                               # of a column NULLed goes from AGREE to four
-                               # differing rows), but the DELETE path still compares
-                               # unequal because the reference carries no `after`
-                               # for a delete and the value extract only reads that
-                               # side. Shipping it on by default would mean a false
-                               # alarm every run, and a harness that cries wolf gets
-                               # muted — which is how the blind spot got here.
+                               # Compare the VALUE too — ON by default as of
+                               # 2026-08-25. Without it the harness is blind to cell
+                               # corruption: a parquet with 100% of a column NULLed
+                               # reports AGREE, measured, and says so in its own
+                               # output now.
+                               #
+                               # It was opt-in because the DELETE path "compared
+                               # unequal". Diagnosing that turned up two defects in
+                               # the COMPARISON, not in either tool: (1) the two
+                               # views projected columns in different orders and
+                               # EXCEPT compares by POSITION, so with values on, all
+                               # four rows of a four-row scenario reported as
+                               # both-sides-only; (2) a DELETE carries its image in
+                               # `before`, not `after`, so rivet's before-image was
+                               # compared against NULL. Both fixed; PostgreSQL crud
+                               # now AGREES on (op, key, v).
+                               *sum((["--value", v] for v in _value_cols(a)), []),
                                ]
                               # MEASURED after adding ExtractNewDocumentState: the
                               # transform flattens inserts and updates so their `_id`

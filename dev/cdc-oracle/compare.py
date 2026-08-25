@@ -43,6 +43,24 @@ def declared_parts(root: str) -> list[str]:
 
 
 SQL = """
+-- `json_extract_string` returns the 4-char STRING 'null' for a JSON null, and the
+-- same 'null' for a JSON string whose value is the text "null" — only `json_type`
+-- tells them apart (measured in DuckDB, not assumed). Two consequences, and both
+-- had to be fixed before `--value` could be trusted:
+--
+--   1. Every NULL cell disagreed: Debezium's side rendered 'null' while rivet's
+--      parquet gave SQL NULL. Any nullable column made every row containing one
+--      report DISAGREE, which is why `--value` was believed broken on deletes.
+--   2. Conflating them the lazy way (mapping the literal 'null' to SQL NULL) would
+--      make a cell holding the TEXT "null" indistinguishable from an absent one —
+--      the degrade-to-null silent-loss class, reintroduced inside the very oracle
+--      meant to catch it.
+--
+-- So the mapping is driven by json_type: a JSON null becomes SQL NULL, a string
+-- "null" stays the string.
+CREATE OR REPLACE MACRO jstr(doc, path) AS
+  CASE WHEN json_type(doc, path) = 'NULL' THEN NULL
+       ELSE json_extract_string(doc, path) END;
 -- Debezium Server's http sink with `format.value=json` and schemas disabled emits
 -- the row envelope FLAT: {after, before, op, source}. The enveloped
 -- {payload:{...}} shape appears when schemas are enabled, so both are accepted —
@@ -54,9 +72,9 @@ SELECT
   -- `__op` is the ExtractNewDocumentState shape (MongoDB): the transform flattens
   -- the document and prefixes its metadata, which is what makes a DELETE carry a
   -- key at all on that engine.
-  CASE coalesce(json_extract_string(j, '$.op'),
-                json_extract_string(j, '$.payload.op'),
-                json_extract_string(j, '$.__op'))
+  CASE coalesce(jstr(j, '$.op'),
+                jstr(j, '$.payload.op'),
+                jstr(j, '$.__op'))
     WHEN 'c' THEN 'insert' WHEN 'r' THEN 'insert'
     WHEN 'u' THEN 'update' WHEN 'd' THEN 'delete'
     WHEN 't' THEN 'truncate' ELSE 'UNKNOWN' END AS op,
@@ -70,18 +88,23 @@ SELECT
   -- nested path first, then a second parse of the string form. Without the second
   -- the key comes back NULL for every Mongo event, which looks like a total
   -- disagreement rather than a normaliser that cannot read the shape.
-  __DBZ_VALS__
   CAST(coalesce(
-    json_extract_string(j, '$.after.__KEY__'),
-    json_extract_string(j, '$.before.__KEY__'),
-    json_extract_string(j, '$.payload.after.__KEY__'),
-    json_extract_string(j, '$.payload.before.__KEY__'),
-    json_extract_string(json_extract_string(j, '$.after'), '$.__KEY__'),
-    json_extract_string(json_extract_string(j, '$.before'), '$.__KEY__'),
-    json_extract_string(json_extract_string(j, '$.payload.after'), '$.__KEY__'),
+    jstr(j, '$.after.__KEY__'),
+    jstr(j, '$.before.__KEY__'),
+    jstr(j, '$.payload.after.__KEY__'),
+    jstr(j, '$.payload.before.__KEY__'),
+    jstr(jstr(j, '$.after'), '$.__KEY__'),
+    jstr(jstr(j, '$.before'), '$.__KEY__'),
+    jstr(jstr(j, '$.payload.after'), '$.__KEY__'),
     -- flattened form: the key sits at the top level beside `__op`
-    json_extract_string(j, '$.__KEY__')
+    jstr(j, '$.__KEY__')
   ) AS VARCHAR) AS k
+  -- Value columns come AFTER the key, matching `riv` below. `EXCEPT` compares by
+  -- POSITION, not by name, so a view that put them BEFORE the key compared v
+  -- against k on every row — with `--value` on, all four rows of a four-row
+  -- scenario reported as "both sides only", which reads as total disagreement and
+  -- is why `--value` was believed to be broken on the delete path alone.
+  __DBZ_VALS__
 FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
       FROM read_text('__DBZ__'))
 -- MySQL's connector also emits SCHEMA-CHANGE events (a `ddl` field, no `op`) on
@@ -89,7 +112,7 @@ FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
 -- not send them — a legitimate asymmetry, so they are excluded EXPLICITLY here
 -- rather than swallowed by the UNKNOWN arm. Silencing them there would have
 -- disarmed the shape check for real unrecognised events too.
-WHERE j <> '' AND json_extract_string(j, '$.ddl') IS NULL;
+WHERE j <> '' AND jstr(j, '$.ddl') IS NULL;
 
 CREATE OR REPLACE VIEW riv AS
 SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k __RIV_VALS__
@@ -158,11 +181,24 @@ def main() -> int:
     # the CELL survived, not whether two type systems render it identically — and
     # a comparison that skipped values entirely reported AGREE over a parquet with
     # 100% of a column NULLed (measured, which is why this exists).
+    # A DELETE has no `after` — its image is in `before`, and rivet writes that
+    # image into the same columns. Reading `$.after.<v>` unconditionally therefore
+    # compared rivet's before-image against NULL on every delete. Under REPLICA
+    # IDENTITY DEFAULT both sides carry only the key and agree by accident; set it
+    # to FULL and they diverge, which is the configuration a value comparison is
+    # for. Op-aware, so both are right.
     dbz_vals = "".join(
-        f"""coalesce(json_extract_string(j, '$.after.{v}'),
-                     json_extract_string(j, '$.payload.after.{v}'),
-                     json_extract_string(json_extract_string(j, '$.after'), '$.{v}'),
-                     json_extract_string(j, '$.{v}')) AS v_{v},\n  """
+        f""", CASE WHEN coalesce(jstr(j, '$.op'),
+                                 jstr(j, '$.payload.op'),
+                                 jstr(j, '$.__op')) = 'd'
+           THEN coalesce(jstr(j, '$.before.{v}'),
+                         jstr(j, '$.payload.before.{v}'),
+                         jstr(jstr(j, '$.before'), '$.{v}'),
+                         jstr(j, '$.{v}'))
+           ELSE coalesce(jstr(j, '$.after.{v}'),
+                         jstr(j, '$.payload.after.{v}'),
+                         jstr(jstr(j, '$.after'), '$.{v}'),
+                         jstr(j, '$.{v}')) END AS v_{v}\n  """
         for v in a.value
     )
     riv_vals = "".join(f", CAST({v} AS VARCHAR) AS v_{v}" for v in a.value)
@@ -171,13 +207,19 @@ def main() -> int:
               .replace("__DBZ__", a.debezium_jsonl)
               .replace("__KEY__", a.key)
               .replace("__PARTS__", "[" + ", ".join(f"'{p}'" for p in parts) + "]"))
+    # SHOW the values in the diff, not just (op, key). A row that appears on BOTH
+    # sides means the tuples differ in a column the output hides, and "everything
+    # disagrees, no reason given" is what makes a gate get bypassed (precondition 3
+    # in the README). With the values printed, a value mismatch reads as a value
+    # mismatch instead of a phantom key difference.
+    shown = "".join(f", coalesce(v_{v}, '<null>') AS v_{v}" for v in a.value)
     sql += f"""
-SELECT 'rivet-only' AS side, op, k FROM (SELECT * FROM riv{where} EXCEPT SELECT * FROM dbz{where})
+SELECT 'rivet-only' AS side, op, k{shown} FROM (SELECT * FROM riv{where} EXCEPT SELECT * FROM dbz{where})
 UNION ALL
-SELECT 'debezium-only', op, k FROM (SELECT * FROM dbz{where} EXCEPT SELECT * FROM riv{where})
+SELECT 'debezium-only', op, k{shown} FROM (SELECT * FROM dbz{where} EXCEPT SELECT * FROM riv{where})
 UNION ALL
-SELECT 'UNKNOWN-SHAPE', op, k FROM dbz WHERE op = 'UNKNOWN'
-ORDER BY 1, 2, 3;
+SELECT 'UNKNOWN-SHAPE', op, k{shown} FROM dbz WHERE op = 'UNKNOWN'
+ORDER BY 2, 3, 1;
 """
     with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as f:
         f.write(sql)
@@ -208,9 +250,16 @@ ORDER BY 1, 2, 3;
              "(SELECT count(*) FROM (SELECT DISTINCT * FROM dbz));"],
             capture_output=True, text=True)
         pairs = cnt.stdout.strip() or "?"
-        print(f"AGREE: rivet and Debezium produced the same (op, key) set "
+        # Name what was actually compared. An "AGREE" that says (op, key) while the
+        # caller passed --value understates the check; one that claims values when
+        # none were passed OVERSTATES it, which is the direction that matters — a
+        # gate reporting a value comparison it never ran is the blind spot this
+        # whole harness exists to close.
+        scope = (f"(op, key, {', '.join(a.value)})" if a.value
+                 else "(op, key) — VALUES NOT COMPARED, pass --value to see cell corruption")
+        print(f"AGREE: rivet and Debezium produced the same {scope} set "
               f"[{len(parts)} declared part(s) / {dbz_lines} reference event(s) "
-              f"-> {pairs} distinct (op,key) pairs compared]")
+              f"-> {pairs} distinct tuples compared]")
         return 0
     print("DISAGREE — one of the two is wrong, and which is the finding:\n")
     print(body)
