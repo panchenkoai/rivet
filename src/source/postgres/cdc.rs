@@ -890,8 +890,23 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
              datum with no pre-image value — logical decoding does not re-log an \
              externally stored value that an UPDATE leaves unchanged, so rivet cannot \
              recover it and refuses to write the literal `unchanged-toast-datum` marker \
-             as data. Capture the full pre-image so the value is preserved: \
-             ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;",
+             as data. \
+             \
+             THIS RECORD CANNOT BE REPAIRED. `ALTER TABLE {schema}.{table} REPLICA \
+             IDENTITY FULL` changes what FUTURE WAL contains and does nothing for a \
+             record already written — MEASURED: applying it and re-running produces \
+             this same error, because the slot still sits on the poisoned commit and \
+             the peek is non-consuming, so every later run meets it first. Clean \
+             changes queued BEHIND it are blocked too, and the un-acked slot pins WAL \
+             while that lasts. \
+             \
+             To get moving again, pick one and know what it costs: \
+             (1) accept the loss of this transaction — \
+             SELECT pg_replication_slot_advance('<slot>', '<lsn past this commit>'); \
+             then set REPLICA IDENTITY FULL so it cannot recur; or \
+             (2) keep nothing from the log — drop the slot, set REPLICA IDENTITY FULL, \
+             re-snapshot the table (`mode: full`) and start CDC from a fresh checkpoint. \
+             Setting REPLICA IDENTITY FULL alone leaves the capture wedged.",
             unrecovered.join(", ")
         )
     });

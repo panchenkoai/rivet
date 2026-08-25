@@ -1062,6 +1062,61 @@ fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
         err.contains("REPLICA IDENTITY FULL"),
         "must name the upstream fix; got: {err}"
     );
+
+    // ── the message must WORK from the degraded state, not describe a better one ──
+    //
+    // The original text said only "ALTER TABLE … REPLICA IDENTITY FULL". MEASURED:
+    // applying exactly that and re-running produces the SAME error, because the
+    // slot still sits on the poisoned commit and the peek is non-consuming — every
+    // later run meets it first, clean changes queued behind it are blocked, and the
+    // un-acked slot pins WAL for as long as that lasts. The capture is wedged
+    // permanently by the fix we printed.
+    //
+    // This half asserts the recovery the message now names actually recovers.
+    assert!(
+        err.contains("CANNOT BE REPAIRED") && err.contains("pg_replication_slot_advance"),
+        "the refusal must say the record is unrepairable AND name a way OUT of the \
+         wedge — an upstream ALTER alone leaves the capture dead: {err}"
+    );
+
+    c.batch_execute(&format!("ALTER TABLE {tbl} REPLICA IDENTITY FULL"))
+        .unwrap();
+    let still = Rig::pg_cdc(&tbl, &slot)
+        .dest_path(d.path().join("out_still"))
+        .run_expect_fail();
+    assert!(
+        still.contains("unchanged-TOAST"),
+        "the upstream ALTER must NOT clear the existing poison — if this ever stops \
+         being true the message is over-warning and should be softened: {still}"
+    );
+
+    // Route (1) from the message: advance past the poisoned commit, accepting its
+    // loss, then the SAME export must capture again.
+    let past: String = c
+        .query_one(
+            &format!(
+                "SELECT max(lsn)::text FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL) \
+                 WHERE data LIKE '%COMMIT%'"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c.execute(
+        &format!("SELECT pg_replication_slot_advance('{slot}', '{past}')"),
+        &[],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (99, 'sm', repeat('z', 6400)); \
+         UPDATE {tbl} SET small = 'sm2' WHERE id = 99"
+    ))
+    .unwrap();
+    // `run_ok` panics with rivet's own stderr if this still fails, which is the
+    // message a reader needs here.
+    Rig::pg_cdc(&tbl, &slot)
+        .dest_path(d.path().join("out_recovered"))
+        .run_ok();
 }
 
 #[test]
