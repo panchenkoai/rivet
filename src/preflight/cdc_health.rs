@@ -26,6 +26,23 @@ use super::doctor::DoctorCheck;
 /// consumer stopped and the disk is filling.
 const PG_RETAINED_WAL_FAIL_BYTES: i64 = 1 << 30; // 1 GiB
 
+/// The bar, with a test seam.
+///
+/// Crossing 1 GiB of real WAL takes minutes of writes, so a live test that wanted
+/// to prove the run REACHES this check had to either burn that time or assert
+/// nothing — and the version that asserted nothing is the one that would have
+/// shipped. `RIVET_TEST_SLOT_WAL_BAR` lets a test cross the bar with a KiB.
+///
+/// Deliberately not a config knob: an operator lowering this would get a warning on
+/// every ordinary backlog and learn to ignore it, which costs more than the warning
+/// is worth. Same reasoning as the fault hooks — a seam for tests, not a feature.
+fn retained_wal_bar() -> i64 {
+    std::env::var("RIVET_TEST_SLOT_WAL_BAR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PG_RETAINED_WAL_FAIL_BYTES)
+}
+
 fn mib(bytes: i64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
@@ -85,6 +102,54 @@ struct PgSlot {
 
 /// Verdict for the export's own slot. Absent is healthy (created on first
 /// run); present is healthy while the retained WAL stays small.
+/// Does this slot's retained WAL warrant telling the operator? Shared by `doctor`
+/// (which FAILS on it) and by every `run` (which WARNS) so the threshold and the
+/// wording have ONE definition. Two would drift on the first change, and the
+/// run-time one is the copy nobody would notice going stale.
+///
+/// `None` below the threshold: a slot legitimately holds everything since the last
+/// run, and a warning on every ordinary backlog is a warning that stops being read.
+pub(crate) fn pg_retained_wal_warning(
+    slot: &str,
+    retained_bytes: i64,
+    active: bool,
+) -> Option<String> {
+    if retained_bytes < retained_wal_bar() {
+        return None;
+    }
+    Some(format!(
+        "slot '{slot}' is pinning {} of WAL (active={active}) — the source disk is filling. \
+         This run will drain it, but a drain that far behind takes time and the WAL keeps \
+         growing meanwhile. If capture here is retired instead: \
+         SELECT pg_drop_replication_slot('{slot}'); consider max_slot_wal_keep_size as a \
+         blast-radius bound",
+        mib(retained_bytes)
+    ))
+}
+
+/// The same question for slots this config does NOT own. These are the dangerous
+/// ones: nobody is draining them, so the WAL they pin is pinned forever — measured
+/// live at 9 abandoned slots holding 1.5 GiB each on a dev stand.
+pub(crate) fn pg_foreign_slots_warning(foreign: &[(String, i64)]) -> Option<String> {
+    let worst = foreign.iter().max_by_key(|(_, b)| *b)?;
+    let bar = retained_wal_bar();
+    if worst.1 < bar {
+        return None;
+    }
+    let listing = foreign
+        .iter()
+        .filter(|(_, b)| *b >= bar)
+        .map(|(n, b)| format!("{n} ({})", mib(*b)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "inactive slot(s) NOT owned by this config are pinning WAL: {listing} — nothing is \
+         draining them, so this WAL is pinned until someone acts. If the consumer is gone \
+         for good: SELECT pg_drop_replication_slot('{}')",
+        worst.0
+    ))
+}
+
 fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorCheck {
     let name = format!("CDC slot '{slot}' (export '{export}')");
     match state {
@@ -104,14 +169,12 @@ fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorChe
             )),
             None,
         ),
+        // The threshold and the wording come from the shared warning so `doctor` and
+        // `run` cannot disagree about when a slot is too far behind.
         Some(s) => check(
             name,
             false,
-            Some(format!(
-                "slot is pinning {} of WAL (active={}) — the source disk is filling",
-                mib(s.retained_bytes),
-                s.active
-            )),
+            pg_retained_wal_warning(slot, s.retained_bytes, s.active),
             Some(
                 "run the CDC export to drain it (advancing the slot releases WAL), or drop it \
                  if capture is retired: SELECT pg_drop_replication_slot('<slot>'); consider \
@@ -746,5 +809,98 @@ mod tests {
     fn norm_lsn_compares_across_prefix_and_case() {
         assert!(norm_lsn("0x0000001000000001") < norm_lsn("00000028000009f0"));
         assert_eq!(norm_lsn("0xABC"), norm_lsn("abc"));
+    }
+}
+
+#[cfg(test)]
+mod slot_retention_warning_tests {
+    use super::*;
+
+    /// The threshold has ONE definition, and both callers must sit on the same side
+    /// of it: `doctor` fails, every `run` warns. A second threshold in the run path
+    /// is the copy that goes stale unnoticed.
+    #[test]
+    fn an_ordinary_backlog_is_silent_and_a_pinned_slot_names_its_escape() {
+        // Below the bar: a slot legitimately holds everything since the last run, and
+        // a warning on every ordinary backlog is one that stops being read.
+        assert_eq!(pg_retained_wal_warning("s", 0, true), None);
+        assert_eq!(
+            pg_retained_wal_warning("s", PG_RETAINED_WAL_FAIL_BYTES - 1, false),
+            None,
+            "one byte under the bar must stay silent — the boundary is the whole \
+             contract, and an off-by-one here makes the warning fire on every run"
+        );
+
+        let w = pg_retained_wal_warning("mine", PG_RETAINED_WAL_FAIL_BYTES, true)
+            .expect("at the bar the operator must be told");
+        assert!(w.contains("mine"), "name the slot: {w}");
+        assert!(
+            w.contains("pg_drop_replication_slot") && w.contains("max_slot_wal_keep_size"),
+            "name what to DO — a warning without an escape is noise: {w}"
+        );
+        assert!(
+            w.contains("This run will drain it"),
+            "and be honest that the run itself fixes this case, or an operator drops a \
+             slot that was about to be drained: {w}"
+        );
+    }
+
+    /// The foreign slots are the dangerous half: nobody is draining them, so their
+    /// WAL is pinned until a human acts. Measured live at 9 abandoned slots holding
+    /// 1.5 GiB each on a dev stand.
+    #[test]
+    fn foreign_slots_warn_only_past_the_bar_and_list_only_the_offenders() {
+        assert_eq!(pg_foreign_slots_warning(&[]), None);
+        assert_eq!(
+            pg_foreign_slots_warning(&[("small".into(), 1024)]),
+            None,
+            "an inactive slot holding a KiB is not a hazard; warning about it teaches \
+             operators to ignore the message"
+        );
+
+        // EXACTLY at the bar, both directions. The sibling test above covers this
+        // boundary for `pg_retained_wal_warning` and this one did not — it fed
+        // `bar + 1` and nothing else, so `< bar` and `<= bar` behaved identically
+        // and the mutant survived CI (`replace < with <=`, 2026-08-25). Testing one
+        // function's boundary and not its twin's is exactly the asymmetry mutation
+        // testing exists to find; reading the two tests side by side does not show it.
+        assert!(
+            pg_foreign_slots_warning(&[("at_the_bar".into(), PG_RETAINED_WAL_FAIL_BYTES)])
+                .is_some(),
+            "a slot sitting exactly ON the bar must be reported — `<=` here would let \
+             the single most common boundary value through in silence"
+        );
+        assert_eq!(
+            pg_foreign_slots_warning(&[("under".into(), PG_RETAINED_WAL_FAIL_BYTES - 1)]),
+            None,
+            "...and one byte under it must not be"
+        );
+
+        let big = PG_RETAINED_WAL_FAIL_BYTES + 1;
+        let w = pg_foreign_slots_warning(&[
+            ("small".into(), 4096),
+            ("orphan_a".into(), big),
+            ("orphan_b".into(), big * 2),
+        ])
+        .expect("two slots past the bar must be reported");
+        assert!(
+            w.contains("orphan_a") && w.contains("orphan_b"),
+            "list every offender, not just the worst — an operator fixing one and \
+             re-running should not have to discover the rest one at a time: {w}"
+        );
+        assert!(
+            !w.contains("small"),
+            "and NOT the ones under the bar, or the list is unreadable at the scale \
+             where it matters: {w}"
+        );
+        assert!(
+            w.contains("pg_drop_replication_slot('orphan_b')"),
+            "the ready-to-paste command should name the WORST one: {w}"
+        );
+        assert!(
+            w.contains("nothing is draining them"),
+            "say why this differs from our own backlog — that distinction is the \
+             reason there are two warnings: {w}"
+        );
     }
 }

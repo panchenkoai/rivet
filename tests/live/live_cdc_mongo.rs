@@ -734,3 +734,155 @@ fn mongo_cdc_per_field_presence_matches_the_source() {
         );
     }
 }
+
+/// A DELETE carries the PRE-IMAGE when the collection has one — the half of Mongo's
+/// delete semantics that nothing asked about.
+///
+/// `mongo_cdc_update_and_delete_carry_document` asserts the opposite case and says
+/// so: with pre-images off, a delete's `document` is NULL and the schema must allow
+/// it. That is the DEFAULT, and it left the whole `full_document_before_change`
+/// request — which rivet issues on every stream — verified by nothing. A silent
+/// no-op and a working pre-image look identical from the default collection.
+///
+/// The distinction matters to a consumer: with a pre-image the delete tombstone
+/// carries what the row WAS, so a loader can reconcile it against the destination;
+/// without one it carries only `_id`.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs (6.0+ for pre-images)"]
+fn mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let db = unique_name("cdc_preimg");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+    // The collection must EXIST before collMod can change it.
+    m.upsert_set("t", 9, "v", "seed");
+    if !m.enable_pre_images("t") {
+        // Said out loud rather than passed quietly: on a pre-6.0 server there is no
+        // pre-image to carry and this cell is genuinely not applicable.
+        skip_live(&format!(
+            "server major {} has no changeStreamPreAndPostImages",
+            m.server_major()
+        ));
+        return;
+    }
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin the anchor past the seed
+
+    m.upsert_set("t", 9, "v", "doomed");
+    m.delete_one("t", 9);
+    rig.run_ok();
+
+    let changes = read_mongo_cdc_changes(&rig.out_dir());
+    let del = changes
+        .iter()
+        .find(|c| c.op == "delete")
+        .unwrap_or_else(|| {
+            panic!(
+                "no delete captured — the fixture is inert ({} changes)",
+                changes.len()
+            )
+        });
+    assert_eq!(del.id, "9", "the delete must carry its _id");
+
+    // MEASURED 2026-08-25 (MongoDB 7.0.37): {"_id":9,"v":"doomed"} — the pre-image
+    // is the document as it was at the instant of the delete, not the seed value it
+    // held two writes earlier. Both halves are asserted, because a `document` that
+    // merely parses proves nothing about WHICH image arrived.
+    assert!(
+        del.document.contains("\"v\":\"doomed\""),
+        "the delete must carry the PRE-IMAGE — the value the document held when it \
+         was deleted. Got: {}",
+        del.document
+    );
+    assert!(
+        !del.document.contains("seed"),
+        "...and the pre-image is the state at DELETE time, not an earlier one. \
+         Got: {}",
+        del.document
+    );
+}
+
+/// The OTHER side of the same window: a crash after the checkpoint is persisted.
+///
+/// Mongo's `ack` is the trait's default no-op — only PostgreSQL consumes on read —
+/// so its resume position is the checkpoint FILE alone. That makes
+/// `cdc_after_checkpoint_before_ack` and `cdc_after_ack` the same instant for this
+/// engine, and what protects it is not the ack but the ORDER: parts flushed, then
+/// manifested, then the checkpoint saved. A crash anywhere in that sequence either
+/// leaves the checkpoint behind the data (re-read, a duplicate) or everything
+/// durable together.
+///
+/// Two ordering mutants were applied and this stayed GREEN against both —
+/// `p.save(ck)` moved above the flush, and the ack moved above the checkpoint —
+/// for a structural reason worth writing down rather than hiding: the fault hook
+/// sits AFTER every durability step, so anything the crash could have skipped was
+/// already written before it fired. Mongo's own model closes the rest (see
+/// `TxnFramer::single_event_commit`): the resume token is per-event and
+/// consume-free, so a checkpoint landing mid-transaction re-reads the tail rather
+/// than skipping it the way a PG slot or an MSSQL from-LSN would.
+///
+/// What the body DOES grade is its two preconditions, and they are not decoration:
+/// `leg1 < 6` fails if the crash left nothing behind, and a resume that delivers
+/// NOTHING fails outright — which is what a checkpoint jumping past unread changes
+/// would produce.
+///
+/// The sibling above (`cdc_after_flush_before_ack`) proves the duplicate side; this
+/// proves there is no gap side. Both resume into a FRESH destination, because a
+/// shared one is satisfied by the crashed run's own durable parts — Mongo's
+/// at-least-once evidence used to be exactly that shape.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_crash_after_the_checkpoint_still_delivers_every_change() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let db = unique_name("cdc_ckcrash");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    let mut rig = cdc(&db, "t").cdc("rollover: 2");
+    rig.run_ok(); // pin the anchor
+    for i in 1..=6 {
+        m.upsert_set("t", i, "v", &format!("x{i}"));
+    }
+
+    let crashed = rig.run_with_env("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack");
+    assert!(
+        !crashed.status.success(),
+        "the fault hook must crash the run — a fault that did not fire leaves this \
+         asserting an ordinary two-run export"
+    );
+    // The crash must have left work behind, or the resume below has nothing to
+    // prove: with rollover 2 and six changes, run 1 checkpoints after the first
+    // part and dies with four changes unread.
+    let leg1 = duckdb_declared_rows(rig.oracle_dir());
+    assert!(
+        leg1 < 6,
+        "run 1 delivered {leg1} of 6 before the crash — nothing was left for the \
+         resume, so the union below would pass over a resume that captured zero"
+    );
+
+    // Leg 1's ids, read BEFORE the destination moves: unlike the sibling above, the
+    // resume here legitimately starts PAST what the checkpoint already covered, so
+    // the oracle is the union — and the union is exactly what at-least-once promises.
+    let leg1_ids = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
+
+    rig.resume_into_fresh_dest();
+    rig.run_ok();
+    let resumed = duckdb_declared_distinct_set(rig.oracle_dir(), "_id");
+    assert!(
+        !resumed.is_empty(),
+        "the resume leg delivered NOTHING — with four changes left unread after the \
+         crash, an empty leg means the checkpoint jumped past them"
+    );
+    let mut union = leg1_ids.clone();
+    union.extend(resumed.iter().cloned());
+    for i in 1..=6 {
+        assert!(
+            union.contains(&i.to_string()),
+            "id {i} was never delivered by EITHER leg — the checkpoint advanced past a \
+             change whose part was not durable. leg1={leg1_ids:?} resume={resumed:?}"
+        );
+    }
+}

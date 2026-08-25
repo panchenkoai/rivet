@@ -44,11 +44,21 @@ struct BqConfig {
 
 /// Read BigQuery configuration from env. Returns `None` if any required piece
 /// is missing — tests skip in that case rather than fail.
+/// The `RIVET-SKIP` marker, local to this suite (see tests/common/mod.rs for why
+/// one token: a lane cannot grep for four different spellings).
+fn skip_live(why: &str) {
+    let who = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed test>")
+        .to_string();
+    eprintln!("RIVET-SKIP {who} — {why}");
+}
+
 fn bq_config() -> Option<BqConfig> {
     let project = std::env::var("BIGQUERY_TEST_PROJECT").ok()?;
     // `bq --version` is the cheapest reachable probe.
     if Command::new("bq").arg("--version").output().is_err() {
-        eprintln!("bigquery_load: skipping — `bq` CLI not on PATH");
+        skip_live("`bq` CLI not on PATH");
         return None;
     }
     Some(BqConfig {
@@ -159,7 +169,7 @@ impl BqConfig {
 fn bigquery_validates_postgres_type_matrix_parquet() {
     require_alive(LiveService::Postgres);
     let Some(cfg) = bq_config() else {
-        eprintln!("bigquery_load: skipping (BIGQUERY_TEST_PROJECT not set)");
+        skip_live("BIGQUERY_TEST_PROJECT not set");
         return;
     };
 
@@ -302,7 +312,7 @@ fn bigquery_validates_postgres_type_matrix_parquet() {
 fn bigquery_validates_mysql_type_matrix_parquet() {
     require_alive(LiveService::Mysql);
     let Some(cfg) = bq_config() else {
-        eprintln!("bigquery_load: skipping (BIGQUERY_TEST_PROJECT not set)");
+        skip_live("BIGQUERY_TEST_PROJECT not set");
         return;
     };
 
@@ -461,7 +471,7 @@ exports:
 fn bigquery_validates_mssql_type_matrix_parquet() {
     require_alive(LiveService::Mssql);
     let Some(cfg) = bq_config() else {
-        eprintln!("bigquery_load: skipping (BIGQUERY_TEST_PROJECT not set)");
+        skip_live("BIGQUERY_TEST_PROJECT not set");
         return;
     };
 

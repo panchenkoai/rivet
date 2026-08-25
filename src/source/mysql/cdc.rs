@@ -134,6 +134,60 @@ impl MysqlChangeStream {
         }
     }
 
+    /// Pure verdict on `binlog_row_metadata` — the engine setting that decides
+    /// whether the sink maps binlog images by NAME or by POSITION.
+    ///
+    /// A WARNING and not a refusal, unlike its sibling [`Self::row_image_verdict`],
+    /// and the asymmetry is the whole point: `binlog_row_image` defaults to FULL, so
+    /// refusing a non-FULL value refuses a setting somebody CHOSE.
+    /// `binlog_row_metadata` defaults to MINIMAL — refusing it would refuse every
+    /// MySQL nobody has touched.
+    ///
+    /// What MINIMAL costs, MEASURED (2026-08-25, MySQL 8.0.46) rather than argued:
+    /// a table `(id, a, b)` holding `(1, 'AAA', 'BBB')`, then
+    /// `ALTER TABLE .. MODIFY b VARCHAR(9) AFTER id`, then a resume across that
+    /// boundary — the schema is resolved at OPEN (new order) while the event
+    /// replays from the CHECKPOINT (old order), so the parquet came back
+    /// `a = 'BBB', b = 'AAA'`. Swapped, `status: success`, nothing in the log.
+    ///
+    /// The sink's arity guard cannot see it: a reorder does not change arity, and
+    /// under FULL the guard is skipped outright (`image_names.is_some()` ⇒ mapped by
+    /// name, which is reorder-proof). So FULL is not a tuning preference here — it
+    /// is what makes a mid-stream DDL safe.
+    ///
+    /// `None` (a server too old to have the variable — it is 8.0.1+) is NOT
+    /// evidence of a bad setting: MySQL 5.7 has no way to carry names, the sink
+    /// maps positionally there by construction, and a warning naming a variable
+    /// that does not exist is one an operator cannot act on.
+    pub(crate) fn row_metadata_warning(metadata: Option<&str>) -> Option<String> {
+        let m = metadata?;
+        if m.eq_ignore_ascii_case("FULL") {
+            return None;
+        }
+        Some(format!(
+            "the server has binlog_row_metadata = {m} (MySQL's default), so binlog row events \
+             carry no column NAMES and the sink maps values by POSITION. A same-arity DDL that \
+             reorders columns across a resume boundary then silently SWAPS them (measured: a \
+             MODIFY .. AFTER moved 'BBB' into column `a` and 'AAA' into `b`, with status \
+             success), and any arity-changing DDL mid-window aborts the flush instead. Set \
+             `binlog_row_metadata = FULL` (8.0.1+) — rivet then maps by name and both cases \
+             become safe"
+        ))
+    }
+
+    /// Live half of [`Self::row_metadata_warning`]: one query at open, on a
+    /// connection that is about to dump. A connect/permission failure answers
+    /// "nothing to say" — this exists to catch a CONFIGURATION, not to police
+    /// access, the same contract as [`Self::row_image`].
+    pub(crate) fn row_metadata(url: &str, tls: Option<&TlsConfig>) -> Option<String> {
+        use mysql::prelude::Queryable;
+        let mut conn = connect_conn(url, tls).ok()?;
+        let m: Option<String> = conn
+            .query_first("SELECT @@global.binlog_row_metadata")
+            .unwrap_or(None);
+        Self::row_metadata_warning(m.as_deref())
+    }
+
     pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
         use super::super::cdc::RowImage;
         use mysql::prelude::Queryable;
@@ -515,6 +569,20 @@ impl MysqlChangeStream {
             // `XA PREPARE` deliberately does NOT release: the transaction is not
             // committed yet, and releasing there would publish rows a later
             // `XA ROLLBACK` erases.
+            // A TRUNCATE is a QUERY event, never rows — so the rows path below
+            // never sees it and the `_ => {}` arm dropped it silently, leaving the
+            // destination holding rows the source no longer has. Table-addressed
+            // for the reason #281 measured: the binlog carries every table on the
+            // server, so refusing without asking whose relation it is would make
+            // one truncated table an outage for exports that never read it.
+            Some(EventData::QueryEvent(qe))
+                if truncate_target(&qe.query(), &qe.schema()).is_some_and(|(sc, tb)| {
+                    undecodable_event_is_ours(Some((&sc, &tb)), &self.configured_tables)
+                }) =>
+            {
+                let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
+                anyhow::bail!(truncate_refusal_message(&sc, &tb));
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -797,6 +865,92 @@ pub(crate) fn classify_mysql_routing(
 /// (one server has one basename — rotation never changes it mid-stream). Fails
 /// open: an unparseable name is never "past" — the `BINLOG_DUMP_NON_BLOCK` EOF
 /// backstop still ends the run (delayed termination, never a dropped commit).
+/// Remove `/* … */` comment spans, leaving a space so tokens never fuse.
+///
+/// Not a general SQL lexer: a `/*` inside a string literal is not something a
+/// TRUNCATE statement can contain (it takes only identifiers), so the simple scan
+/// is exact for this one shape and the parser refuses anything it cannot read
+/// confidently anyway.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => return out, // unterminated — everything after is comment
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The table a `TRUNCATE` QUERY event names, as `(schema, table)` — schema from
+/// the statement's qualifier when it has one, else the event's own database.
+///
+/// A TRUNCATE is logged as a QUERY event, never as rows, so the rows-event path
+/// never sees it and the `_ => {}` arm dropped it in silence. Measured 2026-08-24
+/// on the rivet-mysql-cdc-1 stand: 2 inserts then a TRUNCATE left the source table
+/// EMPTY while the run reported `status: success, rows: 2` — the identical
+/// divergence PostgreSQL had, by a different route.
+///
+/// Parses `TRUNCATE [TABLE] [`db`.]`tbl`` with optional backticks. Deliberately
+/// permissive about whitespace and case (MySQL logs the statement as written) and
+/// deliberately NOT a general SQL parser: anything it cannot read confidently
+/// returns `None` and falls through to the old behaviour, which is what it was
+/// before this existed.
+pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, String)> {
+    // Strip `/* … */` comments before tokenising. An adversarial pass predicted a
+    // hole here (sqlcommenter / Flyway / Rails append one to every statement) and
+    // MEASURING it did NOT reproduce: `SHOW BINLOG EVENTS` renders a trailing
+    // `/* xid=N */` that the QUERY event's own `query()` does not carry, and four
+    // live forms — trailing comment, leading comment, backticked, db-qualified —
+    // all refuse correctly on the 8.0 stand. Handled anyway because the cost is a
+    // few lines and the failure mode is a SILENT divergence: if any server version
+    // or client setting does deliver the text, this is the difference between a
+    // refusal and rows quietly left behind.
+    let stripped = strip_sql_comments(sql);
+    let t = stripped.trim().trim_end_matches(';').trim();
+    let mut w = t.split_whitespace();
+    if !w.next()?.eq_ignore_ascii_case("truncate") {
+        return None;
+    }
+    let mut name = w.next()?;
+    if name.eq_ignore_ascii_case("table") {
+        name = w.next()?;
+    }
+    if w.next().is_some() {
+        return None; // trailing tokens — not a shape this reader claims to understand
+    }
+    let unq = |s: &str| s.trim_matches('`').to_string();
+    match name.split_once('.') {
+        Some((db, tbl)) => Some((unq(db), unq(tbl))),
+        None => Some((event_db.to_string(), unq(name))),
+    }
+}
+
+/// Refuse a TRUNCATE on a captured table. Same contract as the PostgreSQL arm —
+/// see `postgres::cdc::truncate_refusal_message` for why this bails rather than
+/// warns: the rows leave the source with no DELETE events to carry them, so the
+/// destination disagrees with its source permanently and no later capture can
+/// reconcile it.
+pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    format!(
+        "mysql cdc: `{qualified}` was TRUNCATEd, and this reader cannot represent that as a \
+         change. Skipping it would leave every row the truncate removed sitting in the \
+         destination with no DELETE to retract it — the source empty, the destination \
+         not, permanently, because those rows left the source without events and no \
+         later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
+         re-establish the baseline, then resume CDC from a fresh checkpoint."
+    )
+}
+
 /// Does this QUERY event close a transaction?
 ///
 /// `COMMIT` on its own (the non-transactional-engine and binlog-format path) and
@@ -921,6 +1075,46 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// The asymmetry with `row_image_verdict` is deliberate and this pins it: a
+    /// non-FULL `binlog_row_image` is REFUSED (somebody chose it, the default is
+    /// FULL); a non-FULL `binlog_row_metadata` is WARNED (the default IS non-FULL,
+    /// so refusing would refuse every untouched MySQL).
+    #[test]
+    fn minimal_row_metadata_warns_and_names_the_escape_while_full_stays_quiet() {
+        assert_eq!(
+            MysqlChangeStream::row_metadata_warning(Some("FULL")),
+            None,
+            "a correctly-configured server must stay quiet, or the warning fires on \
+             every run and stops being read"
+        );
+        assert_eq!(
+            MysqlChangeStream::row_metadata_warning(Some("full")),
+            None,
+            "the server renders this variable uppercase, but a proxy or a older \
+             build need not — compare case-insensitively like row_image_verdict"
+        );
+        assert_eq!(
+            MysqlChangeStream::row_metadata_warning(None),
+            None,
+            "a server too old to HAVE the variable (pre-8.0.1) maps positionally by \
+             construction; naming a variable that does not exist is a warning nobody \
+             can act on"
+        );
+        for m in ["MINIMAL", "minimal", "SOMETHING_NEW"] {
+            let w = MysqlChangeStream::row_metadata_warning(Some(m))
+                .unwrap_or_else(|| panic!("{m} is not FULL — the sink maps by POSITION"));
+            assert!(
+                w.contains("binlog_row_metadata = FULL"),
+                "the warning must name the ESCAPE, not just the risk: {w}"
+            );
+            assert!(
+                w.contains("POSITION") && w.contains("SWAP"),
+                "and must say what it costs — measured, not hedged: {w}"
+            );
+        }
+    }
+
     /// The MySQL routing guard's decision surface.
     ///
     /// `None` (the catalog has no row) must stay ROUTABLE, deliberately: the schema

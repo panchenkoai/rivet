@@ -609,6 +609,87 @@ impl CdcEngine {
         }
     }
 
+    /// Does this engine's CURRENT configuration map change images by position
+    /// rather than by name, and what does that cost?
+    ///
+    /// MySQL is the only engine that can answer yes: its binlog carries column
+    /// names only at `binlog_row_metadata=FULL`, and the default is MINIMAL. The
+    /// other three name their columns unconditionally — PostgreSQL's
+    /// `test_decoding` prints `name[type]:value`, SQL Server's change table IS a
+    /// table, Mongo's events are documents — so there is no positional mapping to
+    /// warn about, and a `None` here is structural rather than unimplemented.
+    pub(crate) fn positional_mapping_warning(
+        &self,
+        url: &str,
+        tls: Option<&TlsConfig>,
+    ) -> Option<String> {
+        match self {
+            Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_metadata(url, tls),
+            Self::Postgres | Self::Mssql | Self::Mongo => None,
+        }
+    }
+
+    /// WAL this source is holding that an operator should know about before the run
+    /// starts, not after the disk fills.
+    ///
+    /// PostgreSQL only, and structurally so: a replication slot is the one CDC
+    /// anchor that makes the SERVER retain log on the reader's behalf. MySQL's
+    /// binlog and SQL Server's change tables expire on their own schedule whatever
+    /// rivet does (which is why they can lose data to retention and PG cannot), and
+    /// Mongo's oplog is a capped collection. There is nothing to pin, so nothing to
+    /// warn about — a `None` here is a fact about those engines, not a TODO.
+    ///
+    /// Two questions, and the second is the dangerous one. This export's OWN slot
+    /// being far behind is worth saying (the drain will be long and WAL grows
+    /// meanwhile) but the run does fix it. A slot NOBODY owns is pinned until a
+    /// human acts — measured live at 9 abandoned slots holding 1.5 GiB each.
+    ///
+    /// Best-effort like `row_image`: a catalog the reader cannot query answers with
+    /// nothing. This exists to surface a CONFIGURATION hazard, not to police access,
+    /// and a run that refuses because it could not read `pg_replication_slots` would
+    /// trade a warning for an outage.
+    pub(crate) fn retention_warnings(
+        &self,
+        url: &str,
+        tls: Option<&TlsConfig>,
+        opts: &CdcEngineOpts,
+    ) -> Vec<String> {
+        let Self::Postgres = self else {
+            return Vec::new();
+        };
+        let CdcEngineOpts::Postgres { slot, .. } = opts else {
+            return Vec::new();
+        };
+        let slot = slot.clone();
+        let Ok(mut client) = crate::source::postgres::connect_client(url, tls) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Ok(Some(row)) = client.query_opt(
+            "SELECT active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        ) && let Some(w) = crate::preflight::cdc_health::pg_retained_wal_warning(
+            &slot,
+            row.get(1),
+            row.get(0),
+        ) {
+            out.push(w);
+        }
+        let ours = vec![slot];
+        if let Ok(rows) = client.query(
+            "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+             FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
+            &[&ours],
+        ) {
+            let foreign: Vec<(String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+            if let Some(w) = crate::preflight::cdc_health::pg_foreign_slots_warning(&foreign) {
+                out.push(w);
+            }
+        }
+        out
+    }
+
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -817,38 +898,23 @@ pub(crate) fn create_change_stream(
             let ci = capture_instance.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
             })?;
-            // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
-            // server-side cursor — the from-LSN is what makes it at-least-once instead
-            // of re-reading the whole change table each run).
-            let from_lsn = match cfg.checkpoint.as_deref() {
-                // A corrupt checkpoint must fail loud (#99), not silently drop to
-                // None (a full change-table over-read that re-loads everything).
-                Some(p) => Position::load(p)?.and_then(|pos| {
-                    pos.0
-                        .get("lsn")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                }),
-                None => None,
-            };
-            // Was that position an ANCHOR or a resume? Only an anchor may be
-            // floored up to the instance's start; a resume position below the
-            // change table's min LSN is retention loss and must THROW. Absent on
-            // a legacy checkpoint ⇒ treated as a resume, the loud direction.
-            let from_is_pin = match cfg.checkpoint.as_deref() {
-                Some(p) => Position::load(p)?
-                    .and_then(|pos| pos.0.get("pinned").and_then(|v| v.as_bool()))
-                    .unwrap_or(false),
-                None => false,
+            // Resume from the checkpoint's position if one was persisted (SQL Server
+            // has no server-side cursor — the from-LSN is what makes it at-least-once
+            // instead of re-reading the whole change table each run). One load, and
+            // the DECISION — including what an `lsn`-less file means — lives in
+            // `resume_from_checkpoint` where a unit test can grade it.
+            let resume = match cfg.checkpoint.as_deref() {
+                Some(p) => crate::source::mssql::cdc::resume_from_checkpoint(
+                    Position::load(p)?.as_ref(),
+                    &p.display().to_string(),
+                )?,
+                None => crate::source::mssql::cdc::resume_from_checkpoint(None, "")?,
             };
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
                     url,
                     ci,
-                    crate::source::mssql::cdc::Resume {
-                        from_lsn,
-                        from_is_pin,
-                    },
+                    resume,
                     tls,
                     peek,
                     cfg.drain,
@@ -1120,6 +1186,16 @@ pub(crate) fn run_capture(
                 )),
             );
         }
+    }
+    // `warn`, at run start, before a single event is read: an operator whose
+    // capture is about to map by position must learn it from the run rather than
+    // from a swapped column months later. `info` would be functionally silent at
+    // the default log level — the same rule the sparse-chunk warning follows.
+    if let Some(why) = engine.positional_mapping_warning(&url, tls.as_ref()) {
+        log::warn!("{} cdc: {why}.", engine.label());
+    }
+    for why in engine.retention_warnings(&url, tls.as_ref(), &cap.cdc_cfg.engine) {
+        log::warn!("{} cdc: {why}.", engine.label());
     }
     let mut resolver = match CdcSchemaResolver::connect(&url, tls.as_ref()) {
         Ok(r) => r,

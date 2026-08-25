@@ -260,7 +260,11 @@ services:
       - "--max-connections=400"
       # FULL puts column NAMES into TABLE_MAP optional metadata (8.0.1+) —
       # the sink then maps binlog images BY NAME, closing the positional
-      # class on MySQL (doctor recommends this in production too).
+      # class on MySQL. MySQL's OWN default is MINIMAL, so this pin makes the
+      # stack UNLIKE a default deployment: two live tests flip the global back
+      # to MINIMAL under a reset guard (`RowMetadata`) precisely so the engine
+      # default is not the one configuration nothing exercises. rivet warns at
+      # run start when it sees a non-FULL value — measured swap, not folklore.
       - "--binlog-row-metadata=FULL"
     environment:
       MYSQL_ROOT_PASSWORD: rivet

@@ -185,11 +185,22 @@ jobs:
         # mongo-less stack and panicked at require_alive — the exact latent
         # failure the matrix audit predicted. Every Mongo test (module-named or
         # stand_*) is owned by the `mongo-versions` job, same as ci.yml's e2e.
+        # Skip the warehouse cells (`tests/oracle_fixture_matrix.rs`, every test
+        # prefixed `warehouse_cell_`): they drive a REAL BigQuery/Snowflake target
+        # and need RIVET_TEST_GCS_BUCKET plus warehouse credentials, which this job
+        # does not have and no workflow supplies. They used to be SELECTED here and
+        # pass in 0.00s — the harness returned an empty oracle list on a missing
+        # env, and `assert_all_pass` walks straight through an empty list, so 20
+        # cells reported green while verifying nothing. The runners now report
+        # `Skipped`, which the strength floor treats as a failure (its own doc said
+        # so all along), so the exclusion has to be written HERE where a reader can
+        # see it rather than hidden in the harness.
         run: |
           cargo test --release -- --ignored \
             --skip full_content_export_max_pressure \
             --skip validates --skip edge_cases --skip via_duckdb \
-            --skip mongo
+            --skip mongo \
+            --skip warehouse_cell
 
       - name: Dump service logs on failure
         if: failure()

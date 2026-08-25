@@ -1018,9 +1018,9 @@ fn the_idle_canary_refuses_the_229_walk_and_allows_the_documented_dip() {
 #[ignore = "live: requires the optional dev/stand pg18-batch (:5518)"]
 fn pg18_governor_samples_the_modern_checkpointer_catalog() {
     if !pg_modern_alive() {
-        eprintln!(
-            "SKIP pg18_governor_samples_the_modern_checkpointer_catalog: the optional \
-             dev/stand pg18-batch (:5518) is not up"
+        skip_live(
+            "pg18_governor_samples_the_modern_checkpointer_catalog: the optional \
+             dev/stand pg18-batch (:5518) is not up",
         );
         return;
     }

@@ -384,6 +384,7 @@ fn derived_capture_marker_set_is_pinned() {
         "run_args_env(",
         "run_expect_fail(",
         "run_ok(",
+        "run_ok_capture(",
         "run_rivet(",
         "run_rivet_args_bounded(",
         "run_rivet_args_bounded_env(",

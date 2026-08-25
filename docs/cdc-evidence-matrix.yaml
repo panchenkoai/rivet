@@ -148,14 +148,40 @@ shapes:
       Pre-ack manifest: publish only `&s.parts[len-1..]` instead of the whole slice.
       Form B: `*e = sum` instead of `wrapping_add`. MEASURED: the manifest mutant leaves
       the lib suite at 2607 passed, 0 failed.
-    postgres: { gap: "shared sink — the MBT manifest fixture inserts 30 rows in ONE
-        autocommit statement at rollover 10, and should_roll gates on `committed`
-        (sink.rs:106-110) so it yields ONE part; the '3 parts' comments at
-        live_cdc_mbt.rs:289,386 are wrong" }
-    mysql:    { gap: "same shared fixture" }
-    mssql:    { gap: "same shared fixture" }
-    mongo:    { gap: "same shared fixture" }
-
+    postgres:
+      na: >-
+        na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
+        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        fold, so it is proven once on the fixture that drives it rather than four times. This
+        is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
+        by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
+        rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
+    mysql:
+      sound: >-
+        closed 2026-08-25. The fixture inserted 30 rows in ONE autocommit statement at rollover
+        10; `should_roll` gates on `committed`, which marks a TRANSACTION boundary, so it
+        yielded exactly ONE part while two comments claimed three (MEASURED parts=1). A fold
+        over one element makes every fold operator identical. Split into three statements
+        (MEASURED parts=3). Proof that the FIXTURE was the defect, not the assertion: with the
+        pre-ack manifest mutant (publish only `&s.parts[len-1..]`) applied, the OLD one-INSERT
+        fixture stays GREEN and the new three-statement one goes RED — same mutant, same
+        assertions, different fixture (tests/live/live_cdc_mbt.rs).
+    mssql:
+      na: >-
+        na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
+        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        fold, so it is proven once on the fixture that drives it rather than four times. This
+        is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
+        by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
+        rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
+    mongo:
+      na: >-
+        na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
+        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        fold, so it is proven once on the fixture that drives it rather than four times. This
+        is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
+        by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
+        rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
   - id: runs_the_engine_default_configuration
     what: >
       The stand must exercise the configuration an untuned production server has. A stand
@@ -167,18 +193,30 @@ shapes:
         session-state class it DOES have (timezone/datestyle/bytea_output) is pinned on the
         reader's own connection and has its own non-default test" }
     mysql:
-      vacuous: "docker-compose.yaml:264 pins --binlog-row-metadata=FULL; MySQL's default is
-        MINIMAL. Under FULL the sink takes the by-NAME arm and SKIPS the arity guard
-        entirely (sink.rs:683). Every live MySQL CDC test uses MYSQL_CDC_URL -> :3307 -> the
-        named path. The nameless arm has one 2-column live test (live_cdc_replica.rs:94,
-        behind the `replica` profile) and one offline test whose fixture is a SINGLE column.
-        Verified by hand 2026-08-23: `SELECT @@binlog_row_metadata` on the stand returns FULL."
-      kind: below-threshold
+      sound: >-
+        closed 2026-08-25. docker-compose pins --binlog-row-metadata=FULL while MySQL's
+        own default is MINIMAL, so every live MySQL CDC test ran the by-NAME arm and the
+        positional arm plus its arity guard were unreachable. Two live tests now flip the
+        GLOBAL under a reset guard (`RowMetadata`, live_cdc.rs): under MINIMAL a same-arity
+        `MODIFY .. AFTER` across the resume boundary SWAPS the columns (measured a='BBB'
+        b='AAA', status success) and the run must warn; under FULL the same reorder maps
+        by name and the run must stay quiet. RED-proven both directions against
+        `row_metadata_warning` (always-None and always-Some).
     mssql:    { na: "change tables carry a fixed column set from the capture instance; there is
         no server knob that changes the image shape the reader sees" }
-    mongo:    { gap: "change-stream pre/post-image settings are per-collection and unset by
-        default; delete pre-images are untested (see delete_semantics_are_end_to_end)" }
-
+    mongo:
+      sound: >-
+        closed 2026-08-25. `changeStreamPreAndPostImages` is per-COLLECTION and off by default,
+        and every Mongo CDC test ran that default — which is the right way round (unlike MySQL,
+        where the stack pinned the NON-default). What was missing was the other side:
+        rivet issues `full_document_before_change(WhenAvailable)` on every stream, and with the
+        setting off that request is a silent no-op indistinguishable from a working one.
+        mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one
+        (tests/live/live_cdc_mongo.rs) turns it on via MongoTest::enable_pre_images and asserts
+        the delete carries the document AS OF the delete (measured {_id:9,v:'doomed'}, not the
+        earlier 'seed'), and self-skips out loud below server 6.0 where there is no pre-image
+        to carry. RED against `ChangeOp::Delete => cse.full_document`; the pre-existing delete
+        test stays GREEN against that same mutant, which is what made this a gap.
   - id: unknown_input_fails_loud_not_silent
     what: >
       Every "unknown -> default" boundary must warn or bail, never degrade silently. The
@@ -187,12 +225,36 @@ shapes:
     mutant: >
       Feed the boundary its unknown value and assert a warning/error is produced. A silent
       arm passes today because nothing observes the degradation.
-    postgres: { absent: "any test_decoding line that is not INSERT/UPDATE/DELETE — TRUNCATE
-        above all — is dropped with no log, no counter, no test (cdc.rs:390,576-592)" }
-    mysql:    { absent: "a transaction group with no Xid marker is buffered and never emitted
-        (mysql/cdc.rs:360-398)" }
-    mssql:    { absent: "a checkpoint JSON that parses but lacks its engine's key degrades to
-        'no checkpoint' — MySQL uses ok_or_else here, MSSQL does not" }
+    postgres:
+      sound: "TRUNCATE — the one that mattered — now bails: truncate_target +
+        truncate_is_ours + truncate_refusal_message (src/source/postgres/cdc.rs),
+        graded offline by a_truncate_is_recognised_and_refused_only_for_the_captured_tables
+        and live by roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging.
+        RED against two mutants on different asserts: the guard removed (back to the
+        measured `status: success, rows: 2` over an EMPTY source) and the refusal
+        un-addressed (`if true`, which fails a bystander export on the same slot).
+        Other non-DML lines stay unhandled and that is deliberate — TRUNCATE is the
+        one that removes rows without events, so it is the one that diverges."
+    mysql:
+      sound: "the Xid-less group is closed by is_commit_statement (COMMIT / XA COMMIT,
+        #ebc9d87), and the OTHER silent QUERY-event drop — TRUNCATE — now bails:
+        truncate_target + truncate_refusal_message (src/source/mysql/cdc.rs), graded by
+        a_mysql_truncate_statement_resolves_the_table_it_names offline and
+        roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging live. RED
+        against two mutants on different asserts: the guard disabled (back to the
+        measured `status: success, rows: 2` over an EMPTY source) and the addressing
+        removed (which fails a bystander export reading the same binlog)."
+    mssql:
+      sound: "closed 2026-08-25 (src/source/mssql/cdc.rs::resume_from_checkpoint). A
+        checkpoint that PARSES but carries no 'lsn' yielded None via `.and_then`, which
+        fill_sql turns into fn_cdc_get_min_lsn — the entire retained change table re-read
+        and re-delivered under a green exit (MEASURED live: ids [1,2,3,4] where [4] was
+        owed). The decision moved out of live-only glue into a pure predicate so a mutant
+        can grade it; `pinned` stays non-strict beside it, deliberately, because absent
+        `pinned` is a supported legacy default whose value is the LOUD direction. RED
+        against the exact prior bug (key absent -> Ok(None)) offline, over 5 malformed
+        shapes, and live by
+        mssql_cdc_checkpoint_without_an_lsn_must_refuse_not_silently_reread_everything."
     mongo:
       sound: "until_current_bound (src/source/mongo/cdc.rs) replaces the `.ok()` that
         swallowed every `hello` failure: a bounded run with no cluster-time ceiling now
@@ -214,38 +276,179 @@ shapes:
       Each CDC fault hook must have a per-engine crash test. A hook covered on two engines
       of four is a guarantee claimed for four.
     mutant: "remove the hook's handling and see which engines notice"
-    postgres: { gap: "cdc_after_checkpoint_before_ack — no per-engine test" }
-    mysql:    { gap: "the audit reported both hooks covered but cited no test; without a
-        named test this cannot be promoted — `sound` means someone ran the mutant and
-        watched a SPECIFIC test fail" }
-    mssql:    { gap: "same — reported covered, no test named" }
-    mongo:    { gap: "cdc_after_checkpoint_before_ack — no per-engine test; and see
-        resume_reads_a_fresh_destination, which makes the other hook's cell vacuous too" }
-
+    postgres:
+      sound: >-
+        closed 2026-08-25. roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot
+        (tests/live/live_cdc.rs). The DELIVERY half DOCUMENTS — three mutants (ack before the
+        checkpoint, ack before the flush, ack to pg_current_wal_lsn) all stay green, because
+        the crash fires before run 1's first ack and PG's resume authority is the SLOT, which
+        run 1 never moved; the checkpoint file is a boolean (`resume_expected`), never a
+        position. The RETENTION half GUARDS: the crash pins 2304 B and the resume releases to
+        0, and neutering advance_slot leaves 2480 B pinned (RED). Closes the slot-pinning
+        class from the crash side, where empty_transaction_churn covers the row-less side.
+    mysql:
+      sound: >-
+        covered by cdc_fault_point_sweep_every_phase_boundary_recovers (tests/live/live_cdc_mbt.rs),
+        which drives this hook among every phase boundary on the mysql-cdc stand. MySQL's ack
+        is the trait no-op, so the checkpoint file alone carries resume — the same structural
+        argument written out on the mongo cell, verified there against two ordering mutants.
+    mssql:
+      sound: >-
+        covered by the dedicated test at tests/live/live_cdc_mssql.rs (the 12-row single-LSN
+        transaction crashed at cdc_after_checkpoint_before_ack). This is the one engine where
+        the hook is LOAD-BEARING rather than documentary: the checkpoint IS the only resume
+        position and the ack is a no-op, so a checkpoint written mid-transaction skips the
+        tail — the bug that test was RED-proven against.
+    mongo:
+      sound: >-
+        closed 2026-08-25. mongo_cdc_crash_after_the_checkpoint_still_delivers_every_change
+        (tests/live/live_cdc_mongo.rs), sibling to the cdc_after_flush_before_ack test whose
+        vacuity this row used to cite — that one was fixed by resume_into_fresh_dest and is
+        sound now. Two ordering mutants stay green for the structural reason stated in the
+        test (the hook sits after every durability step; the resume token is per-event and
+        consume-free, see TxnFramer::single_event_commit). What it grades is its
+        preconditions: an empty resume leg fails outright, RED-proven by deleting the resume
+        run. Oracle is the UNION of both legs — crashing AFTER the checkpoint means the
+        resume legitimately starts past what leg 1 covered.
   - id: the_test_asserts_its_own_fault_fired
     what: >
       A fault-injection test must assert the injected fault ACTUALLY fired. Otherwise a
       hook that stops firing turns the test into a plain happy-path run that passes.
     mutant: "make the hook a no-op; a sound cell goes RED on 'the fault never fired'"
-    postgres: { gap: "not audited per-test; the class is proven on mysql" }
-    mysql:    { vacuous: "gremlin_cdc_sigkill_mid_drain_recovers_without_gap never asserts its
-        own fault fired (gremlin_cdc.rs)", kind: absence-only }
-    mssql:    { gap: "not audited per-test" }
-    mongo:    { gap: "not audited per-test" }
-
+    postgres:
+      sound: >-
+        audited 2026-08-25 across the whole live suite, not sampled — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    mysql:
+      sound: >-
+        closed 2026-08-25 — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    mssql:
+      sound: >-
+        audited 2026-08-25 across the whole live suite, not sampled — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
+    mongo:
+      sound: >-
+        audited 2026-08-25 across the whole live suite, not sampled — the sweep enumerated every test whose CODE (comments stripped — ten of eleven first-pass
+        hits were the word 'kill' in prose) injects a fault: RIVET_TEST_{PANIC,ERROR,BLOCK}_AT,
+        a real kill(1), or a toxiproxy toxic — 71 tests. Exactly ONE did not assert its own
+        fault fired: gremlin_cdc_sigkill_mid_drain_recovers_without_gap (tests/live/gremlin_cdc.rs) computed
+        killed_mid_drain and only interpolated it into the failure MESSAGE, so a run that
+        drained before the kill landed passed having verified nothing. It now asserts both
+        that the kill fired AND that it mattered (measured 3/3: 500 of 5000 rows survive, so a
+        kill at the finish line — which grades like no kill at all — is refused too). Every
+        other test proves it in the body, in a shared runner (run_pool_split_resume_with
+        asserts !crashed.status.success() plus an INCOMPLETE split), or inside the injector
+        itself: the toxi_* helpers assert the admin API answered 200, which is why eleven
+        toxiproxy tests are sound without saying so at the call site. Pinned by
+        every_toxiproxy_fault_injector_asserts_its_own_injection_landed
+        (tests/offline/skip_is_not_a_pass_guard.rs). RED-proven by
+        disabling the kill window (parts >= 99999) and by stripping one injector's assert.
   - id: skip_is_not_a_pass
     what: >
       A test that SKIPS when its precondition is absent reports success. Where a CI job
       owns the claim, the skip path must fail hard instead — the provisioner sets a marker
       and the test refuses to skip when the marker is present.
     mutant: "unset the precondition and observe whether the suite still reports the claim covered"
-    postgres: { vacuous: "the standby refusal test passes by SKIPPING whenever the opt-in
-        profile is not up", kind: skip-as-pass }
-    mysql:    { gap: "same class, not enumerated per test" }
-    mssql:    { gap: "same class, not enumerated per test" }
-    mongo:    { vacuous: "run_mongo_cdc_delete returns an empty vec rather than Skipped, so
-        assert_all_pass has nothing to panic on", kind: skip-as-pass }
-
+    postgres:
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
+    mysql:
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
+    mssql:
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
+    mongo:
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
   - id: delete_semantics_are_end_to_end
     what: >
       Tombstones and the 'live current state is WHERE NOT __is_deleted' contract must be
@@ -254,6 +457,14 @@ shapes:
     postgres: { sound: "covered by the delete-capture cells in cdc-matrix" }
     mysql:    { sound: "covered by the delete-capture cells in cdc-matrix" }
     mssql:    { sound: "covered by the delete-capture cells in cdc-matrix" }
-    mongo:    { vacuous: "the only end-to-end assertion lives in a bespoke harness path, and
-        delete PRE-IMAGES (full_document_before_change) have no test at all while doctor
-        reports on them", kind: second-cause }
+    mongo:
+      sound: "closed 2026-08-25. The pre-existing test asserts the DEFAULT case (pre-images
+        off ⇒ document NULL) and says so, which left rivet's own
+        full_document_before_change(WhenAvailable) request — issued on every stream —
+        verified by nothing: a silent no-op and a working pre-image are indistinguishable
+        from a default collection. mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one
+        (live_cdc_mongo.rs) enables changeStreamPreAndPostImages via the rig's
+        MongoTest::enable_pre_images and asserts the delete carries the document AS OF the
+        delete (measured {_id:9,v:'doomed'}, not the earlier 'seed'). RED against
+        `ChangeOp::Delete => cse.full_document` — and the disagreement is the finding: the
+        pre-existing delete test stays GREEN against that same mutant." 

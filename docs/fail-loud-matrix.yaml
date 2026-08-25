@@ -30,6 +30,13 @@ scenarios:
     mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
     mongo:    { na: "a change stream's `ns` IS the collection the write addressed; Mongo has no parent/child relation surfacing events under a different name, so there is no second identity to cross-check" }
 
+  - id: cdc_truncate_loud_not_a_silent_divergence
+    what: "a TRUNCATE on a captured table → loud bail naming the re-snapshot, never a silent drop that leaves the destination holding rows the source no longer has (no DELETE events carry them, so no later capture can reconcile it)"
+    postgres: { test: roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging }
+    mysql:    { test: roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging }
+    mssql:    { na: "SQL Server REFUSES the truncate itself — `TRUNCATE TABLE` on a CDC-enabled table raises Msg 4711 (measured 2026-08-24 on rivet-mssql-cdc-1), so the divergence cannot be created and there is nothing for rivet to detect" }
+    mongo:    { na: "MongoDB has no TRUNCATE; a drop/collection-level delete surfaces as an invalidate event on the change stream, a separate contract" }
+
   - id: hostile_numeric_value_loud
     what: "a non-finite value (NaN/Inf) in a lossy fixed-point numeric → loud error, never a silent NULL / truncate-to-zero"
     postgres: { test: pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly }

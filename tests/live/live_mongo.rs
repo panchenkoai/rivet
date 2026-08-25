@@ -388,7 +388,7 @@ fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
     // `read_concern: snapshot` for a find requires MongoDB 5.0+; on 4.4 it is
     // unsupported, so self-skip rather than fail the version matrix.
     if m.server_major() < 5 {
-        eprintln!("skipping: read_concern: snapshot needs MongoDB 5.0+ (server is 4.x)");
+        skip_live("ping: read_concern: snapshot needs MongoDB 5.0+ (server is 4.x)");
         return;
     }
     m.drop_collection("t");

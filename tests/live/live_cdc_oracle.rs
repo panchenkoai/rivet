@@ -129,9 +129,12 @@ fn cdc_types_round_trip_via_duckdb_and_clickhouse() {
                 .expect("clickhouse meta is JSON");
         assert_eq!(cmeta["k"], 1, "clickhouse: json column round-trips");
     } else {
-        eprintln!(
-            "NOTE: ClickHouse unreachable (:8123) — skipping the ClickHouse oracle. \
-             DuckDB validated above; ClickHouse runs on nightly's Linux runner."
+        // A PARTIAL skip — DuckDB already validated above, so the test is not
+        // vacuous. Still marked, because a lane counting coverage should see that
+        // one of the two independent readers did not run.
+        skip_live(
+            "ClickHouse unreachable (:8123) — the ClickHouse half of the oracle did \
+             not run. DuckDB validated above; ClickHouse runs on nightly's Linux runner.",
         );
     }
 

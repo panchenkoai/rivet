@@ -3971,6 +3971,320 @@ fn roast_pg_cdc_refuses_a_config_whose_resolved_identity_routing_cannot_match() 
     );
 }
 
+/// A TRUNCATE on a captured table must FAIL the run, not vanish.
+///
+/// `test_decoding` renders it as `table public.t: TRUNCATE: (no-flags)` — a line
+/// with no columns, so the parser that builds a change out of the column list had
+/// nothing to return and dropped it into its catch-all `None`. The
+/// `unknown -> default` shape the CDC evidence audit found on all four engines.
+///
+/// Measured before the guard (2026-08-24, pg14 stand — this test's RED):
+/// 2 inserts then a TRUNCATE left the source table EMPTY while the run reported
+/// `status: success, rows: 2` and wrote both inserts to the destination. Zero
+/// occurrences of the word at `RUST_LOG=trace` — not a quiet log, no log.
+///
+/// The divergence is PERMANENT, which is why this bails rather than warns: the
+/// rows left the source with no DELETE events to carry them, so no later capture
+/// can reconcile the destination back. A warning would leave a destination that
+/// disagrees with its source forever and call the run a success.
+///
+/// Isolated in its OWN database (see `CdcDb`): the slot decodes the whole DB, so
+/// a parallel test's TRUNCATE on the shared one would fail this run instead.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
+    let cdc_db = CdcDb::new("cdc_trunc");
+    let tbl = unique_name("rivet_cdc_tr").to_lowercase();
+    let other = unique_name("rivet_cdc_trother").to_lowercase();
+    let slot = unique_name("rivet_trunc_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {other} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {tbl}"), &[]).unwrap();
+    // The SOURCE oracle, asked of PostgreSQL: the truncate really emptied it, so
+    // any row in the destination is a row that does not exist.
+    let source_rows: i64 = c
+        .query_one(&format!("SELECT count(*) FROM {tbl}"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        source_rows, 0,
+        "the fixture's TRUNCATE must have emptied it"
+    );
+
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot).source_url(cdc_db.url());
+    // Through the rig, like every other live test here: `run_expect_fail` asserts
+    // the non-zero exit AND returns stdout+stderr, so the hand-rolled
+    // `run_rivet(&["run", "--config", …])` this used to call was a second way of
+    // doing what the rig already does — the per-file command wrapper the rig exists
+    // to have replaced.
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("TRUNCATE"),
+        "a TRUNCATE on a captured table must fail the run — shipping the 2 inserts \
+         as a success leaves them in the destination with nothing to retract them. \
+         Output:\n{said}"
+    );
+    assert!(
+        said.contains("TRUNCATE") && said.contains("mode: full"),
+        "the refusal must name what happened AND the re-snapshot that recovers \
+         from it — a bail with no way forward just moves the operator's problem. \
+         Output:\n{said}"
+    );
+
+    // ── and it must be TABLE-ADDRESSED ────────────────────────────────────────
+    //
+    // The slot decodes the whole DATABASE, so this TRUNCATE is in the stream every
+    // other export on it reads. Failing without asking whose relation it is makes
+    // one truncated table an outage for exports that never touch it — the MySQL
+    // undecodable-rows guard's measured lesson (#281), pinned here before it could
+    // bite again. This export is anchored on the SAME slot span that holds the
+    // truncate, so the event is inside its window by construction.
+    let other_slot = unique_name("rivet_trunc_slot_b").to_lowercase();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&other_slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {other} VALUES (7,70)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {tbl}"), &[]).unwrap();
+    let bystander = Rig::pg_cdc(&format!("public.{other}"), &other_slot).source_url(cdc_db.url());
+    let rows: usize = bystander.run_and_read().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 1,
+        "an export that does not capture the truncated table must complete and \
+         capture its own change"
+    );
+
+    // ── and a MULTI-relation truncate must be caught wherever ours sits ───────
+    //
+    // `TRUNCATE a, b` decodes as ONE line naming both
+    // (`table public.a, public.b: TRUNCATE: (no-flags)`), and so does every
+    // CASCADE that pulls in referencing tables. The FIRST version of this guard
+    // read that list as a single name and let the statement through: MEASURED,
+    // with the captured table configured, the source ended EMPTY while the run
+    // reported `status: success, rows: 1`. An adversarial pass found it; re-reading
+    // the code had not.
+    //
+    // Ours goes SECOND on purpose — a first-position-only fixture would pass
+    // against the very defect this exists to catch.
+    let third_slot = unique_name("rivet_trunc_slot_c").to_lowercase();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&third_slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (9,90)"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {other}, {tbl}"), &[]).unwrap();
+    let multi = Rig::pg_cdc(&format!("public.{tbl}"), &third_slot).source_url(cdc_db.url());
+    let said2 = multi.run_expect_fail();
+    assert!(
+        said2.contains(&tbl),
+        "a TRUNCATE naming our table SECOND in a list must still refuse, and name \
+         OUR table rather than whichever came first. Output:\n{said2}"
+    );
+    // ── and the refusal must not WEDGE the capture ────────────────────────────
+    //
+    // The peek is non-consuming, so the slot still sits on the truncate commit:
+    // every later run meets it first and clean changes queued BEHIND it are
+    // blocked, while the un-acked slot pins WAL. MEASURED: an ordinary INSERT
+    // after the truncate leaves the second run failing identically.
+    //
+    // The message's first version said only "re-snapshot (mode: full)" — which on
+    // PostgreSQL does not move the SLOT and therefore does not recover. This is
+    // the same defect the unchanged-TOAST refusal had, found the same day by an
+    // adversarial pass, in a guard I wrote after fixing that one.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (77,770)"), &[])
+        .unwrap();
+    // `run_expect_fail` panics if the run SUCCEEDS, which is exactly the assertion:
+    // a clean change queued behind the truncate must still be blocked. If this ever
+    // stops panicking the wedge is gone and the message should be softened.
+    let _still_wedged = rig.run_expect_fail();
+    assert!(
+        said.contains("pg_replication_slot_advance"),
+        "the refusal must name the way OUT of the wedge, not only the re-snapshot: \
+         re-snapshotting alone leaves the slot where it is. Got:\n{said}"
+    );
+    // The route the message names must actually work.
+    let past: String = c
+        .query_one(
+            &format!(
+                "SELECT max(lsn)::text FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL) \
+                 WHERE data LIKE '%COMMIT%'"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c.execute(
+        &format!("SELECT pg_replication_slot_advance('{slot}', '{past}')"),
+        &[],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (88,880)"), &[])
+        .unwrap();
+    Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+        .source_url(cdc_db.url())
+        .run_ok();
+}
+
+/// MySQL peer of `roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging`,
+/// and the same divergence by a DIFFERENT route: a TRUNCATE is logged as a QUERY
+/// event, never as rows, so the rows path never sees it and the `_ => {}` arm
+/// dropped it silently.
+///
+/// Measured before the guard (2026-08-24, rivet-mysql-cdc-1): 2 inserts then a
+/// TRUNCATE left the source table EMPTY while the run reported
+/// `status: success, rows: 2`.
+///
+/// The engines differ in the mechanism and agree on the outcome, which is why
+/// both cells are `test` in the fail-loud ledger rather than one being inferred
+/// from the other. SQL Server needs neither: it REFUSES the truncate itself
+/// (Msg 4711 on a CDC-enabled table), so the divergence cannot be created.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_mtr");
+    let other = unique_name("cdc_mtrother");
+    let mut c = conn();
+    for t in [&tbl, &other] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let _g1 = Table(tbl.clone());
+    let _g2 = Table(other.clone());
+
+    let ck = d.path().join("tr.ckpt");
+    let rig = || {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ck.to_path_buf())
+            .dest_path(d.path().join("out"))
+    };
+    rig().run_ok(); // anchor before the truncate lands
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+    c.query_drop(format!("TRUNCATE {tbl}")).unwrap();
+    // The SOURCE oracle: the truncate really emptied it, so any row the run ships
+    // is a row that does not exist.
+    let left: Option<i64> = c
+        .query_first(format!("SELECT count(*) FROM {tbl}"))
+        .unwrap();
+    assert_eq!(left, Some(0), "the fixture's TRUNCATE must have emptied it");
+
+    let msg = rig().run_expect_fail();
+    assert!(
+        msg.contains("TRUNCATE") && msg.contains("mode: full"),
+        "the run must refuse and name both what happened and the re-snapshot that \
+         recovers from it — shipping the 2 inserts as a success leaves them in the \
+         destination with nothing to retract them. Got: {msg}"
+    );
+
+    // Table-addressed, same as the undecodable-rows guard beside it (#281): the
+    // binlog carries every table on the server, so an export that does not capture
+    // the truncated table must still complete. Anchored BEFORE the truncate, so
+    // the event is inside its window by construction rather than by timing.
+    let other_ck = d.path().join("tr_other.ckpt");
+    let other_rig = || {
+        Rig::mysql_cdc(&other)
+            .checkpoint_path(other_ck.to_path_buf())
+            .dest_path(d.path().join("out_other"))
+    };
+    other_rig().run_ok();
+    c.query_drop(format!("INSERT INTO {other} VALUES (7,70)"))
+        .unwrap();
+    c.query_drop(format!("TRUNCATE {tbl}")).unwrap();
+    let rows: usize = other_rig()
+        .run_and_read()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        rows, 1,
+        "an export that does not capture the truncated table must complete and \
+         capture its own change"
+    );
+}
+
+/// An unqualified `table:` captures EVERY schema's relation of that name.
+///
+/// `sink::table_matches` matches a bare config name against any schema — it has to,
+/// because a MongoDB collection has no schema qualifier and may itself contain dots.
+/// On PostgreSQL that means `table: orders` silently captures `public.orders` AND
+/// `archive.orders` into one export.
+///
+/// MEASURED before the warning (2026-08-25): `table: bare` with `public.bare` and
+/// `s2.bare` both present captured 2 rows — one from each schema — into a single
+/// part, with nothing in the output distinguishing them. Counts reconcile against
+/// neither table alone, and a reader of the parquet cannot tell which row came from
+/// where.
+///
+/// A WARNING, not a refusal: capturing one table under a bare name is the common and
+/// correct case. What the operator cannot see is the second relation riding along.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_warns_when_a_bare_table_name_matches_two_schemas() {
+    let cdc_db = CdcDb::new("cdc_bare");
+    let tbl = unique_name("rivet_cdc_bare").to_lowercase();
+    let slot = unique_name("rivet_bare_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id int PRIMARY KEY, v text); \
+         CREATE SCHEMA other; \
+         CREATE TABLE other.{tbl} (id int PRIMARY KEY, v text)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (1,'public'); INSERT INTO other.{tbl} VALUES (2,'other')"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    let said = rig.run_ok_capture();
+    assert!(
+        said.contains("unqualified") && said.contains(&format!("other.{tbl}")),
+        "the run must WARN and name the other relation — the operator cannot see it \
+         in the output otherwise. Got:\n{said}"
+    );
+
+    let rows: usize = rig.read_declared_parts().iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 2,
+        "both schemas' rows land in ONE export — that is the behaviour being warned \
+         about, and if it ever changes the warning should change with it"
+    );
+
+    // Not too WIDE: one matching relation is the ordinary case and must stay silent,
+    // or the warning becomes noise and gets ignored.
+    c.batch_execute("DROP SCHEMA other CASCADE").unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (3,'only')"), &[])
+        .unwrap();
+    let quiet = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    assert!(
+        !quiet.run_ok_capture().contains("unqualified"),
+        "a bare name with ONE matching relation must not warn"
+    );
+}
+
 struct CdcDb {
     name: String,
     url: String,
@@ -4611,9 +4925,9 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     )
     .is_err()
     {
-        eprintln!(
-            "SKIP roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
-             (bring it up with `python3 -m dev.pytools.cdc_stand standby`)"
+        skip_live(
+            "roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
+             (bring it up with `python3 -m dev.pytools.cdc_stand standby`)",
         );
         return;
     }
@@ -5213,7 +5527,7 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
         .ok()
         .flatten();
     if supported.is_none() {
-        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        skip_live("server has no binlog_transaction_compression (pre-8.0.20)");
         return;
     }
 
@@ -5341,7 +5655,7 @@ fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
         .ok()
         .flatten();
     if supported.is_none() {
-        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        skip_live("server has no binlog_transaction_compression (pre-8.0.20)");
         return;
     }
 
@@ -5989,5 +6303,404 @@ fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
         "an export that does NOT capture the partial-JSON table must complete and \
          capture its own change — the undecodable event belongs to another table, \
          and the routing filter would have dropped it anyway"
+    );
+}
+
+/// A guard that returns `binlog_row_metadata` to whatever the stack pinned.
+///
+/// The variable is GLOBAL-only in MySQL 8 — there is no session scope to flip —
+/// so a test that leaves it MINIMAL silently changes every later test's engine.
+struct RowMetadata(String);
+
+impl RowMetadata {
+    fn set(to: &str) -> Self {
+        let mut c = conn();
+        let was: String = c
+            .query_first("SELECT @@GLOBAL.binlog_row_metadata")
+            .expect("read binlog_row_metadata")
+            .expect("a value");
+        c.query_drop(format!("SET GLOBAL binlog_row_metadata={to}"))
+            .expect(
+                "SET GLOBAL binlog_row_metadata needs SYSTEM_VARIABLES_ADMIN — see \
+                 dev/cdc/mysql-grant.sql; without it MySQL's own default configuration is \
+                 the one configuration nothing tests",
+            );
+        Self(was)
+    }
+}
+
+impl Drop for RowMetadata {
+    fn drop(&mut self) {
+        if let Ok(mut c) = mysql::Pool::new(MYSQL_CDC_URL).and_then(|p| p.get_conn()) {
+            let _ = c.query_drop(format!("SET GLOBAL binlog_row_metadata={}", self.0));
+        }
+    }
+}
+
+/// MySQL's DEFAULT `binlog_row_metadata=MINIMAL` maps binlog images POSITIONALLY,
+/// and a same-arity column reorder across the resume boundary silently swaps them.
+///
+/// The stack pins `--binlog-row-metadata=FULL` (docker-compose), which puts column
+/// NAMES into TABLE_MAP — so the sink takes the by-name arm and `continue`s past
+/// the arity guard entirely (`sink.rs`, `if ev.image_names.is_some()`). MySQL's own
+/// default is MINIMAL. Every live MySQL CDC test therefore runs the ONE
+/// configuration a user does not have, and the positional path plus the guard that
+/// protects it are reachable only from the default nobody exercises.
+///
+/// This is the measurement that decides how loud rivet should be about it. Under
+/// MINIMAL: the schema is resolved at OPEN, the events replay from the CHECKPOINT
+/// — so an `ALTER TABLE ... MODIFY b AFTER id` between the two puts a row written
+/// as `(id, a, b)` into columns resolved as `(id, b, a)`.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
+fn mysql_cdc_minimal_row_metadata_is_the_engine_default_and_reorders_silently() {
+    let _serial = cross_process_serial("mysql_cdc_row_metadata");
+    let _meta = RowMetadata::set("MINIMAL");
+    let table = unique_name("rivet_cdc_min");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+
+    // Written under the OLD column order, read back under the new one.
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+
+    let out = rig.out_dir();
+    let said = rig.run_ok_capture();
+
+    // The corruption is REAL and this test does not pretend otherwise: rivet cannot
+    // undo it after the fact, because under MINIMAL the wire carries no names to
+    // detect the reorder from. What it CAN do — and now does — is say so before a
+    // single event is read.
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "a"),
+        ["BBB".to_string()].into_iter().collect(),
+        "MEASURED: positional mapping puts the OLD order's `b` into `a`. If this ever \
+         reads AAA the engine learned to map by name under MINIMAL and the warning \
+         below should go with it"
+    );
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "b"),
+        ["AAA".to_string()].into_iter().collect(),
+        "...and symmetrically the OLD order's `a` into `b`"
+    );
+
+    // The load-bearing half: the operator is TOLD, at warn level, at run start.
+    assert!(
+        said.contains("binlog_row_metadata") && said.contains("POSITION"),
+        "a run that maps by position must say so — an operator who learns it from a \
+         swapped column months later cannot act on it. Got:\n{said}"
+    );
+    assert!(
+        said.contains("binlog_row_metadata = FULL"),
+        "the warning must name the ESCAPE, not just the risk. Got:\n{said}"
+    );
+}
+
+/// ...and under the FULL the stack pins, the same reorder is mapped BY NAME and
+/// comes back correct, with no warning.
+///
+/// Without this half the test above proves only that a swap happens, not that the
+/// setting is what causes it — and the warning would be free to fire on every run,
+/// which is how a warning gets ignored.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
+fn mysql_cdc_full_row_metadata_maps_the_same_reorder_by_name_and_stays_quiet() {
+    let _serial = cross_process_serial("mysql_cdc_row_metadata");
+    let _meta = RowMetadata::set("FULL");
+    let table = unique_name("rivet_cdc_full");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+
+    let out = rig.out_dir();
+    let said = rig.run_ok_capture();
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "a"),
+        ["AAA".to_string()].into_iter().collect(),
+        "under FULL the image carries names, so the reorder maps correctly — this is \
+         the assertion that makes FULL the documented escape rather than folklore"
+    );
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "b"),
+        ["BBB".to_string()].into_iter().collect()
+    );
+    assert!(
+        !said.contains("binlog_row_metadata"),
+        "a correctly-configured server must stay quiet, or the warning becomes noise \
+         on every run and stops being read. Got:\n{said}"
+    );
+}
+
+/// PostgreSQL crash between the checkpoint write and the slot ack — DOCUMENTED,
+/// not guarded, and the difference is the point.
+///
+/// This is the one CDC fault point with no PostgreSQL test, and the reason it had
+/// none turns out to be structural rather than an oversight. Three mutants were
+/// applied and this test stayed GREEN against all three:
+///
+///   1. `stream.ack` moved BEFORE the checkpoint write  — green
+///   2. `stream.ack` moved BEFORE the parts are flushed — green
+///   3. `ack` advancing the slot to `pg_current_wal_lsn()` instead of the last
+///      commit                                          — green
+///
+/// Why: the crash fires BEFORE run 1's first ack, so every ack-side mutant is
+/// unreachable in this fixture; and PostgreSQL's resume authority is the SLOT,
+/// which run 1 therefore never moved. The checkpoint file is consulted only as a
+/// boolean ("a prior run happened", `resume_expected` in cdc/mod.rs) and never as
+/// a position, so the file racing ahead of the slot has nothing to act on.
+/// Contrast SQL Server, where the checkpoint IS the only position and its ack is a
+/// no-op — which is why that engine's test of this hook is load-bearing and this
+/// one is not.
+///
+/// So the DELIVERY half of this test documents rather than guards — no reordering
+/// of the sink's steps can make it red, and that is a fact about PostgreSQL's
+/// design, not a weakness to paper over.
+///
+/// The RETENTION half is a real guard, and it is the half an operator cares about.
+/// A crash here PINS WAL on the slot — it must, or the un-acked span is lost — and
+/// the question is whether that is a transient or a leak. MEASURED: 2304 B pinned
+/// by the crash, 0 after the resume. Neutering `ack` (`advance_slot` -> `Ok(())`)
+/// leaves 2480 B pinned and this test goes RED, which is the mutant it grades.
+///
+/// That closes the crash-side of the slot-pinning class from the direction
+/// `roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot` does not cover:
+/// that one is about row-less spans starving the ack, this one is about a crash
+/// leaving the ack unrun. Both end at the same place — `confirmed_flush_lsn`
+/// frozen while WAL accumulates on an idle database.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgckpt");
+    let slot = unique_name("rivet_ckpt_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // Separate transactions so several parts roll: the crash must land in the
+    // window, and a single transaction would give it only one chance.
+    for g in 0..12 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({g}, {g})"), &[])
+            .unwrap();
+    }
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc("rollover: 3")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let crashed = rig.run_args_env(
+        &[],
+        &[("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack")],
+    );
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1 — a fault that did not fire leaves this \
+         test asserting an ordinary two-run export"
+    );
+
+    // The slot's OWN anchor, not its distance from `pg_current_wal_lsn()`. The first
+    // version measured that distance and failed in CI at 13 243 536 B where it read
+    // 0 locally: the E2E runner drives the whole live suite against one PostgreSQL,
+    // so unrelated WAL moves the reference point between the two reads and the
+    // "distance" grows for reasons that have nothing to do with this slot. Comparing
+    // the anchor to ITSELF is immune to that — the same unscoped-measurement class
+    // as counting rows without scoping to the run.
+    let confirmed = |c: &mut postgres::Client| -> String {
+        c.query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .map(|r| r.get(0))
+        .expect("the slot must exist after the crashed run")
+    };
+    let after_crash = confirmed(&mut c);
+
+    // Run 2 into a FRESH destination, so what it delivers is its own doing: a
+    // shared dir would let run 1's durable parts satisfy the oracle even if the
+    // resume captured nothing (the CDC audit's headline finding).
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    let rig2 = Rig::pg_cdc(&tbl, &slot)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out2.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    // The union is what at-least-once promises. Overlap between the legs is fine
+    // and expected — the un-acked span is re-read by construction.
+    let mut got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
+    got.extend(duckdb_dir_parquet_i64(&out2, "id"));
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got, want,
+        "every row must survive a crash between the checkpoint write and the slot \
+         ack. A missing id means resume trusted the checkpoint FILE over the slot \
+         and started past changes the slot had never released."
+    );
+    let after_resume = confirmed(&mut c);
+    let advanced: i64 = c
+        .query_one(
+            &format!(
+                "SELECT pg_wal_lsn_diff('{after_resume}'::pg_lsn, '{after_crash}'::pg_lsn)::bigint"
+            ),
+            &[],
+        )
+        .map(|r| r.get(0))
+        .expect("compare the two anchor positions");
+
+    // A crash here PINS WAL — it must, or the un-acked span is lost — so the
+    // question is transient or leak. What proves it is the slot MOVING, measured
+    // against where the crash left it: MEASURED 2304 B of WAL pinned by the crash
+    // and released on resume, and neutering `advance_slot` to `Ok(())` leaves the
+    // anchor exactly where it was (advanced = 0) and this goes RED.
+    assert!(
+        advanced > 0,
+        "the resume must ADVANCE the slot past what it re-read: confirmed_flush_lsn \
+         went {after_crash} -> {after_resume} ({advanced} B). Standing still means \
+         the WAL the crash pinned is pinned for good, and an operator who \
+         crash-loops fills the disk"
+    );
+    // And the second leg must really have done work — otherwise the assertion above
+    // is satisfied by leg 1 alone and would pass against a resume that captured zero.
+    assert!(
+        !duckdb_dir_parquet_i64(&out2, "id").is_empty(),
+        "the resume leg delivered NOTHING: the un-acked span was not re-read, so this \
+         cell proves nothing about the boundary it exists for"
+    );
+}
+
+/// A slot nobody is draining pins WAL forever, and `run` used to say nothing.
+///
+/// `rivet doctor` has caught this since it was written — it FAILS past 1 GiB and
+/// names every offender. But doctor is a thing an operator runs when they already
+/// suspect something; the scheduler runs `rivet run` every cycle and it was silent.
+/// Measured on a dev stand: nine abandoned slots holding 1.5 GiB each, 1552 MiB of
+/// WAL on disk, and every CDC run over that instance exited 0 without a word.
+///
+/// Two warnings, and the split is the point. Our OWN slot being far behind is worth
+/// saying but the run does fix it — so the message says so, or an operator drops a
+/// slot that was about to be drained. A FOREIGN inactive slot is pinned until a
+/// human acts, which is the one that fills disks.
+///
+/// The threshold and the wording live in `preflight::cdc_health` and are shared with
+/// doctor, so the two cannot drift; this test is about the WIRING — that a run
+/// reaches them at all, and stays quiet when there is nothing to say.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal() {
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_slotwarn");
+    let slot = unique_name("rivet_slotwarn").to_lowercase();
+    let orphan = unique_name("rivet_orphan").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    for s in [&slot, &orphan] {
+        c.execute(
+            "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[s],
+        )
+        .unwrap();
+    }
+    let _slot = Slot(slot.clone());
+    let _orphan_guard = Slot(orphan.clone());
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1)"), &[])
+        .unwrap();
+
+    // Healthy first: two small slots, nothing to report. Asserted BEFORE the noisy
+    // case because a warning that fires unconditionally would satisfy the positive
+    // assertion below while being useless — and this is the half that catches it.
+    let rig = Rig::pg_cdc(&tbl, &slot);
+    let quiet = rig.run_ok_capture();
+    // The capture itself must have worked. A diagnostic test that never checks its
+    // run delivered anything would pass over a 0-row success — the conformance gate
+    // asks this of every live CDC test, and it caught this one.
+    assert_eq!(
+        duckdb_dir_parquet_i64(&rig.out_dir(), "id"),
+        vec![1],
+        "the run must still CAPTURE while it warns — a warning path that broke the \
+         export would be worse than the silence it replaced"
+    );
+    assert!(
+        !quiet.to_lowercase().contains("pinning"),
+        "a healthy instance must stay silent, or the message is noise on every \
+         scheduler cycle and stops being read. Got:\n{quiet}"
+    );
+
+    // Now the loud case. Crossing a real GiB takes minutes of writes, so the bar
+    // moves instead (`RIVET_TEST_SLOT_WAL_BAR`, a test seam beside the threshold —
+    // deliberately not a config knob, since an operator lowering it would get a
+    // warning on every ordinary backlog and learn to ignore it).
+    let loud = Rig::pg_cdc(&tbl, &slot).run_with_env("RIVET_TEST_SLOT_WAL_BAR", "1");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&loud.stdout),
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    assert!(
+        loud.status.success(),
+        "a retention WARNING must never fail the run — the export is the thing that \
+         drains the slot, so refusing here would make the problem permanent:\n{said}"
+    );
+    assert!(
+        said.contains(&orphan),
+        "the run must name the ABANDONED slot — it is the one nothing is draining, \
+         and an operator cannot drop what they were not told about. Got:\n{said}"
+    );
+    assert!(
+        said.contains("pg_drop_replication_slot"),
+        "and hand over the command, not just the diagnosis. Got:\n{said}"
+    );
+    assert!(
+        said.contains(&slot) && said.contains("This run will drain it"),
+        "our OWN slot gets the other message — saying it will be drained, so nobody \
+         drops a slot that was about to recover. Got:\n{said}"
     );
 }

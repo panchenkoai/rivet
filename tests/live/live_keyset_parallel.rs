@@ -655,7 +655,7 @@ fn parallel_keyset_incremental_survives_no_backslash_escapes_mysql() {
     if c.query_drop("SET GLOBAL sql_mode = CONCAT(@@global.sql_mode, ',NO_BACKSLASH_ESCAPES')")
         .is_err()
     {
-        eprintln!("skip: setting @@global.sql_mode needs SUPER (unavailable for the test user)");
+        skip_live("setting @@global.sql_mode needs SUPER (unavailable for the test user)");
         return;
     }
     c.query_drop(format!("DROP TABLE IF EXISTS {table}"))

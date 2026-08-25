@@ -171,13 +171,23 @@ fn a_sound_cell_cites_where_the_evidence_lives() {
     }
 }
 
-/// Shrink-only ratchet. Not a pass/fail bar on today's state — a floor under it, so the
-/// audit that produced this file does not have to be repeated to discover the same
-/// numbers. It fails DOWNWARD too: close cells and lower the ceiling in the same commit,
-/// or the win is not banked and drifts back.
+/// ZERO unsound cells — and at zero this stopped being a ratchet.
+///
+/// It was one: a floor under the audit's findings so the same numbers would not have
+/// to be rediscovered, failing DOWNWARD too so a closed cell had to be banked in the
+/// same commit. It counted 20 when it was written and was lowered to 16, 12, 8, 3 and
+/// now 0 as the cells closed.
+///
+/// At zero the contract changes shape, so the assertion does too: this ledger now has
+/// the same admission policy as `cdc-matrix` — every cell is `sound` (someone ran the
+/// mutant and watched a specific test fail) or a justified `na` (structurally
+/// inapplicable, with the reason written out and length-checked above). There is no
+/// budget left to spend, which means a NEW CDC shape arrives closed or does not arrive.
+///
+/// Restoring a budget is a decision someone has to argue for in a commit message, not
+/// a number they can nudge.
 #[test]
-fn unsound_cells_only_ever_shrink() {
-    const CEILING: usize = 23;
+fn every_cell_is_sound_or_a_justified_na() {
     let engines = cdc_engines();
     let m = matrix();
     let mut unsound: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -189,17 +199,13 @@ fn unsound_cells_only_ever_shrink() {
             }
         }
     }
-    let total: usize = unsound.values().map(|v| v.len()).sum();
     assert!(
-        total <= CEILING,
-        "{total} cells are neither `sound` nor a justified `na`, over the ceiling of \
-         {CEILING}: {unsound:?}. Adding CDC surface without evidence is what this ledger \
-         records; raising the ceiling to accommodate it is not an option."
-    );
-    assert!(
-        total >= CEILING.saturating_sub(4),
-        "only {total} unsound cells remain against a ceiling of {CEILING} — lower CEILING \
-         to {total} in the same commit that closed them. A ratchet that is not tightened \
-         is a ratchet that lets the next regression back in for free."
+        unsound.is_empty(),
+        "{} cell(s) are neither `sound` nor a justified `na`: {unsound:?}. This ledger \
+         reached zero on 2026-08-25 and holds there — a cell is promoted by someone \
+         running its mutant, so a new shape lands closed or it does not land. If a gap \
+         genuinely has to be admitted, say why in the commit that admits it rather than \
+         raising a number.",
+        unsound.values().map(Vec::len).sum::<usize>()
     );
 }

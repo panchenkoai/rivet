@@ -1812,3 +1812,101 @@ fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
          event was dropped while the checkpoint advanced past it."
     );
 }
+
+/// A checkpoint that PARSES but has no `lsn` silently re-reads the whole change
+/// table — the guard at the parse site claims it doesn't.
+///
+/// `Position::load` refuses a checkpoint that is not valid JSON, and its message
+/// says why: treating it as absent "would permanently skip every change since the
+/// last checkpoint". The MSSQL call site then reads the position with
+/// `.and_then(|pos| pos.0.get("lsn")...)` — so a file that IS valid JSON yet
+/// carries no `lsn` (a key renamed by a future version, a hand-edit, a half-written
+/// migration) yields `None`, which `fill_sql` turns into
+/// `from_expr = fn_cdc_get_min_lsn(ci)`: the entire retained change table, re-read
+/// and re-delivered, with a green exit and nothing in the log.
+///
+/// MySQL refuses exactly this (`ok_or_else`, "checkpoint missing 'file'/'pos'");
+/// Mongo refuses it (`decode_resume_token`); PostgreSQL cannot hit it at all
+/// because its anchor is the slot, server-side. SQL Server is the one engine whose
+/// resume position lives ONLY in that file, and it was the one that shrugged.
+///
+/// The direction of harm is over-read, not loss — at-least-once still holds. It
+/// is still a silent breach of the resume contract, and the comment above the code
+/// already claimed it was closed (#99).
+///
+/// NOT the `pinned` key beside it: absent `pinned` is a documented legacy default
+/// (`unwrap_or(false)` = treat as a resume, the loud direction). Only `lsn` — the
+/// position itself — makes the checkpoint meaningless by its absence.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_checkpoint_without_an_lsn_must_refuse_not_silently_reread_everything() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_nolsn");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,10),(2,20),(3,30)"
+    ));
+    wait_for_capture(&ci, 3);
+
+    // Leg 1: an ordinary run, which writes a real checkpoint.
+    let r1 = mssql_cdc_rig(&table, &ci, &ckpt, &d.path().join("out1"));
+    r1.run_ok();
+    assert_eq!(
+        duckdb_dir_parquet_id_set(&r1.out_dir())
+            .into_iter()
+            .collect::<Vec<i64>>(),
+        vec![1, 2, 3],
+        "leg 1 must really capture — a leg that captured nothing would make every \
+         assertion below vacuous"
+    );
+
+    // The degradation: the file still parses, the position is gone. Keep `pinned`
+    // so the test isolates the `lsn` key rather than two changes at once.
+    let before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    assert!(
+        before.get("lsn").and_then(|v| v.as_str()).is_some(),
+        "the fixture is inert: leg 1 wrote no `lsn` to key off. Got {before}"
+    );
+    std::fs::write(
+        &ckpt,
+        serde_json::to_string(&serde_json::json!({
+            "lsn_renamed_by_a_future_version": before.get("lsn").unwrap(),
+            "pinned": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (4,40)"));
+    wait_for_capture(&ci, 4);
+
+    // Leg 2 into a FRESH destination, so what it delivers is its own doing and not
+    // leg 1's parts read a second time.
+    let r2 = mssql_cdc_rig(&table, &ci, &ckpt, &d.path().join("out2"));
+    let said = r2.run_expect_fail();
+    assert!(
+        said.contains("lsn") && said.to_lowercase().contains("checkpoint"),
+        "the refusal must name the key and the file, or an operator cannot act on \
+         it. Got:\n{said}"
+    );
+
+    // And the refusal must be the LOUD direction: nothing delivered, checkpoint
+    // untouched, so a restored file resumes exactly where leg 1 stopped.
+    assert!(
+        !r2.out_dir().join("manifest.json").is_file(),
+        "a refused run must deliver nothing"
+    );
+}

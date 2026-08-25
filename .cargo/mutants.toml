@@ -412,4 +412,63 @@ exclude_re = [
     # audit_cli_dispatch::run_unknown_export_lists_available_names FAILS — the
     # run exits 0 and prints none of the message it asserts on.
     "replace dispatch -> Result",
+    # `PgChangeStream::fill` / `MysqlChangeStream::fill` are the LIVE-ONLY poll
+    # bodies: each opens a replication slot or a binlog dump against a real server,
+    # so `--lib --bins` never executes a line of them and the whole-function stub is
+    # unkillable HERE by construction — the CLAUDE.md "a live-only path reports 100%
+    # survival and means NOTHING" case. They entered the in-diff scope because the
+    # TRUNCATE guards were added inside them.
+    #
+    # The DECISIONS are extracted and graded offline, deliberately, so this entry
+    # excludes glue and not judgement: `truncate_targets`, `truncate_is_ours`,
+    # `truncate_refusal_message` (postgres), `truncate_target`,
+    # `undecodable_event_is_ours`, `classify_rows_event` (mysql) all have unit
+    # matrices that go RED on their own mutants.
+    #
+    # Live oracle proven by hand 2026-08-24 (mutant applied, live test run, reverted):
+    # PG guard removed -> roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging
+    # FAILS (back to the measured `status: success, rows: 2` over an EMPTY source);
+    # the same test also RED against the list-parse mutant and the un-addressed
+    # refusal. MySQL guard disabled -> roast_mysql_cdc_refuses_a_truncate_instead_of_
+    # silently_diverging FAILS, and again against the un-addressed variant.
+"replace PgChangeStream::fill -> Result",
+    "replace MysqlChangeStream::fill -> Result",
+    # The match GUARD on the MySQL TRUNCATE arm sits inside that same live-only body.
+    # Flipping it to `true`/`false` is the addressed/un-addressed pair that the live
+    # test grades directly (`if true` fails the bystander half; disabling fails the
+    # refusal half) — both run by hand on the same date. Excluded here rather than
+    # left MISSED, because an operator-shaped entry that IS graded live is the
+    # honest form; what would be wrong is an ungraded decision hiding in glue.
+    # The mutant NAME embeds the guard EXPRESSION between "match guard" and
+    # "with true/false", so a pattern written as `replace match guard with true in
+    # …` matches nothing. The gate caught that as a DEAD exclusion — which is the
+    # right verdict and exactly the failure mode a hand-written regex has here
+    # (an over-escaped one earlier in this session matched nothing too, and would
+    # have left the gate red while looking handled).
+    #
+    # Anchored on the guard's own call instead. Both directions are graded LIVE by
+    # roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging: `true`
+    # fails its bystander half (an export that does not capture the truncated
+    # table must still complete), `false` fails the refusal half. Run by hand
+    # 2026-08-24, mutant applied and reverted each time.
+    "replace match guard truncate_target.*MysqlChangeStream::fill",
+
+    # `split_top_level_commas` (src/source/postgres/cdc.rs): dropping the
+    # `in_quotes && next == '"'` guard on the escaped-quote arm cannot change what
+    # the function RETURNS, and the reason is arithmetic rather than aesthetic.
+    #
+    # With the guard, a doubled quote is consumed as one unit: zero toggles of
+    # `in_quotes`. Without it, the pair toggles twice: also zero, net. The two
+    # states can therefore differ only at the byte BETWEEN the pair — which the
+    # guard's own condition proves is a `"`, never a comma, so nothing observes the
+    # difference before they re-converge.
+    #
+    # NOT argued into the file: proven by exhaustive search over every string up to
+    # length 7 on the alphabet `",.ax` — 97 655 inputs, ZERO differing outputs. The
+    # SIBLING mutant on the same line (`replace + with -`, the lookahead reading
+    # backward) differs on 5 580 of them, shortest witness `"",`, and is graded by
+    # `a_truncate_is_recognised_and_refused_only_for_the_captured_tables` with a
+    # name ending in an escaped quote (`"a"""`) — so this exclusion is scoped to the
+    # guard alone and does not blanket the line.
+    "replace match guard in_quotes .* in split_top_level_commas",
 ]

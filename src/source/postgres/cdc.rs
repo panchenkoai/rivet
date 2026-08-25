@@ -70,6 +70,9 @@ pub(crate) struct PgChangeStream {
     /// Rendered LSN of the last frontier advance — the zero-yield release
     /// target. `take()`n once at exhaust.
     frontier_text: Option<String>,
+    /// The `table:` values this run captures — what a TRUNCATE is checked against
+    /// before it is allowed to fail the run. See [`truncate_is_ours`].
+    configured_tables: Vec<String>,
 }
 
 /// The run-start warning emitted when a logical replication slot has to be
@@ -426,6 +429,36 @@ impl PgChangeStream {
             else {
                 continue; // unresolvable here — the schema probe reports it, loudly
             };
+            // A BARE (unqualified) name matches ANY schema in the router: `cfg == table`
+            // in sink::table_matches, which exists because a MongoDB collection has no
+            // schema qualifier and may itself contain dots. On PostgreSQL that makes an
+            // unqualified `table: orders` capture EVERY schema's `orders` into one
+            // export, silently interleaved.
+            //
+            // MEASURED 2026-08-25: `table: bare` with `public.bare` and `s2.bare` both
+            // present captured 2 rows — one from each schema — into a single part, with
+            // nothing in the output distinguishing them.
+            //
+            // A warning, not a refusal: capturing one table under a bare name is the
+            // common and correct case, and `to_regclass` resolves it through search_path
+            // exactly as the schema probe does. What the operator cannot see is that a
+            // SECOND relation of that name will ride along.
+            if !cfg.contains('.') {
+                let others: Vec<String> = client
+                    .query(
+                        "SELECT n.nspname || '.' || c.relname                          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace                          WHERE c.relname = $1 AND c.relkind IN ('r','p')                            AND n.nspname NOT IN ('pg_catalog','information_schema')",
+                        &[&cfg.as_str()],
+                    )
+                    .map(|rows| rows.iter().map(|r| r.get::<_, String>(0)).collect())
+                    .unwrap_or_default();
+                if others.len() > 1 {
+                    log::warn!(
+                        "pg cdc: `{cfg}` is unqualified and {} relations share that name                          ({}). Routing matches a bare name in ANY schema, so changes from                          ALL of them land in this one export, interleaved and                          indistinguishable in the output. Qualify it (`schema.{cfg}`) to                          capture the one you mean.",
+                        others.len(),
+                        others.join(", ")
+                    );
+                }
+            }
             let relkind: String = row.get(0);
             let relpersistence: String = row.get(1);
             let resolved_schema: String = row.get(2);
@@ -574,6 +607,7 @@ impl PgChangeStream {
             bound,
             yielded_data: false,
             frontier_text: None,
+            configured_tables: configured_tables.to_vec(),
         })
     }
 
@@ -646,6 +680,23 @@ impl PgChangeStream {
             } else if data.starts_with("BEGIN") {
                 tx.clear();
                 tx_bytes = 0;
+            } else if let Some((schema, table)) = truncate_targets(&data)
+                .into_iter()
+                .find(|(sc, tb)| truncate_is_ours(sc, tb, &self.configured_tables))
+            {
+                // A TRUNCATE carries no rows, so the parser below has nothing to
+                // build and dropped it silently — leaving the destination holding
+                // rows the source no longer has, with no DELETE to retract them
+                // and no later capture able to reconcile it.
+                //
+                // ONE line can name MANY relations (`TRUNCATE a, b`, and every
+                // CASCADE that pulls in referencing tables), so this searches the
+                // whole list for one of OURS rather than testing the first. A
+                // truncate naming only other tables falls through — the routing
+                // filter would drop their rows anyway, and failing on them would
+                // make one truncated table an outage for every export on this
+                // server (the MySQL undecodable-rows guard's measured lesson).
+                anyhow::bail!(truncate_refusal_message(&schema, &table));
             } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
                 tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
                 tx.push(ev);
@@ -889,6 +940,125 @@ fn split_qualified_ident(qual: &str) -> (String, String) {
         Some(i) => (unquote_ident(&qual[..i]), unquote_ident(&qual[i + 1..])),
         None => (String::new(), unquote_ident(qual)),
     }
+}
+
+/// The relation a `test_decoding` TRUNCATE line names, or `None` if the line is
+/// not a TRUNCATE.
+///
+/// `TRUNCATE` is decoded (PostgreSQL 11+) and rendered as
+/// `table public.t: TRUNCATE: (no-flags)`, but it carries NO rows — so
+/// [`parse_test_decoding`], which builds a change out of the column list, has
+/// nothing to return and dropped the line into its catch-all `None`. Measured
+/// 2026-08-24 on the pg14 stand: 2 inserts then a TRUNCATE left the source table
+/// EMPTY while the run reported `status: success, rows: 2` and wrote both inserts
+/// to the destination. Not one line about it at `RUST_LOG=trace` either — zero
+/// occurrences of the word.
+///
+/// That divergence is permanent. The rows left the source with no DELETE events
+/// to carry them, so no later capture can reconcile the destination back: the
+/// stream is now describing a table state that never existed.
+pub(crate) fn truncate_targets(data: &str) -> Vec<(String, String)> {
+    // The op keyword sits AFTER the (possibly multi-relation) name list, so find the
+    // LAST top-level `": "` rather than the first: a quoted identifier may legally
+    // contain `": "` and splitting at the first occurrence cuts a name in half.
+    let Some(rest) = data.strip_prefix("table ") else {
+        return Vec::new();
+    };
+    // Anchor on the OPERATION marker, not on a bare `": "`. The line holds two of
+    // those — one after the name list, one after the keyword
+    // (`table a, b: TRUNCATE: (no-flags)`) — so "the last `": "`" lands after
+    // TRUNCATE and yields an empty match. Caught by re-measuring the fix rather
+    // than by re-reading it.
+    const MARK: &str = ": TRUNCATE:";
+    let Some(sep) = find_outside_quotes(rest, MARK) else {
+        return Vec::new();
+    };
+    let quals = &rest[..sep];
+    // ONE line can name MANY relations — `TRUNCATE a, b` decodes as
+    // `table public.a, public.b: TRUNCATE: (no-flags)`, and every CASCADE that
+    // pulls in referencing tables does the same. Treating that as a single name
+    // made the guard miss the whole statement: MEASURED with `public.tmulti_a`
+    // configured, `TRUNCATE tmulti_a, tmulti_b` left the source EMPTY while the
+    // run reported `status: success, rows: 1`. Found by an adversarial pass over
+    // the first version of this guard.
+    split_top_level_commas(quals)
+        .into_iter()
+        .map(|q| split_qualified_ident(q.trim()))
+        .collect()
+}
+
+/// Split a relation LIST on top-level commas — a comma inside a quoted identifier
+/// (`"odd,name"`) is part of the name, not a separator.
+fn split_top_level_commas(list: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    let b = list.as_bytes();
+    for i in 0..b.len() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match b[i] {
+            b'"' if in_quotes && b.get(i + 1) == Some(&b'"') => escaped = true,
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                out.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&list[start..]);
+    out
+}
+
+/// Refuse a TRUNCATE on a captured table, naming why re-running cannot fix it.
+///
+/// Loud, not a warning: this is an UNRECOVERABLE divergence, and the repo's rule
+/// is that those fail rather than degrade. A warning would leave a destination
+/// that silently disagrees with the source forever, which is the outcome the
+/// `unknown -> default` shape exists to prevent.
+pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    format!(
+        "pg cdc: `{qualified}` was TRUNCATEd, and this reader cannot represent that as a \
+         change. Skipping it would leave every row the truncate removed sitting in the \
+         destination with no DELETE to retract it — the source empty, the destination \
+         not, permanently, because those rows left the source without events and no \
+         later capture can reconcile them. \
+         \
+         AND THIS RUN WILL NOT MOVE ON ITS OWN. The peek is non-consuming, so the \
+         slot still sits on this commit: every later run meets it first and clean \
+         changes queued BEHIND it are blocked too, while the un-acked slot pins WAL. \
+         MEASURED — a truncate followed by an ordinary INSERT leaves the second run \
+         failing identically. \
+         \
+         Re-snapshot the table (`mode: full`) to re-establish the baseline, and then \
+         get the stream past this commit: \
+         SELECT pg_replication_slot_advance('<slot>', '<lsn past the truncate>'); \
+         Re-snapshotting ALONE leaves the capture wedged, because the slot has not \
+         moved."
+    )
+}
+
+/// Is a TRUNCATE this run's problem? Same asymmetry as the MySQL undecodable-rows
+/// guard, and for the same measured reason: one server's stream carries every
+/// table's changes, so refusing without asking whose relation it is makes one
+/// truncated table an outage for exports that never read it.
+///
+/// Empty `configured` means "capture whatever the stream emits", which makes every
+/// truncate ours.
+pub(crate) fn truncate_is_ours(schema: &str, table: &str, configured: &[String]) -> bool {
+    configured.is_empty()
+        || configured
+            .iter()
+            .any(|c| crate::source::cdc::sink::table_matches(c, schema, table))
 }
 
 /// Parse one `test_decoding` line into a canonical change, or `None` for the
@@ -1424,11 +1594,141 @@ mod tests {
 
     use super::*;
 
-    /// The guard's whole decision surface, one case per relkind that behaves
-    /// differently. Every arm was MEASURED on the pg14 stand (2026-08-24) rather
-    /// than read off the docs — `REFRESH MATERIALIZED VIEW` in particular emits
-    /// no `table …` line at all, which is why 'm' sits with the never-routable
-    /// kinds instead of being assumed routable.
+    /// The TRUNCATE recogniser and its addressing, graded offline.
+    ///
+    /// The multi-relation case is here because the FIRST version of this guard
+    /// shipped without it and an adversarial pass measured the consequence: with
+    /// `public.tmulti_a` configured, `TRUNCATE tmulti_a, tmulti_b` left the source
+    /// EMPTY while the run reported `status: success, rows: 1`. One line names
+    /// every relation, and every CASCADE that pulls in referencing tables produces
+    /// the same shape.
+    #[test]
+    fn a_truncate_is_recognised_across_a_relation_list_and_refused_only_for_ours() {
+        let one = |d: &str| truncate_targets(d);
+
+        assert_eq!(
+            one("table public.orders: TRUNCATE: (no-flags)"),
+            vec![("public".to_string(), "orders".to_string())],
+            "the exact line test_decoding emits for a single relation (measured on pg14)"
+        );
+        // MEASURED wire text for `TRUNCATE tmulti_a, tmulti_b`.
+        assert_eq!(
+            one("table public.a, public.b: TRUNCATE: (no-flags)"),
+            vec![
+                ("public".to_string(), "a".to_string()),
+                ("public".to_string(), "b".to_string())
+            ],
+            "a multi-relation TRUNCATE must yield EVERY relation — missing the list \
+             is how the first version of this guard let the statement through"
+        );
+        assert_eq!(
+            one("table \"My Schema\".\"Odd.Name\": TRUNCATE: (no-flags)"),
+            vec![("My Schema".to_string(), "Odd.Name".to_string())],
+            "a quoted identifier unquotes like every other wire identity (#279) — a \
+             dot INSIDE quotes belongs to the name"
+        );
+        // A comma inside a quoted name is part of the name, not a list separator.
+        assert_eq!(
+            one("table public.\"odd,name\": TRUNCATE: (no-flags)"),
+            vec![("public".to_string(), "odd,name".to_string())],
+            "splitting on a quoted comma would invent two relations that do not exist"
+        );
+        // A DOUBLED quote is an escaped quote INSIDE the name, not the end of it.
+        // Mutation testing found this: five mutants in `split_top_level_commas`'
+        // escape branch survived, because every quoted fixture above closes its
+        // quote immediately and the escape path was never taken. A name like
+        // `od"d` re-opens the quoted span if the doubling is mishandled, and the
+        // following comma is then read as part of the name — one relation instead
+        // of two, and OUR table silently not among them.
+        assert_eq!(
+            one("table public.\"od\"\"d\", public.b: TRUNCATE: (no-flags)"),
+            vec![
+                ("public".to_string(), "od\"d".to_string()),
+                ("public".to_string(), "b".to_string())
+            ],
+            "a doubled quote is an ESCAPE; mishandling it swallows the separator and \
+             loses every relation after it — including possibly ours"
+        );
+        // …and the same escape inside a name that also carries a comma, which is
+        // where the two rules interact.
+        assert_eq!(
+            one("table public.\"a\"\",b\": TRUNCATE: (no-flags)"),
+            vec![("public".to_string(), "a\",b".to_string())],
+            "escape then comma: still ONE relation"
+        );
+
+        // A name ENDING in the escaped quote — `a"` renders as `"a"""`, three quotes
+        // in a row. The fixtures above all have text after the doubling, so the
+        // lookahead `b.get(i + 1)` was never asked about a position where reading
+        // BACKWARD would answer differently: `replace + with -` survived CI
+        // (2026-08-25) against every case here. Proven to be the discriminator by
+        // exhaustive search over 97 655 strings on the alphabet `",.ax` — the
+        // shortest witness is `"",`, and this is its realistic form.
+        assert_eq!(
+            one("table public.\"a\"\"\", public.b: TRUNCATE: (no-flags)"),
+            vec![
+                ("public".to_string(), "a\"".to_string()),
+                ("public".to_string(), "b".to_string())
+            ],
+            "a name ending in an escaped quote must still close, or the following \
+             comma is read as part of it and every later relation disappears"
+        );
+
+        assert!(
+            one("table public.orders: INSERT: id[integer]:1").is_empty(),
+            "an ordinary change must not be mistaken for a truncate"
+        );
+        assert!(one("COMMIT 123").is_empty(), "markers are not truncates");
+        assert!(
+            one("table public.t: DELETE: id[integer]:1").is_empty(),
+            "DELETE stays a change — the guard is for the op with NO rows"
+        );
+
+        let cfg = vec!["public.orders".to_string()];
+        assert!(
+            truncate_is_ours("public", "orders", &cfg),
+            "our own table must fail the run — the divergence it leaves is permanent"
+        );
+        assert!(
+            !truncate_is_ours("public", "audit", &cfg),
+            "another table's truncate must NOT fail this run: the slot decodes the \
+             whole database, so refusing would make one truncated table an outage \
+             for every export on it (the MySQL undecodable-rows lesson, #281)"
+        );
+        assert!(
+            truncate_is_ours("public", "audit", &[]),
+            "`rivet cdc` with no --table captures whatever the stream emits"
+        );
+        assert!(
+            truncate_is_ours("otherschema", "orders", &["orders".to_string()]),
+            "a bare config name matches any schema, exactly as sink::table_matches \
+             routes it — a guard asking a different question protects the wrong set"
+        );
+        // The whole point of parsing the LIST: ours can be anywhere in it.
+        let multi = one("table public.other, public.orders: TRUNCATE: (no-flags)");
+        assert!(
+            multi.iter().any(|(s, t)| truncate_is_ours(s, t, &cfg)),
+            "a truncate naming ours SECOND must still be found: {multi:?}"
+        );
+        assert!(
+            !one("table public.x, public.y: TRUNCATE: (no-flags)")
+                .iter()
+                .any(|(s, t)| truncate_is_ours(s, t, &cfg)),
+            "a list naming only OTHER tables must not fail this run"
+        );
+
+        let msg = truncate_refusal_message("public", "orders");
+        assert!(
+            msg.contains("public.orders") && msg.contains("mode: full"),
+            "the refusal must name the table AND the re-snapshot that recovers from \
+             it; a bail with no way forward just moves the operator's problem: {msg}"
+        );
+        assert!(
+            truncate_refusal_message("", "orders").contains("`orders`"),
+            "a schema-less identity must not render a leading dot"
+        );
+    }
+
     #[test]
     fn classify_routing_refuses_only_the_relations_no_event_can_ever_name() {
         let rel = |kind: char, children: &[&str]| RelationRouting {

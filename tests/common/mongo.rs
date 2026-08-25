@@ -58,6 +58,33 @@ impl MongoTest {
         })
     }
 
+    /// Turn on `changeStreamPreAndPostImages` for one collection (6.0+).
+    ///
+    /// Off by DEFAULT and per-COLLECTION, which is why it needs saying in a test
+    /// rather than in the stack: rivet asks for
+    /// `full_document_before_change(WhenAvailable)`, so on a default collection a
+    /// delete's `document` is legitimately NULL and the request is a silent no-op.
+    /// Whether the pre-image actually arrives when the collection HAS it enabled is
+    /// a different question, and it is the one nothing asked.
+    ///
+    /// Returns false when the server is too old to honour it, so a caller on 4.4/5.0
+    /// can say "not applicable here" out loud instead of asserting a null.
+    pub fn enable_pre_images(&self, name: &str) -> bool {
+        if self.server_major() < 6 {
+            return false;
+        }
+        self.rt.block_on(async {
+            self.client
+                .database(&self.db)
+                .run_command(doc! {
+                    "collMod": name,
+                    "changeStreamPreAndPostImages": { "enabled": true },
+                })
+                .await
+                .is_ok()
+        })
+    }
+
     fn coll(&self, name: &str) -> Collection<Document> {
         self.client.database(&self.db).collection(name)
     }
