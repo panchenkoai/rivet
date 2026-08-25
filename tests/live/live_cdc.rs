@@ -4023,14 +4023,14 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     );
 
     let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot).source_url(cdc_db.url());
-    let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // Through the rig, like every other live test here: `run_expect_fail` asserts
+    // the non-zero exit AND returns stdout+stderr, so the hand-rolled
+    // `run_rivet(&["run", "--config", …])` this used to call was a second way of
+    // doing what the rig already does — the per-file command wrapper the rig exists
+    // to have replaced.
+    let said = rig.run_expect_fail();
     assert!(
-        !out.status.success(),
+        said.contains("TRUNCATE"),
         "a TRUNCATE on a captured table must fail the run — shipping the 2 inserts \
          as a success leaves them in the destination with nothing to retract them. \
          Output:\n{said}"
@@ -4089,14 +4089,9 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
         .unwrap();
     c.execute(&format!("TRUNCATE {other}, {tbl}"), &[]).unwrap();
     let multi = Rig::pg_cdc(&format!("public.{tbl}"), &third_slot).source_url(cdc_db.url());
-    let out2 = run_rivet(&["run", "--config", multi.config_path().to_str().unwrap()]);
-    let said2 = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out2.stdout),
-        String::from_utf8_lossy(&out2.stderr)
-    );
+    let said2 = multi.run_expect_fail();
     assert!(
-        !out2.status.success() && said2.contains(&tbl),
+        said2.contains(&tbl),
         "a TRUNCATE naming our table SECOND in a list must still refuse, and name \
          OUR table rather than whichever came first. Output:\n{said2}"
     );
@@ -4113,12 +4108,10 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     // adversarial pass, in a guard I wrote after fixing that one.
     c.execute(&format!("INSERT INTO {tbl} VALUES (77,770)"), &[])
         .unwrap();
-    let again = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
-    assert!(
-        !again.status.success(),
-        "a clean change queued behind the truncate must still be blocked — if this \
-         ever passes the wedge is gone and the message should be softened"
-    );
+    // `run_expect_fail` panics if the run SUCCEEDS, which is exactly the assertion:
+    // a clean change queued behind the truncate must still be blocked. If this ever
+    // stops panicking the wedge is gone and the message should be softened.
+    let _still_wedged = rig.run_expect_fail();
     assert!(
         said.contains("pg_replication_slot_advance"),
         "the refusal must name the way OUT of the wedge, not only the re-snapshot: \
