@@ -326,6 +326,13 @@ impl MysqlChangeStream {
         configured: &[String],
     ) -> Result<()> {
         use mysql::prelude::Queryable as _;
+        // The connection's own database — what a BARE configured name means.
+        let own_db_for_resolution: String = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_default();
         for cfg in configured {
             let (schema, table) = match cfg.split_once('.') {
                 Some((s, t)) => (Some(s.to_string()), t.to_string()),
@@ -402,7 +409,57 @@ impl MysqlChangeStream {
             let resolved = if matches.is_empty() {
                 None
             } else {
-                let r = crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?;
+                // A BARE name means the CONNECTION'S OWN database — the same rule
+                // `bare_name_spans_databases` enforces on the wire, and the one
+                // rivet's routability check has always used. So a candidate outside
+                // it may never be ELECTED as the identity, only reported.
+                //
+                // MEASURED when it could be: with a VIEW `rivet.hunt_v2` and a base
+                // table `hunt_other.hunt_v2`, resolution elected the foreign table —
+                // the only capturable candidate — classification asked IT for a type,
+                // got BASE TABLE, and the run went `status: success, rows: 0` while
+                // the view the operator meant was skipped in silence. Before this it
+                // was a hard refusal naming that exact harm.
+                //
+                // A LIVE foreign twin is still a refusal, because routing would
+                // genuinely capture it — that is the catalog-visible half of the
+                // ambiguity, and the wire guard covers the half the catalog cannot
+                // see (privilege-filtered `information_schema`).
+                let (mine, foreign): (Vec<_>, Vec<_>) = if schema.is_some() {
+                    (matches.clone(), Vec::new())
+                } else {
+                    matches
+                        .iter()
+                        .cloned()
+                        .partition(|m| m.schema == own_db_for_resolution)
+                };
+                let live_foreign: Vec<_> =
+                    foreign.iter().filter(|m| m.capturable).cloned().collect();
+                // Our own database holds the name AND a live twin exists elsewhere:
+                // that is the cross-database ambiguity, refused here rather than left
+                // for the wire — the catalog can see this one, so it should be caught
+                // before the stream opens. Crucially this fires even when OUR
+                // candidate is inert (a view): electing the foreign table instead is
+                // what turned a hard refusal into `success, rows: 0`.
+                if !mine.is_empty() && !live_foreign.is_empty() {
+                    anyhow::bail!(
+                        "mysql cdc: `{cfg}` is unqualified, so it means the connection's \
+                         own database (`{own_db_for_resolution}`) — but `{}` also holds a \
+                         table of that name, and the binlog dump is server-wide, so its \
+                         rows would land in this export under THIS table's names. Qualify \
+                         it (`{own_db_for_resolution}.{cfg}` or `{}.{cfg}`) to say which \
+                         you mean.",
+                        live_foreign[0].schema,
+                        live_foreign[0].schema
+                    );
+                }
+                // Otherwise resolve within the scope the bare name actually names.
+                let for_resolution = if mine.is_empty() {
+                    matches.clone()
+                } else {
+                    mine
+                };
+                let r = crate::source::cdc::identity::resolve_captured_table(cfg, &for_resolution)?;
                 if let Some(note) = &r.note {
                     log::warn!("mysql cdc: {note}");
                 }
@@ -462,9 +519,18 @@ impl MysqlChangeStream {
         refuse_compressed_binlog(&mut conn)?;
         // Read the connection's own database BEFORE the binlog stream consumes the
         // connection — it is the meaning of a bare configured name.
+        // `Option<String>`, like the two sibling call sites (`mysql/mod.rs`,
+        // `preflight/mysql.rs`). A db-less URL is a DELIBERATELY supported shape —
+        // `cdc/mod.rs` says so in prose and skips its own query for a qualified name
+        // — and `SELECT DATABASE()` then returns NULL. Deserialising that into
+        // `String` PANICS inside `FromRow`, which `.ok().flatten()` cannot catch:
+        // MEASURED `exit 101`, no run summary, no error path, no ledger finalize.
+        // The value is not even consulted for a qualified name, so the crash was
+        // pure collateral.
         let own_db: String = conn
-            .query_first::<String, _>("SELECT DATABASE()")
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
             .ok()
+            .flatten()
             .flatten()
             .unwrap_or_default();
         let mut req = BinlogRequest::new(server_id)

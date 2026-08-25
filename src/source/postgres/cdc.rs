@@ -398,7 +398,9 @@ impl PgChangeStream {
         }) else {
             return Ok(());
         };
-        Self::check_configured_tables_are_routable(&mut client, configured)
+        // The PRECHECK says the note: it runs once per run, where `open`'s call
+        // can repeat under the sink's re-drain loop.
+        Self::check_configured_tables_are_routable(&mut client, configured, true)
     }
 
     /// Live half of the routing guard: ask the CATALOG what each configured
@@ -417,6 +419,14 @@ impl PgChangeStream {
     pub(crate) fn check_configured_tables_are_routable(
         client: &mut Client,
         configured: &[String],
+        // Whether to LOG the inert-twin note. This function is called twice by
+        // design — a precheck on its own connection, then again inside `open` — and
+        // the duplicate is justified as "one round-trip on a config that is about to
+        // fail anyway". That reasoning holds for a REFUSAL and not for a note on a
+        // config that SUCCEEDS: the note then printed twice per run, forever, on
+        // every scheduler cycle. A reporting view named after a table is not a
+        // condition that resolves.
+        say_note: bool,
     ) -> Result<()> {
         use anyhow::Context as _;
         for cfg in configured {
@@ -441,7 +451,7 @@ impl PgChangeStream {
                     // table silently while classification refuses the view — two
                     // reads of one fact naming two relations (measured on MySQL).
                     "SELECT n.nspname::text, c.relname::text, c.relkind::text, \
-                            (c.relkind IN ('r','p','m') AND c.relpersistence = 'p') \
+                            (c.relkind IN ('r','m') AND c.relpersistence = 'p') \
                               AS capturable \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                      WHERE c.relkind IN ('r','p','m','v','f') \
@@ -463,7 +473,15 @@ impl PgChangeStream {
                     table: r.get(1),
                     kind: r.get::<_, String>(2),
                     // Which relkinds can actually CARRY an event, measured rather
-                    // than assumed: `'m'` is capturable because `test_decoding` DOES
+                    // than assumed. `'p'` is NOT one: a partitioned PARENT stores no
+                    // rows, and `test_decoding` names the LEAF — measured, an insert
+                    // into `hunt_arch.hunt_pt` decodes as `table
+                    // hunt_arch.hunt_pt_p1: INSERT`, which a bare `hunt_pt` never
+                    // matches. `classify_routing` says the same thing 200 lines below,
+                    // and counting the parent as a competitor hard-refused a healthy
+                    // config over a twin that cannot put one row in the export.
+                    //
+                    // `'m'` IS capturable because `test_decoding` DOES
                     // decode a materialized view — `CREATE MATERIALIZED VIEW … WITH
                     // DATA` renders as ordinary INSERTs, which is how a same-named
                     // matview injected a fabricated row into an export earlier today.
@@ -486,7 +504,9 @@ impl PgChangeStream {
                     // Resolution succeeded, but the name also matched something that
                     // emits nothing. Very often that inert twin is what the operator
                     // meant, and silence sends them hunting.
-                    log::warn!("pg cdc: {note}");
+                    if say_note {
+                        log::warn!("pg cdc: {note}");
+                    }
                 }
             }
             let Some(row) = client
@@ -583,7 +603,8 @@ impl PgChangeStream {
         // wrapped around it; this one keeps the guarantee for any path that opens a
         // stream directly. The duplicate catalog read costs one round-trip on a
         // config that is about to fail anyway.
-        Self::check_configured_tables_are_routable(&mut client, configured_tables)?;
+        // The refusal still runs here; the NOTE was already said by the precheck.
+        Self::check_configured_tables_are_routable(&mut client, configured_tables, false)?;
 
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
         // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
