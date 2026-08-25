@@ -141,6 +141,21 @@ pub(crate) fn resolve_captured_table(
                 .join(", ")
         )
     };
+    // NOTHING capturable, and more than one candidate. Refusing is right — capture
+    // is impossible either way — but the ambiguity message below would be a LIE
+    // here: it says all of them would land in this export, and none of them can put
+    // a single row in it. A refusal whose explanation is false is as unactionable as
+    // a false refusal. (ONE inert candidate falls through to the single-match arm on
+    // purpose: the engine's own classifier owns "this is a view" and says what to do
+    // about it, which is more specific than anything this function knows.)
+    if live.is_empty() && distinct.len() > 1 {
+        anyhow::bail!(
+            "cdc: `{configured}` matches {} relations and NONE of them can carry a change \
+             event{note}. Capture is not possible for this name — point `table:` at a \
+             relation the engine logs, or capture the underlying table if this is a view.",
+            distinct.len()
+        );
+    }
     let distinct: Vec<&CatalogMatch> = if live.is_empty() { distinct } else { live };
 
     match distinct.as_slice() {
@@ -255,6 +270,27 @@ mod tests {
         let got = resolve_captured_table("vv", &[k("rivet", "vv", "VIEW")])
             .expect("one candidate, inert — classification refuses it, not resolution");
         assert_eq!((got.schema.as_str(), got.table.as_str()), ("rivet", "vv"));
+    }
+
+    /// TWO inert candidates and no live one. Refusing is right — nothing here can be
+    /// captured — but the AMBIGUITY message is a lie in this case: it says all of
+    /// them would land in this export, and none of them can put a single row in it.
+    /// A refusal an operator cannot act on because its explanation is false is the
+    /// same harm as a false refusal.
+    #[test]
+    fn two_inert_candidates_are_refused_for_the_right_reason() {
+        let err = resolve_captured_table("vv", &[k("a", "vv", "VIEW"), k("b", "vv", "VIEW")])
+            .expect_err("nothing capturable, and two of them — capture is impossible");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot carry a change event"),
+            "say the TRUE reason — none of these emits anything — rather than the \
+             ambiguity story about rows landing in the export: {msg}"
+        );
+        assert!(
+            !msg.contains("would land in this export"),
+            "and do not claim rows would land when none can: {msg}"
+        );
     }
 
     /// The ordinary case, and the one that must not regress: one relation resolves
