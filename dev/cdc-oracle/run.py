@@ -15,7 +15,7 @@ The wait matters as much as the ordering. Debezium's slot exists from the moment
 it has finished starting; applying changes before that is safe (the slot retains
 them) while applying them before the SLOT exists is not.
 """
-import argparse, json, os, re, subprocess, sys, time
+import argparse, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The stands do not all share one docker network: the SQL engines sit in
@@ -86,7 +86,18 @@ def _value_cols(a) -> list:
     rather than the values. The op/key comparison plus the per-column null-profile
     check in the live suite covers that engine; a value diff here would be noise.
     """
-    return [] if a.engine == "mongo" else ["v"]
+    return ["v"]
+
+
+def _rivet_json_column(a) -> list:
+    """rivet's side of a Mongo value lives inside the `document` JSON column.
+
+    Debezium's ExtractNewDocumentState flattens the document to the top level, so
+    `$.v` reads the same cell on both sides. Comparing the two whole documents as
+    text would grade JSON key ORDER and whitespace instead — which is what made
+    this look like an engine a value comparison cannot cover.
+    """
+    return ["--rivet-json-column", "document"] if a.engine == "mongo" else []
 
 
 def run_scenario(name: str, sql, t: str) -> None:
@@ -217,13 +228,30 @@ def main() -> int:
     # covered the cross-ENGINE leak (MySQL reading a PostgreSQL offsets.dat) and not
     # the cross-SCENARIO one, which reads identically at the call site.
     work = os.path.join(a.work, a.engine, a.table, a.scenario)
+    # CLEARED, not reused: the sink APPENDS to debezium.jsonl, so re-running one
+    # scenario accumulated its own previous capture and reported a disagreement
+    # against events it had already compared. Third instance of this class in the
+    # harness (cross-engine, then cross-scenario, now cross-RUN) — each one wore the
+    # costume of an engine defect. The dir is derived and owned here; anything worth
+    # keeping is behind --work.
+    shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
     dbz_slot, riv_slot, pub = f"dbz_{t}", f"riv_{t}", f"pub_{t}"
     # Hyphens, NOT underscores: an underscore is illegal in a hostname per RFC 952,
     # and Debezium's http sink rejects the URL with `unsupported URI` — a message
     # that names the URI without saying which character offends. Cost three runs.
     safe = t.replace("_", "-")
-    sink, srv = f"sink-{safe}", f"srv-{safe}"
+    # The SCENARIO is part of the identity, same as the work dir: named from the
+    # table alone, a leftover `srv-oracle-t` from the previous scenario made the
+    # next one die on `Conflict. The container name is already in use` — a harness
+    # failure that reads as an engine problem. Slots and publications key off the
+    # table on purpose (they are server objects the scenario's own SQL manages).
+    scen = a.scenario.replace("_", "-")
+    sink, srv = f"sink-{safe}-{scen}", f"srv-{safe}-{scen}"
+    # And remove a stale pair before starting: a run killed mid-flight (Ctrl-C, a
+    # timeout) leaves them behind, and the next run must not inherit its capture.
+    for c in (sink, srv):
+        subprocess.run(["docker", "rm", "-f", c], capture_output=True)
 
     net = os.environ.get("CDC_ORACLE_NET") or NETS[a.engine]
     ckpt = os.path.join(work, "rivet.ckpt")
@@ -503,6 +531,7 @@ quarkus.log.level=WARN
                                # compared against NULL. Both fixed; PostgreSQL crud
                                # now AGREES on (op, key, v).
                                *sum((["--value", v] for v in _value_cols(a)), []),
+                               *_rivet_json_column(a),
                                ]
                               # MEASURED after adding ExtractNewDocumentState: the
                               # transform flattens inserts and updates so their `_id`

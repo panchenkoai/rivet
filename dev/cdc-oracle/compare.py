@@ -107,12 +107,21 @@ SELECT
   __DBZ_VALS__
 FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
       FROM read_text('__DBZ__'))
--- MySQL's connector also emits SCHEMA-CHANGE events (a `ddl` field, no `op`) on
--- the same sink. They are DDL, not row changes, and PostgreSQL's connector does
--- not send them — a legitimate asymmetry, so they are excluded EXPLICITLY here
--- rather than swallowed by the UNKNOWN arm. Silencing them there would have
--- disarmed the shape check for real unrecognised events too.
-WHERE j <> '' AND jstr(j, '$.ddl') IS NULL;
+-- MySQL and SQL Server also emit SCHEMA-CHANGE events on the same sink. They are
+-- DDL, not row changes, and PostgreSQL's connector does not send them — a
+-- legitimate asymmetry, so they are excluded EXPLICITLY here rather than swallowed
+-- by the UNKNOWN arm. Silencing them there would disarm the shape check for real
+-- unrecognised events too.
+--
+-- Excluded by SHAPE (`tableChanges`), not by `ddl` being non-null: SQL Server sends
+-- schema-change events with `ddl` set to JSON **null**, and once `jstr` started
+-- mapping a JSON null to SQL NULL (correctly — see the macro), a `ddl IS NULL`
+-- filter stopped recognising them. Measured: 24 of 32 events in an mssql crud
+-- capture, all surfacing as UNKNOWN-SHAPE. `tableChanges` is present on both
+-- engines' schema-change events and on no row event.
+WHERE j <> ''
+  AND json_type(j, '$.tableChanges') IS NULL
+  AND jstr(j, '$.ddl') IS NULL;
 
 CREATE OR REPLACE VIEW riv AS
 SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k __RIV_VALS__
@@ -129,6 +138,10 @@ def main() -> int:
                     help="a VALUE column to compare as well as the key; repeatable. "
                          "Without one the comparison is blind to cell corruption — "
                          "a parquet with every value NULLed still reports AGREE.")
+    ap.add_argument("--rivet-json-column", default=None,
+                    help="on rivet's side the value columns live INSIDE this JSON "
+                         "column (MongoDB writes the whole document into `document`), "
+                         "so they are extracted from it rather than read as columns")
     ap.add_argument("--allow-empty-reference", action="store_true",
                     help="accept a zero-event Debezium capture (asserting BOTH are empty)")
     ap.add_argument("--exclude-op", action="append", default=[],
@@ -201,7 +214,19 @@ def main() -> int:
                          jstr(j, '$.{v}')) END AS v_{v}\n  """
         for v in a.value
     )
-    riv_vals = "".join(f", CAST({v} AS VARCHAR) AS v_{v}" for v in a.value)
+    # MongoDB's value columns are not columns: rivet writes the whole document into
+    # one JSON column, and Debezium's ExtractNewDocumentState flattens the same
+    # fields to the top level. Extracting `$.<v>` from both compares the same CELL —
+    # which is what a value comparison is for — where a text comparison of the two
+    # whole documents would have graded JSON key ORDER and whitespace instead. That
+    # difference is why this engine was briefly written off as `na`.
+    if a.rivet_json_column:
+        riv_vals = "".join(
+            f", jstr(CAST({a.rivet_json_column} AS VARCHAR), '$.{v}') AS v_{v}"
+            for v in a.value
+        )
+    else:
+        riv_vals = "".join(f", CAST({v} AS VARCHAR) AS v_{v}" for v in a.value)
     sql = (SQL.replace("__DBZ_VALS__", dbz_vals)
               .replace("__RIV_VALS__", riv_vals)
               .replace("__DBZ__", a.debezium_jsonl)
