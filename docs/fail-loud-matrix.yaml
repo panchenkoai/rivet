@@ -28,7 +28,7 @@ scenarios:
     postgres: { test: roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot }
     mssql:    { test: mssql_cdc_capture_instance_name_must_not_decide_the_table }
     mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
-    mongo:    { na: "a change stream's `ns` IS the collection the write addressed; Mongo has no parent/child relation surfacing events under a different name, so there is no second identity to cross-check" }
+    mongo:    { na: "a change stream's `ns` IS the collection the write addressed; the ORDINARY collection case has no second identity — but this `na` is NARROWER than it first claimed. An adversarial pass reports (and the mechanism is plausible) that a TIME-SERIES collection stores into `system.buckets.<name>` and emits nothing on a default db.watch(), and that a VIEW's writes surface under the base collection. NEITHER is covered by a rivet guard: `CdcEngineOpts::Mongo` carries no configured_tables at all, so unlike the other three engines there is nothing to cross-check. Downgraded from a universal to the case it actually measured, so there is no second identity to cross-check" }
 
   - id: hostile_numeric_value_loud
     what: "a non-finite value (NaN/Inf) in a lossy fixed-point numeric → loud error, never a silent NULL / truncate-to-zero"

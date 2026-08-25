@@ -92,11 +92,17 @@ shapes:
         RANGE-partitioned `mpart` captured both inserted rows through a config
         naming the parent, on the rivet-mysql-cdc-1 stand."
     mongo:
-      na: "A change stream's `ns` is the collection the write addressed, and Mongo
-        has no parent/child relation whose events surface under a different name —
-        there is no second identity for a cross-check to compare against. The
-        engine's routing risk is the dotted-collection-name case, already covered by
-        table_matches' full-name-first arm (sink.rs:227-234)."
+      gap: "DOWNGRADED from `na` 2026-08-25. The original text claimed Mongo has no
+        relation whose events surface under a different name; that is true for an
+        ORDINARY collection and was written as a universal. An adversarial pass
+        reports two counter-examples with a plausible mechanism: a TIME-SERIES
+        collection stores into `system.buckets.<name>` and emits nothing on a default
+        db.watch(), and a VIEW's writes surface under the base collection. Neither is
+        re-verified here, which is why this is a gap and not a claim in either
+        direction. What IS verified from the code: `CdcEngineOpts::Mongo`
+        (src/source/cdc/mod.rs) carries no configured_tables at all — the other three
+        engines all do — so there is nothing for a cross-check to compare against on
+        this engine, and no guard exists."
 
   - id: readback_is_manifest_scoped
     what: >
