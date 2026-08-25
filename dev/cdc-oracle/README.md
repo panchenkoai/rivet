@@ -102,6 +102,22 @@ rather than one representative test.
 `key-update` is **na** on MongoDB: `_id` is immutable, so the scenario cannot be
 expressed. A scenario an engine cannot express is not a passing cell.
 
+**MSSQL wide-txn — measured, undiagnosed, and NOT a claim about rivet.**
+The 50-insert + 25-update scenario puts 100 rows in `cdc.dbo_<t>_CT` (SQL Server
+writes two CT rows per UPDATE). rivet captures 75 change events, which is the
+correct count. Debezium delivers 39 and then STOPS — it quiesces there across
+three consecutive checks, so this is its steady state rather than a flush race:
+an earlier fixed 8s wait gave 30, and waiting for quiescence gave 39.
+
+The 55 resulting rows all sit on the `rivet-only` side, i.e. the REFERENCE is
+short. Candidate causes not yet separated: a batch-size limit on the connector, a
+poll interval interacting with the capture job's own batching, or something about
+`snapshot.mode=no_data` on this engine. Recorded with the numbers rather than
+guessed at — a difference whose cause is unknown is not evidence about either
+tool, and calling this a rivet defect would be the harness lying in our favour.
+
+Original note follows.
+
 **MSSQL wide-txn** shows `rivet-only` rows — i.e. the REFERENCE lagged, not rivet.
 Not yet diagnosed and NOT claimed as a finding: SQL Server's capture job is
 asynchronous on both sides and the wait may still be too short for 75 changes.

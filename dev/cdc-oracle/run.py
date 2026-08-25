@@ -421,7 +421,23 @@ quarkus.log.level=WARN
                 time.sleep(2)
             # let the job settle past the last batch it just reported
             time.sleep(6)
-        time.sleep(8)  # let the reference flush
+        # Wait for the REFERENCE to stop producing, not for a clock. A fixed 8s
+        # flush let Debezium deliver 30 of 100 changes on a 75-change SQL Server
+        # scenario, and the 63 resulting `rivet-only` rows read as a finding
+        # against rivet when the truth was that the reference had not finished.
+        # Quiescence is the honest signal: stop when the capture has not grown for
+        # three consecutive checks.
+        jsonl = os.path.join(work, "debezium.jsonl")
+        stable, last = 0, -1
+        for _ in range(60):
+            time.sleep(2)
+            n = sum(1 for _ in open(jsonl)) if os.path.exists(jsonl) else 0
+            stable = stable + 1 if n == last and n > 0 else 0
+            last = n
+            if stable >= 3:
+                break
+        else:
+            print(f"warning: reference never quiesced (last count {last})", file=sys.stderr)
 
         # 6. rivet over the same window
         out = os.path.join(work, "rivet_out")
