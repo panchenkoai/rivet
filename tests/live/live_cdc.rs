@@ -6653,7 +6653,17 @@ fn roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal() {
     // Healthy first: two small slots, nothing to report. Asserted BEFORE the noisy
     // case because a warning that fires unconditionally would satisfy the positive
     // assertion below while being useless — and this is the half that catches it.
-    let quiet = Rig::pg_cdc(&tbl, &slot).run_ok_capture();
+    let rig = Rig::pg_cdc(&tbl, &slot);
+    let quiet = rig.run_ok_capture();
+    // The capture itself must have worked. A diagnostic test that never checks its
+    // run delivered anything would pass over a 0-row success — the conformance gate
+    // asks this of every live CDC test, and it caught this one.
+    assert_eq!(
+        duckdb_dir_parquet_i64(&rig.out_dir(), "id"),
+        vec![1],
+        "the run must still CAPTURE while it warns — a warning path that broke the \
+         export would be worse than the silence it replaced"
+    );
     assert!(
         !quiet.to_lowercase().contains("pinning"),
         "a healthy instance must stay silent, or the message is noise on every \
