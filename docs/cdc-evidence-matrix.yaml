@@ -92,11 +92,22 @@ shapes:
         RANGE-partitioned `mpart` captured both inserted rows through a config
         naming the parent, on the rivet-mysql-cdc-1 stand."
     mongo:
-      na: "A change stream's `ns` is the collection the write addressed, and Mongo
-        has no parent/child relation whose events surface under a different name —
-        there is no second identity for a cross-check to compare against. The
-        engine's routing risk is the dotted-collection-name case, already covered by
-        table_matches' full-name-first arm (sink.rs:227-234)."
+      sound: "mongo_cdc_warns_when_a_configured_collection_does_not_exist
+        (live_cdc_mongo.rs) — RED against this shape's mutant, MEASURED 2026-08-26:
+        with the open-time cross-check disabled (`if false &&`), a config naming a
+        collection the database does not hold ran to `status: success, rows: 0` with
+        no warning of any kind, and the test failed on the missing name.
+        The cell was `na` until 2026-08-25 on a reason that answered a narrower
+        question — Mongo has no SECOND identity (a change stream's `ns` is the
+        collection the write addressed, no parent/child relation surfaces events
+        under another name), so the cross-check compares against the catalog's
+        PRESENCE rather than against a rival name. That is the same failure this
+        shape grades: a configured table no event can name, shipped green.
+        Loud here means a WARNING, not a bail, and the asymmetry is structural: a
+        Mongo collection is created by its first write, so refusing an absent name
+        would break the legitimate start-the-stream-then-write setup. The SQL
+        engines bail because their unroutable relation EXISTS and can never emit
+        under the configured name — a permanent error, not a pending one."
 
   - id: readback_is_manifest_scoped
     what: >

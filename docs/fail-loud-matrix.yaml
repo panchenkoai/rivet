@@ -24,11 +24,11 @@ scenarios:
     mongo:    { na: "an oplog-rolled-past resume token surfaces the driver's ChangeStreamHistoryLost directly (rivet does not swallow it — src/source/mongo/cdc.rs); forcing an oplog rollover live is impractical (documented NA in cdc_conformance_gate.rs). The adjacent corrupt-checkpoint case IS tested: roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor" }
 
   - id: cdc_unroutable_configured_table_loud
-    what: "a configured `table:` that NO change event can ever name (a PostgreSQL partitioned parent / view / matview; a MySQL VIEW, whose binlog Table_map names the BASE table; a SQL Server capture instance whose catalog identity differs) → loud bail AT OPEN, before any ack, never a 0-row `status: success` past an advanced cursor"
+    what: "a configured `table:` that NO change event can ever name (a PostgreSQL partitioned parent / view / matview; a MySQL VIEW, whose binlog Table_map names the BASE table; a SQL Server capture instance whose catalog identity differs) → loud AT OPEN, before any ack, never a 0-row `status: success` past an advanced cursor. Which LOUD is owed follows the error's permanence, and the split is load-bearing rather than a softening: a relation that EXISTS and can never emit under the configured name is a permanent error → BAIL (the three SQL engines; downgrading one to a warning is this shape's mutant). A name that is merely ABSENT and would become valid at the first write is pending, not wrong → loud WARNING naming what the catalog does hold (Mongo, where a collection is born on its first write; on the SQL engines the absent name is already loud through the schema probe, so no engine trades a bail for a warning)"
     postgres: { test: roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot }
     mssql:    { test: mssql_cdc_capture_instance_name_must_not_decide_the_table }
     mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
-    mongo:    { na: "a change stream's `ns` IS the collection the write addressed; Mongo has no parent/child relation surfacing events under a different name, so there is no second identity to cross-check" }
+    mongo:    { test: mongo_cdc_warns_when_a_configured_collection_does_not_exist }
 
   - id: cdc_truncate_loud_not_a_silent_divergence
     what: "a TRUNCATE on a captured table → loud bail naming the re-snapshot, never a silent drop that leaves the destination holding rows the source no longer has (no DELETE events carry them, so no later capture can reconcile it)"
