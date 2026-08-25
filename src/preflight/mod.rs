@@ -6,7 +6,7 @@ mod analysis;
 #[cfg(test)]
 pub(crate) use analysis::diagnose_mode_str;
 pub(crate) use analysis::overlay_measured_rows;
-mod cdc_health;
+pub(crate) mod cdc_health;
 pub(crate) mod cursor_expr;
 mod doctor;
 mod mongo;

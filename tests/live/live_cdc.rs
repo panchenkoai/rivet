@@ -6608,3 +6608,85 @@ fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot(
          cell proves nothing about the boundary it exists for"
     );
 }
+
+/// A slot nobody is draining pins WAL forever, and `run` used to say nothing.
+///
+/// `rivet doctor` has caught this since it was written — it FAILS past 1 GiB and
+/// names every offender. But doctor is a thing an operator runs when they already
+/// suspect something; the scheduler runs `rivet run` every cycle and it was silent.
+/// Measured on a dev stand: nine abandoned slots holding 1.5 GiB each, 1552 MiB of
+/// WAL on disk, and every CDC run over that instance exited 0 without a word.
+///
+/// Two warnings, and the split is the point. Our OWN slot being far behind is worth
+/// saying but the run does fix it — so the message says so, or an operator drops a
+/// slot that was about to be drained. A FOREIGN inactive slot is pinned until a
+/// human acts, which is the one that fills disks.
+///
+/// The threshold and the wording live in `preflight::cdc_health` and are shared with
+/// doctor, so the two cannot drift; this test is about the WIRING — that a run
+/// reaches them at all, and stays quiet when there is nothing to say.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal() {
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_slotwarn");
+    let slot = unique_name("rivet_slotwarn").to_lowercase();
+    let orphan = unique_name("rivet_orphan").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    for s in [&slot, &orphan] {
+        c.execute(
+            "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[s],
+        )
+        .unwrap();
+    }
+    let _slot = Slot(slot.clone());
+    let _orphan_guard = Slot(orphan.clone());
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1)"), &[])
+        .unwrap();
+
+    // Healthy first: two small slots, nothing to report. Asserted BEFORE the noisy
+    // case because a warning that fires unconditionally would satisfy the positive
+    // assertion below while being useless — and this is the half that catches it.
+    let quiet = Rig::pg_cdc(&tbl, &slot).run_ok_capture();
+    assert!(
+        !quiet.to_lowercase().contains("pinning"),
+        "a healthy instance must stay silent, or the message is noise on every \
+         scheduler cycle and stops being read. Got:\n{quiet}"
+    );
+
+    // Now the loud case. Crossing a real GiB takes minutes of writes, so the bar
+    // moves instead (`RIVET_TEST_SLOT_WAL_BAR`, a test seam beside the threshold —
+    // deliberately not a config knob, since an operator lowering it would get a
+    // warning on every ordinary backlog and learn to ignore it).
+    let loud = Rig::pg_cdc(&tbl, &slot).run_with_env("RIVET_TEST_SLOT_WAL_BAR", "1");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&loud.stdout),
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    assert!(
+        loud.status.success(),
+        "a retention WARNING must never fail the run — the export is the thing that \
+         drains the slot, so refusing here would make the problem permanent:\n{said}"
+    );
+    assert!(
+        said.contains(&orphan),
+        "the run must name the ABANDONED slot — it is the one nothing is draining, \
+         and an operator cannot drop what they were not told about. Got:\n{said}"
+    );
+    assert!(
+        said.contains("pg_drop_replication_slot"),
+        "and hand over the command, not just the diagnosis. Got:\n{said}"
+    );
+    assert!(
+        said.contains(&slot) && said.contains("This run will drain it"),
+        "our OWN slot gets the other message — saying it will be drained, so nobody \
+         drops a slot that was about to recover. Got:\n{said}"
+    );
+}

@@ -629,6 +629,67 @@ impl CdcEngine {
         }
     }
 
+    /// WAL this source is holding that an operator should know about before the run
+    /// starts, not after the disk fills.
+    ///
+    /// PostgreSQL only, and structurally so: a replication slot is the one CDC
+    /// anchor that makes the SERVER retain log on the reader's behalf. MySQL's
+    /// binlog and SQL Server's change tables expire on their own schedule whatever
+    /// rivet does (which is why they can lose data to retention and PG cannot), and
+    /// Mongo's oplog is a capped collection. There is nothing to pin, so nothing to
+    /// warn about — a `None` here is a fact about those engines, not a TODO.
+    ///
+    /// Two questions, and the second is the dangerous one. This export's OWN slot
+    /// being far behind is worth saying (the drain will be long and WAL grows
+    /// meanwhile) but the run does fix it. A slot NOBODY owns is pinned until a
+    /// human acts — measured live at 9 abandoned slots holding 1.5 GiB each.
+    ///
+    /// Best-effort like `row_image`: a catalog the reader cannot query answers with
+    /// nothing. This exists to surface a CONFIGURATION hazard, not to police access,
+    /// and a run that refuses because it could not read `pg_replication_slots` would
+    /// trade a warning for an outage.
+    pub(crate) fn retention_warnings(
+        &self,
+        url: &str,
+        tls: Option<&TlsConfig>,
+        opts: &CdcEngineOpts,
+    ) -> Vec<String> {
+        let Self::Postgres = self else {
+            return Vec::new();
+        };
+        let CdcEngineOpts::Postgres { slot, .. } = opts else {
+            return Vec::new();
+        };
+        let slot = slot.clone();
+        let Ok(mut client) = crate::source::postgres::connect_client(url, tls) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Ok(Some(row)) = client.query_opt(
+            "SELECT active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        ) && let Some(w) = crate::preflight::cdc_health::pg_retained_wal_warning(
+            &slot,
+            row.get(1),
+            row.get(0),
+        ) {
+            out.push(w);
+        }
+        let ours = vec![slot];
+        if let Ok(rows) = client.query(
+            "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+             FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
+            &[&ours],
+        ) {
+            let foreign: Vec<(String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+            if let Some(w) = crate::preflight::cdc_health::pg_foreign_slots_warning(&foreign) {
+                out.push(w);
+            }
+        }
+        out
+    }
+
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -1131,6 +1192,9 @@ pub(crate) fn run_capture(
     // from a swapped column months later. `info` would be functionally silent at
     // the default log level — the same rule the sparse-chunk warning follows.
     if let Some(why) = engine.positional_mapping_warning(&url, tls.as_ref()) {
+        log::warn!("{} cdc: {why}.", engine.label());
+    }
+    for why in engine.retention_warnings(&url, tls.as_ref(), &cap.cdc_cfg.engine) {
         log::warn!("{} cdc: {why}.", engine.label());
     }
     let mut resolver = match CdcSchemaResolver::connect(&url, tls.as_ref()) {
