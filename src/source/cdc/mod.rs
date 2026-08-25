@@ -609,6 +609,26 @@ impl CdcEngine {
         }
     }
 
+    /// Does this engine's CURRENT configuration map change images by position
+    /// rather than by name, and what does that cost?
+    ///
+    /// MySQL is the only engine that can answer yes: its binlog carries column
+    /// names only at `binlog_row_metadata=FULL`, and the default is MINIMAL. The
+    /// other three name their columns unconditionally — PostgreSQL's
+    /// `test_decoding` prints `name[type]:value`, SQL Server's change table IS a
+    /// table, Mongo's events are documents — so there is no positional mapping to
+    /// warn about, and a `None` here is structural rather than unimplemented.
+    pub(crate) fn positional_mapping_warning(
+        &self,
+        url: &str,
+        tls: Option<&TlsConfig>,
+    ) -> Option<String> {
+        match self {
+            Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_metadata(url, tls),
+            Self::Postgres | Self::Mssql | Self::Mongo => None,
+        }
+    }
+
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -1105,6 +1125,13 @@ pub(crate) fn run_capture(
                 )),
             );
         }
+    }
+    // `warn`, at run start, before a single event is read: an operator whose
+    // capture is about to map by position must learn it from the run rather than
+    // from a swapped column months later. `info` would be functionally silent at
+    // the default log level — the same rule the sparse-chunk warning follows.
+    if let Some(why) = engine.positional_mapping_warning(&url, tls.as_ref()) {
+        log::warn!("{} cdc: {why}.", engine.label());
     }
     let mut resolver = match CdcSchemaResolver::connect(&url, tls.as_ref()) {
         Ok(r) => r,

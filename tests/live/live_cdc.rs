@@ -6305,3 +6305,160 @@ fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
          and the routing filter would have dropped it anyway"
     );
 }
+
+/// A guard that returns `binlog_row_metadata` to whatever the stack pinned.
+///
+/// The variable is GLOBAL-only in MySQL 8 — there is no session scope to flip —
+/// so a test that leaves it MINIMAL silently changes every later test's engine.
+struct RowMetadata(String);
+
+impl RowMetadata {
+    fn set(to: &str) -> Self {
+        let mut c = conn();
+        let was: String = c
+            .query_first("SELECT @@GLOBAL.binlog_row_metadata")
+            .expect("read binlog_row_metadata")
+            .expect("a value");
+        c.query_drop(format!("SET GLOBAL binlog_row_metadata={to}"))
+            .expect(
+                "SET GLOBAL binlog_row_metadata needs SYSTEM_VARIABLES_ADMIN — see \
+                 dev/cdc/mysql-grant.sql; without it MySQL's own default configuration is \
+                 the one configuration nothing tests",
+            );
+        Self(was)
+    }
+}
+
+impl Drop for RowMetadata {
+    fn drop(&mut self) {
+        if let Ok(mut c) = mysql::Pool::new(MYSQL_CDC_URL).and_then(|p| p.get_conn()) {
+            let _ = c.query_drop(format!("SET GLOBAL binlog_row_metadata={}", self.0));
+        }
+    }
+}
+
+/// MySQL's DEFAULT `binlog_row_metadata=MINIMAL` maps binlog images POSITIONALLY,
+/// and a same-arity column reorder across the resume boundary silently swaps them.
+///
+/// The stack pins `--binlog-row-metadata=FULL` (docker-compose), which puts column
+/// NAMES into TABLE_MAP — so the sink takes the by-name arm and `continue`s past
+/// the arity guard entirely (`sink.rs`, `if ev.image_names.is_some()`). MySQL's own
+/// default is MINIMAL. Every live MySQL CDC test therefore runs the ONE
+/// configuration a user does not have, and the positional path plus the guard that
+/// protects it are reachable only from the default nobody exercises.
+///
+/// This is the measurement that decides how loud rivet should be about it. Under
+/// MINIMAL: the schema is resolved at OPEN, the events replay from the CHECKPOINT
+/// — so an `ALTER TABLE ... MODIFY b AFTER id` between the two puts a row written
+/// as `(id, a, b)` into columns resolved as `(id, b, a)`.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
+fn mysql_cdc_minimal_row_metadata_is_the_engine_default_and_reorders_silently() {
+    let _serial = cross_process_serial("mysql_cdc_row_metadata");
+    let _meta = RowMetadata::set("MINIMAL");
+    let table = unique_name("rivet_cdc_min");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+
+    // Written under the OLD column order, read back under the new one.
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+
+    let out = rig.out_dir();
+    let said = rig.run_ok_capture();
+
+    // The corruption is REAL and this test does not pretend otherwise: rivet cannot
+    // undo it after the fact, because under MINIMAL the wire carries no names to
+    // detect the reorder from. What it CAN do — and now does — is say so before a
+    // single event is read.
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "a"),
+        ["BBB".to_string()].into_iter().collect(),
+        "MEASURED: positional mapping puts the OLD order's `b` into `a`. If this ever \
+         reads AAA the engine learned to map by name under MINIMAL and the warning \
+         below should go with it"
+    );
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "b"),
+        ["AAA".to_string()].into_iter().collect(),
+        "...and symmetrically the OLD order's `a` into `b`"
+    );
+
+    // The load-bearing half: the operator is TOLD, at warn level, at run start.
+    assert!(
+        said.contains("binlog_row_metadata") && said.contains("POSITION"),
+        "a run that maps by position must say so — an operator who learns it from a \
+         swapped column months later cannot act on it. Got:\n{said}"
+    );
+    assert!(
+        said.contains("binlog_row_metadata = FULL"),
+        "the warning must name the ESCAPE, not just the risk. Got:\n{said}"
+    );
+}
+
+/// ...and under the FULL the stack pins, the same reorder is mapped BY NAME and
+/// comes back correct, with no warning.
+///
+/// Without this half the test above proves only that a swap happens, not that the
+/// setting is what causes it — and the warning would be free to fire on every run,
+/// which is how a warning gets ignored.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
+fn mysql_cdc_full_row_metadata_maps_the_same_reorder_by_name_and_stays_quiet() {
+    let _serial = cross_process_serial("mysql_cdc_row_metadata");
+    let _meta = RowMetadata::set("FULL");
+    let table = unique_name("rivet_cdc_full");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+
+    let out = rig.out_dir();
+    let said = rig.run_ok_capture();
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "a"),
+        ["AAA".to_string()].into_iter().collect(),
+        "under FULL the image carries names, so the reorder maps correctly — this is \
+         the assertion that makes FULL the documented escape rather than folklore"
+    );
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(&out, "b"),
+        ["BBB".to_string()].into_iter().collect()
+    );
+    assert!(
+        !said.contains("binlog_row_metadata"),
+        "a correctly-configured server must stay quiet, or the warning becomes noise \
+         on every run and stops being read. Got:\n{said}"
+    );
+}

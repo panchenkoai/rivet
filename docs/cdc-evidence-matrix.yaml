@@ -167,13 +167,15 @@ shapes:
         session-state class it DOES have (timezone/datestyle/bytea_output) is pinned on the
         reader's own connection and has its own non-default test" }
     mysql:
-      vacuous: "docker-compose.yaml:264 pins --binlog-row-metadata=FULL; MySQL's default is
-        MINIMAL. Under FULL the sink takes the by-NAME arm and SKIPS the arity guard
-        entirely (sink.rs:683). Every live MySQL CDC test uses MYSQL_CDC_URL -> :3307 -> the
-        named path. The nameless arm has one 2-column live test (live_cdc_replica.rs:94,
-        behind the `replica` profile) and one offline test whose fixture is a SINGLE column.
-        Verified by hand 2026-08-23: `SELECT @@binlog_row_metadata` on the stand returns FULL."
-      kind: below-threshold
+      sound: >-
+        closed 2026-08-25. docker-compose pins --binlog-row-metadata=FULL while MySQL's
+        own default is MINIMAL, so every live MySQL CDC test ran the by-NAME arm and the
+        positional arm plus its arity guard were unreachable. Two live tests now flip the
+        GLOBAL under a reset guard (`RowMetadata`, live_cdc.rs): under MINIMAL a same-arity
+        `MODIFY .. AFTER` across the resume boundary SWAPS the columns (measured a='BBB'
+        b='AAA', status success) and the run must warn; under FULL the same reorder maps
+        by name and the run must stay quiet. RED-proven both directions against
+        `row_metadata_warning` (always-None and always-Some).
     mssql:    { na: "change tables carry a fixed column set from the capture instance; there is
         no server knob that changes the image shape the reader sees" }
     mongo:    { gap: "change-stream pre/post-image settings are per-collection and unset by
@@ -206,8 +208,17 @@ shapes:
         against two mutants on different asserts: the guard disabled (back to the
         measured `status: success, rows: 2` over an EMPTY source) and the addressing
         removed (which fails a bystander export reading the same binlog)."
-    mssql:    { absent: "a checkpoint JSON that parses but lacks its engine's key degrades to
-        'no checkpoint' — MySQL uses ok_or_else here, MSSQL does not" }
+    mssql:
+      sound: "closed 2026-08-25 (src/source/mssql/cdc.rs::resume_from_checkpoint). A
+        checkpoint that PARSES but carries no 'lsn' yielded None via `.and_then`, which
+        fill_sql turns into fn_cdc_get_min_lsn — the entire retained change table re-read
+        and re-delivered under a green exit (MEASURED live: ids [1,2,3,4] where [4] was
+        owed). The decision moved out of live-only glue into a pure predicate so a mutant
+        can grade it; `pinned` stays non-strict beside it, deliberately, because absent
+        `pinned` is a supported legacy default whose value is the LOUD direction. RED
+        against the exact prior bug (key absent -> Ok(None)) offline, over 5 malformed
+        shapes, and live by
+        mssql_cdc_checkpoint_without_an_lsn_must_refuse_not_silently_reread_everything."
     mongo:
       sound: "until_current_bound (src/source/mongo/cdc.rs) replaces the `.ok()` that
         swallowed every `hello` failure: a bounded run with no cluster-time ceiling now

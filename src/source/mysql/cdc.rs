@@ -134,6 +134,60 @@ impl MysqlChangeStream {
         }
     }
 
+    /// Pure verdict on `binlog_row_metadata` — the engine setting that decides
+    /// whether the sink maps binlog images by NAME or by POSITION.
+    ///
+    /// A WARNING and not a refusal, unlike its sibling [`Self::row_image_verdict`],
+    /// and the asymmetry is the whole point: `binlog_row_image` defaults to FULL, so
+    /// refusing a non-FULL value refuses a setting somebody CHOSE.
+    /// `binlog_row_metadata` defaults to MINIMAL — refusing it would refuse every
+    /// MySQL nobody has touched.
+    ///
+    /// What MINIMAL costs, MEASURED (2026-08-25, MySQL 8.0.46) rather than argued:
+    /// a table `(id, a, b)` holding `(1, 'AAA', 'BBB')`, then
+    /// `ALTER TABLE .. MODIFY b VARCHAR(9) AFTER id`, then a resume across that
+    /// boundary — the schema is resolved at OPEN (new order) while the event
+    /// replays from the CHECKPOINT (old order), so the parquet came back
+    /// `a = 'BBB', b = 'AAA'`. Swapped, `status: success`, nothing in the log.
+    ///
+    /// The sink's arity guard cannot see it: a reorder does not change arity, and
+    /// under FULL the guard is skipped outright (`image_names.is_some()` ⇒ mapped by
+    /// name, which is reorder-proof). So FULL is not a tuning preference here — it
+    /// is what makes a mid-stream DDL safe.
+    ///
+    /// `None` (a server too old to have the variable — it is 8.0.1+) is NOT
+    /// evidence of a bad setting: MySQL 5.7 has no way to carry names, the sink
+    /// maps positionally there by construction, and a warning naming a variable
+    /// that does not exist is one an operator cannot act on.
+    pub(crate) fn row_metadata_warning(metadata: Option<&str>) -> Option<String> {
+        let m = metadata?;
+        if m.eq_ignore_ascii_case("FULL") {
+            return None;
+        }
+        Some(format!(
+            "the server has binlog_row_metadata = {m} (MySQL's default), so binlog row events \
+             carry no column NAMES and the sink maps values by POSITION. A same-arity DDL that \
+             reorders columns across a resume boundary then silently SWAPS them (measured: a \
+             MODIFY .. AFTER moved 'BBB' into column `a` and 'AAA' into `b`, with status \
+             success), and any arity-changing DDL mid-window aborts the flush instead. Set \
+             `binlog_row_metadata = FULL` (8.0.1+) — rivet then maps by name and both cases \
+             become safe"
+        ))
+    }
+
+    /// Live half of [`Self::row_metadata_warning`]: one query at open, on a
+    /// connection that is about to dump. A connect/permission failure answers
+    /// "nothing to say" — this exists to catch a CONFIGURATION, not to police
+    /// access, the same contract as [`Self::row_image`].
+    pub(crate) fn row_metadata(url: &str, tls: Option<&TlsConfig>) -> Option<String> {
+        use mysql::prelude::Queryable;
+        let mut conn = connect_conn(url, tls).ok()?;
+        let m: Option<String> = conn
+            .query_first("SELECT @@global.binlog_row_metadata")
+            .unwrap_or(None);
+        Self::row_metadata_warning(m.as_deref())
+    }
+
     pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
         use super::super::cdc::RowImage;
         use mysql::prelude::Queryable;
@@ -1021,6 +1075,46 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// The asymmetry with `row_image_verdict` is deliberate and this pins it: a
+    /// non-FULL `binlog_row_image` is REFUSED (somebody chose it, the default is
+    /// FULL); a non-FULL `binlog_row_metadata` is WARNED (the default IS non-FULL,
+    /// so refusing would refuse every untouched MySQL).
+    #[test]
+    fn minimal_row_metadata_warns_and_names_the_escape_while_full_stays_quiet() {
+        assert_eq!(
+            MysqlChangeStream::row_metadata_warning(Some("FULL")),
+            None,
+            "a correctly-configured server must stay quiet, or the warning fires on \
+             every run and stops being read"
+        );
+        assert_eq!(
+            MysqlChangeStream::row_metadata_warning(Some("full")),
+            None,
+            "the server renders this variable uppercase, but a proxy or a older \
+             build need not — compare case-insensitively like row_image_verdict"
+        );
+        assert_eq!(
+            MysqlChangeStream::row_metadata_warning(None),
+            None,
+            "a server too old to HAVE the variable (pre-8.0.1) maps positionally by \
+             construction; naming a variable that does not exist is a warning nobody \
+             can act on"
+        );
+        for m in ["MINIMAL", "minimal", "SOMETHING_NEW"] {
+            let w = MysqlChangeStream::row_metadata_warning(Some(m))
+                .unwrap_or_else(|| panic!("{m} is not FULL — the sink maps by POSITION"));
+            assert!(
+                w.contains("binlog_row_metadata = FULL"),
+                "the warning must name the ESCAPE, not just the risk: {w}"
+            );
+            assert!(
+                w.contains("POSITION") && w.contains("SWAP"),
+                "and must say what it costs — measured, not hedged: {w}"
+            );
+        }
+    }
+
     /// The MySQL routing guard's decision surface.
     ///
     /// `None` (the catalog has no row) must stay ROUTABLE, deliberately: the schema
