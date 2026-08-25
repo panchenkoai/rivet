@@ -7020,3 +7020,68 @@ fn roast_mysql_cdc_ambiguity_refusal_matches_the_shared_sentence() {
     );
     assert!(said.contains("Qualify it"), "and hand over the fix: {said}");
 }
+
+/// A TRUNCATE in the SAME transaction as a row change must still refuse.
+///
+/// The deferred-refusal fix shipped hours ago carried `if !yielded_any &&
+/// tx.is_empty()`, and the second clause wedged the capture permanently. Events sit
+/// in `tx` until their COMMIT line moves them to `pending`, and the `break` at the
+/// truncate means that COMMIT is never reached — so `BEGIN; INSERT; TRUNCATE;
+/// COMMIT` deferred the refusal with `pending` empty, the drain ended clean, `fill`
+/// was never called again, and the refusal never fired.
+///
+/// MEASURED before the fix: `status: success, rows: 0`, exit 0, `_SUCCESS` written,
+/// zero warnings — and no recovery. The slot never advances, so that transaction
+/// heads EVERY later window: two rows inserted afterwards stayed invisible across
+/// three more runs, all green, with WAL accumulating.
+///
+/// The sibling test (`..._delivers_the_rows_it_already_read`) covers the other
+/// direction — a truncate AFTER committed work must deliver that work first. Both
+/// arms of one condition, which is why they are two tests.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn roast_pg_cdc_truncate_inside_a_transaction_with_rows_still_refuses() {
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_wedge").to_lowercase();
+    let slot = unique_name("rivet_wedge_slot").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl}(id int PRIMARY KEY, v text)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // The row change and the truncate in ONE transaction — the shape that left `tx`
+    // non-empty and `pending` empty at the break.
+    c.batch_execute(&format!(
+        "BEGIN; INSERT INTO {tbl} VALUES (1,'a'); TRUNCATE {tbl}; COMMIT"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot);
+    let said = rig.run_expect_fail();
+    assert!(
+        said.to_lowercase().contains("truncate"),
+        "the refusal must fire even though the truncate shares its transaction with \
+         a row change — deferring it here strands it forever, because the COMMIT \
+         that would flush the buffer is never reached. Got:\n{said}"
+    );
+
+    // ...and the capture is not wedged: changes made afterwards are still reachable
+    // once the operator acts on the refusal.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (2,'after')"), &[])
+        .unwrap();
+    let again = Rig::pg_cdc(&format!("public.{tbl}"), &slot);
+    let said2 = again.run_expect_fail();
+    assert!(
+        said2.to_lowercase().contains("truncate"),
+        "the truncate still heads the window, so the refusal repeats — what must NOT \
+         happen is a green run reporting zero rows over it. Got:\n{said2}"
+    );
+}

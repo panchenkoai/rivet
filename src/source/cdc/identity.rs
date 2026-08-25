@@ -47,6 +47,33 @@ use crate::error::Result;
 pub(crate) struct CatalogMatch {
     pub schema: String,
     pub table: String,
+    /// Can this relation actually CARRY a change event?
+    ///
+    /// The engine's query decides, because only it knows its own catalog: a
+    /// PostgreSQL view, matview, foreign table, UNLOGGED or TEMP relation writes no
+    /// logical-decoding record; a MySQL VIEW never appears in a binlog TABLE_MAP.
+    ///
+    /// This is the difference between an AMBIGUITY and a NOTE, and getting it wrong
+    /// is an outage either way. MEASURED: counting non-capturable twins as candidates
+    /// made an UNLOGGED table in another schema hard-fail a healthy config — and a
+    /// STRANGER's `CREATE TEMP TABLE` of the same name did too, so capture flapped
+    /// green/red on a config nobody had touched. Counting them as nothing lost the
+    /// truthful message in the other direction: a VIEW sharing the name is very often
+    /// what the operator MEANT, and silence sends them hunting.
+    ///
+    /// So: two or more CAPTURABLE relations is a refusal; a non-capturable twin rides
+    /// the message as context.
+    pub capturable: bool,
+    /// What the catalog calls it — `BASE TABLE`, `VIEW`, a PostgreSQL `relkind`.
+    /// Carried because the ALTERNATIVE is a second catalog read under a different
+    /// predicate, and two reads of one fact can name two different relations:
+    /// MEASURED on MySQL, where the identity query scanned every schema for a BASE
+    /// TABLE while the kind query pinned `TABLE_SCHEMA = DATABASE()`, so a VIEW
+    /// `rivet.vv` beside a table `other_db.vv` had resolution name one and
+    /// classification refuse the other. Reporting the kind here also makes the
+    /// ambiguity message TRUE — "could mean the view or the table" is what the
+    /// operator needs, not a silent pick of whichever the filter left standing.
+    pub kind: String,
 }
 
 /// A configured `table:` resolved to exactly one relation.
@@ -58,6 +85,11 @@ pub(crate) struct CapturedTable {
     /// The catalog's own spelling — what wire events will carry.
     pub schema: String,
     pub table: String,
+    /// Set when the configured name ALSO matched relations that cannot carry an
+    /// event. Resolution succeeded — only one candidate was capturable — but the
+    /// operator may well have meant the view, and silence sends them hunting. The
+    /// caller logs this at `warn`.
+    pub note: Option<String>,
 }
 
 /// Resolve one configured `table:` against what the catalog reported for it.
@@ -91,22 +123,54 @@ pub(crate) fn resolve_captured_table(
         }
     }
 
+    // Only relations that can CARRY an event compete for the identity. A twin that
+    // emits nothing cannot put its rows in this export, so it is context, not a
+    // collision.
+    let (live, inert): (Vec<&CatalogMatch>, Vec<&CatalogMatch>) =
+        distinct.iter().partition(|m| m.capturable);
+    let note = if inert.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (the name also matches {}, which cannot carry a change event — if that \
+             is the one you meant, capture is not possible for it)",
+            inert
+                .iter()
+                .map(|m| format!("{}.{} [{}]", m.schema, m.table, m.kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let distinct: Vec<&CatalogMatch> = if live.is_empty() { distinct } else { live };
+
     match distinct.as_slice() {
         [] => anyhow::bail!(
             "cdc: `{configured}` matches no relation the source reports. Capture would \
              open a stream and route nothing — every event dropped by the routing \
              filter, silently. Check the name, and qualify it (`schema.table`) if it \
-             lives outside the connection's default schema."
+             lives outside the connection's default schema.{note}"
         ),
         [one] => Ok(CapturedTable {
             configured: configured.to_string(),
             schema: one.schema.clone(),
             table: one.table.clone(),
+            note: (!note.is_empty()).then(|| {
+                format!(
+                    "`{configured}` resolves to {}.{}, but{note}",
+                    one.schema, one.table
+                )
+            }),
         }),
         many => {
             let listing = many
                 .iter()
-                .map(|m| format!("{}.{}", m.schema, m.table))
+                .map(|m| {
+                    if m.kind.is_empty() {
+                        format!("{}.{}", m.schema, m.table)
+                    } else {
+                        format!("{}.{} [{}]", m.schema, m.table, m.kind)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
@@ -117,7 +181,7 @@ pub(crate) fn resolve_captured_table(
                  written under THIS table's names when the arity matches, or as an \
                  all-NULL row when it does not. Neither is recoverable from the output. \
                  Qualify it (`schema.{configured}`, quoted as the catalog spells it) to \
-                 capture the one you mean.",
+                 capture the one you mean.{note}",
                 many.len()
             )
         }
@@ -132,7 +196,65 @@ mod tests {
         CatalogMatch {
             schema: schema.into(),
             table: table.into(),
+            kind: "BASE TABLE".into(),
+            capturable: true,
         }
+    }
+
+    fn k(schema: &str, table: &str, kind: &str) -> CatalogMatch {
+        CatalogMatch {
+            schema: schema.into(),
+            table: table.into(),
+            kind: kind.into(),
+            capturable: kind == "BASE TABLE",
+        }
+    }
+
+    /// A twin that cannot CARRY an event is context, not a collision — and both
+    /// directions of that are outages if you get them wrong.
+    ///
+    /// Counting them as candidates made an UNLOGGED table in another schema hard-fail
+    /// a healthy config, and a STRANGER's `CREATE TEMP TABLE` of the same name did
+    /// too — capture flapping green/red on a config nobody had touched. Counting them
+    /// as nothing loses the message: a VIEW sharing the name is very often what the
+    /// operator meant, and silence sends them hunting.
+    #[test]
+    fn a_twin_that_cannot_carry_an_event_is_a_note_not_an_ambiguity() {
+        let got = resolve_captured_table(
+            "vv",
+            &[k("rivet", "vv", "VIEW"), k("other_db", "vv", "BASE TABLE")],
+        )
+        .expect("only ONE candidate can carry an event, so there is no ambiguity");
+        assert_eq!(
+            (got.schema.as_str(), got.table.as_str()),
+            ("other_db", "vv"),
+            "the capturable relation wins — the view emits nothing and cannot put \
+             rows in this export"
+        );
+        let note = got.note.expect("the view must be reported, not swallowed");
+        assert!(
+            note.contains("rivet.vv [VIEW]") && note.contains("cannot carry a change event"),
+            "name it and say why it was skipped, because it may be what they meant: \
+             {note}"
+        );
+
+        // ...and two CAPTURABLE relations are still a refusal.
+        let err = resolve_captured_table(
+            "vv",
+            &[k("a", "vv", "BASE TABLE"), k("b", "vv", "BASE TABLE")],
+        )
+        .expect_err("two relations that can each carry events IS an ambiguity");
+        assert!(err.to_string().contains("could mean"));
+    }
+
+    /// No capturable candidate at all: the name matches only relations that emit
+    /// nothing. Resolution must not invent one — the engine's own classifier owns
+    /// that refusal and says what to do about a view.
+    #[test]
+    fn a_name_matching_only_inert_relations_still_resolves_for_the_classifier() {
+        let got = resolve_captured_table("vv", &[k("rivet", "vv", "VIEW")])
+            .expect("one candidate, inert — classification refuses it, not resolution");
+        assert_eq!((got.schema.as_str(), got.table.as_str()), ("rivet", "vv"));
     }
 
     /// The ordinary case, and the one that must not regress: one relation resolves

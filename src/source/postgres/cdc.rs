@@ -435,10 +435,19 @@ impl PgChangeStream {
             // probe resolved.
             let matches: Vec<crate::source::cdc::identity::CatalogMatch> = client
                 .query(
-                    "SELECT n.nspname::text, c.relname::text \
+                    // Every relkind logical decoding can name, VIEWS included: a view
+                    // sharing the name is a CANDIDATE for the ambiguity message, not
+                    // something to filter out. Hiding it makes resolution pick the
+                    // table silently while classification refuses the view — two
+                    // reads of one fact naming two relations (measured on MySQL).
+                    "SELECT n.nspname::text, c.relname::text, c.relkind::text, \
+                            (c.relkind IN ('r','p','m') AND c.relpersistence = 'p') \
+                              AS capturable \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE c.relkind IN ('r','p','m') \
+                     WHERE c.relkind IN ('r','p','m','v','f') \
                        AND n.nspname NOT IN ('pg_catalog','information_schema') \
+                       AND n.nspname NOT LIKE 'pg_temp%' \
+                       AND n.nspname NOT LIKE 'pg_toast%' \
                        AND (c.oid = to_regclass($1) \
                             OR c.relname = $1 \
                             OR n.nspname || '.' || c.relname = $1 \
@@ -452,6 +461,18 @@ impl PgChangeStream {
                 .map(|r| crate::source::cdc::identity::CatalogMatch {
                     schema: r.get(0),
                     table: r.get(1),
+                    kind: r.get::<_, String>(2),
+                    // Which relkinds can actually CARRY an event, measured rather
+                    // than assumed: `'m'` is capturable because `test_decoding` DOES
+                    // decode a materialized view — `CREATE MATERIALIZED VIEW … WITH
+                    // DATA` renders as ordinary INSERTs, which is how a same-named
+                    // matview injected a fabricated row into an export earlier today.
+                    // A plain view (`'v'`) and a foreign table (`'f'`) emit nothing,
+                    // and neither does an UNLOGGED relation, so those are context
+                    // rather than competing identities. TEMP schemas are excluded by
+                    // the query itself: a STRANGER's `CREATE TEMP TABLE` of the same
+                    // name made capture flap green/red on a config nobody touched.
+                    capturable: r.get::<_, bool>(3),
                 })
                 .collect();
             if !matches.is_empty() {
@@ -459,7 +480,14 @@ impl PgChangeStream {
                 // below for now — it reports the missing relation today and tests
                 // assert its message; unifying that report is a later pass, said
                 // here rather than silently deferred.
-                crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?;
+                if let Some(note) =
+                    crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?.note
+                {
+                    // Resolution succeeded, but the name also matched something that
+                    // emits nothing. Very often that inert twin is what the operator
+                    // meant, and silence sends them hunting.
+                    log::warn!("pg cdc: {note}");
+                }
             }
             let Some(row) = client
                 .query_opt(
@@ -747,7 +775,24 @@ impl PgChangeStream {
                 // checkpoints and acks that span, and `fill` raises on the next pass
                 // with the slot sitting exactly at the last commit before the truncate.
                 let why = truncate_refusal_message(&schema, &table);
-                if !yielded_any && tx.is_empty() {
+                // `yielded_any` ALONE. The first cut also required `tx.is_empty()`,
+                // and that wedged the capture permanently: events sit in `tx` until
+                // their COMMIT line moves them to `pending`, and the `break` below
+                // means that COMMIT is never reached — so `BEGIN; INSERT; TRUNCATE;
+                // COMMIT` deferred the refusal with `pending` empty, the drain ended
+                // clean, `fill` was never called again, and the refusal never fired.
+                //
+                // MEASURED: `status: success, rows: 0`, exit 0, `_SUCCESS` written,
+                // zero warnings — and it does not recover. The slot never advances,
+                // so that transaction heads EVERY later window: two rows inserted
+                // afterwards were invisible across three more runs, all green, with
+                // WAL accumulating.
+                //
+                // Nothing is at stake in the in-flight `tx`: it was never handed to
+                // the sink, so bailing discards only uncommitted events the next run
+                // re-reads. What must be protected is what was already YIELDED —
+                // exactly what `yielded_any` measures.
+                if !yielded_any {
                     anyhow::bail!(why);
                 }
                 self.pending_truncate_refusal = Some(why);

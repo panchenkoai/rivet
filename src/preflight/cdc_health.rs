@@ -483,6 +483,12 @@ fn mysql_checks(
                     ) {
                         Ok(Some((file, at))) => MysqlCkpt::Loaded { file, pos: at },
                         Ok(None) => MysqlCkpt::NotYetWritten,
+                        // The malformed-file FAIL is the whole answer. Falling
+                        // through to `mysql_ckpt_verdict` printed a SECOND check under
+                        // the same name saying "no `cdc.checkpoint` configured" with a
+                        // hint to set one — factually false (a path IS configured) and
+                        // a no-op remedy the operator has already applied. Two
+                        // contradictory verdicts on one file is worse than either.
                         Err(why) => {
                             checks.push(check(
                                 format!("CDC checkpoint (export '{}')", e.name),
@@ -494,7 +500,7 @@ fn mysql_checks(
                                         .into(),
                                 ),
                             ));
-                            MysqlCkpt::NoPathConfigured
+                            continue;
                         }
                     }
                 }
