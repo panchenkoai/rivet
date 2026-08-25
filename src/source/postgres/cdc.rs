@@ -455,21 +455,47 @@ impl PgChangeStream {
             // present captured 2 rows — one from each schema — into a single part, with
             // nothing in the output distinguishing them.
             //
-            // A warning, not a refusal: capturing one table under a bare name is the
-            // common and correct case, and `to_regclass` resolves it through search_path
-            // exactly as the schema probe does. What the operator cannot see is that a
-            // SECOND relation of that name will ride along.
+            // A REFUSAL when a second relation shares the name, and the escalation from
+            // the warning this shipped as this morning is measured, not cautious.
+            // "Silently interleaved" understated the harm — the foreign rows are
+            // RE-LABELLED, because the sink matches images by column NAME and falls
+            // back to POSITION when no name matches:
+            //
+            //   same arity  — `public.bhx(id, val)` + `bh2.bhx(zzz, qqq)`, `table: bhx`:
+            //                 `INSERT INTO bh2.bhx VALUES (2,'FROM_OTHER_SCHEMA')` was
+            //                 written as `id=2, val='FROM_OTHER_SCHEMA'`. Another
+            //                 table's data under this table's names.
+            //   other arity — a row with every data column NULL, `status: success`.
+            //
+            // Neither is recoverable at the destination: nothing in the output says
+            // which row came from where, so no later capture repairs it. This repo's
+            // rule for a degrade-to-null cell path and a wrong-column write is to FAIL,
+            // and a warning at run start is one an unattended scheduler never reads.
+            //
+            // `relkind` includes `'m'`: `test_decoding` decodes MATERIALIZED VIEWS
+            // (`CREATE … WITH DATA` renders as ordinary INSERTs) and the router matches
+            // them on a bare name like any other relation, so a filter of `('r','p')`
+            // left exactly that case invisible.
+            //
+            // ONE matching relation stays silent — the refusal is scoped to the
+            // ambiguity, not to the bare name, which is the ordinary and correct case.
             if !cfg.contains('.') {
                 let others: Vec<String> = client
                     .query(
-                        "SELECT n.nspname || '.' || c.relname                          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace                          WHERE c.relname = $1 AND c.relkind IN ('r','p')                            AND n.nspname NOT IN ('pg_catalog','information_schema')",
+                        "SELECT n.nspname || '.' || c.relname                          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace                          WHERE c.relname = $1 AND c.relkind IN ('r','p','m')                            AND n.nspname NOT IN ('pg_catalog','information_schema')",
                         &[&cfg.as_str()],
                     )
                     .map(|rows| rows.iter().map(|r| r.get::<_, String>(0)).collect())
                     .unwrap_or_default();
                 if others.len() > 1 {
-                    log::warn!(
-                        "pg cdc: `{cfg}` is unqualified and {} relations share that name                          ({}). Routing matches a bare name in ANY schema, so changes from                          ALL of them land in this one export, interleaved and                          indistinguishable in the output. Qualify it (`schema.{cfg}`) to                          capture the one you mean.",
+                    anyhow::bail!(
+                        "pg cdc: `{cfg}` is unqualified and {} relations share that name \
+                         ({}). Routing matches a bare name in ANY schema, so all of them \
+                         land in this one export — and because images are matched by \
+                         column NAME, a foreign row is written under THIS table's names \
+                         when the arity matches, or as an all-NULL row when it does not. \
+                         Neither is recoverable from the output. Qualify it \
+                         (`schema.{cfg}`) to capture the one you mean.",
                         others.len(),
                         others.join(", ")
                     );

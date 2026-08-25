@@ -120,7 +120,7 @@ shapes:
         mutant left it green. read_cdc_changes resolves via declared_parquet_parts — the union over the immutable manifest-<run_id>.json
         copies — so every caller of cdc_id_ops/read_cdc_changes reads what the run
         DECLARED. Proven to bite before it was wired in:
-        the_declared_parts_oracle_reads_short_of_the_glob_when_a_manifest_under_declares
+        the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory
         stages two durable parts with one named by no manifest; the glob reads 6, the
         declared reader 3. Whole CDC live suite re-run after the switch: 157/157."
     mysql:
@@ -228,7 +228,7 @@ shapes:
     postgres:
       sound: "TRUNCATE — the one that mattered — now bails: truncate_target +
         truncate_is_ours + truncate_refusal_message (src/source/postgres/cdc.rs),
-        graded offline by a_truncate_is_recognised_and_refused_only_for_the_captured_tables
+        graded offline by a_truncate_is_recognised_across_a_relation_list_and_refused_only_for_ours
         and live by roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging.
         RED against two mutants on different asserts: the guard removed (back to the
         measured `status: success, rows: 2` over an EMPTY source) and the refusal
@@ -239,7 +239,7 @@ shapes:
       sound: "the Xid-less group is closed by is_commit_statement (COMMIT / XA COMMIT,
         #ebc9d87), and the OTHER silent QUERY-event drop — TRUNCATE — now bails:
         truncate_target + truncate_refusal_message (src/source/mysql/cdc.rs), graded by
-        a_mysql_truncate_statement_resolves_the_table_it_names offline and
+        a_mysql_truncate_statement_resolves_the_table_it_names (src/source/mysql/cdc.rs) offline and
         roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging live. RED
         against two mutants on different asserts: the guard disabled (back to the
         measured `status: success, rows: 2` over an EMPTY source) and the addressing

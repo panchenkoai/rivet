@@ -153,6 +153,47 @@ fn every_shape_names_the_mutant_that_would_expose_it() {
 fn a_sound_cell_cites_where_the_evidence_lives() {
     let engines = cdc_engines();
     let m = matrix();
+    // Every `fn` name in the tree, so a cited grader is RESOLVED and not merely
+    // shaped like a test name. Three cells cited tests that exist nowhere — one of
+    // them over MySQL's TRUNCATE parser, which had zero offline coverage while the
+    // cell called it graded (PROVEN: stubbing `truncate_target` to `return None`
+    // left the whole lib suite green at 2616 passed). A `sound` cell resting on a
+    // name is the defect this file exists to refuse, and checking only for a `.rs`
+    // substring could not see it.
+    let mut defined: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![repo_root().join("src"), repo_root().join("tests")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs")
+                && let Ok(src) = std::fs::read_to_string(&p)
+            {
+                let mut rest = src.as_str();
+                while let Some(at) = rest.find("fn ") {
+                    rest = &rest[at + 3..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if name.len() > 3 {
+                        defined.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        defined.len() > 500,
+        "collected only {} fn names from src/ and tests/ — the sweep is broken and \
+         would resolve nothing while looking green",
+        defined.len()
+    );
+
     for s in shapes(&m) {
         for e in &engines {
             let (state, note) = cell(s, e);
@@ -167,6 +208,46 @@ fn a_sound_cell_cites_where_the_evidence_lives() {
                  SPECIFIC test fail; without the test named, nobody can re-run it.",
                 shape_id(s)
             );
+            // Any snake_case token long enough to be a test name must RESOLVE.
+            for word in note.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                // Long AND multi-part: this repo's test names are sentences
+                // (`a_mysql_truncate_statement_resolves_the_table_it_names`), while
+                // an API name quoted as prose (`full_document`, `image_names`) is
+                // short. Tuned so the check flags claims about TESTS and not every
+                // identifier a note happens to mention.
+                let looks_like_a_fn = word.len() > 20
+                    && word.matches('_').count() >= 3
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && !word.ends_with("_rs");
+                // A file STEM is not a function: `live_cdc_mongo.rs` splits into
+                // `live_cdc_mongo` + `rs`, and citing the file is exactly what the
+                // `.rs` requirement above asks for.
+                // A method or an API name the note quotes as prose (a driver call,
+                // a config key) is not a claim about a test in THIS tree.
+                // Not a test name: an API call in prose, a backticked identifier, or
+                // a FAULT HOOK — `cdc_after_flush_before_ack` is the string a test
+                // passes to RIVET_TEST_PANIC_AT, and it is defined in the product as
+                // a literal rather than as a `fn`.
+                let is_an_api_name = note.contains(&format!("{word}("))
+                    || note.contains(&format!("`{word}`"))
+                    || word.starts_with("cdc_after")
+                    || word.starts_with("cdc_before");
+                let is_a_file_stem = note.contains(&format!("{word}.rs"))
+                    || note.contains(&format!("{word}.yaml"))
+                    || note.contains(&format!("{word}.toml"));
+                if !looks_like_a_fn || is_a_file_stem || is_an_api_name || defined.contains(word) {
+                    continue;
+                }
+                panic!(
+                    "shape `{}` / engine `{e}` cites `{word}`, which is defined NOWHERE in \
+                     src/ or tests/. Either the test was never written — in which case the \
+                     cell is not sound — or it was renamed and the ledger now points at \
+                     nothing. Both are the same failure: a claim that cannot be re-run.",
+                    shape_id(s)
+                );
+            }
         }
     }
 }

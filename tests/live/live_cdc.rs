@@ -4220,24 +4220,34 @@ fn roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     );
 }
 
-/// An unqualified `table:` captures EVERY schema's relation of that name.
+/// An unqualified `table:` captures EVERY schema's relation of that name, and the
+/// foreign rows are RE-LABELLED — so it is refused, not warned about.
 ///
-/// `sink::table_matches` matches a bare config name against any schema — it has to,
-/// because a MongoDB collection has no schema qualifier and may itself contain dots.
-/// On PostgreSQL that means `table: orders` silently captures `public.orders` AND
+/// `sink::table_matches` matches a bare config name against any schema. It has to:
+/// a MongoDB collection has no schema qualifier and may itself contain dots. On
+/// PostgreSQL that means `table: orders` routes `public.orders` AND
 /// `archive.orders` into one export.
 ///
-/// MEASURED before the warning (2026-08-25): `table: bare` with `public.bare` and
-/// `s2.bare` both present captured 2 rows — one from each schema — into a single
-/// part, with nothing in the output distinguishing them. Counts reconcile against
-/// neither table alone, and a reader of the parquet cannot tell which row came from
-/// where.
+/// This shipped as a WARNING on 2026-08-25 with the harm described as "interleaved
+/// and indistinguishable". A bughunt the same day measured it and the description
+/// was too kind — the sink matches images by column NAME and falls back to POSITION
+/// when no name matches, so:
 ///
-/// A WARNING, not a refusal: capturing one table under a bare name is the common and
-/// correct case. What the operator cannot see is the second relation riding along.
+///   same arity  — `public.bhx(id, val)` + `bh2.bhx(zzz, qqq)`:
+///                 `INSERT INTO bh2.bhx VALUES (2,'FROM_OTHER_SCHEMA')` came back as
+///                 `id=2, val='FROM_OTHER_SCHEMA'` — another table's data under this
+///                 table's names.
+///   other arity — a row with every data column NULL, `status: success`.
+///
+/// Neither is recoverable from the output, which is this repo's line between a
+/// warning and a refusal. A warning at run start is also one an unattended
+/// scheduler never reads.
+///
+/// The relkind filter includes matviews (`'m'`): `test_decoding` decodes them, so a
+/// same-named matview produced the interleave with the guard seeing nothing.
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
-fn roast_pg_cdc_warns_when_a_bare_table_name_matches_two_schemas() {
+fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
     let cdc_db = CdcDb::new("cdc_bare");
     let tbl = unique_name("rivet_cdc_bare").to_lowercase();
     let slot = unique_name("rivet_bare_slot").to_lowercase();
@@ -4245,7 +4255,7 @@ fn roast_pg_cdc_warns_when_a_bare_table_name_matches_two_schemas() {
     c.batch_execute(&format!(
         "CREATE TABLE {tbl} (id int PRIMARY KEY, v text); \
          CREATE SCHEMA other; \
-         CREATE TABLE other.{tbl} (id int PRIMARY KEY, v text)"
+         CREATE TABLE other.{tbl} (zzz int PRIMARY KEY, qqq text)"
     ))
     .unwrap();
     c.execute(
@@ -4254,34 +4264,50 @@ fn roast_pg_cdc_warns_when_a_bare_table_name_matches_two_schemas() {
     )
     .unwrap();
     c.batch_execute(&format!(
-        "INSERT INTO {tbl} VALUES (1,'public'); INSERT INTO other.{tbl} VALUES (2,'other')"
+        "INSERT INTO {tbl} VALUES (1,'mine'); \
+         INSERT INTO other.{tbl} VALUES (2,'FROM_OTHER_SCHEMA')"
     ))
     .unwrap();
 
     let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
-    let said = rig.run_ok_capture();
+    let said = rig.run_expect_fail();
     assert!(
         said.contains("unqualified") && said.contains(&format!("other.{tbl}")),
-        "the run must WARN and name the other relation — the operator cannot see it \
-         in the output otherwise. Got:\n{said}"
+        "the refusal must name the other relation — an operator cannot qualify what \
+         they were not told about. Got:\n{said}"
+    );
+    assert!(
+        said.contains("Qualify it"),
+        "and name the fix, not only the fault: {said}"
     );
 
-    let rows: usize = rig.read_declared_parts().iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        rows, 2,
-        "both schemas' rows land in ONE export — that is the behaviour being warned \
-         about, and if it ever changes the warning should change with it"
-    );
-
-    // Not too WIDE: one matching relation is the ordinary case and must stay silent,
-    // or the warning becomes noise and gets ignored.
+    // A MATERIALIZED VIEW of the same name is the case the first cut missed: the
+    // relkind filter was `('r','p')`, and `test_decoding` decodes matviews.
     c.batch_execute("DROP SCHEMA other CASCADE").unwrap();
+    c.batch_execute(&format!(
+        "CREATE SCHEMA mv; CREATE TABLE mv.src(id int, v text); \
+         INSERT INTO mv.src VALUES (9,'from_a_matview'); \
+         CREATE MATERIALIZED VIEW mv.{tbl} AS SELECT id, v FROM mv.src"
+    ))
+    .unwrap();
+    let mv_rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    let mv_said = mv_rig.run_expect_fail();
+    assert!(
+        mv_said.contains(&format!("mv.{tbl}")),
+        "a matview shares the name and IS decoded, so it must be named too — a \
+         relkind filter of ('r','p') left exactly this invisible. Got:\n{mv_said}"
+    );
+
+    // Not too WIDE: one matching relation is the ordinary case and must still run.
+    c.batch_execute("DROP SCHEMA mv CASCADE").unwrap();
     c.execute(&format!("INSERT INTO {tbl} VALUES (3,'only')"), &[])
         .unwrap();
     let quiet = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    let out = quiet.run_ok_capture();
     assert!(
-        !quiet.run_ok_capture().contains("unqualified"),
-        "a bare name with ONE matching relation must not warn"
+        !out.contains("unqualified"),
+        "a bare name over ONE relation is the common, correct case — refusing it \
+         would break every working single-schema config. Got:\n{out}"
     );
 }
 

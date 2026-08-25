@@ -912,21 +912,61 @@ pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, Stri
     // refusal and rows quietly left behind.
     let stripped = strip_sql_comments(sql);
     let t = stripped.trim().trim_end_matches(';').trim();
-    let mut w = t.split_whitespace();
-    if !w.next()?.eq_ignore_ascii_case("truncate") {
+    // Tokenised with BACKTICKS in mind, not by whitespace. A quoted MySQL identifier
+    // may contain a space or a dot — `` `odd name` `` and `` `odd.name` `` are both
+    // legal and both execute — and a whitespace split saw a trailing token and
+    // returned None, so the truncate was not recognised and the rows left the source
+    // with nothing to carry them. Found by writing the unit test the evidence matrix
+    // already claimed existed; a `.split_once('.')` over the raw text had the same
+    // shape, cutting `` `odd.name` `` into a database and a table that do not exist.
+    let rest = {
+        let mut r = t;
+        fn kw<'s>(r: &'s str, w: &str) -> Option<&'s str> {
+            if r.len() >= w.len() && r[..w.len()].eq_ignore_ascii_case(w) {
+                let after = &r[w.len()..];
+                if after.is_empty() || after.starts_with(char::is_whitespace) {
+                    return Some(after.trim_start());
+                }
+            }
+            None
+        }
+        r = kw(r, "truncate")?;
+        // The TABLE keyword is optional; a table genuinely NAMED `table` would be
+        // backticked, so an unquoted `table` here is always the keyword.
+        if let Some(after) = kw(r, "table") {
+            r = after;
+        }
+        r.trim()
+    };
+
+    // One identifier, optionally qualified. Split on a dot only OUTSIDE backticks.
+    let b = rest.as_bytes();
+    let (mut i, mut in_tick, mut dot) = (0usize, false, None);
+    while i < b.len() {
+        match b[i] {
+            b'`' => {
+                if in_tick && b.get(i + 1) == Some(&b'`') {
+                    i += 2; // doubled backtick — an escaped tick inside the name
+                    continue;
+                }
+                in_tick = !in_tick;
+            }
+            b'.' if !in_tick && dot.is_none() => dot = Some(i),
+            // Anything after the identifier — a second name, a WHERE, a stray word —
+            // is a shape this reader does not claim to understand. Guessing here
+            // refuses the wrong table.
+            c if !in_tick && (c.is_ascii_whitespace() || c == b',') => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_tick || rest.is_empty() {
         return None;
     }
-    let mut name = w.next()?;
-    if name.eq_ignore_ascii_case("table") {
-        name = w.next()?;
-    }
-    if w.next().is_some() {
-        return None; // trailing tokens — not a shape this reader claims to understand
-    }
-    let unq = |s: &str| s.trim_matches('`').to_string();
-    match name.split_once('.') {
-        Some((db, tbl)) => Some((unq(db), unq(tbl))),
-        None => Some((event_db.to_string(), unq(name))),
+    let unq = |s: &str| s.trim_matches('`').replace("``", "`");
+    match dot {
+        Some(at) => Some((unq(&rest[..at]), unq(&rest[at + 1..]))),
+        None => Some((event_db.to_string(), unq(rest))),
     }
 }
 
@@ -1075,6 +1115,106 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// MySQL's TRUNCATE parser had ZERO offline coverage while the evidence matrix
+    /// claimed it was graded by `a_mysql_truncate_statement_resolves_the_table_it_names`
+    /// — a test that exists nowhere in the tree. PROVEN by stubbing this function to
+    /// `return None` (the exact pre-fix silent divergence) and watching the whole lib
+    /// suite stay green at 2616 passed. A cited grader nobody resolved against the
+    /// source is a `sound` cell resting on a name.
+    ///
+    /// The shapes that matter are the ones a real server emits: a bare name resolved
+    /// against the EVENT's database, a db-qualified one, backticks, and the comment
+    /// forms every ORM appends.
+    #[test]
+    fn a_mysql_truncate_statement_resolves_the_table_it_names() {
+        let t = |sql: &str| truncate_target(sql, "shop");
+
+        // Bare name ⇒ the event's own database, which is the only place it can come
+        // from: a binlog QUERY event carries the schema separately from the SQL.
+        assert_eq!(t("TRUNCATE orders"), Some(("shop".into(), "orders".into())));
+        assert_eq!(
+            t("TRUNCATE TABLE orders"),
+            Some(("shop".into(), "orders".into())),
+            "the optional TABLE keyword is not part of the name"
+        );
+        assert_eq!(
+            t("truncate table Orders;"),
+            Some(("shop".into(), "Orders".into())),
+            "the keyword is case-insensitive and the trailing semicolon is not a token; \
+             the NAME's case is preserved because MySQL table names can be \
+             case-sensitive depending on lower_case_table_names"
+        );
+
+        // Qualified and quoted — a db-qualified truncate names another schema, and
+        // routing must see that schema, not the event's.
+        assert_eq!(
+            t("TRUNCATE archive.orders"),
+            Some(("archive".into(), "orders".into())),
+            "an explicit database must win over the event's — routing it to `shop` \
+             would refuse the wrong export, or none"
+        );
+        assert_eq!(
+            t("TRUNCATE TABLE `archive`.`odd name`"),
+            Some(("archive".into(), "odd name".into())),
+            "backticks are quoting, not part of the identifier"
+        );
+
+        // Comments: measured NOT to reach this reader on 8.0, handled anyway because
+        // the failure mode is a silent divergence rather than an error.
+        assert_eq!(
+            t("TRUNCATE TABLE orders /* xid=42 */"),
+            Some(("shop".into(), "orders".into()))
+        );
+        assert_eq!(
+            t("/* app='api' */ TRUNCATE TABLE orders"),
+            Some(("shop".into(), "orders".into()))
+        );
+
+        // NOT a truncate, and the boundary matters: claiming one of these would fail
+        // an export over a statement that removes nothing.
+        for not_one in [
+            "DELETE FROM orders",
+            "DROP TABLE orders",
+            "TRUNCATE",
+            "TRUNCATE TABLE",
+            "SELECT 'TRUNCATE orders'",
+            "CREATE TABLE truncate_log(id int)",
+        ] {
+            assert_eq!(t(not_one), None, "{not_one} is not a truncate of a table");
+        }
+
+        // A shape this reader does not claim to understand must be None rather than a
+        // guess — a wrong guess refuses the wrong table.
+        assert_eq!(
+            t("TRUNCATE TABLE a, b"),
+            None,
+            "MySQL does not accept a list here, and inventing an answer for an \
+             unrecognised shape is how a reader refuses an export it should not"
+        );
+
+        // A DOT inside backticks is part of the name, not a qualifier. The old
+        // `split_once('.')` over the raw text cut this into a database and a table
+        // that do not exist, so routing found neither and the truncate was not
+        // refused for the table it actually names.
+        assert_eq!(
+            t("TRUNCATE TABLE `odd.name`"),
+            Some(("shop".into(), "odd.name".into())),
+            "a quoted dot is a character in the identifier"
+        );
+        assert_eq!(
+            t("TRUNCATE TABLE `db.x`.`t.y`"),
+            Some(("db.x".into(), "t.y".into())),
+            "...and the qualifier splits on the dot BETWEEN the quoted parts"
+        );
+        // A doubled backtick is an escaped one inside the name.
+        assert_eq!(
+            t("TRUNCATE TABLE `we``ird`"),
+            Some(("shop".into(), "we`ird".into()))
+        );
+        // An unterminated quote is not a name.
+        assert_eq!(t("TRUNCATE TABLE `unclosed"), None);
+    }
 
     /// The asymmetry with `row_image_verdict` is deliberate and this pins it: a
     /// non-FULL `binlog_row_image` is REFUSED (somebody chose it, the default is
