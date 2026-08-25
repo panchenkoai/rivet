@@ -546,6 +546,7 @@ fn run_cdc_inner(
                         canonical: config.source.mongo.as_ref().is_some_and(|m| {
                             matches!(m.json, crate::config::MongoJsonMode::Canonical)
                         }),
+                        configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                     },
                 },
             },

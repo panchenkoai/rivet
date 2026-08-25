@@ -393,7 +393,14 @@ pub(crate) enum CdcEngineOpts {
     /// Render the `document` blob as canonical (type-tagged) extended JSON — the
     /// `source.mongo.json: canonical` mode, so a CDC stream and a full export
     /// produce identical text. Config-driven only; the CLI defaults to relaxed.
-    Mongo { canonical: bool },
+    Mongo {
+        canonical: bool,
+        /// The export's configured `table:` names. Every other engine's variant
+        /// carried these and Mongo's did not, which is why it was the one engine
+        /// with no routing cross-check of any kind: a typo'd collection ran to
+        /// `status: success, rows: 0` in silence.
+        configured_tables: Vec<String>,
+    },
 }
 
 /// How a capture run ends — ONE name for the concept that used to cross the
@@ -934,7 +941,10 @@ pub(crate) fn create_change_stream(
                 .context(MSSQL_CDC_HINT)?,
             ))
         }
-        CdcEngineOpts::Mongo { canonical } => {
+        CdcEngineOpts::Mongo {
+            canonical,
+            configured_tables,
+        } => {
             // Validate the checkpoint BEFORE open so a corrupt/truncated one
             // surfaces cleanly, not blanketed by MONGO_CDC_HINT — the same hoist
             // MySQL/PG/MSSQL do (bughunt MED: MongoChangeStream::open loaded it
@@ -953,6 +963,7 @@ pub(crate) fn create_change_stream(
                     cfg.checkpoint.as_deref(),
                     *canonical,
                     cfg.drain,
+                    configured_tables,
                 )
                 .context(MONGO_CDC_HINT)?,
             ))

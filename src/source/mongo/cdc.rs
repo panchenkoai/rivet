@@ -285,6 +285,9 @@ impl MongoChangeStream {
         checkpoint: Option<&std::path::Path>,
         canonical: bool,
         mode: DrainMode,
+        // The export's configured `table:` names. Mongo had no routing
+        // cross-check at all — this is what the zero-match warning needs.
+        configured_tables: &[String],
     ) -> Result<Self> {
         let until_current = mode.is_bounded();
         let session = MongoSession::connect(url, tls)?;
@@ -307,6 +310,49 @@ impl MongoChangeStream {
         // sub-6.0 server gives current-state UpdateLookup post-images and no delete
         // pre-image, so a null `document` on an update/delete means "this tier
         // can't provide it", not "the value was null". doctor surfaces the same.
+        // A configured collection the database does not hold. MEASURED before this:
+        // `table: no_such_collection` ran to `status: success, rows: 0` with no
+        // warning — a typo and a genuinely quiet window look identical, and the
+        // first is the one an operator needs before concluding "CDC works, there is
+        // just no traffic".
+        //
+        // A WARNING, not a refusal: on Mongo a collection is created by its first
+        // write, so capturing one that does not exist YET is a legitimate setup —
+        // start the stream, then let the app create it. Refusing would break that.
+        // What is not legitimate is silence.
+        //
+        // This engine's whole share of the resolution contract is this arm: the
+        // stream is scoped to ONE database, so the cross-schema ambiguity the SQL
+        // engines refuse cannot arise here.
+        if !configured_tables.is_empty() {
+            let present: Vec<String> = session
+                .block_on(async {
+                    session
+                        .client()
+                        .database(&db_name)
+                        .list_collection_names()
+                        .await
+                })
+                .unwrap_or_default();
+            if !present.is_empty() {
+                let missing: Vec<&String> = configured_tables
+                    .iter()
+                    .filter(|c| {
+                        !present
+                            .iter()
+                            .any(|p| crate::source::cdc::sink::table_matches(c, &db_name, p))
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    log::warn!(
+                        "mongodb cdc: could not find {missing:?} in database `{db_name}` — it \
+                         holds {present:?}. A collection is created by its first write, so \
+                         this is fine if the app has not written yet; if it is a typo the \
+                         capture will report success over zero rows forever."
+                    );
+                }
+            }
+        }
         let cap = probe_capability_on(&session);
         log::info!(
             "mongodb cdc: server {} — capture tier: {}",
@@ -411,7 +457,17 @@ pub(crate) fn pin_checkpoint_at_current(
     // first-run anchor). One mechanism, one place — this is the `ensure_anchor`
     // entry into it. (A non-replica-set can't `watch()`, so open fails loudly
     // before any pin.) The stream is opened only to anchor, then dropped.
-    MongoChangeStream::open(url, tls, Some(checkpoint), false, DrainMode::Continuous).map(|_| ())
+    // Anchor-only open: the routing cross-check is the RUN's job, so an empty
+    // configured list here is correct rather than an omission.
+    MongoChangeStream::open(
+        url,
+        tls,
+        Some(checkpoint),
+        false,
+        DrainMode::Continuous,
+        &[],
+    )
+    .map(|_| ())
 }
 
 /// What a MongoDB CDC run actually delivers — probed from the server so the tier

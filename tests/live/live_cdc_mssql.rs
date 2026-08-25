@@ -1910,3 +1910,71 @@ fn mssql_cdc_checkpoint_without_an_lsn_must_refuse_not_silently_reread_everythin
         "a refused run must deliver nothing"
     );
 }
+
+/// SQL Server needs no ambiguity resolution — and this pins WHY, so the next
+/// reader does not add a guard that cannot fire.
+///
+/// The other three engines resolve a configured `table:` against a catalog that
+/// may hold the name more than once. SQL Server cannot: the stream is opened on a
+/// CAPTURE INSTANCE, `cdc.change_tables` holds one row per instance, and that row
+/// names exactly one source object. So the relation is resolved before rivet
+/// compares anything, and a bare configured name cannot pull in a second relation
+/// because the stream carries only the one instance's change table.
+///
+/// What remains is the CROSS-CHECK — that the configured string matches the
+/// relation the instance actually emits — and that already refuses, naming the
+/// catalog's own spelling. This test proves both halves: a same-named table in
+/// ANOTHER schema does not disturb a correct config, and a config naming the wrong
+/// schema is refused rather than silently capturing.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_capture_instance_resolves_identity_so_a_same_named_table_cannot_interfere() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let table = unique_name("rivet_cdc_amb");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "IF SCHEMA_ID('other') IS NULL EXEC('CREATE SCHEMA other'); \
+         CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    // The same NAME in another schema — the shape that re-labels rows on the
+    // engines whose stream is server-wide.
+    mssql_cdc_exec(&format!(
+        "IF OBJECT_ID('other.{table}') IS NOT NULL DROP TABLE other.{table}; \
+         CREATE TABLE other.{table}(zzz INT PRIMARY KEY, qqq INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    mssql_cdc_exec(&format!("INSERT INTO other.{table} VALUES (2,20)"));
+    wait_for_capture(&ci, 1);
+
+    // A BARE configured name, the ambiguous shape elsewhere. Here the instance has
+    // already resolved the relation, so it runs clean and captures only dbo's row.
+    let d = tempfile::tempdir().unwrap();
+    let rig = mssql_cdc_rig(&table, &ci, &d.path().join("c.ckpt"), &d.path().join("out"));
+    rig.run_ok();
+    assert_eq!(
+        duckdb_dir_parquet_i64(&rig.out_dir(), "id"),
+        vec![1],
+        "only the capture instance's own relation is streamed — a same-named table \
+         in another schema is not in this change table at all, which is why this \
+         engine has no ambiguity to resolve"
+    );
+
+    // ...and naming the WRONG schema is refused, not silently captured.
+    let wrong = Rig::mssql_cdc(&format!("other.{table}"), &ci)
+        .checkpoint_path(d.path().join("w.ckpt"))
+        .dest_path(d.path().join("w"));
+    let said = wrong.run_expect_fail();
+    assert!(
+        said.contains(&format!("dbo.{table}")),
+        "the refusal must name the relation the INSTANCE emits — that is the whole \
+         remediation, and it is the catalog's spelling rather than the config's. \
+         Got:\n{said}"
+    );
+    mssql_cdc_exec(&format!("DROP TABLE IF EXISTS other.{table}"));
+}

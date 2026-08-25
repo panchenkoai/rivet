@@ -6953,3 +6953,70 @@ fn roast_pg_cdc_folded_twin_refusal_names_both_relations() {
         "a config problem must not wear the permissions hint. Got:\n{said}"
     );
 }
+
+/// MySQL's ambiguity refusal must speak the SAME sentence PostgreSQL does.
+///
+/// Both engines now refuse a configured string that does not name one relation, and
+/// an operator reading two different messages for one class has to learn the class
+/// twice. The shared `identity::resolve_captured_table` is what makes them one
+/// sentence; this test is the contract for wiring MySQL into it.
+///
+/// The engine difference that stays, because it is real: MySQL's
+/// `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE` hands
+/// over the whole server's binlog, so the catalog CANNOT see every database the
+/// capture will receive. Resolution closes what the catalog can see; the wire-side
+/// check (`bare_name_spans_databases`) stays as the backstop for what it cannot.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_ambiguity_refusal_matches_the_shared_sentence() {
+    let _serial = cross_process_serial("mysql_cdc_ambiguity");
+    let table = unique_name("rivet_cdc_amb").to_lowercase();
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, v VARCHAR(20))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+    // A second database holding the same name, and GRANTED so this connection's
+    // catalog can see it — that is the half resolution owns. Created as root
+    // because `rivet` cannot create a database, which is itself the reason the
+    // wire-side backstop exists: in production the second database is usually one
+    // this user has no rights on at all.
+    {
+        let root = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet").expect("root pool");
+        let mut rc = root.get_conn().expect("root conn");
+        rc.query_drop("CREATE DATABASE IF NOT EXISTS amb_other")
+            .unwrap();
+        rc.query_drop(format!(
+            "CREATE TABLE IF NOT EXISTS amb_other.{table}(zzz INT PRIMARY KEY, qqq VARCHAR(20))"
+        ))
+        .unwrap();
+        rc.query_drop("GRANT SELECT ON amb_other.* TO 'rivet'@'%'")
+            .unwrap();
+        rc.query_drop("FLUSH PRIVILEGES").unwrap();
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt);
+    let said = rig.run_expect_fail();
+
+    {
+        let root = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet");
+        if let Ok(p) = root
+            && let Ok(mut rc) = p.get_conn()
+        {
+            let _ = rc.query_drop("DROP DATABASE IF EXISTS amb_other");
+        }
+    }
+    assert!(
+        said.contains("could mean") && said.contains(&format!("amb_other.{table}")),
+        "MySQL must refuse with the SHARED sentence and name the other relation — an \
+         operator meeting this class on two engines should not have to learn it \
+         twice. Got:\n{said}"
+    );
+    assert!(said.contains("Qualify it"), "and hand over the fix: {said}");
+}

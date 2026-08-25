@@ -886,3 +886,52 @@ fn mongo_cdc_crash_after_the_checkpoint_still_delivers_every_change() {
         );
     }
 }
+
+/// A configured collection that does not exist must SAY so — today it is silence.
+///
+/// MEASURED 2026-08-25: `table: no_such_collection` against a database that holds
+/// `real` ran to `status: success, rows: 0` with no warning of any kind. A typo and
+/// a genuinely quiet window are indistinguishable, and the first is the one an
+/// operator needs to hear about before they conclude "CDC works, there is just no
+/// traffic".
+///
+/// A WARNING and not a refusal, and the asymmetry is the point: on Mongo a
+/// collection is created by its first write, so capturing one that does not exist
+/// YET is a legitimate and common setup — start the stream, then let the app create
+/// it. Refusing would break that. What is not legitimate is saying nothing.
+///
+/// Mongo's stream is scoped to ONE database (`database(&db).watch()`), so the
+/// cross-schema ambiguity the SQL engines refuse cannot arise here — this engine's
+/// share of the resolution contract is the zero-match arm alone.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_warns_when_a_configured_collection_does_not_exist() {
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_ghost");
+    let m = MongoTest::connect(PORT, &db);
+    // A real collection beside it, so the warning can name what IS there — a
+    // "collection not found" that lists nothing is a message an operator cannot act
+    // on when the cause is a typo.
+    m.upsert_set("real", 1, "v", "here");
+
+    let rig = cdc(&db, "no_such_collection");
+    let said = rig.run_ok_capture();
+    assert!(
+        said.contains("no_such_collection"),
+        "the run must name the collection it could not find. Got:\n{said}"
+    );
+    assert!(
+        said.contains("real"),
+        "...and name what the database DOES hold, because the cause is almost always \
+         a typo and the fix is the neighbouring name. Got:\n{said}"
+    );
+
+    // Not too WIDE: a collection that exists must stay silent, or the warning fires
+    // on every correct config and stops being read.
+    let quiet = cdc(&db, "real");
+    let out = quiet.run_ok_capture();
+    assert!(
+        !out.contains("could not find"),
+        "an existing collection is the ordinary case and must not warn. Got:\n{out}"
+    );
+}

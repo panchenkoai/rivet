@@ -341,48 +341,46 @@ impl MysqlChangeStream {
                     )
                     .unwrap_or(None),
             };
-            // A BARE name is ambiguous ACROSS DATABASES, and on MySQL that is worse
-            // than on PostgreSQL. The binlog dump is server-wide — `BinlogRequest`
-            // carries no database filter — and `sink::table_matches` matches an
-            // unqualified config name in ANY schema, while the check above asks only
-            // `TABLE_SCHEMA = DATABASE()`. So a second database's same-named table is
-            // captured and invisible to the guard.
+            // RESOLUTION-FIRST, through the SAME decision PostgreSQL uses. An
+            // operator meeting this class on two engines should not have to learn it
+            // twice, and one refusal is one place a mutant can grade.
             //
-            // MEASURED 2026-08-25: `table: bhm` with `rivet.bhm(id, val)` and
-            // `other_db.bhm(zzz, qqq)` present wrote `INSERT INTO other_db.bhm VALUES
-            // (2,'FROM_OTHER_DB')` into the export as `id=2, val='FROM_OTHER_DB'` —
-            // a foreign DATABASE's row under this table's column names, zero warnings.
-            // The column names do not even match; under the default
-            // `binlog_row_metadata=MINIMAL` the wire carries none, so the positional
-            // fallback maps it and there is no name-match left to fail on.
-            //
-            // Refused rather than warned, for the reason the PostgreSQL peer gives:
-            // neither the re-labelled row nor the all-NULL row it produces at a
-            // different arity is recoverable from the output.
-            if schema.is_none() {
-                let others: Vec<String> = conn
+            // The engine difference that stays, because it is real: MySQL's
+            // `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE`
+            // hands over the whole server's binlog — MEASURED, as root the catalog
+            // listed `other_db, rivet` and as the `rivet` user it listed `rivet`
+            // alone, while the export captured other_db's row anyway. So resolution
+            // closes what the catalog CAN see, and `bare_name_spans_databases` stays
+            // as the wire-side backstop for what it cannot. Two guards, two different
+            // sources of truth, deliberately.
+            let matches: Vec<crate::source::cdc::identity::CatalogMatch> = match &schema {
+                // A qualified name names one database; ambiguity cannot apply.
+                Some(sch) => conn
                     .exec_map(
-                        "SELECT TABLE_SCHEMA FROM information_schema.TABLES \
+                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                           AND TABLE_TYPE = 'BASE TABLE'",
+                        (sch, &table),
+                        |(schema, table): (String, String)| {
+                            crate::source::cdc::identity::CatalogMatch { schema, table }
+                        },
+                    )
+                    .unwrap_or_default(),
+                None => conn
+                    .exec_map(
+                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES \
                          WHERE TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE' \
                            AND TABLE_SCHEMA NOT IN \
                                ('mysql','information_schema','performance_schema','sys')",
                         (&table,),
-                        |sch: String| sch,
+                        |(schema, table): (String, String)| {
+                            crate::source::cdc::identity::CatalogMatch { schema, table }
+                        },
                     )
-                    .unwrap_or_default();
-                if others.len() > 1 {
-                    anyhow::bail!(
-                        "mysql cdc: `{cfg}` is unqualified and {} databases hold a table of \
-                         that name ({}). The binlog dump is SERVER-WIDE and routing matches a \
-                         bare name in any schema, so all of them land in this export — and \
-                         under the default binlog_row_metadata=MINIMAL the wire carries no \
-                         column names, so a foreign row is mapped by POSITION under this \
-                         table's names. Qualify it (`database.{cfg}`) to capture the one you \
-                         mean.",
-                        others.len(),
-                        others.join(", ")
-                    );
-                }
+                    .unwrap_or_default(),
+            };
+            if !matches.is_empty() {
+                crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?;
             }
             if let MysqlRoutingVerdict::Never(why) = classify_mysql_routing(cfg, row.as_deref()) {
                 anyhow::bail!("{why}");
