@@ -420,6 +420,47 @@ impl PgChangeStream {
     ) -> Result<()> {
         use anyhow::Context as _;
         for cfg in configured {
+            // RESOLUTION-FIRST — one decision instead of two. The catalog query
+            // returns every relation the configured string could mean under EITHER
+            // rule that is live today: what PostgreSQL itself would pick
+            // (`to_regclass`, which FOLDS case and accepts `db.schema.table`), and
+            // what the byte-exact router would capture (`sink::table_matches`: the
+            // whole string as a relname — a quoted name may contain dots — or a
+            // `schema.table` split on the FIRST dot). The union goes through
+            // `identity::resolve_captured_table`, whose ambiguity arm subsumes the
+            // bare-name block that used to sit here AND the folded-twin case that
+            // `classify_routing`'s first arm catches after the fact: with both
+            // `mixedcase` and `"MixedCase"` present, `table: MixedCase` now refuses
+            // naming BOTH relations, where the fold arm named only the one the
+            // probe resolved.
+            let matches: Vec<crate::source::cdc::identity::CatalogMatch> = client
+                .query(
+                    "SELECT n.nspname::text, c.relname::text \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.relkind IN ('r','p','m') \
+                       AND n.nspname NOT IN ('pg_catalog','information_schema') \
+                       AND (c.oid = to_regclass($1) \
+                            OR c.relname = $1 \
+                            OR n.nspname || '.' || c.relname = $1 \
+                            OR (position('.' in $1) > 0 \
+                                AND n.nspname = split_part($1, '.', 1) \
+                                AND c.relname = substr($1, position('.' in $1) + 1)))",
+                    &[&cfg.as_str()],
+                )
+                .with_context(|| format!("pg cdc: listing catalog matches for `{cfg}`"))?
+                .iter()
+                .map(|r| crate::source::cdc::identity::CatalogMatch {
+                    schema: r.get(0),
+                    table: r.get(1),
+                })
+                .collect();
+            if !matches.is_empty() {
+                // The ambiguity decision. A NO-match stays with the schema probe
+                // below for now — it reports the missing relation today and tests
+                // assert its message; unifying that report is a later pass, said
+                // here rather than silently deferred.
+                crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?;
+            }
             let Some(row) = client
                 .query_opt(
                     "SELECT c.relkind::text, c.relpersistence::text, \
@@ -445,62 +486,6 @@ impl PgChangeStream {
             else {
                 continue; // unresolvable here — the schema probe reports it, loudly
             };
-            // A BARE (unqualified) name matches ANY schema in the router: `cfg == table`
-            // in sink::table_matches, which exists because a MongoDB collection has no
-            // schema qualifier and may itself contain dots. On PostgreSQL that makes an
-            // unqualified `table: orders` capture EVERY schema's `orders` into one
-            // export, silently interleaved.
-            //
-            // MEASURED 2026-08-25: `table: bare` with `public.bare` and `s2.bare` both
-            // present captured 2 rows — one from each schema — into a single part, with
-            // nothing in the output distinguishing them.
-            //
-            // A REFUSAL when a second relation shares the name, and the escalation from
-            // the warning this shipped as this morning is measured, not cautious.
-            // "Silently interleaved" understated the harm — the foreign rows are
-            // RE-LABELLED, because the sink matches images by column NAME and falls
-            // back to POSITION when no name matches:
-            //
-            //   same arity  — `public.bhx(id, val)` + `bh2.bhx(zzz, qqq)`, `table: bhx`:
-            //                 `INSERT INTO bh2.bhx VALUES (2,'FROM_OTHER_SCHEMA')` was
-            //                 written as `id=2, val='FROM_OTHER_SCHEMA'`. Another
-            //                 table's data under this table's names.
-            //   other arity — a row with every data column NULL, `status: success`.
-            //
-            // Neither is recoverable at the destination: nothing in the output says
-            // which row came from where, so no later capture repairs it. This repo's
-            // rule for a degrade-to-null cell path and a wrong-column write is to FAIL,
-            // and a warning at run start is one an unattended scheduler never reads.
-            //
-            // `relkind` includes `'m'`: `test_decoding` decodes MATERIALIZED VIEWS
-            // (`CREATE … WITH DATA` renders as ordinary INSERTs) and the router matches
-            // them on a bare name like any other relation, so a filter of `('r','p')`
-            // left exactly that case invisible.
-            //
-            // ONE matching relation stays silent — the refusal is scoped to the
-            // ambiguity, not to the bare name, which is the ordinary and correct case.
-            if !cfg.contains('.') {
-                let others: Vec<String> = client
-                    .query(
-                        "SELECT n.nspname || '.' || c.relname                          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace                          WHERE c.relname = $1 AND c.relkind IN ('r','p','m')                            AND n.nspname NOT IN ('pg_catalog','information_schema')",
-                        &[&cfg.as_str()],
-                    )
-                    .map(|rows| rows.iter().map(|r| r.get::<_, String>(0)).collect())
-                    .unwrap_or_default();
-                if others.len() > 1 {
-                    anyhow::bail!(
-                        "pg cdc: `{cfg}` is unqualified and {} relations share that name \
-                         ({}). Routing matches a bare name in ANY schema, so all of them \
-                         land in this one export — and because images are matched by \
-                         column NAME, a foreign row is written under THIS table's names \
-                         when the arity matches, or as an all-NULL row when it does not. \
-                         Neither is recoverable from the output. Qualify it \
-                         (`schema.{cfg}`) to capture the one you mean.",
-                        others.len(),
-                        others.join(", ")
-                    );
-                }
-            }
             let relkind: String = row.get(0);
             let relpersistence: String = row.get(1);
             let resolved_schema: String = row.get(2);

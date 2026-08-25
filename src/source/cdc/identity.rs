@@ -62,38 +62,36 @@ pub(crate) struct CapturedTable {
 
 /// Resolve one configured `table:` against what the catalog reported for it.
 ///
-/// The pure half — the query that produces `matches` is per-engine and lives with
-/// the adapter. Everything that DECIDES is here, so a mutant can grade it.
+/// The DIVISION OF KNOWLEDGE is the design: the per-engine catalog query answers
+/// "which relations could this string mean under every rule live on this engine"
+/// (PostgreSQL: what `to_regclass` folds to AND what the byte-exact router would
+/// capture; Mongo: the collection literally named), and this pure function answers
+/// only 0 / 1 / many. Engine differences live with engines; the decision has one
+/// home a mutant can grade.
 ///
-/// Precedence mirrors `sink::table_matches`, deliberately: an exact WHOLE-name
-/// match wins over a `schema.table` split. That order is not a nicety — a MongoDB
-/// collection may be named `events.v2`, and splitting it would look up a collection
-/// that does not exist. It is also why a bare name is accepted at all, and therefore
-/// why the ambiguity below has to be caught rather than defined away.
+/// MANY is a refusal, always — there is no precedence. The first cut ranked a
+/// whole-name match above a `schema.table` split, mirroring the router, and the
+/// folded-twin fixture proved that wrong on its first live run: `table: MixedCase`
+/// with both `mixedcase` and `"MixedCase"` present resolved "cleanly" to the
+/// byte-exact one while PostgreSQL's own parser reads the same string as the OTHER
+/// relation. Two systems disagreeing about one string is not a tie to break — it is
+/// the ambiguity this seam exists to surface, and only the operator knows which
+/// relation they meant.
 pub(crate) fn resolve_captured_table(
     configured: &str,
     matches: &[CatalogMatch],
 ) -> Result<CapturedTable> {
-    // A QUALIFIED name selects its own schema and cannot be ambiguous — but only if
-    // the whole string is not itself a relation name (the dotted-collection case).
-    let whole: Vec<&CatalogMatch> = matches.iter().filter(|m| m.table == configured).collect();
-    let qualified: Vec<&CatalogMatch> = match configured.split_once('.') {
-        Some((sch, tbl)) => matches
-            .iter()
-            .filter(|m| m.schema == sch && m.table == tbl)
-            .collect(),
-        None => Vec::new(),
-    };
+    // One relation reported through several rules is one relation: the PG query
+    // reaches a row via up to four OR-arms, and a set that counts it twice would
+    // refuse a perfectly unambiguous config.
+    let mut distinct: Vec<&CatalogMatch> = Vec::new();
+    for m in matches {
+        if !distinct.iter().any(|d| **d == *m) {
+            distinct.push(m);
+        }
+    }
 
-    let chosen: Vec<&CatalogMatch> = if !whole.is_empty() {
-        whole
-    } else if !qualified.is_empty() {
-        qualified
-    } else {
-        matches.iter().collect()
-    };
-
-    match chosen.as_slice() {
+    match distinct.as_slice() {
         [] => anyhow::bail!(
             "cdc: `{configured}` matches no relation the source reports. Capture would \
              open a stream and route nothing — every event dropped by the routing \
@@ -112,12 +110,14 @@ pub(crate) fn resolve_captured_table(
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
-                "cdc: `{configured}` is unqualified and {} relations share that name \
-                 ({listing}). Routing matches a bare name in ANY schema, so all of them \
-                 land in this export — and because images are matched by column NAME, a \
-                 foreign row is written under THIS table's names when the arity matches, \
-                 or as an all-NULL row when it does not. Neither is recoverable from the \
-                 output. Qualify it (`schema.{configured}`) to capture the one you mean.",
+                "cdc: `{configured}` could mean {} different relations ({listing}) — the \
+                 engine's own parser and rivet's byte-exact routing do not agree on one, \
+                 or more than one schema holds the name. All of them would land in this \
+                 export, and because images are matched by column NAME, a foreign row is \
+                 written under THIS table's names when the arity matches, or as an \
+                 all-NULL row when it does not. Neither is recoverable from the output. \
+                 Qualify it (`schema.{configured}`, quoted as the catalog spells it) to \
+                 capture the one you mean.",
                 many.len()
             )
         }
@@ -135,121 +135,107 @@ mod tests {
         }
     }
 
-    /// The ordinary case, and the one that must not regress: a bare name over
-    /// exactly one relation resolves to the CATALOG's spelling while keeping the
-    /// operator's string as the destination prefix.
+    /// The ordinary case, and the one that must not regress: one relation resolves
+    /// to the CATALOG's spelling while the operator's string stays the destination
+    /// sub-prefix.
     #[test]
-    fn a_bare_name_over_one_relation_resolves_to_the_catalog_spelling() {
+    fn one_match_resolves_to_the_catalog_spelling_and_keeps_the_configured_string() {
         let got = resolve_captured_table("orders", &[m("public", "orders")])
             .expect("one match is the ordinary case");
-        assert_eq!(got.schema, "public");
-        assert_eq!(got.table, "orders");
+        assert_eq!(
+            (got.schema.as_str(), got.table.as_str()),
+            ("public", "orders")
+        );
         assert_eq!(
             got.configured, "orders",
-            "the operator's string stays the destination sub-prefix — resolving must \
-             not move an existing output path"
+            "the operator's string is the destination sub-prefix — resolving must not \
+             move an existing output path"
         );
     }
 
-    /// The FOLD case, which `classify_routing` exists to detect today: the operator
-    /// writes `mixedcase`, the catalog spells it `MixedCase`, and wire events carry
-    /// the catalog's spelling. Resolution takes the catalog's answer, so routing
-    /// stops needing a fold-mismatch guard at all.
+    /// The FOLD case: the operator writes `mixedcase`, the catalog spells it
+    /// `MixedCase`, and wire events carry the catalog's spelling. Resolution takes
+    /// the catalog's answer, so routing stops needing a fold-mismatch guard.
     #[test]
     fn resolution_takes_the_catalogs_case_not_the_configured_one() {
         let got = resolve_captured_table("mixedcase", &[m("public", "MixedCase")])
             .expect("the catalog found it");
         assert_eq!(
             (got.schema.as_str(), got.table.as_str()),
-            ("public", "MixedCase"),
-            "wire events carry the catalog's spelling; routing on the CONFIGURED one \
-             is the mismatch classify_routing had to notice"
+            ("public", "MixedCase")
         );
         assert_eq!(got.configured, "mixedcase");
     }
 
-    /// A QUALIFIED name names one relation whatever else exists — the ambiguity
-    /// below cannot apply to it, and refusing it would break every correct config.
+    /// ONE relation reported through SEVERAL rules is one relation. The PG query
+    /// reaches a row via up to four OR-arms; a resolver that counted it twice would
+    /// refuse a perfectly unambiguous config — the false-alarm direction, which for
+    /// a refusal is an outage.
     #[test]
-    fn a_qualified_name_is_never_ambiguous() {
+    fn duplicate_reports_of_the_same_relation_do_not_make_an_ambiguity() {
         let got = resolve_captured_table(
-            "archive.orders",
-            &[m("archive", "orders"), m("public", "orders")],
+            "public.orders",
+            &[m("public", "orders"), m("public", "orders")],
         )
-        .expect("a qualified name selects its own schema");
+        .expect("the same relation twice is not two relations");
         assert_eq!(
             (got.schema.as_str(), got.table.as_str()),
-            ("archive", "orders")
+            ("public", "orders")
         );
     }
 
-    /// The defect this module removes, twice measured: a bare name matching more
-    /// than one relation. On PostgreSQL the foreign row is written under THIS
-    /// table's column names; on MySQL the same, from a database the connection
-    /// cannot even see.
+    /// MANY is a refusal, always — no precedence. The first cut ranked a whole-name
+    /// match above a split, mirroring the router, and the folded-twin live fixture
+    /// proved that wrong on its first run: `MixedCase` resolved "cleanly" to the
+    /// byte-exact relation while PostgreSQL's own parser reads the same string as
+    /// the folded one. Two systems disagreeing about one string is the ambiguity
+    /// this seam exists to surface, not a tie to break.
     #[test]
-    fn a_bare_name_over_two_relations_is_a_resolution_failure() {
-        let err =
-            resolve_captured_table("orders", &[m("public", "orders"), m("archive", "orders")])
-                .expect_err("two relations means the config does not name one");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("public.orders") && msg.contains("archive.orders"),
-            "name BOTH — an operator qualifies the name only if they know which one \
-             they meant: {msg}"
-        );
-        assert!(
-            msg.contains("archive.orders") && msg.contains("Qualify"),
-            "and hand over the fix in the form they must type: {msg}"
-        );
+    fn two_distinct_relations_are_refused_naming_both_whatever_their_shapes() {
+        for (cfg, pair) in [
+            ("orders", [m("public", "orders"), m("archive", "orders")]),
+            (
+                "MixedCase",
+                [m("public", "MixedCase"), m("public", "mixedcase")],
+            ),
+            ("events.v2", [m("app", "events.v2"), m("events", "v2")]),
+        ] {
+            let err = resolve_captured_table(cfg, &pair)
+                .expect_err("two distinct relations means the config does not name one");
+            let msg = err.to_string();
+            let a = format!("{}.{}", pair[0].schema, pair[0].table);
+            let b = format!("{}.{}", pair[1].schema, pair[1].table);
+            assert!(
+                msg.contains(&a) && msg.contains(&b),
+                "`{cfg}`: name BOTH — an operator qualifies only if they know which \
+                 one they meant: {msg}"
+            );
+            assert!(msg.contains("Qualify"), "hand over the fix: {msg}");
+        }
     }
 
-    /// Nothing matched. Today this surfaces as a routing filter that silently drops
+    /// Nothing matched. Today this surfaces as a routing filter silently dropping
     /// every event; as a resolution failure it is one loud line before the stream
     /// opens.
     #[test]
     fn a_name_the_catalog_does_not_know_is_a_resolution_failure() {
         let err = resolve_captured_table("ghost", &[]).expect_err("no relation, no capture");
-        assert!(
-            err.to_string().contains("ghost"),
-            "name what could not be resolved: {err}"
-        );
+        assert!(err.to_string().contains("ghost"));
     }
 
-    /// PRECEDENCE, where both readings have a catalog match. The test below feeds a
-    /// dotted name that only ONE reading can satisfy, so it passes whichever order
-    /// the resolver uses — MEASURED: swapping the precedence left all six tests
-    /// green. A fixture that cannot express the ambiguity cannot grade the rule that
-    /// resolves it.
-    ///
-    /// Here `events.v2` is BOTH a collection named `events.v2` in schema `app` AND a
-    /// relation `v2` in a schema called `events`. Whole-name wins, because that is
-    /// what `sink::table_matches` does and routing is the authority: resolving to
-    /// `events.v2` while the router matches `app`.`events.v2` would send every event
-    /// to a table nobody configured.
+    /// A dotted MongoDB collection resolves WHOLE — `a.b` is a legal collection
+    /// name, and this is the entire reason a bare name is accepted anywhere. The
+    /// Mongo catalog query supplies only the literal collection, so the set has one
+    /// member; on an engine where the same string could also mean `schema.table`,
+    /// the QUERY supplies both and the many-arm refuses. Engine knowledge in the
+    /// query, decision in here.
     #[test]
-    fn a_whole_name_match_wins_over_a_schema_dot_table_split() {
-        let got = resolve_captured_table("events.v2", &[m("app", "events.v2"), m("events", "v2")])
-            .expect("both readings match, and precedence must pick one");
-        assert_eq!(
-            (got.schema.as_str(), got.table.as_str()),
-            ("app", "events.v2"),
-            "the WHOLE name wins — `sink::table_matches` tries the full string first,              and a resolver that disagrees with the router sends events to a relation              nobody configured"
-        );
-    }
-
-    /// A dotted MongoDB collection is not a qualified name — `a.b.c` is a legal
-    /// collection name, and this is the whole reason a bare name is accepted at all.
-    /// Resolution must take the catalog's word rather than splitting on the dot.
-    #[test]
-    fn a_dotted_collection_name_resolves_whole() {
+    fn a_dotted_collection_name_resolves_whole_when_it_is_the_only_reading() {
         let got = resolve_captured_table("events.v2", &[m("app", "events.v2")])
-            .expect("the catalog reported it as one collection");
+            .expect("one reading, one relation");
         assert_eq!(
             (got.schema.as_str(), got.table.as_str()),
-            ("app", "events.v2"),
-            "splitting `events.v2` into schema `events` would look up a collection \
-             that does not exist — the dotted-name case is why bare names exist"
+            ("app", "events.v2")
         );
     }
 }

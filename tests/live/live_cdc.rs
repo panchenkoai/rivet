@@ -4271,8 +4271,12 @@ fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
 
     let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
     let said = rig.run_expect_fail();
+    // The wording moved when the bare-name block folded into `identity::resolve_
+    // captured_table` — one refusal for every shape of "this string does not name
+    // one relation". The load-bearing assertions are unchanged: the OTHER relation
+    // is named, and the fix is handed over.
     assert!(
-        said.contains("unqualified") && said.contains(&format!("other.{tbl}")),
+        said.contains("could mean") && said.contains(&format!("other.{tbl}")),
         "the refusal must name the other relation — an operator cannot qualify what \
          they were not told about. Got:\n{said}"
     );
@@ -4305,7 +4309,7 @@ fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
     let quiet = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
     let out = quiet.run_ok_capture();
     assert!(
-        !out.contains("unqualified"),
+        !out.contains("could mean"),
         "a bare name over ONE relation is the common, correct case — refusing it \
          would break every working single-schema config. Got:\n{out}"
     );
@@ -6893,5 +6897,49 @@ fn roast_mysql_cdc_warns_on_a_minimal_backlog_a_full_server_would_hide() {
     assert!(
         said.contains("binlog_row_metadata = FULL"),
         "and it must still name the escape: {said}"
+    );
+}
+
+/// A folded-twin refusal must name BOTH relations — resolution-first.
+///
+/// Today the twin case (`table: MixedCase` with both `mixedcase` and `"MixedCase"`
+/// present) is refused by `classify_routing`'s fold arm, whose message names only
+/// the relation the probe resolved (`public.mixedcase`) and explains byte-exact
+/// routing. Correct, but the operator learns about ONE of the two relations — the
+/// other, the one the router would actually capture, is the surprise they need.
+///
+/// With resolution-first the case becomes an AMBIGUITY: the catalog query returns
+/// both the fold-resolved relation and the byte-exact one, `resolve_captured_table`
+/// refuses, and the message lists both plus the fix. This test is the contract for
+/// that wiring, written before it.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_folded_twin_refusal_names_both_relations() {
+    let cdc_db = CdcDb::new("cdc_twin");
+    let slot = unique_name("rivet_twin_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(
+        "CREATE TABLE \"MixedCase\" (id int, v text); \
+         CREATE TABLE mixedcase (id int, other_col text, extra text)",
+    )
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    let rig = Rig::pg_cdc("MixedCase", &slot).source_url(cdc_db.url());
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("public.mixedcase") && said.contains("public.MixedCase"),
+        "the refusal must name BOTH relations — the folded one the probe resolves AND \
+         the byte-exact one the router would capture. An operator shown only one \
+         cannot know the collision exists. Got:\n{said}"
+    );
+    assert!(
+        !said.contains("wal_level=logical and a role"),
+        "a config problem must not wear the permissions hint. Got:\n{said}"
     );
 }
