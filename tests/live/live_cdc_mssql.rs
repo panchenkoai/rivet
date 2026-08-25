@@ -1978,3 +1978,203 @@ fn mssql_cdc_capture_instance_resolves_identity_so_a_same_named_table_cannot_int
     );
     mssql_cdc_exec(&format!("DROP TABLE IF EXISTS other.{table}"));
 }
+
+/// The schema probe must read the relation the CAPTURE INSTANCE names — not
+/// whatever the connection's default schema makes of the configured string.
+///
+/// Round-3 bughunt, and SQL Server is the only engine that never calls
+/// `identity::resolve_captured_table`, so it takes the harm the other engines
+/// refuse out loud. Two independent resolutions of one config:
+///
+///   `MssqlChangeStream::open` reads `cdc.change_tables` — the catalog, the truth —
+///   and tags every event `<schema>.<table>`. Its routing check then passes, because
+///   `table_matches` lets a BARE configured name match any schema.
+///
+///   `run_capture` separately hands the CONFIGURED string to `CdcSchemaResolver`,
+///   whose `SELECT * FROM <name>` resolves in the connection's DEFAULT schema — a
+///   different relation, with different columns.
+///
+/// Nothing compares the two. The export is then written with one table's column
+/// names over another table's events: PROVEN before the fix — `status: success`,
+/// exit 0, no warning, and the parquet carried `dbo`'s columns while `note`, the
+/// captured table's only data column, was absent from the output entirely and the
+/// columns that were present were all NULL.
+///
+/// This is precisely what PostgreSQL refuses in words — "a foreign row is written
+/// under THIS table's names … or as an all-NULL row … Neither is recoverable from
+/// the output" — and SQL Server was doing it.
+///
+/// The fix is resolution, not refusal: a capture instance names its source object
+/// in the catalog unambiguously, so there is nothing here for an operator to
+/// disambiguate. Carry the pair the stream already resolved.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_sch");
+    let ci = format!("rvsales_{table}");
+    // A same-named DECOY in the default schema, with DIFFERENT columns. Without
+    // one the two resolutions agree by accident and the test proves nothing — the
+    // fixture has to cross the mechanism's activation threshold.
+    mssql_cdc_exec("IF SCHEMA_ID('rvsales') IS NULL EXEC('CREATE SCHEMA rvsales');");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT, dbo_only INT); \
+         INSERT INTO dbo.{table} VALUES (900, 42, 7);"
+    ));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE rvsales.{table}(id INT PRIMARY KEY, note NVARCHAR(50))"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let _decoy = DboDecoy(table.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!(
+        "INSERT INTO rvsales.{table} VALUES (1, N'real-note-one'), (2, N'real-note-two')"
+    ));
+    wait_for_capture(&ci, 2);
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // The config an operator writes: the bare table name plus the capture instance
+    // that says, unambiguously, which relation it means.
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
+
+    let batches = read_all_parts(&out);
+    let cols: std::collections::BTreeSet<String> = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        cols.contains("note"),
+        "the captured table's own column must be in the output. Its absence is the \
+         defect in its purest form: the probe read dbo's columns, so the only data \
+         column of the relation actually being captured never reached the \
+         destination. Got: {cols:?}"
+    );
+    assert!(
+        !cols.contains("dbo_only"),
+        "and the DECOY's columns must not be — a column that exists in neither the \
+         captured table nor its events can only arrive all-NULL, which reads as \
+         'the source had no data' rather than as a mis-resolved config: {cols:?}"
+    );
+
+    // Values, not just names: a schema that is right while every cell is NULL is
+    // the same silent loss one layer down.
+    let notes: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&out, "note");
+    assert_eq!(
+        notes,
+        ["real-note-one", "real-note-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the captured rows' real values must reach the destination"
+    );
+}
+
+/// Drops the `dbo` decoy the schema-probe test plants. The shared
+/// [`MssqlCdcTable`] guard owns the CAPTURED table (it must disable CDC first);
+/// this one owns the un-captured twin, which is an ordinary table.
+struct DboDecoy(String);
+impl Drop for DboDecoy {
+    fn drop(&mut self) {
+        let t = self.0.clone();
+        let _ = std::panic::catch_unwind(move || {
+            mssql_cdc_drop_table(&format!("dbo.{t}"));
+        });
+    }
+}
+
+/// The SNAPSHOT leg must read the same relation the drain captures.
+///
+/// The other half of the schema-probe defect, and the worse half: the drain wrote
+/// the wrong COLUMNS, this writes rows that never existed in the captured table at
+/// all. `initial: snapshot` plans its baseline BEFORE any stream opens, from
+/// `export.table` — the configured string — so `SELECT … FROM <name>` resolves in
+/// the connection's default schema and the baseline is a different table's
+/// contents, deposited in the captured table's own prefix.
+///
+/// MEASURED before the fix on the mssql CDC stand: `status: success`, exit 0, and
+/// `snapshot/…parquet` held exactly `{"id":900,"amount":42,"dbo_only":7}` — the
+/// decoy's row — while the captured table's two rows appeared nowhere. A
+/// downstream loader folds that baseline into the current-state view as fact.
+///
+/// The label and the READ have to part ways here: the sub-prefix and the leg's
+/// name stay the configured string (both legs share one prefix, and the snapshot
+/// marker is keyed by it, so changing them would strand every existing resume), while
+/// the relation read follows the catalog.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_snp");
+    let ci = format!("rvsales_{table}");
+    mssql_cdc_exec("IF SCHEMA_ID('rvsales') IS NULL EXEC('CREATE SCHEMA rvsales');");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT, dbo_only INT); \
+         INSERT INTO dbo.{table} VALUES (900, 42, 7);"
+    ));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE rvsales.{table}(id INT PRIMARY KEY, note NVARCHAR(50)); \
+         INSERT INTO rvsales.{table} VALUES (1, N'base-one'), (2, N'base-two');"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let _decoy = DboDecoy(table.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    mssql_cdc_rig(&table, &ci, &ckpt, &out)
+        .cdc_line("initial: snapshot")
+        .run_ok();
+
+    let snap = out.join("snapshot");
+    assert!(
+        snap.is_dir(),
+        "the snapshot leg must have run at all — without it this test grades nothing"
+    );
+    let notes: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&snap, "note");
+    assert_eq!(
+        notes,
+        ["base-one", "base-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the baseline must be the CAPTURED table's rows. Before the fix this \
+         directory held the decoy's row (id 900) — data that never existed in the \
+         relation being captured, written into its prefix under a green run"
+    );
+}

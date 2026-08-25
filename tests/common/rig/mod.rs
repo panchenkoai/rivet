@@ -593,13 +593,23 @@ impl Drop for MssqlCdcTable {
     fn drop(&mut self) {
         let (table, ci) = (self.table.clone(), self.ci.clone());
         let _ = std::panic::catch_unwind(move || {
+            // The SCHEMA comes from the catalog, never from an assumption. Two
+            // reasons, both already paid for in this repo: a fixture may put the
+            // captured table outside `dbo` (the schema-probe bughunt needs exactly
+            // that), and the recorded MSSQL lesson is that a guard joining
+            // `cdc.change_tables` to `sys.tables` goes blind the moment the table is
+            // dropped first — leaving the capture instance behind, so the next
+            // `sp_cdc_enable_table` fails 22926 and the suite alternates pass/fail.
+            // `capture_instance` survives the drop; join on that.
             super::mssql::mssql_cdc_exec(&format!(
-                "IF EXISTS(SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t \
-                   ON ct.source_object_id=t.object_id WHERE t.name='{table}') \
-                 EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', \
-                 @source_name=N'{table}', @capture_instance=N'{ci}';"
+                "DECLARE @s sysname = (SELECT TOP 1 OBJECT_SCHEMA_NAME(ct.source_object_id) \
+                   FROM cdc.change_tables ct WHERE ct.capture_instance = N'{ci}'); \
+                 IF @s IS NOT NULL EXEC sys.sp_cdc_disable_table @source_schema=@s, \
+                   @source_name=N'{table}', @capture_instance=N'{ci}'; \
+                 DECLARE @d nvarchar(max) = N'DROP TABLE IF EXISTS ' \
+                   + QUOTENAME(COALESCE(@s, N'dbo')) + N'.' + QUOTENAME(N'{table}'); \
+                 EXEC sp_executesql @d;"
             ));
-            super::mssql::mssql_cdc_drop_table(&format!("dbo.{table}"));
         });
     }
 }

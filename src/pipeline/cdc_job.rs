@@ -231,6 +231,22 @@ pub(super) fn initial_snapshot_pending(
         (None, Some(t)) => (vec![t.clone()], false),
         (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
     };
+    // The relation the SNAPSHOT must read, when the engine can name it from a
+    // catalog rather than from the configured string. On SQL Server the capture
+    // instance settles it outright, and the two readings disagreed in silence: the
+    // baseline was `SELECT … FROM <configured>` resolved in the connection's DEFAULT
+    // schema, so a same-named decoy's rows were deposited in the captured table's
+    // own prefix (MEASURED: `{"id":900,"amount":42,"dbo_only":7}` for a relation
+    // holding neither that id nor those columns, `status: success`). The LABEL stays
+    // the configured string — both legs share one prefix and the snapshot marker is
+    // keyed by it — while the READ follows the catalog.
+    let catalog_read: Option<String> = match (CdcEngine::from_url(&url)?, &cdc.capture_instance) {
+        (CdcEngine::Mssql, Some(ci)) => {
+            crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
+                .map(|(schema, table)| format!("{schema}.{table}"))
+        }
+        _ => None,
+    };
     let mut table_dests = Vec::with_capacity(tables.len());
     let mut done_flags = Vec::with_capacity(tables.len());
     for t in &tables {
@@ -245,7 +261,11 @@ pub(super) fn initial_snapshot_pending(
         // bucket); the GCS `snapshot/_SUCCESS` marker stays a legacy co-signal so
         // pre-v14 runs and setups without state still skip correctly.
         let done = state.snapshot_done(&export.name, t)? || dest.head("_SUCCESS")?.is_some();
-        table_dests.push((t.clone(), snap_dcfg));
+        table_dests.push((
+            t.clone(),
+            catalog_read.clone().unwrap_or_else(|| t.clone()),
+            snap_dcfg,
+        ));
         done_flags.push(done);
     }
 
@@ -273,8 +293,8 @@ pub(super) fn initial_snapshot_pending(
 
     let mut pending = Vec::new();
     for idx in pending_idx {
-        let (t, snap_dcfg) = &table_dests[idx];
-        pending.push(synth_snapshot_export(export, t, snap_dcfg));
+        let (label, read, snap_dcfg) = &table_dests[idx];
+        pending.push(synth_snapshot_export(export, label, read, snap_dcfg));
     }
     Ok(pending)
 }
@@ -288,12 +308,13 @@ pub(super) fn initial_snapshot_pending(
 /// version of that test green against a product which still mis-folded.
 #[cfg(test)]
 pub(crate) fn synth_snapshot_export_for_test(export: &ExportConfig, table: &str) -> ExportConfig {
-    synth_snapshot_export(export, table, &export.destination)
+    synth_snapshot_export(export, table, table, &export.destination)
 }
 
 fn synth_snapshot_export(
     export: &ExportConfig,
     table: &str,
+    read: &str,
     snap_dcfg: &crate::config::DestinationConfig,
 ) -> ExportConfig {
     let mut synth = export.clone();
@@ -306,7 +327,10 @@ fn synth_snapshot_export(
         crate::manifest::SNAPSHOT_LEG_INFIX
     );
     synth.mode = crate::config::ExportMode::Full;
-    synth.table = Some(table.to_string());
+    // The LABEL names the leg (and through it the prefix and the snapshot marker);
+    // the READ names the relation. They differ only where a catalog knows better
+    // than the configured string.
+    synth.table = Some(read.to_string());
     synth.tables = None;
     synth.cdc = None;
     synth.destination = snap_dcfg.clone();
@@ -753,7 +777,7 @@ mod tests {
             path: Some("/tmp/snap".into()),
             ..Default::default()
         };
-        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        let synth = synth_snapshot_export(&e, "orders", "orders", &dcfg);
         assert!(
             !synth.meta_columns.exported_at,
             "a per-run stamp must not ride along onto the snapshot leg"
@@ -832,7 +856,7 @@ mod tests {
             path: Some("/tmp/snap".into()),
             ..Default::default()
         };
-        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        let synth = synth_snapshot_export(&e, "orders", "orders", &dcfg);
         assert_eq!(
             synth.meta_columns.row_hash, e.meta_columns.row_hash,
             "the snapshot leg must emit the SAME hash column the drain does"

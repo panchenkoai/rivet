@@ -260,6 +260,22 @@ pub(crate) trait ChangeStream {
     fn ack(&mut self, _position: &Position) -> Result<()> {
         Ok(())
     }
+
+    /// The relation this stream's events will actually name, when the engine knows
+    /// it from a CATALOG rather than from the configured string.
+    ///
+    /// The schema probe (`SELECT * FROM <name>`) resolves the CONFIGURED string in
+    /// the connection's default schema, which is a second, independent reading of
+    /// one config. On SQL Server the two disagreed in silence: `open` resolves the
+    /// capture instance through `cdc.change_tables` and tags events
+    /// `<schema>.<table>`, while the probe read a same-named table in `dbo` — so an
+    /// export was written with one relation's column names over another's events,
+    /// `status: success`, no warning, the captured table's only data column absent
+    /// from the output. Engines that cannot know better return `None` and keep the
+    /// configured string.
+    fn resolved_identity(&self, _configured: &str) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// `rivet cdc` driver. Streams canonical changes from any engine adapter,
@@ -1224,7 +1240,14 @@ pub(crate) fn run_capture(
         Err(e) => return (Vec::new(), Err(e)),
     };
     for o in cap.outputs {
-        let columns = match resolver.resolve(&o.table, &o.overrides) {
+        // Probe the relation the STREAM resolved, not the string the config spelled
+        // — the two are the same on every engine that cannot do better, and on SQL
+        // Server the difference was a silently mis-columned export.
+        let probe = match stream.resolved_identity(&o.table) {
+            Some((schema, table)) => format!("{schema}.{table}"),
+            None => o.table.clone(),
+        };
+        let columns = match resolver.resolve(&probe, &o.overrides) {
             Ok(c) => c,
             Err(e) => return (Vec::new(), Err(e)),
         };

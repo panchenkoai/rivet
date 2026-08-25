@@ -401,6 +401,56 @@ pub(crate) struct MssqlCdcConfig {
 }
 
 /// Polls a CDC change table and yields canonical changes.
+/// The relation a capture instance names, from `cdc.change_tables` — the catalog
+/// answer, reusable by callers that need it BEFORE a stream exists.
+///
+/// The `initial: snapshot` leg is planned before any stream opens, so it had no way
+/// to ask and read the CONFIGURED string instead: on a fixture where the default
+/// schema holds a same-named decoy, the baseline it deposited in the captured
+/// table's own prefix was the DECOY's row — data that never existed in the relation
+/// being captured, under a green run.
+pub(crate) fn source_object_of_capture_instance(
+    url: &str,
+    capture_instance: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<Option<(String, String)>> {
+    // The same gate `from_url` applies — a plan-time lookup must not be the one
+    // path that dials remote plaintext.
+    require_tls_or_loopback(url, tls)?;
+    let p = crate::source::mssql::parse_mssql_url(url)?;
+    let cfg = &MssqlCdcConfig {
+        host: p.host,
+        port: p.port,
+        database: p.database,
+        user: p.user,
+        password: p.password,
+        capture_instance: capture_instance.to_string(),
+        from_lsn: None,
+        from_is_pin: false,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut client = rt.block_on(connect(cfg, tls))?;
+    Ok(rt.block_on(async {
+        let row = client
+            .query(
+                "SELECT OBJECT_SCHEMA_NAME(source_object_id), \
+                        OBJECT_NAME(source_object_id) \
+                 FROM cdc.change_tables WHERE capture_instance = @P1",
+                &[&cfg.capture_instance.as_str()],
+            )
+            .await
+            .ok()?
+            .into_row()
+            .await
+            .ok()??;
+        let s: Option<&str> = row.get(0);
+        let t: Option<&str> = row.get(1);
+        Some((s?.to_string(), t?.to_string()))
+    }))
+}
+
 pub(crate) struct MssqlChangeStream {
     rt: tokio::runtime::Runtime,
     client: Client<Compat<TcpStream>>,
@@ -776,6 +826,17 @@ impl MssqlChangeStream {
 }
 
 impl ChangeStream for MssqlChangeStream {
+    /// The capture instance names its source object in `cdc.change_tables`, so this
+    /// engine ALWAYS knows the real pair — and it is the engine that most needs to
+    /// say so, being the only one whose `table:` is accompanied by a second
+    /// identifier (`capture_instance:`) that settles the question outright. Gated on
+    /// the same predicate the sink routes by, so an output this stream does not feed
+    /// keeps its own configured name.
+    fn resolved_identity(&self, configured: &str) -> Option<(String, String)> {
+        crate::source::cdc::sink::table_matches(configured, &self.schema, &self.table)
+            .then(|| (self.schema.clone(), self.table.clone()))
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         // Refill a bounded batch whenever the buffer drains, advancing the cursor
         // each time, until a poll returns nothing (window drained to the max LSN).
