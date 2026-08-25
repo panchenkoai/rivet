@@ -1,0 +1,116 @@
+# `rivet cdc` — the CLI subcommand's surface, per engine.
+#
+# WHY THIS EXISTS. The two pre-existing CLI ledgers (cli-surface-matrix,
+# cli-flag-matrix) contain ZERO mentions of CDC — measured 2026-08-25 — and the
+# first is two rows about `rivet state`. So nothing asked whether the CDC
+# subcommand was exercised, and the answer turned out to be "unevenly":
+#
+#     mysql 11 of 13 flags · mssql 4 · postgres 3 · mongo 0
+#
+# Uneven coverage is rarely laziness; it is what happens when no ledger asks. The
+# repo's own rule — a coverage ledger must grade the CALL SITE, and its enumerated
+# dimension must be DERIVED — applies here: the flag list comes from
+# docs/reference/cli-reference.md, which is regenerated from clap on every commit,
+# so a new flag arrives with a missing row rather than silently uncovered.
+#
+# STATES
+#   test — a live test invokes `rivet cdc` with this flag against THIS engine
+#   na   — structurally inapplicable, with the reason written out (length-checked)
+#   gap  — applicable, unproven. Shrink-only.
+#
+# `mode: cdc` in a config is a DIFFERENT surface and is covered by cdc-matrix;
+# this ledger is only about the subcommand.
+
+engines: [postgres, mysql, mssql, mongo]
+
+flags:
+  - id: "--source"
+    postgres: { test: "pg_cdc_column_types_match_batch_export and siblings" }
+    mysql:    { test: "cdc_full_surface_cross_oracle_matches_literals and siblings" }
+    mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
+    mongo:    { gap: "the subcommand ACCEPTS a mongodb:// url — verified, it reaches a real
+                connection error rather than an argument error — and no test drives it" }
+
+  - id: "--source-env"
+    postgres: { gap: "resolution is engine-agnostic but only proven on mysql" }
+    mysql:    { test: "mysql_cdc_cli_resolves_the_source_from_env_and_file_alike" }
+    mssql:    { gap: "same" }
+    mongo:    { gap: "same" }
+
+  - id: "--source-file"
+    postgres: { gap: "resolution is engine-agnostic but only proven on mysql" }
+    mysql:    { test: "mysql_cdc_cli_resolves_the_source_from_env_and_file_alike" }
+    mssql:    { gap: "same" }
+    mongo:    { gap: "same" }
+
+  - id: "--table"
+    postgres: { test: "driven in the pg cli tests" }
+    mysql:    { test: "driven in six mysql cli tests" }
+    mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
+    mongo:    { gap: "a Mongo collection has no schema qualifier and may contain dots, which is
+                exactly the routing shape that has produced defects on the other three
+                engines — and it is the one engine where the subcommand is unexercised" }
+
+  - id: "--slot"
+    postgres: { test: "driven in the pg cli tests" }
+    mysql:    { na: "PostgreSQL-only: a logical replication slot is that engine's anchor, and
+                the flag is rejected for any other source" }
+    mssql:    { na: "PostgreSQL-only: SQL Server anchors on a from-LSN in the checkpoint, and
+                the flag is rejected for any other source" }
+    mongo:    { na: "PostgreSQL-only: MongoDB anchors on a driver resume token, and the flag is
+                rejected for any other source" }
+
+  - id: "--capture-instance"
+    postgres: { na: "SQL Server-only: it names a `cdc.<instance>_CT` change table, which no
+                other engine has — the flag is rejected for any other source" }
+    mysql:    { na: "SQL Server-only: the binlog has no capture instance, and the flag is
+                rejected for any other source" }
+    mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
+    mongo:    { na: "SQL Server-only: a change stream has no capture instance, and the flag is
+                rejected for any other source" }
+
+  - id: "--server-id"
+    postgres: { na: "MySQL-only: it is the replica identity a binlog dump registers under, and
+                the flag is rejected for any other source" }
+    mysql:    { test: "mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id" }
+    mssql:    { na: "MySQL-only: no binlog, no dump registration — rejected for other sources" }
+    mongo:    { na: "MySQL-only: no binlog, no dump registration — rejected for other sources" }
+
+  - id: "--checkpoint"
+    postgres: { gap: "PG's anchor is the SLOT and the checkpoint file is only a boolean, so the
+                subcommand path deserves its own cell rather than inheriting mysql's" }
+    mysql:    { test: "five mysql cli tests drive resume through it" }
+    mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
+    mongo:    { gap: "Mongo's checkpoint holds a driver resume token that nobody can hand-repair,
+                which makes its subcommand path the one most worth proving" }
+
+  - id: "--output"
+    postgres: { gap: "only proven on mysql and mssql" }
+    mysql:    { test: "mysql_cdc_cli_csv_output_is_wired_and_readable" }
+    mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
+    mongo:    { gap: "only proven on mysql and mssql" }
+
+  - id: "--format"
+    postgres: { gap: "the writer is shared, but CSV vs parquet is re-selected per invocation" }
+    mysql:    { test: "mysql_cdc_cli_csv_output_is_wired_and_readable" }
+    mssql:    { gap: "same" }
+    mongo:    { gap: "Mongo's `document` column is JSON, so its CSV rendering is the one that
+                differs most from the other three and is proven by nothing" }
+
+  - id: "--max-events"
+    postgres: { gap: "the cap is applied in shared driver code but only proven on mysql" }
+    mysql:    { test: "roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpoint" }
+    mssql:    { gap: "same" }
+    mongo:    { gap: "same" }
+
+  - id: "--rollover"
+    postgres: { gap: "only proven on mysql" }
+    mysql:    { test: "roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clobber" }
+    mssql:    { gap: "same" }
+    mongo:    { gap: "same" }
+
+  - id: "--stream"
+    postgres: { gap: "only proven on mysql" }
+    mysql:    { test: "mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id" }
+    mssql:    { gap: "same" }
+    mongo:    { gap: "same" }
