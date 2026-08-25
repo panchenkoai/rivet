@@ -515,6 +515,20 @@ impl MysqlChangeStream {
             // `XA PREPARE` deliberately does NOT release: the transaction is not
             // committed yet, and releasing there would publish rows a later
             // `XA ROLLBACK` erases.
+            // A TRUNCATE is a QUERY event, never rows — so the rows path below
+            // never sees it and the `_ => {}` arm dropped it silently, leaving the
+            // destination holding rows the source no longer has. Table-addressed
+            // for the reason #281 measured: the binlog carries every table on the
+            // server, so refusing without asking whose relation it is would make
+            // one truncated table an outage for exports that never read it.
+            Some(EventData::QueryEvent(qe))
+                if truncate_target(&qe.query(), &qe.schema()).is_some_and(|(sc, tb)| {
+                    undecodable_event_is_ours(Some((&sc, &tb)), &self.configured_tables)
+                }) =>
+            {
+                let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
+                anyhow::bail!(truncate_refusal_message(&sc, &tb));
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
