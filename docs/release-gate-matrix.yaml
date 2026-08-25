@@ -127,6 +127,19 @@ preflights:
   - id: cdc_corruption_is_detected
     what: "the same negative proof for the CDC leg, which needs its own: the CDC sink keeps a SEPARATE per-column accumulator and writes its own manifests, so a green batch cell says nothing about it. The same annihilating XOR fold lived here, and the render marker was briefly left `None` on this path — which alone would have made every CDC prefix read as corrupt. Captures to a LOCAL destination rather than the object store the e2e cell uses, because the corruption must be a byte flip IN PLACE and a download/edit/re-upload round trip rewrites the object. Positive first (a clean capture verifies), then the flip. Opt-in on RIVET_CDC_<ENGINE>_URL like the e2e cell, and SKIPs loudly without it."
     status: test        # verify_cdc_corruption_is_detected (dev/release_oracle/corruption.py)
+  - id: cdc_differential
+    what: "an INDEPENDENT implementation of the same capture. `cdc_e2e` compares the destination
+      to the SOURCE (per-column null profile, distinct counts) and catches loss and
+      degrade-to-null; it is structurally blind to rivet and its own oracle agreeing on a wrong
+      SPEC. Debezium reads the same window from the same engine and the two captures are
+      compared in DuckDB on (op, key, VALUES). The value comparison is load-bearing: without it
+      a parquet with 100% of a column NULLed reports AGREE, measured, so a run that compared only
+      (op, key) is graded a FAILURE here rather than accepted. `key-update` is excluded and the
+      reason is written at the call site: rivet emits update(new) where Debezium emits
+      delete(old)+insert(new), which is a representation decision, and a cell that EXPECTS a
+      difference goes green the day someone fixes it."
+    infra: [docker]
+    status: test        # verify_cdc_differential (dev/release_oracle/cdc.py)
   - id: row_hash
     what: "`_rivet_row_hash` recomputed by something that is NOT rivet. The in-tree auditor recomputes with rivet's own `enrich` function — `src/lib.rs` says so deliberately, to avoid a second implementation drifting from the extractor — which is sound for detecting changed DATA and structurally blind to a defect in the SPEC, because both sides share it. Render id v1 shipped non-injective in two independent ways and lived four months. So this cell holds the other side: DuckDB re-reads the exported parquet, a Python implementation rebuilds the canonical image from the spec (presence tag, u32 length, rendered bytes) and hashes it with `xxhash`, and the two are compared. TWO checks, neither implying the other: DIGEST PARITY (catches a drift in rendering or framing) and INJECTIVITY (two rows differing only in where a field boundary falls must hash differently). The probe is exported TWICE because injectivity needs the primary key OUT of the coverage — measured: under v1's rendering the same probe scores 4/4 distinct with the key covered and 3/4 without it, so `row_hash: true` alone would pass against a length-less join. RED-proven on postgres against a v1-shape mutant: both checks fire, the second naming the colliding row pair. SKIPs loudly without the `xxhash` package rather than comparing rivet against itself."
     status: test        # verify_row_hash (dev/release_oracle/rowhash.py)

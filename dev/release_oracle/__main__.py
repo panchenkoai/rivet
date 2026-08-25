@@ -350,6 +350,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
+    cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
     # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than

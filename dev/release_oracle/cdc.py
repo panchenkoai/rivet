@@ -36,7 +36,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -1078,3 +1081,77 @@ def _cdc_state_snapshot_pg(surl: str) -> dict[str, str]:
     r = q("SELECT count(*)||' '||COALESCE(sum((status='success')::int),0) FROM run_status").split()
     snap["run_status_all_success"] = "yes" if len(r) == 2 and r[0] != "0" and r[0] == r[1] else "no"
     return snap
+
+
+# ── the differential oracle: rivet vs Debezium over the SAME window ──────────
+#
+# `verify_cdc_e2e` above compares the destination to the SOURCE, per-column null
+# profile and distinct counts included. It catches loss and degrade-to-null. It is
+# structurally blind to rivet and its own oracle agreeing on a wrong SPEC — which
+# is what an INDEPENDENT implementation of the same capture catches, and nothing
+# else in this gate does.
+#
+# The harness (`dev/cdc-oracle/run.py`) stands the reference up itself: pulls
+# quay.io/debezium/server, puts a receiver on the stand network, and waits on the
+# engine's OWN readiness signal (PG `pg_replication_slots.active`, MySQL's Binlog
+# Dump thread in SHOW PROCESSLIST, MSSQL/Mongo offsets). Every config trap it hit
+# is written down in that directory's README, and each one presents identically:
+# "started and captured nothing".
+#
+# Scenario choice, said plainly: `key-update` is EXCLUDED. rivet emits `update(new)`
+# where Debezium emits `delete(old)+insert(new)`, identically on PostgreSQL and
+# MySQL, and that is a representation decision rather than a defect — a gate cell
+# that EXPECTS a difference would go green on the day someone fixes it, which is
+# the wrong direction for a ratchet. It belongs in the ADR, not here.
+_DIFFERENTIAL_SCENARIOS = ("crud", "wide-txn", "mid-stream-table")
+
+
+def verify_cdc_differential(led: "Ledger") -> None:
+    """rivet and Debezium over one window, compared in DuckDB.
+
+    SKIPS loudly when docker or the harness is unavailable — the ledger carries an
+    explicit Skipped that is not a pass. It does NOT fail the release on a missing
+    reference image, because an unreachable quay.io is an infrastructure fact about
+    the runner rather than a statement about the build.
+    """
+    root = Path(__file__).resolve().parents[2]
+    runner = root / "dev" / "cdc-oracle" / "run.py"
+    if not runner.is_file():
+        led.skipped("-", "cdc", "differential", "-",
+                    f"differential: {runner} absent", "no harness")
+        return
+    if shutil.which("docker") is None:
+        led.skipped("-", "cdc", "differential", "-",
+                    "differential: docker unavailable on this runner", "no docker")
+        return
+
+    led.phase("CDC differential [rivet vs Debezium] (same window, compared in DuckDB)")
+    for eng in ("postgres", "mysql", "mssql", "mongo"):
+        for scen in _DIFFERENTIAL_SCENARIOS:
+            r = subprocess.run(
+                [sys.executable, str(runner), "--engine", eng, "--scenario", scen],
+                capture_output=True, text=True, timeout=900,
+            )
+            tail = (r.stdout or "")[-600:] + (r.stderr or "")[-600:]
+            if r.returncode == 0 and "AGREE" in (r.stdout or ""):
+                # The message names its own scope. A run that compared only
+                # (op, key) says so, and that is NOT the check this row claims —
+                # so it is graded as a failure rather than quietly accepted.
+                if "VALUES NOT COMPARED" in r.stdout:
+                    led.failed(eng, "cdc", f"differential:{scen}", "-",
+                               f"differential[{eng}/{scen}]: values were not compared "
+                               f"— the row claims a value-level check", "no values")
+                else:
+                    led.passed(eng, "cdc", f"differential:{scen}", "-",
+                               f"differential[{eng}/{scen}]: AGREE with values")
+            elif "DISAGREE" in (r.stdout or ""):
+                led.failed(eng, "cdc", f"differential:{scen}", "-",
+                           f"differential[{eng}/{scen}]: DISAGREE\n{tail}", "disagree")
+            else:
+                # Neither AGREE nor DISAGREE: the harness itself did not complete.
+                # Seven plumbing artefacts in two days say this happens, and a gate
+                # that reports its own races as release blockers gets muted — so it
+                # is a SKIP with the tail attached, never a silent pass.
+                led.skipped(eng, "cdc", f"differential:{scen}", "-",
+                            f"differential[{eng}/{scen}]: harness did not complete\n{tail}",
+                            "harness")
