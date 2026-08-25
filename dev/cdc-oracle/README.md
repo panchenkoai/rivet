@@ -188,20 +188,35 @@ lesson it learned from a `verify_blessed_path` registered `test` on four engines
 with no caller anywhere in the tree. A row describing intent is exactly what it
 exists to reject.
 
-Three things must be true before the row belongs there. As of 2026-08-25 the
-second and third are done and the first is not:
+Three things had to be true before the row belonged there. All three are done as
+of 2026-08-25, and the row is wired:
 
-1. **The gate must stand up the reference.** NOT DONE. Pull
-   `quay.io/debezium/server`, put a receiver on the stand network, wait on the
-   engine's own readiness signal. Every config trap is in this README and each
-   presents as "started and captured nothing". This is the remaining work.
-2. **`--value` must be on.** DONE 2026-08-25 — on by default, RED-proven to catch
-   a fully NULLed column, and the delete path AGREES on all four engines. It was
+1. **The gate must stand up the reference.** DONE — `verify_cdc_differential`
+   (dev/release_oracle/cdc.py), called from `__main__`, row `cdc_differential`
+   in docs/release-gate-matrix.yaml marked `test`. The harness already pulled
+   `quay.io/debezium/server`, put a receiver on the stand network and waited on
+   each engine's OWN readiness signal, so the gate did not have to learn any of
+   it. The gap ratchet is untouched at 10 because nothing was added to it — the
+   two earlier refusals were both correct, and the fix was to WIRE the check
+   rather than to describe it.
+2. **`--value` must be on.** DONE — on by default, RED-proven to catch a fully
+   NULLed column, AGREE on all four engines including the delete path. It was
    never a delete-path problem: three defects in the comparison itself (artefacts
    7, 8, 9 above) produced that symptom.
 3. **The harness must stay quiet when nothing is wrong.** DONE for the shapes
    found so far — `postgres crud` three times in a row AGREES three times, where
    the un-cleared work dir made run 2 disagree. Said with the caveat the artefact
-   list earns: seven plumbing defects in two days means the next one is likely,
-   and this precondition is a standing obligation rather than a box that stays
-   ticked.
+   list earns: nine defects in two days means the next one is likely, so the gate
+   grades a harness that did not complete as SKIP with the tail attached, never a
+   silent pass.
+
+Two grading decisions live at the call site rather than here, because they decide
+what the gate MEANS:
+
+- An AGREE that compared only `(op, key)` is a FAILURE, not a pass. The row claims
+  a value-level check, the comparison names its own scope in its output, and that
+  is checked rather than assumed.
+- `key-update` is excluded. rivet emits `update(new)` where Debezium emits
+  `delete(old)+insert(new)`, identically on PostgreSQL and MySQL — a representation
+  decision that belongs in an ADR. A gate cell EXPECTING a difference would go
+  green the day someone fixes it, which is the wrong direction for a ratchet.
