@@ -16,8 +16,8 @@
 #      never-loaded data. Fixed: only a successful load marks runs loaded.
 #
 # Coverage note: all three modes are live-verified end-to-end on the devbox —
-# full (smoke_batch_mysql), cdc (cdc_backfill_snapshot_{mysql,pg,mongo}), and
-# incremental (incremental_dedup_mysql: no-loss + cursor dedup + never-tombstones
+# full (warehouse_cell_smoke_batch_mysql), cdc (cdc_backfill_snapshot_{mysql,pg,mongo}), and
+# incremental (warehouse_cell_incremental_dedup_mysql: no-loss + cursor dedup + never-tombstones
 # + staging wiped), backed by the dedup-view + ledger unit tests. `na` marks a
 # contract that mode does not have (full has no dedup view; incremental/cdc never
 # OVERWRITE, so never truncate).
@@ -65,7 +65,7 @@ scenarios:
     what: "a delete: cdc keeps a flagged tombstone (__is_deleted=true); incremental cannot observe deletes and never tombstones"
     full:        { na: "a full snapshot mirrors the source — a deleted row is simply absent next run" }
     incremental: { test: inc_dedup_view_orders_by_cursor_and_never_tombstones_on_every_dialect }
-    cdc:         { test: mongo_cdc_delete_flag_bigquery }
+    cdc:         { test: warehouse_cell_mongo_cdc_delete_flag_bigquery }
 
   - id: ledger_skips_already_loaded_runs
     what: "the state DB records each load and skips extraction runs already loaded into a target — the incremental step is DB-driven, not file-driven"
@@ -83,7 +83,7 @@ scenarios:
     what: "cdc.initial: snapshot backfills preexisting rows into the change log, then streams — the view keeps every backfilled row live"
     full:        { na: "full IS a snapshot — no separate backfill step" }
     incremental: { na: "incremental has no snapshot phase — the first run exports all rows above the empty cursor" }
-    cdc:         { test: cdc_backfill_snapshot_mysql }
+    cdc:         { test: warehouse_cell_cdc_backfill_snapshot_mysql }
 
   - id: snapshot_completion_survives_cleanup
     what: "snapshot completion is recorded in the state DB (not a bucket marker), so cleanup can wipe the bucket without triggering a full re-snapshot"
@@ -99,6 +99,6 @@ scenarios:
 
   - id: cleanup_source_safe_end_to_end
     what: "cleanup_source: true wipes the staged Parquet after a recorded load without losing data — proven live end to end"
-    full:        { test: smoke_batch_mysql }
-    incremental: { test: incremental_dedup_mysql }
-    cdc:         { test: cdc_backfill_snapshot_mysql }
+    full:        { test: warehouse_cell_smoke_batch_mysql }
+    incremental: { test: warehouse_cell_incremental_dedup_mysql }
+    cdc:         { test: warehouse_cell_cdc_backfill_snapshot_mysql }

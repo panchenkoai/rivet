@@ -377,6 +377,11 @@ pub enum OracleOutcome {
     Skipped { why: String },
 }
 
+/// Why a runner reports `Skipped` rather than an empty result. `assert_all_pass`
+/// panics on Skipped and walks straight through an empty vec — so an empty return
+/// is a cell that verified nothing and said it passed.
+const SKIP_WHY: &str = "RIVET_TEST_GCS_BUCKET unset — no live warehouse env. This cell verified NOTHING; a green run without it is absence, not success";
+
 impl Verification {
     pub fn new(engine: Engine, mode: Mode, fixture: Fixture) -> Self {
         Verification {
@@ -407,12 +412,29 @@ impl Verification {
         &self,
         oracles: &[WarehouseOracle],
     ) -> Result<Vec<(WarehouseOracle, OracleOutcome)>> {
-        if no_live_warehouse_env() {
-            eprintln!("SKIP run: RIVET_TEST_GCS_BUCKET unset — no live warehouse env");
-            return Ok(Vec::new());
-        }
+        // Order matters: an empty oracle list is a CONFIG error whatever the
+        // environment, so it is answered before the env check — otherwise a machine
+        // without credentials cannot tell a mis-declared cell from a skipped one.
         if oracles.is_empty() {
             bail!("strength-floor: a `test:` case must declare ≥1 oracle (ADR-0001)");
+        }
+        if no_live_warehouse_env() {
+            // A `Skipped` per requested oracle, NOT an empty vec: `assert_all_pass`
+            // panics on Skipped and walks straight through an empty list, so the
+            // empty return made every cell in the matrix pass vacuously on a machine
+            // with no credentials — while this function's own doc called that a
+            // strength-floor failure.
+            return Ok(oracles
+                .iter()
+                .map(|o| {
+                    (
+                        *o,
+                        OracleOutcome::Skipped {
+                            why: SKIP_WHY.to_string(),
+                        },
+                    )
+                })
+                .collect());
         }
         let env = HarnessEnv::load()?;
         let work = TempWork::new("rivet-pro-matrix")?;
@@ -447,8 +469,12 @@ impl Verification {
         soak: &[SoakOracle],
     ) -> Result<Vec<(String, OracleOutcome)>> {
         if no_live_warehouse_env() {
-            eprintln!("SKIP run_soak: RIVET_TEST_GCS_BUCKET unset — no live warehouse env");
-            return Ok(Vec::new());
+            return Ok(vec![(
+                "run_soak".to_string(),
+                OracleOutcome::Skipped {
+                    why: SKIP_WHY.to_string(),
+                },
+            )]);
         }
         if self.mode != Mode::Cdc {
             bail!("run_soak requires Mode::Cdc");
@@ -512,8 +538,12 @@ impl Verification {
     /// `_id:1` live and `_id:2` as a tombstone (`__is_deleted = true`).
     pub fn run_mongo_cdc_delete(&self) -> Result<Vec<(String, OracleOutcome)>> {
         if no_live_warehouse_env() {
-            eprintln!("SKIP run_mongo_cdc_delete: RIVET_TEST_GCS_BUCKET unset");
-            return Ok(Vec::new());
+            return Ok(vec![(
+                "run_mongo_cdc_delete".to_string(),
+                OracleOutcome::Skipped {
+                    why: SKIP_WHY.to_string(),
+                },
+            )]);
         }
         if self.engine != Engine::Mongo || self.mode != Mode::Cdc {
             bail!("run_mongo_cdc_delete is Mongo+Cdc only");
@@ -591,8 +621,12 @@ impl Verification {
     /// source + an `id` column — neither holds for Mongo's `_id`/JSON-blob model).
     pub fn run_mongo_batch(&self) -> Result<Vec<(String, OracleOutcome)>> {
         if no_live_warehouse_env() {
-            eprintln!("SKIP run_mongo_batch: RIVET_TEST_GCS_BUCKET unset");
-            return Ok(Vec::new());
+            return Ok(vec![(
+                "run_mongo_batch".to_string(),
+                OracleOutcome::Skipped {
+                    why: SKIP_WHY.to_string(),
+                },
+            )]);
         }
         if self.engine != Engine::Mongo || self.mode != Mode::Batch {
             bail!("run_mongo_batch is Mongo+Batch only");
@@ -663,8 +697,12 @@ impl Verification {
     /// insert), tombstoned 1, and an untouched mid-backfill row live.
     pub fn run_cdc_backfill(&self) -> Result<Vec<(String, OracleOutcome)>> {
         if no_live_warehouse_env() {
-            eprintln!("SKIP run_cdc_backfill: RIVET_TEST_GCS_BUCKET unset");
-            return Ok(Vec::new());
+            return Ok(vec![(
+                "run_cdc_backfill".to_string(),
+                OracleOutcome::Skipped {
+                    why: SKIP_WHY.to_string(),
+                },
+            )]);
         }
         if self.mode != Mode::Cdc || !self.initial_snapshot {
             bail!("run_cdc_backfill needs Mode::Cdc + .initial_snapshot()");
@@ -775,8 +813,12 @@ impl Verification {
     /// bucket.
     pub fn run_incremental(&self) -> Result<Vec<(String, OracleOutcome)>> {
         if no_live_warehouse_env() {
-            eprintln!("SKIP run_incremental: RIVET_TEST_GCS_BUCKET unset");
-            return Ok(Vec::new());
+            return Ok(vec![(
+                "run_incremental".to_string(),
+                OracleOutcome::Skipped {
+                    why: SKIP_WHY.to_string(),
+                },
+            )]);
         }
         let env = HarnessEnv::load()?;
         let work = TempWork::new("rivet-incremental")?;

@@ -734,3 +734,72 @@ fn mongo_cdc_per_field_presence_matches_the_source() {
         );
     }
 }
+
+/// A DELETE carries the PRE-IMAGE when the collection has one — the half of Mongo's
+/// delete semantics that nothing asked about.
+///
+/// `mongo_cdc_update_and_delete_carry_document` asserts the opposite case and says
+/// so: with pre-images off, a delete's `document` is NULL and the schema must allow
+/// it. That is the DEFAULT, and it left the whole `full_document_before_change`
+/// request — which rivet issues on every stream — verified by nothing. A silent
+/// no-op and a working pre-image look identical from the default collection.
+///
+/// The distinction matters to a consumer: with a pre-image the delete tombstone
+/// carries what the row WAS, so a loader can reconcile it against the destination;
+/// without one it carries only `_id`.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs (6.0+ for pre-images)"]
+fn mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let db = unique_name("cdc_preimg");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+    // The collection must EXIST before collMod can change it.
+    m.upsert_set("t", 9, "v", "seed");
+    if !m.enable_pre_images("t") {
+        // Said out loud rather than passed quietly: on a pre-6.0 server there is no
+        // pre-image to carry and this cell is genuinely not applicable.
+        eprintln!(
+            "SKIP: server major {} has no changeStreamPreAndPostImages",
+            m.server_major()
+        );
+        return;
+    }
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin the anchor past the seed
+
+    m.upsert_set("t", 9, "v", "doomed");
+    m.delete_one("t", 9);
+    rig.run_ok();
+
+    let changes = read_mongo_cdc_changes(&rig.out_dir());
+    let del = changes
+        .iter()
+        .find(|c| c.op == "delete")
+        .unwrap_or_else(|| {
+            panic!(
+                "no delete captured — the fixture is inert ({} changes)",
+                changes.len()
+            )
+        });
+    assert_eq!(del.id, "9", "the delete must carry its _id");
+
+    // MEASURED 2026-08-25 (MongoDB 7.0.37): {"_id":9,"v":"doomed"} — the pre-image
+    // is the document as it was at the instant of the delete, not the seed value it
+    // held two writes earlier. Both halves are asserted, because a `document` that
+    // merely parses proves nothing about WHICH image arrived.
+    assert!(
+        del.document.contains("\"v\":\"doomed\""),
+        "the delete must carry the PRE-IMAGE — the value the document held when it \
+         was deleted. Got: {}",
+        del.document
+    );
+    assert!(
+        !del.document.contains("seed"),
+        "...and the pre-image is the state at DELETE time, not an earlier one. \
+         Got: {}",
+        del.document
+    );
+}

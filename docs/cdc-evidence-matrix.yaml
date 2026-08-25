@@ -269,9 +269,17 @@ shapes:
         profile is not up", kind: skip-as-pass }
     mysql:    { gap: "same class, not enumerated per test" }
     mssql:    { gap: "same class, not enumerated per test" }
-    mongo:    { vacuous: "run_mongo_cdc_delete returns an empty vec rather than Skipped, so
-        assert_all_pass has nothing to panic on", kind: skip-as-pass }
-
+    mongo:
+      sound: "closed 2026-08-25, and it was not one cell but SIX. Every runner in
+        tests/harness/mod.rs answered a missing RIVET_TEST_GCS_BUCKET with Ok(Vec::new());
+        assert_all_pass panics on Skipped and walks straight through an empty list, so the
+        whole oracle-fixture matrix reported `20 passed` in 0.00s on any machine without
+        credentials — which is EVERY machine, since that variable appears in no workflow.
+        Each runner now returns a Skipped outcome (SKIP_WHY), the two CI lanes that cannot
+        supply credentials exclude the cells BY NAME (--skip warehouse_cell, prefix added
+        for exactly that), and tests/offline/skip_is_not_a_pass_guard.rs derives the runner
+        set from the source so a seventh is asked the same question. RED-proven by
+        restoring one empty return." 
   - id: delete_semantics_are_end_to_end
     what: >
       Tombstones and the 'live current state is WHERE NOT __is_deleted' contract must be
@@ -280,6 +288,14 @@ shapes:
     postgres: { sound: "covered by the delete-capture cells in cdc-matrix" }
     mysql:    { sound: "covered by the delete-capture cells in cdc-matrix" }
     mssql:    { sound: "covered by the delete-capture cells in cdc-matrix" }
-    mongo:    { vacuous: "the only end-to-end assertion lives in a bespoke harness path, and
-        delete PRE-IMAGES (full_document_before_change) have no test at all while doctor
-        reports on them", kind: second-cause }
+    mongo:
+      sound: "closed 2026-08-25. The pre-existing test asserts the DEFAULT case (pre-images
+        off ⇒ document NULL) and says so, which left rivet's own
+        full_document_before_change(WhenAvailable) request — issued on every stream —
+        verified by nothing: a silent no-op and a working pre-image are indistinguishable
+        from a default collection. mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one
+        (live_cdc_mongo.rs) enables changeStreamPreAndPostImages via the rig's
+        MongoTest::enable_pre_images and asserts the delete carries the document AS OF the
+        delete (measured {_id:9,v:'doomed'}, not the earlier 'seed'). RED against
+        `ChangeOp::Delete => cse.full_document` — and the disagreement is the finding: the
+        pre-existing delete test stays GREEN against that same mutant." 

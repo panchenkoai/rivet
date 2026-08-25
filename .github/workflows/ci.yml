@@ -1591,7 +1591,17 @@ jobs:
         # mongo` covers every Mongo test by substring — the live_mongo* / live_cdc_mongo
         # modules AND the Mongo cells of the engine-agnostic chunking_stand
         # (`stand_*_mongo`), which a module-prefix skip like `--skip live_mongo` misses.
-        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb --skip mongo
+        # Skip the warehouse cells (`tests/oracle_fixture_matrix.rs`, every test
+        # prefixed `warehouse_cell_`): they drive a REAL BigQuery/Snowflake target
+        # and need RIVET_TEST_GCS_BUCKET plus warehouse credentials, which this job
+        # does not have and no workflow supplies. They used to be SELECTED here and
+        # pass in 0.00s — the harness returned an empty oracle list on a missing
+        # env, and `assert_all_pass` walks straight through an empty list, so 20
+        # cells reported green while verifying nothing. The runners now report
+        # `Skipped`, which the strength floor treats as a failure (its own doc said
+        # so all along), so the exclusion has to be written HERE where a reader can
+        # see it rather than hidden in the harness.
+        run: cargo test -- --ignored --skip content_export --skip validates --skip edge_cases --skip via_duckdb --skip mongo --skip warehouse_cell
 
       - name: Stop services
         if: always()
