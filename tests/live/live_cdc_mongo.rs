@@ -760,10 +760,10 @@ fn mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one() {
     if !m.enable_pre_images("t") {
         // Said out loud rather than passed quietly: on a pre-6.0 server there is no
         // pre-image to carry and this cell is genuinely not applicable.
-        eprintln!(
-            "SKIP: server major {} has no changeStreamPreAndPostImages",
+        skip_live(&format!(
+            "server major {} has no changeStreamPreAndPostImages",
             m.server_major()
-        );
+        ));
         return;
     }
 

@@ -124,7 +124,7 @@ fn parallel_checkpoint(rig: Rig) -> Rig {
 fn state_parity_parallel_keyset_checkpoint() {
     require_alive(LiveService::Postgres);
     let Some(pg) = pg_state_url() else {
-        eprintln!("skip: RIVET_TEST_STATE_URL not set");
+        skip_live("RIVET_TEST_STATE_URL not set");
         return;
     };
     let table = unique_name("sp_ckpt");
@@ -152,7 +152,7 @@ fn incremental(rig: Rig) -> Rig {
 fn state_parity_incremental_cursor() {
     require_alive(LiveService::Postgres);
     let Some(pg) = pg_state_url() else {
-        eprintln!("skip: RIVET_TEST_STATE_URL not set");
+        skip_live("RIVET_TEST_STATE_URL not set");
         return;
     };
     let table = unique_name("sp_incr");
@@ -210,7 +210,7 @@ fn state_parity_incremental_cursor() {
 fn state_parity_parallel_keyset_crash_resume() {
     require_alive(LiveService::Postgres);
     let Some(pg) = pg_state_url() else {
-        eprintln!("skip: RIVET_TEST_STATE_URL not set");
+        skip_live("RIVET_TEST_STATE_URL not set");
         return;
     };
     let table = unique_name("sp_crash");

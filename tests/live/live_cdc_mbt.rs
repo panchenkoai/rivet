@@ -1057,7 +1057,7 @@ fn cdc_replication_grant_revoked_mid_life_fails_loud_and_resumes_after_regrant()
 #[ignore = "live: requires mysql-cdc + RIVET_TINYFS_DIR pointing at a ~2MB filesystem"]
 fn cdc_destination_disk_full_is_loud_and_lossless() {
     let Some(tiny) = std::env::var_os("RIVET_TINYFS_DIR") else {
-        eprintln!("RIVET_TINYFS_DIR not set — skipping (see the test doc for mounting)");
+        skip_live("RIVET_TINYFS_DIR not set — skipping (see the test doc for mounting)");
         return;
     };
     let tiny = std::path::PathBuf::from(tiny);

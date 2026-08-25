@@ -33,7 +33,9 @@ fn run_sweep(module: &str) {
     // this test is inert in jobs that don't provide the sweep's deps (e.g. the E2E
     // matrix has no host `duckdb` CLI). Corruption is exit 1; a clean run is exit 0.
     if out.status.code() == Some(2) {
-        eprintln!("SKIP {module}: sweep dependencies unavailable in this environment:\n{stdout}");
+        crate::common::skip_live(&format!(
+            "{module}: sweep dependencies unavailable in this environment:\n{stdout}"
+        ));
         return;
     }
     assert!(

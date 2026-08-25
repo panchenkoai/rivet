@@ -390,61 +390,65 @@ shapes:
       and the test refuses to skip when the marker is present.
     mutant: "unset the precondition and observe whether the suite still reports the claim covered"
     postgres:
-      gap: >-
-        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
-        class was not in the live suite at all: all six runners in tests/harness/mod.rs
-        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
-        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
-        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
-        milder and is stated rather than claimed closed: the standby refusal test (roast_pg_cdc_bounded_on_a_standby_fails_loud) and the pg18 governor catalog test return early when an opt-in
-        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
-        release oracle does NOT share this defect — it carries an explicit SKIP status,
-        distinct from pass, by design. The structural fix for the live suite is a marker
-        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
-        here rather than half-built, because a guard that greps for early returns had ten
-        false positives out of eleven when tried on the sibling class.
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
     mysql:
-      gap: >-
-        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
-        class was not in the live suite at all: all six runners in tests/harness/mod.rs
-        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
-        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
-        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
-        milder and is stated rather than claimed closed: the two compressed-binlog tests (mysql_cdc_refuses_a_compressed_binlog..., mysql_cdc_compressed_payload_in_stream_refuses_not_skips) return early when an opt-in
-        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
-        release oracle does NOT share this defect — it carries an explicit SKIP status,
-        distinct from pass, by design. The structural fix for the live suite is a marker
-        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
-        here rather than half-built, because a guard that greps for early returns had ten
-        false positives out of eleven when tried on the sibling class.
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
     mssql:
-      gap: >-
-        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
-        class was not in the live suite at all: all six runners in tests/harness/mod.rs
-        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
-        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
-        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
-        milder and is stated rather than claimed closed: no CDC test on this engine skips silently; the shared live sites that do (state-backend parity, validate-exit) are engine-agnostic return early when an opt-in
-        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
-        release oracle does NOT share this defect — it carries an explicit SKIP status,
-        distinct from pass, by design. The structural fix for the live suite is a marker
-        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
-        here rather than half-built, because a guard that greps for early returns had ten
-        false positives out of eleven when tried on the sibling class.
+      sound: >-
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
     mongo:
       sound: >-
-        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
-        class was not in the live suite at all: all six runners in tests/harness/mod.rs
-        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
-        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
-        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
-        milder and is stated rather than claimed closed: the pre-image test added today, which self-skips below server 6.0 and says the version it saw return early when an opt-in
-        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
-        release oracle does NOT share this defect — it carries an explicit SKIP status,
-        distinct from pass, by design. The structural fix for the live suite is a marker
-        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
-        here rather than half-built, because a guard that greps for early returns had ten
-        false positives out of eleven when tried on the sibling class.
+        closed 2026-08-25. The worst instance was in tests/harness/mod.rs — six runners
+        answering a missing warehouse env with an EMPTY result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine. That half was fixed and guarded first.
+        The live half is now closed too: `cargo test` prints `ok` for a test that returned
+        early, and the 22 skip sites said `SKIP`, `skip:`, `skipping:` and `... — skipping` in
+        four different spellings, so a release lane could not grep for them. One marker now
+        (`skip_live`, tests/common/mod.rs) printing `RIVET-SKIP <test> — <why>`, verified live.
+        Guarded by a_live_test_that_skips_says_so_through_the_one_marker
+        (tests/offline/skip_is_not_a_pass_guard.rs), which is WINDOW-based rather than
+        line-based — the first cut checked one line and sailed past every multi-line macro,
+        found by RED-proving the guard rather than reading it, and the rewrite immediately
+        surfaced four more sites including this engine's own standby test. RED-proven by
+        reverting a site to its own words.
   - id: delete_semantics_are_end_to_end
     what: >
       Tombstones and the 'live current state is WHERE NOT __is_deleted' contract must be

@@ -47,10 +47,20 @@ struct SfConfig {
 
 /// Read Snowflake configuration from env. Returns `None` if the connection name
 /// is missing or `snow` is not on PATH — tests skip rather than fail.
+/// The `RIVET-SKIP` marker, local to this suite (see tests/common/mod.rs for why
+/// one token: a lane cannot grep for four different spellings).
+fn skip_live(why: &str) {
+    let who = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed test>")
+        .to_string();
+    eprintln!("RIVET-SKIP {who} — {why}");
+}
+
 fn sf_config() -> Option<SfConfig> {
     let connection = std::env::var("SNOWFLAKE_TEST_CONNECTION").ok()?;
     if Command::new("snow").arg("--version").output().is_err() {
-        eprintln!("snowflake_load: skipping — `snow` CLI not on PATH");
+        skip_live("`snow` CLI not on PATH");
         return None;
     }
     Some(SfConfig {
@@ -173,7 +183,7 @@ fn infer_type<'a>(rows: &'a serde_json::Value, col: &str) -> &'a str {
 fn snowflake_validates_postgres_type_matrix_parquet() {
     require_alive(LiveService::Postgres);
     let Some(cfg) = sf_config() else {
-        eprintln!("snowflake_load: skipping (SNOWFLAKE_TEST_CONNECTION not set)");
+        skip_live("SNOWFLAKE_TEST_CONNECTION not set");
         return;
     };
 
@@ -294,7 +304,7 @@ fn snowflake_validates_mysql_uint64_overflow_survives_via_decimal_override() {
     use mysql::prelude::Queryable;
     require_alive(LiveService::Mysql);
     let Some(cfg) = sf_config() else {
-        eprintln!("snowflake_load: skipping (SNOWFLAKE_TEST_CONNECTION not set)");
+        skip_live("SNOWFLAKE_TEST_CONNECTION not set");
         return;
     };
 

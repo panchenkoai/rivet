@@ -156,3 +156,97 @@ fn every_toxiproxy_fault_injector_asserts_its_own_injection_landed() {
          never happened."
     );
 }
+
+/// A live test that does not run must say so in ONE countable form.
+///
+/// `cargo test` prints `ok` for a test that returned early, so a skip and a pass
+/// are indistinguishable in the output — the same shape that let 20 warehouse
+/// cells report `20 passed` in 0.00s. The harness half got an explicit `Skipped`
+/// outcome; the live suite has no such channel, so the marker IS the channel.
+///
+/// Before this, the thirteen skip sites said `SKIP`, `skip:`, `skipping:` and
+/// `RIVET_TINYFS_DIR not set — skipping` in four different shapes. A release lane
+/// cannot grep for all of them, which is why the skips were invisible rather than
+/// merely inconvenient.
+///
+/// Narrow ON PURPOSE. The obvious guard — find every early return and ask whether
+/// it announced itself — was tried on the sibling class today and produced ten
+/// false positives out of eleven (the word "kill" in a comment, assertions living
+/// in a shared runner). This one looks for a specific string in a specific macro,
+/// which is exactly the drift it exists to catch and nothing else.
+#[test]
+fn a_live_test_that_skips_says_so_through_the_one_marker() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut offenders = Vec::new();
+    let mut marked = 0usize;
+    let mut stack: Vec<PathBuf> = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).expect("read tests dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            // The helper's own definition and this guard both mention the token.
+            if p.ends_with("common/mod.rs") || p.ends_with("skip_is_not_a_pass_guard.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).expect("read a test file");
+            marked += src.matches("skip_live(").count();
+            // WINDOW-based, not line-based. The first cut checked `is_print &&
+            // says_skip` on ONE line and sailed past a multi-line macro — where
+            // `eprintln!(` sits on its own line and the message on the next, which
+            // is how rustfmt writes any message long enough to matter. Found by
+            // RED-proving the guard rather than by reading it: reverting a site to
+            // `eprintln!(\n  "SKIP: ...` left it green.
+            let bytes = src.as_bytes();
+            for m in ["println!(", "eprintln!("] {
+                let mut from = 0usize;
+                while let Some(rel) = src[from..].find(m) {
+                    let at = from + rel;
+                    from = at + m.len();
+                    // `eprintln!(` also matches inside `println!(` — skip the inner hit.
+                    if m == "println!(" && at > 0 && bytes[at - 1] == b'e' {
+                        continue;
+                    }
+                    let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    if src[line_start..at].trim_start().starts_with("//") {
+                        continue;
+                    }
+                    // The macro's arguments, bounded so a later unrelated "skip"
+                    // cannot be attributed to this call.
+                    let end = (at + 300).min(src.len());
+                    let win = &src[at..src[at..end].find(");").map(|i| at + i).unwrap_or(end)];
+                    if !win.to_lowercase().contains("skip") {
+                        continue;
+                    }
+                    if win.contains("skip_live") || win.contains("RIVET-SKIP {who}") {
+                        continue;
+                    }
+                    let line_no = src[..at].matches('\n').count() + 1;
+                    offenders.push(format!(
+                        "{}:{}  {}",
+                        p.strip_prefix(&root).unwrap_or(&p).display(),
+                        line_no,
+                        win.replace('\n', " ").chars().take(90).collect::<String>()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        marked >= 9,
+        "found only {marked} `skip_live(` call sites — the sweep that introduced the \
+         marker converted nine, so a number below that means they were reverted or \
+         this guard is reading the wrong tree, and it would pass over anything"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these announce a skip in their own words instead of through `skip_live`, so \
+         a release lane cannot count them:\n  {}",
+        offenders.join("\n  ")
+    );
+}

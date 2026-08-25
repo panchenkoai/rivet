@@ -4925,9 +4925,9 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     )
     .is_err()
     {
-        eprintln!(
-            "SKIP roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
-             (bring it up with `python3 -m dev.pytools.cdc_stand standby`)"
+        skip_live(
+            "roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
+             (bring it up with `python3 -m dev.pytools.cdc_stand standby`)",
         );
         return;
     }
@@ -5527,7 +5527,7 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
         .ok()
         .flatten();
     if supported.is_none() {
-        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        skip_live("server has no binlog_transaction_compression (pre-8.0.20)");
         return;
     }
 
@@ -5655,7 +5655,7 @@ fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
         .ok()
         .flatten();
     if supported.is_none() {
-        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        skip_live("server has no binlog_transaction_compression (pre-8.0.20)");
         return;
     }
 

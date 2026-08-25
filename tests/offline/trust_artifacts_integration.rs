@@ -19,6 +19,20 @@
 
 use std::path::{Path, PathBuf};
 
+/// The same `RIVET-SKIP` marker the live suite uses, defined locally because this
+/// suite is deliberately self-contained (no shared `mod common` — see the module
+/// doc on tests/offline_suite.rs).
+///
+/// These skips fire when the binary is not built, which is exactly the vacuous
+/// pass this marker exists to make visible: `cargo test` prints `ok` either way.
+fn skip_live(why: &str) {
+    let who = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed test>")
+        .to_string();
+    eprintln!("RIVET-SKIP {who} — {why}");
+}
+
 use rivet::config::{DestinationConfig, DestinationType};
 use rivet::journal::PlanSnapshot;
 use rivet::manifest::{
@@ -2030,7 +2044,7 @@ fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
         })
         .unwrap_or_else(|| "target/debug/rivet".into());
     if !std::path::Path::new(&bin).exists() {
-        eprintln!("skipping flag-count test: binary not built at {bin}");
+        skip_live(&format!("flag-count test: binary not built at {bin}"));
         return;
     }
     let output = std::process::Command::new(&bin)
@@ -2106,7 +2120,7 @@ fn rivet_validate_subcommand_drives_existing_m5_semantics_passing_path() {
     // a `summary.json[validation][manifest]` consumer already parses.
     let bin = locate_rivet_bin();
     let Some(bin) = bin else {
-        eprintln!("skipping rivet_validate_subcommand test: binary not built");
+        skip_live("rivet_validate_subcommand test: binary not built");
         return;
     };
 
@@ -2182,7 +2196,7 @@ fn rivet_validate_subcommand_exits_nonzero_on_missing_part() {
     // branch on the exit code without parsing JSON.
     let bin = locate_rivet_bin();
     let Some(bin) = bin else {
-        eprintln!("skipping rivet_validate_subcommand failure test: binary not built");
+        skip_live("rivet_validate_subcommand failure test: binary not built");
         return;
     };
 
@@ -2239,7 +2253,7 @@ fn rivet_validate_subcommand_legacy_run_exits_zero() {
     // failures), JSON carries `legacy_run: true`, parts_verified = 0.
     let bin = locate_rivet_bin();
     let Some(bin) = bin else {
-        eprintln!("skipping rivet_validate_subcommand legacy test: binary not built");
+        skip_live("rivet_validate_subcommand legacy test: binary not built");
         return;
     };
 
@@ -2297,7 +2311,7 @@ fn rivet_run_resume_refuses_when_success_marker_present_without_force() {
     // `--force` is given.  This test pins the refusal end-to-end.
     let bin = locate_rivet_bin();
     let Some(bin) = bin else {
-        eprintln!("skipping success-gate test: binary not built");
+        skip_live("success-gate test: binary not built");
         return;
     };
 
@@ -2388,7 +2402,7 @@ fn rivet_run_resume_proceeds_when_no_success_marker() {
     // protect.
     let bin = locate_rivet_bin();
     let Some(bin) = bin else {
-        eprintln!("skipping success-gate-absent test: binary not built");
+        skip_live("success-gate-absent test: binary not built");
         return;
     };
 

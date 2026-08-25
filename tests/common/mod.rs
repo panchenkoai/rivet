@@ -86,6 +86,29 @@ static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Build a globally-unique identifier safe to use as a SQL table name or an
 /// export name.  Combines process id and an atomic counter so parallel
 /// `cargo test --test-threads=N` runs do not collide.
+/// Announce that a live test did NOT run, in a form a release lane can COUNT.
+///
+/// `cargo test` prints `ok` for a test that returned early, so a skip and a pass
+/// are indistinguishable in the output — the same shape that let 20 warehouse
+/// cells report `20 passed` in 0.00s. The harness half of that was fixed by giving
+/// its runners an explicit `Skipped` outcome; the live suite has no such channel,
+/// so the marker IS the channel.
+///
+/// One token, `RIVET-SKIP`, and the test's own name, because the messages it
+/// replaces said `SKIP`, `skip:`, and `skipping` in three different shapes and a
+/// lane cannot grep for all of them. What a lane does with the count is its
+/// business: assert a ceiling, diff against a previous run, or just print it —
+/// none of which is possible while the skips are invisible.
+///
+/// Returns `()` so a call site reads `return skip_live("...")`.
+pub fn skip_live(why: &str) {
+    let who = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed test>")
+        .to_string();
+    eprintln!("RIVET-SKIP {who} — {why}");
+}
+
 pub fn unique_name(prefix: &str) -> String {
     let c = NAME_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();

@@ -96,9 +96,9 @@ fn roast_validate_exits_nonzero_when_manifest_unreadable() {
     if std::fs::read(&manifest_path).is_ok() {
         // Running as root: mode 000 does not block reads, so the degraded
         // state cannot be staged.  Skip rather than report a false verdict.
-        eprintln!(
+        skip_live(
             "skipping roast_validate_exits_nonzero_when_manifest_unreadable: \
-             euid 0 ignores file modes"
+             euid 0 ignores file modes",
         );
         return;
     }
