@@ -30,7 +30,28 @@ fn skip_live(why: &str) {
         .name()
         .unwrap_or("<unnamed test>")
         .to_string();
-    eprintln!("RIVET-SKIP {who} — {why}");
+    let line = format!("RIVET-SKIP {who} — {why}");
+    eprintln!("{line}");
+    // To a FILE as well: libtest captures and discards a PASSING test's stderr, and
+    // a skip IS a pass — so the eprintln alone is invisible without `--nocapture`,
+    // which no workflow passes. See tests/common/mod.rs for the measurement.
+    let path = std::env::var("RIVET_SKIP_LOG").unwrap_or_else(|_| {
+        format!(
+            "{}/rivet-skips.log",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into())
+        )
+    });
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 use rivet::config::{DestinationConfig, DestinationType};

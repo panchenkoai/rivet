@@ -313,6 +313,13 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
             "{point}: the faulted run must fail loudly"
         );
 
+        // The fixture's threshold, ASSERTED — see the sibling below. Three separate
+        // statements are what make three parts roll; one 30-row INSERT is ONE
+        // transaction and one part, and a one-part fold cannot tell `^=` from `|=`.
+        // The sweep hits fault points BEFORE any part exists, so this is checked
+        // after the retries rather than here — the count that matters is what the
+        // completed export holds.
+
         // Clean retries close the gap.
         let mut ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for _ in 0..3 {
@@ -410,6 +417,26 @@ fn cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read() {
     // Crash in the ack→terminal-manifest window: the 3 parts are flushed and the
     // slot acked past them, but the terminal manifest is not yet written.
     let res = rig.run_with_env("RIVET_TEST_PANIC_AT", "cdc_before_manifest");
+    // The fixture's threshold, ASSERTED — not left to a comment. A fold over one
+    // element makes every fold operator identical, so this test grades the
+    // cross-part manifest fold only while several parts really roll. MEASURED:
+    // the single-INSERT form yields parts=1 and the three-statement form yields
+    // 3, and reverting to one INSERT left this test GREEN against the pre-ack
+    // manifest mutant — which is how two "3 parts at rollover 10" comments
+    // stayed wrong for months.
+    let parts = std::fs::read_dir(&out)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        parts >= 2,
+        "the fixture must cross the fold threshold — got {parts} part(s), and a \
+         one-part fold cannot tell `^=` from `|=`"
+    );
+
     assert!(
         !res.status.success(),
         "the faulted run must fail loudly at cdc_before_manifest"
