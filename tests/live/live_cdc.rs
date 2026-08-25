@@ -4100,6 +4100,51 @@ fn roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging() {
         "a TRUNCATE naming our table SECOND in a list must still refuse, and name \
          OUR table rather than whichever came first. Output:\n{said2}"
     );
+    // ── and the refusal must not WEDGE the capture ────────────────────────────
+    //
+    // The peek is non-consuming, so the slot still sits on the truncate commit:
+    // every later run meets it first and clean changes queued BEHIND it are
+    // blocked, while the un-acked slot pins WAL. MEASURED: an ordinary INSERT
+    // after the truncate leaves the second run failing identically.
+    //
+    // The message's first version said only "re-snapshot (mode: full)" — which on
+    // PostgreSQL does not move the SLOT and therefore does not recover. This is
+    // the same defect the unchanged-TOAST refusal had, found the same day by an
+    // adversarial pass, in a guard I wrote after fixing that one.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (77,770)"), &[])
+        .unwrap();
+    let again = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+    assert!(
+        !again.status.success(),
+        "a clean change queued behind the truncate must still be blocked — if this \
+         ever passes the wedge is gone and the message should be softened"
+    );
+    assert!(
+        said.contains("pg_replication_slot_advance"),
+        "the refusal must name the way OUT of the wedge, not only the re-snapshot: \
+         re-snapshotting alone leaves the slot where it is. Got:\n{said}"
+    );
+    // The route the message names must actually work.
+    let past: String = c
+        .query_one(
+            &format!(
+                "SELECT max(lsn)::text FROM pg_logical_slot_peek_changes('{slot}', NULL, NULL) \
+                 WHERE data LIKE '%COMMIT%'"
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    c.execute(
+        &format!("SELECT pg_replication_slot_advance('{slot}', '{past}')"),
+        &[],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (88,880)"), &[])
+        .unwrap();
+    Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+        .source_url(cdc_db.url())
+        .run_ok();
 }
 
 /// MySQL peer of `roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging`,

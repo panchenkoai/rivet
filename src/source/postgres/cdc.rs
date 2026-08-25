@@ -1001,8 +1001,19 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          change. Skipping it would leave every row the truncate removed sitting in the \
          destination with no DELETE to retract it — the source empty, the destination \
          not, permanently, because those rows left the source without events and no \
-         later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
-         re-establish the baseline, then resume CDC from a fresh checkpoint."
+         later capture can reconcile them. \
+         \
+         AND THIS RUN WILL NOT MOVE ON ITS OWN. The peek is non-consuming, so the \
+         slot still sits on this commit: every later run meets it first and clean \
+         changes queued BEHIND it are blocked too, while the un-acked slot pins WAL. \
+         MEASURED — a truncate followed by an ordinary INSERT leaves the second run \
+         failing identically. \
+         \
+         Re-snapshot the table (`mode: full`) to re-establish the baseline, and then \
+         get the stream past this commit: \
+         SELECT pg_replication_slot_advance('<slot>', '<lsn past the truncate>'); \
+         Re-snapshotting ALONE leaves the capture wedged, because the slot has not \
+         moved."
     )
 }
 
