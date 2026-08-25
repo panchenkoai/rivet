@@ -37,7 +37,7 @@ MSSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MSSQL_CONTAINER", "ri
               "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
               "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-Q"]
 MONGO_HOST_IN_NET = os.environ.get("CDC_ORACLE_MONGO_HOST", "mongo80-cdc")
-MONGO_URL = os.environ.get("MONGO_CDC_URL", "mongodb://127.0.0.1:27017/rivet?replicaSet=rs0")
+MONGO_URL = os.environ.get("MONGO_CDC_URL", "mongodb://127.0.0.1:27208/rivet?replicaSet=rs0&directConnection=true")
 MONGO_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MONGO_CONTAINER", "stand-mongo80-cdc-1"),
               "mongosh", "--quiet", "rivet", "--eval"]
 
@@ -361,10 +361,17 @@ quarkus.log.level=WARN
                         f"WHERE slot_name='{dbz_slot}'") == "t":
                     break
             elif a.engine == "mongo":
-                # No server-side per-connector marker either; the offsets file is
-                # the connector's own progress, same as SQL Server.
-                op = os.path.join(work, "offsets.dat")
-                if os.path.exists(op) and os.path.getsize(op) > 0:
+                # Ask the SERVER, not the connector. Debezium writes offsets.dat
+                # only after its FIRST event, and events come after this wait — a
+                # deadlock by construction, and the reason the first attempt hung.
+                # MongoDB reports open cursors in currentOp, and a change stream is
+                # a cursor with a $changeStream pipeline stage, so its presence IS
+                # the readiness signal.
+                cur = mongo("db.getSiblingDB('admin').aggregate(["
+                            "{$currentOp:{idleCursors:true}},"
+                            "{$match:{'cursor.originatingCommand.pipeline.0.$changeStream':"
+                            "{$exists:true}}}]).toArray().length")
+                if cur.strip().isdigit() and int(cur.strip()) > 0:
                     break
             elif a.engine == "mssql":
                 # No slot and no dump thread to ask about. The connector's progress
@@ -429,7 +436,16 @@ quarkus.log.level=WARN
         return subprocess.run([sys.executable, os.path.join(HERE, "compare.py"),
                                "--rivet-dir", out,
                                "--debezium-jsonl", os.path.join(work, "debezium.jsonl"),
-                               "--key", "id"]).returncode
+                               # MongoDB's key is `_id` on both sides — rivet writes
+                               # it under that name and Debezium's after-document
+                               # carries it likewise.
+                               "--key", "_id" if a.engine == "mongo" else "id"]
+                              # MongoDB deletes carry their key in the message KEY,
+                              # which the http sink does not forward — a harness
+                              # blind spot, documented in the README. Excluded here
+                              # rather than silently filtered in the SQL.
+                              + (["--exclude-op", "delete"] if a.engine == "mongo" else [])
+                              ).returncode
     finally:
         if not a.keep:
             cleanup()

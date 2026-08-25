@@ -60,11 +60,19 @@ SELECT
   -- error, not a NULL. json_extract_string over the raw line is shape-agnostic:
   -- it survives whichever fields the capture happens to contain, which is the
   -- point. The harness must not depend on the reference having exercised every op.
+  -- MongoDB's connector serialises the document as a JSON STRING in `after`,
+  -- where the relational connectors nest it as an object. Both are tried: the
+  -- nested path first, then a second parse of the string form. Without the second
+  -- the key comes back NULL for every Mongo event, which looks like a total
+  -- disagreement rather than a normaliser that cannot read the shape.
   CAST(coalesce(
     json_extract_string(j, '$.after.__KEY__'),
     json_extract_string(j, '$.before.__KEY__'),
     json_extract_string(j, '$.payload.after.__KEY__'),
-    json_extract_string(j, '$.payload.before.__KEY__')
+    json_extract_string(j, '$.payload.before.__KEY__'),
+    json_extract_string(json_extract_string(j, '$.after'), '$.__KEY__'),
+    json_extract_string(json_extract_string(j, '$.before'), '$.__KEY__'),
+    json_extract_string(json_extract_string(j, '$.payload.after'), '$.__KEY__')
   ) AS VARCHAR) AS k
 FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
       FROM read_text('__DBZ__'))

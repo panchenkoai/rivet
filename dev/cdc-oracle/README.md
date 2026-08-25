@@ -30,6 +30,21 @@ broker; `sink.py` is a ~30-line receiver whose only job is to append raw events.
 Normalisation lives in the comparison step so the capture stays a faithful record
 of what the reference emitted.
 
+## A harness limitation, stated because it looks like a finding
+
+**MongoDB deletes carry no key in the event BODY.** Debezium puts the deleted
+document's `_id` in the message KEY, and the http sink forwards only the value —
+so `{after: null, before: null, op: "d"}` is all that arrives. The comparison
+sees a keyless delete on the reference side and a keyed one from rivet, which
+renders as a disagreement and is not one.
+
+This is the harness's own blind spot, not a difference between the tools. Fixing
+it means capturing the message key (a sink that records both, or `transforms`
+that lift `documentKey` into the value). Until then, MongoDB's `delete` is
+excluded by `--exclude-op delete` and the exclusion is recorded HERE rather than
+applied silently — an excluded op that nobody wrote down becomes an op nobody
+checks.
+
 ## Known asymmetries (these are NOT findings)
 
 The two tools legitimately differ, and the comparison must account for it or it
@@ -66,11 +81,13 @@ catch.
 
 ## Status (2026-08-25)
 
-    engine      crud    key-update   wide-txn   mid-stream-table
-    postgres    AGREE   DIFFERS      AGREE      AGREE
-    mysql       AGREE   DIFFERS      AGREE      AGREE
-    mssql       AGREE   AGREE        rivet-only AGREE
-    mongo       —       na           —          —
+    engine      crud    key-update   wide-txn      mid-stream-table
+    postgres    AGREE   DIFFERS      AGREE 75/75   AGREE
+    mysql       AGREE   DIFFERS      AGREE 75/75   AGREE
+    mssql       AGREE   AGREE        undiagnosed   AGREE
+    mongo       AGREE   na           AGREE 75/75   AGREE
+
+Fourteen of sixteen cells settled; all four engines run.
 
 **The key-update finding.** `UPDATE t SET id=9 WHERE id=1` gives
 `delete(1)+insert(9)` from Debezium and `update(9)` from rivet, identically on
@@ -78,7 +95,9 @@ PostgreSQL and MySQL — so it is rivet's representation choice, not a plugin
 artefact. A consumer applying the documented latest-image MERGE keeps the old key
 in the destination forever. Counts reconcile on both sides, which is why the
 source-vs-destination oracles never saw it. SQL Server agrees because the engine
-itself splits a PK update into delete+insert in the change table.
+itself splits a PK update into delete+insert in its change table, so the same
+defect is INVISIBLE on one engine of three — the argument for a per-engine matrix
+rather than one representative test.
 
 `key-update` is **na** on MongoDB: `_id` is immutable, so the scenario cannot be
 expressed. A scenario an engine cannot express is not a passing cell.
