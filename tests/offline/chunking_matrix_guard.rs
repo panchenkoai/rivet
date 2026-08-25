@@ -84,6 +84,13 @@ const EXEMPT: &[(&str, &str)] = &[
         "docs/cdc-axis-matrix.yaml",
         "tests/offline/cdc_axis_matrix_guard.rs",
     ),
+    // Its dimension is the `rivet cdc` FLAG set, derived from the generated CLI
+    // reference rather than from a declared engine list, and its own guard carries
+    // the gap ratchet plus a citation-resolves check.
+    (
+        "docs/cdc-cli-surface-matrix.yaml",
+        "tests/offline/cdc_cli_surface_guard.rs",
+    ),
     // Not a coverage ledger in the same sense as its siblings: its cells grade
     // whether the evidence would BITE, so its ratchet counts UNSOUND cells rather
     // than gaps, and its columns are derived from src/source/*/cdc.rs instead of a
