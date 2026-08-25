@@ -452,4 +452,23 @@ exclude_re = [
     # table must still complete), `false` fails the refusal half. Run by hand
     # 2026-08-24, mutant applied and reverted each time.
     "replace match guard truncate_target.*MysqlChangeStream::fill",
+
+    # `split_top_level_commas` (src/source/postgres/cdc.rs): dropping the
+    # `in_quotes && next == '"'` guard on the escaped-quote arm cannot change what
+    # the function RETURNS, and the reason is arithmetic rather than aesthetic.
+    #
+    # With the guard, a doubled quote is consumed as one unit: zero toggles of
+    # `in_quotes`. Without it, the pair toggles twice: also zero, net. The two
+    # states can therefore differ only at the byte BETWEEN the pair — which the
+    # guard's own condition proves is a `"`, never a comma, so nothing observes the
+    # difference before they re-converge.
+    #
+    # NOT argued into the file: proven by exhaustive search over every string up to
+    # length 7 on the alphabet `",.ax` — 97 655 inputs, ZERO differing outputs. The
+    # SIBLING mutant on the same line (`replace + with -`, the lookahead reading
+    # backward) differs on 5 580 of them, shortest witness `"",`, and is graded by
+    # `a_truncate_is_recognised_and_refused_only_for_the_captured_tables` with a
+    # name ending in an escaped quote (`"a"""`) — so this exclusion is scoped to the
+    # guard alone and does not blanket the line.
+    "replace match guard in_quotes .* in split_top_level_commas",
 ]

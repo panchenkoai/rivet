@@ -1657,6 +1657,23 @@ mod tests {
             "escape then comma: still ONE relation"
         );
 
+        // A name ENDING in the escaped quote — `a"` renders as `"a"""`, three quotes
+        // in a row. The fixtures above all have text after the doubling, so the
+        // lookahead `b.get(i + 1)` was never asked about a position where reading
+        // BACKWARD would answer differently: `replace + with -` survived CI
+        // (2026-08-25) against every case here. Proven to be the discriminator by
+        // exhaustive search over 97 655 strings on the alphabet `",.ax` — the
+        // shortest witness is `"",`, and this is its realistic form.
+        assert_eq!(
+            one("table public.\"a\"\"\", public.b: TRUNCATE: (no-flags)"),
+            vec![
+                ("public".to_string(), "a\"".to_string()),
+                ("public".to_string(), "b".to_string())
+            ],
+            "a name ending in an escaped quote must still close, or the following \
+             comma is read as part of it and every later relation disappears"
+        );
+
         assert!(
             one("table public.orders: INSERT: id[integer]:1").is_empty(),
             "an ordinary change must not be mistaken for a truncate"

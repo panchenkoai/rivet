@@ -858,6 +858,24 @@ mod slot_retention_warning_tests {
              operators to ignore the message"
         );
 
+        // EXACTLY at the bar, both directions. The sibling test above covers this
+        // boundary for `pg_retained_wal_warning` and this one did not — it fed
+        // `bar + 1` and nothing else, so `< bar` and `<= bar` behaved identically
+        // and the mutant survived CI (`replace < with <=`, 2026-08-25). Testing one
+        // function's boundary and not its twin's is exactly the asymmetry mutation
+        // testing exists to find; reading the two tests side by side does not show it.
+        assert!(
+            pg_foreign_slots_warning(&[("at_the_bar".into(), PG_RETAINED_WAL_FAIL_BYTES)])
+                .is_some(),
+            "a slot sitting exactly ON the bar must be reported — `<=` here would let \
+             the single most common boundary value through in silence"
+        );
+        assert_eq!(
+            pg_foreign_slots_warning(&[("under".into(), PG_RETAINED_WAL_FAIL_BYTES - 1)]),
+            None,
+            "...and one byte under it must not be"
+        );
+
         let big = PG_RETAINED_WAL_FAIL_BYTES + 1;
         let w = pg_foreign_slots_warning(&[
             ("small".into(), 4096),
