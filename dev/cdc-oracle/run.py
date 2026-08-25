@@ -18,7 +18,11 @@ them) while applying them before the SLOT exists is not.
 import argparse, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NET = os.environ.get("CDC_ORACLE_NET", "rivet_default")
+# The stands do not all share one docker network: the SQL engines sit in
+# `rivet_default`, the Mongo stands in `stand_default`. The sink must join the
+# SAME network as the source, or Debezium cannot resolve either of them.
+NETS = {"postgres": "rivet_default", "mysql": "rivet_default",
+        "mssql": "rivet_default", "mongo": "stand_default"}
 PG_HOST_IN_NET = os.environ.get("CDC_ORACLE_PG_HOST", "postgres-cdc")
 PG_URL = os.environ.get("POSTGRES_CDC_URL", "postgresql://rivet:rivet@127.0.0.1:5434/rivet")
 PG_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_PG_CONTAINER", "rivet-postgres-cdc-1"),
@@ -32,8 +36,17 @@ MSSQL_URL = os.environ.get("MSSQL_CDC_URL", "sqlserver://sa:Rivet_Passw0rd!@127.
 MSSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MSSQL_CONTAINER", "rivet-mssql-cdc-1"),
               "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
               "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-Q"]
-MONGO_HOST_IN_NET = os.environ.get("CDC_ORACLE_MONGO_HOST", "mongo-cdc")
+MONGO_HOST_IN_NET = os.environ.get("CDC_ORACLE_MONGO_HOST", "mongo80-cdc")
 MONGO_URL = os.environ.get("MONGO_CDC_URL", "mongodb://127.0.0.1:27017/rivet?replicaSet=rs0")
+MONGO_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MONGO_CONTAINER", "stand-mongo80-cdc-1"),
+              "mongosh", "--quiet", "rivet", "--eval"]
+
+
+def mongo(js: str) -> str:
+    r = subprocess.run(MONGO_EXEC + [js], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"mongosh failed: {r.stderr.strip()}\n  js: {js}")
+    return r.stdout.strip()
 
 
 def mssql(sql: str) -> str:
@@ -103,6 +116,34 @@ def run_scenario(name: str, sql, t: str) -> None:
         raise SystemExit(f"unknown scenario {name}")
 
 
+def run_scenario_mongo(name: str, t: str) -> None:
+    """The same change patterns in the document model.
+
+    `_id` is the key on both sides, and it is IMMUTABLE in MongoDB — so
+    `key-update` cannot be expressed as an update at all. Replacing the document
+    under a new `_id` is delete+insert by construction, which makes Mongo's answer
+    to that scenario structurally the reference's answer. Recorded as `na` rather
+    than run, because a scenario the engine cannot express is not a passing cell.
+    """
+    if name == "crud":
+        mongo(f"db.{t}.insertMany([{{_id:1,v:'a'}},{{_id:2,v:'b'}}]); "
+              f"db.{t}.updateOne({{_id:2}},{{$set:{{v:'B'}}}}); "
+              f"db.{t}.deleteOne({{_id:1}})")
+    elif name == "wide-txn":
+        docs = ", ".join(f"{{_id:{i},v:'v{i}'}}" for i in range(1, 51))
+        mongo(f"db.{t}.insertMany([{docs}]); "
+              f"db.{t}.updateMany({{_id:{{$lte:25}}}},{{$set:{{v:'x'}}}})")
+    elif name == "mid-stream-table":
+        mongo(f"db.{t}_late.insertOne({{_id:1,v:'late'}}); "
+              f"db.{t}.insertMany([{{_id:1,v:'a'}},{{_id:2,v:'b'}}]); "
+              f"db.{t}.updateOne({{_id:2}},{{$set:{{v:'B'}}}})")
+    elif name == "key-update":
+        raise SystemExit("key-update is NA on MongoDB: _id is immutable, so the "
+                         "scenario cannot be expressed — see run_scenario_mongo")
+    else:
+        raise SystemExit(f"unknown scenario {name}")
+
+
 def _write_cfg(work, a, t, ckpt, out) -> str:
     """One rivet config writer, used for both the MySQL anchoring run and the
     scenario run — two copies would drift and the anchor would stop anchoring the
@@ -110,6 +151,9 @@ def _write_cfg(work, a, t, ckpt, out) -> str:
     if a.engine == "postgres":
         src, tbl = f'{{ type: postgres, url: "{PG_URL}" }}', f"public.{t}"
         cdc_opts = f"{{ slot: riv_{t}, until_current: true }}"
+    elif a.engine == "mongo":
+        src, tbl = f'{{ type: mongo, url: "{MONGO_URL}" }}', t
+        cdc_opts = f"{{ until_current: true, checkpoint: {ckpt} }}"
     elif a.engine == "mssql":
         src, tbl = f'{{ type: mssql, url: "{MSSQL_URL}" }}', f"dbo.{t}"
         cdc_opts = f"{{ capture_instance: dbo_{t}, until_current: true, checkpoint: {ckpt} }}"
@@ -162,6 +206,7 @@ def main() -> int:
     safe = t.replace("_", "-")
     sink, srv = f"sink-{safe}", f"srv-{safe}"
 
+    net = os.environ.get("CDC_ORACLE_NET") or NETS[a.engine]
     ckpt = os.path.join(work, "rivet.ckpt")
 
     def cleanup():
@@ -170,6 +215,8 @@ def main() -> int:
             psql(f"DROP TABLE IF EXISTS {t}, {t}_late; DROP PUBLICATION IF EXISTS {pub}")
             psql(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
                  f"WHERE slot_name IN ('{dbz_slot}','{riv_slot}')")
+        elif a.engine == "mongo":
+            mongo(f"db.{t}.drop(); db.{t}_late.drop()")
         elif a.engine == "mssql":
             for tt in (t, f"{t}_late"):
                 mssql(f"IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance='dbo_{tt}') "
@@ -194,6 +241,11 @@ def main() -> int:
             psql(f"CREATE TABLE {t} (id int PRIMARY KEY, v text)")
             psql(f"CREATE PUBLICATION {pub} FOR TABLE {t}")
             psql(f"SELECT pg_create_logical_replication_slot('{riv_slot}','test_decoding')")
+        elif a.engine == "mongo":
+            # A change stream needs the collection to EXIST before it can be
+            # watched by name, so create it explicitly rather than relying on the
+            # first insert — which would land before the cursor.
+            mongo(f"db.createCollection('{t}')")
         elif a.engine == "mssql":
             # CDC must be enabled on the DB and the table, and the capture job needs
             # to have populated fn_cdc_get_min_lsn before either tool can read —
@@ -215,7 +267,7 @@ def main() -> int:
         # 3. sink inside the stand's network: host.docker.internal did not carry
         #    the traffic, addressing the receiver by container name does.
         subprocess.run(["cp", os.path.join(HERE, "sink.py"), work], check=True)
-        sh("docker", "run", "-d", "--name", sink, "--network", NET,
+        sh("docker", "run", "-d", "--name", sink, "--network", net,
            "-v", f"{work}:/data", "-e", "DBZ_SINK_OUT=/data/debezium.jsonl",
            "python:3.12-slim", "python", "/data/sink.py")
 
@@ -234,6 +286,17 @@ debezium.source.plugin.name=pgoutput
 debezium.source.slot.name={dbz_slot}
 debezium.source.publication.name={pub}
 debezium.source.table.include.list=public.{t}"""
+        elif a.engine == "mongo":
+            connector_block = f"""debezium.source.connector.class=io.debezium.connector.mongodb.MongoDbConnector
+# The replica set advertises itself as 127.0.0.1:27017, so a driver that follows
+# the RS topology from inside another container dials ITSELF. directConnection
+# skips topology discovery; change streams still work because the node IS an RS
+# member — only the discovery step is bypassed.
+debezium.source.mongodb.connection.string=mongodb://{MONGO_HOST_IN_NET}:27017/?replicaSet=rs0&directConnection=true
+debezium.source.topic.prefix=oracle
+debezium.source.database.include.list=rivet
+debezium.source.collection.include.list=rivet.{t}
+debezium.source.capture.mode=change_streams_update_full"""
         elif a.engine == "mssql":
             connector_block = f"""debezium.source.connector.class=io.debezium.connector.sqlserver.SqlServerConnector
 debezium.source.database.hostname={MSSQL_HOST_IN_NET}
@@ -274,7 +337,7 @@ quarkus.log.level=WARN
         # WARNING and a process that starts and captures nothing.
         with open(os.path.join(work, "application.properties"), "w") as f:
             f.write(props)
-        sh("docker", "run", "-d", "--name", srv, "--network", NET,
+        sh("docker", "run", "-d", "--name", srv, "--network", net,
            "-v", f"{work}/application.properties:/debezium/config/application.properties",
            "-v", f"{work}:/data", "quay.io/debezium/server:3.0.0.Final")
 
@@ -297,6 +360,12 @@ quarkus.log.level=WARN
                 if psql(f"SELECT active FROM pg_replication_slots "
                         f"WHERE slot_name='{dbz_slot}'") == "t":
                     break
+            elif a.engine == "mongo":
+                # No server-side per-connector marker either; the offsets file is
+                # the connector's own progress, same as SQL Server.
+                op = os.path.join(work, "offsets.dat")
+                if os.path.exists(op) and os.path.getsize(op) > 0:
+                    break
             elif a.engine == "mssql":
                 # No slot and no dump thread to ask about. The connector's progress
                 # IS its offsets file, so wait for it to appear rather than for the
@@ -318,15 +387,18 @@ quarkus.log.level=WARN
 
         # 5. the scenario — applied through the engine's own client
         binary = os.environ.get("RIVET_BIN", "./target/debug/rivet")
-        if a.engine in ("mysql", "mssql"):
+        if a.engine in ("mysql", "mssql", "mongo"):
             # MySQL has no server-side anchor: the checkpoint file IS the cursor,
             # and it is written by a run. Anchor BEFORE the scenario so both tools
             # start from the same point.
             _anchor_cfg = _write_cfg(work, a, t, ckpt, os.path.join(work, "anchor_out"))
             subprocess.run([binary, "run", "--config", _anchor_cfg],
                            capture_output=True, text=True)
-        exec_sql = {"postgres": psql, "mysql": mysql, "mssql": mssql}[a.engine]
-        run_scenario(a.scenario, exec_sql, t)
+        if a.engine == "mongo":
+            run_scenario_mongo(a.scenario, t)
+        else:
+            exec_sql = {"postgres": psql, "mysql": mysql, "mssql": mssql}[a.engine]
+            run_scenario(a.scenario, exec_sql, t)
         # Wait for the SOURCE to have made the changes readable, then let the
         # reference flush. A fixed sleep produced an intermittent false
         # disagreement on SQL Server: its capture job is asynchronous, and 75

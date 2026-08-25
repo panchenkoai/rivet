@@ -64,7 +64,33 @@ and an event matching NEITHER surfaces as `UNKNOWN-SHAPE` rather than being
 dropped — a lenient normaliser would reintroduce the exact class this exists to
 catch.
 
-## Status
+## Status (2026-08-25)
 
-Sink, contract and DuckDB comparison. The compose service and the first
-differential test are next.
+    engine      crud    key-update   wide-txn   mid-stream-table
+    postgres    AGREE   DIFFERS      AGREE      AGREE
+    mysql       AGREE   DIFFERS      AGREE      AGREE
+    mssql       AGREE   AGREE        rivet-only AGREE
+    mongo       —       na           —          —
+
+**The key-update finding.** `UPDATE t SET id=9 WHERE id=1` gives
+`delete(1)+insert(9)` from Debezium and `update(9)` from rivet, identically on
+PostgreSQL and MySQL — so it is rivet's representation choice, not a plugin
+artefact. A consumer applying the documented latest-image MERGE keeps the old key
+in the destination forever. Counts reconcile on both sides, which is why the
+source-vs-destination oracles never saw it. SQL Server agrees because the engine
+itself splits a PK update into delete+insert in the change table.
+
+`key-update` is **na** on MongoDB: `_id` is immutable, so the scenario cannot be
+expressed. A scenario an engine cannot express is not a passing cell.
+
+**MSSQL wide-txn** shows `rivet-only` rows — i.e. the REFERENCE lagged, not rivet.
+Not yet diagnosed and NOT claimed as a finding: SQL Server's capture job is
+asynchronous on both sides and the wait may still be too short for 75 changes.
+
+**MongoDB is NOT running yet.** The connector starts but never records progress
+within the readiness window. Two obstacles are already solved and worth keeping:
+the Mongo stands live in `stand_default` (not `rivet_default`), and the replica
+set advertises itself as `127.0.0.1:27017`, so a driver inside another container
+dials itself — `directConnection=true` alongside `replicaSet=rs0` gets past that.
+What remains is the readiness signal: `offsets.dat` never appears, so either the
+connector needs longer or it is failing after validation.
