@@ -6462,3 +6462,149 @@ fn mysql_cdc_full_row_metadata_maps_the_same_reorder_by_name_and_stays_quiet() {
          on every run and stops being read. Got:\n{said}"
     );
 }
+
+/// PostgreSQL crash between the checkpoint write and the slot ack — DOCUMENTED,
+/// not guarded, and the difference is the point.
+///
+/// This is the one CDC fault point with no PostgreSQL test, and the reason it had
+/// none turns out to be structural rather than an oversight. Three mutants were
+/// applied and this test stayed GREEN against all three:
+///
+///   1. `stream.ack` moved BEFORE the checkpoint write  — green
+///   2. `stream.ack` moved BEFORE the parts are flushed — green
+///   3. `ack` advancing the slot to `pg_current_wal_lsn()` instead of the last
+///      commit                                          — green
+///
+/// Why: the crash fires BEFORE run 1's first ack, so every ack-side mutant is
+/// unreachable in this fixture; and PostgreSQL's resume authority is the SLOT,
+/// which run 1 therefore never moved. The checkpoint file is consulted only as a
+/// boolean ("a prior run happened", `resume_expected` in cdc/mod.rs) and never as
+/// a position, so the file racing ahead of the slot has nothing to act on.
+/// Contrast SQL Server, where the checkpoint IS the only position and its ack is a
+/// no-op — which is why that engine's test of this hook is load-bearing and this
+/// one is not.
+///
+/// So the DELIVERY half of this test documents rather than guards — no reordering
+/// of the sink's steps can make it red, and that is a fact about PostgreSQL's
+/// design, not a weakness to paper over.
+///
+/// The RETENTION half is a real guard, and it is the half an operator cares about.
+/// A crash here PINS WAL on the slot — it must, or the un-acked span is lost — and
+/// the question is whether that is a transient or a leak. MEASURED: 2304 B pinned
+/// by the crash, 0 after the resume. Neutering `ack` (`advance_slot` -> `Ok(())`)
+/// leaves 2480 B pinned and this test goes RED, which is the mutant it grades.
+///
+/// That closes the crash-side of the slot-pinning class from the direction
+/// `roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot` does not cover:
+/// that one is about row-less spans starving the ack, this one is about a crash
+/// leaving the ack unrun. Both end at the same place — `confirmed_flush_lsn`
+/// frozen while WAL accumulates on an idle database.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgckpt");
+    let slot = unique_name("rivet_ckpt_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // Separate transactions so several parts roll: the crash must land in the
+    // window, and a single transaction would give it only one chance.
+    for g in 0..12 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({g}, {g})"), &[])
+            .unwrap();
+    }
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc("rollover: 3")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let crashed = rig.run_args_env(
+        &[],
+        &[("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack")],
+    );
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1 — a fault that did not fire leaves this \
+         test asserting an ordinary two-run export"
+    );
+
+    let retained_after_crash: i64 = c
+        .query_one(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .map(|r| r.get(0))
+        .unwrap_or(-1);
+    eprintln!("RIVET_MEASURE retained_after_crash={retained_after_crash}");
+
+    // Run 2 into a FRESH destination, so what it delivers is its own doing: a
+    // shared dir would let run 1's durable parts satisfy the oracle even if the
+    // resume captured nothing (the CDC audit's headline finding).
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    let rig2 = Rig::pg_cdc(&tbl, &slot)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out2.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    // The union is what at-least-once promises. Overlap between the legs is fine
+    // and expected — the un-acked span is re-read by construction.
+    let mut got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
+    got.extend(duckdb_dir_parquet_i64(&out2, "id"));
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got, want,
+        "every row must survive a crash between the checkpoint write and the slot \
+         ack. A missing id means resume trusted the checkpoint FILE over the slot \
+         and started past changes the slot had never released."
+    );
+    let retained: i64 = c
+        .query_one(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .map(|r| r.get(0))
+        .unwrap_or(-1);
+    // MEASURED: 2304 B retained by the crash (exactly the un-acked span — the data
+    // that must not be lost), and 0 after the resume. The crash PINS WAL, which is
+    // correct; what this asserts is that it is a transient, not a leak. A resume
+    // that captured the rows but never acked would leave the slot exactly where the
+    // crash left it, and PostgreSQL would retain WAL forever on an idle database —
+    // the slot-pinning class `roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot`
+    // covers from the other side (row-less spans).
+    assert!(
+        retained_after_crash > 0,
+        "the crash must PIN the un-acked span (measured 2304 B) — a zero here means \
+         the fixture never left anything un-acked and the release below is vacuous"
+    );
+    assert!(
+        retained >= 0 && retained < retained_after_crash,
+        "the resume must RELEASE the WAL the crash pinned (measured: 2304 B -> 0). \
+         Still {retained} B means the slot never advanced past what was re-read, and \
+         an operator who crash-loops fills the disk"
+    );
+    // And the second leg must really have done work — otherwise the assertion above
+    // is satisfied by leg 1 alone and would pass against a resume that captured zero.
+    assert!(
+        !duckdb_dir_parquet_i64(&out2, "id").is_empty(),
+        "the resume leg delivered NOTHING: the un-acked span was not re-read, so this \
+         cell proves nothing about the boundary it exists for"
+    );
+}
