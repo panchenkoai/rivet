@@ -233,3 +233,60 @@ set advertises itself as `127.0.0.1:27017`, so a driver inside another container
 dials itself — `directConnection=true` alongside `replicaSet=rs0` gets past that.
 What remains is the readiness signal: `offsets.dat` never appears, so either the
 connector needs longer or it is failing after validation.
+
+
+## The harness compares KEYS, not values — and that was a real blind spot
+
+An adversarial pass RAN the check I had not: it took a real capture, rewrote the
+parquet with `NULL::VARCHAR AS v` — 100% of the value column destroyed — and
+`compare.py` printed a byte-identical **AGREE**. Every "15 of 16 agree" result in
+this file was therefore weaker than it read: it proves the two tools saw the same
+CHANGES, not that rivet wrote the same VALUES.
+
+`--value <col>` (repeatable) now compares cells as text on both sides, and it is
+verified to catch that mutation: the same NULLed parquet goes from AGREE to four
+differing rows.
+
+It is **not on by default yet**, deliberately. The DELETE path still compares
+unequal, because the reference carries no `after` document for a delete while the
+value extract reads only that side. Turning it on now would mean a false alarm on
+every run, and a harness that cries wolf gets muted — which is exactly how this
+blind spot survived in the first place.
+
+## The gap this harness does NOT cover: a degrading source LINK
+
+Measured 2026-08-25 while looking for negative scenarios: `toxi_` appears **zero**
+times in `live_cdc.rs`, `live_cdc_mssql.rs` and `live_cdc_mongo.rs`. Every fault
+test in the suite either kills the PROCESS (`RIVET_TEST_PANIC_AT`) or aims at the
+DESTINATION upload. A degrading source link is untested on all four engines.
+
+It is a different shape from a crash, which is why the crash coverage does not
+stand in for it: the process stays ALIVE holding a half-read stream, and that is
+where a reader can mistake "the connection ended" for "the log ended" — a bounded
+run then writes `_SUCCESS` over a short capture.
+
+Four rows belong in `cdc-evidence-matrix.yaml` when there is something to put in
+them:
+
+    cdc_source_link_drops_mid_capture              toxi_disable
+    cdc_source_link_stalls_under_a_large_txn       toxi_add_bandwidth
+    cdc_link_cut_after_flush_before_ack            toxi_disable, timed
+    cdc_latency_must_not_shorten_a_bounded_run     toxi_add_latency
+
+They are NOT in that matrix yet, deliberately. Its ratchet is shrink-only and adding
+four unproven cells would have pushed 22 past a ceiling of 23 — the ledger refuses
+to let a new gap be declared, which is the behaviour it exists for. The rows go in
+when a test goes in, and the note lives here meanwhile so the surface is not
+forgotten rather than being laundered into a ledger as "known".
+
+Per engine, the reason each is worth running:
+
+- **postgres** — the slot peek is non-consuming, so the ARGUMENT is that a lost
+  connection re-reads from the un-acked position. That argument has never been run,
+  and this engine's `until_current` bound is load-bearing for termination.
+- **mysql** — a long-lived dump connection plus a file checkpoint: a drop between
+  read and part-commit is the window the idle-first-run anchor rule was written for.
+- **mssql** — reads are ordinary SELECTs, so a drop should surface as a query error;
+  whether the run reports failure or an EMPTY SUCCESS is untested.
+- **mongo** — the stream is tailable and the driver retries internally, which is
+  precisely why a silent short read is plausible here rather than a loud one.

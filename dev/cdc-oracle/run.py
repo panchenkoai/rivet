@@ -466,7 +466,20 @@ quarkus.log.level=WARN
                                # MongoDB's key is `_id` on both sides — rivet writes
                                # it under that name and Debezium's after-document
                                # carries it likewise.
-                               "--key", "_id" if a.engine == "mongo" else "id"]
+                               "--key", "_id" if a.engine == "mongo" else "id",
+                               # Compare the VALUE too. Without it the harness is
+                               # blind to cell corruption: a parquet with 100%% of a
+                               # column NULLed reported AGREE (measured 2026-08-25).
+                               # NOTE: --value is NOT passed by default yet. It is
+                               # proven to catch cell corruption (a parquet with 100%
+                               # of a column NULLed goes from AGREE to four
+                               # differing rows), but the DELETE path still compares
+                               # unequal because the reference carries no `after`
+                               # for a delete and the value extract only reads that
+                               # side. Shipping it on by default would mean a false
+                               # alarm every run, and a harness that cries wolf gets
+                               # muted — which is how the blind spot got here.
+                               ]
                               # MEASURED after adding ExtractNewDocumentState: the
                               # transform flattens inserts and updates so their `_id`
                               # IS comparable, but a delete still arrives as

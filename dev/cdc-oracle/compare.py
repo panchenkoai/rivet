@@ -70,6 +70,7 @@ SELECT
   -- nested path first, then a second parse of the string form. Without the second
   -- the key comes back NULL for every Mongo event, which looks like a total
   -- disagreement rather than a normaliser that cannot read the shape.
+  __DBZ_VALS__
   CAST(coalesce(
     json_extract_string(j, '$.after.__KEY__'),
     json_extract_string(j, '$.before.__KEY__'),
@@ -91,7 +92,7 @@ FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
 WHERE j <> '' AND json_extract_string(j, '$.ddl') IS NULL;
 
 CREATE OR REPLACE VIEW riv AS
-SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k
+SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k __RIV_VALS__
 FROM read_parquet(__PARTS__);
 """
 
@@ -101,6 +102,10 @@ def main() -> int:
     ap.add_argument("--rivet-dir", required=True)
     ap.add_argument("--debezium-jsonl", required=True)
     ap.add_argument("--key", required=True, help="the key column, on both sides")
+    ap.add_argument("--value", action="append", default=[],
+                    help="a VALUE column to compare as well as the key; repeatable. "
+                         "Without one the comparison is blind to cell corruption — "
+                         "a parquet with every value NULLed still reports AGREE.")
     ap.add_argument("--allow-empty-reference", action="store_true",
                     help="accept a zero-event Debezium capture (asserting BOTH are empty)")
     ap.add_argument("--exclude-op", action="append", default=[],
@@ -149,7 +154,21 @@ def main() -> int:
         where = f" WHERE op NOT IN ({ops})"
 
     # Explicit replace, not str.format: the SQL contains DuckDB struct braces.
-    sql = (SQL.replace("__DBZ__", a.debezium_jsonl)
+    # Value columns, if any. Compared as text on both sides: the point is whether
+    # the CELL survived, not whether two type systems render it identically — and
+    # a comparison that skipped values entirely reported AGREE over a parquet with
+    # 100% of a column NULLed (measured, which is why this exists).
+    dbz_vals = "".join(
+        f"""coalesce(json_extract_string(j, '$.after.{v}'),
+                     json_extract_string(j, '$.payload.after.{v}'),
+                     json_extract_string(json_extract_string(j, '$.after'), '$.{v}'),
+                     json_extract_string(j, '$.{v}')) AS v_{v},\n  """
+        for v in a.value
+    )
+    riv_vals = "".join(f", CAST({v} AS VARCHAR) AS v_{v}" for v in a.value)
+    sql = (SQL.replace("__DBZ_VALS__", dbz_vals)
+              .replace("__RIV_VALS__", riv_vals)
+              .replace("__DBZ__", a.debezium_jsonl)
               .replace("__KEY__", a.key)
               .replace("__PARTS__", "[" + ", ".join(f"'{p}'" for p in parts) + "]"))
     sql += f"""

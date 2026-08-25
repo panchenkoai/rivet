@@ -120,7 +120,7 @@ shapes:
         mutant left it green. read_cdc_changes resolves via declared_parquet_parts — the union over the immutable manifest-<run_id>.json
         copies — so every caller of cdc_id_ops/read_cdc_changes reads what the run
         DECLARED. Proven to bite before it was wired in:
-        the_declared_parts_oracle_reads_short_of_the_glob_when_a_manifest_under_declares
+        the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory
         stages two durable parts with one named by no manifest; the glob reads 6, the
         declared reader 3. Whole CDC live suite re-run after the switch: 157/157."
     mysql:
