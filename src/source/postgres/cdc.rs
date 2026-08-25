@@ -225,13 +225,31 @@ pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
                  snapshot the parent with `mode: full`, which reads through the parent normally."
             ))
         }
-        // A view/matview/foreign table has no WAL of its own. Verified on the
-        // pg14 stand: a `REFRESH MATERIALIZED VIEW` emits no `table …` line at
-        // all, so this is a guaranteed zero, not a rare one.
-        'v' | 'm' | 'f' => {
+        // A MATERIALIZED VIEW is the one of the three that CAN emit under its own
+        // name, so it is a partial, not a refusal. MEASURED on the pg16 CDC stand,
+        // three forms against one `test_decoding` slot:
+        //   CREATE MATERIALIZED VIEW … WITH DATA      → `table s.mv: INSERT: …`
+        //   REFRESH MATERIALIZED VIEW …               → nothing under its own name
+        //   REFRESH MATERIALIZED VIEW CONCURRENTLY …  → `table s.mv: INSERT: …`
+        // The earlier comment here measured only the middle form and generalised it
+        // to "a guaranteed zero" — while the candidate query 200 lines below was
+        // rewritten on the OPPOSITE measurement (`'m'` is capturable). Two halves of
+        // one file disagreeing, and the false half was the one reaching operators:
+        // CONCURRENTLY is the standard production refresh (it does not lock readers),
+        // so the refused config was the common one.
+        'm' => RoutingVerdict::Partial(format!(
+            "pg cdc: `{cfg}` is a MATERIALIZED VIEW. It CAN be captured — a `REFRESH \
+             MATERIALIZED VIEW CONCURRENTLY` decodes as ordinary row events under its \
+             own name — but know what that delivers: REFRESH DELTAS, not the base \
+             table's own changes, and a PLAIN `REFRESH MATERIALIZED VIEW` emits \
+             nothing at all, so a capture whose refresh job uses the plain form sits \
+             at 0 rows forever while reporting success. Capture the base table(s) \
+             instead if you want the source's changes."
+        )),
+        // A view and a foreign table have no WAL of their own under any operation.
+        'v' | 'f' => {
             let what = match rel.relkind {
                 'v' => "a VIEW",
-                'm' => "a MATERIALIZED VIEW",
                 _ => "a FOREIGN TABLE",
             };
             RoutingVerdict::Never(format!(
@@ -493,14 +511,14 @@ impl PgChangeStream {
                     capturable: r.get::<_, bool>(3),
                 })
                 .collect();
+            let mut resolved: Option<(String, String)> = None;
             if !matches.is_empty() {
                 // The ambiguity decision. A NO-match stays with the schema probe
                 // below for now — it reports the missing relation today and tests
                 // assert its message; unifying that report is a later pass, said
                 // here rather than silently deferred.
-                if let Some(note) =
-                    crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?.note
-                {
+                let elected = crate::source::cdc::identity::resolve_captured_table(cfg, &matches)?;
+                if let Some(note) = &elected.note {
                     // Resolution succeeded, but the name also matched something that
                     // emits nothing. Very often that inert twin is what the operator
                     // meant, and silence sends them hunting.
@@ -508,7 +526,19 @@ impl PgChangeStream {
                         log::warn!("pg cdc: {note}");
                     }
                 }
+                // CARRY the election forward. Re-resolving the configured string
+                // below through `to_regclass` (i.e. `search_path`) is how one run
+                // came to print two contradictory sentences: a warning that `vv`
+                // resolves to deep.vv, then an error that `vv` is a VIEW and to
+                // "capture the BASE table(s) it reads" — naming the relation the
+                // warning had just elected. MySQL got this half in 62a7876 and
+                // PostgreSQL did not.
+                resolved = Some((elected.schema, elected.table));
             }
+            let (rs, rt): (Option<&str>, Option<&str>) = match &resolved {
+                Some((sch, tbl)) => (Some(sch.as_str()), Some(tbl.as_str())),
+                None => (None, None),
+            };
             let Some(row) = client
                 .query_opt(
                     "SELECT c.relkind::text, c.relpersistence::text, \
@@ -524,9 +554,10 @@ impl PgChangeStream {
                      LEFT JOIN pg_inherits i ON i.inhparent = c.oid \
                      LEFT JOIN pg_class c2 ON c2.oid = i.inhrelid \
                      LEFT JOIN pg_namespace n2 ON n2.oid = c2.relnamespace \
-                     WHERE c.oid = to_regclass($1) \
+                     WHERE (($2::text IS NULL AND c.oid = to_regclass($1)) \
+                        OR (n.nspname = $2 AND c.relname = $3)) \
                      GROUP BY c.relkind, c.relpersistence, n.nspname, c.relname, c.oid",
-                    &[&cfg.as_str()],
+                    &[&cfg.as_str(), &rs, &rt],
                 )
                 .with_context(|| {
                     format!("pg cdc: reading pg_class to check that `{cfg}` is routable")
@@ -550,7 +581,16 @@ impl PgChangeStream {
             };
             match classify_routing(&rel) {
                 RoutingVerdict::Routable => {}
-                RoutingVerdict::Partial(why) => log::warn!("{why}"),
+                // Gated exactly like the note above, and for a stronger reason: a
+                // `Partial` config SUCCEEDS, so this repeats on every scheduler
+                // cycle forever, while a note usually precedes a bail and is seen
+                // once anyway. The precheck runs twice per run (preflight, then
+                // open).
+                RoutingVerdict::Partial(why) => {
+                    if say_note {
+                        log::warn!("{why}");
+                    }
+                }
                 RoutingVerdict::Never(why) => anyhow::bail!("{why}"),
             }
         }
@@ -1980,16 +2020,41 @@ mod tests {
         };
         assert!(why.contains("no partitions yet"), "{why}");
 
-        for (kind, word) in [
-            ('v', "VIEW"),
-            ('m', "MATERIALIZED VIEW"),
-            ('f', "FOREIGN TABLE"),
-        ] {
+        for (kind, word) in [('v', "VIEW"), ('f', "FOREIGN TABLE")] {
             let RoutingVerdict::Never(why) = classify_routing(&rel(kind, &[])) else {
                 panic!("{kind} writes no WAL under its own name — it must be refused");
             };
             assert!(why.contains(word), "the refusal must say what it is: {why}");
         }
+
+        // A MATERIALIZED VIEW is NOT in that list, and this assertion is the
+        // correction of a measured falsehood rather than a relaxation. This loop
+        // held `'m'` until the round-3 bughunt, on a comment that had measured one
+        // refresh form and generalised it; the candidate query 200 lines below was
+        // meanwhile rewritten on the OPPOSITE measurement, so the file contradicted
+        // itself and the false half was the one operators saw. MEASURED, pg16 CDC
+        // stand, one `test_decoding` slot: `CREATE … WITH DATA` and `REFRESH …
+        // CONCURRENTLY` both decode under the matview's own name; only the plain
+        // `REFRESH` is silent. CONCURRENTLY is the standard production refresh, so
+        // `Never` refused the common case.
+        let RoutingVerdict::Partial(why) = classify_routing(&rel('m', &[])) else {
+            panic!(
+                "a matview refreshed CONCURRENTLY emits row events under its own \
+                 name — refusing it refuses a capture that works"
+            );
+        };
+        assert!(
+            why.contains("MATERIALIZED VIEW") && why.to_uppercase().contains("CONCURRENTLY"),
+            "and the warning must name the ONE refresh form that decodes, since a \
+             capture whose refresh job uses the plain form sits at 0 rows forever \
+             while reporting success: {why}"
+        );
+        assert!(
+            why.contains("not the base table") || why.contains("REFRESH DELTAS"),
+            "it must also say WHAT is delivered — refresh deltas, not the source \
+             table's changes — or an operator reads a working matview capture as \
+             source CDC: {why}"
+        );
 
         // A plain table is routable, and stays routable — refusing it would break
         // every working config.

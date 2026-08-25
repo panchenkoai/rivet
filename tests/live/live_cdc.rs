@@ -6819,12 +6819,20 @@ fn roast_pg_cdc_truncate_refusal_delivers_the_rows_it_already_read() {
         .iter()
         .map(|r| r.get::<_, String>(0))
         .filter(|d| !d.starts_with("BEGIN") && !d.starts_with("COMMIT"))
+        // A logical slot decodes the WHOLE DATABASE, not this test's tables, so a
+        // concurrent test's INSERTs land in it too. The first version asserted on
+        // the unfiltered list and went RED in a parallel suite while passing alone
+        // — 172 passed / 1 failed, its slot holding two other tests' tables — which
+        // is the alternating-test shape, not a product signal. Scope to the two
+        // relations this test owns; the PROPERTY under test (the remedy leaves
+        // nothing but the truncate of OUR tables behind) is unchanged.
+        .filter(|d| d.contains(&ta) || d.contains(&tb))
         .collect();
     assert_eq!(
         remaining.len(),
         1,
-        "the slot must hold ONLY the truncate — anything else still in it is what \
-         `pg_replication_slot_advance` would destroy. Got: {remaining:?}"
+        "the slot must hold ONLY the truncate — anything else of OURS still in it is \
+         what `pg_replication_slot_advance` would destroy. Got: {remaining:?}"
     );
     assert!(
         remaining[0].contains("TRUNCATE"),
@@ -7091,5 +7099,216 @@ fn roast_pg_cdc_truncate_inside_a_transaction_with_rows_still_refuses() {
         said2.to_lowercase().contains("truncate"),
         "the truncate still heads the window, so the refusal repeats — what must NOT \
          happen is a green run reporting zero rows over it. Got:\n{said2}"
+    );
+}
+
+/// Classification must ask about the relation RESOLUTION elected — not re-read the
+/// configured string through `search_path` and answer about a different one.
+///
+/// Round-3 bughunt. `62a7876` fixed exactly this on MySQL ("classification asked
+/// the foreign table for a type … sending the operator to fix a relation resolution
+/// had already ruled out") and PostgreSQL never got the same half: after
+/// `resolve_captured_table` elects a relation, the very next query is
+/// `WHERE c.oid = to_regclass($1)` over the CONFIGURED string, which `search_path`
+/// can fold to something else entirely.
+///
+/// The fixture is an ordinary shape — a reporting VIEW in the search path over a
+/// base table that lives in another schema, both spelled the same. One run then
+/// emitted two contradictory sentences: a WARN saying the name resolves to the base
+/// table, and an Error saying it is a VIEW and to "capture the BASE table(s) it
+/// reads instead" — which is the relation the warning had just named. The
+/// remediation names no config an operator can type, and the refused config is one
+/// the router would have captured.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_classification_asks_about_the_resolved_relation_not_the_search_path_one() {
+    let cdc_db = CdcDb::new("cdc_resolved");
+    let slot = unique_name("rivet_resolved_slot");
+    let name = unique_name("rivet_cdc_rv").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE SCHEMA IF NOT EXISTS deep; \
+         CREATE TABLE deep.{name} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE VIEW public.{name} AS SELECT id, v FROM deep.{name}"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(
+        &format!("INSERT INTO deep.{name} VALUES (1,10),(2,20)"),
+        &[],
+    )
+    .unwrap();
+
+    // The BARE name: `search_path` reads it as the view, rivet's router reads it as
+    // any schema's relation of that name, and resolution has already ruled the view
+    // out because it can carry no event.
+    let rig = Rig::pg_cdc(&name, &slot).source_url(cdc_db.url());
+    let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !said.contains("is a VIEW"),
+        "the view is the relation resolution DISCARDED — refusing the config because \
+         of it contradicts the warning printed moments earlier in the same run, and \
+         sends the operator to 'capture the BASE table' which is what rivet already \
+         resolved to. Output:\n{said}"
+    );
+    assert!(
+        out.status.success(),
+        "a config the router would capture must not be refused:\n{said}"
+    );
+    let rows = read_all_parts(&rig.out_dir())
+        .iter()
+        .map(|b| b.num_rows())
+        .sum::<usize>();
+    assert_eq!(
+        rows, 2,
+        "and it must actually capture the base table's two rows — a green run over \
+         zero rows would pass the assertions above while proving nothing"
+    );
+}
+
+/// A MATERIALIZED VIEW is not a guaranteed zero — refuse it and you refuse a
+/// capture that works.
+///
+/// Round-3 bughunt, and the two halves of this file disagreed with each other:
+/// `62a7876` made `'m'` CAPTURABLE in the candidate query on the measured ground
+/// that `test_decoding` decodes a matview, while `classify_routing` 130 lines above
+/// still hard-refused it as writing "no WAL under its own name — no change event
+/// can ever carry it". The false one is the one that reaches the operator.
+///
+/// MEASURED on the pg16 CDC stand, three refresh forms, one slot:
+///   `CREATE MATERIALIZED VIEW … WITH DATA`     → `table v3.mv: INSERT: id[integer]:1 …`
+///   `REFRESH MATERIALIZED VIEW …`              → nothing under its own name
+///   `REFRESH MATERIALIZED VIEW CONCURRENTLY …` → `table v3.mv: INSERT: id[integer]:3 …`
+///
+/// The original comment measured only the middle form and generalised from it.
+/// CONCURRENTLY is the standard production refresh — it does not lock readers — so
+/// the refused config is the common one.
+///
+/// The honest verdict is PARTIAL, not Routable and not Never: what a matview emits
+/// are REFRESH deltas, not the source table's changes, and a plain refresh emits
+/// nothing at all. An operator who points CDC at a matview expecting source changes
+/// needs to hear that, and needs the run to work.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_matview_is_a_loud_partial_not_a_refusal() {
+    let cdc_db = CdcDb::new("cdc_matview");
+    let slot = unique_name("rivet_mv_slot");
+    let base = unique_name("rivet_cdc_mvb").to_lowercase();
+    let mv = format!("{base}_mv");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {base} (id BIGINT PRIMARY KEY, v INT); \
+         INSERT INTO {base} VALUES (1,10); \
+         CREATE MATERIALIZED VIEW {mv} AS SELECT id, v FROM {base} WITH DATA; \
+         CREATE UNIQUE INDEX ON {mv} (id)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    // The refresh form that DOES decode, and the one a production job runs.
+    c.batch_execute(&format!(
+        "INSERT INTO {base} VALUES (2,20); REFRESH MATERIALIZED VIEW CONCURRENTLY {mv}"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&format!("public.{mv}"), &slot).source_url(cdc_db.url());
+    let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a matview refreshed CONCURRENTLY emits rows under its own name (MEASURED), \
+         so refusing it refuses a working capture:\n{said}"
+    );
+    assert!(
+        said.to_lowercase().contains("concurrently"),
+        "and the run must WARN what it is actually delivering — refresh deltas, only \
+         from CONCURRENTLY refreshes, never the base table's own changes. Silence \
+         here is how someone ships a matview capture that sits at 0 rows forever \
+         because their refresh is the plain form:\n{said}"
+    );
+    let rows = read_all_parts(&rig.out_dir())
+        .iter()
+        .map(|b| b.num_rows())
+        .sum::<usize>();
+    assert!(
+        rows > 0,
+        "the CONCURRENTLY refresh's delta must reach the destination — a green run \
+         over zero rows makes the assertions above vacuous:\n{said}"
+    );
+}
+
+/// The routing WARNING must print once per run, like the note beside it.
+///
+/// Round-3 bughunt. `62a7876` gated the inert-twin note behind `say_note` because
+/// "the note then printed twice per run, forever, on every scheduler cycle. A
+/// reporting view named after a table is not a condition that resolves." The
+/// `RoutingVerdict::Partial` warning four lines away is in the SAME loop, in the
+/// SAME function called twice, and was left ungated — and it is the better example
+/// of the class, because a `Partial` config SUCCEEDS. A note usually precedes a
+/// bail, so it is seen once anyway; this one repeats on every cycle forever.
+///
+/// The oracle is the COUNT, not the presence: a warning that fires is correct here,
+/// and only its multiplicity is the defect.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_says_the_inheritance_gap_once_per_run_not_twice() {
+    let cdc_db = CdcDb::new("cdc_partial_once");
+    let slot = unique_name("rivet_partial_slot");
+    let parent = unique_name("rivet_cdc_inh").to_lowercase();
+    let child = format!("{parent}_child");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {parent} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {child} () INHERITS ({parent})"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {parent} VALUES (1,10)"), &[])
+        .unwrap();
+
+    let rig = Rig::pg_cdc(&format!("public.{parent}"), &slot).source_url(cdc_db.url());
+    let out = run_rivet(&["run", "--config", rig.config_path().to_str().unwrap()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "an inheritance parent routes its OWN rows, so this run must succeed:\n{said}"
+    );
+    let times = said.matches(&child).filter(|_| true).count();
+    assert!(
+        times >= 1,
+        "the fixture is not inert — the inheritance gap must be reported at all, \
+         naming the child whose direct writes would be dropped:\n{said}"
+    );
+    assert_eq!(
+        said.matches("inheritance child table(s)").count(),
+        1,
+        "and exactly ONCE per run. The precheck runs twice (preflight, then open) \
+         and the note beside this warning is already gated on that; this one was \
+         not, so a `Partial` config repeats it on every scheduler cycle \
+         forever:\n{said}"
     );
 }

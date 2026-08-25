@@ -128,19 +128,27 @@ pub(crate) fn resolve_captured_table(
     // collision.
     let (live, inert): (Vec<&CatalogMatch>, Vec<&CatalogMatch>) =
         distinct.iter().partition(|m| m.capturable);
-    let note = if inert.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " (the name also matches {}, which cannot carry a change event — if that \
-             is the one you meant, capture is not possible for it)",
-            inert
-                .iter()
-                .map(|m| format!("{}.{} [{}]", m.schema, m.table, m.kind))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+    // The note is about TWINS, so it is always built with the elected relation
+    // excluded. When the only match is inert it IS the elected one, and the
+    // unfiltered list produced "`orders` resolves to public.orders, but (the name
+    // also matches public.orders …)" — the same relation on both sides of "but".
+    let note_excluding = |elected: Option<&CatalogMatch>| -> String {
+        let twins: Vec<String> = inert
+            .iter()
+            .filter(|m| elected.is_none_or(|e| ***m != *e))
+            .map(|m| format!("{}.{} [{}]", m.schema, m.table, m.kind))
+            .collect();
+        if twins.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (the name also matches {}, which cannot carry a change event — if that \
+                 is the one you meant, capture is not possible for it)",
+                twins.join(", ")
+            )
+        }
     };
+    let note = note_excluding(None);
     // NOTHING capturable, and more than one candidate. Refusing is right — capture
     // is impossible either way — but the ambiguity message below would be a LIE
     // here: it says all of them would land in this export, and none of them can put
@@ -151,8 +159,11 @@ pub(crate) fn resolve_captured_table(
     if live.is_empty() && distinct.len() > 1 {
         anyhow::bail!(
             "cdc: `{configured}` matches {} relations and NONE of them can carry a change \
-             event{note}. Capture is not possible for this name — point `table:` at a \
-             relation the engine logs, or capture the underlying table if this is a view.",
+             event under that name{note}. Qualify it (`schema.table`) to say which one \
+             you mean — that resolves to a single relation, and the engine then names \
+             what is possible for THAT kind (a partitioned parent is captured by its \
+             leaves or snapshotted with `mode: full`; a view is captured through the \
+             base table it reads).",
             distinct.len()
         );
     }
@@ -165,17 +176,20 @@ pub(crate) fn resolve_captured_table(
              filter, silently. Check the name, and qualify it (`schema.table`) if it \
              lives outside the connection's default schema.{note}"
         ),
-        [one] => Ok(CapturedTable {
-            configured: configured.to_string(),
-            schema: one.schema.clone(),
-            table: one.table.clone(),
-            note: (!note.is_empty()).then(|| {
-                format!(
-                    "`{configured}` resolves to {}.{}, but{note}",
-                    one.schema, one.table
-                )
-            }),
-        }),
+        [one] => {
+            let note = note_excluding(Some(one));
+            Ok(CapturedTable {
+                configured: configured.to_string(),
+                schema: one.schema.clone(),
+                table: one.table.clone(),
+                note: (!note.is_empty()).then(|| {
+                    format!(
+                        "`{configured}` resolves to {}.{}, but{note}",
+                        one.schema, one.table
+                    )
+                }),
+            })
+        }
         many => {
             let listing = many
                 .iter()
@@ -290,6 +304,56 @@ mod tests {
         assert!(
             !msg.contains("would land in this export"),
             "and do not claim rows would land when none can: {msg}"
+        );
+    }
+
+    /// The single-inert case's NOTE must not name the relation it just elected.
+    ///
+    /// `note` is built from `inert`, and when the only match IS inert that list
+    /// holds the elected relation itself — so the message read "`orders` resolves to
+    /// public.orders, but (the name also matches public.orders [p] …)": the same
+    /// relation on both sides of "but", telling the operator about a twin that does
+    /// not exist. The arm above deliberately lets one inert candidate through to the
+    /// engine's classifier; nobody checked what the note said once it did.
+    #[test]
+    fn a_lone_inert_match_gets_no_note_about_itself() {
+        let got = resolve_captured_table("orders", &[k("public", "orders", "p")])
+            .expect("one candidate, inert — classification owns the refusal");
+        assert_eq!(
+            got.note, None,
+            "the only match IS the elected relation, so there is no twin to warn \
+             about — a note naming it on both sides of `but` is noise the operator \
+             has to decode before discarding. Got: {:?}",
+            got.note
+        );
+    }
+
+    /// The all-inert refusal must not claim capture is impossible for the NAME.
+    ///
+    /// It is a true statement about the relations as MATCHED and a false one about
+    /// the operator's options: qualifying the name (`table: public.orders`) reduces
+    /// this to the single-match arm, where the engine's classifier owns the specific
+    /// remedy — for a partitioned parent, "name the leaves, or `mode: full`". That
+    /// remedy exists and was unreachable, because this bail fires first.
+    #[test]
+    fn the_all_inert_refusal_points_at_qualification_not_at_impossibility() {
+        let err = resolve_captured_table(
+            "orders",
+            &[k("public", "orders", "p"), k("rep", "orders", "v")],
+        )
+        .expect_err("nothing capturable under this name as configured");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Capture is not possible for this name"),
+            "capture IS possible for a partitioned parent — by its leaves, or with \
+             `mode: full`. Stating the opposite sends an operator away from a \
+             workable config: {msg}"
+        );
+        assert!(
+            msg.contains("qualify") || msg.contains("schema.table"),
+            "hand over the one action that reaches the engine's specific advice — \
+             qualifying the name resolves to ONE relation and the classifier then \
+             names what to do about it: {msg}"
         );
     }
 
