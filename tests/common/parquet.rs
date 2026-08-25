@@ -77,6 +77,118 @@ fn stage_for_duckdb(dir: &Path) -> String {
     container
 }
 
+/// Stage only the parts the MANIFEST declares, for a reader inside the container.
+///
+/// The sibling of [`stage_for_duckdb`], which globs. A glob answers "what does the
+/// destination hold"; every consumer — `rivet load`, `rivet validate`, reconcile —
+/// reads what the run DECLARED, and a crashed run leaves parts no manifest names.
+/// A row-level comparison against the source has to use the declared set or it
+/// grades orphans as delivered.
+fn stage_declared_for_duckdb(dir: &Path) -> String {
+    let label = format!(
+        "duckdb_declared_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    );
+    let (host, container) = super::live_shared_workdir(&label);
+    for f in std::fs::read_dir(&host).into_iter().flatten().flatten() {
+        let _ = std::fs::remove_file(f.path());
+    }
+    for f in declared_parquet_parts(dir) {
+        let name = f.file_name().expect("part has a name");
+        std::fs::copy(&f, host.join(name))
+            .unwrap_or_else(|e| panic!("stage declared {} for duckdb: {e}", f.display()));
+    }
+    container
+}
+
+/// Rows the two sides do not agree on, at TUPLE granularity, with the source
+/// ATTACHed into the same DuckDB session.
+///
+/// Every source-vs-destination oracle in this repo before this one was a per-column
+/// AGGREGATE — `live_differential`'s fingerprint is `count, sum(id), sum(n),
+/// sum(big), sum(length(text)), count(DISTINCT id), count(DISTINCT text)`, and the
+/// source-parity sweep compares `count/count(col)/count(distinct col)` plus sums.
+/// Swapping the values of one column between two rows preserves EVERY one of those.
+/// MEASURED on 1000 rows: all seven fingerprint fields identical, all four sweep
+/// profiles identical, and a row-level `EXCEPT` finds the two rows in 4 ms.
+///
+/// So this closes a class nothing else here can see: row misassociation, a
+/// cross-row shuffle, a swap between two columns of the same profile — and, in
+/// practice more often, any type the aggregate fixtures do not carry (the
+/// differential's fixture is `BIGINT, INT, BIGINT, TEXT`; no decimal, timestamp,
+/// json, bytea or array is in it at all).
+///
+/// The reader shares no code with either side: DuckDB decodes the Parquet AND
+/// pulls the source through its own postgres/mysql scanner. The `ATTACH` pattern is
+/// already used one directory over — `dev/pytools/state_parity_duckdb.py` attaches
+/// SQLite and Postgres in one session, for the same reason: a digest computed with
+/// each engine's own string concatenation disagreed across engines whose data was
+/// byte-identical.
+///
+/// Both sides are cast to VARCHAR by the CALLER's projection, deliberately: a
+/// difference in RENDERING (1.10 vs 1.1) would otherwise read as a difference in
+/// VALUE. Pass explicit casts for any type whose two renderings differ, and keep the
+/// projections textually identical so a mismatch means the data differs.
+///
+/// Only PostgreSQL and MySQL: DuckDB ships `postgres`/`mysql`/`sqlite` scanners and
+/// no SQL Server or MongoDB one. On those two engines the aggregate oracles remain
+/// the strongest available, and that is a limit to state, not to paper over.
+pub struct RowDiff {
+    /// In the SOURCE and not at the destination — a loss.
+    pub missing: Vec<String>,
+    /// At the destination and not in the source — a duplicate, a stale row, or a
+    /// value written wrong (which shows up on BOTH sides, once each way).
+    pub extra: Vec<String>,
+}
+
+impl RowDiff {
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.extra.is_empty()
+    }
+}
+
+pub fn duckdb_row_diff_vs_source(
+    dir: &Path,
+    attach_dsn: &str,
+    attach_type: &str,
+    source_projection: &str,
+    dest_projection: &str,
+) -> RowDiff {
+    let staged = stage_declared_for_duckdb(dir);
+    let sql = format!(
+        "INSTALL {attach_type}; LOAD {attach_type}; \
+         ATTACH '{attach_dsn}' AS src (TYPE {attach_type}, READ_ONLY); \
+         CREATE OR REPLACE VIEW s AS {source_projection}; \
+         CREATE OR REPLACE VIEW d AS SELECT * FROM ({dest_projection}); \
+         SELECT 'missing' AS side, * FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM d) \
+         UNION ALL \
+         SELECT 'extra', * FROM (SELECT * FROM d EXCEPT ALL SELECT * FROM s) \
+         LIMIT 50"
+    )
+    .replace("__STAGED__", &staged);
+    let v = super::duckdb_run_sql_json(&sql);
+    let mut out = RowDiff {
+        missing: Vec::new(),
+        extra: Vec::new(),
+    };
+    for row in v["rows"].as_array().into_iter().flatten() {
+        let cells: Vec<String> = row
+            .as_array()
+            .into_iter()
+            .flatten()
+            .skip(1)
+            .map(|c| c.as_str().unwrap_or("<null>").to_string())
+            .collect();
+        let line = cells.join(" | ");
+        match row[0].as_str().unwrap_or("") {
+            "missing" => out.missing.push(line),
+            _ => out.extra.push(line),
+        }
+    }
+    out
+}
+
 /// Row count of every `.parquet` under `dir`, read by DuckDB.
 ///
 /// The independent-decoder twin of [`total_parquet_rows`]. rivet writes Parquet
