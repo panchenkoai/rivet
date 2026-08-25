@@ -147,6 +147,74 @@ impl MysqlChangeStream {
         Self::row_image_verdict(image.as_deref())
     }
 
+    /// [`Self::check_configured_tables_are_routable`] on its own connection, for the
+    /// caller to run BEFORE `open_or_resume`.
+    ///
+    /// The hoist matters: `create_change_stream` wraps that call in
+    /// `MYSQL_CDC_HINT` (binlog grants / binlog_format), so a routing refusal raised
+    /// inside `open` reaches the operator prefixed with "if this is a
+    /// permissions/setup error" — for a config problem that has nothing to do with
+    /// permissions. Same reason the checkpoint is validated before the call, and the
+    /// same defect that hoist was added for.
+    ///
+    /// A connect failure here is swallowed deliberately: `open_or_resume` is about to
+    /// dial the same server and its error — WITH the grants hint — is the right one
+    /// for that case.
+    pub(crate) fn precheck_configured_tables(
+        url: &str,
+        tls: Option<&TlsConfig>,
+        configured: &[String],
+    ) -> Result<()> {
+        if configured.is_empty() {
+            return Ok(());
+        }
+        let Ok(mut conn) = connect_conn(url, tls) else {
+            return Ok(());
+        };
+        Self::check_configured_tables_are_routable(&mut conn, configured)
+    }
+
+    /// Live half: ask `information_schema` what each configured name IS, before
+    /// the stream is read and long before any checkpoint advance. Decisions live
+    /// in [`classify_mysql_routing`]; this is glue.
+    ///
+    /// Best-effort on the QUERY itself — a catalog permission error must not fail
+    /// a capture that is otherwise fine, the same posture `row_image` takes. What
+    /// is NOT best-effort is the verdict: once the catalog answers, a non-base
+    /// relation bails.
+    pub(crate) fn check_configured_tables_are_routable(
+        conn: &mut mysql::Conn,
+        configured: &[String],
+    ) -> Result<()> {
+        use mysql::prelude::Queryable as _;
+        for cfg in configured {
+            let (schema, table) = match cfg.split_once('.') {
+                Some((s, t)) => (Some(s.to_string()), t.to_string()),
+                None => (None, cfg.clone()),
+            };
+            let row: Option<String> = match &schema {
+                Some(s) => conn
+                    .exec_first(
+                        "SELECT TABLE_TYPE FROM information_schema.TABLES \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        (s, &table),
+                    )
+                    .unwrap_or(None),
+                None => conn
+                    .exec_first(
+                        "SELECT TABLE_TYPE FROM information_schema.TABLES \
+                         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+                        (&table,),
+                    )
+                    .unwrap_or(None),
+            };
+            if let MysqlRoutingVerdict::Never(why) = classify_mysql_routing(cfg, row.as_deref()) {
+                anyhow::bail!("{why}");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn open(
         url: &str,
         server_id: u32,
@@ -447,20 +515,6 @@ impl MysqlChangeStream {
             // `XA PREPARE` deliberately does NOT release: the transaction is not
             // committed yet, and releasing there would publish rows a later
             // `XA ROLLBACK` erases.
-            // A TRUNCATE is a QUERY event, never rows — so the rows path below
-            // never sees it and the `_ => {}` arm dropped it silently, leaving the
-            // destination holding rows the source no longer has. Table-addressed
-            // for the reason #281 measured: the binlog carries every table on the
-            // server, so refusing without asking whose relation it is would make
-            // one truncated table an outage for exports that never read it.
-            Some(EventData::QueryEvent(qe))
-                if truncate_target(&qe.query(), &qe.schema()).is_some_and(|(sc, tb)| {
-                    undecodable_event_is_ours(Some((&sc, &tb)), &self.configured_tables)
-                }) =>
-            {
-                let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
-                anyhow::bail!(truncate_refusal_message(&sc, &tb));
-            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -690,6 +744,59 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     Ok(conn)
 }
 
+/// What a configured MySQL `table:` actually IS, and whether the binlog can ever
+/// name it — the MySQL half of the PostgreSQL routing guard (#283).
+///
+/// A binlog `Table_map` names the relation the rows PHYSICALLY landed in. For a
+/// RANGE-partitioned table that is the logical table (measured — partitioning is
+/// fine here, unlike PostgreSQL). For an updatable VIEW it is the BASE table, and
+/// the sink routes byte-exact, so every change is dropped.
+///
+/// MEASURED 2026-08-24 by an adversarial re-check of a matrix cell that claimed
+/// MySQL had no such relation: 3 rows committed through a view gave
+/// `rows: 0, files: 0, status: success, exit 0` with the checkpoint advanced past
+/// the commit (54945184 -> 54945514), and fixing the config recovered NOTHING
+/// from that checkpoint.
+///
+/// Severity differs from PostgreSQL and the message says so: MySQL binlog
+/// retention is reader-independent, so the events are still in the log and
+/// deleting the checkpoint re-reads them. On PostgreSQL the slot had already
+/// freed the WAL, which is why that one is unrecoverable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MysqlRoutingVerdict {
+    Routable,
+    Never(String),
+}
+
+/// Pure half of the guard. `table_type` is `information_schema.TABLES.TABLE_TYPE`
+/// for the configured name, or `None` when the catalog has no row for it — which
+/// the schema probe reports on its own, loudly, so this stays quiet about it
+/// rather than producing a second, competing error for one cause.
+pub(crate) fn classify_mysql_routing(
+    configured: &str,
+    table_type: Option<&str>,
+) -> MysqlRoutingVerdict {
+    match table_type {
+        None => MysqlRoutingVerdict::Routable,
+        Some(t) if t.eq_ignore_ascii_case("BASE TABLE") => MysqlRoutingVerdict::Routable,
+        Some(t) => MysqlRoutingVerdict::Never(format!(
+            "mysql cdc: `{configured}` is a {t}, not a base table. The binlog names the relation \
+             rows physically landed in — for a view that is the BASE table — and routing is \
+             byte-exact, so every change would be dropped while the checkpoint advanced past it: \
+             a run reporting success with 0 rows. Capture the base table(s) the view reads \
+             instead. If a run already did this, the changes are NOT lost — MySQL binlog \
+             retention does not depend on the reader, so deleting the checkpoint re-reads them."
+        )),
+    }
+}
+
+/// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
+/// the bounded run's termination contract (see [`MysqlChangeStream::bound`]).
+/// Binlog files order by their numeric suffix (`binlog.000042`); a lexicographic
+/// compare breaks at the 999999 → 1000000 width rollover, so parse the ordinal
+/// (one server has one basename — rotation never changes it mid-stream). Fails
+/// open: an unparseable name is never "past" — the `BINLOG_DUMP_NON_BLOCK` EOF
+/// backstop still ends the run (delayed termination, never a dropped commit).
 /// Remove `/* … */` comment spans, leaving a space so tokens never fuse.
 ///
 /// Not a general SQL lexer: a `/*` inside a string literal is not something a
@@ -776,13 +883,6 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
     )
 }
 
-/// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
-/// the bounded run's termination contract (see [`MysqlChangeStream::bound`]).
-/// Binlog files order by their numeric suffix (`binlog.000042`); a lexicographic
-/// compare breaks at the 999999 → 1000000 width rollover, so parse the ordinal
-/// (one server has one basename — rotation never changes it mid-stream). Fails
-/// open: an unparseable name is never "past" — the `BINLOG_DUMP_NON_BLOCK` EOF
-/// backstop still ends the run (delayed termination, never a dropped commit).
 /// Does this QUERY event close a transaction?
 ///
 /// `COMMIT` on its own (the non-transactional-engine and binlog-format path) and
@@ -907,85 +1007,55 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
-    /// The MySQL TRUNCATE recogniser, graded offline.
+    /// The MySQL routing guard's decision surface.
     ///
-    /// MySQL logs the statement AS WRITTEN, so the parser must survive the forms a
-    /// human or an ORM actually emits — with and without `TABLE`, with and without
-    /// backticks, qualified and bare — and must refuse to guess at anything else
-    /// rather than fire on a statement it half-understood.
+    /// `None` (the catalog has no row) must stay ROUTABLE, deliberately: the schema
+    /// probe reports a missing table with a message that already names it, and a
+    /// second competing error for one cause is worse than none.
     #[test]
-    fn a_mysql_truncate_statement_resolves_the_table_it_names() {
-        let t = |sql: &str| truncate_target(sql, "appdb");
-        for form in [
-            "TRUNCATE TABLE orders",
-            "truncate table orders",
-            "TRUNCATE orders",
-            "TRUNCATE TABLE `orders`",
-            "TRUNCATE TABLE orders;",
-            "  TRUNCATE   TABLE   orders  ",
-        ] {
-            assert_eq!(
-                t(form),
-                Some(("appdb".to_string(), "orders".to_string())),
-                "a bare name takes the EVENT's database: {form}"
-            );
-        }
+    fn a_non_base_relation_is_refused_and_a_base_table_is_not() {
         assert_eq!(
-            t("TRUNCATE TABLE `other`.`orders`"),
-            Some(("other".to_string(), "orders".to_string())),
-            "a qualified name carries its OWN schema — a cross-database truncate \
-             must not be attributed to the event's database"
+            classify_mysql_routing("rivet.orders", Some("BASE TABLE")),
+            MysqlRoutingVerdict::Routable,
+            "an ordinary table must stay routable — refusing it would break every config"
         );
         assert_eq!(
-            t("TRUNCATE other.orders"),
-            Some(("other".to_string(), "orders".to_string()))
+            classify_mysql_routing("rivet.orders", Some("base table")),
+            MysqlRoutingVerdict::Routable,
+            "TABLE_TYPE casing is not something to depend on"
         );
-
-        // Comment forms. The prediction that these were a live hole did NOT
-        // reproduce (the QUERY event's `query()` does not carry the `/* xid=N */`
-        // that SHOW BINLOG EVENTS renders, and four live forms all refused
-        // correctly), so this is insurance rather than a fix — but it is the kind
-        // of insurance worth having, because the failure mode is a silent
-        // divergence rather than an error.
-        for form in [
-            "TRUNCATE TABLE orders /* xid=892514 */",
-            "TRUNCATE TABLE orders /*controller='orders',action='purge'*/",
-            "/*route=purge*/ TRUNCATE TABLE orders",
-            "TRUNCATE /*odd*/ TABLE orders",
-        ] {
-            assert_eq!(
-                t(form),
-                Some(("appdb".to_string(), "orders".to_string())),
-                "a comment must not hide a truncate: {form}"
-            );
-        }
-        // An UNTERMINATED comment must not resurrect the tail as a table name.
         assert_eq!(
-            t("TRUNCATE TABLE orders /* never closed"),
-            Some(("appdb".to_string(), "orders".to_string()))
+            classify_mysql_routing("rivet.orders", None),
+            MysqlRoutingVerdict::Routable,
+            "an absent catalog row is the schema probe's error to report, not this \
+             guard's — two errors for one cause is worse than one"
         );
 
-        // Not a truncate, and — just as important — not a shape this reader claims
-        // to understand. Guessing would fail runs on statements it misread.
-        for other in [
-            "COMMIT",
-            "BEGIN",
-            "DELETE FROM orders",
-            "DROP TABLE orders",
-            "TRUNCATE TABLE orders PARTITION (p0)",
-        ] {
-            assert_eq!(t(other), None, "must not fire on: {other}");
-        }
-
-        let msg = truncate_refusal_message("appdb", "orders");
+        let MysqlRoutingVerdict::Never(why) =
+            classify_mysql_routing("rivet.orders_v", Some("VIEW"))
+        else {
+            panic!("a VIEW can never be routed — the binlog names its BASE table");
+        };
         assert!(
-            msg.contains("appdb.orders") && msg.contains("mode: full"),
-            "the refusal must name the table AND the re-snapshot that recovers: {msg}"
+            why.contains("rivet.orders_v") && why.contains("VIEW"),
+            "the refusal must name the relation and what it is: {why}"
         );
         assert!(
-            truncate_refusal_message("", "orders").contains("`orders`"),
-            "a schema-less identity must not render a leading dot"
+            why.contains("base table(s)"),
+            "it must say what to capture instead: {why}"
         );
+        assert!(
+            why.contains("NOT lost"),
+            "MySQL binlog retention is reader-independent, so this IS recoverable by \
+             deleting the checkpoint — saying so is the difference between a config \
+             fix and a re-snapshot the operator does not need: {why}"
+        );
+        // SYSTEM VIEW is the other type information_schema reports; it must refuse
+        // for the same reason rather than fall through to Routable.
+        assert!(matches!(
+            classify_mysql_routing("x", Some("SYSTEM VIEW")),
+            MysqlRoutingVerdict::Never(_)
+        ));
     }
 
     /// The refusal message IS the remediation — an operator has nothing else to go

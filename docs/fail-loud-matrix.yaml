@@ -24,10 +24,10 @@ scenarios:
     mongo:    { na: "an oplog-rolled-past resume token surfaces the driver's ChangeStreamHistoryLost directly (rivet does not swallow it — src/source/mongo/cdc.rs); forcing an oplog rollover live is impractical (documented NA in cdc_conformance_gate.rs). The adjacent corrupt-checkpoint case IS tested: roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor" }
 
   - id: cdc_unroutable_configured_table_loud
-    what: "a configured `table:` that NO change event can ever name (a PostgreSQL partitioned parent / view / matview; a SQL Server capture instance whose catalog identity differs) → loud bail AT OPEN, before any ack, never a 0-row `status: success` past an advanced cursor"
+    what: "a configured `table:` that NO change event can ever name (a PostgreSQL partitioned parent / view / matview; a MySQL VIEW, whose binlog Table_map names the BASE table; a SQL Server capture instance whose catalog identity differs) → loud bail AT OPEN, before any ack, never a 0-row `status: success` past an advanced cursor"
     postgres: { test: roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot }
     mssql:    { test: mssql_cdc_capture_instance_name_must_not_decide_the_table }
-    mysql:    { na: "no MySQL relation emits under a name other than the configured one — the binlog's table_map carries the LOGICAL table, partitioning included (measured 2026-08-24: a RANGE-partitioned table captured through a config naming the parent)" }
+    mysql:    { test: roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table }
     mongo:    { na: "a change stream's `ns` IS the collection the write addressed; Mongo has no parent/child relation surfacing events under a different name, so there is no second identity to cross-check" }
 
   - id: cdc_truncate_loud_not_a_silent_divergence

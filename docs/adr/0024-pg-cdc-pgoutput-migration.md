@@ -69,3 +69,90 @@ anchor-model contract is unchanged — PG still pins server-side at slot creatio
 - The non-UTC session test (`pg_cdc_non_utc_database_timezone_matches_batch`)
   is the canary for this ADR — it fails first if a new session-shaped
   rendering appears.
+
+## Amendment 2026-08-24: a SECOND text class — identity, not values
+
+The six defects above are all about the rendering of a *value*. A hostile
+verification pass found a distinct class the pin set never covered: the rendering
+of an **identity**. `test_decoding` names relations as TEXT, and every routing
+decision compares that text byte-exact, so the same hop corrupts *which table a
+change belongs to* rather than what it contains.
+
+Four measured this session, each a silent loss past an advancing slot:
+
+1. **Partitioned parent.** `test_decoding` names the PARTITION a row landed in.
+   A config naming the logical parent captured 0 of 2 rows, reported
+   `status: success`, advanced the slot, and the corrected re-run recovered
+   nothing (the WAL was already freed).
+2. **A folded twin.** The schema probe interpolates the config into
+   `SELECT * FROM {table}` (PostgreSQL FOLDS it); the router compares byte-exact.
+   With `"MixedCase"` and `mixedcase` both present, rows were written under the
+   WRONG table's schema — the real column absent entirely, exit 0.
+3. **A 3-part name.** `to_regclass` accepts `db.schema.table`; `table_matches`
+   splits on the first dot. Resolves, never routes.
+4. **TRUNCATE.** Arrives as a line of prose naming a comma-separated LIST of
+   relations, which had to be re-parsed (twice — the first fix anchored on the
+   wrong separator and matched nothing).
+
+`pgoutput` makes all four unrepresentable for the same structural reason the
+value class disappears: it carries a **relation OID plus a Relation message**,
+not a name to parse, and TRUNCATE is a typed message carrying an ARRAY of
+relation OIDs rather than text. Partition identity is a publication-level
+setting — `publish_via_partition_root`, which Debezium 3.2 exposes as
+`publish.via.partition.root` — and it does not exist for `test_decoding` at all,
+because publications are a pgoutput concept.
+
+External corroboration worth recording: **Debezium supports only `decoderbufs`
+and `pgoutput`** — `test_decoding` is not a supported plugin, and PostgreSQL's
+own docs call it "meant for testing that replication works rather than for
+building robust production apps". The guards this session added are the correct
+minimum FOR `test_decoding` (they turn each silent loss into a loud refusal),
+but each is a parser standing in for a mechanism the protocol would provide.
+
+### Effect on the decision
+
+Trigger 1 is widened: it now fires on a seventh text-rendering defect class **or
+a text-IDENTITY defect class**. The identity class has now fired — four
+instances in one day — so by the ADR's own terms this is no longer "not
+scheduled" but a candidate whose gate has been met. The blockers in "Why not
+now" (the sync `postgres` crate does not speak streaming replication; a
+PUBLICATION is a new server-side resource with its own lifecycle) are unchanged
+and still real; what has changed is the cost of NOT migrating, which is now
+measured rather than projected.
+
+Recommended next step, and deliberately scoped smaller than the migration: a
+spike that answers (a) which streaming-replication crate is audit-clean today,
+and (b) whether a PUBLICATION can be made optional — capture without DDL rights
+was the original reason for this plugin, and if `pgoutput` cannot preserve it,
+the migration is a dual-mode adapter rather than a replacement.
+
+### What the rest of the ecosystem does (surveyed 2026-08-24)
+
+Checked because "are we reinventing the wheel" is the right question to ask
+before building the seventh parser. Answer: on the plugin choice, yes.
+
+- **Debezium** supports `decoderbufs` and `pgoutput` only. `test_decoding` is not
+  a supported plugin at all.
+- **PeerDB** takes the parent table name and nothing else — "you don't need to
+  specify the names of each partition" — via a publication with
+  `publish_via_partition_root` (PG 13-16; on PG 12, a publication FOR ALL TABLES).
+- **Sequin's** plugin guide states test_decoding's "output format is not designed
+  for production parsing" and calls it "mainly useful for understanding how
+  logical decoding works or for quick debugging".
+- PostgreSQL's own docs: "meant for testing that replication works rather than
+  for building robust production apps".
+
+Two design answers worth stealing regardless of which way this ADR goes:
+
+1. **TRUNCATE is a MODE, not a verdict.** Debezium's `truncate.handling.mode`
+   defaults to `skip` and can be set to `include`. rivet now REFUSES, which is
+   right for a file/warehouse sink (there is no consumer to interpret a truncate
+   event, and the divergence is permanent) — but it is a stricter answer than the
+   ecosystem's, and the difference should be a documented choice rather than an
+   accident of what we happened to implement.
+2. **Partition drop is documented, not detected.** PeerDB explicitly does NOT
+   propagate a dropped partition: "we don't delete data matching that partition."
+   That is the same class as the `SWITCH PARTITION` finding this session left
+   open on SQL Server — rows leaving the source with no events. The mature answer
+   is a stated contract, not a detector, and our ledger should record it that way
+   rather than carrying it as an unfilled gap forever.
