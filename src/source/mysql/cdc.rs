@@ -159,6 +159,44 @@ impl MysqlChangeStream {
     /// evidence of a bad setting: MySQL 5.7 has no way to carry names, the sink
     /// maps positionally there by construction, and a warning naming a variable
     /// that does not exist is one an operator cannot act on.
+    /// Read a resume position out of a checkpoint that has already PARSED.
+    ///
+    /// The MSSQL peer of this (`mssql::cdc::resume_from_checkpoint`) exists because
+    /// the runner and `doctor` had drifted into two readings of one file. MySQL had
+    /// the same split and the doctor side was the LOOSER one: it read `file` with
+    /// `.unwrap_or_default()` and `pos` with `.unwrap_or(0)`, so a malformed
+    /// checkpoint rendered as `Loaded { file: "", pos: 0 }` and was then graded
+    /// "below binlog retention (file purged) — the next run fails with ERROR 1236",
+    /// hinting RE-SNAPSHOT. Wrong cause, and a destructive remedy for a file that is
+    /// merely malformed — the run's actual error is `checkpoint missing 'file'`.
+    ///
+    /// One decoder, so the two cannot disagree again.
+    pub(crate) fn resume_from_checkpoint(
+        pos: Option<&super::super::cdc::Position>,
+        path: &str,
+    ) -> Result<Option<(String, u64)>> {
+        let Some(pos) = pos else {
+            return Ok(None);
+        };
+        let file = pos
+            .0
+            .get("file")
+            .and_then(Json::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
+                     treat it as absent, which would re-anchor at the CURRENT binlog \
+                     position and silently skip every change since it was written. Restore \
+                     the file, or delete it to accept a fresh anchor."
+                )
+            })?
+            .to_string();
+        let p = pos.0.get("pos").and_then(Json::as_u64).ok_or_else(|| {
+            anyhow::anyhow!("checkpoint '{path}' parses as JSON but carries no 'pos'")
+        })?;
+        Ok(Some((file, p)))
+    }
+
     pub(crate) fn row_metadata_warning(metadata: Option<&str>) -> Option<String> {
         let m = metadata?;
         if m.eq_ignore_ascii_case("FULL") {
@@ -374,19 +412,11 @@ impl MysqlChangeStream {
         configured_tables: Vec<String>,
     ) -> Result<Self> {
         if let Some(path) = ckpt
-            && let Some(pos) = Position::load(path)?
+            && let Some((file, p)) = Self::resume_from_checkpoint(
+                Position::load(path)?.as_ref(),
+                &path.display().to_string(),
+            )?
         {
-            let file = pos
-                .0
-                .get("file")
-                .and_then(Json::as_str)
-                .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'file'"))?
-                .to_string();
-            let p = pos
-                .0
-                .get("pos")
-                .and_then(Json::as_u64)
-                .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
             return Self::open(url, server_id, file, p, mode, tls, configured_tables);
         }
         // First run (no checkpoint yet): anchor at the current position and persist

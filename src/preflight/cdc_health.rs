@@ -470,15 +470,33 @@ fn mysql_checks(
             None => MysqlCkpt::NoPathConfigured,
             Some(p) => match crate::source::cdc::Position::load(std::path::Path::new(p))? {
                 None => MysqlCkpt::NotYetWritten,
+                // The SAME decoder the run uses. This read `file` with
+                // `.unwrap_or_default()` and `pos` with `.unwrap_or(0)`, so a
+                // malformed checkpoint rendered as `Loaded { file: "", pos: 0 }` and
+                // was graded "below binlog retention (file purged) … ERROR 1236" with
+                // a RE-SNAPSHOT hint — the wrong cause and a destructive remedy for a
+                // file the run rejects as `checkpoint missing 'file'`.
                 Some(pos) => {
-                    let file = pos
-                        .0
-                        .get("file")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let p = pos.0.get("pos").and_then(|v| v.as_u64()).unwrap_or(0);
-                    MysqlCkpt::Loaded { file, pos: p }
+                    match crate::source::mysql::cdc::MysqlChangeStream::resume_from_checkpoint(
+                        Some(&pos),
+                        p,
+                    ) {
+                        Ok(Some((file, at))) => MysqlCkpt::Loaded { file, pos: at },
+                        Ok(None) => MysqlCkpt::NotYetWritten,
+                        Err(why) => {
+                            checks.push(check(
+                                format!("CDC checkpoint (export '{}')", e.name),
+                                false,
+                                Some(why.to_string()),
+                                Some(
+                                    "restore the file, or delete it to accept a fresh \
+                                     anchor at the current binlog position"
+                                        .into(),
+                                ),
+                            ));
+                            MysqlCkpt::NoPathConfigured
+                        }
+                    }
                 }
             },
         };
@@ -682,10 +700,55 @@ fn mssql_checks(
 fn mongo_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
-    _exports: &[&ExportConfig],
+    exports: &[&ExportConfig],
 ) -> Result<Vec<DoctorCheck>> {
     let cap = crate::source::mongo::cdc::probe_capability(url, tls)?;
     let mut checks = Vec::new();
+
+    // The checkpoint, which this took as `_exports` and never read. `create_change_
+    // stream`'s Mongo arm loads it and `Position::load` HARD-FAILS on a corrupt file,
+    // so the exact defect measured on SQL Server today — `doctor` exit 0 and `check`
+    // saying "Looks good" on a file the run then refuses — was live here too, on the
+    // engine whose resume position is a driver token nobody can hand-repair.
+    for e in exports {
+        let Some(path) = e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) else {
+            continue;
+        };
+        let name = format!("CDC checkpoint (export '{}')", e.name);
+        match crate::source::cdc::Position::load(std::path::Path::new(path)) {
+            Ok(None) => checks.push(check(
+                name,
+                true,
+                Some("not written yet — the first run pins its own anchor".into()),
+                None,
+            )),
+            Ok(Some(pos)) => match crate::source::mongo::cdc::decode_resume_token(&pos.0) {
+                Ok(_) => checks.push(check(
+                    name,
+                    true,
+                    Some("resume token readable".into()),
+                    None,
+                )),
+                Err(why) => checks.push(check(
+                    name,
+                    false,
+                    Some(format!("{why} — the run refuses this file")),
+                    Some(
+                        "restore the checkpoint, or delete it to accept a fresh anchor at \
+                         the current cluster time (which SKIPS everything since it was \
+                         written — re-snapshot if that gap matters)"
+                            .into(),
+                    ),
+                )),
+            },
+            Err(why) => checks.push(check(
+                name,
+                false,
+                Some(why.to_string()),
+                Some("restore the file, or delete it to accept a fresh anchor".into()),
+            )),
+        }
+    }
     // Hard requirement: change streams need a replica set.
     checks.push(check(
         "CDC replica set".into(),
