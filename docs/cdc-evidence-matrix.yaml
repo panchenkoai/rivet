@@ -204,9 +204,19 @@ shapes:
         `row_metadata_warning` (always-None and always-Some).
     mssql:    { na: "change tables carry a fixed column set from the capture instance; there is
         no server knob that changes the image shape the reader sees" }
-    mongo:    { gap: "change-stream pre/post-image settings are per-collection and unset by
-        default; delete pre-images are untested (see delete_semantics_are_end_to_end)" }
-
+    mongo:
+      sound: >-
+        closed 2026-08-25. `changeStreamPreAndPostImages` is per-COLLECTION and off by default,
+        and every Mongo CDC test ran that default — which is the right way round (unlike MySQL,
+        where the stack pinned the NON-default). What was missing was the other side:
+        rivet issues `full_document_before_change(WhenAvailable)` on every stream, and with the
+        setting off that request is a silent no-op indistinguishable from a working one.
+        mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one
+        (tests/live/live_cdc_mongo.rs) turns it on via MongoTest::enable_pre_images and asserts
+        the delete carries the document AS OF the delete (measured {_id:9,v:'doomed'}, not the
+        earlier 'seed'), and self-skips out loud below server 6.0 where there is no pre-image
+        to carry. RED against `ChangeOp::Delete => cse.full_document`; the pre-existing delete
+        test stays GREEN against that same mutant, which is what made this a gap.
   - id: unknown_input_fails_loud_not_silent
     what: >
       Every "unknown -> default" boundary must warn or bail, never degrade silently. The
@@ -379,21 +389,62 @@ shapes:
       owns the claim, the skip path must fail hard instead — the provisioner sets a marker
       and the test refuses to skip when the marker is present.
     mutant: "unset the precondition and observe whether the suite still reports the claim covered"
-    postgres: { vacuous: "the standby refusal test passes by SKIPPING whenever the opt-in
-        profile is not up", kind: skip-as-pass }
-    mysql:    { gap: "same class, not enumerated per test" }
-    mssql:    { gap: "same class, not enumerated per test" }
+    postgres:
+      gap: >-
+        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
+        class was not in the live suite at all: all six runners in tests/harness/mod.rs
+        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
+        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
+        milder and is stated rather than claimed closed: the standby refusal test (roast_pg_cdc_bounded_on_a_standby_fails_loud) and the pg18 governor catalog test return early when an opt-in
+        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
+        release oracle does NOT share this defect — it carries an explicit SKIP status,
+        distinct from pass, by design. The structural fix for the live suite is a marker
+        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
+        here rather than half-built, because a guard that greps for early returns had ten
+        false positives out of eleven when tried on the sibling class.
+    mysql:
+      gap: >-
+        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
+        class was not in the live suite at all: all six runners in tests/harness/mod.rs
+        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
+        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
+        milder and is stated rather than claimed closed: the two compressed-binlog tests (mysql_cdc_refuses_a_compressed_binlog..., mysql_cdc_compressed_payload_in_stream_refuses_not_skips) return early when an opt-in
+        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
+        release oracle does NOT share this defect — it carries an explicit SKIP status,
+        distinct from pass, by design. The structural fix for the live suite is a marker
+        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
+        here rather than half-built, because a guard that greps for early returns had ten
+        false positives out of eleven when tried on the sibling class.
+    mssql:
+      gap: >-
+        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
+        class was not in the live suite at all: all six runners in tests/harness/mod.rs
+        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
+        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
+        milder and is stated rather than claimed closed: no CDC test on this engine skips silently; the shared live sites that do (state-backend parity, validate-exit) are engine-agnostic return early when an opt-in
+        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
+        release oracle does NOT share this defect — it carries an explicit SKIP status,
+        distinct from pass, by design. The structural fix for the live suite is a marker
+        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
+        here rather than half-built, because a guard that greps for early returns had ten
+        false positives out of eleven when tried on the sibling class.
     mongo:
-      sound: "closed 2026-08-25, and it was not one cell but SIX. Every runner in
-        tests/harness/mod.rs answered a missing RIVET_TEST_GCS_BUCKET with Ok(Vec::new());
-        assert_all_pass panics on Skipped and walks straight through an empty list, so the
-        whole oracle-fixture matrix reported `20 passed` in 0.00s on any machine without
-        credentials — which is EVERY machine, since that variable appears in no workflow.
-        Each runner now returns a Skipped outcome (SKIP_WHY), the two CI lanes that cannot
-        supply credentials exclude the cells BY NAME (--skip warehouse_cell, prefix added
-        for exactly that), and tests/offline/skip_is_not_a_pass_guard.rs derives the runner
-        set from the source so a seventh is asked the same question. RED-proven by
-        restoring one empty return." 
+      sound: >-
+        PARTIALLY closed 2026-08-25, and the honest split matters. The WORST instance of this
+        class was not in the live suite at all: all six runners in tests/harness/mod.rs
+        answered a missing warehouse env with an empty result, so 20 oracle-fixture cells
+        reported `20 passed` in 0.00s on every machine (that variable is in no workflow). Fixed
+        + guarded (tests/offline/skip_is_not_a_pass_guard.rs). What REMAINS on this engine is
+        milder and is stated rather than claimed closed: the pre-image test added today, which self-skips below server 6.0 and says the version it saw return early when an opt-in
+        profile is not up, printing a SKIP line that `cargo test` still reports as `ok`. The
+        release oracle does NOT share this defect — it carries an explicit SKIP status,
+        distinct from pass, by design. The structural fix for the live suite is a marker
+        protocol the release lane can COUNT (assert N skips, not zero failures); it is named
+        here rather than half-built, because a guard that greps for early returns had ten
+        false positives out of eleven when tried on the sibling class.
   - id: delete_semantics_are_end_to_end
     what: >
       Tombstones and the 'live current state is WHERE NOT __is_deleted' contract must be
