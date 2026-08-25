@@ -259,12 +259,21 @@ fn pg_foreign_slots_verdict(foreign: &[(String, i64, String)]) -> DoctorCheck {
     // and the drop command is safe to offer. The run path cannot say that.
     match pg_foreign_slots_warning(foreign, false) {
         None => {
+            // NAMES and the total. The names were here before and an operator wants
+            // them — a lingering slot is worth knowing about while it is still
+            // small. The total is the addition: reporting only the max is what let
+            // 1.96 GiB across eight slots read as "small".
             let total: i64 = foreign.iter().map(|(_, b, _)| *b).sum();
+            let listing = foreign
+                .iter()
+                .map(|(n, b, _)| format!("{n} ({})", mib(*b)))
+                .collect::<Vec<_>>()
+                .join(", ");
             check(
                 name,
                 true,
                 Some(format!(
-                    "inactive but small: {} across {} slot(s)",
+                    "inactive but small: {listing} — {} across {} slot(s)",
                     mib(total),
                     foreign.len()
                 )),
@@ -615,22 +624,50 @@ fn mssql_checks(
     for e in exports {
         let ci = e.cdc.as_ref().and_then(|c| c.capture_instance.as_deref());
         let health = src.cdc_health(ci)?;
+        // The SAME decision the run makes, not a second copy of it. This used to
+        // reach for `lsn` with `.and_then`, so a checkpoint that exists but carries
+        // no readable position collapsed to `Some(None)` and rendered as a PASSING
+        // "no checkpoint yet — the first run starts at the retained minimum".
+        // MEASURED: `doctor` exit 0 and `check` saying "Looks good" on the exact
+        // file `run` then hard-refuses. Both preflight claims were false — the file
+        // is present, and the run does not start at the minimum.
+        //
+        // `resume_from_checkpoint` is that decision, and it is where the reason
+        // lives; a failure here carries its message verbatim so the operator is
+        // told the same thing twice rather than two different things.
+        let mut ckpt_error: Option<String> = None;
         let ckpt_state = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
             None => None,
-            Some(p) => Some(
-                crate::source::cdc::Position::load(std::path::Path::new(p))?.and_then(|pos| {
-                    pos.0
-                        .get("lsn")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                }),
-            ),
+            Some(p) => {
+                let pos = crate::source::cdc::Position::load(std::path::Path::new(p))?;
+                match crate::source::mssql::cdc::resume_from_checkpoint(pos.as_ref(), p) {
+                    Ok(r) => Some(r.from_lsn),
+                    Err(e) => {
+                        ckpt_error = Some(e.to_string());
+                        Some(None)
+                    }
+                }
+            }
         };
         let mssql_health = MssqlHealth {
             cdc_enabled: health.cdc_enabled,
             instance_min_lsn: health.instance_min_lsn,
             agent_running: health.agent_running,
         };
+        // A checkpoint the RUN would refuse is a FAIL here, carrying the run's own
+        // message — not a passing "no checkpoint yet".
+        if let Some(why) = ckpt_error {
+            checks.push(check(
+                format!("CDC checkpoint (export '{}')", e.name),
+                false,
+                Some(why),
+                Some(
+                    "restore the file, or delete it to accept a fresh anchor from the \
+                     retained minimum"
+                        .into(),
+                ),
+            ));
+        }
         checks.extend(mssql_verdicts(&e.name, ci, &mssql_health, ckpt_state));
     }
     Ok(checks)
@@ -725,10 +762,12 @@ mod tests {
         let small =
             pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 1 << 20, "logical".into())]);
         assert!(small.ok, "a small inactive slot is a note, not a failure");
+        let d = small.detail.unwrap();
         assert!(
-            small.detail.unwrap().contains("1 slot(s)"),
-            "the healthy note reports the aggregate; naming each small slot is what \
-             made the 2 GiB-across-eight case read as OK"
+            d.contains("ingestr_leftover") && d.contains("1 slot(s)"),
+            "the healthy note carries BOTH — the name, because a lingering slot is \
+             worth knowing about while it is still small, and the total, because \
+             reporting only the max is what let 1.96 GiB across eight read as OK: {d}"
         );
         let big =
             pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 5 << 30, "logical".into())]);

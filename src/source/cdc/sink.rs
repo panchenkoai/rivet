@@ -224,6 +224,34 @@ impl TableSink<'_> {
 /// (`public.orders` — matches schema AND table). Adapters always emit schema
 /// and table separately; comparing the config string verbatim against the
 /// bare event table silently routed ZERO events for qualified configs.
+/// Warn ONCE per (schema, table) per process that images are mapping by position.
+///
+/// The truth about a MySQL binlog image is on the wire — a `TABLE_MAP` written at
+/// `binlog_row_metadata=MINIMAL` carries no column names, whatever the server's
+/// setting is today. `row_metadata_warning` (the open-time probe) is the early
+/// hint; this is the one that cannot be wrong.
+fn warn_positional_once(schema: &str, table: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{schema}.{table}");
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.insert(key.clone()) {
+        log::warn!(
+            "cdc: {key}: this change image carries no column NAMES, so values are \
+             mapped by POSITION. On MySQL that is `binlog_row_metadata = MINIMAL` \
+             (the server default) — note the events replay the setting in force when \
+             they were WRITTEN, so a server switched to FULL still drains a MINIMAL \
+             backlog this way. A same-arity DDL that reorders columns then silently \
+             SWAPS them; an arity-changing one aborts the flush. Set \
+             `binlog_row_metadata = FULL` (8.0.1+) and re-capture from before the DDL"
+        );
+    }
+}
+
 pub(crate) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
     // Full-name match FIRST: a MongoDB collection name may contain dots
     // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
@@ -683,6 +711,18 @@ fn flush(
         if ev.image_names.is_some() {
             continue; // named image — mapped by name, arity-proof for any op
         }
+        // A NAMELESS image maps by POSITION, and this is the only place that knows
+        // it for certain. The open-time probe asks the server what
+        // `binlog_row_metadata` is set to NOW; these events replay whatever was in
+        // force when they were WRITTEN. MEASURED: a server at FULL draining a
+        // backlog written under MINIMAL, with a same-arity `MODIFY .. AFTER`
+        // across the resume boundary, produced `a='BBB', b='AAA'` — swapped,
+        // status success, and ZERO warnings, because the probe answered a question
+        // about the present.
+        //
+        // Once per table per flush, not per event: a MINIMAL backlog is every
+        // event, and a line per row is a line nobody reads.
+        warn_positional_once(&ev.schema, &ev.table);
         let img = if is_delete {
             ev.before.as_ref()
         } else {

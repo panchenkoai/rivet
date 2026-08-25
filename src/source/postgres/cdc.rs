@@ -55,6 +55,22 @@ pub(crate) struct PgChangeStream {
     /// foreign/empty span. Only a non-acking consumer (NDJSON, one big
     /// `Unbounded` peek) treats it as the end.
     exhausted: bool,
+    /// A TRUNCATE of a captured table, seen but NOT yet raised.
+    ///
+    /// Raising it the instant the line is scanned discards everything already read
+    /// in the same peek window: the run fails with `rows: 0`, so nothing flushes,
+    /// nothing acks, and the slot has not moved. The refusal's own remedy —
+    /// re-snapshot, then `pg_replication_slot_advance` past the truncate — then
+    /// throws those transactions away. MEASURED: a two-table export where
+    /// `public.tb` committed an insert BEFORE `public.ta` was truncated lost that
+    /// insert entirely when the remedy was followed verbatim; `tb` was never
+    /// truncated and the message names only `ta`.
+    ///
+    /// So the truncate ENDS the window instead (`exhausted`), the sink flushes +
+    /// checkpoints + acks everything that precedes it, and the refusal is raised on
+    /// the next `fill`. The slot then sits exactly at the last commit before the
+    /// truncate, which is what makes "advance past it" lossless for everything else.
+    pending_truncate_refusal: Option<String>,
     /// Open-time COMMIT-LSN ceiling for a bounded run — the first transaction
     /// committing past it ends the stream; `None` (daemon / anchor-only open)
     /// keeps the pure catch-up exit. The contract lives on [`DrainMode`].
@@ -604,6 +620,7 @@ impl PgChangeStream {
             batch_limit: wire_budget(peek),
             frontier: 0,
             exhausted: false,
+            pending_truncate_refusal: None,
             bound,
             yielded_data: false,
             frontier_text: None,
@@ -625,6 +642,12 @@ impl PgChangeStream {
     /// new transaction — or returns less than a full batch — has drained
     /// everything past the ack frontier and marks the stream [`Self::exhausted`].
     fn fill(&mut self) -> Result<()> {
+        // The refusal deferred by the previous window. By now the sink has flushed,
+        // checkpointed and acked everything that preceded the truncate, so the slot
+        // sits at the last commit before it and the remedy is lossless for the rest.
+        if let Some(why) = self.pending_truncate_refusal.take() {
+            anyhow::bail!(why);
+        }
         let rows = self.client.query(
             "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
             &[&self.slot, &self.batch_limit],
@@ -696,7 +719,29 @@ impl PgChangeStream {
                 // filter would drop their rows anyway, and failing on them would
                 // make one truncated table an outage for every export on this
                 // server (the MySQL undecodable-rows guard's measured lesson).
-                anyhow::bail!(truncate_refusal_message(&schema, &table));
+                // WHEN to raise it depends on whether anything is at stake.
+                //
+                // Nothing yielded in this window yet ⇒ there is nothing to flush and
+                // nothing an ack could save, so raise NOW: deferring would leave a
+                // BOUNDED run (`until_current`) free to reach its ceiling and
+                // terminate without ever calling `fill` again — reporting SUCCESS over
+                // a truncate, which is worse than the immediate bail. (Measured: the
+                // pre-existing single-table truncate test went GREEN against the first
+                // cut of this change, which is how that hole surfaced.)
+                //
+                // Something WAS yielded ⇒ those transactions precede the truncate and
+                // are still owed to the destination. Bailing now discards them, and the
+                // refusal's own remedy — advance the slot past the truncate — then
+                // destroys them for good. So end the window instead: the sink flushes,
+                // checkpoints and acks that span, and `fill` raises on the next pass
+                // with the slot sitting exactly at the last commit before the truncate.
+                let why = truncate_refusal_message(&schema, &table);
+                if !yielded_any && tx.is_empty() {
+                    anyhow::bail!(why);
+                }
+                self.pending_truncate_refusal = Some(why);
+                self.exhausted = true;
+                break;
             } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
                 tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
                 tx.push(ev);

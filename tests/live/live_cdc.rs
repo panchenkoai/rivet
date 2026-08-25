@@ -6704,3 +6704,168 @@ fn roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal() {
          drops a slot that was about to recover. Got:\n{said}"
     );
 }
+
+/// The TRUNCATE refusal must not throw away what it has already read.
+///
+/// The bail used to fire the instant the truncate line was scanned — before the
+/// window's earlier, fully-committed transactions reached the sink. The run failed
+/// with `rows: 0`, so nothing flushed and nothing acked, and the slot had not moved.
+/// The refusal's own remedy then finished the job: `pg_replication_slot_advance`
+/// past the truncate discards every one of them.
+///
+/// MEASURED before the fix: a two-table export where `public.tb` committed an
+/// insert BEFORE `public.ta` was truncated lost that insert for good when the
+/// remedy was followed verbatim — on a table that was never truncated, and which
+/// the message does not mention.
+///
+/// So the truncate now ENDS the window (`exhausted`) and the refusal is raised on
+/// the next fill, after the sink has flushed, checkpointed and acked. What this
+/// asserts is the property that makes the remedy honest: the run still FAILS, the
+/// preceding rows are DELIVERED, and the slot is left holding nothing but the
+/// truncate itself.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn roast_pg_cdc_truncate_refusal_delivers_the_rows_it_already_read() {
+    use postgres::NoTls;
+    let ta = unique_name("rivet_cdc_trka").to_lowercase();
+    let tb = unique_name("rivet_cdc_trkb").to_lowercase();
+    let slot = unique_name("rivet_trk_slot").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {ta}; DROP TABLE IF EXISTS {tb}; \
+         CREATE TABLE {ta}(id int PRIMARY KEY, v text); \
+         CREATE TABLE {tb}(id int PRIMARY KEY, v text)"
+    ))
+    .unwrap();
+    let _ta = PgTable::adopt_on(POSTGRES_CDC_URL, ta.clone());
+    let _tb = PgTable::adopt_on(POSTGRES_CDC_URL, tb.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // The bystander commits FIRST, in its own transaction, and is never truncated.
+    c.execute(
+        &format!("INSERT INTO {tb} VALUES (1,'B_MUST_SURVIVE')"),
+        &[],
+    )
+    .unwrap();
+    c.execute(&format!("INSERT INTO {ta} VALUES (1,'a1')"), &[])
+        .unwrap();
+    c.execute(&format!("TRUNCATE {ta}"), &[]).unwrap();
+
+    let rig = Rig::pg_cdc(&format!("public.{ta}"), &slot)
+        .tables(&[&format!("public.{ta}"), &format!("public.{tb}")]);
+    let said = rig.run_expect_fail();
+    assert!(
+        said.to_lowercase().contains("truncate"),
+        "the run must still REFUSE — deferring the bail must not turn it into a \
+         silent success. Got:\n{said}"
+    );
+
+    // ...and the rows it had already read must be AT the destination, not discarded
+    // with the error.
+    // A multi-table export writes one sub-directory PER TABLE, so the bystander's
+    // rows are under `public.<tb>/` — reading the top level finds nothing and would
+    // make this assertion fail for a harness reason rather than a product one.
+    let got: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir().join(format!("public.{tb}")), "v");
+    assert!(
+        got.contains("B_MUST_SURVIVE"),
+        "the bystander's insert committed BEFORE the truncate and must be delivered \
+         — the remedy advances the slot past this point, so anything not delivered \
+         here is lost for good. Got: {got:?}"
+    );
+
+    // The property that makes the remedy honest: nothing but the truncate is left.
+    let remaining: Vec<String> = c
+        .query(
+            "SELECT data FROM pg_logical_slot_peek_changes($1, NULL, NULL)",
+            &[&slot],
+        )
+        .expect("peek the slot")
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .filter(|d| !d.starts_with("BEGIN") && !d.starts_with("COMMIT"))
+        .collect();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "the slot must hold ONLY the truncate — anything else still in it is what \
+         `pg_replication_slot_advance` would destroy. Got: {remaining:?}"
+    );
+    assert!(
+        remaining[0].contains("TRUNCATE"),
+        "and that one thing is the truncate itself: {remaining:?}"
+    );
+}
+
+/// The metadata warning must come from the WIRE, not from the server's setting.
+///
+/// `row_metadata_warning` asks `@@global.binlog_row_metadata` at open. The events
+/// a run drains replay whatever was in force when they were WRITTEN — so a server
+/// switched to FULL yesterday still reads a MINIMAL backlog positionally, and the
+/// probe, asked about the present, says nothing.
+///
+/// MEASURED before the fix: anchor under FULL, one row written under MINIMAL,
+/// server back to FULL, then a same-arity `MODIFY .. AFTER` — the parquet came back
+/// `a='BBB', b='AAA'`, swapped, `status: success`, and ZERO warnings. The probe was
+/// not wrong about the variable; it was answering the wrong question.
+///
+/// The sink now warns when it takes the nameless arm, once per table, which is the
+/// only place that knows for certain.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (SYSTEM_VARIABLES_ADMIN)"]
+fn roast_mysql_cdc_warns_on_a_minimal_backlog_a_full_server_would_hide() {
+    let _serial = cross_process_serial("mysql_cdc_row_metadata");
+    let _meta = RowMetadata::set("FULL");
+    let table = unique_name("rivet_cdc_wire").to_lowercase();
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, a VARCHAR(9), b VARCHAR(9))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    write_checkpoint(&mut c, &ckpt);
+    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt.clone());
+
+    // Written under MINIMAL — the TABLE_MAP for THIS event carries no names.
+    c.query_drop("SET GLOBAL binlog_row_metadata=MINIMAL")
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    // ...and the server is healthy again by the time the run opens, which is
+    // exactly what made the open-time probe silent.
+    c.query_drop("SET GLOBAL binlog_row_metadata=FULL").unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+    let now: String = c
+        .query_first("SELECT @@GLOBAL.binlog_row_metadata")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        now, "FULL",
+        "the fixture is inert unless the server LOOKS healthy at open — that is the \
+         whole point of this cell"
+    );
+
+    let said = rig.run_ok_capture();
+    assert!(
+        said.contains("mapped by POSITION"),
+        "a nameless image must be announced from the WIRE — the server's current \
+         setting cannot see a backlog written under the old one. Got:\n{said}"
+    );
+    assert!(
+        said.contains("binlog_row_metadata = FULL"),
+        "and it must still name the escape: {said}"
+    );
+}
