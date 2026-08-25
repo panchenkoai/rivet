@@ -288,9 +288,23 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
         let out = rig.out_dir();
         // Pin cleanly, then a 30-row backlog (3 parts at rollover 10).
         rig.run_ok();
-        let vals: Vec<String> = (1..=30).map(|i| format!("({i}, {i})")).collect();
-        c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
-            .unwrap();
+        // THREE statements, not one: `should_roll` gates on `committed`, which marks a
+        // TRANSACTION boundary, so 30 rows in a single autocommit INSERT is one
+        // transaction and yields exactly ONE part (MEASURED: parts=1, while the comment
+        // above claimed three). A fold over one element makes every fold operator
+        // identical — `^=`, `|=` and `+=` all agree — so the cross-part manifest fold
+        // this test exists to cover was never exercised. Three statements cross the
+        // threshold.
+        for chunk in 0..3 {
+            let vals: Vec<String> = (1..=10)
+                .map(|i| {
+                    let id = chunk * 10 + i;
+                    format!("({id}, {id})")
+                })
+                .collect();
+            c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+                .unwrap();
+        }
 
         // Faulted run: must crash (loudly), never report success.
         let res = rig.run_with_env("RIVET_TEST_PANIC_AT", point);
@@ -379,9 +393,19 @@ fn cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read() {
     let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 10");
     let out = rig.out_dir();
     rig.run_ok(); // pin cleanly
-    let vals: Vec<String> = (1..=30).map(|i| format!("({i}, {i})")).collect();
-    c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
-        .unwrap();
+    // Three statements so three parts really roll — see the note on the sibling
+    // fixture above: one autocommit INSERT is one transaction and one part, and a
+    // one-part fold cannot tell `^=` from `|=`.
+    for chunk in 0..3 {
+        let vals: Vec<String> = (1..=10)
+            .map(|i| {
+                let id = chunk * 10 + i;
+                format!("({id}, {id})")
+            })
+            .collect();
+        c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+            .unwrap();
+    }
 
     // Crash in the ack→terminal-manifest window: the 3 parts are flushed and the
     // slot acked past them, but the terminal manifest is not yet written.

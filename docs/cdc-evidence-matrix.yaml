@@ -148,14 +148,40 @@ shapes:
       Pre-ack manifest: publish only `&s.parts[len-1..]` instead of the whole slice.
       Form B: `*e = sum` instead of `wrapping_add`. MEASURED: the manifest mutant leaves
       the lib suite at 2607 passed, 0 failed.
-    postgres: { gap: "shared sink — the MBT manifest fixture inserts 30 rows in ONE
-        autocommit statement at rollover 10, and should_roll gates on `committed`
-        (sink.rs:106-110) so it yields ONE part; the '3 parts' comments at
-        live_cdc_mbt.rs:289,386 are wrong" }
-    mysql:    { gap: "same shared fixture" }
-    mssql:    { gap: "same shared fixture" }
-    mongo:    { gap: "same shared fixture" }
-
+    postgres:
+      na: >-
+        na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
+        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        fold, so it is proven once on the fixture that drives it rather than four times. This
+        is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
+        by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
+        rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
+    mysql:
+      sound: >-
+        closed 2026-08-25. The fixture inserted 30 rows in ONE autocommit statement at rollover
+        10; `should_roll` gates on `committed`, which marks a TRANSACTION boundary, so it
+        yielded exactly ONE part while two comments claimed three (MEASURED parts=1). A fold
+        over one element makes every fold operator identical. Split into three statements
+        (MEASURED parts=3). Proof that the FIXTURE was the defect, not the assertion: with the
+        pre-ack manifest mutant (publish only `&s.parts[len-1..]`) applied, the OLD one-INSERT
+        fixture stays GREEN and the new three-statement one goes RED — same mutant, same
+        assertions, different fixture (tests/live/live_cdc_mbt.rs).
+    mssql:
+      na: >-
+        na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
+        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        fold, so it is proven once on the fixture that drives it rather than four times. This
+        is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
+        by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
+        rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
+    mongo:
+      na: >-
+        na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
+        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        fold, so it is proven once on the fixture that drives it rather than four times. This
+        is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
+        by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
+        rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
   - id: runs_the_engine_default_configuration
     what: >
       The stand must exercise the configuration an untuned production server has. A stand
