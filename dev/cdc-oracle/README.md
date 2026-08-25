@@ -42,9 +42,15 @@ delete still arrives as:
 
     {"__deleted": true, "__op": "d"}
 
-with no key at all. `add.fields`, `add.headers` and
-`delete.tombstone.handling.mode=rewrite` were all set; none lifts the key for the
-delete case over this sink.
+with no key at all. Three configurations were tried and MEASURED, not assumed:
+
+    add.headers=op                     -> header X-DEBEZIUM-__OP only, no key
+    delete.tombstone.handling.mode=rewrite -> `__deleted: true`, still no key
+    add.fields=op,id                   -> the field appears as `__id: null`
+
+The last one is the clearest evidence: Debezium adds the field and has nothing to
+put in it, because the key never enters the value for a Mongo delete. It lives in
+the message KEY, and the http sink transmits value plus headers only.
 
 So `delete` is excluded for MongoDB BY FLAG, with the reason here and at the call
 site. It is the harness's blind spot, not a difference between the tools, and

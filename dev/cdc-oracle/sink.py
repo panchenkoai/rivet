@@ -1,23 +1,46 @@
 #!/usr/bin/env python3
-"""Minimal HTTP sink for Debezium Server — appends every change event to a JSONL file.
+"""HTTP sink for Debezium Server — records every change event as JSONL.
 
-Debezium Server's `http` sink POSTs a JSON array of events. We keep the raw
-payload: normalisation belongs in the comparison step, not here, so the captured
-file stays a faithful record of what the reference tool emitted.
+Written to be a FAITHFUL record of what the reference emitted, because everything
+downstream compares against it. Three things the first version got wrong, each of
+which silently corrupted the comparison rather than failing:
+
+1. **HTTP/1.0.** The default closes the connection after each response while
+   Debezium's Java client keeps it alive; the next POST hit a closed socket, the
+   connector logged `IOException: HTTP/1.1 header parser received no bytes` and
+   DROPPED the batch. Measured: 30, 39, 57 of 75 events across identical runs,
+   which read as the reference falling short.
+2. **Single-threaded, listen queue 5.** Connections refused under batch delivery.
+3. **Headers discarded.** Debezium carries metadata in `X-DEBEZIUM-*` headers
+   (base64-encoded Connect values) — the message key among them. Throwing them
+   away is why MongoDB deletes could not be compared by key.
+
+So: HTTP/1.1 with an explicit Content-Length, threaded with a deep queue, and the
+headers merged into each record under `__headers` rather than dropped.
 """
-import json, os, sys, threading
+import base64, json, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 OUT = os.environ.get("DBZ_SINK_OUT", "/data/debezium.jsonl")
+_LOCK = threading.Lock()
+
+
+def _decode(v: str):
+    """Debezium base64-encodes header values as serialised Connect data. Decode
+    when it round-trips as JSON; otherwise keep the raw string — a lossy guess
+    would be worse than an unparsed value the comparison can still see."""
+    try:
+        raw = base64.b64decode(v, validate=True).decode("utf-8")
+    except Exception:
+        return v
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
 
 class H(BaseHTTPRequestHandler):
-    # HTTP/1.1 with keep-alive, and it is load-bearing. The default HTTP/1.0
-    # closes the connection after each response, while Debezium's Java client
-    # reuses it — the next POST then hits a closed socket and the connector logs
-    # `IOException: HTTP/1.1 header parser received no bytes` and DROPS that
-    # batch. Measured on a 75-change scenario: 30, 39, 57 events delivered across
-    # three identical runs, which read as the reference falling short when it was
-    # the sink losing them.
+    # Load-bearing: see the module docstring. HTTP/1.0 loses batches.
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
@@ -28,31 +51,28 @@ class H(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             payload = [{"_unparsed": body.decode("utf-8", "replace")}]
         events = payload if isinstance(payload, list) else [payload]
+        hdrs = {k: _decode(v) for k, v in self.headers.items()
+                if k.upper().startswith("X-DEBEZIUM-")}
         with _LOCK, open(OUT, "a") as f:
             for e in events:
+                if isinstance(e, dict) and hdrs:
+                    e = {**e, "__headers": hdrs}
                 f.write(json.dumps(e, sort_keys=True) + "\n")
-        # An explicit zero-length body: under HTTP/1.1 a response without either
-        # Content-Length or a chunked encoding leaves the client waiting, which is
-        # the same lost batch by a slower route.
+        # An explicit zero-length body: under HTTP/1.1 a response with neither a
+        # Content-Length nor chunked encoding leaves the client waiting, which
+        # loses the batch by a slower route.
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
     def log_message(self, *a):
         pass
 
+
 class Server(ThreadingHTTPServer):
-    # A single-threaded HTTPServer with the default 5-deep listen queue DROPPED
-    # connections under Debezium's batch delivery, and the loss looked like the
-    # reference falling short: the same 75-change scenario delivered 30, then 39,
-    # then 57 across three runs. Threaded, with a deep queue, so the harness stops
-    # manufacturing the disagreements it is supposed to measure.
     daemon_threads = True
     request_queue_size = 128
 
-
-# One lock around the append: threads now serve concurrently, and interleaved
-# writes would corrupt the very capture this file exists to preserve.
-_LOCK = threading.Lock()
 
 if __name__ == "__main__":
     port = int(os.environ.get("DBZ_SINK_PORT", "8088"))

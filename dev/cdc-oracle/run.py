@@ -268,7 +268,7 @@ def main() -> int:
         #    the traffic, addressing the receiver by container name does.
         subprocess.run(["cp", os.path.join(HERE, "sink.py"), work], check=True)
         sh("docker", "run", "-d", "--name", sink, "--network", net,
-           "-v", f"{work}:/data", "-e", "DBZ_SINK_OUT=/data/debezium.jsonl",
+           "-v", f"{work}:/data", "-e", "DBZ_SINK_OUT=/data/debezium.jsonl", "-e", "DBZ_SINK_HEADERS=1",
            "python:3.12-slim", "python", "/data/sink.py")
 
         # Per-engine connector config. The two differ in more than credentials:
@@ -306,7 +306,7 @@ debezium.source.capture.mode=change_streams_update_full
 debezium.transforms=unwrap
 debezium.transforms.unwrap.type=io.debezium.connector.mongodb.transforms.ExtractNewDocumentState
 debezium.transforms.unwrap.add.headers=op
-debezium.transforms.unwrap.add.fields=op
+debezium.transforms.unwrap.add.fields=op,id
 debezium.transforms.unwrap.delete.tombstone.handling.mode=rewrite"""
         elif a.engine == "mssql":
             connector_block = f"""debezium.source.connector.class=io.debezium.connector.sqlserver.SqlServerConnector
