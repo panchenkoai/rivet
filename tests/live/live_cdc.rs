@@ -6542,15 +6542,22 @@ fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot(
          test asserting an ordinary two-run export"
     );
 
-    let retained_after_crash: i64 = c
-        .query_one(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
-             FROM pg_replication_slots WHERE slot_name = $1",
+    // The slot's OWN anchor, not its distance from `pg_current_wal_lsn()`. The first
+    // version measured that distance and failed in CI at 13 243 536 B where it read
+    // 0 locally: the E2E runner drives the whole live suite against one PostgreSQL,
+    // so unrelated WAL moves the reference point between the two reads and the
+    // "distance" grows for reasons that have nothing to do with this slot. Comparing
+    // the anchor to ITSELF is immune to that — the same unscoped-measurement class
+    // as counting rows without scoping to the run.
+    let confirmed = |c: &mut postgres::Client| -> String {
+        c.query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
         .map(|r| r.get(0))
-        .unwrap_or(-1);
-    eprintln!("RIVET_MEASURE retained_after_crash={retained_after_crash}");
+        .expect("the slot must exist after the crashed run")
+    };
+    let after_crash = confirmed(&mut c);
 
     // Run 2 into a FRESH destination, so what it delivers is its own doing: a
     // shared dir would let run 1's durable parts satisfy the oracle even if the
@@ -6574,31 +6581,28 @@ fn roast_pg_cdc_crash_between_checkpoint_and_ack_re_reads_and_releases_the_slot(
          ack. A missing id means resume trusted the checkpoint FILE over the slot \
          and started past changes the slot had never released."
     );
-    let retained: i64 = c
+    let after_resume = confirmed(&mut c);
+    let advanced: i64 = c
         .query_one(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
-             FROM pg_replication_slots WHERE slot_name = $1",
-            &[&slot],
+            &format!(
+                "SELECT pg_wal_lsn_diff('{after_resume}'::pg_lsn, '{after_crash}'::pg_lsn)::bigint"
+            ),
+            &[],
         )
         .map(|r| r.get(0))
-        .unwrap_or(-1);
-    // MEASURED: 2304 B retained by the crash (exactly the un-acked span — the data
-    // that must not be lost), and 0 after the resume. The crash PINS WAL, which is
-    // correct; what this asserts is that it is a transient, not a leak. A resume
-    // that captured the rows but never acked would leave the slot exactly where the
-    // crash left it, and PostgreSQL would retain WAL forever on an idle database —
-    // the slot-pinning class `roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot`
-    // covers from the other side (row-less spans).
+        .expect("compare the two anchor positions");
+
+    // A crash here PINS WAL — it must, or the un-acked span is lost — so the
+    // question is transient or leak. What proves it is the slot MOVING, measured
+    // against where the crash left it: MEASURED 2304 B of WAL pinned by the crash
+    // and released on resume, and neutering `advance_slot` to `Ok(())` leaves the
+    // anchor exactly where it was (advanced = 0) and this goes RED.
     assert!(
-        retained_after_crash > 0,
-        "the crash must PIN the un-acked span (measured 2304 B) — a zero here means \
-         the fixture never left anything un-acked and the release below is vacuous"
-    );
-    assert!(
-        retained >= 0 && retained < retained_after_crash,
-        "the resume must RELEASE the WAL the crash pinned (measured: 2304 B -> 0). \
-         Still {retained} B means the slot never advanced past what was re-read, and \
-         an operator who crash-loops fills the disk"
+        advanced > 0,
+        "the resume must ADVANCE the slot past what it re-read: confirmed_flush_lsn \
+         went {after_crash} -> {after_resume} ({advanced} B). Standing still means \
+         the WAL the crash pinned is pinned for good, and an operator who \
+         crash-loops fills the disk"
     );
     // And the second leg must really have done work — otherwise the assertion above
     // is satisfied by leg 1 alone and would pass against a resume that captured zero.
