@@ -32,18 +32,23 @@ of what the reference emitted.
 
 ## A harness limitation, stated because it looks like a finding
 
-**MongoDB deletes carry no key in the event BODY.** Debezium puts the deleted
-document's `_id` in the message KEY, and the http sink forwards only the value —
-so `{after: null, before: null, op: "d"}` is all that arrives. The comparison
-sees a keyless delete on the reference side and a keyed one from rivet, which
-renders as a disagreement and is not one.
+**MongoDB deletes cannot be compared by key — and this was PURSUED, not assumed.**
 
-This is the harness's own blind spot, not a difference between the tools. Fixing
-it means capturing the message key (a sink that records both, or `transforms`
-that lift `documentKey` into the value). Until then, MongoDB's `delete` is
-excluded by `--exclude-op delete` and the exclusion is recorded HERE rather than
-applied silently — an excluded op that nobody wrote down becomes an op nobody
-checks.
+The Mongo connector puts the deleted document's `_id` in the message KEY, and the
+http sink forwards only the value. Adding `ExtractNewDocumentState` (the documented
+remedy) fixed inserts and updates — those now arrive flattened with `_id` beside
+`__op`, which is why Mongo's crud cell compares three of four ops for real. A
+delete still arrives as:
+
+    {"__deleted": true, "__op": "d"}
+
+with no key at all. `add.fields`, `add.headers` and
+`delete.tombstone.handling.mode=rewrite` were all set; none lifts the key for the
+delete case over this sink.
+
+So `delete` is excluded for MongoDB BY FLAG, with the reason here and at the call
+site. It is the harness's blind spot, not a difference between the tools, and
+closing it needs a sink that records the message key alongside the value.
 
 ## Known asymmetries (these are NOT findings)
 
@@ -85,7 +90,7 @@ catch.
     postgres    AGREE   DIFFERS      AGREE 75/75   AGREE
     mysql       AGREE   DIFFERS      AGREE 75/75   AGREE
     mssql       AGREE   AGREE        AGREE 75/75   AGREE
-    mongo       AGREE   na           AGREE 75/75   AGREE
+    mongo       AGREE*  na           AGREE 75/75   AGREE     (* delete excluded, see below)
 
 All sixteen cells settled: fifteen agreements, one difference, one `na`.
 
@@ -178,7 +183,7 @@ catch.
     postgres    AGREE   DIFFERS      AGREE 75/75   AGREE
     mysql       AGREE   DIFFERS      AGREE 75/75   AGREE
     mssql       AGREE   AGREE        undiagnosed   AGREE
-    mongo       AGREE   na           AGREE 75/75   AGREE
+    mongo       AGREE*  na           AGREE 75/75   AGREE     (* delete excluded, see below)
 
 Fourteen of sixteen cells settled; all four engines run.
 

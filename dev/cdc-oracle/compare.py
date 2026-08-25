@@ -51,7 +51,12 @@ SQL = """
 -- exact class this harness exists to catch.
 CREATE OR REPLACE VIEW dbz AS
 SELECT
-  CASE coalesce(json_extract_string(j, '$.op'), json_extract_string(j, '$.payload.op'))
+  -- `__op` is the ExtractNewDocumentState shape (MongoDB): the transform flattens
+  -- the document and prefixes its metadata, which is what makes a DELETE carry a
+  -- key at all on that engine.
+  CASE coalesce(json_extract_string(j, '$.op'),
+                json_extract_string(j, '$.payload.op'),
+                json_extract_string(j, '$.__op'))
     WHEN 'c' THEN 'insert' WHEN 'r' THEN 'insert'
     WHEN 'u' THEN 'update' WHEN 'd' THEN 'delete'
     WHEN 't' THEN 'truncate' ELSE 'UNKNOWN' END AS op,
@@ -72,7 +77,9 @@ SELECT
     json_extract_string(j, '$.payload.before.__KEY__'),
     json_extract_string(json_extract_string(j, '$.after'), '$.__KEY__'),
     json_extract_string(json_extract_string(j, '$.before'), '$.__KEY__'),
-    json_extract_string(json_extract_string(j, '$.payload.after'), '$.__KEY__')
+    json_extract_string(json_extract_string(j, '$.payload.after'), '$.__KEY__'),
+    -- flattened form: the key sits at the top level beside `__op`
+    json_extract_string(j, '$.__KEY__')
   ) AS VARCHAR) AS k
 FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
       FROM read_text('__DBZ__'))

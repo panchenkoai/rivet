@@ -296,7 +296,18 @@ debezium.source.mongodb.connection.string=mongodb://{MONGO_HOST_IN_NET}:27017/?r
 debezium.source.topic.prefix=oracle
 debezium.source.database.include.list=rivet
 debezium.source.collection.include.list=rivet.{t}
-debezium.source.capture.mode=change_streams_update_full"""
+debezium.source.capture.mode=change_streams_update_full
+# A Mongo DELETE carries its `_id` only in the message KEY, and the http sink
+# forwards the value alone — so the body arrives as
+# an empty envelope and the key is unrecoverable. ExtractNewDocumentState
+# lifts the key fields INTO the value (`__key.` prefixed), which is what makes the
+# delete comparable at all. Without it the harness has to exclude Mongo deletes,
+# i.e. stop checking the one operation whose loss is hardest to notice downstream.
+debezium.transforms=unwrap
+debezium.transforms.unwrap.type=io.debezium.connector.mongodb.transforms.ExtractNewDocumentState
+debezium.transforms.unwrap.add.headers=op
+debezium.transforms.unwrap.add.fields=op
+debezium.transforms.unwrap.delete.tombstone.handling.mode=rewrite"""
         elif a.engine == "mssql":
             connector_block = f"""debezium.source.connector.class=io.debezium.connector.sqlserver.SqlServerConnector
 debezium.source.database.hostname={MSSQL_HOST_IN_NET}
@@ -456,10 +467,15 @@ quarkus.log.level=WARN
                                # it under that name and Debezium's after-document
                                # carries it likewise.
                                "--key", "_id" if a.engine == "mongo" else "id"]
-                              # MongoDB deletes carry their key in the message KEY,
-                              # which the http sink does not forward — a harness
-                              # blind spot, documented in the README. Excluded here
-                              # rather than silently filtered in the SQL.
+                              # MEASURED after adding ExtractNewDocumentState: the
+                              # transform flattens inserts and updates so their `_id`
+                              # IS comparable, but a delete still arrives as
+                              # `__deleted: true, __op: d` with no key at all. The
+                              # key lives in the message KEY, which the http sink does
+                              # not forward, and no transform option tried lifts it
+                              # for the delete case. Excluded BY FLAG, with the reason
+                              # here and in the README — an excluded op nobody wrote
+                              # down is an op nobody checks.
                               + (["--exclude-op", "delete"] if a.engine == "mongo" else [])
                               ).returncode
     finally:
