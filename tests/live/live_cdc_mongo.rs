@@ -1076,3 +1076,67 @@ fn mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column() {
     m.drop_collection("docs");
     m.drop_collection("other");
 }
+
+/// A dotted collection name is one collection, not a schema qualifier — and the
+/// sibling it used to also match must stay out.
+///
+/// Round-3B bughunt, two defects meeting in one fixture. The config layer REFUSED
+/// every dotted Mongo collection under `mode: cdc`, on a reason that had stopped
+/// being true: the refusal was written when `table_matches` split the name into a
+/// bogus `schema.table` and routed zero events, the ROUTER was then fixed to try
+/// the full name first, and the guard stayed — refusing a working capture and
+/// telling the operator to rename a production collection.
+///
+/// Underneath it hid the real defect. With the split arm still live for Mongo, a
+/// collection whose first segment equals the DATABASE name matched TWICE: `table:
+/// <db>.orders` took both the collection literally named `<db>.orders` and the
+/// sibling `orders`. Two collections interleaved into one destination, `status:
+/// success`, and no count could show it — each collection's rows are individually
+/// plausible.
+///
+/// Mongo has no schema to qualify with, so the split arm no longer runs there at
+/// all. This test pins both halves at once: the dotted name captures, and only it.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling() {
+    require_alive(LiveService::MongoRs);
+    use mongodb::bson::doc;
+    // The database name is the FIRST SEGMENT of the dotted collection — the exact
+    // shape that used to match twice. A neutral prefix would prove nothing.
+    let db = unique_name("dotted").to_lowercase();
+    let dotted = format!("{db}.orders");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection(&dotted);
+    m.drop_collection("orders");
+
+    let rig = cdc(&db, &dotted);
+    rig.run_ok(); // anchor
+    m.insert_many(&dotted, vec![doc! { "_id": 1_i64, "who": "dotted" }]);
+    // The sibling the split arm used to pull in.
+    m.insert_many("orders", vec![doc! { "_id": 2_i64, "who": "sibling" }]);
+    rig.run_ok();
+
+    let who: std::collections::BTreeSet<String> = read_mongo_cdc_changes(&rig.out_dir())
+        .iter()
+        .filter_map(|c| {
+            serde_json::from_str::<serde_json::Value>(&c.document)
+                .ok()?
+                .get("who")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert_eq!(
+        who,
+        ["dotted"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the dotted collection must be captured (a config that no longer even \
+         LOADS would give an empty set) and the sibling `orders` must not be — \
+         `sibling` appearing here is the interleave, which counts cannot see"
+    );
+
+    m.drop_collection(&dotted);
+    m.drop_collection("orders");
+}

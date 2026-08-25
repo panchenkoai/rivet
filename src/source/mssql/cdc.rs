@@ -566,9 +566,14 @@ impl MssqlChangeStream {
         // Checked with the SAME predicate the sink routes by, deliberately: a
         // check that asks a different question is not a check.
         if !configured_tables.is_empty()
-            && !configured_tables
-                .iter()
-                .any(|c| crate::source::cdc::sink::table_matches(c, &schema, &table))
+            && !configured_tables.iter().any(|c| {
+                crate::source::cdc::sink::table_matches(
+                    crate::source::cdc::CdcEngine::Mssql,
+                    c,
+                    &schema,
+                    &table,
+                )
+            })
         {
             anyhow::bail!(
                 "sqlserver cdc: capture instance '{}' emits changes for `{}.{}` (from \
@@ -826,6 +831,10 @@ impl MssqlChangeStream {
 }
 
 impl ChangeStream for MssqlChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Mssql
+    }
+
     /// The capture instance names its source object in `cdc.change_tables`, so this
     /// engine ALWAYS knows the real pair — and it is the engine that most needs to
     /// say so, being the only one whose `table:` is accompanied by a second
@@ -833,8 +842,13 @@ impl ChangeStream for MssqlChangeStream {
     /// the same predicate the sink routes by, so an output this stream does not feed
     /// keeps its own configured name.
     fn resolved_identity(&self, configured: &str) -> Option<(String, String)> {
-        crate::source::cdc::sink::table_matches(configured, &self.schema, &self.table)
-            .then(|| (self.schema.clone(), self.table.clone()))
+        crate::source::cdc::sink::table_matches(
+            crate::source::cdc::CdcEngine::Mssql,
+            configured,
+            &self.schema,
+            &self.table,
+        )
+        .then(|| (self.schema.clone(), self.table.clone()))
     }
 
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {

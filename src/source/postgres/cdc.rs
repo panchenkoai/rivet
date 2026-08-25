@@ -189,7 +189,12 @@ pub(crate) fn classify_routing(rel: &RelationRouting<'_>) -> RoutingVerdict {
     // `to_regclass` accepts it when `db` is the current database, so the probe
     // resolves happily while `table_matches` splits on the FIRST dot and compares
     // `db` against the schema — never matching.
-    if !crate::source::cdc::sink::table_matches(cfg, rs, rt) {
+    if !crate::source::cdc::sink::table_matches(
+        crate::source::cdc::CdcEngine::Postgres,
+        cfg,
+        rs,
+        rt,
+    ) {
         return RoutingVerdict::Never(format!(
             "pg cdc: `{cfg}` resolves to the relation `{rs}.{rt}`, but routing compares the              config string BYTE-EXACT against the name test_decoding emits — and those two              disagree here. The schema probe would read `{rs}.{rt}`'s columns while events              carrying a different spelling route nowhere, so the run would either capture              NOTHING or write rows under the wrong table's schema, silently, past an              advancing slot. Set `table:` to `{rs}.{rt}` exactly as the catalog spells it."
         ));
@@ -993,6 +998,10 @@ fn parse_lsn(lsn: &str) -> Option<u64> {
 }
 
 impl ChangeStream for PgChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Postgres
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         loop {
             // Refill a bounded batch whenever the buffer drains — the ack (from
@@ -1218,9 +1227,14 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
 /// truncate ours.
 pub(crate) fn truncate_is_ours(schema: &str, table: &str, configured: &[String]) -> bool {
     configured.is_empty()
-        || configured
-            .iter()
-            .any(|c| crate::source::cdc::sink::table_matches(c, schema, table))
+        || configured.iter().any(|c| {
+            crate::source::cdc::sink::table_matches(
+                crate::source::cdc::CdcEngine::Postgres,
+                c,
+                schema,
+                table,
+            )
+        })
 }
 
 /// Parse one `test_decoding` line into a canonical change, or `None` for the

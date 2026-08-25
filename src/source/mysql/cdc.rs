@@ -759,7 +759,12 @@ impl MysqlChangeStream {
                 // evidence that exists.
                 for cfg in &self.configured_tables {
                     if cfg.contains('.')
-                        || !crate::source::cdc::sink::table_matches(cfg, &schema, &table)
+                        || !crate::source::cdc::sink::table_matches(
+                            crate::source::cdc::CdcEngine::Mysql,
+                            cfg,
+                            &schema,
+                            &table,
+                        )
                     {
                         continue;
                     }
@@ -913,9 +918,14 @@ pub(crate) fn undecodable_event_is_ours(
     }
     match resolved {
         None => true,
-        Some((schema, table)) => configured
-            .iter()
-            .any(|c| crate::source::cdc::sink::table_matches(c, schema, table)),
+        Some((schema, table)) => configured.iter().any(|c| {
+            crate::source::cdc::sink::table_matches(
+                crate::source::cdc::CdcEngine::Mysql,
+                c,
+                schema,
+                table,
+            )
+        }),
     }
 }
 
@@ -1363,6 +1373,10 @@ impl Iterator for MysqlChangeStream {
 }
 
 impl ChangeStream for MysqlChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Mysql
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         self.next()
     }

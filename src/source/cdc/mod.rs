@@ -276,6 +276,14 @@ pub(crate) trait ChangeStream {
     fn resolved_identity(&self, _configured: &str) -> Option<(String, String)> {
         None
     }
+
+    /// Which engine this stream speaks — required, never defaulted.
+    ///
+    /// Routing semantics differ by engine (a document store has no schema to
+    /// qualify with, so `a.b` has ONE reading there and two on SQL), and a
+    /// default would hand a new adapter the wrong one in silence. Making it a
+    /// required method means the compiler asks.
+    fn engine(&self) -> CdcEngine;
 }
 
 /// `rivet cdc` driver. Streams canonical changes from any engine adapter,
@@ -298,6 +306,7 @@ pub(crate) fn run(
     if max_events == Some(0) {
         return Ok(());
     }
+    let eng = stream.engine();
     let mut txn_seq = TxnSeq::default();
     while let Some(ev) = stream.next_change() {
         let mut ev = ev?;
@@ -311,7 +320,7 @@ pub(crate) fn run(
         let filtered = !tables.is_empty()
             && !tables
                 .iter()
-                .any(|t| sink::table_matches(t, &ev.schema, &ev.table));
+                .any(|t| sink::table_matches(eng, t, &ev.schema, &ev.table));
         if filtered {
             if committed && let Some(p) = &checkpoint {
                 ev.position.save(p)?;
@@ -1304,6 +1313,10 @@ mod tests {
 
         struct Fake(VecDeque<ChangeEvent>);
         impl ChangeStream for Fake {
+            fn engine(&self) -> CdcEngine {
+                CdcEngine::Postgres
+            }
+
             fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
                 self.0.pop_front().map(Ok)
             }
@@ -1628,6 +1641,10 @@ mod tests {
     // ── NDJSON driver honours ChangeEvent.poison (silent-corruption guard) ──
     struct OneShot(Option<super::ChangeEvent>);
     impl super::ChangeStream for OneShot {
+        fn engine(&self) -> super::CdcEngine {
+            super::CdcEngine::Postgres
+        }
+
         fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
             self.0.take().map(Ok)
         }
@@ -1677,6 +1694,10 @@ mod tests {
     // A stream that MUST NOT be consumed — `next_change` panics if polled.
     struct Forbidden;
     impl super::ChangeStream for Forbidden {
+        fn engine(&self) -> super::CdcEngine {
+            super::CdcEngine::Postgres
+        }
+
         fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
             panic!("run must not poll the stream when --max-events 0");
         }

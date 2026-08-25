@@ -49,6 +49,29 @@ pub struct Config {
     pub load: Option<serde_json::Value>,
 }
 
+/// Two configured `tables:` entries that can name ONE relation, if any.
+///
+/// The routing rule this mirrors is `sink::table_matches`: a BARE name matches any
+/// schema, a qualified one matches its own. So `orders` and `sales.orders` overlap
+/// — whichever is listed first takes every event — while `sales.orders` and
+/// `audit.orders` never do. Pure, so the decision has one home a mutant can grade.
+pub(crate) fn overlapping_table_pair(ts: &[String]) -> Option<(String, String)> {
+    let leaf = |t: &str| {
+        t.rsplit_once('.')
+            .map_or(t.to_string(), |(_, l)| l.to_string())
+    };
+    for (i, a) in ts.iter().enumerate() {
+        for b in ts.iter().skip(i + 1) {
+            let (qa, qb) = (a.contains('.'), b.contains('.'));
+            // One bare, one qualified, same leaf: the bare one swallows the other.
+            if qa != qb && leaf(a) == leaf(b) {
+                return Some((a.clone(), b.clone()));
+            }
+        }
+    }
+    None
+}
+
 impl Config {
     pub fn load(path: &str) -> crate::error::Result<Self> {
         Self::load_with_params(path, None)
@@ -1157,6 +1180,29 @@ impl Config {
                                 );
                             }
                         }
+                        // Two DISTINCT strings can still name one relation, and the
+                        // sink routes each event to the FIRST that matches — so the
+                        // loser's prefix collects a `_SUCCESS` and a `row_count: 0`
+                        // manifest on every run, which a downstream loader reads as
+                        // a healthy, complete, empty export rather than as a config
+                        // error (round-3B bughunt, DEMONSTRATED live on PostgreSQL:
+                        // three inserts, `status: success, rows: 3`, all three under
+                        // `bh_orders/` while `public.bh_orders/` published emptiness).
+                        // The distinct-string check above cannot see it.
+                        if self.source.source_type != SourceType::Mongo
+                            && let Some((a, b)) = overlapping_table_pair(ts)
+                        {
+                            anyhow::bail!(
+                                "export '{}': `tables:` lists both '{}' and '{}', which can name \
+                                 the SAME relation — a bare name matches any schema, so every \
+                                 event routes to whichever is listed first and the other \
+                                 publishes an empty, successful-looking export forever. Keep one \
+                                 spelling.",
+                                export.name,
+                                a,
+                                b
+                            );
+                        }
                         if self.source.source_type == SourceType::Mssql {
                             anyhow::bail!(
                                 "export '{}': `tables:` is not yet supported for SQL Server — \
@@ -1374,24 +1420,15 @@ impl Config {
             );
         }
 
-        // A collection whose name contains a dot does not route through the
-        // change-stream capture — its events are silently dropped. Refuse loudly
-        // rather than report 0-row success forever (bug-hunt find). Batch handles
-        // dotted names fine, so this is CDC-only.
-        if export.mode == ExportMode::Cdc && self.source.source_type == SourceType::Mongo {
-            let dotted = |t: &str| t.contains('.');
-            if export.table.as_deref().is_some_and(dotted)
-                || export.tables.iter().flatten().any(|t| dotted(t))
-            {
-                anyhow::bail!(
-                    "export '{}': MongoDB `mode: cdc` does not support a collection name \
-                     containing a dot — the change-stream router cannot address it and its \
-                     events would be silently dropped. Rename the collection, or capture it \
-                     with `mode: full` (batch handles dotted names).",
-                    export.name
-                );
-            }
-        }
+        // (A `mode: cdc` refusal of DOTTED Mongo collection names lived here until
+        // round-3B. It was written when a dotted name really was dropped — the
+        // router split it into a bogus `schema.table` — and the ROUTER was fixed
+        // while the guard that existed because of the bug stayed, refusing a
+        // capture that works and telling operators to rename a production
+        // collection. Mongo's routing now has no split arm at all, so the string
+        // has one reading; see `a_mongo_dotted_name_never_splits_into_a_schema_
+        // qualifier` and `mongo_cdc_accepts_a_dotted_collection_name_because_the_
+        // router_addresses_it`.)
 
         if let Some(days) = export.chunk_by_days {
             if export.mode != ExportMode::Chunked {

@@ -338,9 +338,14 @@ impl MongoChangeStream {
                 let missing: Vec<&String> = configured_tables
                     .iter()
                     .filter(|c| {
-                        !present
-                            .iter()
-                            .any(|p| crate::source::cdc::sink::table_matches(c, &db_name, p))
+                        !present.iter().any(|p| {
+                            crate::source::cdc::sink::table_matches(
+                                crate::source::cdc::CdcEngine::Mongo,
+                                c,
+                                &db_name,
+                                p,
+                            )
+                        })
                     })
                     .collect();
                 if !missing.is_empty() {
@@ -603,6 +608,10 @@ fn to_change_event(
 }
 
 impl ChangeStream for MongoChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Mongo
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         let canonical = self.canonical;
         let until_current = self.until_current;
