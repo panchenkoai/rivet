@@ -75,6 +75,10 @@ pub(crate) struct MysqlChangeStream {
     /// `None` at once instead of consuming — and re-deferring — the past-bound
     /// events the next run will re-read from the checkpoint.
     past_bound: bool,
+    /// First schema seen for each BARE configured name — the wire-side ambiguity
+    /// detector's memory. See `bare_name_spans_databases` for why the catalog
+    /// cannot answer this on MySQL.
+    bare_first_schema: std::collections::HashMap<String, String>,
 }
 
 impl MysqlChangeStream {
@@ -197,6 +201,43 @@ impl MysqlChangeStream {
         Ok(Some((file, p)))
     }
 
+    /// A BARE configured name has just matched an event from `saw`, having already
+    /// matched one from `first`. That is the cross-database ambiguity, seen on the
+    /// WIRE — the only place it can be seen.
+    ///
+    /// The catalog cannot answer this on MySQL. `information_schema` is filtered by
+    /// PRIVILEGE, so a connection that lacks rights on `other_db` does not see
+    /// `other_db.orders` at all — while `REPLICATION SLAVE` hands it the whole
+    /// server's binlog regardless. MEASURED 2026-08-25: as `root` the catalog listed
+    /// `other_db, rivet`; as the `rivet` user it listed `rivet` alone, and the export
+    /// captured `other_db`'s row anyway. A catalog-based guard is structurally unable
+    /// to fire.
+    ///
+    /// Debezium does not have this problem because it cannot be expressed there:
+    /// `table.include.list` is `database.table`, always, and on PostgreSQL the filter
+    /// is a PUBLICATION, so an unlisted relation never reaches the wire. rivet accepts
+    /// a bare name because a MongoDB collection has no schema qualifier — one
+    /// compromise, inherited by three engines that do not need it.
+    pub(crate) fn bare_name_spans_databases(
+        configured: &str,
+        first: &str,
+        saw: &str,
+    ) -> Option<String> {
+        if configured.contains('.') || first == saw {
+            return None;
+        }
+        Some(format!(
+            "mysql cdc: `{configured}` is unqualified and events for it have arrived from \
+             TWO databases (`{first}` and `{saw}`). The binlog dump is server-wide and \
+             routing matches a bare name in any schema, so both land in this export — and \
+             under the default binlog_row_metadata=MINIMAL the wire carries no column \
+             names, so the foreign rows are mapped by POSITION under this table's names. \
+             The catalog cannot warn about this: information_schema is filtered by \
+             privilege, so a database this connection cannot see still reaches the binlog. \
+             Qualify it (`database.{configured}`) to capture the one you mean."
+        ))
+    }
+
     pub(crate) fn row_metadata_warning(metadata: Option<&str>) -> Option<String> {
         let m = metadata?;
         if m.eq_ignore_ascii_case("FULL") {
@@ -300,6 +341,49 @@ impl MysqlChangeStream {
                     )
                     .unwrap_or(None),
             };
+            // A BARE name is ambiguous ACROSS DATABASES, and on MySQL that is worse
+            // than on PostgreSQL. The binlog dump is server-wide — `BinlogRequest`
+            // carries no database filter — and `sink::table_matches` matches an
+            // unqualified config name in ANY schema, while the check above asks only
+            // `TABLE_SCHEMA = DATABASE()`. So a second database's same-named table is
+            // captured and invisible to the guard.
+            //
+            // MEASURED 2026-08-25: `table: bhm` with `rivet.bhm(id, val)` and
+            // `other_db.bhm(zzz, qqq)` present wrote `INSERT INTO other_db.bhm VALUES
+            // (2,'FROM_OTHER_DB')` into the export as `id=2, val='FROM_OTHER_DB'` —
+            // a foreign DATABASE's row under this table's column names, zero warnings.
+            // The column names do not even match; under the default
+            // `binlog_row_metadata=MINIMAL` the wire carries none, so the positional
+            // fallback maps it and there is no name-match left to fail on.
+            //
+            // Refused rather than warned, for the reason the PostgreSQL peer gives:
+            // neither the re-labelled row nor the all-NULL row it produces at a
+            // different arity is recoverable from the output.
+            if schema.is_none() {
+                let others: Vec<String> = conn
+                    .exec_map(
+                        "SELECT TABLE_SCHEMA FROM information_schema.TABLES \
+                         WHERE TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE' \
+                           AND TABLE_SCHEMA NOT IN \
+                               ('mysql','information_schema','performance_schema','sys')",
+                        (&table,),
+                        |sch: String| sch,
+                    )
+                    .unwrap_or_default();
+                if others.len() > 1 {
+                    anyhow::bail!(
+                        "mysql cdc: `{cfg}` is unqualified and {} databases hold a table of \
+                         that name ({}). The binlog dump is SERVER-WIDE and routing matches a \
+                         bare name in any schema, so all of them land in this export — and \
+                         under the default binlog_row_metadata=MINIMAL the wire carries no \
+                         column names, so a foreign row is mapped by POSITION under this \
+                         table's names. Qualify it (`database.{cfg}`) to capture the one you \
+                         mean.",
+                        others.len(),
+                        others.join(", ")
+                    );
+                }
+            }
             if let MysqlRoutingVerdict::Never(why) = classify_mysql_routing(cfg, row.as_deref()) {
                 anyhow::bail!("{why}");
             }
@@ -343,6 +427,7 @@ impl MysqlChangeStream {
             file,
             bound,
             past_bound: false,
+            bare_first_schema: std::collections::HashMap::new(),
         })
     }
 
@@ -542,6 +627,29 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                // WIRE-side ambiguity check: a bare configured name that has now
+                // matched events from two databases. The catalog cannot see this —
+                // information_schema is privilege-filtered while the binlog dump is
+                // server-wide — so the first event from a second schema is the first
+                // evidence that exists.
+                for cfg in &self.configured_tables {
+                    if cfg.contains('.')
+                        || !crate::source::cdc::sink::table_matches(cfg, &schema, &table)
+                    {
+                        continue;
+                    }
+                    match self.bare_first_schema.get(cfg) {
+                        None => {
+                            self.bare_first_schema.insert(cfg.clone(), schema.clone());
+                        }
+                        Some(first) => {
+                            if let Some(why) = Self::bare_name_spans_databases(cfg, first, &schema)
+                            {
+                                anyhow::bail!(why);
+                            }
+                        }
+                    }
+                }
                 // Provisional position; rewritten to the commit position at XID.
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {
@@ -1145,6 +1253,48 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// The cross-database ambiguity is detected on the WIRE because the catalog
+    /// structurally cannot see it: MySQL's information_schema is filtered by
+    /// PRIVILEGE, while `REPLICATION SLAVE` hands over the whole server's binlog.
+    /// MEASURED: as `root` the catalog listed `other_db, rivet`; as the `rivet` user
+    /// it listed `rivet` alone — and the export captured `other_db`'s row anyway,
+    /// written under this table's column names.
+    #[test]
+    fn a_bare_name_seen_in_two_databases_is_refused_and_a_qualified_one_is_not() {
+        // The ordinary case: one database, seen twice. Silent.
+        assert_eq!(
+            MysqlChangeStream::bare_name_spans_databases("orders", "shop", "shop"),
+            None,
+            "the same database twice is not an ambiguity — this fires on every event, \
+             so a false positive here is an outage"
+        );
+
+        // A QUALIFIED name cannot be ambiguous: routing compares the whole string.
+        assert_eq!(
+            MysqlChangeStream::bare_name_spans_databases("shop.orders", "shop", "archive"),
+            None,
+            "`database.table` names exactly one relation, whatever else exists"
+        );
+
+        // The defect.
+        let why = MysqlChangeStream::bare_name_spans_databases("orders", "shop", "archive")
+            .expect("a bare name matching two databases must be refused");
+        assert!(
+            why.contains("shop") && why.contains("archive"),
+            "name BOTH databases — an operator qualifies the name only if they know \
+             which one they meant: {why}"
+        );
+        assert!(
+            why.contains("database.orders"),
+            "and hand over the fix in the form they must type: {why}"
+        );
+        assert!(
+            why.contains("privilege"),
+            "say WHY no catalog check warned them, or the next reader adds one and it \
+             does not fire either: {why}"
+        );
+    }
 
     /// MySQL's TRUNCATE parser had ZERO offline coverage while the evidence matrix
     /// claimed it was graded by `a_mysql_truncate_statement_resolves_the_table_it_names`
