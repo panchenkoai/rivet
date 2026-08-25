@@ -308,12 +308,74 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
 /// `String` and a `bool` whose meaning is invisible at the call site — and the
 /// bool decides whether a position the cleanup job purged past is REFUSED or
 /// silently skipped.
+#[derive(Debug)]
 pub(crate) struct Resume {
     /// Hex LSN to read after, or `None` for "from the change table's min".
     pub from_lsn: Option<String>,
     /// True when that LSN is an ANCHOR (nothing was captured from it) rather
     /// than a flushed resume position.
     pub from_is_pin: bool,
+}
+
+/// Read a resume position out of a checkpoint that has already PARSED.
+///
+/// `Position::load` refuses a file that is not valid JSON, and says why: treating
+/// it as absent "would permanently skip every change since the last checkpoint".
+/// This is the other half of that guard — a file that parses and yet carries no
+/// `lsn`. The call site used to reach for it with `.and_then(...)`, so the key's
+/// absence became `None`, and `fill_sql` turns `None` into
+/// `fn_cdc_get_min_lsn(ci)`: the whole retained change table, re-read and
+/// re-delivered under a green exit.
+///
+/// MEASURED (2026-08-25, live SQL Server): a checkpoint whose `lsn` key was
+/// renamed delivered ids `[1, 2, 3, 4]` on the resume leg where `[4]` was owed —
+/// silently, with `status: success`. The direction of harm is over-read, so
+/// at-least-once holds; the resume CONTRACT does not, and the comment at the call
+/// site already claimed this case was closed (#99).
+///
+/// `pinned` is deliberately NOT strict: a checkpoint written before that field
+/// existed is a real and supported input, and its documented default (`false` ⇒
+/// treat the position as a resume) is the loud direction. `lsn` is different in
+/// kind — it IS the position, and a checkpoint without one says nothing at all.
+///
+/// A named function rather than an expression at the call site because it DECIDES
+/// something: live-only glue may sequence and wrap, but the branch that separates
+/// "resume here" from "re-read everything" is graded by a mutant only if a unit
+/// test can call it.
+pub(crate) fn resume_from_checkpoint(
+    pos: Option<&crate::source::cdc::Position>,
+    path: &str,
+) -> Result<Resume> {
+    let Some(pos) = pos else {
+        return Ok(Resume {
+            from_lsn: None,
+            from_is_pin: false,
+        });
+    };
+    let from_lsn = pos
+        .0
+        .get("lsn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "checkpoint '{path}' parses as JSON but carries no 'lsn' — refusing to treat \
+                 it as absent, which would re-read and re-deliver the ENTIRE retained change \
+                 table from fn_cdc_get_min_lsn under a successful exit. Restore the file, or \
+                 delete it to accept a fresh anchor."
+            )
+        })?
+        .to_string();
+    Ok(Resume {
+        from_lsn: Some(from_lsn),
+        // Absent on a checkpoint written before the field existed ⇒ treated as a
+        // resume position, which is the direction that THROWS on retention loss
+        // rather than silently flooring past it.
+        from_is_pin: pos
+            .0
+            .get("pinned")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 pub(crate) struct MssqlCdcConfig {
@@ -912,6 +974,61 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+
+    fn ckpt(j: serde_json::Value) -> crate::source::cdc::Position {
+        crate::source::cdc::Position(j)
+    }
+
+    /// The whole point: absence of `lsn` is an ERROR, absence of `pinned` is a
+    /// documented default. Conflating them re-reads the entire change table.
+    #[test]
+    fn a_checkpoint_without_an_lsn_is_refused_not_read_as_absent() {
+        // No file at all — a genuine first run.
+        let fresh = resume_from_checkpoint(None, "/x").expect("no checkpoint is not an error");
+        assert_eq!(fresh.from_lsn, None);
+        assert!(!fresh.from_is_pin);
+
+        // The ordinary resume, and the pin.
+        let r = resume_from_checkpoint(Some(&ckpt(serde_json::json!({"lsn": "0a0b"}))), "/x")
+            .expect("an lsn without `pinned` is a legacy checkpoint, still valid");
+        assert_eq!(r.from_lsn.as_deref(), Some("0a0b"));
+        assert!(
+            !r.from_is_pin,
+            "a checkpoint written before `pinned` existed must default to RESUME — the \
+             direction that throws on retention loss rather than flooring past it"
+        );
+        let pinned = resume_from_checkpoint(
+            Some(&ckpt(serde_json::json!({"lsn": "0a0b", "pinned": true}))),
+            "/x",
+        )
+        .unwrap();
+        assert!(pinned.from_is_pin);
+
+        // And the defect this function exists for. Each of these parses as JSON.
+        for missing in [
+            serde_json::json!({}),
+            serde_json::json!({"pinned": false}),
+            serde_json::json!({"lsn_renamed_by_a_future_version": "0a0b"}),
+            // Present but not a string: `as_str` yields None, and a position that
+            // cannot be read is no position at all.
+            serde_json::json!({"lsn": 2571}),
+            serde_json::json!({"lsn": null}),
+        ] {
+            let err = resume_from_checkpoint(Some(&ckpt(missing.clone())), "/tmp/c.ckpt")
+                .expect_err(&format!(
+                    "{missing} carries no readable position — treating it as absent re-reads \
+                     the ENTIRE retained change table under a green exit (measured: ids \
+                     [1,2,3,4] delivered where [4] was owed)"
+                ))
+                .to_string();
+            assert!(
+                err.contains("lsn") && err.contains("/tmp/c.ckpt"),
+                "the refusal must name the key AND the file, or an operator cannot act on \
+                 it: {err}"
+            );
+        }
+    }
+
     use super::*;
 
     /// Every data-only `ColumnData` arm, with an INDEPENDENT expectation.

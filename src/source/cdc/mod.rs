@@ -817,38 +817,23 @@ pub(crate) fn create_change_stream(
             let ci = capture_instance.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
             })?;
-            // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
-            // server-side cursor — the from-LSN is what makes it at-least-once instead
-            // of re-reading the whole change table each run).
-            let from_lsn = match cfg.checkpoint.as_deref() {
-                // A corrupt checkpoint must fail loud (#99), not silently drop to
-                // None (a full change-table over-read that re-loads everything).
-                Some(p) => Position::load(p)?.and_then(|pos| {
-                    pos.0
-                        .get("lsn")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                }),
-                None => None,
-            };
-            // Was that position an ANCHOR or a resume? Only an anchor may be
-            // floored up to the instance's start; a resume position below the
-            // change table's min LSN is retention loss and must THROW. Absent on
-            // a legacy checkpoint ⇒ treated as a resume, the loud direction.
-            let from_is_pin = match cfg.checkpoint.as_deref() {
-                Some(p) => Position::load(p)?
-                    .and_then(|pos| pos.0.get("pinned").and_then(|v| v.as_bool()))
-                    .unwrap_or(false),
-                None => false,
+            // Resume from the checkpoint's position if one was persisted (SQL Server
+            // has no server-side cursor — the from-LSN is what makes it at-least-once
+            // instead of re-reading the whole change table each run). One load, and
+            // the DECISION — including what an `lsn`-less file means — lives in
+            // `resume_from_checkpoint` where a unit test can grade it.
+            let resume = match cfg.checkpoint.as_deref() {
+                Some(p) => crate::source::mssql::cdc::resume_from_checkpoint(
+                    Position::load(p)?.as_ref(),
+                    &p.display().to_string(),
+                )?,
+                None => crate::source::mssql::cdc::resume_from_checkpoint(None, "")?,
             };
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
                     url,
                     ci,
-                    crate::source::mssql::cdc::Resume {
-                        from_lsn,
-                        from_is_pin,
-                    },
+                    resume,
                     tls,
                     peek,
                     cfg.drain,
