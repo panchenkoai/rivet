@@ -605,3 +605,44 @@ pub fn duckdb_row_census(
         file_log: n(3),
     }
 }
+
+/// SQL that lets the oracle read a BUCKET EMULATOR directly — MinIO today, and any
+/// S3-compatible endpoint by the same shape.
+///
+/// The independent oracle covered sources, the destination's local files and rivet's
+/// state DB, and stopped at the bucket — so a cloud-destination claim was checked by
+/// re-reading rivet's own verdict. That is exactly the gap the leading-slash bug
+/// lived in: `rivet validate` called one object both PART_MISSING and
+/// UNTRACKED_OBJECT on perfectly correct data, and only a reader that shares no code
+/// with rivet can say which half was the lie. MEASURED after the fix — DuckDB read
+/// `s3://leadtest/lead/x/*.parquet` as 500 rows / 500 distinct / sum 250500, matching
+/// the source's arithmetic exactly.
+///
+/// `minio:9000` is the CONTAINER-side endpoint: the oracle runs inside
+/// `rivet-duckdb`, where the host's `127.0.0.1:9000` reaches nothing — and a bucket
+/// that reads as empty is indistinguishable from an export that wrote nothing.
+pub fn duckdb_minio_prelude() -> String {
+    "INSTALL httpfs; LOAD httpfs; \
+     CREATE OR REPLACE SECRET s (TYPE s3, KEY_ID 'minioadmin', SECRET 'minioadmin', \
+       ENDPOINT 'minio:9000', USE_SSL false, URL_STYLE 'path');"
+        .to_string()
+}
+
+/// Row count of every parquet under an s3 prefix, read by DuckDB from the emulator.
+///
+/// Asserts the glob matched something first: `read_parquet` over an empty match is
+/// an error, but a caller that swallowed it would read zero as "the export delivered
+/// nothing" rather than "the oracle looked in the wrong place".
+pub fn duckdb_s3_parquet_rows(bucket: &str, prefix: &str) -> i64 {
+    let p = prefix.trim_matches('/');
+    let v = duckdb_run_sql_json(&format!(
+        "{} SELECT count(*) FROM read_parquet('s3://{bucket}/{p}/**/*.parquet')",
+        duckdb_minio_prelude()
+    ));
+    v["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            panic!("duckdb read nothing under s3://{bucket}/{p}/ — a bucket that reads as empty and an export that wrote nothing look identical, so this is never a valid answer")
+        })
+}
