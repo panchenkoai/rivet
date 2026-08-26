@@ -128,18 +128,33 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
     // run-unique copies (manifest-<run_id>.json) — the same set `load` reconciles
     // — so validate actually checks the parts that are physically present. Only
     // an empty result when there is NO manifest of any kind.
-    let manifests: Vec<RunManifest> = if dest.head(&manifest_key)?.is_some() {
-        vec![serde_json::from_slice(&dest.read(&manifest_key)?)?]
-    } else {
-        let mut copies = Vec::new();
-        for m in dest.list_prefix(prefix)? {
-            let base = m.key.rsplit('/').next().unwrap_or("");
-            if crate::manifest::is_run_unique_manifest_name(base) {
-                copies.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
-            }
+    // The run-unique COPIES first, and the canonical only when there are none.
+    //
+    // The canonical `manifest.json` is a LATEST-RUN POINTER, and an `until_current`
+    // cycle that finds no changes legitimately declares zero parts — which is the
+    // steady state for a scheduled capture, and for most tables of a `tables:`
+    // multiplex most of the time. Reading it alone therefore answered "what did the
+    // last run deliver", while every field printed said "the prefix". MEASURED: a
+    // run captured 3 changes and `validate --depth full` verified 1 part; ONE idle
+    // cycle later the canonical read `parts: []` and the same command reported
+    // `PASSED, 0 parts verified` — then still PASSED after the parquet was
+    // overwritten with junk, and again after it was DELETED, with the copy declaring
+    // it sitting unread beside it.
+    //
+    // The copies are the set `load` reconciles, so validate now asks the same
+    // question the loader does. They do not overlap (one per run) and the canonical
+    // duplicates one of them, so preferring the copies also avoids double-counting.
+    // The canonical stays the fallback for prefixes written before copies existed.
+    let mut manifests: Vec<RunManifest> = Vec::new();
+    for m in dest.list_prefix(prefix)? {
+        let base = m.key.rsplit('/').next().unwrap_or("");
+        if crate::manifest::is_run_unique_manifest_name(base) {
+            manifests.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
         }
-        copies
-    };
+    }
+    if manifests.is_empty() && dest.head(&manifest_key)?.is_some() {
+        manifests.push(serde_json::from_slice(&dest.read(&manifest_key)?)?);
+    }
     if manifests.is_empty() {
         return Ok(PositionCheck::default());
     }

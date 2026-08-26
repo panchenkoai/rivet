@@ -621,6 +621,34 @@ fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) 
             }
         }
     }
+    // A canonical declaring ZERO parts supersedes NOTHING, so the supersession
+    // argument above does not apply to it and its same-family copies must be folded.
+    //
+    // This is the CDC steady state, not an edge: an `until_current` cycle that finds
+    // no changes writes a `Success` manifest with `parts: []` over the canonical
+    // pointer — and for most tables of a `tables:` multiplex that is most cycles.
+    // MEASURED: a run captured 3 changes and `validate --depth full` verified 1
+    // part; ONE idle cycle later the same command reported `PASSED, 0 parts
+    // verified`, then still PASSED after the parquet was overwritten with junk, and
+    // again after it was DELETED — with the copy declaring it sitting unread beside
+    // it. Every field printed was internally consistent; nothing said that "0 parts
+    // verified" was a statement about the manifest rather than about the prefix.
+    //
+    // Deliberately NOT widened to a non-empty canonical: there a plain export's
+    // historical copies really are superseded snapshots, and presence-checking a
+    // legitimately cleaned old part would false-fail.
+    if merged.parts.is_empty() && !canonical.export_family.is_empty() {
+        for run in census.runs() {
+            if run.family() != canonical.export_family {
+                continue;
+            }
+            for p in &run.manifest.parts {
+                if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
+                    merged.parts.push(p.clone());
+                }
+            }
+        }
+    }
     merged
 }
 

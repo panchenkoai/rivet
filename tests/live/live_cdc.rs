@@ -7539,3 +7539,72 @@ fn a_json_opaque_leaf_is_refused_loudly_and_only_for_the_captured_table() {
          Got:\n{said}"
     );
 }
+
+/// An idle cycle must not blind `validate --depth full`.
+///
+/// Round-9 bughunt, and the harm is that the ORACLE goes quiet, not the data. An
+/// `until_current` cycle that finds no changes writes a `Success` manifest with
+/// `parts: []` over the canonical pointer — the steady state for a scheduled
+/// capture, and for most tables of a `tables:` multiplex most cycles. `validate`
+/// read the canonical alone, so it answered "what did the LAST run deliver" while
+/// every field it printed said "the prefix".
+///
+/// MEASURED before the fix: a run captured 3 changes and `--depth full` verified 1
+/// part; ONE idle cycle later the same command reported `PASSED, 0 parts verified`
+/// — and still PASSED after the parquet was DELETED, with the run-unique copy
+/// declaring it sitting unread beside it.
+///
+/// The test asserts the FAILURE, because a validate that cannot fail is the defect:
+/// asserting PASSED on an intact prefix would have passed before the fix too.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn an_idle_cycle_does_not_blind_validate_to_a_missing_part() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_vblind").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl).dest_path(out.path().to_path_buf());
+    rig.run_ok(); // anchor
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20),(3,30)"))
+        .expect("seed");
+    rig.run_ok(); // captures 3
+    let parts = files_with_extension(out.path(), "parquet");
+    assert_eq!(parts.len(), 1, "fixture: one part must have been written");
+
+    rig.run_ok(); // the IDLE cycle — rewrites the canonical to `parts: []`
+    let canonical: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("read canonical"),
+    )
+    .expect("parse canonical");
+    assert_eq!(
+        canonical["parts"].as_array().map(Vec::len),
+        Some(0),
+        "fixture: the idle cycle must really have emptied the canonical pointer — \
+         without that this test grades nothing"
+    );
+
+    // Now take the part away. validate must notice.
+    std::fs::remove_file(&parts[0]).expect("delete the part");
+    let v = rig.cli(&["validate", "--depth", "full"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+    assert!(
+        !v.status.success(),
+        "a deleted part must fail validation. Before the fix this exited 0 with \
+         `PASSED, 0 parts verified` — the canonical declared nothing, so validate \
+         verified nothing and said so in words that read as a clean bill of \
+         health:\n{said}"
+    );
+    assert!(
+        said.to_uppercase().contains("MISSING"),
+        "and it must name the missing part, not merely fail:\n{said}"
+    );
+}
