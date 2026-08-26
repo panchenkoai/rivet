@@ -157,8 +157,23 @@ pub(crate) fn pg_foreign_slots_warning(
 ) -> Option<String> {
     let bar = retained_wal_bar();
     let total: i64 = foreign.iter().map(|(_, b, _)| *b).sum();
-    let worst = foreign.iter().max_by_key(|(_, b, _)| *b)?;
-    if worst.1 < bar && total < bar {
+    // The empty-list early return, said explicitly. It used to ride on the `?` of a
+    // `max_by_key` whose value the guard below then compared — and when that
+    // comparison turned out to be redundant, removing it would have taken the
+    // early return with it silently. A `?` doing two jobs is one job too many.
+    if foreign.is_empty() {
+        return None;
+    }
+    // `total < bar` ALONE, and the removed `worst.1 < bar &&` is why: `total` is the
+    // sum and `worst` the max over the same non-negative list, so `total >= worst.1`
+    // always — the first clause can never decide anything the second does not.
+    //
+    // Found by mutation testing rather than by reading: `replace < with <=` on the
+    // first clause survived, and no fixture could kill it. Reaching it needs
+    // `worst.1 == bar` together with `total < bar`, which is arithmetically
+    // impossible here. An unkillable mutant on a redundant clause is the clause
+    // asking to be deleted, not an exclusion to be written into mutants.toml.
+    if total < bar {
         return None;
     }
     // Everything that contributes to a total past the bar is worth naming; a
@@ -1146,6 +1161,69 @@ mod slot_retention_warning_tests {
             ),
             None,
             "...and one byte under it must not be"
+        );
+
+        // The PHYSICAL label, and that it is not applied to a logical slot. Mutating
+        // `kind == "physical"` to `!=` survived: nothing asserted the label appears
+        // on the right one, so the two renderings were interchangeable.
+        let phys = pg_foreign_slots_warning(
+            &[(
+                "standby".into(),
+                PG_RETAINED_WAL_FAIL_BYTES + 1,
+                "physical".into(),
+            )],
+            false,
+        )
+        .expect("past the bar");
+        assert!(
+            phys.contains("PHYSICAL — a standby's"),
+            "a physical slot must be labelled — the drop hint must never name a \
+             standby's slot as a CDC leftover: {phys}"
+        );
+        let logi = pg_foreign_slots_warning(
+            &[(
+                "leftover".into(),
+                PG_RETAINED_WAL_FAIL_BYTES + 1,
+                "logical".into(),
+            )],
+            false,
+        )
+        .expect("past the bar");
+        assert!(
+            !logi.contains("PHYSICAL — a standby's"),
+            "...and a logical one must NOT be. Asserted on the per-slot LABEL, not on \
+             the word: the message's closing caveat says `never for a slot marked \
+             PHYSICAL` regardless, so a bare substring check passes on every input \
+             and grades nothing: {logi}"
+        );
+
+        // The `and N more` tail's boundary. `more > 0` survived three mutants
+        // (`==`, `>=`, `<`) because no fixture ever had exactly ten slots — the
+        // listing takes 10, so ten is the one count at which the tail must be
+        // ABSENT and eleven the one at which it must appear.
+        let many = |n: usize| -> String {
+            let slots: Vec<(String, i64, String)> = (0..n)
+                .map(|i| {
+                    (
+                        format!("s{i}"),
+                        PG_RETAINED_WAL_FAIL_BYTES + 1 + i as i64,
+                        "logical".to_string(),
+                    )
+                })
+                .collect();
+            pg_foreign_slots_warning(&slots, false).expect("past the bar")
+        };
+        assert!(
+            !many(10).contains("more"),
+            "exactly ten slots all fit in the listing — a tail here would claim \
+             something was hidden when nothing was: {}",
+            many(10)
+        );
+        assert!(
+            many(11).contains("and 1 more"),
+            "and the eleventh must be counted, or the operator reads a truncated \
+             listing as the whole set: {}",
+            many(11)
         );
 
         let big = PG_RETAINED_WAL_FAIL_BYTES + 1;
