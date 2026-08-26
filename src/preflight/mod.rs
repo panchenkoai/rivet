@@ -492,9 +492,12 @@ pub fn check(
                 export,
                 &column_overrides,
                 &policy,
-                eff_target,
-                config_dir,
-                params,
+                type_report::ReportContext {
+                    target: eff_target,
+                    config_dir,
+                    params,
+                    on_unresolved: type_report::OnUnresolvedCapture::Degrade,
+                },
             ) {
                 Ok(reports) => {
                     tally.add_export(eff_target, &reports);
@@ -617,9 +620,13 @@ pub fn collect_type_reports(
             export,
             &column_overrides,
             &policy,
-            Some(target),
-            config_dir,
-            None,
+            type_report::ReportContext {
+                target: Some(target),
+                config_dir,
+                params: None,
+                // The load PLANS from these reports; see `OnUnresolvedCapture`.
+                on_unresolved: type_report::OnUnresolvedCapture::Fail,
+            },
         )
         .map_err(|e| {
             anyhow::anyhow!(

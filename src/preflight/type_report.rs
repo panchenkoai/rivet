@@ -151,15 +151,50 @@ fn unit_overrides(
     crate::types::overrides_for_unit(all, table.or(export.table.as_deref()))
 }
 
+/// What to do when a CDC capture instance cannot be resolved to its relation.
+///
+/// The two callers have different stakes, and one shared decision was wrong for one
+/// of them. `rivet check --type-report` is run BEFORE `sp_cdc_enable_table`, so an
+/// unreadable cdc catalog is its NORMAL state and a report describing the configured
+/// relation is useful. `rivet load` PLANS the warehouse DDL from the same reports —
+/// and `collect_type_reports`' own docstring says a report that cannot be collected
+/// is an ERROR there, because a missing report is a table that silently does not
+/// load. Round-5 made the lookup advisory for both, which turned the load's failure
+/// from missing into WRONG: DDL from one relation, parquet from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUnresolvedCapture {
+    /// Type the configured relation and warn — the preflight's stance.
+    Degrade,
+    /// Refuse: a wrong warehouse schema is worse than no answer.
+    Fail,
+}
+
+/// Where a report is being collected FROM, and on whose behalf.
+///
+/// Grouped rather than passed loose because the last field is a stance, not a
+/// datum: two callers with different stakes must each state it (see
+/// [`OnUnresolvedCapture`]), and a bare trailing bool at a 7-argument call site is
+/// exactly the kind of thing that gets copied wrong.
+pub struct ReportContext<'a> {
+    pub target: Option<ExportTarget>,
+    pub config_dir: &'a std::path::Path,
+    pub params: Option<&'a std::collections::HashMap<String, String>>,
+    pub on_unresolved: OnUnresolvedCapture,
+}
+
 pub fn collect_reports(
     config: &Config,
     export: &ExportConfig,
     column_overrides: &ColumnOverrides,
     policy: &TypePolicy,
-    target: Option<ExportTarget>,
-    config_dir: &std::path::Path,
-    params: Option<&std::collections::HashMap<String, String>>,
+    ctx: ReportContext<'_>,
 ) -> Result<Vec<ExportTypeReport>> {
+    let ReportContext {
+        target,
+        config_dir,
+        params,
+        on_unresolved,
+    } = ctx;
     let mut units = report_units(export, config_dir, params)?;
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
@@ -181,14 +216,13 @@ pub fn collect_reports(
         && let Some(cdc) = &export.cdc
         && let Some(ci) = &cdc.capture_instance
     {
-        // ADVISORY, never fatal. `rivet check --type-report` is exactly what an
-        // operator runs BEFORE enabling CDC, and propagating this made the whole
-        // column table vanish on a database with no `cdc` schema (error 208) or a
-        // login without SELECT on it — `preflight::check` swallows the error into
-        // one `log::warn!`, then prints the verdict, "Looks good." and exit 0 with
-        // nothing typed at all (round-5, RED/GREEN on a CDC-less database). A
-        // resolution that cannot run must degrade to the configured relation, which
-        // is what every non-CDC export uses anyway, and SAY so.
+        // Advisory or fatal by CALLER, never one stance for both — see
+        // `OnUnresolvedCapture`. `rivet check --type-report` is run BEFORE
+        // `sp_cdc_enable_table`, so an unreadable cdc catalog is its normal state and
+        // a report over the configured relation is useful; making the lookup fatal
+        // there printed a verdict, "Looks good." and exit 0 with no column table at
+        // all. `rivet load` plans the warehouse DDL from these same reports, and a
+        // report describing the WRONG relation is worse than none.
         match crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls) {
             Ok(Some((schema, table))) => {
                 for (unit, query) in units.iter_mut() {
@@ -203,6 +237,14 @@ pub fn collect_reports(
                  expected; once it is, re-run so the report follows the catalog.",
                 export.table.as_deref().unwrap_or("the export")
             ),
+            Err(e) if on_unresolved == OnUnresolvedCapture::Fail => {
+                return Err(e.context(
+                    "mssql: the warehouse schema is planned from this report, so typing \
+                     the configured relation instead of the captured one would create \
+                     the load table with one relation's columns and feed it the other's \
+                     parquet",
+                ));
+            }
             Err(e) => log::warn!(
                 "mssql: could not resolve capture instance '{ci}' from cdc.change_tables, \
                  typing the configured relation instead — the report describes what \

@@ -502,14 +502,44 @@ fn classify_source_object(
         // The catalog has no such capture instance.
         None => Ok(None),
         Some((Some(s), Some(t))) => Ok(Some((s, t))),
-        // The row is there and the source object is not.
+        // The row is there and the object names are not. TWO causes produce this,
+        // and the first version named only the rarer one — then prescribed a command
+        // that DESTROYS the capture instance if the other cause is the real one.
+        //
+        // 1. METADATA VISIBILITY, and this is the likely one: SQL Server returns NULL
+        //    from `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` when the caller has no permission
+        //    on the object. rivet's OWN documented least-privilege reader
+        //    (`GRANT SELECT ON SCHEMA::cdc`, docs/reference/cdc.md) is exactly such a
+        //    login. MEASURED on the stand: `sa` sees `dbo`/`lp6`, the documented
+        //    reader sees NULL/NULL — same row, same healthy instance, table present.
+        // 2. A transient ORPHAN: the table was dropped without disabling capture, so
+        //    the row briefly outlives its object. MEASURED: the Agent's capture job
+        //    clears it within a few seconds on its own.
+        //
+        // The old hint told the operator to run `sp_cdc_disable_table`. On cause 1
+        // that SUCCEEDS and drops a healthy capture instance together with every
+        // change it still holds; on cause 2 it FAILS (Msg 22931, "Source table does
+        // not exist"), and so does recreating the table first (Msg 22960). Wrong on
+        // both branches — one destructive, one impossible. The rule this violated is
+        // the one the commit that wrote it cited: a remediation must recover from the
+        // ALREADY-DEGRADED state.
+        //
+        // Refusing is still right — resolution is what stops a fabricated snapshot
+        // baseline, and "we cannot read the names" is not "the configured string is
+        // fine". Only the diagnosis changes.
         Some(_) => anyhow::bail!(
-            "sqlserver cdc: capture instance '{capture_instance}' exists in \
-             cdc.change_tables but its source object is gone — the table was dropped \
-             without disabling capture first, so the change table is orphaned. Run \
-             `EXEC sys.sp_cdc_disable_table` for it before re-enabling; \
-             `sp_cdc_enable_table` on its own fails here with 22926 (capture instance \
-             already exists), so enabling is not the recovery from this state."
+            "sqlserver cdc: cdc.change_tables has a row for capture instance \
+             '{capture_instance}', but its source object's schema and name read back \
+             as NULL, so rivet cannot tell which relation it captures. Two causes, \
+             in order of likelihood: (1) this login lacks permission on the source \
+             TABLE — SQL Server hides object names from a principal that cannot see \
+             the object, and a reader granted only `SELECT ON SCHEMA::cdc` hits this \
+             on a perfectly healthy instance; grant it SELECT on the captured table. \
+             (2) the table was dropped without disabling capture first, leaving the \
+             row briefly orphaned — SQL Server Agent's capture job clears that within \
+             seconds, so re-run shortly. Do NOT run `sp_cdc_disable_table` here: under \
+             cause (1) it succeeds and destroys a working capture instance along with \
+             every change it holds, and under cause (2) it fails with Msg 22931."
         ),
     }
 }
@@ -1120,7 +1150,7 @@ mod tests {
     /// real and was measured on the stand; the DECISION about it belongs here, where
     /// a mutant can grade it.
     #[test]
-    fn a_lookup_tells_a_missing_instance_from_an_orphaned_one() {
+    fn a_lookup_tells_a_missing_instance_from_unreadable_object_names() {
         assert_eq!(
             super::classify_source_object("dbo_orders", None).expect("no row is not an error"),
             None,
@@ -1140,15 +1170,27 @@ mod tests {
             .expect_err("a row whose source object is gone is neither a resolution nor an absence")
             .to_string();
         assert!(
-            err.contains("sp_cdc_disable_table"),
-            "the remediation must work from the DEGRADED state — sp_cdc_enable_table \
-             fails 22926 once the instance exists, so telling the operator to enable \
-             is telling them to run a command that cannot succeed: {err}"
+            err.to_lowercase().contains("permission"),
+            "NULL object names are produced by METADATA VISIBILITY far more often \
+             than by a dropped table — rivet's own documented least-privilege reader \
+             (`GRANT SELECT ON SCHEMA::cdc`) reads NULL/NULL on a healthy instance \
+             (MEASURED against `sa` on the same row). A message that names only the \
+             rare cause sends the operator to repair something that is not broken: \
+             {err}"
+        );
+        assert!(
+            !err.contains("Run `EXEC sys.sp_cdc_disable_table`")
+                && !err.contains("Run `sp_cdc_disable_table`"),
+            "and it must NOT prescribe disabling. MEASURED both branches: under the \
+             permission cause that command SUCCEEDS and destroys a working capture \
+             instance with every change it still holds; under the orphan cause it \
+             FAILS with Msg 22931. A hint that is destructive on one branch and \
+             impossible on the other is worse than no hint: {err}"
         );
         assert!(
             !err.contains("does not know"),
             "and it must not claim the instance is unknown when the row is right \
-             there — that is the wrong repair for the state they are in: {err}"
+             there — that is a different state with a different repair: {err}"
         );
     }
 

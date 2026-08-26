@@ -814,3 +814,51 @@ fn roast_a_null_cursor_cell_must_not_freeze_the_incremental_cursor() {
         per_run[2], per_run
     );
 }
+
+/// An ordinary batch export must record the relation it read in its manifest.
+///
+/// Round-6 bughunt, and the finding is a coverage gap rather than a bug that had
+/// already bitten: `plan.source_table` — the sole input to the manifest's recorded
+/// identity — is produced by `build_plan` for EVERY export, and nothing anywhere
+/// observed it for an ordinary one. The only finalize test that asserts
+/// `source.table` hand-builds `source_table: None` and is answered by the
+/// `export_name` fallback, never by the real producer.
+///
+/// What that blindness costs: with `source_table` left empty, `identity_source`
+/// collapses to the bare engine, and `ensure_single_source` deliberately folds a
+/// colon-free identity away as "unknown" — so two DIFFERENT sources writing under
+/// one export name into one prefix pass the guard whose docstring records the
+/// measured loss it exists to prevent. RED-proven against exactly that mutant
+/// (`source_table: export.snapshot_label.clone()`, dropping the `.or_else` half),
+/// which the CDC snapshot-leg assertions cannot see because a leg always carries a
+/// label.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_batch_export_records_the_table_it_read_in_its_manifest() {
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("mfid").to_lowercase();
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, v INT NOT NULL);
+         INSERT INTO {table_name} SELECT g, g*10 FROM generate_series(1,3) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(&table_name).dest_path(out.path().to_path_buf());
+    rig.run_ok();
+
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.path().join("manifest.json")).unwrap())
+            .expect("parse the manifest");
+    assert_eq!(
+        m["source"]["table"].as_str(),
+        Some(table_name.as_str()),
+        "the manifest must name the relation this export read. An empty `table` is \
+         not a cosmetic gap: `identity_source` then renders the bare engine, and the \
+         two-source guard folds that away as unknown — so a prefix holding two \
+         different sources under one export name passes it. Got: {}",
+        m["source"]
+    );
+}
