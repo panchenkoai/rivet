@@ -1291,7 +1291,12 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
             .unwrap()
             .clone();
         for r in 0..b.num_rows() {
-            if op.value(r) == "update" {
+            // ADR-0030: a PK-changing UPDATE is now delivered as `delete(old key)` +
+            // `insert(new row)` — the same shape Debezium emits and SQL Server's
+            // engine already produces. The row that carries the NEW tuple is
+            // therefore the INSERT, not an update; this test asserted the old
+            // one-event form and is updated with the contract, not around it.
+            if op.value(r) == "insert" && id.value(r) == 2 {
                 update_after = Some((id.value(r), v.value(r).to_string()));
             }
         }
@@ -1299,7 +1304,7 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
     assert_eq!(
         update_after,
         Some((2, "a".to_string())),
-        "the update's after-image is the NEW tuple (id=2), stream not bricked"
+        "the NEW tuple (id=2) arrives as an insert, stream not bricked"
     );
 }
 
