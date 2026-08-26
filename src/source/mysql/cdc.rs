@@ -637,6 +637,29 @@ impl MysqlChangeStream {
         // "current" position, and every change in between would be silently skipped.
         let (file, pos) = Self::current_coordinates(url, tls)?;
         if let Some(path) = ckpt {
+            // LOUD, and at `warn` — this branch is reached both on a genuine first
+            // run and when a previously-written checkpoint is simply NOT THERE, and
+            // rivet cannot tell those apart. Round 9 measured the second case end to
+            // end: a relative `checkpoint:` (what `rivet init` scaffolds) is resolved
+            // against the process CWD, so running the same config from a different
+            // working directory found no file, re-anchored HERE at the current
+            // binlog coordinates, and reported `status: success, rows: 0` — three
+            // green runs delivering ids [3] of a source holding [1,2,3], with no line
+            // at any log level. PostgreSQL has said this for its own re-anchor
+            // (`slot_created_warning`) since the equivalent bug there; MySQL's peer
+            // was missing, and MySQL is the engine with NO server-side anchor to fall
+            // back on.
+            log::warn!(
+                "mysql cdc: no checkpoint at `{}` — anchoring at the CURRENT binlog \
+                 position ({file}:{pos}), so anything written before now is NOT \
+                 captured. On a first run that is expected. If this checkpoint existed \
+                 before, it was deleted or the path resolved elsewhere (a RELATIVE \
+                 `cdc.checkpoint:` is resolved against the process working directory, \
+                 so the same config run from another directory looks in another place) \
+                 — and the changes since it was written are gone from this stream. \
+                 Re-snapshot (`mode: full`) before trusting the result.",
+                path.display()
+            );
             Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
         }
         Self::open(url, server_id, file, pos, mode, tls, configured_tables)

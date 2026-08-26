@@ -433,7 +433,23 @@ impl MongoChangeStream {
             && let Some(pos) = this.anchor_position()
         {
             pos.save(ckpt)?;
-            log::info!("mongodb cdc: pinned resume anchor at open (fresh checkpoint)");
+            // `warn`, not `info`: this branch is reached both on a genuine first run
+            // and when a previously-written checkpoint is simply NOT THERE, and rivet
+            // cannot tell them apart. An `info` line is invisible at the default
+            // level, so the second case was silent — and a relative `cdc.checkpoint:`
+            // is resolved against the process working directory, so the same config
+            // run from another directory finds no file and re-anchors at NOW, past
+            // everything written since (round 9, measured on the MySQL peer of this
+            // branch: three green runs delivered [3] of [1,2,3]).
+            log::warn!(
+                "mongodb cdc: no checkpoint at `{}` — anchoring the resume token at the \
+                 CURRENT oplog position, so anything written before now is NOT captured. \
+                 On a first run that is expected. If this checkpoint existed before, it \
+                 was deleted or the path resolved elsewhere (a RELATIVE path is resolved \
+                 against the process working directory) — re-snapshot before trusting \
+                 this stream.",
+                ckpt.display()
+            );
         }
         Ok(this)
     }
