@@ -574,9 +574,28 @@ fn resolve_final_result(
     run_result: crate::error::Result<()>,
     reconcile_gate: crate::error::Result<()>,
     manifest_gap: Option<String>,
+    validated: Option<bool>,
 ) -> crate::error::Result<()> {
     if failed {
         return run_result;
+    }
+    // A FAILED `--validate` fails the run. It did not: this function took the
+    // reconcile gate and the manifest gap and never looked at the `validated`
+    // verdict, so `rivet run --config … --validate` printed `validated: FAIL` and
+    // exited 0 — while the standalone `rivet validate` on the identical destination
+    // state exits 3. Measured on both during the round-11 leading-slash work, and it
+    // is what hid that bug: a CI gate keyed on the run's exit code never learned.
+    //
+    // Ordered AFTER the manifest gap for the same reason that one outranks reconcile
+    // — an unreachable prefix is the condition to act on first — and before nothing,
+    // since reconcile is the remaining leg.
+    if validated == Some(false) {
+        return Err(anyhow::anyhow!(
+            "validation FAILED — the run wrote its data and the post-run \
+             `--validate` check did not pass. `rivet validate --config … --depth full` \
+             prints which parts disagree; the exit code is non-zero here so a \
+             scheduler or CI gate sees what the report already said."
+        ));
     }
     // The manifest gap outranks the reconcile verdict. Reconcile answers "is the
     // data right?"; this answers "is the data REACHABLE?" — and an unreachable
@@ -1283,7 +1302,13 @@ fn execute_resolved_plan(
 
     // An export failure wins, otherwise an unwritten manifest fails the run;
     // the reconcile leg is `Ok(())` where the policy disables it.
-    let final_result = resolve_final_result(failed, result, reconcile_gate, manifest_gap);
+    let final_result = resolve_final_result(
+        failed,
+        result,
+        reconcile_gate,
+        manifest_gap,
+        summary.validated,
+    );
     (final_result, summary)
 }
 
@@ -1817,7 +1842,7 @@ mod tests {
         // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
         // the fold reopens the bug; this test then goes red.
         let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
-        let out = resolve_final_result(false, Ok(()), gate, None);
+        let out = resolve_final_result(false, Ok(()), gate, None, None);
         assert!(
             out.is_err(),
             "a reconcile mismatch on a successful export must surface as the run result"
@@ -1826,16 +1851,31 @@ mod tests {
 
         // An export/quality failure takes precedence over the reconcile gate.
         let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
-        assert!(resolve_final_result(true, qfail, Ok(()), None).is_err());
+        assert!(resolve_final_result(true, qfail, Ok(()), None, None).is_err());
+        // A failed `--validate` verdict fails the run on its own — round-11 measured
+        // `validated: FAIL` printed beside exit 0, which is how a CI gate keyed on
+        // the exit code learns nothing about a destination that does not verify.
+        assert!(
+            resolve_final_result(false, Ok(()), Ok(()), None, Some(false)).is_err(),
+            "a FAILED validation must fail the run"
+        );
+        assert!(
+            resolve_final_result(false, Ok(()), Ok(()), None, Some(true)).is_ok(),
+            "...and a passing one must not"
+        );
+        assert!(
+            resolve_final_result(false, Ok(()), Ok(()), None, None).is_ok(),
+            "...nor must its ABSENCE, which is every run that did not ask for it"
+        );
 
         // Clean run: no export failure, no reconcile mismatch → Ok. (A --validate
         // verified-wrong verdict is NON-fatal by design — ADR-0001 §I7; a hard gate
         // is the standalone `rivet validate` command, not `run --validate`.)
-        assert!(resolve_final_result(false, Ok(()), Ok(()), None).is_ok());
+        assert!(resolve_final_result(false, Ok(()), Ok(()), None, None).is_ok());
         // A run whose manifest never landed is not a success, even with the
         // export and the reconcile both green: the parts are durable and no
         // manifest names them, so the loader cannot reach them.
-        let gap = resolve_final_result(false, Ok(()), Ok(()), Some("no manifest".into()));
+        let gap = resolve_final_result(false, Ok(()), Ok(()), Some("no manifest".into()), None);
         assert!(
             gap.is_err(),
             "an unwritten manifest must fail the run — reporting success there is a claim the \
