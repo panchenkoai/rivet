@@ -3175,28 +3175,31 @@ fn cdc_resume_captures_only_new_changes() {
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_run_is_recorded_in_state_db() {
     let tbl = unique_name("rivet_cdc_regr");
-    // The SHARED workdir, not a bare tempdir: the DuckDB oracle reads from inside a
-    // container and cannot see `/var/folders/...`. The state DB sits beside the
-    // config, so the config has to live here too — otherwise the census can reach
-    // the parquet and not the ledger, which is the half that needs reconciling.
-    let (shared, shared_container) = live_shared_workdir(&unique_name("cdc_census"));
     let _drop = Table(tbl.clone());
     let mut c = conn();
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
 
-    let ckpt = shared.join("cdc.ckpt");
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
     write_checkpoint(&mut c, &ckpt);
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20),(3,30)"))
         .unwrap();
-    let out = shared.join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    let cfg = cdc_rig(&tbl, &ckpt, &out).config_in(&shared);
-    run_rivet_ok(&cfg);
+    // `census_oracle()` owns the workdir, the destination AND the config placement —
+    // the state DB lives beside the config, and the oracle reads from inside a
+    // container. Hand-building those paths in a test body is the smell the rig
+    // exists to remove; the first version of this test did it and put the ledger
+    // somewhere the census could not see.
+    let rig = Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .census_oracle();
+    rig.run_ok();
+    let out = rig.out_dir();
+    let db = out.parent().expect("shared dir").join(".rivet_state.db");
 
     // A CDC run must show up like a batch run: an export_metrics row with mode=cdc,
     // and a run_journal entry (FileWritten + RunCompleted) so `rivet journal` works.
-    let db = shared.join(".rivet_state.db");
+
     let sql = rusqlite::Connection::open(&db).expect("state db");
 
     let (rows, mode): (i64, String) = sql
@@ -3217,14 +3220,7 @@ fn cdc_run_is_recorded_in_state_db() {
     //
     // Four numbers from one DuckDB session, sharing no code with rivet: the SOURCE
     // table, the delivered parquet, `export_metrics.total_rows`, `file_log.row_count`.
-    let census = duckdb_row_census(
-        OracleEngine::MysqlCdc,
-        "rivet",
-        &tbl,
-        &format!("{shared_container}/out/**/*.parquet"),
-        &format!("{shared_container}/.rivet_state.db"),
-        &tbl,
-    );
+    let census = rig.row_census();
     assert_eq!(
         census.delivered, 3,
         "the parquet must hold the three changes an independent reader can count, \

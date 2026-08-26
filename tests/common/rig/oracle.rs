@@ -154,3 +154,98 @@ impl Rig {
             .collect::<Vec<_>>()
     }
 }
+
+impl Rig {
+    /// [`Rig::duckdb_oracle`] plus the CONFIG in the shared workdir, which is what
+    /// [`Rig::row_census`] needs and `duckdb_oracle` alone does not give.
+    ///
+    /// The state DB lives beside the config. `duckdb_oracle` moves only the
+    /// DESTINATION into the container's view, so a census through it reaches the
+    /// parquet and not the ledger — and reconciling rivet's counters against the
+    /// artifacts is the half that catches a run recording more than it delivered.
+    pub fn census_oracle(mut self) -> Self {
+        self = self.duckdb_oracle();
+        // The rig's OWN shared directory holds both: the config at its root and the
+        // destination one level down. The first version put the config in the shared
+        // ROOT — which every rig shares — so `rig.yaml` collided across tests and the
+        // hand-edit guard fired. The container path gains the same `/out` segment.
+        let base = self.dest_override.clone().expect("duckdb_oracle set it");
+        self.config_dir_override = Some(base.clone());
+        let dest = base.join("out");
+        std::fs::create_dir_all(&dest).expect("census destination");
+        self.dest_override = Some(dest);
+        self.oracle_container_dir = self.oracle_container_dir.map(|c| format!("{c}/out"));
+        self
+    }
+
+    /// The four-way row census for THIS rig — source, delivered parquet,
+    /// `export_metrics.total_rows` and `file_log.row_count`, from one DuckDB session.
+    ///
+    /// On the rig rather than called loose from a test body, for the reason the rig
+    /// exists at all: the first hand-rolled call needed a `live_shared_workdir`, two
+    /// hand-built container paths and a moved config, and got the state DB's location
+    /// wrong on the first try. None of that is the test's business — the rig already
+    /// owns its workdir, its destination, its export name and its source.
+    ///
+    /// The ENGINE is derived from the rig's own `source_type` and URL, so this reaches
+    /// every engine without the caller naming one: postgres and mysql through DuckDB's
+    /// core scanners, SQL Server and MongoDB through the community `mssql` / `mongo`
+    /// extensions the stand now pins (DuckDB 1.5.0 — no build exists below it).
+    ///
+    /// Requires [`Rig::census_oracle`], which puts the CONFIG in the shared workdir
+    /// too: the state DB sits beside the config, and a census that can reach the
+    /// parquet but not the ledger is exactly half of the comparison that matters.
+    pub fn row_census(&self) -> super::super::duckdb::RowCensus {
+        let container = self.oracle_container_dir.as_ref().expect(
+            "row_census needs `.census_oracle()` — the DuckDB container reads \
+                     from inside itself and cannot see a bare tempdir, and a bucket or \
+                     directory that reads as empty is indistinguishable from an export \
+                     that wrote nothing",
+        );
+        let engine = self.oracle_engine();
+        // ONE table. A multi-table rig has N sub-prefixes and N source relations, so a
+        // single count would compare a sum against one of them — refused rather than
+        // silently answering about the first.
+        let [table] = self.tables.as_slice() else {
+            panic!(
+                "row_census compares ONE source relation against ONE destination; this \
+                 rig captures {:?}. Census each table's sub-prefix separately.",
+                self.tables
+            )
+        };
+        super::super::duckdb::duckdb_row_census(
+            engine,
+            self.oracle_database(),
+            table,
+            &format!("{container}/**/*.parquet"),
+            // The ledger sits beside the CONFIG, one level above the destination.
+            &format!("{}/.rivet_state.db", container.trim_end_matches("/out")),
+            &self.name,
+        )
+    }
+
+    /// Which DuckDB reader reaches this rig's source. Derived, never passed in — a
+    /// hand-named engine is one more thing a copied test body can get wrong, and the
+    /// wrong one reads zero rows, which looks exactly like an empty source.
+    fn oracle_engine(&self) -> super::super::duckdb::OracleEngine {
+        use super::super::duckdb::OracleEngine as E;
+        match self.source_type {
+            "postgres" if self.source_url.contains(":5434") => E::PostgresCdc,
+            "postgres" => E::Postgres,
+            "mysql" => E::MysqlCdc,
+            "mssql" => E::MssqlCdc,
+            "mongo" => E::MongoRs,
+            other => panic!("row_census has no DuckDB reader for source type `{other}`"),
+        }
+    }
+
+    /// The database the source URL names — the last path segment, minus any query.
+    fn oracle_database(&self) -> &str {
+        self.source_url
+            .rsplit('/')
+            .next()
+            .map(|s| s.split('?').next().unwrap_or(s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("rivet")
+    }
+}

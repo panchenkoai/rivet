@@ -105,7 +105,11 @@ impl Rig {
         for e in &self.extra_exports {
             std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
         }
-        let cfg = self.dir.path().join("rig.yaml");
+        let cfg = self
+            .config_dir_override
+            .as_deref()
+            .unwrap_or_else(|| self.dir.path())
+            .join("rig.yaml");
         // Every run helper re-materializes through here, so a caller who
         // HAND-EDITED the file would have the patch silently clobbered and the
         // test would run the un-patched config while looking patched (bughunt:

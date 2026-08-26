@@ -61,6 +61,11 @@ pub struct Rig {
     extra_exports: Vec<SecondaryExport>,
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
     oracle_container_dir: Option<String>,
+    /// Where `config_path()` materialises, when it must be somewhere the oracle
+    /// container can see — see [`Rig::census_oracle`]. `None` keeps the rig's own
+    /// tempdir, which is right for every test that does not read the state DB from
+    /// inside a container.
+    config_dir_override: Option<PathBuf>,
     ckpt_override: Option<PathBuf>,
     /// Cloud destination override when the exports write to a bucket/container
     /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
@@ -121,6 +126,7 @@ impl Rig {
             url_env: None,
             extra_exports: Vec::new(),
             oracle_container_dir: None,
+            config_dir_override: None,
             ckpt_override: None,
             dest_stdout: false,
             cloud_dest: None,
