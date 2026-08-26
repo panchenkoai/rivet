@@ -839,6 +839,47 @@ impl CdcEngine {
     }
 }
 
+/// Add an engine's setup hint ONLY to errors rivet did not raise itself.
+///
+/// Every `open` is wrapped in a `wal_level` / binlog-grants / Agent-setup hint,
+/// because a connection that fails for a permissions reason gives an opaque driver
+/// message and the hint is the whole answer. But rivet's OWN verdicts are already
+/// the whole answer, and the wrap puts the wrong cause FIRST — measured on the PG
+/// anti-gap guard, which reports permanent DATA LOSS:
+///
+///   Error: if this is a permissions/setup error: PostgreSQL CDC needs wal_level=
+///   logical and a role with the REPLICATION attribute — see … : pg cdc: slot
+///   'x' is missing but a resume checkpoint exists — the changes since then are no
+///   longer in the log. Re-snapshot …
+///
+/// The operator reads a wal_level troubleshooting line while the sentence that
+/// matters — re-snapshot, the data is gone — sits past a colon at the end. Two
+/// call sites were already hoisted OUT of their wrap one at a time for exactly
+/// this (`precheck_configured_tables` on both MySQL and PG, each with a comment
+/// saying the hint "sends the operator to fix permissions they never had a problem
+/// with"). Hoisting works only for a check that can run BEFORE `open`; this covers
+/// the ones raised inside it.
+///
+/// The discriminator is the prefix rivet puts on its own CDC messages
+/// (`mysql cdc:`, `pg cdc:`, …), which is also what the refusals and guards in each
+/// adapter are built from.
+fn with_setup_hint(e: anyhow::Error, hint: &'static str) -> anyhow::Error {
+    let rendered = format!("{e:#}");
+    if [
+        "mysql cdc:",
+        "pg cdc:",
+        "mssql cdc:",
+        "mongodb cdc:",
+        "cdc:",
+    ]
+    .iter()
+    .any(|p| rendered.contains(p))
+    {
+        return e;
+    }
+    e.context(hint)
+}
+
 /// Setup/permission hints appended to a CDC start-up error — so a missing grant
 /// surfaces the fix, not just a raw driver error. Phrased "if this is a
 /// permissions/setup error" because the same call can fail for other reasons.
@@ -855,7 +896,6 @@ pub(crate) fn create_change_stream(
     cfg: &CdcConfig,
     peek: PeekBound,
 ) -> Result<Box<dyn ChangeStream>> {
-    use anyhow::Context;
     let url = cfg.url.as_str();
     // A host-less URL is a config/parse error, not a per-engine setup problem —
     // validate BEFORE the engine match so it never gets blanketed by the binlog/
@@ -894,7 +934,7 @@ pub(crate) fn create_change_stream(
                     tls,
                     configured_tables.clone(),
                 )
-                .context(MYSQL_CDC_HINT)?,
+                .map_err(|e| with_setup_hint(e, MYSQL_CDC_HINT))?,
             ))
         }
         CdcEngineOpts::Postgres {
@@ -931,7 +971,7 @@ pub(crate) fn create_change_stream(
                     cfg.drain,
                     configured_tables,
                 )
-                .context(PG_CDC_HINT)?,
+                .map_err(|e| with_setup_hint(e, PG_CDC_HINT))?,
             ))
         }
         CdcEngineOpts::Mssql {
@@ -963,7 +1003,7 @@ pub(crate) fn create_change_stream(
                     cfg.drain,
                     configured_tables,
                 )
-                .context(MSSQL_CDC_HINT)?,
+                .map_err(|e| with_setup_hint(e, MSSQL_CDC_HINT))?,
             ))
         }
         CdcEngineOpts::Mongo {
@@ -1001,7 +1041,7 @@ pub(crate) fn create_change_stream(
                     if crate::source::mongo::cdc::error_names_its_own_cause(&e) {
                         e
                     } else {
-                        e.context(MONGO_CDC_HINT)
+                        with_setup_hint(e, MONGO_CDC_HINT)
                     }
                 })?,
             ))
@@ -1377,6 +1417,53 @@ pub(crate) fn resolve_checkpoint(raw: &str, config_dir: &std::path::Path) -> Pat
         return p.to_path_buf();
     }
     by_config
+}
+
+#[cfg(test)]
+mod setup_hint {
+    /// Both directions, because only the pair says anything: a hint on everything
+    /// is the bug, and a hint on nothing is the bug it would be replaced by.
+    ///
+    /// MEASURED live on the pg-cdc stand, both ways — a dropped slot with a
+    /// checkpoint present now leads with `pg cdc: slot '…' is missing …`, and a
+    /// `wal_level = replica` server still leads with the wal_level hint.
+    #[test]
+    fn a_setup_hint_is_added_to_driver_errors_and_withheld_from_rivets_own_verdicts() {
+        let hint = super::PG_CDC_HINT;
+
+        // A driver error says nothing actionable on its own — the hint IS the answer.
+        let driver = anyhow::anyhow!("db error: ERROR: logical decoding requires wal_level >= lo");
+        let wrapped = format!("{:#}", super::with_setup_hint(driver, hint));
+        assert!(
+            wrapped.starts_with("if this is a permissions/setup error"),
+            "an opaque driver error must keep its setup hint, or removing the wrap \
+             from rivet's verdicts would silently take it from the case it exists \
+             for. Got: {wrapped}"
+        );
+
+        // rivet's own verdict is already the whole answer, and it is about DATA LOSS.
+        let ours = anyhow::anyhow!(
+            "pg cdc: slot 'x' is missing but a resume checkpoint exists — the changes \
+             since then are no longer in the log. Re-snapshot the table (mode: full)"
+        );
+        let kept = format!("{:#}", super::with_setup_hint(ours, hint));
+        assert!(
+            kept.starts_with("pg cdc: slot 'x' is missing"),
+            "rivet's own verdict must LEAD. Prefixed, the operator reads a wal_level \
+             troubleshooting line while `re-snapshot, the data is gone` sits past a \
+             colon at the end. Got: {kept}"
+        );
+
+        // The sink's engine-agnostic prefix counts too — it raises the partial-image
+        // and arity refusals, which are not setup problems either.
+        let sink =
+            anyhow::anyhow!("cdc: rivet.t: a row image carries 1 value(s) under 3 column name(s)");
+        assert!(
+            format!("{:#}", super::with_setup_hint(sink, hint)).starts_with("cdc: rivet.t"),
+            "an engine-agnostic sink refusal is rivet's verdict as much as an \
+             engine-prefixed one"
+        );
+    }
 }
 
 #[cfg(test)]
