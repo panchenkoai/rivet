@@ -146,6 +146,28 @@ impl Rig {
         self.run_args_env(extra, &[])
     }
 
+    /// Run with the child's WORKING DIRECTORY set — the seam for path-resolution
+    /// contracts.
+    ///
+    /// A relative path in a config is resolved by SOMETHING, and which something is
+    /// a contract worth testing: `cdc.checkpoint: ./x.ckpt` was resolved against the
+    /// process CWD until round 9 measured the cost (the same config run from a cron
+    /// entry and from a shell looked in two places, found nothing the second time,
+    /// and re-anchored at the current log position — three green runs delivered
+    /// `[3]` of `[1,2,3]`). Every other rig entry point inherits the test harness's
+    /// own directory, so nothing could express the case; two hand-rolled
+    /// `Command::new(RIVET_BIN)` sites did, and the rig-adoption guard rightly
+    /// refused them.
+    pub fn run_in_dir(&self, dir: &std::path::Path) -> std::process::Output {
+        let out = self
+            .invoke_command(&self.run_argv(&[]), &[])
+            .current_dir(dir)
+            .output()
+            .expect("spawn rivet binary");
+        self.absorb_product_config_writes();
+        out
+    }
+
     /// Run with an extra environment variable (fault injection); returns the
     /// raw output — the caller asserts success or failure.
     pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {

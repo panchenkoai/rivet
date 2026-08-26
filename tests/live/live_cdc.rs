@@ -7312,3 +7312,155 @@ fn pg_cdc_says_the_inheritance_gap_once_per_run_not_twice() {
          forever:\n{said}"
     );
 }
+
+/// A relative `cdc.checkpoint:` must resolve against the CONFIG's directory, not
+/// the process working directory.
+///
+/// Round-9 bughunt, MEASURED as data loss before the fix: `rivet init` scaffolds
+/// `checkpoint: ./cdc/<table>.ckpt`, and the path was taken verbatim — so the same
+/// config invoked from a cron entry, a systemd unit with its own `WorkingDirectory`,
+/// a container entrypoint or by hand looked in a different place, found nothing, and
+/// re-anchored at the CURRENT log position. Run 1 from directory A anchored; ids 1
+/// and 2 were written; run 2 from directory B captured 0 and re-anchored past them;
+/// run 3 captured id 3. Delivered `[3]` against a source holding `[1,2,3]` — three
+/// green runs, two rows gone.
+///
+/// rivet already resolves every other relative path against the config's directory
+/// (the state DB, type-report paths); the CDC checkpoint was the one that did not.
+///
+/// The oracle is the DELIVERED SET across both runs, not the second run's count: a
+/// resume that merely returns a plausible number proves nothing about what was
+/// skipped before it.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn a_relative_cdc_checkpoint_follows_the_config_not_the_working_directory() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_ckcwd").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl)
+        .relative_checkpoint("./relative.ckpt")
+        .dest_path(out.path().to_path_buf());
+    // Two DIFFERENT working directories, neither of them the config's.
+    let cwd_a = tempfile::tempdir().expect("cwd A");
+    let cwd_b = tempfile::tempdir().expect("cwd B");
+    let run_from = |dir: &std::path::Path| {
+        let o = rig.run_in_dir(dir);
+        assert!(
+            o.status.success(),
+            "run from {} failed:\n{}",
+            dir.display(),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+
+    run_from(cwd_a.path()); // anchors
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .expect("seed between runs");
+    run_from(cwd_b.path()); // must RESUME from A's checkpoint, not re-anchor
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
+        .expect("seed after");
+    run_from(cwd_b.path());
+
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        got,
+        [1, 2, 3]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "every row written across the three runs must be delivered. Before the fix \
+         this returned [3]: run 2 resolved `./relative.ckpt` against ITS OWN working \
+         directory, found nothing, and re-anchored at the current binlog position — \
+         `status: success, rows: 0`, with ids 1 and 2 gone from both the stream and \
+         the destination"
+    );
+}
+
+/// An existing CWD-relative checkpoint must keep working — the fix must not cause,
+/// once on upgrade, the very loss it prevents.
+///
+/// Round-9 follow-up. Resolving a relative `cdc.checkpoint:` against the config's
+/// directory is correct, and it MOVES the lookup for every deployment already
+/// running. One whose working directory happens to be where its checkpoint lives
+/// would, on the first run after upgrading, find nothing at the new location and
+/// re-anchor at the current log position — skipping everything since, silently,
+/// which is exactly the failure the change exists to remove.
+///
+/// So the old location still wins when it holds a file and the new one does not,
+/// and the run says where the checkpoint should move to. The oracle is again the
+/// DELIVERED SET, not the second run's count.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn an_existing_working_directory_checkpoint_is_not_stranded_by_the_new_resolution() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_ckcompat").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl)
+        .relative_checkpoint("./legacy.ckpt")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
+    // ONE stable working directory, as a pre-upgrade deployment would have.
+    let cwd = tempfile::tempdir().expect("cwd");
+
+    let run = || {
+        let o = rig.run_in_dir(cwd.path());
+        assert!(
+            o.status.success(),
+            "run failed:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+
+    run(); // anchors — writes ./legacy.ckpt under the CONFIG's dir now
+    // Simulate the pre-upgrade world: the checkpoint lives beside the CWD, and the
+    // config-relative location has none.
+    let by_config = cfg.parent().expect("config dir").join("legacy.ckpt");
+    assert!(by_config.is_file(), "run 1 must have written a checkpoint");
+    std::fs::rename(&by_config, cwd.path().join("legacy.ckpt")).expect("move it to the CWD");
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .expect("seed between runs");
+    let said = run();
+    assert!(
+        said.contains("relative to the working directory"),
+        "the run must SAY it fell back, and where the file should move to — a silent \
+         fallback leaves the deployment permanently dependent on where rivet is \
+         invoked from. Got:\n{said}"
+    );
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
+        .expect("seed after");
+    run();
+
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        got,
+        [1, 2, 3]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "and nothing may be skipped across the upgrade: an existing checkpoint that \
+         the new resolution cannot see would re-anchor at the current position, \
+         which is the loss this whole change removes"
+    );
+}

@@ -430,6 +430,25 @@ impl Rig {
     /// Override the checkpoint path (resume/crash suites share one
     /// checkpoint across several configs — the rig renders, the test owns
     /// the file's lifetime).
+    /// Render `cdc.checkpoint:` as the given RELATIVE path, verbatim.
+    ///
+    /// Every other constructor hands the rig an ABSOLUTE tempdir path, which is
+    /// precisely why nothing caught the working-directory bug: a relative
+    /// `checkpoint:` — what `rivet init` scaffolds — was resolved against the
+    /// process CWD, so the same config run from another directory found no file and
+    /// re-anchored at the current log position, silently. A test for that class
+    /// cannot use the absolute default, and this is the seam rather than a
+    /// hand-written `cdc_line`, which collides with the `__CKPT__` marker the
+    /// constructors already seed.
+    pub fn relative_checkpoint(mut self, rel: &str) -> Self {
+        for l in self.cdc_lines.iter_mut() {
+            if l == "__CKPT__" {
+                *l = format!("checkpoint: \"{rel}\"");
+            }
+        }
+        self
+    }
+
     pub fn checkpoint_path(mut self, path: PathBuf) -> Self {
         self.ckpt_override = Some(path);
         // The checkpoint only reaches the config if the cdc block renders it.

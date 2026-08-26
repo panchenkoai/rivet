@@ -1303,13 +1303,17 @@ pub(super) fn run_export_job(
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails
         // the export — the anchor stays, so the retry resumes gap-free.
-        let pending = match super::cdc_job::initial_snapshot_pending(config, export, state) {
-            Ok(p) => p,
-            Err(e) => {
-                let summary = synthetic_failed_summary(&export.name, &e);
-                return (Err(e), summary);
-            }
-        };
+        let cdc_config_dir = std::path::Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let pending =
+            match super::cdc_job::initial_snapshot_pending(config, export, state, cdc_config_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    let summary = synthetic_failed_summary(&export.name, &e);
+                    return (Err(e), summary);
+                }
+            };
         for synth in &pending {
             let (res, summary) =
                 run_export_job(config_path, config, synth, state, config_dir, opts);

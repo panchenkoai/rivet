@@ -43,6 +43,46 @@ fn cdc_ignored_meta_warning(export: &ExportConfig) -> Option<String> {
     })
 }
 
+/// Resolve a configured `cdc.checkpoint:` path.
+///
+/// An ABSOLUTE path is used as written. A RELATIVE one is resolved against the
+/// CONFIG FILE's directory — the way rivet already resolves the state DB and every
+/// other relative path — rather than against the process working directory, which
+/// is what it did until round 9 measured the cost: `rivet init` scaffolds
+/// `checkpoint: ./cdc/<table>.ckpt`, so the same config invoked from a cron entry, a
+/// systemd unit with its own `WorkingDirectory`, a container entrypoint or by hand
+/// looked somewhere else, found nothing, and re-anchored at the CURRENT log
+/// position. Measured: three green runs delivered `[3]` of a source holding
+/// `[1,2,3]`.
+///
+/// COMPATIBILITY, and it is the reason this is a function rather than a `join`: a
+/// deployment whose working directory happens to be where its checkpoint already
+/// lives must not be moved out from under it by this fix — that would cause exactly
+/// the loss the fix exists to prevent, once, on upgrade. So if the config-relative
+/// location has no file and the CWD-relative one does, the existing file wins and
+/// the run says where it will live from now on.
+fn resolve_checkpoint(raw: &str, config_dir: &std::path::Path) -> PathBuf {
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let by_config = config_dir.join(p);
+    if !by_config.exists() && p.exists() {
+        log::warn!(
+            "cdc: using the existing checkpoint at `{}` (relative to the working \
+             directory). rivet now resolves a relative `cdc.checkpoint:` against the \
+             config's directory, so this run would otherwise have re-anchored at the \
+             current log position and skipped everything since. Move it to `{}` — or \
+             make the path absolute — so the location no longer depends on where \
+             rivet is invoked from.",
+            p.display(),
+            by_config.display()
+        );
+        return p.to_path_buf();
+    }
+    by_config
+}
+
 pub(super) fn run_cdc_export(
     config_path: &str,
     config: &Config,
@@ -118,7 +158,10 @@ pub(super) fn run_cdc_export(
     // while leaving the hole open.
 
     let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes);
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes, config_dir);
     let duration_ms = started.elapsed().as_millis() as i64;
 
     // The manifests describe what was made DURABLE; `outcome` says whether the
@@ -206,6 +249,7 @@ pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
+    config_dir: &std::path::Path,
 ) -> Result<Vec<ExportConfig>> {
     let cdc = export.cdc.clone().unwrap_or_default();
     // `snapshot` is the only OSS `initial:` mode; absence means "capture changes
@@ -311,7 +355,11 @@ pub(super) fn initial_snapshot_pending(
     // by `.ok()` into "no checkpoint" — that let PG CDC treat a run as a fresh
     // first anchor and re-create a dropped slot at 'current', permanently skipping
     // every change since the loss (the anti-gap guard never fired).
-    let ckpt_resume = match cdc.checkpoint.as_deref().map(std::path::Path::new) {
+    let ckpt_path = cdc
+        .checkpoint
+        .as_deref()
+        .map(|raw| resolve_checkpoint(raw, config_dir));
+    let ckpt_resume = match ckpt_path.as_deref() {
         Some(p) => crate::source::cdc::Position::load(p)?.is_some(),
         None => false,
     };
@@ -322,7 +370,7 @@ pub(super) fn initial_snapshot_pending(
     CdcEngine::from_url(&url)?.ensure_anchor(
         &url,
         &slot,
-        cdc.checkpoint.as_deref().map(std::path::Path::new),
+        ckpt_path.as_deref(),
         tls,
         resume_expected,
     )?;
@@ -478,12 +526,14 @@ pub(crate) fn dest_for_table(
 /// the metric + journal.
 /// Returns what the drain made DURABLE paired with its outcome — never one
 /// without the other. See `sink::run_to_files`.
+#[allow(clippy::too_many_arguments)]
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
     state: &StateStore,
     read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    config_dir: &std::path::Path,
 ) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = match config.source.resolve_url() {
         Ok(u) => u,
@@ -592,7 +642,10 @@ fn run_cdc_inner(
             export_name: export.name.clone(),
             cdc_cfg: CdcConfig {
                 url,
-                checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
+                checkpoint: cdc
+                    .checkpoint
+                    .as_deref()
+                    .map(|raw| resolve_checkpoint(raw, config_dir)),
                 drain: DrainMode::from_until_current(cdc.until_current),
                 tls: config.source.tls.clone(),
                 engine: match config.source.source_type {
