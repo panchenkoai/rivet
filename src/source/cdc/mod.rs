@@ -990,7 +990,20 @@ pub(crate) fn create_change_stream(
                     cfg.drain,
                     configured_tables,
                 )
-                .context(MONGO_CDC_HINT)?,
+                // The setup hint is a GUESS about the cause, so it must not be
+                // pasted onto an error that already names one. An oversized change
+                // event (`BSONObjectTooLarge`) surfaced here wearing "change streams
+                // require a replica set" — on a stand that IS one — which sends the
+                // operator to inspect a healthy topology and, finding nothing,
+                // eventually delete the checkpoint: the one action that turns a
+                // stalled run into lost data. Round 9, measured.
+                .map_err(|e| {
+                    if crate::source::mongo::cdc::error_names_its_own_cause(&e) {
+                        e
+                    } else {
+                        e.context(MONGO_CDC_HINT)
+                    }
+                })?,
             ))
         }
     }

@@ -364,23 +364,28 @@ impl MongoChangeStream {
             cap.server_version,
             cap.tier()
         );
-        let stream = session.block_on(async {
-            session
-                .client()
-                .database(&db_name)
-                .watch()
-                // Post-image for insert/update (current-state lookup).
-                .full_document(FullDocumentType::UpdateLookup)
-                // Delete/update PRE-image when the server carries it (6.0+ with
-                // `changeStreamPreAndPostImages`); silently absent otherwise.
-                .full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable)
-                // Bound how long the server holds a getMore open for a new change.
-                // Short so a bounded (`until_current`) run detects "drained" quickly
-                // via `next_if_any`; harmless for the daemon (`next` just re-polls).
-                .max_await_time(std::time::Duration::from_millis(500))
-                .resume_after(resume)
-                .await
-        })?;
+        let stream = session
+            .block_on(async {
+                session
+                    .client()
+                    .database(&db_name)
+                    .watch()
+                    // Post-image for insert/update (current-state lookup).
+                    .full_document(FullDocumentType::UpdateLookup)
+                    // Delete/update PRE-image when the server carries it (6.0+ with
+                    // `changeStreamPreAndPostImages`); silently absent otherwise.
+                    .full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable)
+                    // Bound how long the server holds a getMore open for a new change.
+                    // Short so a bounded (`until_current`) run detects "drained" quickly
+                    // via `next_if_any`; harmless for the daemon (`next` just re-polls).
+                    .max_await_time(std::time::Duration::from_millis(500))
+                    .resume_after(resume)
+                    .await
+            })
+            // The oversize failure lands HERE, on the initial aggregate, not on a later
+            // poll — so diagnosing it only in `next_change` left it wearing the generic
+            // setup hint. Same function, both sites.
+            .map_err(diagnose_stream_error)?;
         // The "current end" a bounded (`until_current`) run drains up to (the
         // resume-token `_data`, for the empty-poll race), plus the cluster time at
         // open (the strict upper bound that terminates under sustained writes).
@@ -669,6 +674,50 @@ fn to_change_event(
     Ok(ev)
 }
 
+/// Turn a change-stream error into one an operator can act on.
+///
+/// Only one shape is intercepted, and it is intercepted because the generic hint
+/// wrapped around every Mongo CDC error is actively WRONG for it: an oversized
+/// change event surfaces as `BSONObjectTooLarge`, and rivet answered it with
+/// "MongoDB change streams require a replica set" — on a stand that IS one.
+///
+/// The event carries the post-image, the pre-image (when
+/// `changeStreamPreAndPostImages` is on) and the envelope in ONE BSON document
+/// against a 16 MB ceiling. MEASURED on the mongo-rs stand: a 9 MB document updated
+/// with both images enabled produced `BSONObj size: 18874897 … is invalid`. The run
+/// then fails on every attempt — the checkpoint sits at the last committed event
+/// before it — so this is a WEDGE, not a transient, and an operator following the
+/// replica-set hint would find nothing wrong and eventually delete the checkpoint,
+/// which re-anchors past the change and loses it.
+/// True when this error already carries a specific, actionable diagnosis, so the
+/// generic setup hint would only bury it.
+pub(crate) fn error_names_its_own_cause(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("16 MB BSON limit")
+}
+
+fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
+    let text = e.to_string();
+    if text.contains("BSONObjectTooLarge") || text.contains("BSONObj size") {
+        return anyhow::anyhow!(
+            "mongodb cdc: a single change event exceeds MongoDB's 16 MB BSON limit — \
+             the event carries the post-image, the pre-image and the envelope in ONE \
+             document, so a document over roughly 8 MB can cross it on an update. \
+             This is not a setup problem and it does not clear on retry: the run stops \
+             at the same event every time. Recovery is a RE-SNAPSHOT — run this \
+             collection with `mode: full` (verified: a batch read of the same 9 MB \
+             document succeeds, because the snapshot reads the document rather than \
+             an event carrying two copies of it), then move the checkpoint past the \
+             stuck position. Do NOT just delete the checkpoint: on its own that \
+             re-anchors at NOW and drops the change with nothing standing in for it. \
+             Turning `changeStreamPreAndPostImages` off does NOT unstick THIS event \
+             either — the pre-image was already recorded when the change happened — \
+             though it does prevent the next one. Server error: {text}"
+        );
+    }
+    anyhow::Error::from(e)
+}
+
 impl ChangeStream for MongoChangeStream {
     fn engine(&self) -> crate::source::cdc::CdcEngine {
         crate::source::cdc::CdcEngine::Mongo
@@ -707,12 +756,12 @@ impl ChangeStream for MongoChangeStream {
                         }
                         continue; // backlog still coming — poll again
                     }
-                    Err(e) => return Some(Err(anyhow::Error::from(e))),
+                    Err(e) => return Some(Err(diagnose_stream_error(e))),
                 }
             } else {
                 match session.block_on(async { stream.next().await }) {
                     Some(Ok(cse)) => cse,
-                    Some(Err(e)) => return Some(Err(anyhow::Error::from(e))),
+                    Some(Err(e)) => return Some(Err(diagnose_stream_error(e))),
                     None => return None, // stream closed
                 }
             };
