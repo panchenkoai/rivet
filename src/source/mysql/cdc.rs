@@ -1249,7 +1249,17 @@ pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, Stri
     let rest = {
         let mut r = t;
         fn kw<'s>(r: &'s str, w: &str) -> Option<&'s str> {
-            if r.len() >= w.len() && r[..w.len()].eq_ignore_ascii_case(w) {
+            // `get`, never a byte slice. `r[..w.len()]` PANICS when the boundary
+            // falls inside a multi-byte character, and this runs in a match guard
+            // for EVERY QueryEvent in the server-wide binlog — so an unquoted
+            // `TRUNCATE données` on a table nobody captures killed the process:
+            // `byte index 5 is not a char boundary`, exit 101, no run summary, no
+            // journal RunCompleted, no ledger row. The checkpoint stays before the
+            // DDL, so every later run panics at the same event and capture is wedged
+            // until someone hand-edits the file (round-13 bughunt, reproduced twice).
+            // The backticked form happened to be safe, which is why this survived.
+            let head = r.get(..w.len())?;
+            if head.eq_ignore_ascii_case(w) {
                 let after = &r[w.len()..];
                 if after.is_empty() || after.starts_with(char::is_whitespace) {
                     return Some(after.trim_start());

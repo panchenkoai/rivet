@@ -727,8 +727,43 @@ fn flush(
         // prefix; an image WIDER than the schema, or a non-delete image of
         // ANY other arity, proves a stale pre-DDL layout.
         let is_delete = ev.op == ChangeOp::Delete;
-        if ev.image_names.is_some() {
-            continue; // named image — mapped by name, arity-proof for any op
+        if let Some(names) = ev.image_names.as_deref() {
+            // Named, but NOT unconditionally trustworthy — this bypass used to be
+            // `continue`, and a partial row image walked straight through it.
+            //
+            // MySQL builds `image_names` from the TABLE_MAP's full column list while
+            // the VALUES come from `BinlogRow::unwrap()`, which yields only the
+            // columns set in the image bitmap. Under `binlog_row_image = MINIMAL` (or
+            // NOBLOB, or a per-SESSION override the open-time `@@global` probe cannot
+            // see) the two disagree, `image_cell` resolves every name past the end of
+            // the short value vector, and the row lands ALL NULL. MEASURED on the
+            // mysql-cdc stand: an UPDATE written under MINIMAL delivered
+            // `id=NULL, a=NULL, b=NULL` at `status: success, rows: 1`, no warning,
+            // checkpoint advanced past it — the change gone for good.
+            //
+            // The events replay the setting in force when they were WRITTEN, which is
+            // the same present-tense trap the `binlog_row_metadata` probe below
+            // already documents. Arity is the evidence that survives the wire.
+            //
+            // A key-only DELETE is not a counter-example: PostgreSQL names only the
+            // key columns it also supplies, so its lengths agree.
+            let n = ev.after.as_ref().or(ev.before.as_ref()).map_or(0, Vec::len);
+            if n != names.len() {
+                anyhow::bail!(
+                    "cdc: {}.{}: a row image carries {n} value(s) under {} column \
+                     name(s) — a PARTIAL image, which rivet cannot map without \
+                     fabricating the missing cells as NULL. On MySQL this is \
+                     `binlog_row_image` set to something other than FULL when the \
+                     change was WRITTEN (a session override counts, and the open-time \
+                     probe reads only the global). Set `binlog_row_image = FULL` and \
+                     re-capture from before the affected DDL/DML; the changes are \
+                     still in the binlog, so this is a delay rather than a loss.",
+                    ev.schema,
+                    ev.table,
+                    names.len()
+                );
+            }
+            continue; // named AND complete — mapped by name, arity-proof for any op
         }
         // A NAMELESS image maps by POSITION, and this is the only place that knows
         // it for certain. The open-time probe asks the server what
