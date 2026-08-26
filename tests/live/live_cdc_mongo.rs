@@ -1109,7 +1109,12 @@ fn mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling() {
     m.drop_collection(&dotted);
     m.drop_collection("orders");
 
-    let rig = cdc(&db, &dotted);
+    // `initial: snapshot` is not incidental: the snapshot leg is the one that goes
+    // through `finalize`, and its manifest is where the engine-blind name split
+    // recorded a different collection's identity. Without it the manifest assertion
+    // below grades nothing — PROVEN by mutating the fix back and watching this test
+    // stay green until the leg was added.
+    let rig = cdc(&db, &dotted).cdc_line("initial: snapshot");
     rig.run_ok(); // anchor
     m.insert_many(&dotted, vec![doc! { "_id": 1_i64, "who": "dotted" }]);
     // The sibling the split arm used to pull in.
@@ -1136,6 +1141,39 @@ fn mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling() {
          LOADS would give an empty set) and the sibling `orders` must not be — \
          `sibling` appearing here is the interleave, which counts cannot see"
     );
+
+    // Both LEGS must agree about the identity they recorded. `finalize` derived
+    // `schema`/`table` by splitting on the first dot regardless of engine, so the
+    // snapshot leg's manifest named `{schema: "<db>", table: "orders"}` — the
+    // SIBLING collection, which exists and holds different rows — while the drain
+    // recorded the whole string. `identity_source` re-joins with a dot, so both
+    // render the same source id and the single-source guard sees nothing; only a
+    // consumer reading the two fields separately meets the contradiction.
+    {
+        let p = rig.out_dir().join("snapshot").join("manifest.json");
+        assert!(
+            p.is_file(),
+            "the snapshot leg must have produced a manifest — without one this \
+             assertion is vacuous, which is exactly how the defect survived"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).expect("read manifest"))
+                .expect("parse manifest");
+        assert_eq!(
+            doc["source"]["schema"],
+            serde_json::Value::Null,
+            "a MongoDB manifest must carry NO schema — the database is not one, and \
+             recording the first dot-segment as a schema names a different \
+             collection. Got: {}",
+            doc["source"]
+        );
+        assert_eq!(
+            doc["source"]["table"].as_str(),
+            Some(dotted.as_str()),
+            "and the table must be the collection's WHOLE name: {}",
+            doc["source"]
+        );
+    }
 
     m.drop_collection(&dotted);
     m.drop_collection("orders");

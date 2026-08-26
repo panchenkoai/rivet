@@ -397,13 +397,27 @@ pub(super) fn finalize_manifest(
     // The name split stays as the FALLBACK: an export declared with `query:`
     // has no `table:`, and a `schema.table` export name is still the only place
     // its schema appears.
+    // A document store has NO schema to qualify with, so `a.b` is one collection
+    // name and splitting it invents an identity. Round-4 measured the cost on one
+    // `initial: snapshot` Mongo export into one prefix: the drain recorded
+    // `{table: "bh4.orders"}` while the snapshot leg recorded
+    // `{schema: "bh4", table: "orders"}` — the name of a DIFFERENT collection that
+    // existed and held different rows. `identity_source` re-joins with a dot, so
+    // both render `mongo:bh4.orders` and the single-source guard sees nothing; only
+    // a consumer reading the two fields separately meets the contradiction.
+    //
+    // This is the same lesson the router learned in 680e537 — routing semantics are
+    // the engine's — arriving one file late.
+    let mongo = plan.source.source_type == crate::config::SourceType::Mongo;
     let (source_schema, source_table) = match plan.source_table.as_deref() {
+        Some(t) if mongo => (None, Some(t.to_string())),
         Some(t) => match t.split_once('.') {
             Some((s, tbl)) if !s.is_empty() && !tbl.is_empty() => {
                 (Some(s.to_string()), Some(tbl.to_string()))
             }
             _ => (None, Some(t.to_string())),
         },
+        None if mongo => (None, None),
         None => match summary.export_name.split_once('.') {
             Some((s, t)) if !s.is_empty() && !t.is_empty() => {
                 (Some(s.to_string()), Some(t.to_string()))

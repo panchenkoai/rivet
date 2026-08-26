@@ -160,9 +160,35 @@ pub fn collect_reports(
     config_dir: &std::path::Path,
     params: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<Vec<ExportTypeReport>> {
-    let units = report_units(export, config_dir, params)?;
+    let mut units = report_units(export, config_dir, params)?;
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
+
+    // The THIRD reading of one config, and it must agree with the other two.
+    //
+    // On SQL Server a CDC export's `capture_instance:` names its source object in
+    // the catalog, and the configured `table:` may be a bare name that resolves
+    // elsewhere. The extract follows the catalog (`resolved_identity`, and the
+    // snapshot leg's plan-time lookup); this probe was still doing `SELECT * FROM
+    // <configured>` in the connection's default schema. Round-4 MEASURED the split:
+    // `rivet check` reported a decoy's columns and row count with verdict
+    // ACCEPTABLE while the run wrote the captured relation's — and `rivet load`
+    // PLANS the warehouse schema from these very reports, so it would create
+    // `<table>__changes` with one relation's columns and feed it the other's
+    // parquet. Before the resolution landed all three were wrong TOGETHER, which is
+    // consistent and survivable; disagreeing is not.
+    if config.source.source_type == SourceType::Mssql
+        && let Some(cdc) = &export.cdc
+        && let Some(ci) = &cdc.capture_instance
+        && let Some((schema, table)) =
+            crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
+    {
+        for (unit, query) in units.iter_mut() {
+            if unit.is_none() {
+                *query = format!("SELECT * FROM {schema}.{table}");
+            }
+        }
+    }
 
     let mut src: Box<dyn source::Source> = match config.source.source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(

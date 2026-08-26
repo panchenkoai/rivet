@@ -432,19 +432,39 @@ pub(crate) fn source_object_of_capture_instance(
         .enable_all()
         .build()?;
     let mut client = rt.block_on(connect(cfg, tls))?;
-    Ok(rt.block_on(async {
-        let row = client
-            .query(
-                "SELECT OBJECT_SCHEMA_NAME(source_object_id), \
-                        OBJECT_NAME(source_object_id) \
-                 FROM cdc.change_tables WHERE capture_instance = @P1",
-                &[&cfg.capture_instance.as_str()],
+
+    // Three outcomes, kept APART. Collapsing them into `Ok(None)` — which the first
+    // cut did, with `.ok()?` — let a mistyped `capture_instance:`, a login without
+    // SELECT on the cdc schema, and a network blip all fall back to the configured
+    // string: silently restoring the pre-fix behaviour for exactly the config most
+    // likely to be wrong. Round-4 DEMONSTRATED the cost: a typo'd instance wrote a
+    // fabricated snapshot baseline AND marked it done, so correcting the typo never
+    // backfilled the real rows — the fabrication was permanent.
+    let rows = rt
+        .block_on(async {
+            client
+                .query(
+                    "SELECT OBJECT_SCHEMA_NAME(source_object_id), \
+                            OBJECT_NAME(source_object_id) \
+                     FROM cdc.change_tables WHERE capture_instance = @P1",
+                    &[&cfg.capture_instance.as_str()],
+                )
+                .await
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "sqlserver cdc: reading cdc.change_tables for capture instance \
+                 '{capture_instance}' (the login needs SELECT on the cdc schema): {e}"
             )
-            .await
-            .ok()?
-            .into_row()
-            .await
-            .ok()??;
+        })?;
+    let row = rt.block_on(async { rows.into_row().await }).map_err(|e| {
+        anyhow::anyhow!(
+            "sqlserver cdc: reading the cdc.change_tables row for capture \
+                 instance '{capture_instance}': {e}"
+        )
+    })?;
+    // `None` now means ONE thing: the catalog has no such capture instance.
+    Ok(row.and_then(|row| {
         let s: Option<&str> = row.get(0);
         let t: Option<&str> = row.get(1);
         Some((s?.to_string(), t?.to_string()))

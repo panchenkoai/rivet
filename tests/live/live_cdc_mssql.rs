@@ -2034,10 +2034,7 @@ fn mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema() 
         "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
          @role_name=NULL, @capture_instance=N'{ci}';"
     ));
-    let _guard = MssqlCdcTable {
-        table: table.clone(),
-        ci: ci.clone(),
-    };
+    let _guard = MssqlCdcTable::in_schema("rvsales", &table, &ci);
     let _decoy = DboDecoy(table.clone());
 
     let ckpt = d.path().join("cdc.ckpt");
@@ -2075,6 +2072,37 @@ fn mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema() 
         "and the DECOY's columns must not be — a column that exists in neither the \
          captured table nor its events can only arrive all-NULL, which reads as \
          'the source had no data' rather than as a mis-resolved config: {cols:?}"
+    );
+
+    // `rivet check` is the THIRD reading of this config, and the operator's last
+    // chance to notice. Round-4 measured it reporting the DECOY's columns and row
+    // count with verdict ACCEPTABLE while the run wrote the captured relation's —
+    // and `rivet load` plans the warehouse schema from these same reports, so it
+    // would create `<table>__changes` with one relation's columns and feed it the
+    // other's parquet.
+    let checked = run_rivet(&[
+        "check",
+        "--config",
+        mssql_cdc_rig(&table, &ci, &ckpt, &out)
+            .config_path()
+            .to_str()
+            .unwrap(),
+        "--json",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(
+        said.contains("note"),
+        "preflight must probe the relation the capture instance names — it reported \
+         the decoy's columns while the run wrote the captured table's, and the two \
+         disagreeing is worse than both being wrong together. Got:\n{said}"
+    );
+    assert!(
+        !said.contains("dbo_only"),
+        "and it must not report the decoy's columns at all:\n{said}"
     );
 
     // Values, not just names: a schema that is right while every cell is NULL is
@@ -2147,10 +2175,7 @@ fn mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema() {
         "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
          @role_name=NULL, @capture_instance=N'{ci}';"
     ));
-    let _guard = MssqlCdcTable {
-        table: table.clone(),
-        ci: ci.clone(),
-    };
+    let _guard = MssqlCdcTable::in_schema("rvsales", &table, &ci);
     let _decoy = DboDecoy(table.clone());
 
     let ckpt = d.path().join("cdc.ckpt");
@@ -2176,5 +2201,156 @@ fn mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema() {
         "the baseline must be the CAPTURED table's rows. Before the fix this \
          directory held the decoy's row (id 900) — data that never existed in the \
          relation being captured, written into its prefix under a green run"
+    );
+}
+
+/// A capture instance the catalog does not know must be refused BEFORE the
+/// snapshot leg makes a fabricated baseline permanent.
+///
+/// Round-4 bughunt, and the finding is about ORDER, not about detection: `open`
+/// already bails on an unknown capture instance, but the snapshot leg runs, writes
+/// and MARKS ITSELF DONE first. So a typo'd `capture_instance:` produced a baseline
+/// read from whatever the configured name resolves to in the default schema, the
+/// drain then failed, and the operator's fix was worthless — MEASURED: run 2 with
+/// the name corrected reported `status: success`, exit 0, and never backfilled the
+/// real rows, because the snapshot was already done. One fabricated row, two real
+/// rows missing, permanently.
+///
+/// The plan-time lookup that made the fix possible had swallowed the distinction:
+/// a missing instance, a permission error and a network blip all became `Ok(None)`
+/// and fell back to the configured string — silently restoring the pre-fix
+/// behaviour for exactly the config most likely to be wrong.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_ghost");
+    let ci = format!("rvsales_{table}");
+    mssql_cdc_exec("IF SCHEMA_ID('rvsales') IS NULL EXEC('CREATE SCHEMA rvsales');");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT); \
+         INSERT INTO dbo.{table} VALUES (900, 42);"
+    ));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE rvsales.{table}(id INT PRIMARY KEY, note NVARCHAR(50)); \
+         INSERT INTO rvsales.{table} VALUES (1, N'real-one'), (2, N'real-two');"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable::in_schema("rvsales", &table, &ci);
+    let _decoy = DboDecoy(table.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // The typo: a capture instance that does not exist.
+    let typo = format!("{ci}_typo");
+    let rig = mssql_cdc_rig(&table, &typo, &ckpt, &out).cdc_line("initial: snapshot");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains(&typo),
+        "the refusal must name the instance it could not find — an operator cannot \
+         fix a name they were not shown. Got:\n{said}"
+    );
+    assert!(
+        !out.join("snapshot").exists()
+            || files_with_extension(&out.join("snapshot"), "parquet").is_empty(),
+        "and it must refuse BEFORE the snapshot writes. A baseline on disk here is \
+         the whole defect: it is also marked done, so correcting the typo never \
+         backfills the rows it skipped"
+    );
+
+    // With the name corrected the run works, and the baseline is the real table's.
+    let ok_rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot");
+    ok_rig.run_ok();
+    let notes: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&out.join("snapshot"), "note");
+    assert_eq!(
+        notes,
+        ["real-one", "real-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the corrected run must produce the CAPTURED table's baseline — this is the \
+         assertion that failed before the fix, because the typo'd run had already \
+         marked the snapshot done"
+    );
+}
+
+/// The snapshot-done row must be keyed by the LABEL both times, or the durable
+/// signal cannot match itself and every cycle re-snapshots the whole table.
+///
+/// Round-4 bughunt, and a regression introduced by the round-3B fix beside it: once
+/// the snapshot leg learned to READ the catalog's relation, `mark_snapshot_done`
+/// started writing that string while `snapshot_plan` kept asking with the CONFIGURED
+/// one. The key is byte-exact, so on SQL Server — the only engine where the two
+/// differ — the row written as `dbo.orders` could never answer a question about
+/// `orders`.
+///
+/// The oracle is the behaviour, not the row: the state DB exists precisely so that
+/// `cleanup_source: true` may wipe the destination without the next run
+/// re-snapshotting (its own docstring says so), so deleting the snapshot directory
+/// and running again asks exactly the question the store was built to answer. A
+/// mismatched key means a full table re-read plus a duplicated baseline appended
+/// into `<table>__changes` on every scheduled cycle, forever, under `status:
+/// success`.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_a_completed_snapshot_is_not_redone_after_the_destination_is_wiped() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_once");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT); \
+         INSERT INTO dbo.{table} VALUES (1,10),(2,20);"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // ONE rig, run twice — the state DB lives in the rig's workdir, so two rigs
+    // would be two databases and the second run could never see the first's row.
+    // (That mistake made the first draft of this test fail for a harness reason
+    // while it looked like the product defect.)
+    let rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot");
+    rig.run_ok();
+    let snap = out.join("snapshot");
+    assert!(
+        !files_with_extension(&snap, "parquet").is_empty(),
+        "run 1 must actually produce a baseline — without one this test grades nothing"
+    );
+
+    // What `cleanup_source: true` does: the destination goes, the state row stays.
+    std::fs::remove_dir_all(&snap).expect("wipe the snapshot prefix");
+    rig.run_ok();
+    assert!(
+        files_with_extension(&snap, "parquet").is_empty(),
+        "run 2 must NOT re-snapshot: the state DB already records this table as \
+         backfilled, and that record is the ONLY thing standing between a wiped \
+         destination and a full re-read plus a duplicated baseline on every \
+         scheduled cycle"
     );
 }

@@ -589,9 +589,29 @@ pub struct MssqlCdcTable {
     pub table: String,
     pub ci: String,
 }
+
+impl MssqlCdcTable {
+    /// A captured table outside `dbo`. The schema is taken at CONSTRUCTION because
+    /// the catalog cannot supply it at teardown: `OBJECT_SCHEMA_NAME(source_object_id)`
+    /// resolves the SOURCE OBJECT, so once the table is dropped it returns NULL even
+    /// though the `cdc.change_tables` row is still there (MEASURED on the stand).
+    /// A teardown that derives the schema from a possibly-gone object then skips the
+    /// disable AND drops the wrong name — leaking a non-`dbo` table.
+    pub fn in_schema(schema: &str, table: &str, ci: &str) -> Self {
+        Self {
+            table: format!("{schema}.{table}"),
+            ci: ci.to_string(),
+        }
+    }
+}
 impl Drop for MssqlCdcTable {
     fn drop(&mut self) {
-        let (table, ci) = (self.table.clone(), self.ci.clone());
+        // `table` may be `schema.table` (see `in_schema`) or a bare name in `dbo`.
+        let (schema, leaf) = match self.table.split_once('.') {
+            Some((s, t)) => (s.to_string(), t.to_string()),
+            None => ("dbo".to_string(), self.table.clone()),
+        };
+        let ci = self.ci.clone();
         let _ = std::panic::catch_unwind(move || {
             // The SCHEMA comes from the catalog, never from an assumption. Two
             // reasons, both already paid for in this repo: a fixture may put the
@@ -602,12 +622,12 @@ impl Drop for MssqlCdcTable {
             // `sp_cdc_enable_table` fails 22926 and the suite alternates pass/fail.
             // `capture_instance` survives the drop; join on that.
             super::mssql::mssql_cdc_exec(&format!(
-                "DECLARE @s sysname = (SELECT TOP 1 OBJECT_SCHEMA_NAME(ct.source_object_id) \
-                   FROM cdc.change_tables ct WHERE ct.capture_instance = N'{ci}'); \
-                 IF @s IS NOT NULL EXEC sys.sp_cdc_disable_table @source_schema=@s, \
-                   @source_name=N'{table}', @capture_instance=N'{ci}'; \
+                "DECLARE @s sysname = N'{schema}', @t sysname = N'{leaf}'; \
+                 IF EXISTS(SELECT 1 FROM cdc.change_tables WHERE capture_instance = N'{ci}') \
+                   EXEC sys.sp_cdc_disable_table @source_schema=@s, \
+                     @source_name=@t, @capture_instance=N'{ci}'; \
                  DECLARE @d nvarchar(max) = N'DROP TABLE IF EXISTS ' \
-                   + QUOTENAME(COALESCE(@s, N'dbo')) + N'.' + QUOTENAME(N'{table}'); \
+                   + QUOTENAME(@s) + N'.' + QUOTENAME(@t); \
                  EXEC sp_executesql @d;"
             ));
         });

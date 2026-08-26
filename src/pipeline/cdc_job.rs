@@ -242,8 +242,44 @@ pub(super) fn initial_snapshot_pending(
     // keyed by it — while the READ follows the catalog.
     let catalog_read: Option<String> = match (CdcEngine::from_url(&url)?, &cdc.capture_instance) {
         (CdcEngine::Mssql, Some(ci)) => {
-            crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
-                .map(|(schema, table)| format!("{schema}.{table}"))
+            let Some((schema, table)) =
+                crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
+            else {
+                // The catalog has no such capture instance. `open` bails on this
+                // too — but the SNAPSHOT leg runs, writes, and MARKS ITSELF DONE
+                // before `open` is ever called, so deferring to it means a typo'd
+                // instance deposits a baseline read from whatever the configured
+                // name resolves to and then never re-reads (round-4, DEMONSTRATED:
+                // correcting the typo left the fabricated row in place and the real
+                // rows never backfilled). Refuse where it is still cheap.
+                anyhow::bail!(
+                    "sqlserver cdc: export '{}' names capture instance '{ci}', which \
+                     `cdc.change_tables` does not know. Enable CDC on the table \
+                     (`sys.sp_cdc_enable_table`) or fix the name — continuing would \
+                     snapshot whatever `{}` resolves to in the connection's default \
+                     schema and record that as this table's baseline.",
+                    export.name,
+                    tables.first().map(String::as_str).unwrap_or("the table"),
+                );
+            };
+            // And the configured name must AGREE with the catalog, by the same
+            // predicate the sink routes by. `open` checks this; the snapshot leg had
+            // no routing check at all, so a `table:` contradicting its capture
+            // instance backfilled one relation into the other's prefix and only then
+            // failed the drain.
+            for t in &tables {
+                if !crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
+                    anyhow::bail!(
+                        "sqlserver cdc: export '{}' configures `table: {t}` while capture \
+                         instance '{ci}' emits changes for `{schema}.{table}` — the two \
+                         name different relations, so the snapshot would back up one and \
+                         the drain capture the other. Set `table:` to `{schema}.{table}`, \
+                         or point `capture_instance:` at the table you meant.",
+                        export.name,
+                    );
+                }
+            }
+            Some(format!("{schema}.{table}"))
         }
         _ => None,
     };
@@ -307,8 +343,19 @@ pub(super) fn initial_snapshot_pending(
 /// hand-typing the expected family — the fixture bypass that made the earlier
 /// version of that test green against a product which still mis-folded.
 #[cfg(test)]
-pub(crate) fn synth_snapshot_export_for_test(export: &ExportConfig, table: &str) -> ExportConfig {
-    synth_snapshot_export(export, table, table, &export.destination)
+/// Test door onto [`synth_snapshot_export`], taking BOTH strings.
+///
+/// It took only the one until round-4, and passed it twice — so no unit test could
+/// express LABEL ≠ READ, which is the entire distinction the SQL Server catalog
+/// resolution introduced. That is how a broken snapshot-done key shipped: the
+/// mechanism's activation threshold is two DIFFERENT strings, and every fixture had
+/// one.
+pub(crate) fn synth_snapshot_export_for_test(
+    export: &ExportConfig,
+    table: &str,
+    read: &str,
+) -> ExportConfig {
+    synth_snapshot_export(export, table, read, &export.destination)
 }
 
 fn synth_snapshot_export(
@@ -321,6 +368,9 @@ fn synth_snapshot_export(
     // The leg's family is the PARENT export, recorded here — the one place that
     // knows, because it is building the name from it.
     synth.snapshot_parent = Some(export.name.clone());
+    // The label travels WITH the leg, so every consumer that must agree with the
+    // configured string can ask for it instead of re-deriving it.
+    synth.snapshot_label = Some(table.to_string());
     synth.name = format!(
         "{}{}{table}",
         export.name,
@@ -845,6 +895,43 @@ mod tests {
     // the legs; BOTH legs produce `_rivet_row_hash`, so dropping it on the
     // snapshot is what would desynchronize them — leaving every backfilled
     // row's hash NULL and the audit's cheap path unusable.
+    /// LABEL and READ are different strings, and each consumer must get the right
+    /// one.
+    ///
+    /// Round-4: once the snapshot leg learned to READ the relation SQL Server's
+    /// capture instance names, `synth.table` stopped being the configured string —
+    /// and `mark_snapshot_done` kept writing `synth.table` while `snapshot_plan`
+    /// asked with the configured one. The key is byte-exact, so the row could never
+    /// answer its own question and every scheduled cycle re-snapshotted the whole
+    /// table under a green run.
+    ///
+    /// The fixture needs TWO DIFFERENT strings; the test door passed one twice
+    /// until now, which is why nothing here could see it.
+    #[test]
+    fn the_snapshot_leg_carries_the_label_and_reads_the_catalog_relation() {
+        let e = crate::config::sample_export("orders");
+        let synth = synth_snapshot_export_for_test(&e, "orders", "sales.orders");
+        assert_eq!(
+            synth.table.as_deref(),
+            Some("sales.orders"),
+            "the relation READ follows the catalog — that is the whole point of the \
+             resolution"
+        );
+        assert_eq!(
+            synth.snapshot_label.as_deref(),
+            Some("orders"),
+            "and the LABEL travels with the leg, because everything a later run keys \
+             on — the snapshot-done row above all — asks with the configured string"
+        );
+        assert!(
+            synth.name.contains("orders") && !synth.name.contains("sales.orders"),
+            "the leg's NAME is built from the label too, so the destination \
+             sub-prefix and the manifest identity do not move when a catalog \
+             resolution changes: {}",
+            synth.name
+        );
+    }
+
     #[test]
     fn snapshot_leg_inherits_the_row_hash() {
         let mut e = crate::config::sample_export("orders");

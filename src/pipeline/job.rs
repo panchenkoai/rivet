@@ -1327,7 +1327,13 @@ pub(super) fn run_export_job(
             // wasteful (a fresh full re-read + re-load), NOT data loss: the
             // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
             // anchor and no changes are skipped.
-            if let Some(table) = synth.table.as_deref()
+            // The LABEL, never the relation read. `snapshot_plan` asks this store
+            // with the configured string, and on SQL Server `synth.table` is the
+            // catalog's pair — so writing that made the key unable to match itself
+            // and every cycle re-snapshotted the whole table under a green run
+            // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
+            // the two are the same string anyway.
+            if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
                 && let Err(e) =
                     state.mark_snapshot_done(&export.name, table, &summary.journal.run_id)
             {
