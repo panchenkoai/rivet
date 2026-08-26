@@ -783,6 +783,56 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
 
 #[cfg(test)]
 mod tests {
+
+    /// `resolve_checkpoint`'s three cases, each named by a mutant that survived.
+    ///
+    /// The function is pure apart from two `exists()` probes, and it had only LIVE
+    /// coverage — so `replace -> PathBuf with Default::default()`, `delete !` and
+    /// `&& -> ||` all sailed through the offline gate. It decides where a resume
+    /// looks for its position, so a wrong answer re-anchors the stream at NOW.
+    #[test]
+    fn resolve_checkpoint_prefers_the_config_dir_and_keeps_an_existing_cwd_file() {
+        let cfg_dir = tempfile::tempdir().expect("config dir");
+        let cwd_dir = tempfile::tempdir().expect("cwd");
+        let _guard = std::env::set_current_dir(cwd_dir.path());
+
+        // ABSOLUTE: used verbatim, and never empty — the `-> Default::default()`
+        // mutant returns an empty path, which `Position::load` reads as "no
+        // checkpoint" and re-anchors.
+        let abs = cfg_dir.path().join("abs.ckpt");
+        assert_eq!(
+            super::resolve_checkpoint(abs.to_str().unwrap(), cfg_dir.path()),
+            abs
+        );
+
+        // RELATIVE with nothing anywhere: the CONFIG's directory, not the CWD.
+        assert_eq!(
+            super::resolve_checkpoint("rel.ckpt", cfg_dir.path()),
+            cfg_dir.path().join("rel.ckpt"),
+            "a relative path follows the config — resolving it against the process \
+             working directory is what made one config look in two places"
+        );
+
+        // RELATIVE with a file ALREADY at the CWD-relative location and none at the
+        // config one: the existing file wins, or upgrading strands it and the next
+        // run re-anchors past everything since.
+        std::fs::write(cwd_dir.path().join("legacy.ckpt"), b"{}").expect("seed legacy");
+        assert_eq!(
+            super::resolve_checkpoint("legacy.ckpt", cfg_dir.path()),
+            std::path::Path::new("legacy.ckpt"),
+            "an existing CWD-relative checkpoint is kept — `&&` becoming `||`, or the \
+             `!` disappearing, both break this compatibility arm"
+        );
+
+        // ...but once the config-relative one exists, it wins even though the CWD
+        // one still does — that is the pair the `&&` guards.
+        std::fs::write(cfg_dir.path().join("legacy.ckpt"), b"{}").expect("seed config-side");
+        assert_eq!(
+            super::resolve_checkpoint("legacy.ckpt", cfg_dir.path()),
+            cfg_dir.path().join("legacy.ckpt")
+        );
+    }
+
     use super::*;
     use crate::config::{DestinationConfig, DestinationType};
 

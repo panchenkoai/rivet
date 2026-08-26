@@ -696,9 +696,24 @@ pub(crate) fn error_names_its_own_cause(e: &anyhow::Error) -> bool {
     text.contains("16 MB BSON limit")
 }
 
+/// Does this driver error text name an OVERSIZED change event?
+///
+/// A named predicate rather than an inline `||`, per the rule that live-only glue
+/// may sequence and connect but must not decide: `diagnose_stream_error` takes a
+/// `mongodb::error::Error`, which no unit test can construct, so the decision inside
+/// it was ungradable — the `||` survived mutation to `&&` (which would require BOTH
+/// spellings in one message and so recognise nothing).
+///
+/// TWO spellings because the server uses both: the error CODE name
+/// `BSONObjectTooLarge` and the size complaint `BSONObj size: … is invalid`,
+/// measured on the mongo-rs stand.
+fn names_oversize_event(text: &str) -> bool {
+    text.contains("BSONObjectTooLarge") || text.contains("BSONObj size")
+}
+
 fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
     let text = e.to_string();
-    if text.contains("BSONObjectTooLarge") || text.contains("BSONObj size") {
+    if names_oversize_event(&text) {
         return anyhow::anyhow!(
             "mongodb cdc: a single change event exceeds MongoDB's 16 MB BSON limit — \
              the event carries the post-image, the pre-image and the envelope in ONE \
@@ -827,6 +842,55 @@ impl ChangeStream for MongoChangeStream {
 
 #[cfg(test)]
 mod tests {
+
+    /// The oversize predicate recognises EITHER spelling, and the capability string
+    /// tells the truth about the version it describes.
+    ///
+    /// Both were ungraded until the local mutation run: `||` survived becoming `&&`
+    /// (which recognises nothing, since one message never carries both spellings),
+    /// and `tier` survived being replaced by `""` and by `"xyzzy"` outright — nothing
+    /// asserted it said anything at all.
+    #[test]
+    fn the_oversize_predicate_and_the_capability_string_say_what_they_mean() {
+        // MEASURED wire text, both forms.
+        assert!(super::names_oversize_event(
+            "Executor error during getMore :: caused by :: BSONObj size: 18874897 is invalid"
+        ));
+        assert!(super::names_oversize_event(
+            "PlanExecutor error during aggregation :: BSONObjectTooLarge"
+        ));
+        assert!(
+            !super::names_oversize_event("not authorized on db to execute command"),
+            "an unrelated error must NOT be diagnosed as oversize — that would send \
+             an operator to shrink documents over a permissions problem"
+        );
+
+        let cap = |major: u32| super::MongoCdcCapability {
+            server_version: format!("{major}.0.0"),
+            major,
+            is_replica_set: true,
+        };
+        let six = cap(6);
+        let five = cap(5);
+        assert!(
+            six.tier().contains("6.0+") && six.tier().to_uppercase().contains("DELETE"),
+            "6.0+ must declare what actually rides — DELETE pre-images, not update \
+             ones, which the decode never consults: {}",
+            six.tier()
+        );
+        assert!(
+            five.tier().contains("UpdateLookup"),
+            "and below 6.0 it must say the post-images are current-state: {}",
+            five.tier()
+        );
+        assert_ne!(
+            six.tier(),
+            five.tier(),
+            "the two tiers must not render identically, or the declaration carries \
+             no information about the server it describes"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
