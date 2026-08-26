@@ -377,6 +377,7 @@ fn derived_capture_marker_set_is_pinned() {
     let expected: Vec<&str> = vec![
         "cli(",
         "cli_env(",
+        "cli_in_dir(",
         "drain_and_read(",
         "run(",
         "run_and_read(",

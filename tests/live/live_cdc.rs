@@ -7480,6 +7480,21 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
          Got:\n{said}",
         expected.display()
     );
+    // The anchor the warning DESCRIBES must be a real one: a change written after it
+    // has to arrive. A message about a position nothing resumes from grades nothing.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (5,50)"))
+        .expect("seed after the anchor");
+    rig.run_ok();
+    let after: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        after,
+        [5].into_iter().collect::<std::collections::BTreeSet<i64>>(),
+        "the run that emitted the warning must really have pinned an anchor — \
+         everything after it is captured, and nothing before"
+    );
     assert!(
         said.contains("CONFIG FILE's directory") && !said.contains("process working directory"),
         "the warning must explain the resolution that is in force. It said `resolved \
@@ -7646,6 +7661,22 @@ fn doctor_grades_the_checkpoint_the_run_opens_not_one_relative_to_the_shell() {
             .unwrap_or("<no CDC checkpoint check ran>")
             .to_string()
     };
+
+    // The delivered outcome, not just the file: a checkpoint doctor grades must be
+    // one a RESUME actually uses. Without this the anchor run could deliver nothing
+    // forever and both doctor halves would agree about an inert file.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (7,70)"))
+        .expect("seed after the anchor");
+    rig.run_ok();
+    let resumed: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        resumed,
+        [7].into_iter().collect::<std::collections::BTreeSet<i64>>(),
+        "the checkpoint under test must be a live resume position, not an inert file"
+    );
 
     let elsewhere = tempfile::tempdir().expect("a different working directory");
     let from_config = say(&rig.cli_in_dir(&["doctor"], rig.config_path().parent().unwrap()));
