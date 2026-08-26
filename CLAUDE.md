@@ -984,6 +984,48 @@ from the run's own metrics row. RED against the pre-fix order (`left: Some(0)`,
 the same mutant. When a new test and an old one disagree about a mutant, the
 disagreement is the finding: the old test's blind spot has a name and a boundary.
 
+## A claim inside a product message is a testable claim — run it
+
+Three rounds of the 2026-08 CDC hunt found nothing by reading code and three
+classes by taking `warn`/`bail` text literally and checking whether it was TRUE.
+Mutation testing is structurally blind here: a string that is merely untrue kills
+no mutant, and every reader's eye slides over prose that reads plausibly.
+
+1. **A hint drifts into a lie when the code under it changes.** MySQL's and
+   Mongo's re-anchor warnings still said a relative `cdc.checkpoint:` resolves
+   against the process working directory — true until round 9 moved it to the
+   config's directory. The one line someone reads while deciding whether to
+   re-snapshot sent them to a directory the file was never written to. Nothing
+   graded either message, which is exactly why it drifted.
+2. **A blanket error context puts the WRONG cause first.** Every engine's `open`
+   was wrapped in a setup hint (wal_level, binlog grants, the Agent), applied
+   unconditionally — so PG's anti-gap guard, which reports permanent DATA LOSS,
+   came out as `if this is a permissions/setup error: … wal_level=logical … : pg
+   cdc: slot 'x' is missing …`. The sentence that matters sat past a colon at the
+   end. Two call sites had already been hoisted OUT of the wrap one at a time for
+   this reason; `with_setup_hint` (`src/source/cdc/mod.rs`) covers the ones raised
+   inside `open`, keyed on rivet's own `<engine> cdc:` prefix. Grade BOTH
+   directions — a hint on everything is the bug and a hint on nothing is the bug
+   that replaces it.
+3. **A remediation can prescribe a LOSSY ORDER while the product does it right.**
+   Five sites told the operator to re-snapshot and THEN restart CDC from a fresh
+   checkpoint. `run_cdc_export` calls `ensure_anchor` BEFORE the snapshots, so the
+   snapshot overlaps the stream — duplicates, which at-least-once handles.
+   Followed literally, the hint leaves everything changed between the snapshot and
+   the new anchor in NEITHER, a gap as wide as the snapshot takes, prescribed to
+   someone who has already lost data once.
+
+Process rule: **treat every promise in a message as a test case, and probe it from
+the state that produces it.** `slot_created_warning` says "Set `cdc.checkpoint:` to
+turn this case into a hard error" — running that end to end (run, capture, drop the
+slot, re-run) confirmed the promise AND surfaced #2 in the error it produced on the
+way. A message that names a path must name the path rivet LOOKED AT (`config_dir
+.join("./x")` kept the dot, so every `rivet init` config rendered
+`/etc/rivet/./cdc/t.ckpt`); a message that names an order must name the product's
+own order; a message that names a cause must be re-checked whenever that cause is
+changed. If a `warn` is worth emitting at a level the default log shows, it is
+worth one assertion — and none of these had one.
+
 ## A coverage ledger must grade the CALL SITE, not the definition
 
 A matrix row saying `test` means "the gate runs this". The guard that protects
