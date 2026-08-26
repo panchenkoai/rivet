@@ -80,6 +80,56 @@ change is judged too disruptive: it is the only option under which a destination
 converges without every downstream consumer being told to change, and it puts
 rivet's representation where two of the four engines already are.
 
+## What the implementation actually needs — measured 2026-08-26
+
+The decision is (3), split into delete + insert. These measurements were taken
+before writing any of it, because they change the shape of the work.
+
+**The old key reaches the sink on both engines.** `rivet cdc` NDJSON for
+`UPDATE t SET id=9 WHERE id=1`:
+
+    postgres   update | before=[1]        | after=[9,'a']
+    mysql      update | before=[1,'a']    | after=[9,'a']
+
+PostgreSQL sends the key alone (REPLICA IDENTITY DEFAULT); MySQL sends the whole
+old row. A delete needs only the key, so both are sufficient. Nothing has to be
+added to the wire, the adapters or the checkpoints — the split is a SINK change.
+
+**The two engines need DIFFERENT detection, and this is the part that was not
+obvious.** Measured with an ordinary update and a PK update side by side:
+
+    postgres   ordinary  before=None      ← `before` appears ONLY on a PK change
+    postgres   pk        before=[1]
+    mysql      ordinary  before=[1,'a']   ← binlog always carries a before-image
+    mysql      pk        before=[1,'b']
+
+So on PostgreSQL the rule is simply "`before` is present". On MySQL that rule would
+split EVERY update, turning every value change into a delete+insert pair — the
+detection there must compare the KEY columns, and `TypeMapping` carries no
+primary-key flag. MySQL therefore needs PK metadata plumbed from
+`information_schema` into the schema resolution first; PostgreSQL does not.
+
+**Debezium's shape, measured rather than assumed** (`dev/cdc-oracle`, postgres,
+`key-update`):
+
+    debezium-only   delete   k=1   v=<null>
+    debezium-only   insert   k=9   v=a
+    rivet-only      update   k=9   v=a
+
+The delete carries the KEY ONLY — no field values — which is exactly what rivet
+has. Debezium emits the delete FIRST, and the order is load-bearing rather than
+cosmetic: if the new key collides with another row's key, applying insert before
+delete loses that row. The split must therefore emit `delete(before)` at the same
+`__pos` with the LOWER `__seq`.
+
+**Reachability is per-table, and one path needs no `UPDATE` at all.** A surrogate
+auto-increment or UUID key nobody touches never hits this. A natural key does —
+email, SKU, contract number, country code — and so does a composite key with a
+mutable part. And `ON UPDATE CASCADE` produces it in CHILD tables with nothing
+written against them; measured on the pg stand, updating only the parent:
+
+    csc_child   update | before=['AA',1] | after=['BB',1]
+
 ## Consequences of leaving this open
 
 The differential gate row (`cdc_differential`, wired 2026-08-25) EXCLUDES the
