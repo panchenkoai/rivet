@@ -597,12 +597,17 @@ services:
       # `pytz` is required by the duckdb Python adapter to materialise
       # TIMESTAMP WITH TIME ZONE values — without it, every `SELECT *` over
       # a Parquet with a tz-aware timestamp column raises ModuleNotFoundError.
+      # duckdb 1.5.0 is a FLOOR, not a preference: the community `mssql` and
+      # `mongo` extensions publish no build below it (measured — 404 for every
+      # version through 1.4.1, 200 from 1.5.0), and those two are what let the
+      # independent oracle ATTACH all four source engines in ONE session instead
+      # of only the two with core scanners.
       # `pyarrow` is the third independent Parquet reader used by tests
       # (alongside duckdb and clickhouse) — it is the reference Arrow
       # implementation, so it sees field metadata and statistics exactly
       # the way we wrote them.
       - "pip install --quiet --disable-pip-version-check \
-           duckdb==1.4.1 pytz==2024.1 pyarrow==18.1.0 && \
+           duckdb==1.5.0 pytz==2024.1 pyarrow==18.1.0 && \
          python -c 'import duckdb, pytz, pyarrow; print(\"duckdb\", duckdb.__version__, \"pyarrow\", pyarrow.__version__)' && \
          exec tail -f /dev/null"
     container_name: rivet-duckdb

@@ -131,9 +131,14 @@ fn stage_declared_for_duckdb(dir: &Path) -> String {
 /// VALUE. Pass explicit casts for any type whose two renderings differ, and keep the
 /// projections textually identical so a mismatch means the data differs.
 ///
-/// Only PostgreSQL and MySQL: DuckDB ships `postgres`/`mysql`/`sqlite` scanners and
-/// no SQL Server or MongoDB one. On those two engines the aggregate oracles remain
-/// the strongest available, and that is a limit to state, not to paper over.
+/// `attach_type` is a CORE scanner (`postgres`, `mysql`, `sqlite`). SQL Server and
+/// MongoDB are reachable too — this docstring claimed for a while that DuckDB "ships
+/// no SQL Server or MongoDB one", which was wrong: both exist as COMMUNITY
+/// extensions and simply publish no build below DuckDB 1.5.0 (measured: 404 for
+/// every version through 1.4.1, 200 from 1.5.0). The stand's pin moved to that
+/// floor. Reach them through [`OracleEngine`], which also carries the container-side
+/// hostnames and the fact that Mongo has no `ATTACH` at all — its extension exposes
+/// `mongo_scan(uri, db, collection)` instead.
 pub struct RowDiff {
     /// In the SOURCE and not at the destination — a loss.
     pub missing: Vec<String>,
