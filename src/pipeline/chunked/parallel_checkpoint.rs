@@ -57,7 +57,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         // for that to be sound — neither of which was checked, because this arm
         // skipped the whole match below (round-11 bughunt).
         //
-        // 1. The SCHEMA must not have drifted. `on_schema_drift: fail` was inert
+        // 1. The SCHEMA must not have drifted. Through `check_drift_only_FRESH`,
+        //    which opens its own short-lived connection — this runner has no
+        //    `Source` in scope here, and that seam exists precisely for it. An
+        //    earlier pass deferred this half claiming a `Source` would have to be
+        //    threaded in; the helper was already there, one line away. `on_schema_drift: fail` was inert
         //    here: DEMONSTRATED — a `DROP COLUMN` between the crash and the resume
         //    produced exit 0, `rows: 300`, and three parts under ONE
         //    `schema_fingerprint` whose schemas disagree. The identical drop without
@@ -79,6 +83,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         // which ordinals were exported, and those records now describe rows nobody
         // can identify. Re-deriving would produce a correct plan over an incorrect
         // ledger.
+        super::check_drift_only_fresh(plan, state, summary)?;
         if cp.dense {
             anyhow::bail!(
                 "export '{}': cannot resume a `chunk_dense` plan. Dense chunks are \
