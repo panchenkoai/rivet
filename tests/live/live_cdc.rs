@@ -7425,6 +7425,99 @@ fn a_relative_cdc_checkpoint_follows_the_config_not_the_working_directory() {
     );
 }
 
+/// A PREPARED XA branch must never be published by another transaction's commit.
+///
+/// Round 14, and the worst shape a CDC reader can have: not loss, FABRICATION.
+///
+/// MySQL binlogs an XA transaction's ROWS at `XA PREPARE`, and the outcome
+/// (`XA COMMIT` / `XA ROLLBACK`) as a much later Query event. rivet holds one
+/// transaction buffer per stream and drains ALL of it at a commit marker, so the
+/// prepared rows sat in that buffer until the next unrelated transaction's `Xid`
+/// swept them out — published as committed, stamped with that transaction's
+/// position, fused into its group.
+///
+/// MEASURED on mysql 8.0.46 before the fix: the source held `{2}` and rivet
+/// delivered `{1, 2}`, both at `binlog.000011:55090448` with `__seq` 0 and 1. Row 1
+/// was rolled back and never existed — and no later event retracts it, because a
+/// rollback of a prepared branch writes no row events at all. Every count, sum and
+/// null-profile check downstream agrees with itself.
+///
+/// The interleave is not exotic: `XA PREPARE` writes to the binlog immediately, so
+/// any other session committing before the branch resolves produces it. That is the
+/// normal case for an XA transaction manager, not a race.
+///
+/// Why the reader could not simply skip the string: on 5.7.7+ `XA PREPARE` arrives
+/// as a BINARY `XaPrepareLogEvent`, never as a QueryEvent — so
+/// `is_commit_statement`'s "deliberately NOT XA PREPARE" unit case grades an input
+/// this reader cannot receive. Correct logic, correct test, an input the product
+/// never produces.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn a_prepared_xa_branch_is_never_published_by_another_transactions_commit() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_xa").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl).dest_path(out.path().to_path_buf());
+    rig.run_ok(); // anchor
+
+    let xid = format!("x{}", std::process::id());
+    c.query_drop(format!(
+        "XA START '{xid}'; INSERT INTO {tbl} VALUES (1,100); XA END '{xid}'; \
+         XA PREPARE '{xid}'"
+    ))
+    .expect("prepare an XA branch");
+    // An ordinary transaction commits while the branch is prepared — the event that
+    // used to drain the prepared rows along with its own.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (2,200)"))
+        .expect("an unrelated commit");
+    c.query_drop(format!("XA ROLLBACK '{xid}'"))
+        .expect("roll the branch back");
+
+    let live: Vec<i64> = c
+        .query(format!("SELECT id FROM {tbl} ORDER BY id"))
+        .expect("read the source");
+    assert_eq!(
+        live,
+        vec![2],
+        "the fixture is inert: the source must hold ONLY the committed row, or there \
+         is no fabrication to detect"
+    );
+
+    // The raw invoke, so the DELIVERED set is graded before the exit status. A
+    // `run_expect_fail` here would panic on the status first, and the status is the
+    // weaker oracle: it cannot tell rivet's guard from an unrelated failure, and a
+    // regression that re-published row 1 would be reported as "expected to fail"
+    // rather than as the fabrication it is.
+    let o = rig.run_args(&[]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert!(
+        !got.contains(&1),
+        "id=1 was ROLLED BACK and must never reach the destination; delivered {got:?}. \
+         Before the fix this held {{1, 2}} at `status: success` — a row that never \
+         existed, which no later change event can retract."
+    );
+    assert!(
+        !o.status.success() && said.contains("XA PREPARE") && said.contains(&tbl),
+        "the run must refuse, and NAME the branch and the table — publishing nothing \
+         while exiting 0 would advance the checkpoint past the branch and turn this \
+         into silent loss. Got:\n{said}"
+    );
+}
+
 /// `rivet doctor` must grade the checkpoint the RUN will open, not one named
 /// relative to whatever shell it was started from.
 ///

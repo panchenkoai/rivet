@@ -905,6 +905,37 @@ impl MysqlChangeStream {
                 let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
                 anyhow::bail!(truncate_refusal_message(&sc, &tb));
             }
+            // `XA PREPARE` arrives as a BINARY `XaPrepareLogEvent` on 5.7.7+, never
+            // as a QueryEvent — so `is_commit_statement`'s "deliberately not XA
+            // PREPARE" arm grades a string this reader cannot receive, and the
+            // prepared rows fell through `_ => {}` and stayed in `self.tx`. The next
+            // UNRELATED transaction's Xid then drained them: `close_transaction_at`
+            // empties the whole buffer, one buffer per stream.
+            //
+            // MEASURED on mysql 8.0.46 — `XA START/INSERT(1)/XA END/XA PREPARE`, then
+            // an ordinary `INSERT(2)` committing, then `XA ROLLBACK`. The source held
+            // {2}; rivet delivered {1, 2}, both stamped `binlog.000011:55090448` (the
+            // SECOND transaction's Xid) at `__seq` 0 and 1 — the rolled-back row
+            // published as committed, and two transactions fused into one group.
+            //
+            // Table-addressed for the reason #281 measured: the dump is server-wide,
+            // so an XA branch on a table nobody captures must not be an outage for
+            // exports that never read it.
+            Some(EventData::XaPrepareLogEvent(_)) => {
+                if let Some(ev) = self.tx.iter().find(|ev| {
+                    undecodable_event_is_ours(
+                        Some((&ev.schema, &ev.table)),
+                        &self.configured_tables,
+                    )
+                }) {
+                    anyhow::bail!(xa_prepare_refusal_message(&ev.schema, &ev.table));
+                }
+                // Nothing of ours in the branch: drop it rather than leave it for the
+                // next commit to stamp and fuse. The sink would route these rows away,
+                // but only after they had already corrupted that transaction's framing.
+                self.tx.clear();
+                self.tx_bytes = 0;
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -1325,6 +1356,45 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          not, permanently, because those rows left the source without events and no \
          later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
          re-establish the baseline, then resume CDC from a fresh checkpoint."
+    )
+}
+
+/// A prepared XA branch this reader cannot frame — and must not let another
+/// transaction publish.
+///
+/// This is a HARD STOP, not a deferral, and the message says so. The TRUNCATE
+/// refusal beside it can promise recovery because re-running re-reads the same
+/// rows; this one cannot. The `XA_prepare_log_event` stays in the binlog forever,
+/// so every re-run from the same checkpoint hits it again — MEASURED: run, refuse,
+/// re-run, refuse. The only way past is a checkpoint on the far side of the branch,
+/// which skips whatever else happened in between, which is why the remedy is the
+/// same re-snapshot TRUNCATE asks for.
+///
+/// It also refuses a branch that goes on to COMMIT, because at `XA PREPARE` there is
+/// nothing to distinguish the two — the outcome is a Query event that has not been
+/// read yet. Over-refusing is the safe direction: the alternative shipped a
+/// rolled-back row as committed.
+pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    format!(
+        "mysql cdc: `{qualified}` was written inside an XA transaction that reached \
+         `XA PREPARE`, and this reader cannot frame a prepared branch. Prepared is not \
+         committed — the branch may still `XA ROLLBACK` — and rivet holds one \
+         transaction buffer per stream, so the NEXT transaction's commit would drain \
+         these rows too and publish them under ITS position: rows that never existed, \
+         stamped with someone else's commit. Fabricating a row is worse than failing, \
+         so the run stops with the checkpoint unmoved.\n\n\
+         This does NOT clear by re-running: the prepare stays in the binlog and every \
+         run from this checkpoint reaches it again. To move past it, re-snapshot the \
+         table (`mode: full`) to re-establish the baseline and resume CDC from a fresh \
+         checkpoint — re-anchoring alone would skip every change since. To avoid it, \
+         do not drive captured tables through an XA transaction manager until rivet \
+         frames XA branches by their xid; those tables can be exported with `mode: \
+         full` meanwhile."
     )
 }
 
@@ -1824,6 +1894,11 @@ mod tests {
         for no in [
             "BEGIN",
             "XA START 'x1'",
+            // KEEP, but it grades a string this reader does not receive: on 5.7.7+
+            // the prepare is a BINARY `XaPrepareLogEvent`, so the arm that actually
+            // stops it is in `fill`, proven live by
+            // `a_prepared_xa_branch_is_never_published_by_another_transactions_commit`.
+            // Left here for the 5.7.0-5.7.6 spelling and as a second lock.
             "XA PREPARE 'x1'",
             "XA ROLLBACK 'x1'",
             "ROLLBACK",
