@@ -1391,6 +1391,20 @@ struct ParsedColumn {
     unrepresentable: bool,
 }
 
+/// Is this `test_decoding` cell PostgreSQL's `infinity` sentinel on a temporal type?
+///
+/// A named predicate because six mutants lived inside it while it was an inline
+/// expression — every operator in `(timestamp || date) && (infinity || -infinity)`
+/// could be flipped without a test noticing. The live test that guards the class
+/// carries ONE row shape, and one shape cannot distinguish four boolean arms.
+///
+/// The TYPE is the disambiguator, not the quoting: `test_decoding` renders this
+/// sentinel WITH quotes (`expires[timestamp with time zone]:'infinity'`, measured),
+/// and no genuine text value can sit on a timestamp or date column.
+fn is_unrepresentable_temporal(typ: &str, val: &str) -> bool {
+    (typ.starts_with("timestamp") || typ == "date") && (val == "infinity" || val == "-infinity")
+}
+
 fn parse_columns(s: &str) -> Vec<ParsedColumn> {
     let mut out = Vec::new();
     let mut rest = s.trim_start();
@@ -1422,8 +1436,7 @@ fn parse_columns(s: &str) -> Vec<ParsedColumn> {
         // collide — the TYPE is the disambiguator here, where for TOAST it was the
         // quoting. Getting that backwards made the first cut of this guard silently
         // inert; the run still reported `status: success, rows: 2`.
-        let unrepresentable = (typ.starts_with("timestamp") || *typ == *"date")
-            && (val == "infinity" || val == "-infinity");
+        let unrepresentable = is_unrepresentable_temporal(typ, &val);
         out.push(ParsedColumn {
             name,
             value: map_pg_value(typ, &val, quoted),
@@ -1875,6 +1888,56 @@ fn parse_pg_timestamp(val: &str) -> RivetValue {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every arm of the infinity predicate, and the doubled-quote path of both
+    /// scanners — eleven mutants that the parsers' existing tests could not reach.
+    ///
+    /// The predicate had SIX: each of `(timestamp || date) && (infinity ||
+    /// -infinity)` could be flipped and the live test still passed, because one row
+    /// shape cannot distinguish four boolean arms. The scanners had five, all in the
+    /// `i += 2` that skips an ESCAPED quote (`''`) — no fixture contained one, so
+    /// the cursor arithmetic was never exercised. (Their siblings show up as
+    /// TIMEOUTs rather than survivors: a mutated cursor stops advancing and the test
+    /// hangs, which is detection, just not by assertion.)
+    #[test]
+    fn the_infinity_predicate_and_the_escaped_quote_path_are_graded() {
+        use super::is_unrepresentable_temporal as inf;
+
+        // Both temporal types, both spellings — the four TRUE corners.
+        assert!(inf("timestamp with time zone", "infinity"));
+        assert!(inf("timestamp without time zone", "-infinity"));
+        assert!(inf("date", "infinity"));
+        assert!(inf("date", "-infinity"));
+
+        // A temporal type with an ordinary value: `&&` becoming `||` would call
+        // every timestamp unrepresentable and refuse every capture.
+        assert!(!inf("timestamp with time zone", "2026-01-02 03:04:05+00"));
+        // The sentinel spelling on a NON-temporal type: a text column may legally
+        // hold the word, and refusing it would be a false loss report.
+        assert!(!inf("text", "infinity"));
+        assert!(!inf("integer", "-infinity"));
+        // `date` must not be matched by prefix — `datemark` is a different type, and
+        // `==` becoming `!=` on that arm inverts exactly this.
+        assert!(!inf("datemark", "infinity"));
+
+        // The scanners' escaped-quote path. A doubled quote inside a literal is ONE
+        // escaped character, not the end of the literal — so a TRUNCATE marker that
+        // follows it must still be found, and a `,` inside it must not be read as a
+        // separator.
+        let line = "table public.\"o''brien\": TRUNCATE: (no-flags)";
+        assert!(
+            super::find_outside_quotes(line, ": TRUNCATE:").is_some(),
+            "a doubled quote is an escape, not a terminator — mutating the `i += 2` \
+             that skips it desynchronises the scanner and the marker goes unseen, \
+             which is how one apostrophe blinded the whole TRUNCATE guard before"
+        );
+        let hits = super::truncate_targets("table public.t: TRUNCATE: (no-flags)");
+        assert_eq!(
+            hits,
+            vec![("public".to_string(), "t".to_string())],
+            "and the ordinary form must still resolve"
+        );
+    }
 
     use super::*;
 
