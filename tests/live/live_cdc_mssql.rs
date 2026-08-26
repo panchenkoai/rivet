@@ -2202,6 +2202,31 @@ fn mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema() {
          directory held the decoy's row (id 900) — data that never existed in the \
          relation being captured, written into its prefix under a green run"
     );
+
+    // The other half of the LABEL/READ split, and the half round-5 caught: the leg
+    // READS the catalog's relation but must RECORD the configured one. Both legs of
+    // one export write into one prefix, and `ensure_single_export` refuses a prefix
+    // whose manifests name two sources — so a leg recording `dbo.<table>` against a
+    // drain recording `<table>` breaks `rivet load` on artifacts that are already
+    // durable, with a message blaming the operator's prefix layout.
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(snap.join("manifest.json")).expect("read the leg's manifest"),
+    )
+    .expect("parse the leg's manifest");
+    assert_eq!(
+        doc["source"]["table"].as_str(),
+        Some(table.as_str()),
+        "the leg must record the CONFIGURED name, which is what the drain records \
+         (`schema: None, table: <configured>`). Got: {}",
+        doc["source"]
+    );
+    assert_eq!(
+        doc["source"]["schema"],
+        serde_json::Value::Null,
+        "and no schema, for the same reason — the drain writes none, and an identity \
+         the two legs spell differently is a refused load: {}",
+        doc["source"]
+    );
 }
 
 /// A capture instance the catalog does not know must be refused BEFORE the
@@ -2353,4 +2378,79 @@ fn mssql_cdc_a_completed_snapshot_is_not_redone_after_the_destination_is_wiped()
          destination and a full re-read plus a duplicated baseline on every \
          scheduled cycle"
     );
+}
+
+/// `rivet check --type-report` must still type the export when the cdc catalog is
+/// unreadable — that is the moment an operator runs it.
+///
+/// Round-5 bughunt, a regression from round 4's own fix. Teaching preflight to
+/// resolve the capture instance made the lookup FATAL: on a database where CDC has
+/// never been enabled (`Invalid object name 'cdc.change_tables'`, error 208) or a
+/// login without SELECT on the cdc schema, the error escaped `collect_reports`,
+/// `preflight::check` swallowed it into one `log::warn!`, and the command printed
+/// its verdict, `Looks good.` and exit 0 — with no column table at all. MEASURED
+/// RED/GREEN on a fresh CDC-less database.
+///
+/// A resolution that cannot run must degrade to the configured relation — the same
+/// relation every non-CDC export reads — and say so.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_check_still_types_the_export_when_the_cdc_catalog_is_unreadable() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_chk_nocdc").to_lowercase();
+    // A DATABASE where CDC was never enabled, so `cdc.change_tables` does not exist
+    // at all (error 208) — not merely a table with no capture instance. The
+    // distinction is the whole test: a missing ROW is `Ok(None)` and always
+    // degraded gracefully; a missing CATALOG is the `Err` arm, and that is the one
+    // that made the column table vanish. Measured: with the fixture on the shared
+    // `rivet` database (CDC enabled by every other test here) the mutant sails
+    // through, because the query succeeds and simply returns nothing.
+    let db = format!("nocdc_{table}");
+    mssql_cdc_exec(&format!(
+        "IF DB_ID(N'{db}') IS NOT NULL DROP DATABASE [{db}]; CREATE DATABASE [{db}];"
+    ));
+    let _db_guard = NoCdcDb(db.clone());
+    mssql_cdc_exec(&format!(
+        "USE [{db}]; CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT); \
+         INSERT INTO dbo.{table} VALUES (1, 10);"
+    ));
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = mssql_cdc_rig(&table, &format!("dbo_{table}"), &ckpt, &out)
+        .source_url(&MSSQL_CDC_URL.replace("/rivet", &format!("/{db}")));
+    let checked = run_rivet(&[
+        "check",
+        "--config",
+        rig.config_path().to_str().unwrap(),
+        "--type-report",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(
+        said.contains("amount"),
+        "the column report must still be produced — an unreadable cdc catalog is \
+         the NORMAL state before `sp_cdc_enable_table` runs, and a check that \
+         silently types nothing while printing a verdict is worse than one that \
+         refuses. Got:\n{said}"
+    );
+}
+
+/// Drops the CDC-less database the check test stands up.
+struct NoCdcDb(String);
+impl Drop for NoCdcDb {
+    fn drop(&mut self) {
+        let db = self.0.clone();
+        let _ = std::panic::catch_unwind(move || {
+            mssql_cdc_exec(&format!(
+                "IF DB_ID(N'{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER \
+                 WITH ROLLBACK IMMEDIATE; DROP DATABASE [{db}]; END"
+            ));
+        });
+    }
 }

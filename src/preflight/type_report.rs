@@ -180,13 +180,36 @@ pub fn collect_reports(
     if config.source.source_type == SourceType::Mssql
         && let Some(cdc) = &export.cdc
         && let Some(ci) = &cdc.capture_instance
-        && let Some((schema, table)) =
-            crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
     {
-        for (unit, query) in units.iter_mut() {
-            if unit.is_none() {
-                *query = format!("SELECT * FROM {schema}.{table}");
+        // ADVISORY, never fatal. `rivet check --type-report` is exactly what an
+        // operator runs BEFORE enabling CDC, and propagating this made the whole
+        // column table vanish on a database with no `cdc` schema (error 208) or a
+        // login without SELECT on it — `preflight::check` swallows the error into
+        // one `log::warn!`, then prints the verdict, "Looks good." and exit 0 with
+        // nothing typed at all (round-5, RED/GREEN on a CDC-less database). A
+        // resolution that cannot run must degrade to the configured relation, which
+        // is what every non-CDC export uses anyway, and SAY so.
+        match crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls) {
+            Ok(Some((schema, table))) => {
+                for (unit, query) in units.iter_mut() {
+                    if unit.is_none() {
+                        *query = format!("SELECT * FROM {schema}.{table}");
+                    }
+                }
             }
+            Ok(None) => log::warn!(
+                "mssql: capture instance '{ci}' is not in cdc.change_tables — typing \
+                 the relation `{}` names instead. If CDC is not enabled yet this is \
+                 expected; once it is, re-run so the report follows the catalog.",
+                export.table.as_deref().unwrap_or("the export")
+            ),
+            Err(e) => log::warn!(
+                "mssql: could not resolve capture instance '{ci}' from cdc.change_tables, \
+                 typing the configured relation instead — the report describes what \
+                 `{}` resolves to in the connection's default schema, which is the \
+                 same relation every non-CDC export would read: {e:#}",
+                export.table.as_deref().unwrap_or("the export")
+            ),
         }
     }
 

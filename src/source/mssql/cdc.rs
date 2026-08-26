@@ -463,12 +463,55 @@ pub(crate) fn source_object_of_capture_instance(
                  instance '{capture_instance}': {e}"
         )
     })?;
-    // `None` now means ONE thing: the catalog has no such capture instance.
-    Ok(row.and_then(|row| {
+    // A FOURTH outcome the first cut folded back into "no such instance", making
+    // that comment a lie four lines after it was written: the row EXISTS while
+    // `OBJECT_SCHEMA_NAME(source_object_id)` is NULL, because the source table was
+    // dropped and SQL Server has not yet cleaned the capture instance up (MEASURED
+    // on the stand — the `cdc.change_tables` row outlives the table). Calling that
+    // "the catalog does not know this instance" sent the operator to
+    // `sp_cdc_enable_table`, which from THAT state fails 22926 "capture instance
+    // already exists" — a remediation that cannot recover from the degraded state,
+    // the exact class this repo has a rule about. The recovery is to disable first.
+    let named: Option<(Option<String>, Option<String>)> = row.map(|row| {
         let s: Option<&str> = row.get(0);
         let t: Option<&str> = row.get(1);
-        Some((s?.to_string(), t?.to_string()))
-    }))
+        (s.map(str::to_string), t.map(str::to_string))
+    });
+    classify_source_object(capture_instance, named)
+}
+
+/// What a `cdc.change_tables` lookup MEANS — the decision, pulled out of the I/O.
+///
+/// Live-only glue may sequence and connect; it must not decide. The reason this is
+/// a function is that its third case cannot be reproduced live on demand: SQL Server
+/// cleans an orphaned capture instance up within a second or two of the drop, so a
+/// live test racing that window documents a flake rather than the contract. It is
+/// nonetheless REAL and was measured on the stand — the `cdc.change_tables` row
+/// outlives its source table, and `OBJECT_SCHEMA_NAME(source_object_id)` returns
+/// NULL while the row is still there.
+///
+/// Folding that case into "no such capture instance" — which the first cut did, four
+/// lines under a comment asserting `None` now meant one thing — sent the operator to
+/// `sp_cdc_enable_table`, which from THAT state fails 22926 "capture instance already
+/// exists". A remediation must recover from the ALREADY-DEGRADED state.
+fn classify_source_object(
+    capture_instance: &str,
+    named: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<(String, String)>> {
+    match named {
+        // The catalog has no such capture instance.
+        None => Ok(None),
+        Some((Some(s), Some(t))) => Ok(Some((s, t))),
+        // The row is there and the source object is not.
+        Some(_) => anyhow::bail!(
+            "sqlserver cdc: capture instance '{capture_instance}' exists in \
+             cdc.change_tables but its source object is gone — the table was dropped \
+             without disabling capture first, so the change table is orphaned. Run \
+             `EXEC sys.sp_cdc_disable_table` for it before re-enabling; \
+             `sp_cdc_enable_table` on its own fails here with 22926 (capture instance \
+             already exists), so enabling is not the recovery from this state."
+        ),
+    }
 }
 
 pub(crate) struct MssqlChangeStream {
@@ -1069,6 +1112,45 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+    /// The three outcomes of a `cdc.change_tables` lookup, kept apart.
+    ///
+    /// The middle one is why this is a unit test: an orphaned capture instance (row
+    /// present, source object dropped) is cleaned up by SQL Server within a second or
+    /// two, so a live test racing that window would document a flake. The state is
+    /// real and was measured on the stand; the DECISION about it belongs here, where
+    /// a mutant can grade it.
+    #[test]
+    fn a_lookup_tells_a_missing_instance_from_an_orphaned_one() {
+        assert_eq!(
+            super::classify_source_object("dbo_orders", None).expect("no row is not an error"),
+            None,
+            "no row means the catalog does not know this instance — the caller then \
+             says so and points at sp_cdc_enable_table, which is the right repair \
+             for THAT state"
+        );
+        assert_eq!(
+            super::classify_source_object(
+                "dbo_orders",
+                Some((Some("dbo".into()), Some("orders".into()))),
+            )
+            .expect("a complete row resolves"),
+            Some(("dbo".to_string(), "orders".to_string()))
+        );
+        let err = super::classify_source_object("dbo_orders", Some((None, None)))
+            .expect_err("a row whose source object is gone is neither a resolution nor an absence")
+            .to_string();
+        assert!(
+            err.contains("sp_cdc_disable_table"),
+            "the remediation must work from the DEGRADED state — sp_cdc_enable_table \
+             fails 22926 once the instance exists, so telling the operator to enable \
+             is telling them to run a command that cannot succeed: {err}"
+        );
+        assert!(
+            !err.contains("does not know"),
+            "and it must not claim the instance is unknown when the row is right \
+             there — that is the wrong repair for the state they are in: {err}"
+        );
+    }
 
     fn ckpt(j: serde_json::Value) -> crate::source::cdc::Position {
         crate::source::cdc::Position(j)
