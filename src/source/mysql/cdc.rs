@@ -799,17 +799,56 @@ impl MysqlChangeStream {
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {
                     let (before, after) = row?;
+                    let before = before.map(render_row);
+                    let after = after.map(render_row);
+                    // A cell with no faithful representation is a DEFERRED refusal,
+                    // exactly like PostgreSQL's unrecoverable unchanged-TOAST datum:
+                    // the binlog dump is server-wide, so bailing here would poison
+                    // capture of unrelated tables that merely share the stream. The
+                    // sink raises it only when the event routes to a captured table.
+                    let undecodable: Vec<usize> = before
+                        .iter()
+                        .chain(after.iter())
+                        .flat_map(|(_, bad)| bad.iter().copied())
+                        .collect();
+                    let poison = (!undecodable.is_empty()).then(|| {
+                        let cols: Vec<String> = undecodable
+                            .iter()
+                            .map(|i| {
+                                image_names
+                                    .as_ref()
+                                    .and_then(|n| n.get(*i))
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("column {i}"))
+                            })
+                            .collect();
+                        format!(
+                            "mysql cdc: {schema}.{table}: column(s) [{}] hold a JSON \
+                             document with an OPAQUE leaf — a DECIMAL, DATE, TIME or \
+                             DATETIME that MySQL materialised server-side and wrote to \
+                             the binlog as a type tag plus raw bytes, not as JSON text. \
+                             rivet cannot render those bytes the way the server does, \
+                             and refuses rather than writing NULL (which discards the \
+                             whole document while every count agrees) or the crate's \
+                             `base64:type<N>:…` placeholder (a marker where a number \
+                             belongs). A `mode: full` export of this table renders it \
+                             correctly — the server does the rendering there — so \
+                             snapshot the column, or store it as a JSON string in the \
+                             source so the binlog carries text.",
+                            cols.join(", ")
+                        )
+                    });
                     let ev = ChangeEvent {
                         op,
                         schema: schema.clone(),
                         table: table.clone(),
-                        before: before.map(render_row),
-                        after: after.map(render_row),
+                        before: before.map(|(v, _)| v),
+                        after: after.map(|(v, _)| v),
                         position: position.clone(),
                         committed: false,
                         image_names: image_names.clone(),
                         seq: 0, // stamped by TxnSeq as the stream is consumed
-                        poison: None,
+                        poison,
                     };
                     self.tx_bytes = self.tx_bytes.saturating_add(ev.estimated_bytes());
                     self.tx.push(ev);
@@ -1316,23 +1355,57 @@ pub(crate) fn binlog_file_ordinal(name: &str) -> Option<u64> {
 
 /// Decode a binlog row's cells to typed [`RivetValue`]s (structural — no string
 /// reparse of temporals).
-fn render_row(r: mysql::binlog::row::BinlogRow) -> Vec<RivetValue> {
-    r.unwrap().iter().map(binlog_value_to_rivet).collect()
+/// Returns the row's values plus the INDICES of cells that could not be decoded —
+/// a cell that has no faithful representation, never one that is genuinely absent.
+/// The caller turns those indices into a deferred poison naming the columns.
+fn render_row(r: mysql::binlog::row::BinlogRow) -> (Vec<RivetValue>, Vec<usize>) {
+    let mut undecodable = Vec::new();
+    let vals = r
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, bv)| match binlog_value_to_rivet(bv) {
+            Some(v) => v,
+            None => {
+                undecodable.push(i);
+                RivetValue::Null
+            }
+        })
+        .collect();
+    (vals, undecodable)
 }
 
-fn binlog_value_to_rivet(bv: &BinlogValue) -> RivetValue {
+/// `None` ⇒ this cell has no faithful representation — the caller must refuse, not
+/// write the placeholder NULL this returns alongside it.
+fn binlog_value_to_rivet(bv: &BinlogValue) -> Option<RivetValue> {
     match bv {
-        BinlogValue::Value(v) => RivetValue::from_mysql(v),
+        BinlogValue::Value(v) => Some(RivetValue::from_mysql(v)),
         // A JSON column arrives as MySQL's internal JSONB binary — convert it to
         // JSON text in the SAME rendering the server itself produces (", " and
         // ": " separators), so CDC and batch outputs of one value are
         // byte-identical; compact serde output would differ only in whitespace.
+        // A JSONB tree MySQL materialised server-side carries OPAQUE leaves — a
+        // DECIMAL, DATE, TIME or DATETIME stored with a type tag and raw bytes rather
+        // than as JSON text. `serde_json::Value::try_from` errors on the first one and
+        // the object/array arms propagate it, so ONE opaque leaf discarded the WHOLE
+        // document. Measured: `JSON_OBJECT('amt', CAST(1.50 AS DECIMAL(10,2)), 'sku',
+        // 'A1')` and `JSON_OBJECT('created', CAST('2024-01-02' AS DATE))` both came
+        // back `doc: null` under `status: success`, while the plain text literal
+        // beside them was fine — and a `mode: full` export of the SAME table wrote all
+        // three correctly. So a snapshot-plus-CDC pipeline shows the column populated
+        // by the snapshot leg and NULL for every change row that touches it.
+        //
+        // Nulling is not an option and neither is the crate's own fallback, which
+        // renders an opaque leaf as `base64:type<N>:<bytes>` — writing a marker where
+        // a number belongs is the same class as the `unchanged-toast-datum` refusal on
+        // PostgreSQL. rivet cannot render these bytes the way MySQL does, so it says
+        // so and refuses this cell; the caller defers the refusal to routing.
         BinlogValue::Jsonb(j) => match serde_json::Value::try_from(j.clone()) {
-            Ok(json) => RivetValue::Bytes(mysql_style_json(&json).into_bytes()),
-            Err(_) => RivetValue::Null,
+            Ok(json) => Some(RivetValue::Bytes(mysql_style_json(&json).into_bytes())),
+            Err(_) => None,
         },
         // JSONB partial-update diffs (rare) — carry the debug bytes as text.
-        other => RivetValue::Bytes(format!("{other:?}").into_bytes()),
+        other => Some(RivetValue::Bytes(format!("{other:?}").into_bytes())),
     }
 }
 

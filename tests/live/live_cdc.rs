@@ -7464,3 +7464,78 @@ fn an_existing_working_directory_checkpoint_is_not_stranded_by_the_new_resolutio
          which is the loss this whole change removes"
     );
 }
+
+/// One opaque leaf must not discard the whole JSON document — and must not be
+/// written as a placeholder either.
+///
+/// Round-9 bughunt. A JSON tree MySQL materialises server-side carries OPAQUE
+/// leaves: a DECIMAL, DATE, TIME or DATETIME written to the binlog as a type tag
+/// plus raw bytes rather than as JSON text. `serde_json::Value::try_from` errors on
+/// the first one and the object/array arms propagate it, so ONE such leaf nulled
+/// the ENTIRE document. MEASURED before the fix: `JSON_OBJECT('amt', CAST(1.50 AS
+/// DECIMAL(10,2)), 'sku','A1')` and `JSON_OBJECT('created', CAST('2024-01-02' AS
+/// DATE))` both came back `doc: null` under `status: success, rows: 3`, while the
+/// plain text literal beside them was correct — and a `mode: full` export of the
+/// SAME table wrote all three. A snapshot-plus-CDC pipeline therefore shows the
+/// column populated by the snapshot leg and NULL for every change row touching it.
+///
+/// The refusal is DEFERRED, and the second half of this test is the reason: the
+/// binlog dump is server-wide, so an opaque leaf in a table nobody captures must
+/// not wedge the run.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn a_json_opaque_leaf_is_refused_loudly_and_only_for_the_captured_table() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_jsop").to_lowercase();
+    let bystander = format!("{tbl}_other");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, doc JSON); \
+         DROP TABLE IF EXISTS {bystander}; \
+         CREATE TABLE {bystander} (id BIGINT PRIMARY KEY, doc JSON)"
+    ))
+    .expect("create tables");
+    let _t = MysqlCdcTable(tbl.clone());
+    let _b = MysqlCdcTable(bystander.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl).dest_path(out.path().to_path_buf());
+    rig.run_ok(); // anchor
+
+    // The bystander's opaque leaf must be ignored, and the captured table's plain
+    // document must arrive — proving the run is not wedged by traffic it does not
+    // capture.
+    c.query_drop(format!(
+        "INSERT INTO {bystander} VALUES (1, JSON_OBJECT('amt', CAST(1.50 AS DECIMAL(10,2)))); \
+         INSERT INTO {tbl} VALUES (1, '{{\"sku\": \"A1\"}}')"
+    ))
+    .expect("seed");
+    rig.run_ok();
+    let delivered: usize = read_all_parts(out.path())
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        delivered, 1,
+        "an opaque leaf in an UNCAPTURED table must not affect this run — the binlog \
+         dump is server-wide, so a refusal there would wedge capture of every table \
+         that merely shares the stream"
+    );
+
+    // Now the captured table itself.
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (2, JSON_OBJECT('amt', CAST(9.99 AS DECIMAL(10,2))))"
+    ))
+    .expect("seed opaque");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("doc"),
+        "the refusal must name the COLUMN — an operator cannot act on 'some JSON \
+         somewhere'. Got:\n{said}"
+    );
+    assert!(
+        said.contains("mode: full") || said.to_lowercase().contains("snapshot"),
+        "and hand over what actually works: the server renders this document \
+         correctly for a batch read, so snapshotting the column is the way out. \
+         Got:\n{said}"
+    );
+}
