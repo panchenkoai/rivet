@@ -434,8 +434,9 @@ fn mysql_ckpt_verdict(export: &str, ckpt: MysqlCkpt, logs: &[(String, u64)]) -> 
                          next run fails with ERROR 1236"
                     )),
                     Some(
-                        "re-snapshot the table (mode: full) and restart CDC from a fresh \
-                         checkpoint; size binlog retention above your CDC cadence"
+                        "restart CDC from a fresh checkpoint FIRST, then re-snapshot \
+                         (mode: full) — snapshotting first leaves the changes in between \
+                         in neither; size binlog retention above your CDC cadence"
                             .into(),
                     ),
                 );
@@ -616,7 +617,8 @@ fn mssql_verdicts(
                                  cleanup job removed changes past it; the next run fails loudly"
                             )),
                             Some(
-                                "re-snapshot (mode: full) and restart CDC from a fresh checkpoint"
+                                "restart CDC from a fresh checkpoint, THEN re-snapshot (mode: full) — \
+                                 snapshotting first leaves the changes in between in neither"
                                     .into(),
                             ),
                         ));

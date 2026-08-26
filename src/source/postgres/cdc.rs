@@ -678,8 +678,10 @@ impl PgChangeStream {
                 anyhow::bail!(
                     "pg cdc: slot '{slot}' is missing but a resume checkpoint exists — the slot \
                      was dropped or invalidated, and the changes since then are no longer in the \
-                     log. Re-snapshot the table (mode: full) and restart CDC from a fresh \
-                     checkpoint (delete the checkpoint file to accept a new slot)."
+                     log. Recover in rivet's OWN order: delete the checkpoint file so the \
+                     next run pins a fresh slot at the current WAL position, THEN re-snapshot \
+                     the table (mode: full). Snapshotting first leaves everything changed \
+                     between the snapshot and the new slot in neither."
                 );
             }
             // Creating the slot anchors capture at the CURRENT WAL position:

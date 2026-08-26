@@ -1354,8 +1354,11 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          change. Skipping it would leave every row the truncate removed sitting in the \
          destination with no DELETE to retract it — the source empty, the destination \
          not, permanently, because those rows left the source without events and no \
-         later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
-         re-establish the baseline, then resume CDC from a fresh checkpoint."
+         later capture can reconcile them. Recover in rivet's OWN order: re-anchor \
+         FIRST (delete the checkpoint so the next run pins a fresh one), THEN \
+         re-snapshot the table (`mode: full`). Snapshotting first leaves everything \
+         changed between the snapshot and the new anchor in neither — a silent gap \
+         as wide as the snapshot takes."
     )
 }
 
@@ -1389,9 +1392,11 @@ pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
          stamped with someone else's commit. Fabricating a row is worse than failing, \
          so the run stops with the checkpoint unmoved.\n\n\
          This does NOT clear by re-running: the prepare stays in the binlog and every \
-         run from this checkpoint reaches it again. To move past it, re-snapshot the \
-         table (`mode: full`) to re-establish the baseline and resume CDC from a fresh \
-         checkpoint — re-anchoring alone would skip every change since. To avoid it, \
+         run from this checkpoint reaches it again. To move past it, recover in \
+         rivet's OWN order — re-anchor FIRST (delete the checkpoint so the next run \
+         pins a fresh one), THEN re-snapshot the table (`mode: full`). Snapshotting \
+         first leaves everything changed between the snapshot and the new anchor in \
+         neither, and re-anchoring alone skips every change since the old position. To avoid it, \
          do not drive captured tables through an XA transaction manager until rivet \
          frames XA branches by their xid; those tables can be exported with `mode: \
          full` meanwhile."

@@ -289,7 +289,7 @@ fn fill_sql(p: Poll<'_>) -> String {
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
             THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
-— re-snapshot the table (mode: full) and restart CDC from a fresh checkpoint.', 1; \
+— restart CDC from a fresh checkpoint FIRST, then re-snapshot the table (mode: full): snapshotting first leaves the changes in between in neither.', 1; \
          DECLARE @to binary(10) = NULL; \
          IF @from IS NOT NULL AND @max IS NOT NULL AND @from <= @max \
             SELECT @to = MAX(s) FROM (SELECT TOP ({batch}) __$start_lsn AS s \
