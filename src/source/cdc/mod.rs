@@ -1061,6 +1061,34 @@ impl CdcSchemaResolver {
         let mut mappings = self
             .src
             .type_mappings(&format!("SELECT * FROM {table}"), overrides)?;
+        // A source column in the CDC meta namespace collides with the columns the
+        // sink prepends, and the collision is silent in the direction that matters.
+        // The sink puts `__op`/`__pos`/`__seq` at batch indices 0-2, and
+        // `row_hash_array` resolves each covered name with `index_of`, which returns
+        // the FIRST match — so `_rivet_row_hash` over a table with a column called
+        // `__op` folds the sink's operation string instead of the source cell, and
+        // the drain and the snapshot leg then produce DIFFERENT hashes for the same
+        // row. That breaks precisely the cross-leg comparison the column exists for.
+        // The part would also carry two fields of one name, which no reader resolves
+        // the same way twice.
+        //
+        // Round-10 bughunt, read-only there; refused here rather than papered over,
+        // because there is no rendering of this table that is both faithful and
+        // unambiguous.
+        if let Some(m) = mappings
+            .iter()
+            .find(|m| matches!(m.column_name.as_str(), "__op" | "__pos" | "__seq"))
+        {
+            anyhow::bail!(
+                "cdc: `{table}` has a column named `{}`, which is one of the names the \
+                 CDC sink adds to every part (`__op`, `__pos`, `__seq`). Capturing it \
+                 would put two fields of that name in one part and silently redirect \
+                 `_rivet_row_hash` to the sink's value instead of the source's — the \
+                 drain and the snapshot leg would then disagree about the same row. \
+                 Project the column to another name with a `query:`, or exclude it.",
+                m.column_name
+            );
+        }
         // MySQL: enrich `source_native_type` with the full
         // `information_schema.COLUMN_TYPE` ("bit(8)", "binary(4)",
         // "enum('a','b','c')") — the binlog cell fixes need widths + labels the

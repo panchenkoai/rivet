@@ -1203,6 +1203,26 @@ impl Config {
                                 b
                             );
                         }
+                        // A streaming destination has no per-table sub-prefix to
+                        // extend — `dest_for_table`'s `Stdout` arm is a no-op while
+                        // the local and cloud arms both append `<table>/`. So every
+                        // captured table shares ONE stream: round-10 measured two
+                        // tables emitting two different CSV headers into one output,
+                        // which any reader downstream mixes silently. No manifest is
+                        // written for a streaming destination either, so the stream
+                        // is the only artifact and nothing records the interleave.
+                        if export.destination.destination_type == DestinationType::Stdout {
+                            anyhow::bail!(
+                                "export '{}': `tables:` cannot write to `destination: \
+                                 {{ type: stdout }}` — a stream has no per-table \
+                                 sub-prefix, so all {} tables would interleave into one \
+                                 output with their headers and column sets mixed. Use a \
+                                 local or cloud destination, or capture one table per \
+                                 export.",
+                                export.name,
+                                ts.len()
+                            );
+                        }
                         if self.source.source_type == SourceType::Mssql {
                             anyhow::bail!(
                                 "export '{}': `tables:` is not yet supported for SQL Server — \
