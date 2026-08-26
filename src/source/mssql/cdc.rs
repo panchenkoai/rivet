@@ -1186,6 +1186,29 @@ mod tests {
         // negative substring check enumerates the ways a mistake can be SPELLED; the
         // warning either survives a rewrite or the test fails, which is the only
         // formulation a reword cannot slip through.
+        // Round 8 measured what the positive check still missed: two mutants kept
+        // the `Do NOT run` sentence and stayed green — one DELETING the GRANT remedy
+        // (the actual repair for the likely cause), one REVERSING the causes so the
+        // rare orphan leads and prescribing "recreate the table", which round 6
+        // measured as impossible (Msg 22960). A message can carry the right warning
+        // and still send the operator to the wrong place, so the ORDER and the REPAIR
+        // are pinned too.
+        let permission_at = err.find("permission").expect("the likely cause is named");
+        let dropped_at = err.find("dropped").expect("the rare cause is named");
+        assert!(
+            permission_at < dropped_at,
+            "the causes must be ordered by LIKELIHOOD — metadata visibility is what a \
+             least-privilege reader hits every run, a dropped table is a few-second \
+             window. Leading with the rare one sends the operator to repair something \
+             that is not broken: {err}"
+        );
+        assert!(
+            err.contains("grant it SELECT on the captured table"),
+            "and the repair for that likely cause must be IN the message — measured, \
+             granting SELECT on the base table makes OBJECT_SCHEMA_NAME return the \
+             name and rivet proceed. Without it the operator is told what is wrong and \
+             not what to do: {err}"
+        );
         assert!(
             err.contains("Do NOT run `sp_cdc_disable_table`"),
             "the message must carry the explicit warning, not merely avoid one \

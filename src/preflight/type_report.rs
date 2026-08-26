@@ -182,6 +182,16 @@ pub struct ReportContext<'a> {
     pub on_unresolved: OnUnresolvedCapture,
 }
 
+/// Why a capture instance did not resolve — the input to WHICH repair to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unresolved {
+    Resolved,
+    /// The catalog was readable and holds no row for this instance.
+    NoRow,
+    /// The catalog itself could not be read.
+    Unreadable,
+}
+
 /// Can the configured `table:` name its relation WITHOUT the catalog?
 ///
 /// A schema-qualified name can: it means one relation on any connection, whatever
@@ -253,6 +263,15 @@ pub fn collect_reports(
         // to it is safe for either caller. A BARE name is not, and that is the only
         // case where the two callers must part.
         let resolved = crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls);
+        // WHY it is unresolved decides which repair to name. Round 8: the single
+        // remedy "restore access to the cdc schema" was inert on the no-row branch,
+        // which is reached with cdc access working — the same shape (a remedy correct
+        // on one cause, wrong on the other) that round 6 had just removed.
+        let resolved_kind = match &resolved {
+            Ok(Some(_)) => Unresolved::Resolved,
+            Ok(None) => Unresolved::NoRow,
+            Err(_) => Unresolved::Unreadable,
+        };
         let why = match &resolved {
             Ok(Some(_)) => None,
             Ok(None) => Some(format!(
@@ -274,15 +293,34 @@ pub fn collect_reports(
             (_, Some(why)) => {
                 let configured = export.table.as_deref();
                 if unresolved_capture_is_fatal(on_unresolved, configured) {
+                    // The remedy is branched off the CAUSE, and it leads with the one
+                    // that does not change the export's identity. Round 8 caught both
+                    // halves of the first version: it offered "restore access to the
+                    // cdc schema" on a branch reached WITH cdc access working, and
+                    // prescribed qualifying the name without saying what that does —
+                    // `warehouse_table_name` folds the dot, so `orders` becomes
+                    // `dbo_orders` and the load silently starts filling a NEW, empty
+                    // warehouse table while the old one is left behind, stale and
+                    // still read downstream. The `log::info!` announcing the fold is
+                    // invisible at the default level. A hint that repoints the
+                    // destination is not a fix, it is a second incident.
+                    let remedy = if matches!(resolved_kind, Unresolved::NoRow) {
+                        "Enable capture on the table (`sys.sp_cdc_enable_table`) or \
+                         correct `capture_instance:`"
+                    } else {
+                        "Restore this login's SELECT on the cdc schema"
+                    };
                     anyhow::bail!(
                         "mssql: {why}, and `table: {}` is a BARE name — which relation it \
                          means depends on the connection's default schema, so rivet cannot \
                          say what these artifacts hold. The warehouse schema is planned \
                          from this report, so guessing would create the load table with \
                          one relation's columns and feed it another's parquet, with every \
-                         name matching and every count agreeing. Qualify it as \
-                         `schema.table` to load without the catalog, or restore access to \
-                         the cdc schema.",
+                         name matching and every count agreeing. {remedy}. Qualifying \
+                         `table:` as `schema.table` also works, but change it knowingly: \
+                         the warehouse table name is derived from it (a dot folds to an \
+                         underscore), so the load would start writing to a DIFFERENT, \
+                         empty table and leave the current one behind.",
                         configured.unwrap_or("<none>")
                     );
                 }
@@ -290,12 +328,22 @@ pub fn collect_reports(
                     "mssql: {why} — typing `{}` as the connection resolves it. {}",
                     configured.unwrap_or("the export"),
                     if degrade_is_unambiguous(configured) {
-                        "The name is schema-qualified, so this is the same relation the \
-                         catalog would have named."
+                        // Claims unambiguity of the NAME only. The first version said
+                        // "the same relation the catalog would have named", which rivet
+                        // has not established and which round 8 measured FALSE: a
+                        // qualified `table:` pointing at a decoy while
+                        // `capture_instance:` names another relation made `check` print
+                        // ACCEPTABLE / "Looks good." over the decoy's types for a config
+                        // `run` refuses outright.
+                        "The name is schema-qualified, so it means one relation on any \
+                         connection — but rivet could not confirm it is the one the \
+                         capture instance emits; `rivet run` checks that against the \
+                         catalog and will refuse if they disagree."
                     } else {
                         "The name is BARE, so this is whatever the connection's default \
                          schema resolves it to — qualify it as `schema.table` if the \
-                         captured relation lives elsewhere."
+                         captured relation lives elsewhere (note that changes the \
+                         warehouse table name, which is derived from it)."
                     }
                 );
             }

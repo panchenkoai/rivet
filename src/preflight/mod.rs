@@ -608,6 +608,12 @@ pub fn collect_type_reports(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     let mut out = Vec::with_capacity(config.exports.len());
+    // Failures are ACCUMULATED, not raised at the first one. The load stays
+    // fail-closed as a whole — its own contract is that a table which cannot be
+    // typed must not silently not-load — but reporting only the first unresolvable
+    // export makes the operator fix them one run at a time, and a `rivet load` over
+    // a many-export config is not a cheap round trip (round 8).
+    let mut failures: Vec<String> = Vec::new();
     for export in &config.exports {
         let column_overrides =
             crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
@@ -634,8 +640,20 @@ pub fn collect_type_reports(
                 export.name,
                 target.label()
             )
-        })?;
-        out.extend(reports);
+        });
+        match reports {
+            Ok(r) => out.extend(r),
+            Err(e) => failures.push(format!("{e:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} export(s) could not be typed for the {} load, and a table that cannot \
+             be typed must not silently not-load:\n  - {}",
+            failures.len(),
+            target.label(),
+            failures.join("\n  - ")
+        );
     }
     Ok(out)
 }
