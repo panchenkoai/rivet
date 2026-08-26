@@ -147,6 +147,21 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
     // The canonical stays the fallback for prefixes written before copies existed.
     let mut manifests: Vec<RunManifest> = Vec::new();
     for m in dest.list_prefix(prefix)? {
+        // THIS prefix's own copies, not a nested leg's. The listing recurses on both
+        // the local and the cloud destination, so an `initial: snapshot` export's
+        // `<prefix>/snapshot/manifest-<run_id>.json` was swept up here — and its
+        // `parts[].path` is relative to `snapshot/`, so validate looked for those
+        // parts at the CDC root and reported `cdc __pos check could not complete: No
+        // such file or directory`, exit 1, on a correct export. MEASURED: the
+        // documented production shape (`cdc: { initial: snapshot }`) failed
+        // `rivet validate --depth full` outright, and moving that one file aside made
+        // the same command exit 0. It broke every `rivet validate && deploy` gate.
+        //
+        // A key with a separator is a nested leg by construction — the copies this
+        // prefix owns sit directly under it.
+        if m.key.contains('/') {
+            continue;
+        }
         let base = m.key.rsplit('/').next().unwrap_or("");
         if crate::manifest::is_run_unique_manifest_name(base) {
             manifests.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);

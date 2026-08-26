@@ -865,10 +865,8 @@ impl PgChangeStream {
                 self.exhausted = true;
                 break;
             } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
-                for ev in split_key_changing_update(ev) {
-                    tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
-                    tx.push(ev);
-                }
+                tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
+                tx.push(ev);
                 // Memory backstop, matching the MySQL adapter's MAX_TX_ROWS: a
                 // transaction is buffered whole (never split across parts), so an
                 // oversized one grows unbounded. `upto_nchanges` cannot split a
@@ -1407,73 +1405,35 @@ fn is_unrepresentable_temporal(typ: &str, val: &str) -> bool {
     (typ.starts_with("timestamp") || typ == "date") && (val == "infinity" || val == "-infinity")
 }
 
-/// An UPDATE that MOVED the primary key becomes `delete(old key)` + `insert(new
-/// row)`, matching what Debezium emits and what SQL Server's engine already does
-/// for the same statement.
-///
-/// WHY the one-event form cannot work (ADR-0030, measured): rivet emitted a single
-/// `update` carrying the NEW tuple, and the old key appeared NOWHERE in the output —
-/// so a consumer applying the documented latest-image-per-key MERGE ended with TWO
-/// live rows where the source has ONE, with nothing telling it a removal was owed.
-/// Counts reconciled on both sides, which is why every source-vs-destination oracle
-/// missed it.
-///
-/// WHY `before.is_some()` is the whole rule HERE and would be wrong on MySQL:
-/// `test_decoding` renders `old-key:` ONLY for a key-changing update — measured, an
-/// ordinary `UPDATE … SET v=…` yields `before = None`. MySQL's binlog carries a
-/// before-image on EVERY update, so the same rule there would split every value
-/// change; that engine needs a key comparison and PK metadata the sink does not yet
-/// have. Said plainly rather than generalised.
-///
-/// WHY the delete comes FIRST, and it is not cosmetic: if the new key collides with
-/// another row's key, applying the insert before the delete loses that row. The two
-/// events share this transaction, so `TxnSeq` stamps them consecutively and the
-/// commit framing (which marks only the LAST event of a transaction) still lands on
-/// the insert — neither can be split across parts.
-///
-/// The delete carries the KEY ONLY, with no field values, which is exactly what
-/// PostgreSQL hands over under the default replica identity and exactly the shape
-/// Debezium's tombstone has (measured: `delete k=1 v=<null>`).
-fn split_key_changing_update(ev: ChangeEvent) -> Vec<ChangeEvent> {
-    // KEY-ONLY before-image, not merely a present one. Under the DEFAULT replica
-    // identity `test_decoding` emits `old-key:` only for a key change, and it holds
-    // the key columns alone — so a `before` SHORTER than the after-image is a PK move
-    // and nothing else.
-    //
-    // The first cut tested `before.is_some()`, and the suite caught it: under
-    // `REPLICA IDENTITY FULL` PostgreSQL sends a full before-image on EVERY update,
-    // so 200 ordinary updates became 400 events. That is the same trap MySQL has by
-    // construction (its binlog always carries a before-image), arriving on PostgreSQL
-    // through a table setting.
-    //
-    // Splitting under FULL needs to know WHICH columns are the key, and neither
-    // `TypeMapping` nor the event carries that yet. So FULL keeps the old one-event
-    // form — unchanged behaviour with the ADR-0030 limitation, never a wrong split —
-    // and the PK metadata that unlocks both FULL and MySQL is the next step, named
-    // in the ADR rather than guessed at here.
-    let is_key_move = ev.op == ChangeOp::Update
-        && match (&ev.before, &ev.after) {
-            (Some(b), Some(a)) => b.len() < a.len(),
-            _ => false,
-        };
-    if !is_key_move {
-        return vec![ev];
-    }
-    let mut tombstone = ChangeEvent {
-        op: ChangeOp::Delete,
-        before: ev.before.clone(),
-        after: None,
-        ..ev.clone()
-    };
-    // The tombstone is never a commit boundary: the insert that follows it is.
-    tombstone.committed = false;
-    let born = ChangeEvent {
-        op: ChangeOp::Insert,
-        before: None,
-        ..ev
-    };
-    vec![tombstone, born]
-}
+// REVERTED: `split_key_changing_update` lived here and shipped CORRUPTION, so it is
+// gone rather than patched. Kept as a note because the next attempt must not start
+// from the same place.
+//
+// It turned a PK-changing UPDATE into `delete(before)` + `insert(after)` — the right
+// SHAPE (it made rivet agree with Debezium; the differential oracle's one
+// disagreement went AGREE). But the tombstone carried the old key's VALUES with the
+// AFTER-image's column NAMES, because a PG update's `before` is key-only and
+// `ChangeEvent` has no `before_names`. MEASURED on a table whose PK is not the
+// leading column (`v text, id int PRIMARY KEY`):
+//
+//     __op   | v      | id
+//     delete | "10"   | NULL      <- the old PK written into a TEXT column, key NULL
+//
+// A NULL-keyed tombstone retracts nothing, so the moved row stayed live at BOTH keys
+// AND a fabricated row entered the change log — strictly worse than the
+// non-convergence the split was fixing. Silent: `image_names.is_some()` skips the
+// arity guard, Form A derives both checksum sides from the same wrong cells, and the
+// count is exactly 2.
+//
+// The length heuristic was also incomplete in the other direction: `before.len() <
+// after.len()` cannot fire when the PK covers EVERY column, so a junction table
+// (`PRIMARY KEY(a, b)`) silently kept the one-event form.
+//
+// Both defects have ONE root, and it is the prerequisite ADR-0030 already names: the
+// sink knows neither which columns are the key nor what the before-image's columns
+// are called. Reverting restores a KNOWN, DOCUMENTED limitation (the destination does
+// not converge on a PK move) in place of corruption, which is the trade an operator
+// can reason about. The split returns when the key is a type.
 
 fn parse_columns(s: &str) -> Vec<ParsedColumn> {
     let mut out = Vec::new();
