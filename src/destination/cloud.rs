@@ -192,6 +192,17 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 /// `/` and lists an empty `exports/mydata/` -> a false PART_MISSING on present data
 /// (dogfood). Empty (bucket root) and already-slashed prefixes are unchanged.
 fn normalize_prefix(p: String) -> String {
+    // A LEADING slash is stripped too, and the trailing-slash comment above is the
+    // reason to expect its sibling: opendal normalizes `/lead/x/` away on the wire,
+    // so the data lands correctly at `lead/x/…` — but `self.prefix` keeps the slash,
+    // and `list_prefix`'s `strip_prefix(self.prefix)` then FAILS and falls through to
+    // the bucket-absolute key. MEASURED on MinIO with `prefix: "/lead/x/"`: `rivet
+    // validate` reported the SAME object as `PART_MISSING` and as an
+    // `UNTRACKED_OBJECT` in one run, on 100%-correct data. Every listing consumer
+    // shares this — validate, the M8 resume decisions (every part → Rewrite, every
+    // real object → Quarantine), split-unit manifest reads, the CDC validator and
+    // the value-checksum re-read.
+    let p = p.trim_start_matches('/').to_string();
     if p.is_empty() || p.ends_with('/') {
         p
     } else {
@@ -426,6 +437,18 @@ mod tests {
         );
         assert_eq!(normalize_prefix(String::new()), ""); // bucket root
         assert_eq!(normalize_prefix("a".into()), "a/");
+        // The LEADING slash, whose absence made `list_prefix` return
+        // bucket-absolute keys: `strip_prefix("/lead/x/")` cannot match a key
+        // opendal already normalized to `lead/x/…`, and the `unwrap_or` swallows
+        // that. MEASURED on MinIO — the same object reported PART_MISSING and
+        // UNTRACKED_OBJECT in one `rivet validate`, on correct data.
+        assert_eq!(normalize_prefix("/lead/x/".into()), "lead/x/");
+        assert_eq!(normalize_prefix("/lead/x".into()), "lead/x/");
+        assert_eq!(
+            normalize_prefix("/".into()),
+            "",
+            "a lone slash is the bucket ROOT, not a directory named empty"
+        );
     }
 
     // L20 (cloud-fastfail): the no-retry probe seam must construct. A GCS
