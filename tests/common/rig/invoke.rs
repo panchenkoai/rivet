@@ -168,6 +168,25 @@ impl Rig {
         out
     }
 
+    /// [`Rig::run_in_dir`] for any OTHER subcommand — `doctor`, `check`, `validate`.
+    ///
+    /// A diagnostic must answer about the file the RUN will open. `rivet doctor`
+    /// resolved `cdc.checkpoint:` against the process working directory while the
+    /// run resolved it against the config's, so the same config graded green from
+    /// one shell and described a different file from another — and the ABSENT
+    /// answer is this check's green one ("no checkpoint yet — the first run pins
+    /// the open position"). `run_in_dir` could express the run half of that pair
+    /// and nothing could express the diagnostic half.
+    pub fn cli_in_dir(&self, args: &[&str], dir: &std::path::Path) -> std::process::Output {
+        let out = self
+            .invoke_command(&self.cli_argv(args), &[])
+            .current_dir(dir)
+            .output()
+            .expect("spawn rivet binary");
+        self.absorb_product_config_writes();
+        out
+    }
+
     /// Run with an extra environment variable (fault injection); returns the
     /// raw output — the caller asserts success or failure.
     pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {

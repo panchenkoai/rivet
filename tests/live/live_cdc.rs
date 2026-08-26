@@ -7425,6 +7425,89 @@ fn a_relative_cdc_checkpoint_follows_the_config_not_the_working_directory() {
     );
 }
 
+/// `rivet doctor` must grade the checkpoint the RUN will open, not one named
+/// relative to whatever shell it was started from.
+///
+/// Round 14. The run resolves a relative `cdc.checkpoint:` against the config's
+/// directory; the preflight read the raw string against the process working
+/// directory. The two answers only differ when doctor is invoked from somewhere
+/// else — a cron entry, a systemd unit, a CI step, an operator in `$HOME` — which
+/// is the normal way a diagnostic is run and the exact case nothing exercised.
+///
+/// What makes it worse than a mislabelled path: ABSENT is this check's GREEN
+/// answer. A checkpoint doctor cannot find is reported as "no checkpoint yet —
+/// the first run pins the open position", `[OK]`, exit 0. So the one check whose
+/// job is to catch a position about to fall off binlog retention — the ERROR 1236
+/// that ends a stream — is confidently describing a file that is not there.
+///
+/// The oracle is the DISAGREEMENT, not the text: the same config, the same
+/// checkpoint, two working directories, and doctor must say the same thing.
+/// RED-proven by restoring the raw `Path::new(raw)` read — from another directory
+/// it printed `[OK] … no checkpoint yet` while the file held
+/// `binlog.000011:54840425`.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn doctor_grades_the_checkpoint_the_run_opens_not_one_relative_to_the_shell() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_ckdoctor").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl)
+        .relative_checkpoint("./doctor.ckpt")
+        .dest_path(out.path().to_path_buf());
+
+    // A REAL checkpoint, written by a real run — not a hand-made file. The bug is
+    // in the seam between what the run writes and what the preflight reads, so a
+    // fabricated fixture would grade the reader against an input the product does
+    // not produce.
+    rig.run_ok();
+    let ckpt = rig
+        .config_path()
+        .parent()
+        .expect("config dir")
+        .join("doctor.ckpt");
+    assert!(
+        ckpt.is_file(),
+        "the fixture is inert: run 1 wrote no checkpoint at {}, so both doctor \
+         invocations below would agree on `not yet written` and prove nothing",
+        ckpt.display()
+    );
+
+    let say = |o: &std::process::Output| {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        text.lines()
+            .find(|l| l.contains("CDC checkpoint"))
+            .unwrap_or("<no CDC checkpoint check ran>")
+            .to_string()
+    };
+
+    let elsewhere = tempfile::tempdir().expect("a different working directory");
+    let from_config = say(&rig.cli_in_dir(&["doctor"], rig.config_path().parent().unwrap()));
+    let from_elsewhere = say(&rig.cli_in_dir(&["doctor"], elsewhere.path()));
+
+    assert!(
+        from_config.contains("binlog."),
+        "the control half is broken — doctor run from the config's own directory \
+         must read the position the run just wrote, got:\n{from_config}"
+    );
+    assert_eq!(
+        from_config, from_elsewhere,
+        "doctor described two different checkpoints for one config. The verdict \
+         from another working directory is the one deployments actually see, and \
+         `no checkpoint yet` is GREEN — so a position below binlog retention grades \
+         [OK] and the run then dies with ERROR 1236."
+    );
+}
+
 /// An existing CWD-relative checkpoint must keep working — the fix must not cause,
 /// once on upgrade, the very loss it prevents.
 ///

@@ -1326,6 +1326,54 @@ pub(crate) fn run_capture(
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }
 
+/// Resolve a configured `cdc.checkpoint:` path.
+///
+/// An ABSOLUTE path is used as written. A RELATIVE one is resolved against the
+/// CONFIG FILE's directory — the way rivet already resolves the state DB and every
+/// other relative path — rather than against the process working directory, which
+/// is what it did until round 9 measured the cost: `rivet init` scaffolds
+/// `checkpoint: ./cdc/<table>.ckpt`, so the same config invoked from a cron entry, a
+/// systemd unit with its own `WorkingDirectory`, a container entrypoint or by hand
+/// looked somewhere else, found nothing, and re-anchored at the CURRENT log
+/// position. Measured: three green runs delivered `[3]` of a source holding
+/// `[1,2,3]`.
+///
+/// COMPATIBILITY, and it is the reason this is a function rather than a `join`: a
+/// deployment whose working directory happens to be where its checkpoint already
+/// lives must not be moved out from under it by this fix — that would cause exactly
+/// the loss the fix exists to prevent, once, on upgrade. So if the config-relative
+/// location has no file and the CWD-relative one does, the existing file wins and
+/// the run says where it will live from now on.
+///
+/// It lives HERE, beside `Position`, rather than in the runner, because `rivet
+/// doctor` must answer about the SAME file the run will open. It did not: the
+/// preflight read the raw string against the process working directory, so a
+/// config invoked from anywhere else graded a checkpoint that was not there —
+/// and "not there" is this check's GREEN answer ("no checkpoint yet — the first
+/// run pins the open position"). The one check whose job is to catch a position
+/// about to fall off binlog retention was reporting on an absent file.
+pub(crate) fn resolve_checkpoint(raw: &str, config_dir: &std::path::Path) -> PathBuf {
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let by_config = config_dir.join(p);
+    if !by_config.exists() && p.exists() {
+        log::warn!(
+            "cdc: using the existing checkpoint at `{}` (relative to the working \
+             directory). rivet now resolves a relative `cdc.checkpoint:` against the \
+             config's directory, so this run would otherwise have re-anchored at the \
+             current log position and skipped everything since. Move it to `{}` — or \
+             make the path absolute — so the location no longer depends on where \
+             rivet is invoked from.",
+            p.display(),
+            by_config.display()
+        );
+        return p.to_path_buf();
+    }
+    by_config
+}
+
 #[cfg(test)]
 mod tests {
 

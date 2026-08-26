@@ -68,7 +68,7 @@ fn probe_failed(e: &anyhow::Error) -> DoctorCheck {
 /// Entry point: every CDC health check for the config, or empty when the
 /// config has no `mode: cdc` exports. A connection failure becomes a single
 /// failed check rather than aborting doctor.
-pub(super) fn collect(config: &Config) -> Vec<DoctorCheck> {
+pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<DoctorCheck> {
     let cdc: Vec<&ExportConfig> = config
         .exports
         .iter()
@@ -84,11 +84,11 @@ pub(super) fn collect(config: &Config) -> Vec<DoctorCheck> {
     let tls = config.source.tls.as_ref();
     let result = match config.source.source_type {
         SourceType::Postgres => pg_checks(&url, tls, &cdc),
-        SourceType::Mysql => mysql_checks(&url, tls, &cdc),
-        SourceType::Mssql => mssql_checks(&url, tls, &cdc),
+        SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir),
+        SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir),
         // Change streams: probe the replica-set requirement + declare the capture
         // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
-        SourceType::Mongo => mongo_checks(&url, tls, &cdc),
+        SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir),
     };
     result.unwrap_or_else(|e| vec![probe_failed(&e)])
 }
@@ -456,6 +456,7 @@ fn mysql_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
 ) -> Result<Vec<DoctorCheck>> {
     use mysql::prelude::Queryable;
     let pool = crate::source::mysql::connect_pool(url, tls)?;
@@ -483,43 +484,46 @@ fn mysql_checks(
     for e in exports {
         let ckpt = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
             None => MysqlCkpt::NoPathConfigured,
-            Some(p) => match crate::source::cdc::Position::load(std::path::Path::new(p))? {
-                None => MysqlCkpt::NotYetWritten,
-                // The SAME decoder the run uses. This read `file` with
-                // `.unwrap_or_default()` and `pos` with `.unwrap_or(0)`, so a
-                // malformed checkpoint rendered as `Loaded { file: "", pos: 0 }` and
-                // was graded "below binlog retention (file purged) … ERROR 1236" with
-                // a RE-SNAPSHOT hint — the wrong cause and a destructive remedy for a
-                // file the run rejects as `checkpoint missing 'file'`.
-                Some(pos) => {
-                    match crate::source::mysql::cdc::MysqlChangeStream::resume_from_checkpoint(
-                        Some(&pos),
-                        p,
-                    ) {
-                        Ok(Some((file, at))) => MysqlCkpt::Loaded { file, pos: at },
-                        Ok(None) => MysqlCkpt::NotYetWritten,
-                        // The malformed-file FAIL is the whole answer. Falling
-                        // through to `mysql_ckpt_verdict` printed a SECOND check under
-                        // the same name saying "no `cdc.checkpoint` configured" with a
-                        // hint to set one — factually false (a path IS configured) and
-                        // a no-op remedy the operator has already applied. Two
-                        // contradictory verdicts on one file is worse than either.
-                        Err(why) => {
-                            checks.push(check(
-                                format!("CDC checkpoint (export '{}')", e.name),
-                                false,
-                                Some(why.to_string()),
-                                Some(
-                                    "restore the file, or delete it to accept a fresh \
+            Some(raw) => {
+                let p = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+                match crate::source::cdc::Position::load(p)? {
+                    None => MysqlCkpt::NotYetWritten,
+                    // The SAME decoder the run uses. This read `file` with
+                    // `.unwrap_or_default()` and `pos` with `.unwrap_or(0)`, so a
+                    // malformed checkpoint rendered as `Loaded { file: "", pos: 0 }` and
+                    // was graded "below binlog retention (file purged) … ERROR 1236" with
+                    // a RE-SNAPSHOT hint — the wrong cause and a destructive remedy for a
+                    // file the run rejects as `checkpoint missing 'file'`.
+                    Some(pos) => {
+                        match crate::source::mysql::cdc::MysqlChangeStream::resume_from_checkpoint(
+                            Some(&pos),
+                            &p.display().to_string(),
+                        ) {
+                            Ok(Some((file, at))) => MysqlCkpt::Loaded { file, pos: at },
+                            Ok(None) => MysqlCkpt::NotYetWritten,
+                            // The malformed-file FAIL is the whole answer. Falling
+                            // through to `mysql_ckpt_verdict` printed a SECOND check under
+                            // the same name saying "no `cdc.checkpoint` configured" with a
+                            // hint to set one — factually false (a path IS configured) and
+                            // a no-op remedy the operator has already applied. Two
+                            // contradictory verdicts on one file is worse than either.
+                            Err(why) => {
+                                checks.push(check(
+                                    format!("CDC checkpoint (export '{}')", e.name),
+                                    false,
+                                    Some(why.to_string()),
+                                    Some(
+                                        "restore the file, or delete it to accept a fresh \
                                      anchor at the current binlog position"
-                                        .into(),
-                                ),
-                            ));
-                            continue;
+                                            .into(),
+                                    ),
+                                ));
+                                continue;
+                            }
                         }
                     }
                 }
-            },
+            }
         };
         checks.push(mysql_ckpt_verdict(&e.name, ckpt, &logs));
     }
@@ -657,6 +661,7 @@ fn mssql_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
 ) -> Result<Vec<DoctorCheck>> {
     let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
     let mut checks = Vec::new();
@@ -677,9 +682,13 @@ fn mssql_checks(
         let mut ckpt_error: Option<String> = None;
         let ckpt_state = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
             None => None,
-            Some(p) => {
-                let pos = crate::source::cdc::Position::load(std::path::Path::new(p))?;
-                match crate::source::mssql::cdc::resume_from_checkpoint(pos.as_ref(), p) {
+            Some(raw) => {
+                let p = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+                let pos = crate::source::cdc::Position::load(p)?;
+                match crate::source::mssql::cdc::resume_from_checkpoint(
+                    pos.as_ref(),
+                    &p.display().to_string(),
+                ) {
                     Ok(r) => Some(r.from_lsn),
                     Err(e) => {
                         ckpt_error = Some(e.to_string());
@@ -722,6 +731,7 @@ fn mongo_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
 ) -> Result<Vec<DoctorCheck>> {
     let cap = crate::source::mongo::cdc::probe_capability(url, tls)?;
     let mut checks = Vec::new();
@@ -732,11 +742,12 @@ fn mongo_checks(
     // saying "Looks good" on a file the run then refuses — was live here too, on the
     // engine whose resume position is a driver token nobody can hand-repair.
     for e in exports {
-        let Some(path) = e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) else {
+        let Some(raw) = e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) else {
             continue;
         };
+        let path = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
         let name = format!("CDC checkpoint (export '{}')", e.name);
-        match crate::source::cdc::Position::load(std::path::Path::new(path)) {
+        match crate::source::cdc::Position::load(path) {
             Ok(None) => checks.push(check(
                 name,
                 true,
