@@ -53,6 +53,47 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let cp = chunked_plan(plan);
 
     let chunks = if plan.resume {
+        // A resume re-executes the STORED plan, and two things must still be true
+        // for that to be sound — neither of which was checked, because this arm
+        // skipped the whole match below (round-11 bughunt).
+        //
+        // 1. The SCHEMA must not have drifted. `on_schema_drift: fail` was inert
+        //    here: DEMONSTRATED — a `DROP COLUMN` between the crash and the resume
+        //    produced exit 0, `rows: 300`, and three parts under ONE
+        //    `schema_fingerprint` whose schemas disagree. The identical drop without
+        //    `--resume` fails loudly. The gap between a crash and its resume is
+        //    exactly where a schema change is most likely.
+        //
+        // 2. For `chunk_dense`, the ROW SET must not have changed. Dense windows are
+        //    ORDINALS (`ROW_NUMBER() OVER (ORDER BY col)`, 1..COUNT(*)) frozen at
+        //    plan time and re-evaluated at execution, so an insert shifts every row
+        //    under every stored ordinal. DEMONSTRATED on a 50-row table: crash after
+        //    chunk 0, insert 3 rows below the key range, resume → `status: success`,
+        //    `rows: 50`, and an independent read of the parts gives 50 rows / 47
+        //    DISTINCT — three ids written twice while six that exist in the source
+        //    were never exported. Silent because the ordinal partition stays gapless
+        //    and self-consistent and `rows` equals the manifest sum; only a per-key
+        //    comparison against the source sees it.
+        //
+        // Refusing rather than silently re-planning: the chunk table already records
+        // which ordinals were exported, and those records now describe rows nobody
+        // can identify. Re-deriving would produce a correct plan over an incorrect
+        // ledger.
+        if cp.dense {
+            anyhow::bail!(
+                "export '{}': cannot resume a `chunk_dense` plan. Dense chunks are \
+                 ORDINALS (`ROW_NUMBER() OVER (ORDER BY …)`, 1..COUNT(*)) frozen when \
+                 the plan was made and re-evaluated at execution, so ANY insert or \
+                 delete since then shifts which rows every stored window names — the \
+                 resume would re-export some and skip others while reporting success. \
+                 rivet cannot tell from the chunk ledger whether the row set moved, \
+                 because the ledger records ordinals, not keys. Re-run WITHOUT \
+                 `--resume` to re-plan from scratch, or switch to range chunking \
+                 (`chunk_dense: false`), whose windows are KEY ranges and survive a \
+                 change to the rows between them.",
+                plan.export_name
+            );
+        }
         vec![]
     } else {
         match chunk_source {
