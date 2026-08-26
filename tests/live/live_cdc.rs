@@ -3174,25 +3174,29 @@ fn cdc_resume_captures_only_new_changes() {
 #[test]
 #[ignore = "live: requires docker compose mysql (binlog ROW + REPLICATION grant)"]
 fn cdc_run_is_recorded_in_state_db() {
-    let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_cdc_regr");
+    // The SHARED workdir, not a bare tempdir: the DuckDB oracle reads from inside a
+    // container and cannot see `/var/folders/...`. The state DB sits beside the
+    // config, so the config has to live here too — otherwise the census can reach
+    // the parquet and not the ledger, which is the half that needs reconciling.
+    let (shared, shared_container) = live_shared_workdir(&unique_name("cdc_census"));
     let _drop = Table(tbl.clone());
     let mut c = conn();
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
 
-    let ckpt = d.path().join("cdc.ckpt");
+    let ckpt = shared.join("cdc.ckpt");
     write_checkpoint(&mut c, &ckpt);
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20),(3,30)"))
         .unwrap();
-    let out = d.path().join("out");
+    let out = shared.join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let cfg = cdc_config(&d, &tbl, &ckpt, &out);
+    let cfg = cdc_rig(&tbl, &ckpt, &out).config_in(&shared);
     run_rivet_ok(&cfg);
 
     // A CDC run must show up like a batch run: an export_metrics row with mode=cdc,
     // and a run_journal entry (FileWritten + RunCompleted) so `rivet journal` works.
-    let db = d.path().join(".rivet_state.db");
+    let db = shared.join(".rivet_state.db");
     let sql = rusqlite::Connection::open(&db).expect("state db");
 
     let (rows, mode): (i64, String) = sql
@@ -3204,6 +3208,34 @@ fn cdc_run_is_recorded_in_state_db() {
         .expect("export_metrics row for the cdc run");
     assert_eq!(mode, "cdc");
     assert_eq!(rows, 3, "metric total_rows = captured changes");
+
+    // The ledger RECONCILED against the artifacts, not read on its own. An oracle
+    // census found this test asserting `export_metrics.total_rows == 3` and nothing
+    // else — so a run recording 3 while delivering 2 passed it, which is the shape
+    // rivet's own counters can never catch. `duckdb_row_census` was written for
+    // exactly this and had ZERO callers in the tree; its docstring names this gap.
+    //
+    // Four numbers from one DuckDB session, sharing no code with rivet: the SOURCE
+    // table, the delivered parquet, `export_metrics.total_rows`, `file_log.row_count`.
+    let census = duckdb_row_census(
+        OracleEngine::MysqlCdc,
+        "rivet",
+        &tbl,
+        &format!("{shared_container}/out/**/*.parquet"),
+        &format!("{shared_container}/.rivet_state.db"),
+        &tbl,
+    );
+    assert_eq!(
+        census.delivered, 3,
+        "the parquet must hold the three changes an independent reader can count, \
+         not the three rivet says it wrote: {census:?}"
+    );
+    assert_eq!(
+        census.metrics, census.file_log,
+        "and rivet's two ledgers must agree with each other and with the artifacts \
+         — a metric that outruns the file log is a run claiming rows no part \
+         declares: {census:?}"
+    );
 
     let journal: String = sql
         .query_row(

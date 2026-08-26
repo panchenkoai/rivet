@@ -44,6 +44,11 @@ pub fn duckdb_run_sql_json(sql: &str) -> serde_json::Value {
         r#"
 import duckdb, json, sys
 con = duckdb.connect()
+# The progress bar writes to STDOUT, which is the channel this helper parses as
+# JSON. It only appears once an operation runs long enough — an extension DOWNLOAD
+# does — so the first caller to `INSTALL … FROM community` broke the parse with
+# `trailing characters at line 1 column 5`. Off for every query, not just that one.
+con.execute("SET enable_progress_bar=false")
 cur = con.execute({sql_repr})
 cols = [d[0] for d in cur.description] if cur.description else []
 out_rows = []
