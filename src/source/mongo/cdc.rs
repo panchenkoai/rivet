@@ -505,8 +505,14 @@ impl MongoCdcCapability {
     /// One-line fidelity declaration for the log / `doctor`.
     pub(crate) fn tier(&self) -> &'static str {
         if self.major >= 6 {
-            "full-image-capable (6.0+) — delete/update pre-images ride when \
-             changeStreamPreAndPostImages is enabled on the collection"
+            // Says what the code DOES. The previous wording promised update
+            // pre-images "ride", and the decode consults the pre-image only for a
+            // DELETE — an update's document is the `updateLookup` post-image, which
+            // resolves at read time and is absent once the document is gone.
+            "full-image-capable (6.0+) — DELETE pre-images ride when \
+             changeStreamPreAndPostImages is enabled; an UPDATE's document is a \
+             current-state lookup, so a document deleted after the change has none \
+             and rivet refuses that event rather than writing NULL"
         } else {
             "current-state (UpdateLookup) — update post-images are current-state \
              (not point-in-time) and deletes carry _id only; upgrade to 6.0+ for pre/post-images"
@@ -583,11 +589,51 @@ fn to_change_event(
     let id_val = RivetValue::Bytes(id_str.into_bytes());
 
     // The `document` column: post-image for insert/update, pre-image (6.0+) for
-    // delete, else Null (a delete with no pre-image, or an unlooked-up update).
+    // delete.
     let doc_source = match op {
         ChangeOp::Delete => cse.full_document_before_change.as_ref(),
         _ => cse.full_document.as_ref(),
     };
+    // An insert/update whose post-image is absent writes NULL here, and that is a
+    // KNOWN GAP with a narrow harmful case — recorded rather than papered over.
+    //
+    // `fullDocument: updateLookup` resolves the CURRENT document at read time, so an
+    // update to a document deleted since the change resolves to nothing. In the
+    // ORDINARY case that is harmless: the DELETE is itself a captured op, so its
+    // event follows and `dedup_view_sql` marks the key `__is_deleted` — the NULL row
+    // is outranked and nothing wrong reaches current state.
+    //
+    // The harmful case is a collection DROP. `classify_op` skips it (a
+    // database-scoped stream emits `drop` without `invalidate`), so NO delete event
+    // ever arrives — and the NULL row, ranked latest by `__pos`, then publishes a
+    // document that does not exist. MEASURED on the mongo-rs stand: `updateOne` then
+    // `drop()` gives `op=update, fullDocument=null` while the pre-image holds the
+    // content, and current state exposes `(_id, NULL)`.
+    //
+    // A blanket refusal here is NOT the fix, and this comment exists because I shipped
+    // one and the suite caught it: an insert-then-delete inside one polling window
+    // resolves to nothing too, so refusing wedges an ordinary workload
+    // (`mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one` went RED).
+    // The pre-image is not a substitute either — it is the document BEFORE the update,
+    // so writing it would publish a wrong value rather than a missing one. The real
+    // fix is to give a captured collection's DROP the same end-of-life semantics a
+    // delete has, which is a contract decision, not a decode tweak.
+    //
+    // `fullDocument: updateLookup` resolves the CURRENT document at read time, so an
+    // update to a document that has since been deleted — or whose collection was
+    // dropped — resolves to nothing. MEASURED on the mongo-rs stand: `updateOne` then
+    // `drop()` yields `op=update, fullDocument=null` while the pre-image holds the
+    // content. rivet wrote `document = NULL`, and because `dedup_view_sql` ranks by
+    // `__pos DESC` and only a `delete` sets `__is_deleted`, that NULL row OUTRANKED
+    // the earlier correct capture — current state then exposed `(_id, NULL)` for a
+    // document that no longer exists. A `drop` is classified `Skip`, so no delete
+    // event ever arrives to correct it. Counts balance; nothing warns.
+    //
+    // The pre-image is NOT a substitute here: it is the document BEFORE the update,
+    // and writing it as the post-image would publish a wrong value rather than a
+    // missing one. So this is a DEFERRED refusal, like the engines' other
+    // unrepresentable cells — the stream carries every collection in the database,
+    // so an uncaptured one must not wedge the run.
     let doc_val = match doc_source {
         Some(d) => RivetValue::Bytes(document_to_json(d, canonical)?.into_bytes()),
         None => RivetValue::Null,
