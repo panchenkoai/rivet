@@ -1357,7 +1357,12 @@ pub(crate) fn resolve_checkpoint(raw: &str, config_dir: &std::path::Path) -> Pat
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    let by_config = config_dir.join(p);
+    // `components()` drops the `.` that `rivet init` scaffolds into every path it
+    // writes (`./cdc/<table>.ckpt`), so the location rivet REPORTS is one an
+    // operator can compare against `ls` — `/etc/rivet/./cdc/t.ckpt` is the same
+    // file and reads like a bug in the message that names it. Rendering only: the
+    // components are unchanged, so this cannot move where the file lives.
+    let by_config: PathBuf = config_dir.join(p).components().collect();
     if !by_config.exists() && p.exists() {
         log::warn!(
             "cdc: using the existing checkpoint at `{}` (relative to the working \

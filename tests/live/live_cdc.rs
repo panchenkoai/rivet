@@ -7425,6 +7425,70 @@ fn a_relative_cdc_checkpoint_follows_the_config_not_the_working_directory() {
     );
 }
 
+/// The re-anchor warning must name the place rivet actually looked.
+///
+/// Round 15. MySQL has no server-side anchor, so a run that finds no checkpoint
+/// pins at the CURRENT binlog position and everything written before now is gone
+/// from the stream. The `warn` that says so also tells the operator WHY the file
+/// might be missing, and it went stale: it still said a relative `cdc.checkpoint:`
+/// is resolved against the process working directory, which round 9 changed to the
+/// config's directory. So the one line an operator reads while deciding whether to
+/// re-snapshot sent them to look somewhere the file was never going to be.
+///
+/// Nothing graded either engine's message — which is how it drifted for as long as
+/// it did. A `warn` is a product surface: if it is worth emitting at a level the
+/// default log shows, it is worth one assertion.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_anchorwarn").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl)
+        .relative_checkpoint("./anchorwarn.ckpt")
+        .dest_path(out.path().to_path_buf());
+
+    // A FIRST run: no checkpoint anywhere, so this is the re-anchor branch.
+    let o = rig.run_args(&[]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "the anchor run must succeed:\n{said}");
+    assert!(
+        said.contains("no checkpoint at"),
+        "a first run re-anchors at the current binlog position and MUST say so at \
+         `warn` — silent here is what round 9 measured as three green runs \
+         delivering [3] of [1,2,3]. Got:\n{said}"
+    );
+    let expected = rig
+        .config_path()
+        .parent()
+        .expect("config dir")
+        .join("anchorwarn.ckpt");
+    assert!(
+        said.contains(&expected.display().to_string()),
+        "the warning must name the path rivet LOOKED AT ({}), not a bare relative \
+         spelling — the operator reading it is deciding whether to re-snapshot. \
+         Got:\n{said}",
+        expected.display()
+    );
+    assert!(
+        said.contains("CONFIG FILE's directory") && !said.contains("process working directory"),
+        "the warning must explain the resolution that is in force. It said `resolved \
+         against the process working directory` until round 15 — true before round 9 \
+         and false since, which sends the operator to a directory the file was never \
+         written to. Got:\n{said}"
+    );
+}
+
 /// A PREPARED XA branch must never be published by another transaction's commit.
 ///
 /// Round 14, and the worst shape a CDC reader can have: not loss, FABRICATION.

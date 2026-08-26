@@ -441,18 +441,22 @@ impl MongoChangeStream {
             // `warn`, not `info`: this branch is reached both on a genuine first run
             // and when a previously-written checkpoint is simply NOT THERE, and rivet
             // cannot tell them apart. An `info` line is invisible at the default
-            // level, so the second case was silent — and a relative `cdc.checkpoint:`
-            // is resolved against the process working directory, so the same config
-            // run from another directory finds no file and re-anchors at NOW, past
-            // everything written since (round 9, measured on the MySQL peer of this
-            // branch: three green runs delivered [3] of [1,2,3]).
+            // level, so the second case was silent (round 9, measured on the MySQL
+            // peer of this branch: three green runs delivered [3] of [1,2,3], because
+            // a relative `cdc.checkpoint:` was then resolved against the process
+            // working directory and the same config run from elsewhere found no file).
+            // That resolution now follows the CONFIG's directory, so the message names
+            // the path rivet actually looked at rather than a cause that no longer
+            // exists — a hint pointing somewhere the file was never going to be is
+            // spent at exactly the moment the operator is deciding whether to
+            // re-snapshot.
             log::warn!(
                 "mongodb cdc: no checkpoint at `{}` — anchoring the resume token at the \
                  CURRENT oplog position, so anything written before now is NOT captured. \
                  On a first run that is expected. If this checkpoint existed before, it \
-                 was deleted or the path resolved elsewhere (a RELATIVE path is resolved \
-                 against the process working directory) — re-snapshot before trusting \
-                 this stream.",
+                 was deleted or the config moved: a RELATIVE `cdc.checkpoint:` is \
+                 resolved against the CONFIG FILE's directory, so the path above is \
+                 where rivet looked — re-snapshot before trusting this stream.",
                 ckpt.display()
             );
         }

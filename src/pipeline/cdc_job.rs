@@ -763,6 +763,16 @@ mod tests {
             abs
         );
 
+        // A scaffolded `./x` renders WITHOUT the dot component: `rivet init` writes
+        // `./cdc/<table>.ckpt` into every config, so `/etc/rivet/./cdc/t.ckpt` is what
+        // the re-anchor warning would name — the same file, and unreadable next to an
+        // `ls`. Same components, so this is rendering and not resolution.
+        assert_eq!(
+            crate::source::cdc::resolve_checkpoint("./cdc/t.ckpt", cfg_dir.path()),
+            cfg_dir.path().join("cdc").join("t.ckpt"),
+            "a `.` component must not survive into the path rivet reports"
+        );
+
         // RELATIVE with nothing anywhere: the CONFIG's directory, not the CWD.
         assert_eq!(
             crate::source::cdc::resolve_checkpoint("rel.ckpt", cfg_dir.path()),

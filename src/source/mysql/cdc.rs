@@ -653,11 +653,11 @@ impl MysqlChangeStream {
                 "mysql cdc: no checkpoint at `{}` — anchoring at the CURRENT binlog \
                  position ({file}:{pos}), so anything written before now is NOT \
                  captured. On a first run that is expected. If this checkpoint existed \
-                 before, it was deleted or the path resolved elsewhere (a RELATIVE \
-                 `cdc.checkpoint:` is resolved against the process working directory, \
-                 so the same config run from another directory looks in another place) \
-                 — and the changes since it was written are gone from this stream. \
-                 Re-snapshot (`mode: full`) before trusting the result.",
+                 before, it was deleted or the config moved: a RELATIVE \
+                 `cdc.checkpoint:` is resolved against the CONFIG FILE's directory, so \
+                 the path above is where rivet looked — and the changes since it was \
+                 written are gone from this stream. Re-snapshot (`mode: full`) before \
+                 trusting the result.",
                 path.display()
             );
             Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
