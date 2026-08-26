@@ -119,6 +119,31 @@ impl<'a> PgFromSql<'a> for PgJsonRawText<'a> {
     }
 }
 
+/// A PostgreSQL date/timestamp the Arrow type cannot hold — `infinity` and
+/// `-infinity`, PostgreSQL's standard "never expires" / "since forever" sentinels.
+///
+/// `Row::get` PANICS rather than returning `Err` when the driver cannot deserialize
+/// a column, and `chrono` has no representation for the sentinel — so a table with
+/// a single `'infinity'::timestamptz` aborted the whole export at
+/// `error retrieving column 1: error deserializing column 1`, exit 101, with no run
+/// summary, no error path and no ledger finalize (round-9 bughunt, reproduced on the
+/// pg stand). Nulling it instead would be worse: it is a real, ordered value that
+/// every count and checksum fold would then agree about losing.
+///
+/// So: `try_get`, and a loud error that names the column and what to do.
+fn unrepresentable_temporal(col: &str, kind: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "postgres: column `{col}` holds a {kind} value Arrow cannot represent — \
+         almost certainly PostgreSQL's `infinity` or `-infinity` sentinel, which has \
+         no instant to map to. rivet refuses rather than writing NULL, because a NULL \
+         here is indistinguishable from a genuinely absent value and every count and \
+         checksum would agree about the loss. Project the column through a `query:` \
+         that maps the sentinels to a real bound (e.g. \
+         `CASE WHEN {col} = 'infinity' THEN '9999-12-31' ELSE {col} END`), or exclude \
+         the column."
+    )
+}
+
 fn pg_numeric_optional_utf8_string(row: &Row, col_idx: usize) -> Result<Option<String>> {
     match row.try_get::<_, Option<PgNumericWire<'_>>>(col_idx)? {
         None => Ok(None),
@@ -706,7 +731,10 @@ fn build_array(
         DataType::Date32 => {
             let mut b = Date32Builder::with_capacity(rows.len());
             for row in rows {
-                match row.get::<_, Option<chrono::NaiveDate>>(col_idx) {
+                match row
+                    .try_get::<_, Option<chrono::NaiveDate>>(col_idx)
+                    .map_err(|_| unrepresentable_temporal(column, "DATE"))?
+                {
                     Some(d) => {
                         let epoch =
                             chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
@@ -734,7 +762,10 @@ fn build_array(
             let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
             if *pg_type == Type::TIMESTAMPTZ {
                 for row in rows {
-                    match row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx) {
+                    match row
+                        .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(col_idx)
+                        .map_err(|_| unrepresentable_temporal(column, "TIMESTAMPTZ"))?
+                    {
                         Some(ts) => b.append_value(ts.timestamp_micros()),
                         None => b.append_null(),
                     }

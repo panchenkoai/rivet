@@ -1291,6 +1291,24 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
     // event's `poison`; the sink raises it ONLY if this event routes to a captured
     // table (uncaptured tables are dropped without ever surfacing it).
     let unrecovered = recover_unchanged_toast(&mut named, old_named.as_deref());
+    // Same deferral, same reason: the slot decodes every table in the database, so
+    // an unrepresentable value on an UNCAPTURED table must not bail this run.
+    let infinite: Vec<String> = named
+        .iter()
+        .filter(|c| c.unrepresentable)
+        .map(|c| c.name.clone())
+        .collect();
+    let infinity_poison = (!infinite.is_empty()).then(|| {
+        format!(
+            "pg cdc: {schema}.{table}: column(s) [{}] hold PostgreSQL's `infinity` / \
+             `-infinity` sentinel, which has no instant Arrow can represent. rivet \
+             refuses rather than writing NULL, because a NULL here is \
+             indistinguishable from a genuinely absent value and every count and \
+             checksum would agree about the loss. Map the sentinels to real bounds in \
+             the source, or exclude the column from capture.",
+            infinite.join(", ")
+        )
+    });
     let poison = (!unrecovered.is_empty()).then(|| {
         format!(
             "pg cdc: {schema}.{table}: column(s) [{}] arrived as an unchanged-TOAST \
@@ -1333,7 +1351,7 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
         // would not trigger a premature roll.
         committed: false,
         seq: 0, // stamped by TxnSeq as the stream is consumed
-        poison,
+        poison: poison.or(infinity_poison),
     }))
 }
 
@@ -1348,6 +1366,11 @@ struct ParsedColumn {
     name: String,
     value: RivetValue,
     toast_unchanged: bool,
+    /// The wire text held a value the target type cannot represent, so `value` is
+    /// a stand-in NULL that must NOT be delivered as data. Recorded here because
+    /// this is the last place the raw rendering exists — one level up the value is
+    /// already `Null` and indistinguishable from a genuine one.
+    unrepresentable: bool,
 }
 
 fn parse_columns(s: &str) -> Vec<ParsedColumn> {
@@ -1368,10 +1391,26 @@ fn parse_columns(s: &str) -> Vec<ParsedColumn> {
         // marker arrives quoted (`'unchanged-toast-datum'`), so the quoted flag
         // disambiguates — no false positive on real data.
         let toast_unchanged = !quoted && val == "unchanged-toast-datum";
+        // PostgreSQL's `infinity` / `-infinity` sentinels are ordinary, ordered
+        // values on a timestamp or date column — and `chrono` has no instant for
+        // them, so the parser fell through to NULL. That is silent loss of a real
+        // value: every count and checksum fold skips nulls, so the sink's two-ended
+        // check agreed with itself while two of three rows lost their timestamp
+        // (round-9 bughunt, measured). The batch leg PANICKED on the same value; it
+        // now refuses loudly, and this is the CDC half of that parity.
+        // NOT gated on `quoted`, unlike the TOAST sentinel above: `test_decoding`
+        // renders this one WITH quotes (`expires[timestamp with time zone]:'infinity'`,
+        // measured), and on a timestamp or date column no genuine text value can
+        // collide — the TYPE is the disambiguator here, where for TOAST it was the
+        // quoting. Getting that backwards made the first cut of this guard silently
+        // inert; the run still reported `status: success, rows: 2`.
+        let unrepresentable = (typ.starts_with("timestamp") || *typ == *"date")
+            && (val == "infinity" || val == "-infinity");
         out.push(ParsedColumn {
             name,
             value: map_pg_value(typ, &val, quoted),
             toast_unchanged,
+            unrepresentable,
         });
         rest = after_colon[consumed..].trim_start();
     }
