@@ -1178,14 +1178,22 @@ mod tests {
              rare cause sends the operator to repair something that is not broken: \
              {err}"
         );
+        // POSITIVE, not a list of phrasings to avoid. The first version of this
+        // assertion banned two exact strings, and round 7 walked straight past it:
+        // rewording the last sentence to "To clear it, execute
+        // `sys.sp_cdc_disable_table` … and then re-enable capture" restored the
+        // destructive advice with the test still green (measured — 1 passed). A
+        // negative substring check enumerates the ways a mistake can be SPELLED; the
+        // warning either survives a rewrite or the test fails, which is the only
+        // formulation a reword cannot slip through.
         assert!(
-            !err.contains("Run `EXEC sys.sp_cdc_disable_table`")
-                && !err.contains("Run `sp_cdc_disable_table`"),
-            "and it must NOT prescribe disabling. MEASURED both branches: under the \
-             permission cause that command SUCCEEDS and destroys a working capture \
-             instance with every change it still holds; under the orphan cause it \
-             FAILS with Msg 22931. A hint that is destructive on one branch and \
-             impossible on the other is worse than no hint: {err}"
+            err.contains("Do NOT run `sp_cdc_disable_table`"),
+            "the message must carry the explicit warning, not merely avoid one \
+             phrasing of the advice. MEASURED both branches: under the permission \
+             cause that command SUCCEEDS and destroys a working capture instance with \
+             every change it still holds; under the orphan cause it FAILS with Msg \
+             22931. Destructive on one branch, impossible on the other — an operator \
+             has to be told so in the message itself: {err}"
         );
         assert!(
             !err.contains("does not know"),
