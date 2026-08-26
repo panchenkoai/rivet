@@ -7621,3 +7621,82 @@ fn an_idle_cycle_does_not_blind_validate_to_a_missing_part() {
         "and it must name the missing part, not merely fail:\n{said}"
     );
 }
+
+/// A bounded run must reach its OPEN-TIME bound across an empty-transaction span,
+/// not stop at the first one it meets after its first data.
+///
+/// Round-10 bughunt. `release_empty_frontier` is what lets a run slide the slot past
+/// WAL that decodes to nothing, and it was gated on `yielded_data` — a RUN-SCOPED
+/// latch set by the first data event and never cleared. So the guard answered "did
+/// this run ever yield?" instead of "is anything still owed downstream", and a run
+/// that yielded data first then exhausted at the next all-empty peek window.
+///
+/// MEASURED before the fix, everything committed BEFORE run 1 opened, `until_current:
+/// true`, `rollover: 5`, WAL laid out `1 row | 6 empty DDL transactions | 3 rows`:
+/// run 1 delivered 1, run 2 the other 3, run 3 nothing. Three `status: success` runs
+/// to drain four rows, no warning, `_SUCCESS` claiming the prefix complete while
+/// in-bound committed data sat unread and the slot stayed pinned behind it. On a
+/// workload that recurs this shape — temp tables per request, autovacuum ANALYZE,
+/// partition maintenance — the drain rate collapses to one transaction per scheduler
+/// cycle and WAL grows without bound.
+///
+/// The empty span is not exotic: `CREATE TEMP TABLE … DROP` decodes as a row-less
+/// BEGIN/COMMIT, and EVERY wire row counts against the peek budget, so roughly
+/// `rollover/2` of them fill a window.
+///
+/// The ack discharges the latch now: everything yielded up to the acked position is
+/// durable, so a data-free span past it has nothing to lose.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn a_bounded_run_reaches_its_bound_across_an_empty_transaction_span() {
+    let cdc_db = CdcDb::new("cdc_empty_span");
+    let slot = unique_name("rivet_espan_slot").to_lowercase();
+    let tbl = unique_name("rivet_cdc_espan").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+
+    // Everything below is committed BEFORE the run opens, so `until_current`'s
+    // open-time snapshot covers all of it — a run that stops early is not "caught
+    // up", it gave up.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
+        .unwrap();
+    for i in 0..6 {
+        c.batch_execute(&format!(
+            "CREATE TEMP TABLE espan_tmp{i}(x int); DROP TABLE espan_tmp{i}"
+        ))
+        .unwrap();
+    }
+    c.execute(
+        &format!("INSERT INTO {tbl} VALUES (2,20),(3,30),(4,40)"),
+        &[],
+    )
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&format!("public.{tbl}"), &slot)
+        .source_url(cdc_db.url())
+        .cdc_line("rollover: 5");
+    rig.run_ok();
+
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(&rig.out_dir())
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(
+        got,
+        [1, 2, 3, 4]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "ONE bounded run must deliver every row committed before it opened. Before \
+         the fix this returned {{1}} — the run met the empty DDL span, exhausted, and \
+         wrote `_SUCCESS` over a prefix missing three quarters of its data, with the \
+         slot still pinned behind it"
+    );
+}

@@ -934,15 +934,24 @@ fn mongo_cdc_warns_when_a_configured_collection_does_not_exist() {
         !out.contains("could not find"),
         "an existing collection is the ordinary case and must not warn. Got:\n{out}"
     );
-    // The OUTCOME too: the real collection beside the ghost must still capture, or
-    // a wedged run would satisfy every assertion about the warning text while
-    // delivering nothing (the conformance gate refuses a capture test that never
-    // says what was delivered).
-    let delivered = read_mongo_cdc_changes(&rig.out_dir()).len();
+    // The OUTCOME too, and it has to be a real one. The first version of this
+    // assertion read the GHOST rig's destination and demanded a row — which is
+    // wrong twice over: that export captures `no_such_collection`, so zero is the
+    // CORRECT answer, and the `real` write happened before either rig anchored, so
+    // nothing was in bound for the other either. It was written to satisfy the
+    // conformance gate without checking what the fixture does, which is the exact
+    // defect this suite keeps finding in other people's tests.
+    //
+    // The claim being proven is "a missing collection WARNS rather than refusing",
+    // and what makes that claim bite is that capture still WORKS afterwards — so
+    // write AFTER the anchor and read it back.
+    m.upsert_set("real", 2, "v", "after-anchor");
+    quiet.run_ok();
+    let delivered = read_mongo_cdc_changes(&quiet.out_dir()).len();
     assert_eq!(
         delivered, 1,
-        "a missing collection is a WARNING, not a refusal — the neighbouring \
-         collection's write must still arrive"
+        "the warning path must not wedge capture — a change written after the anchor \
+         has to arrive, or `warning, not refusal` is an empty claim"
     );
 }
 

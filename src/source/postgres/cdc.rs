@@ -1046,7 +1046,25 @@ impl ChangeStream for PgChangeStream {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("pg cdc ack: position missing 'lsn'"))?
             .to_string();
-        self.advance_slot(&lsn)
+        self.advance_slot(&lsn)?;
+        // The ack DISCHARGES the latch: everything yielded up to here is durable at
+        // the destination, so a data-free span PAST it has nothing to lose and may be
+        // released by `release_empty_frontier`. Leaving `yielded_data` set for the
+        // whole run made the guard answer "did this run ever yield?" instead of "is
+        // anything still owed downstream", and a bounded run then STOPPED at the first
+        // empty span it met after its first data.
+        //
+        // MEASURED on the pg16 CDC stand, everything committed BEFORE run 1 opened,
+        // `until_current: true`, `rollover: 5`, WAL laid out as
+        // `1 row | 6 empty DDL transactions | 3 rows`: run 1 delivered 1 row, run 2
+        // the other 3, run 3 nothing. Four rows, three `status: success` runs, no
+        // warning — `_SUCCESS` claiming a prefix complete while in-bound committed
+        // data sat unread and the slot stayed pinned behind it. The empty span need
+        // not be exotic: `CREATE TEMP TABLE … DROP` and a bare `ANALYZE` each decode
+        // as a row-less BEGIN/COMMIT, and every wire row counts against the peek
+        // budget, so ~rollover/2 of them fill a window.
+        self.yielded_data = false;
+        Ok(())
     }
 }
 
