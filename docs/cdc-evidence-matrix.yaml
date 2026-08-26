@@ -479,3 +479,58 @@ shapes:
         delete (measured {_id:9,v:'doomed'}, not the earlier 'seed'). RED against
         `ChangeOp::Delete => cse.full_document` — and the disagreement is the finding: the
         pre-existing delete test stays GREEN against that same mutant." 
+
+  - id: every_reading_of_one_config_agrees
+    what: >
+      A CDC export's `table:` is read by MORE THAN ONE subsystem — the event router,
+      the schema probe, the `initial: snapshot` baseline, the preflight type report
+      that `rivet load` plans the warehouse from, and the manifest's recorded
+      identity. Each resolves the string independently. They must all land on ONE
+      relation, and where an engine's CATALOG can name it (a SQL Server capture
+      instance, a PostgreSQL candidate query) the catalog is what they must follow —
+      never the connection's default schema and never a name split by a rule the
+      engine does not have.
+    mutant: >
+      Point any ONE reading back at the raw configured string (drop the resolved pair
+      from the schema probe, from the snapshot leg's read, from the preflight query,
+      or split a Mongo collection name on the first dot). A sound cell goes RED on
+      the CONTENT — wrong columns, a fabricated baseline, a foreign identity in the
+      manifest — never on a count, because every count stays plausible.
+      MEASURED on SQL Server 2026-08-26: with the schema probe reading the default
+      schema, an export ran `status: success`, exit 0, no warning, and the parquet
+      carried a decoy table's columns while the captured relation's only data column
+      was absent entirely; the `initial: snapshot` leg deposited a row that had never
+      existed in the captured table into that table's own prefix.
+    postgres:
+      sound: "pg_cdc_classification_asks_about_the_resolved_relation_not_the_search_path_one
+        (live_cdc.rs) — RED before the fix on a run that printed two contradictory
+        sentences: a WARN that the name resolves to deep.vv, then an Error that it is
+        a VIEW and to capture the base table it reads — the relation the warning had
+        just elected. PostgreSQL's readings are the candidate query, classification
+        and the schema probe."
+    mysql:
+      sound: "roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds
+        (live_cdc.rs) — MySQL's second reader is the SERVER-WIDE binlog, which the
+        privilege-filtered catalog structurally cannot see, so agreement here means
+        the catalog precheck and the wire guard refuse the same config. RED against
+        removing either half; both postures measured (root sees both databases and
+        bails at the precheck; the `rivet` user's filtered catalog passes and the
+        wire guard bails on the first foreign event)."
+    mssql:
+      sound: "mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema
+        + mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema
+        + mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable
+        (live_cdc_mssql.rs). Three readings, three tests: the drain's probe, the
+        snapshot baseline, and `rivet check` (whose report `rivet load` plans the
+        warehouse schema from — asserted in the first test). Each RED-proven against
+        the reading it guards. This engine earned the shape: it is the only one whose
+        `table:` is accompanied by a second identifier (`capture_instance:`) that
+        settles the question outright, and it was the last to consult it."
+    mongo:
+      sound: "mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling
+        (live_cdc_mongo.rs) — Mongo's disagreement is not about schemas but about how
+        many READINGS a dotted name has. RED-proven twice on one fixture: with the
+        router's split arm restored the capture takes the sibling collection too
+        ({dotted, sibling} vs {dotted}), and with finalize's engine-blind split
+        restored the snapshot leg's manifest records {schema: <db>, table: orders} —
+        a different, existing collection. The database is not a schema."
