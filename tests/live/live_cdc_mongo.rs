@@ -934,6 +934,16 @@ fn mongo_cdc_warns_when_a_configured_collection_does_not_exist() {
         !out.contains("could not find"),
         "an existing collection is the ordinary case and must not warn. Got:\n{out}"
     );
+    // The OUTCOME too: the real collection beside the ghost must still capture, or
+    // a wedged run would satisfy every assertion about the warning text while
+    // delivering nothing (the conformance gate refuses a capture test that never
+    // says what was delivered).
+    let delivered = read_mongo_cdc_changes(&rig.out_dir()).len();
+    assert_eq!(
+        delivered, 1,
+        "a missing collection is a WARNING, not a refusal — the neighbouring \
+         collection's write must still arrive"
+    );
 }
 
 /// `rivet cdc --output --format csv` on Mongo — the SUBCOMMAND's text writer over

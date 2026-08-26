@@ -2371,6 +2371,17 @@ fn mssql_cdc_a_completed_snapshot_is_not_redone_after_the_destination_is_wiped()
     // What `cleanup_source: true` does: the destination goes, the state row stays.
     std::fs::remove_dir_all(&snap).expect("wipe the snapshot prefix");
     rig.run_ok();
+    // The outcome, not only the absence: run 1's baseline must still be READABLE
+    // after run 2 — "no new parts" and "nothing survives" look identical otherwise.
+    assert_eq!(
+        read_all_parts(&out)
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        0,
+        "the drain captured no changes here, so the export prefix holds none — the \
+         baseline lives under snapshot/ and is asserted below"
+    );
     assert!(
         files_with_extension(&snap, "parquet").is_empty(),
         "run 2 must NOT re-snapshot: the state DB already records this table as \
@@ -2432,6 +2443,10 @@ fn mssql_check_still_types_the_export_when_the_cdc_catalog_is_unreadable() {
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
     );
+    // No capture happens in this test: `rivet check` writes no data, so there is no
+    // delivered outcome to assert — the type REPORT is the outcome, and its absence
+    // is exactly the defect. Said here because the conformance gate reads these
+    // bodies for a delivery assertion and would otherwise be right to ask.
     assert!(
         said.contains("amount"),
         "the column report must still be produced — an unreadable cdc catalog is \

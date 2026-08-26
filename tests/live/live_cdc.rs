@@ -7303,6 +7303,19 @@ fn pg_cdc_says_the_inheritance_gap_once_per_run_not_twice() {
         "the fixture is not inert — the inheritance gap must be reported at all, \
          naming the child whose direct writes would be dropped:\n{said}"
     );
+    // The OUTCOME, not just the warning: a `Partial` config still captures the
+    // parent's own rows, and a 0-row success would satisfy every assertion about
+    // the message while proving the capture broken (the conformance gate refuses a
+    // capture test that never says what was delivered).
+    let delivered: usize = read_all_parts(&rig.out_dir())
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        delivered, 1,
+        "the parent's own row must still be captured — the inheritance gap is about \
+         rows written DIRECTLY to a child, not about the parent's"
+    );
     assert_eq!(
         said.matches("inheritance child table(s)").count(),
         1,

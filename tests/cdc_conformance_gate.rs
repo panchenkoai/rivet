@@ -383,6 +383,10 @@ fn derived_capture_marker_set_is_pinned() {
         "run_args(",
         "run_args_env(",
         "run_expect_fail(",
+        // `Rig::run_in_dir` — the working-directory seam added for the relative
+        // `cdc.checkpoint:` contract (a relative path must follow the CONFIG, not the
+        // process CWD). It spawns rivet, so it is a capture marker like its siblings.
+        "run_in_dir(",
         "run_ok(",
         "run_ok_capture(",
         "run_rivet(",
@@ -783,6 +787,14 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // …and the same command driven through the rig, which supplies
                 // the config flag itself.
                 || chunk.contains("cli(&[\"validate\"")
+                // `rivet check` writes NOTHING — it types the source and reports.
+                // Demanding "what was delivered" from it asks a question with no
+                // answer, the same way it does for `validate`; the report itself is
+                // the outcome, and its ABSENCE is the defect such a test guards
+                // (round-9: an unreadable cdc catalog made `check --type-report`
+                // print a verdict and exit 0 with no column table at all).
+                || chunk.contains("\"check\",")
+                || chunk.contains("cli(&[\"check\"")
                 // External-warehouse oracles (the strongest read-back in the
                 // suite): the CDC parquet is loaded and queried by another engine.
                 || chunk.contains("duckdb_run_sql_json(")
