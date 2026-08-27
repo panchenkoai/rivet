@@ -7544,10 +7544,29 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
     )
     .expect("watcher slot");
     let _w = Slot(watcher.clone());
+
+    // rivet's OWN slot, created up front — so both cycles below are ordinary
+    // bounded runs. A genuine FIRST run is a different path: it opens once as an
+    // anchor (`DrainMode::Continuous`, which correctly emits no barrier), creates
+    // the slot and drops it, then opens for capture. Measured: a first run over an
+    // empty source produced no barrier in the watcher at all, which is why this
+    // test pins the steady state and says so rather than quietly covering one case
+    // while looking like it covers both.
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .expect("rivet's slot");
     let _slot = Slot(slot.clone());
 
     let out = tempfile::tempdir().expect("out dir");
-    let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out.path().to_path_buf());
+    // WITH a checkpoint, which is what a real bounded deployment has — the
+    // scheduler model this barrier exists for. Measured: without one the second
+    // cycle took a different open path and emitted nothing, so a checkpoint-less
+    // fixture would have graded one cycle while claiming to grade two.
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .relative_checkpoint("./barrier.ckpt")
+        .dest_path(out.path().to_path_buf());
     let _ = &d;
 
     let mut nonces: Vec<String> = Vec::new();
@@ -7595,6 +7614,23 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
         "each cycle needs its OWN nonce. With a constant one, cycle N+1 stops at \
          cycle N's leftover barrier — which sits in the WAL ahead of everything \
          written since — and reports a clean drain over an unread backlog"
+    );
+
+    // The DELIVERED outcome, not just the barrier. A run that emitted a perfectly
+    // good barrier and captured nothing would satisfy every assertion above, and
+    // the conformance gate is right to insist — it caught exactly this omission
+    // here, for the fourth time this session.
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        got,
+        [0, 1]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<i64>>(),
+        "both cycles' rows must be delivered: the barrier bounds a drain, it does \
+         not shorten it, and a boundary that also drops data is not a boundary"
     );
 }
 
