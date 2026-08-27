@@ -1266,6 +1266,20 @@ mod tests {
         // two events' worth, giving 2+2+2; `>` would roll only past it, giving 3+3.
         // Both are "more than one part", so the loose assertion could not tell the
         // boundary apart — measured, the `>= -> >` mutant survived it.
+        // The manifest's part_ids are 1-BASED, matching what the batch path records.
+        // `(i + 1)` -> `i * 1` renumbers them 0..n-1: still unique, so the manifest's
+        // own consistency check passes, and the ledger keys parts by file name so
+        // nothing cross-references them either — the mutant is behaviourally
+        // equivalent and survived. The `+ 1` is not redundant though: it is a wire
+        // convention a downstream consumer can join on, so it is PINNED here rather
+        // than deleted. (Contrast the `*s > 0` filter in `refine_decimal_scales`,
+        // which guarded a write that changed nothing and was removed.)
+        assert_eq!(
+            manifest.parts.iter().map(|p| p.part_id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "CDC manifest part ids are 1-based and contiguous; a silent renumbering \
+             is a wire-format change for anything joining on them"
+        );
         assert_eq!(
             manifest.part_count, 3,
             "6 events at a byte cap of exactly two events' worth must land in three \
