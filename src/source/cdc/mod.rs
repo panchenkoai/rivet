@@ -628,6 +628,44 @@ pub(crate) enum RowImage {
     /// wrong rather than merely thin, so this is refused.
     Partial { why: String },
 }
+impl CdcEngine {
+    /// Can this engine's wire format ever map a row image by POSITION rather than
+    /// by column name?
+    ///
+    /// MySQL only, and it is a property of the binlog: `binlog_row_metadata` may
+    /// omit column names, and the events replay whatever was in force when they
+    /// were WRITTEN. PostgreSQL's `test_decoding` names every column, SQL Server's
+    /// change tables are relational, and Mongo's events are documents — none of
+    /// them can produce a nameless image, so `None` there is a FACT and not a TODO.
+    ///
+    /// Extracted from `positional_mapping_warning`'s dispatch, which is live-only
+    /// glue: `-> None` survived, and with it the whole warning disappears on the one
+    /// engine that needs it. The fact now has one home instead of being restated in
+    /// a match arm and a doc comment.
+    pub(crate) fn maps_by_position(self) -> bool {
+        match self {
+            Self::Mysql => true,
+            Self::Postgres | Self::Mssql | Self::Mongo => false,
+        }
+    }
+
+    /// Does this engine make the SERVER retain log on the reader's behalf?
+    ///
+    /// PostgreSQL only, and structurally: a replication slot is the one CDC anchor
+    /// that pins WAL until the reader acks. MySQL's binlog and SQL Server's change
+    /// tables expire on their own schedule whatever rivet does — which is why they
+    /// can LOSE data to retention and PostgreSQL instead fills a disk — and Mongo's
+    /// oplog is capped. There is nothing to pin, so nothing to warn about.
+    ///
+    /// The inverse of this predicate is the reason those three engines need the
+    /// retention checks in `doctor` that PostgreSQL does not.
+    pub(crate) fn pins_log_for_reader(self) -> bool {
+        match self {
+            Self::Postgres => true,
+            Self::Mysql | Self::Mssql | Self::Mongo => false,
+        }
+    }
+}
 
 impl CdcEngine {
     /// Ask the source what it can supply for the tables about to be captured.
@@ -679,10 +717,10 @@ impl CdcEngine {
         url: &str,
         tls: Option<&TlsConfig>,
     ) -> Option<String> {
-        match self {
-            Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_metadata(url, tls),
-            Self::Postgres | Self::Mssql | Self::Mongo => None,
+        if !self.maps_by_position() {
+            return None;
         }
+        crate::source::mysql::cdc::MysqlChangeStream::row_metadata(url, tls)
     }
 
     /// WAL this source is holding that an operator should know about before the run
@@ -710,9 +748,9 @@ impl CdcEngine {
         tls: Option<&TlsConfig>,
         opts: &CdcEngineOpts,
     ) -> Vec<String> {
-        let Self::Postgres = self else {
+        if !self.pins_log_for_reader() {
             return Vec::new();
-        };
+        }
         let CdcEngineOpts::Postgres { slot, .. } = opts else {
             return Vec::new();
         };
@@ -1472,6 +1510,104 @@ mod mod_decisions {
             "2 GiB — `*` -> `+` collapses it to 3074 bytes, which refuses every \
              transaction that carries more than a couple of rows"
         );
+    }
+
+    /// Both engine facts, EVERY variant — derived from the enum rather than typed
+    /// in, so a fifth CDC engine cannot arrive without an answer here.
+    ///
+    /// These were `match` arms inside live-only dispatchers, and their mutants
+    /// (`-> None`, `delete match arm`) survived: with `positional_mapping_warning`
+    /// silenced, the one engine that CAN map by position stops warning about it,
+    /// which is the exact class rounds 15-17 spent three rounds on.
+    #[test]
+    fn every_cdc_engine_answers_both_engine_facts_and_only_one_engine_answers_yes() {
+        let all = [
+            CdcEngine::Mysql,
+            CdcEngine::Postgres,
+            CdcEngine::Mssql,
+            CdcEngine::Mongo,
+        ];
+
+        let positional: Vec<CdcEngine> = all
+            .iter()
+            .copied()
+            .filter(|e| e.maps_by_position())
+            .collect();
+        assert_eq!(
+            positional,
+            vec![CdcEngine::Mysql],
+            "MySQL is the ONLY engine whose wire format can omit column names — \
+             `test_decoding` names every column, SQL Server's change tables are \
+             relational, Mongo's events are documents. Answering `false` for MySQL \
+             silences the warning on the one engine that needs it; answering `true` \
+             elsewhere warns about something those engines cannot do."
+        );
+
+        let pinning: Vec<CdcEngine> = all
+            .iter()
+            .copied()
+            .filter(|e| e.pins_log_for_reader())
+            .collect();
+        assert_eq!(
+            pinning,
+            vec![CdcEngine::Postgres],
+            "a replication slot is the only anchor that makes the SERVER retain log \
+             until the reader acks — which is why PostgreSQL fills a disk where the \
+             others lose data to retention. Both errors are silent: `false` for PG \
+             drops the WAL-growth warning, `true` elsewhere promises a retention \
+             guarantee those engines do not give."
+        );
+
+        // MUTUALLY EXCLUSIVE, not a partition: SQL Server and MongoDB answer `false`
+        // to both, and that is correct — their logs neither omit column names nor
+        // wait on a reader. What must never happen is ONE engine claiming both,
+        // which would mean a nameless wire format whose retention rivet also owns.
+        for e in all {
+            assert!(
+                !(e.maps_by_position() && e.pins_log_for_reader()),
+                "{e:?} claims both facts. No engine has a nameless image AND a \
+                 reader-pinned log; an engine that did would need the positional \
+                 warning and the WAL-growth warning to agree about the same events, \
+                 and nothing in the sink arranges that."
+            );
+        }
+        assert_eq!(
+            all.iter().filter(|e| e.maps_by_position()).count()
+                + all.iter().filter(|e| e.pins_log_for_reader()).count(),
+            2,
+            "exactly two of the four answer yes to exactly one fact each — a count \
+             that would move the moment either predicate became `true` everywhere"
+        );
+    }
+
+    /// A stream that resolves no catalog identity must say NOTHING, not a name.
+    ///
+    /// `ChangeStream::resolved_identity` defaults to `None` — "this adapter cannot
+    /// resolve the configured string against a catalog". Four mutants replaced that
+    /// with `Some((...))`, and each hands the router a fabricated schema/table pair
+    /// for every adapter that does not override it. Names are labels; catalogs are
+    /// truth, and a fabricated label routes events to a relation nobody asked for.
+    #[test]
+    fn an_adapter_that_resolves_no_identity_returns_none_not_a_fabricated_pair() {
+        struct Unresolving;
+        impl ChangeStream for Unresolving {
+            fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+                None
+            }
+            fn ack(&mut self, _position: &Position) -> Result<()> {
+                Ok(())
+            }
+            fn engine(&self) -> CdcEngine {
+                CdcEngine::Mongo
+            }
+        }
+        assert_eq!(
+            Unresolving.resolved_identity("anything"),
+            None,
+            "the default must be `no answer`. Any `Some` here — including a pair of \
+             empty strings — is a claim about a catalog the adapter never read."
+        );
+        assert_eq!(Unresolving.resolved_identity(""), None);
     }
 
     /// `__seq` is the intra-transaction ordinal the load's dedup sorts by, together
