@@ -1682,3 +1682,104 @@ mod spill_cost {
         );
     }
 }
+
+/// What ONE buffered change actually costs in memory — measured, because the cap
+/// that is supposed to bound it charges a number computed a different way.
+///
+///     cargo test --release --lib event_cost -- --ignored --nocapture
+#[cfg(test)]
+mod event_cost {
+    use super::*;
+    use serde_json::json;
+
+    #[cfg(target_os = "macos")]
+    fn rss_bytes() -> u64 {
+        // `ru_maxrss` is BYTES on macOS, KILOBYTES on Linux — one field, two
+        // meanings, and reading it wrong is a 1024x error.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+            return 0;
+        }
+        ru.ru_maxrss.max(0) as u64
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn rss_bytes() -> u64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+            return 0;
+        }
+        (ru.ru_maxrss.max(0) as u64) * 1024
+    }
+
+    fn narrow(i: u64, names: &std::sync::Arc<[String]>, pos: &Position) -> ChangeEvent {
+        ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "public".into(),
+            table: "orders".into(),
+            before: None,
+            after: Some(vec![
+                RivetValue::Int(i as i64),
+                RivetValue::Int(i as i64),
+                RivetValue::Bytes(b"x".to_vec()),
+            ]),
+            position: pos.clone(),
+            committed: false,
+            image_names: Some(names.clone()),
+            seq: i,
+            poison: None,
+        }
+    }
+
+    /// Where a buffered transaction's memory actually goes.
+    ///
+    /// The soak measures a whole process; this measures the events alone, so the
+    /// cost can be ATTRIBUTED instead of guessed. Peak RSS is monotonic, so each
+    /// arm runs from a fresh high-water mark by allocating the largest arm first
+    /// and reporting deltas — read the per-event numbers, not the totals.
+    #[test]
+    #[ignore = "measurement: run with --release --nocapture"]
+    fn what_does_one_buffered_change_actually_cost() {
+        const N: u64 = 1_000_000;
+        let names: std::sync::Arc<[String]> =
+            std::sync::Arc::from(["id", "v", "pad"].map(String::from).to_vec());
+        let pos = Position(json!({ "lsn": "0/16B2E00" }));
+
+        println!(
+            "size_of::<ChangeEvent>() = {} B (inline only — every String, Vec, Arc \
+             and the position's JSON map are separate heap allocations on top)",
+            std::mem::size_of::<ChangeEvent>()
+        );
+
+        let before = rss_bytes();
+        let mut v: Vec<ChangeEvent> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            v.push(narrow(i, &names, &pos));
+        }
+        let after = rss_bytes();
+        let per = (after - before) as f64 / N as f64;
+        let estimated: usize = v.iter().map(ChangeEvent::estimated_bytes).sum();
+        println!(
+            "{N} narrow events: RSS +{:.0} MB -> {per:.0} B/event | \
+             estimated_bytes says {:.0} B/event | the cap under-counts {:.1}x",
+            (after - before) as f64 / 1e6,
+            estimated as f64 / N as f64,
+            per / (estimated as f64 / N as f64),
+        );
+
+        // Attribute the position: the framer stamps `ev.position = commit.clone()`
+        // on EVERY event, and `Position` wraps a `serde_json::Value` — an object
+        // whose map, key and value are separate allocations, cloned a million times
+        // for one transaction. Sharing it would cost one.
+        let mid = rss_bytes();
+        let shared: Vec<serde_json::Value> = (0..N).map(|_| pos.0.clone()).collect();
+        let end = rss_bytes();
+        println!(
+            "{N} cloned positions alone: RSS +{:.0} MB -> {:.0} B/clone",
+            (end - mid) as f64 / 1e6,
+            (end - mid) as f64 / N as f64,
+        );
+        // Touch both so nothing is optimised away.
+        assert_eq!(v.len(), N as usize);
+        assert_eq!(shared.len(), N as usize);
+    }
+}
