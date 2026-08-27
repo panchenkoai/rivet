@@ -775,6 +775,45 @@ pub(crate) fn drain_is_complete(hit_max: bool, yielded_this_pass: usize) -> bool
     hit_max || yielded_this_pass == 0
 }
 
+/// A NAMED image whose value count disagrees with its name count — a PARTIAL
+/// image. `Some((values, names))` when they disagree, and the caller formats.
+///
+/// Round 13's guard, which lived as an `if` inside `flush` and was proven only by a
+/// live test (`SET GLOBAL binlog_row_image=MINIMAL`, one UPDATE). Offline, its `!=`
+/// → `==` mutant survived: refusing every image whose arity AGREES is the whole
+/// stream, so a green suite said nothing about the case that matters.
+///
+/// A key-only DELETE is not a counter-example: PostgreSQL names only the key
+/// columns it also supplies, so its lengths agree.
+pub(crate) fn named_image_arity_mismatch(ev: &ChangeEvent) -> Option<(usize, usize)> {
+    let names = ev.image_names.as_deref()?;
+    let n = ev.after.as_ref().or(ev.before.as_ref()).map_or(0, Vec::len);
+    (n != names.len()).then_some((n, names.len()))
+}
+
+/// A NAMELESS image mapped by POSITION whose width disagrees with the schema —
+/// a DDL landed inside the capture window. `Some(values)` when it does.
+///
+/// The DELETE arm is `>` and not `!=` on purpose: a key-only delete legitimately
+/// carries FEWER values than the table has columns, so only an image WIDER than the
+/// schema is evidence of drift. `>` → `<` inverts that into "refuse every key-only
+/// delete and accept every wide one" — it survived offline because the condition
+/// sat inside live-only glue.
+pub(crate) fn positional_image_width_mismatch(ev: &ChangeEvent, ncols: usize) -> Option<usize> {
+    if ev.image_names.is_some() {
+        return None;
+    }
+    let is_delete = ev.op == ChangeOp::Delete;
+    let vals = if is_delete {
+        ev.before.as_ref()?
+    } else {
+        ev.after.as_ref()?
+    };
+    let n = vals.len();
+    let bad = if is_delete { n > ncols } else { n != ncols };
+    bad.then_some(n)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flush(
     events: &[ChangeEvent],
@@ -814,8 +853,7 @@ fn flush(
         // row-image carries everything) — a SHORTER delete image maps by
         // prefix; an image WIDER than the schema, or a non-delete image of
         // ANY other arity, proves a stale pre-DDL layout.
-        let is_delete = ev.op == ChangeOp::Delete;
-        if let Some(names) = ev.image_names.as_deref() {
+        if ev.image_names.is_some() {
             // Named, but NOT unconditionally trustworthy — this bypass used to be
             // `continue`, and a partial row image walked straight through it.
             //
@@ -835,10 +873,11 @@ fn flush(
             //
             // A key-only DELETE is not a counter-example: PostgreSQL names only the
             // key columns it also supplies, so its lengths agree.
-            let n = ev.after.as_ref().or(ev.before.as_ref()).map_or(0, Vec::len);
-            if n != names.len() {
-                anyhow::bail!(
-                    "cdc: {}.{}: a row image carries {n} value(s) under {} column \
+            let Some((n, nnames)) = named_image_arity_mismatch(ev) else {
+                continue; // named AND complete — mapped by name, arity-proof for any op
+            };
+            anyhow::bail!(
+                "cdc: {}.{}: a row image carries {n} value(s) under {} column \
                      name(s) — a PARTIAL image, which rivet cannot map without \
                      fabricating the missing cells as NULL. On MySQL this is \
                      `binlog_row_image` set to something other than FULL when the \
@@ -846,12 +885,10 @@ fn flush(
                      probe reads only the global). Set `binlog_row_image = FULL` and \
                      re-capture from before the affected DDL/DML; the changes are \
                      still in the binlog, so this is a delay rather than a loss.",
-                    ev.schema,
-                    ev.table,
-                    names.len()
-                );
-            }
-            continue; // named AND complete — mapped by name, arity-proof for any op
+                ev.schema,
+                ev.table,
+                nnames
+            );
         }
         // A NAMELESS image maps by POSITION, and this is the only place that knows
         // it for certain. The open-time probe asks the server what
@@ -865,21 +902,7 @@ fn flush(
         // Once per table per flush, not per event: a MINIMAL backlog is every
         // event, and a line per row is a line nobody reads.
         warn_positional_once(&ev.schema, &ev.table);
-        let img = if is_delete {
-            ev.before.as_ref()
-        } else {
-            ev.after.as_ref()
-        };
-        let bad = |n: usize| {
-            if is_delete {
-                n > columns.len()
-            } else {
-                n != columns.len()
-            }
-        };
-        if let Some(vals) = img
-            && bad(vals.len())
-        {
+        if let Some(n) = positional_image_width_mismatch(ev, columns.len()) {
             anyhow::bail!(
                 "cdc: an event for table '{}' carries {} column(s) but the resolved \
                  schema has {} — a DDL landed inside this capture window, and mapping \
@@ -890,7 +913,7 @@ fn flush(
                  binlog_row_metadata=FULL on the MySQL server (8.0.1+) — rivet then \
                  maps binlog images by column NAME and this error class disappears.",
                 ev.table,
-                vals.len(),
+                n,
                 columns.len()
             );
         }
@@ -1784,6 +1807,122 @@ mod tests {
             &DataType::Int64,
             "a buildable type keeps its own width; degrading everything to Utf8 would \
              satisfy the assertion above and lose every type in the stream"
+        );
+    }
+
+    /// Both arity guards, every arm — four mutants that survived while these were
+    /// `if` conditions inside `flush`.
+    ///
+    /// The NAMED one is round 13's partial-image guard, proven live (`SET GLOBAL
+    /// binlog_row_image=MINIMAL`, one UPDATE, an all-NULL row) and ungraded offline:
+    /// `!=` → `==` refuses every image whose arity AGREES, i.e. the whole stream, so
+    /// a green suite said nothing about the case that matters.
+    #[test]
+    fn a_partial_named_image_and_a_post_ddl_positional_image_are_both_refused() {
+        use std::sync::Arc;
+        let names: Arc<[String]> =
+            Arc::from(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let named = |vals: Vec<i64>| ChangeEvent {
+            after: Some(vals.into_iter().map(RivetValue::Int).collect()),
+            image_names: Some(names.clone()),
+            ..insert(0)
+        };
+
+        assert_eq!(
+            named_image_arity_mismatch(&named(vec![1, 2, 3])),
+            None,
+            "a complete named image is mapped by NAME and is arity-proof — refusing \
+             it stops every stream rivet can actually read"
+        );
+        assert_eq!(
+            named_image_arity_mismatch(&named(vec![1])),
+            Some((1, 3)),
+            "one value under three names is a MINIMAL row image; mapping it resolves \
+             every name past the end of the vector and the row lands all NULL"
+        );
+        // WIDER than its names too — the inequality is not a one-sided `<`.
+        assert_eq!(
+            named_image_arity_mismatch(&named(vec![1, 2, 3, 4])),
+            Some((4, 3))
+        );
+        // A key-only PG DELETE names only what it supplies, so its lengths agree.
+        let key_only: Arc<[String]> = Arc::from(vec!["a".to_string()]);
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Int(1)]),
+            after: None,
+            image_names: Some(key_only),
+            ..insert(0)
+        };
+        assert_eq!(
+            named_image_arity_mismatch(&del),
+            None,
+            "PostgreSQL names only the key columns it also supplies — refusing this \
+             would refuse every PG delete"
+        );
+        // A NAMELESS image is not this guard's business.
+        assert_eq!(
+            named_image_arity_mismatch(&ChangeEvent {
+                after: Some(vec![RivetValue::Int(1)]),
+                image_names: None,
+                ..insert(0)
+            }),
+            None
+        );
+
+        // POSITIONAL. Three schema columns throughout.
+        let anon = |op: ChangeOp, vals: Vec<i64>| {
+            let v: Vec<RivetValue> = vals.into_iter().map(RivetValue::Int).collect();
+            match op {
+                ChangeOp::Delete => ChangeEvent {
+                    op: ChangeOp::Delete,
+                    before: Some(v),
+                    after: None,
+                    image_names: None,
+                    ..insert(0)
+                },
+                _ => ChangeEvent {
+                    after: Some(v),
+                    image_names: None,
+                    ..insert(0)
+                },
+            }
+        };
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2, 3]), 3),
+            None
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2]), 3),
+            Some(2),
+            "a non-delete of any other width proves a stale pre-DDL layout; mapping \
+             it by position puts values into the WRONG columns"
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2, 3, 4]), 3),
+            Some(4)
+        );
+
+        // The DELETE arm is `>` and not `!=` ON PURPOSE, and this is the pair that
+        // says so: SHORTER is legitimate (a key-only delete), WIDER is drift.
+        // `>` → `<` swaps exactly these two answers.
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1]), 3),
+            None,
+            "a key-only delete carries fewer values than the table has columns and \
+             maps by prefix — refusing it is an outage on every engine that emits one"
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1, 2, 3]), 3),
+            None,
+            "a FULL delete image carries every column — MySQL's `binlog_row_image = \
+             FULL` emits exactly this, and it is the BOUNDARY: without it `>` and \
+             `>=` agree on every fixture and the mutant survives (measured)"
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1, 2, 3, 4]), 3),
+            Some(4),
+            "an image WIDER than the schema is drift whatever the op"
         );
     }
 
