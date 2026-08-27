@@ -22,6 +22,7 @@
 mod arrow_convert;
 pub(crate) mod cdc;
 mod from_parse;
+pub(crate) mod pgoutput;
 
 use std::collections::HashMap;
 use std::sync::Arc;
