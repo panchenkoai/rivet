@@ -431,7 +431,18 @@ exclude_re = [
     # the same test also RED against the list-parse mutant and the un-addressed
     # refusal. MySQL guard disabled -> roast_mysql_cdc_refuses_a_truncate_instead_of_
     # silently_diverging FAILS, and again against the un-addressed variant.
-"replace PgChangeStream::fill -> Result",
+# `warn_positional_once` (src/source/cdc/sink.rs) is a LOG line and nothing else,
+    # so `-> ()` leaves every value and every count identical — it survives the lib
+    # suite by construction. It is not ungraded: the warning is the product surface
+    # round 15 argued for, and it has a live oracle.
+    #
+    # Live oracle proven by hand 2026-08-27 (mutant applied, live CDC suite run,
+    # reverted): stubbing the body -> roast_mysql_cdc_warns_on_a_minimal_backlog_a_
+    # full_server_would_hide FAILS, 105 pass / 1 fail. That test is the reason the
+    # warning exists — a server at FULL draining a backlog written under MINIMAL maps
+    # by POSITION, and the open-time probe answers about the present.
+    "replace warn_positional_once with \\(\\)",
+    "replace PgChangeStream::fill -> Result",
     "replace MysqlChangeStream::fill -> Result",
     # The match GUARD on the MySQL TRUNCATE arm sits inside that same live-only body.
     # Flipping it to `true`/`false` is the addressed/un-addressed pair that the live

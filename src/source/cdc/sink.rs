@@ -439,6 +439,15 @@ pub(crate) fn run_to_files(
     // re-runs, and the changes are already gone from the log.
     let drain: Result<()> = (|| {
         loop {
+            // Graded LIVE, not offline, and deliberately not excluded: `+= -> *=`
+            // pins this at 0, `drain_is_complete` then ends the loop after one pass,
+            // and the re-drain starvation tests go RED — measured 2026-08-27, six of
+            // them, led by roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_
+            // transaction. An exclusion would have to name `+= in run_to_files`,
+            // which also matches `total_rows`, `emitted` and `total_bytes` — all
+            // three graded (the first two by the lib suite, the third by
+            // `the_byte_rollover_cap_really_rolls_and_is_not_a_dead_accumulator`).
+            // Over-excluding graded mutants is worse than leaving one MISSED.
             let mut yielded_this_pass = 0usize;
             while let Some(ev) = stream.next_change() {
                 let mut ev = ev?;
@@ -814,6 +823,26 @@ pub(crate) fn positional_image_width_mismatch(ev: &ChangeEvent, ncols: usize) ->
     bad.then_some(n)
 }
 
+/// The O(1) name-lookup memo `image_cell` takes: this column's index in the
+/// image-names vector every event in the flush shares.
+///
+/// Extracted for the reason `pass_must_roll` was: the decision was at the CALL
+/// SITE. `image_cell`'s own matrix passes the memo in, so `n == col` here — a
+/// different `==` from the one inside the predicate — sat in live-only glue and its
+/// `!=` mutant survived. A wrong memo is silent and total: every event in the flush
+/// shares one names-Arc, so a memo pointing at the wrong index maps EVERY row of
+/// that column to a neighbour's value.
+///
+/// `None` when no event carries names (the positional engines) — then `image_cell`
+/// indexes by position and there is nothing to memoise.
+pub(crate) fn image_name_memo<'a>(
+    events: &'a [ChangeEvent],
+    col: &str,
+) -> Option<(&'a std::sync::Arc<[String]>, Option<usize>)> {
+    let names = events.iter().find_map(|e| e.image_names.as_ref())?;
+    Some((names, names.iter().position(|n| n == col)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flush(
     events: &[ChangeEvent],
@@ -934,8 +963,7 @@ fn flush(
         // O(1) name lookup for the common case: all events in a flush share
         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
         // column's image index once and reuse it by pointer identity.
-        let memo_arc = events.iter().find_map(|e| e.image_names.as_ref());
-        let memo = memo_arc.map(|names| (names, names.iter().position(|n| n == &m.column_name)));
+        let memo = image_name_memo(events, &m.column_name);
         let render = value::render_type(m.arrow_type.as_ref());
         let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
             events
@@ -1193,6 +1221,59 @@ mod tests {
     // the commit bookkeeping dropped the boundary — checkpoint never advanced,
     // the captured rows re-read (and re-written) on every scheduler cycle.
     // The boundary is a STREAM property: it must be recorded before routing.
+    /// `rollover_memory_bytes` really rolls — the BYTE cap, driven end to end.
+    ///
+    /// `should_roll` is pure and its unit matrix feeds `buf_bytes` every arm, so the
+    /// DECIDER was well tested. Its SUPPLIER was not: `total_bytes += eb` → `*=`
+    /// pins the accumulator at 0 forever, and the mutant survived the lib suite AND
+    /// the whole live CDC suite (106 tests, measured). Both halves correct, the seam
+    /// between them observed by nothing — the third defect class in CLAUDE.md, and
+    /// the one mutation testing is structurally blind to when you only mutate the
+    /// consumer.
+    ///
+    /// What it costs in production: with the byte cap silently dead, a stream of wide
+    /// rows buffers to the ROW cap instead, so the memory ceiling an operator set is
+    /// not the one they get.
+    ///
+    /// The row cap is set far above the event count on purpose, so the ONLY thing
+    /// that can split these parts is bytes.
+    #[test]
+    fn the_byte_rollover_cap_really_rolls_and_is_not_a_dead_accumulator() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let events: Vec<ChangeEvent> = (1..=6).map(insert).collect();
+        let one = events[0].estimated_bytes();
+        assert!(
+            one > 0,
+            "the fixture is inert: an event must weigh something"
+        );
+
+        let mut stream = FakeStream {
+            events: events.into(),
+            acked: Vec::new(),
+        };
+        let cfg = SinkConfig {
+            // Rows can never trigger: 100 ≫ 6.
+            rollover_memory_bytes: Some(one * 2),
+            ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 100)
+        };
+        let (m, r) = run_to_files(&mut stream, cfg);
+        r.unwrap();
+        let manifest = m.into_iter().next().expect("one table, one manifest");
+        assert_eq!(manifest.row_count, 6, "every event must still be delivered");
+        // EXACTLY three, not merely "more than one". The cap is `>=`, so it rolls AT
+        // two events' worth, giving 2+2+2; `>` would roll only past it, giving 3+3.
+        // Both are "more than one part", so the loose assertion could not tell the
+        // boundary apart — measured, the `>= -> >` mutant survived it.
+        assert_eq!(
+            manifest.part_count, 3,
+            "6 events at a byte cap of exactly two events' worth must land in three \
+             parts: one part means the byte accumulator never moved and the cap is \
+             decoration, two means it rolls one event late"
+        );
+    }
+
     #[test]
     fn commit_boundary_on_an_uncaptured_table_still_advances_the_checkpoint() {
         let d = tempfile::tempdir().unwrap();
@@ -1576,8 +1657,31 @@ mod tests {
         );
         assert_eq!(image_cell(&e, 1, "a", 2, None), Some(&RivetValue::Int(10)));
 
-        // The MEMO is a pointer-identity shortcut and must agree with the search.
-        let memo = Some((&names, names.iter().position(|n| n == "b")));
+        // The MEMO is a pointer-identity shortcut and must agree with the search —
+        // and it comes from `image_name_memo`, not hand-built here, so this grades
+        // the real producer. A closure re-implementing the rule would pass against
+        // the very mutant it is written to catch.
+        let batch = [e.clone()];
+        let memo = image_name_memo(&batch, "b");
+        assert_eq!(
+            memo.expect("the batch carries names").1,
+            Some(1),
+            "the memo must point at `b`'s own index; matching the first name that is \
+             NOT `b` maps every row of that column to a neighbour's value"
+        );
+        assert_eq!(
+            image_name_memo(&batch, "absent")
+                .expect("the batch carries names")
+                .1,
+            None,
+            "a column the image does not name has no memo — a Some here would index \
+             the wrong cell for the whole flush"
+        );
+        assert!(
+            image_name_memo(&[insert(0)], "v").is_none(),
+            "no event carries names ⇒ no memo; the positional engines index by \
+             position and have nothing to memoise"
+        );
         assert_eq!(image_cell(&e, 0, "b", 2, memo), Some(&RivetValue::Int(20)));
         // A memo for a DIFFERENT names-Arc must be ignored, not trusted.
         let other: Arc<[String]> = Arc::from(vec!["b".to_string(), "a".to_string()]);
