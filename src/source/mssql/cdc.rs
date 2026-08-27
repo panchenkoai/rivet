@@ -1410,6 +1410,22 @@ mod tests {
         assert_eq!(numeric_to_decimal_string(15005, 2), "150.05");
         assert_eq!(numeric_to_decimal_string(-7500, 3), "-7.500");
         assert_eq!(numeric_to_decimal_string(42, 0), "42");
+
+        // THE BOUNDARY: `digits.len() == scale`, where the padding decision flips.
+        // `<=` -> `<` survives every case above, because all of them have more
+        // digits than scale. Here it drops the leading zero and emits `.5`, which
+        // is not a decimal literal any reader is obliged to accept — and it reaches
+        // the destination as the column's value.
+        assert_eq!(
+            numeric_to_decimal_string(5, 1),
+            "0.5",
+            "one digit at scale 1 is the boundary; `<` emits `.5`"
+        );
+        assert_eq!(numeric_to_decimal_string(-5, 1), "-0.5");
+        // One BELOW the boundary, so the pad width itself is graded: `scale + 1 -
+        // len` must leave room for the integer zero, not just the fraction.
+        assert_eq!(numeric_to_decimal_string(5, 3), "0.005");
+        assert_eq!(numeric_to_decimal_string(0, 2), "0.00");
         assert_eq!(numeric_to_decimal_string(5, 2), "0.05");
     }
 
