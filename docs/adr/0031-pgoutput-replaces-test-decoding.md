@@ -88,25 +88,43 @@ released CDC and no persistent slot on any stand.
 
 ## Implementation status
 
-Done, and each piece pure and offline-graded:
+Done, and each piece pure and offline-graded against REAL wire bytes:
 
-* `src/source/postgres/pgoutput.rs::decode` — the message decoder, 9 mutants RED
-  against real captured wire bytes (`tests/fixtures/pgoutput/messages.hex`);
+* `pgoutput.rs::decode` — the message decoder. 9 mutants RED
+  (`tests/fixtures/pgoutput/messages.hex`);
 * `…::value_from_binary` — per-OID value decoding through `postgres_types::FromSql`,
-  6 mutants RED against a binary capture (`…/binary_values.hex`).
+  the same implementations the batch export already trusts. 6 mutants RED
+  (`…/binary_values.hex`);
+* `…::Assembler` — the relation cache and `Message` → `ChangeEvent` framing, with
+  `committed` on the true commit boundary. 11 mutants RED;
+* the SCENARIOS live in the rig (`tests/common/pg.rs`: `pg_hard_types_ddl`,
+  `pg_all_null_row`, `in_one_transaction`, `incompressible_text_sql`), and one live
+  test renders them to the fixture. They were a scratch script first, which is the
+  bespoke-harness shape the rig exists to refuse.
 
-Remaining, all of it glue around those two:
+Three protocol facts the move corrected, each measured rather than reasoned:
+
+* **a key-only image is not NARROWER.** A tuple always carries as many cells as the
+  relation has columns; the replica identity decides which hold a VALUE and pads the
+  rest with the NULL tag. This is why `decode_tuple`'s arity check is an equality;
+* **`REPLICA IDENTITY FULL` does not stop an unchanged TOAST in the NEW tuple** —
+  identity shapes the OLD one. Refusing on it would refuse most UPDATEs on any table
+  with a large column, and the obvious advice ("set FULL") would not have helped.
+  The assembler recovers from the pre-image, as the text reader does;
+* **a refusal mid-transaction must poison the rest of it.** A caller that logs the
+  error and keeps feeding otherwise gets a PARTIAL transaction — measured: a DELETE
+  without its UPDATE. At-least-once is transaction-atomic, so half of one is worse
+  than none, and remembering that is not the caller's job.
+
+Remaining, all of it glue around those three:
 
 1. slot creation with `pgoutput`; publication resolution (create or refuse);
-2. the read query and its options;
-3. a relation cache (pgoutput sends `Relation` once, then references it by OID) and
-   `Message` → `ChangeEvent` framing, including `committed` on the true commit
-   boundary — the rule CLAUDE.md already states for every adapter;
-4. delete the text parser, and remove the `allow(dead_code)` the decoder carries
+2. the read query and its options (`binary=true` is the load-bearing half);
+3. delete the text parser, and remove the `allow(dead_code)` the decoder carries
    with its own expiry note;
-5. simplify routing once server-side filtering is in force — measure the classes it
-   actually removes rather than assuming all of them;
-6. the live PG CDC suite: it currently creates `test_decoding` slots in the rig.
+4. simplify routing once server-side filtering is in force — MEASURE which classes
+   it actually removes rather than assuming all of them;
+5. the live PG CDC suite: the rig still creates `test_decoding` slots.
 
 ### Two fixture thresholds this cost, recorded so they are not rediscovered
 
@@ -116,3 +134,6 @@ Remaining, all of it glue around those two:
   incompressible data (concatenated md5s);
 * a NULL INSIDE an array value is not a NULL CELL. The first capture had only the
   former and `Cell::Null -> Cell::Text` survived it.
+* and a third, from the assembler: a transaction of ONE row makes `committed` on
+  the last, on the first, and on every event the same answer. Three rows separate
+  all three.

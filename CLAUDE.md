@@ -156,6 +156,30 @@ checkpointed open must persist its coordinates immediately
 must state which of the three anchor models it has and test the idle
 variant accordingly.
 
+The anchor model also decides whether a checkpoint can be used against the WRONG
+SERVER, and that half was missing until 2026-08-27. A client-side anchor is a set of
+coordinates that mean nothing off the machine that wrote them: MySQL's
+`{file, pos}` parses on every host and addresses a DIFFERENT binlog on each, so
+pointing one config at a new host — a failover, a restored dump, a copied `url:`, a
+stand rebuilt under the same name — resumes from an arbitrary point, capturing what
+is there and skipping what was between, silently in both directions. The
+server-side anchors are immune by construction (a foreign slot simply does not
+exist), which is exactly why nobody noticed.
+
+Process rule: **an engine with a CLIENT-side anchor must record the server's
+IDENTITY in the checkpoint and refuse a mismatch.** Two tiers, because one is not
+enough: a stable per-server id (`@@server_uuid`) is the floor and is present
+everywhere, while a GTID set catches what the id cannot — the SAME server after a
+`RESET MASTER`, where the coordinates are stale and the identity still matches. Ask
+the SERVER for containment (`GTID_SUBSET`) rather than reimplementing set logic, or
+there are two definitions to drift. Two degradations must NOT refuse: a checkpoint
+with no identity (it predates the check — WARN, do not strand a stream that is
+probably fine) and an EMPTY GTID set (that records "gtid_mode was off", not "no
+transactions", and `gtid_mode` is OFF by default — measured, so GTID can never be
+the only check). Regression:
+`a_mysql_checkpoint_from_another_server_is_refused`, RED against removing the
+verification.
+
 ## A bounded drain stops at an OPEN-TIME snapshot, never "when it catches up"
 
 `until_current` must mean "current as of the moment the run opened" — a
