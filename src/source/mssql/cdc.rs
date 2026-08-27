@@ -916,8 +916,12 @@ impl MssqlChangeStream {
                 log::warn!(
                     "sqlserver cdc: poll batch at {lsn} passed the in-memory cap at \
                      {} rows / {batch_bytes} bytes — spilling the rest to {} rather \
-                     than failing the run. Every transaction is still delivered \
-                     whole and atomically; this trades memory for disk.",
+                     than failing the run, which is what this used to do. Every \
+                     transaction is still delivered whole and atomically. Note this \
+                     moves the ADAPTER's copy to disk; the sink still holds a whole \
+                     transaction (a part is never split across one), so peak memory \
+                     falls only modestly — measured ~11% on a 100k-row transaction, \
+                     not to the cap.",
                     batch.len(),
                     self.spill_dir.display()
                 );

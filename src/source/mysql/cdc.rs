@@ -833,9 +833,12 @@ impl MysqlChangeStream {
         }
         log::warn!(
             "mysql cdc: transaction at {}:{log_pos} passed the in-memory cap at {} \
-             rows / {} bytes — spilling the rest to {} rather than failing the run. \
-             The transaction is still delivered whole and atomically; this trades \
-             memory for disk.",
+             rows / {} bytes — spilling the rest to {} rather than failing the run, \
+             which is what this used to do. The transaction is still delivered whole \
+             and atomically. Note this moves the ADAPTER's copy to disk; the sink \
+             still holds the whole transaction (a part is never split across one), so \
+             peak memory falls only modestly — measured ~11% on a 100k-row \
+             transaction, not to the cap.",
             self.file,
             self.tx.len(),
             self.tx_bytes,

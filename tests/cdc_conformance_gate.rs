@@ -750,6 +750,13 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("manifest.json")
                 // the mssql change-row replay oracle (read_cdc_rows' sibling);
                 || chunk.contains("read_cdc_changes(")
+                // the four-way DuckDB census — the SOURCE table, the delivered
+                // parquet and rivet's two ledgers, from a session sharing no code
+                // with the product. Registered for the soak stand, whose whole
+                // oracle this is; it is a strictly stronger claim than a re-read,
+                // since a run that recorded rows no part declares fails it too.
+                || chunk.contains("row_census(")
+                || chunk.contains("assert_soak_is_sound(")
                 // The read-back DERIVED value the scenario smokes assert on.
                 // drain_and_read(/run_and_read( themselves are NOT outcome
                 // markers: they sit in the derived CAPTURE set too, so a

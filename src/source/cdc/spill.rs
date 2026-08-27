@@ -5,6 +5,17 @@
 //! `check_tx_buffer_caps` bails, and capture stops until someone splits the source
 //! transaction or raises a cap. That is a memory ceiling wearing a refusal.
 //!
+//! MEASURED LIMIT, so nobody has to rediscover it: this bounds the ADAPTER's copy
+//! and not the run. `sink::RolloverPolicy::should_roll` requires a `committed`
+//! event — the "never split a transaction across parts" invariant that makes crash
+//! resume transaction-atomic — so the sink buffers a whole transaction whatever the
+//! adapter does. A 100k-row transaction peaked at 202 MB with spilling and 226 MB
+//! without: ~11%, not a ceiling. What this DOES buy is that the run no longer fails
+//! outright, which was the point. An end-to-end ceiling needs the SINK to spill too,
+//! and that is a separate piece of work — the soak stand
+//! (`tests/live/soak_spill.rs`) is where the two numbers are produced, so the claim
+//! stays honest as the code changes.
+//!
 //! This is the container, not the encoding. Two encodings ride on it and the choice
 //! is per adapter:
 //!
@@ -130,7 +141,19 @@ impl SpillFile {
         // have cleaned up after itself, and nothing else ever will.
         static SWEPT: std::sync::Once = std::sync::Once::new();
         SWEPT.call_once(|| sweep_dead_spills(dir, pid_is_alive));
-        let path = dir.join(format!("rivet-spill-{label}-{}.bin", std::process::id()));
+        // `{label}-{seq}-{pid}`: the pid stays LAST so the sweep's parse is a
+        // single `rsplit_once`, and the counter makes the name unique WITHIN a
+        // process. Today one process drives one CDC stream, so label+pid would not
+        // collide — but that is an invariant nothing enforces, and the failure mode
+        // if it ever breaks is silent: `create` truncates, so a second stream would
+        // destroy the first's spilled transaction while its reader held the file
+        // open. Cheaper to remove the class than to document the assumption.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!(
+            "rivet-spill-{label}-{seq}-{}.bin",
+            std::process::id()
+        ));
         // read+write, not `File::create`: `drain` rewinds and reads the same
         // handle back, and a write-only descriptor fails there with `Bad file
         // descriptor` — which reads as a TRUNCATED log, i.e. the one error this
@@ -447,6 +470,50 @@ mod tests {
             text.contains("truncated"),
             "the error must name the cause — a short read here is a torn \
              transaction, and the caller has to know that is what happened: {text}"
+        );
+    }
+
+    /// Two spills open at once never share a path.
+    ///
+    /// `create` TRUNCATES, so a shared name means the second spill destroys the
+    /// first's transaction while its reader still holds the file — silent, and
+    /// silent in the worst way: the reader's `read_exact` then fails as a TORN
+    /// LOG, which is the error that means "your transaction is half gone".
+    ///
+    /// One process drives one CDC stream today, so label+pid would not actually
+    /// collide. This pins the property rather than the circumstance.
+    #[test]
+    fn two_spills_in_one_process_do_not_share_a_file() {
+        let d = dir();
+        let mut a = SpillFile::create(d.path(), "pg-tx").expect("a");
+        let mut b = SpillFile::create(d.path(), "pg-tx").expect("b");
+        assert_ne!(
+            a.path, b.path,
+            "same label, same pid — the names must differ"
+        );
+        a.push(b"aaa").expect("push a");
+        b.push(b"bbbb").expect("push b");
+        assert_eq!(a.drain().expect("drain a"), vec![b"aaa".to_vec()]);
+        assert_eq!(b.drain().expect("drain b"), vec![b"bbbb".to_vec()]);
+    }
+
+    /// The sweep still finds the pid after the counter was added to the name.
+    #[test]
+    fn a_counted_spill_name_still_yields_the_writer_pid() {
+        let d = dir();
+        let s = SpillFile::create(d.path(), "mssql-batch").expect("create");
+        let name = s
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .expect("named")
+            .to_string();
+        assert_eq!(
+            spill_file_pid(&name),
+            Some(std::process::id()),
+            "the pid must stay the LAST field, or the sweep stops recognising \
+             rivet's own files and every orphan lives forever: {name}"
         );
     }
 
@@ -1447,6 +1514,171 @@ mod frame_tests {
             "the same transaction continues — closing here lets the sink ack \
              mid-transaction, and a crash before the rest advances the resume past \
              the commit"
+        );
+    }
+}
+
+/// MEASURED cost of spilling, not estimated — the repo's rule about latency claims
+/// applies to size and throughput too.
+///
+/// `#[ignore]`d because it is a measurement, not an assertion about behaviour, and
+/// it wants a release build to mean anything:
+///     cargo test --release --lib spill_cost -- --ignored --nocapture
+#[cfg(test)]
+mod spill_cost {
+    use super::*;
+    use serde_json::json;
+
+    /// A row shaped like a real captured one: a key, some text, a timestamp, a
+    /// decimal carried as bytes, a flag, and a wide column. A one-integer fixture
+    /// would report a bytes-per-row that no real table produces.
+    fn realistic(i: u64) -> ChangeEvent {
+        ChangeEvent {
+            op: ChangeOp::Update,
+            schema: "public".into(),
+            table: "orders".into(),
+            before: None,
+            after: Some(vec![
+                RivetValue::Int(i as i64),
+                RivetValue::Bytes(format!("customer-{i}-acme-industries").into_bytes()),
+                RivetValue::DateTime(
+                    chrono::DateTime::from_timestamp(1_700_000_000 + i as i64, 0)
+                        .expect("ts")
+                        .naive_utc(),
+                ),
+                RivetValue::Bytes(b"12345.6789".to_vec()),
+                RivetValue::Bool(i.is_multiple_of(2)),
+                RivetValue::Bytes(vec![b'x'; 200]),
+            ]),
+            position: Position(json!({ "lsn": "0/16B2E00" })),
+            committed: false,
+            image_names: Some(std::sync::Arc::from(
+                ["id", "name", "at", "amount", "ok", "pad"]
+                    .map(String::from)
+                    .to_vec(),
+            )),
+            seq: i,
+            poison: None,
+        }
+    }
+
+    /// Bytes ON DISK per row, against the in-memory footprint the cap counts.
+    ///
+    /// The ratio is the number that matters operationally: it says how much disk a
+    /// given `RIVET_CDC_MAX_TX_BYTES` overflow actually costs.
+    #[test]
+    #[ignore = "measurement: run with --release --nocapture"]
+    fn how_much_disk_does_a_spilled_row_take() {
+        const N: u64 = 100_000;
+        let d = tempfile::tempdir().expect("dir");
+        let mut f = SpillFile::create(d.path(), "cost").expect("create");
+        let mut in_memory = 0usize;
+        for i in 0..N {
+            let e = realistic(i);
+            in_memory += e.estimated_bytes();
+            f.push(&encode_event(&e)).expect("push");
+        }
+        let on_disk = f.bytes();
+        println!(
+            "spill cost: {N} rows | on disk {} B total, {:.1} B/row | in memory {} B \
+             total, {:.1} B/row | ratio {:.2}x",
+            on_disk,
+            on_disk as f64 / N as f64,
+            in_memory,
+            in_memory as f64 / N as f64,
+            on_disk as f64 / in_memory as f64,
+        );
+    }
+
+    /// How fast the log is written and read back — the cost the spill adds to a
+    /// transaction that would otherwise have failed the run outright.
+    #[test]
+    #[ignore = "measurement: run with --release --nocapture"]
+    fn how_fast_is_a_spilled_transaction_written_and_parsed() {
+        const N: u64 = 100_000;
+        let d = tempfile::tempdir().expect("dir");
+        let events: Vec<ChangeEvent> = (0..N).map(realistic).collect();
+
+        let t0 = std::time::Instant::now();
+        let mut f = SpillFile::create(d.path(), "speed").expect("create");
+        for e in &events {
+            f.push(&encode_event(e)).expect("push");
+        }
+        let wrote = t0.elapsed();
+        let bytes = f.bytes();
+
+        let t1 = std::time::Instant::now();
+        let mut r = f.into_reader().expect("seal");
+        let mut n = 0u64;
+        let mut cells = 0usize;
+        while let Some(rec) = r.next_record() {
+            let e = decode_event(&rec.expect("record")).expect("decode");
+            // Touch the decoded values so the work cannot be optimised away.
+            cells += e.after.as_ref().map_or(0, Vec::len);
+            n += 1;
+        }
+        let read = t1.elapsed();
+        assert_eq!(n, N);
+        assert_eq!(cells, N as usize * 6);
+        println!(
+            "spill speed: {N} rows, {} B | write {:?} ({:.0} rows/s) | \
+             read+decode {:?} ({:.0} rows/s, {:.0} MB/s)",
+            bytes,
+            wrote,
+            N as f64 / wrote.as_secs_f64(),
+            read,
+            N as f64 / read.as_secs_f64(),
+            bytes as f64 / read.as_secs_f64() / 1e6,
+        );
+    }
+
+    /// The same two numbers for PostgreSQL's RAW-ROW encoding, which is a different
+    /// shape: no per-value framing at all, just the text the server sent.
+    #[test]
+    #[ignore = "measurement: run with --release --nocapture"]
+    fn how_much_does_a_raw_wire_row_cost() {
+        const N: u64 = 100_000;
+        let d = tempfile::tempdir().expect("dir");
+        let line = |i: u64| {
+            format!(
+                "table public.orders: UPDATE: id[integer]:{i} \
+                 name[text]:'customer-{i}-acme-industries' \
+                 at[timestamp]:'2023-11-14 22:13:20' amount[numeric]:12345.6789 \
+                 ok[boolean]:true pad[text]:'{}'",
+                "x".repeat(200)
+            )
+        };
+        let mut f = SpillFile::create(d.path(), "raw").expect("create");
+        let t0 = std::time::Instant::now();
+        for i in 0..N {
+            // Mirrors `postgres::cdc::encode_wire_row`: a u32 lsn length, the lsn,
+            // then the row text.
+            let (lsn, data) = ("0/16B2E00", line(i));
+            let mut rec = Vec::with_capacity(4 + lsn.len() + data.len());
+            rec.extend_from_slice(&(lsn.len() as u32).to_be_bytes());
+            rec.extend_from_slice(lsn.as_bytes());
+            rec.extend_from_slice(data.as_bytes());
+            f.push(&rec).expect("push");
+        }
+        let wrote = t0.elapsed();
+        let bytes = f.bytes();
+        let t1 = std::time::Instant::now();
+        let mut r = f.into_reader().expect("seal");
+        let mut n = 0u64;
+        while let Some(rec) = r.next_record() {
+            let _ = rec.expect("record").len();
+            n += 1;
+        }
+        let read = t1.elapsed();
+        assert_eq!(n, N);
+        println!(
+            "raw-row cost: {N} rows | on disk {} B, {:.1} B/row | write {:?} | \
+             read {:?} ({:.0} rows/s)",
+            bytes,
+            bytes as f64 / N as f64,
+            wrote,
+            read,
+            N as f64 / read.as_secs_f64(),
         );
     }
 }

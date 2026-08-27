@@ -482,3 +482,38 @@ pub fn mssql_seed_one_transaction(table: &str, ids: std::ops::RangeInclusive<usi
          ) q"
     ));
 }
+
+// ─── CDC scenarios, shared by the live suite and the soak stand ──────────────
+//
+// Private to `live_cdc_mssql.rs` until the soak stand needed them. A scenario that
+// two suites need is harness, not test body — the same rule that put the transaction
+// seeds here.
+
+/// Enable CDC on the database (idempotent) + the table, creating capture instance
+/// `ci`. The capture job (SQL Server Agent) then populates `cdc.<ci>_CT`.
+pub fn enable_cdc(table: &str, ci: &str) {
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+}
+
+/// Block until the capture job has copied at least `want` rows into the change
+/// table — the job runs asynchronously, so the test must wait for it.
+pub fn wait_for_capture(ci: &str, want: i64) {
+    // 60s ceiling: the SQL Server Agent capture job is asynchronous and its
+    // scan interval stretches under a loaded E2E runner — a 30s bound flaked
+    // one test at ~456s suite wall-clock (r6 CI). Doubling the ceiling matches
+    // the async reality; it does NOT mask a bug (a real drop still times out).
+    for _ in 0..120 {
+        if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
+}

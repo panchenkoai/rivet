@@ -259,3 +259,32 @@ pub fn quiet_window_guard() -> QuietWindowGuard {
     }
     QuietWindowGuard { _file: file }
 }
+
+/// Peak resident memory of any child process this test binary has reaped, in bytes.
+///
+/// `getrusage(RUSAGE_CHILDREN)` reports the MAXIMUM over all reaped children rather
+/// than the last one's, so it is monotonic — which is exactly the shape a ceiling
+/// assertion wants: "no rivet this test ever spawned went past X". It cannot
+/// attribute a peak to one child, and does not need to.
+///
+/// `ru_maxrss` is BYTES on macOS and KILOBYTES on Linux — one field with two
+/// meanings, and reading it wrong is a 1024× error in whichever direction hides the
+/// failure. Normalised here so no caller has to remember.
+#[cfg(unix)]
+pub fn peak_child_rss_bytes() -> u64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) } != 0 {
+        return 0;
+    }
+    let raw = ru.ru_maxrss.max(0) as u64;
+    if cfg!(target_os = "macos") {
+        raw
+    } else {
+        raw * 1024
+    }
+}
+
+#[cfg(not(unix))]
+pub fn peak_child_rss_bytes() -> u64 {
+    0
+}

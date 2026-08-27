@@ -17,35 +17,6 @@ use crate::common::*;
 // nextest one-process-per-test runner (r4 bughunt; same class as r3's
 // COMPRESSION_SERIAL).
 
-/// Enable CDC on the database (idempotent) + the table, creating capture instance
-/// `ci`. The capture job (SQL Server Agent) then populates `cdc.<ci>_CT`.
-fn enable_cdc(table: &str, ci: &str) {
-    mssql_cdc_exec(
-        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
-         EXEC sys.sp_cdc_enable_db;",
-    );
-    mssql_cdc_exec(&format!(
-        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
-         @role_name=NULL, @capture_instance=N'{ci}';"
-    ));
-}
-
-/// Block until the capture job has copied at least `want` rows into the change
-/// table — the job runs asynchronously, so the test must wait for it.
-fn wait_for_capture(ci: &str, want: i64) {
-    // 60s ceiling: the SQL Server Agent capture job is asynchronous and its
-    // scan interval stretches under a loaded E2E runner — a 30s bound flaked
-    // one test at ~456s suite wall-clock (r6 CI). Doubling the ceiling matches
-    // the async reality; it does NOT mask a bug (a real drop still times out).
-    for _ in 0..120 {
-        if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
-}
-
 /// One CDC rig per (table, capture instance, checkpoint, destination). Callers
 /// own ckpt/out so several configs can share one dir across a scenario; the rig
 /// owns everything else (this replaced a yaml round-trip through write_config).

@@ -1030,11 +1030,15 @@ impl PgChangeStream {
                     log::warn!(
                         "pg cdc: transaction at {lsn} passed the in-memory cap at {} \
                          rows / {tx_bytes} bytes — spilling the rest to {} rather \
-                         than failing the run. The transaction is still delivered \
-                         whole and atomically; this trades memory for disk. Expect \
-                         this line once per peek until the sink acks past the \
-                         commit — a slot peek does not consume, so an un-acked \
-                         transaction is re-read (and re-spilled) on the next pass.",
+                         than failing the run, which is what this used to do. The \
+                         transaction is still delivered whole and atomically. Note \
+                         this moves the ADAPTER's copy to disk; the sink still holds \
+                         the whole transaction (a part is never split across one), so \
+                         peak memory falls only modestly — measured ~11% on a \
+                         100k-row transaction, not to the cap. Expect this line once \
+                         per peek until the sink acks past the commit: a slot peek \
+                         does not consume, so an un-acked transaction is re-read (and \
+                         re-spilled) on the next pass.",
                         tx.len(),
                         dir.display()
                     );
