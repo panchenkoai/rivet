@@ -26,6 +26,30 @@ use crate::config::TlsConfig;
 use crate::error::Result;
 use value::RivetValue;
 
+/// The cap a `RIVET_CDC_MAX_TX_*` override resolves to — the pure half of
+/// [`max_tx_rows`] and [`max_tx_bytes`].
+///
+/// Extracted because the callers cache in a `OnceLock`: the body runs at most once
+/// per process, so no unit test can exercise both the default and an override, and
+/// TWELVE mutants survived in those two functions — `-> 0`, `-> 1`, `> -> <`,
+/// `> -> >=`, `* -> +`, `* -> /`. `-> 0` is the worst of them: a zero cap makes
+/// `tx.len() > cap` true on the FIRST row, so every transaction is refused as
+/// oversized and CDC stops entirely.
+///
+/// A non-positive or unparseable override falls back to the default rather than
+/// being taken literally — `RIVET_CDC_MAX_TX_ROWS=0` must not mean "refuse
+/// everything", and `=abc` must not mean "cap at nothing".
+pub(crate) fn tx_cap_from_env(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Default row cap — 5M rows, far above any real OLTP transaction.
+pub(crate) const DEFAULT_MAX_TX_ROWS: usize = 5_000_000;
+/// Default byte cap — 2 GiB, likewise.
+pub(crate) const DEFAULT_MAX_TX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 /// Canonical DML kind. Engine framing — PostgreSQL `BEGIN`/`COMMIT` markers, the
 /// SQL Server update before/after split — is normalised away by each adapter; a
 /// row change is exactly one of these.
@@ -491,11 +515,10 @@ pub(crate) fn max_tx_rows() -> usize {
     use std::sync::OnceLock;
     static CELL: OnceLock<usize> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("RIVET_CDC_MAX_TX_ROWS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(5_000_000)
+        tx_cap_from_env(
+            std::env::var("RIVET_CDC_MAX_TX_ROWS").ok().as_deref(),
+            DEFAULT_MAX_TX_ROWS,
+        )
     })
 }
 
@@ -510,11 +533,10 @@ pub(crate) fn max_tx_bytes() -> usize {
     use std::sync::OnceLock;
     static CELL: OnceLock<usize> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("RIVET_CDC_MAX_TX_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(2 * 1024 * 1024 * 1024)
+        tx_cap_from_env(
+            std::env::var("RIVET_CDC_MAX_TX_BYTES").ok().as_deref(),
+            DEFAULT_MAX_TX_BYTES,
+        )
     })
 }
 
@@ -1417,6 +1439,133 @@ pub(crate) fn resolve_checkpoint(raw: &str, config_dir: &std::path::Path) -> Pat
         return p.to_path_buf();
     }
     by_config
+}
+
+#[cfg(test)]
+mod mod_decisions {
+    use super::*;
+
+    /// The two buffer caps, the sequence stamp and the byte estimate — the clusters
+    /// a mutation run over this file found ungraded (45+ survivors, 12 of them in
+    /// the caps alone).
+    #[test]
+    fn a_tx_cap_falls_back_to_its_default_on_anything_that_is_not_a_positive_number() {
+        // The override, when it is one.
+        assert_eq!(tx_cap_from_env(Some("7"), 100), 7);
+        // ABSENT, unparseable, negative, and ZERO all mean "use the default".
+        // `-> 0` is the mutant that matters: a zero cap makes `len() > cap` true on
+        // the FIRST row, so every transaction is refused as oversized and CDC stops.
+        assert_eq!(tx_cap_from_env(None, 100), 100);
+        assert_eq!(tx_cap_from_env(Some("abc"), 100), 100);
+        assert_eq!(tx_cap_from_env(Some("-1"), 100), 100);
+        assert_eq!(
+            tx_cap_from_env(Some("0"), 100),
+            100,
+            "`RIVET_CDC_MAX_TX_ROWS=0` must not mean `refuse every transaction` — \
+             taking it literally turns a tuning knob into a kill switch"
+        );
+        // The defaults are named so `*` -> `+` / `/` in the constant is graded.
+        assert_eq!(DEFAULT_MAX_TX_ROWS, 5_000_000);
+        assert_eq!(
+            DEFAULT_MAX_TX_BYTES,
+            2 * 1024 * 1024 * 1024,
+            "2 GiB — `*` -> `+` collapses it to 3074 bytes, which refuses every \
+             transaction that carries more than a couple of rows"
+        );
+    }
+
+    /// `__seq` is the intra-transaction ordinal the load's dedup sorts by, together
+    /// with `__pos`. `stamp` is the one line that WRITES it, and `-> ()` survived:
+    /// every event then keeps `seq = 0`, so `(__pos, __seq)` no longer orders the
+    /// changes within a transaction and the warehouse can pick the wrong row as the
+    /// winner for a key. Silent, and correct-looking at every count.
+    #[test]
+    fn the_sequence_stamp_writes_the_ordinal_onto_the_event() {
+        let at = |lsn: &str| Position(serde_json::json!({ "lsn": lsn }));
+        let ev = |lsn: &str| ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "s".into(),
+            table: "t".into(),
+            before: None,
+            after: None,
+            position: at(lsn),
+            committed: false,
+            image_names: None,
+            seq: 999, // a value the stamp must OVERWRITE, so `-> ()` cannot pass
+            poison: None,
+        };
+        let mut seq = TxnSeq::default();
+
+        // Three changes in ONE transaction: 0, 1, 2. Two would not distinguish
+        // `counter += 1` from `counter = 1`.
+        let mut a = ev("0/10");
+        let mut b = ev("0/10");
+        let mut c = ev("0/10");
+        seq.stamp(&mut a);
+        seq.stamp(&mut b);
+        seq.stamp(&mut c);
+        assert_eq!(
+            (a.seq, b.seq, c.seq),
+            (0, 1, 2),
+            "the ordinal must be written onto the EVENT — leaving the constructor's \
+             value there is what `stamp -> ()` does, and every row then sorts equal"
+        );
+
+        // A new commit position restarts the ordinal.
+        let mut d = ev("0/20");
+        seq.stamp(&mut d);
+        assert_eq!(d.seq, 0, "a new transaction restarts the ordinal");
+        let mut e = ev("0/20");
+        seq.stamp(&mut e);
+        assert_eq!(e.seq, 1);
+    }
+
+    /// `estimated_bytes` is the SUPPLIER of the sink's byte-cap accounting, whose
+    /// consumer (`should_roll`) has a full unit matrix. Five mutants survived here
+    /// — `+` -> `*`, `+` -> `-`, and the whole body — because nothing observed the
+    /// value the consumer was handed. Same seam as the retry decider fed a `0`.
+    #[test]
+    fn the_byte_estimate_counts_both_images_the_names_and_the_overhead() {
+        let mk = |before: Option<Vec<RivetValue>>, after: Option<Vec<RivetValue>>| ChangeEvent {
+            op: ChangeOp::Update,
+            schema: "sch".into(), // 3
+            table: "tab".into(),  // 3
+            before,
+            after,
+            position: Position(serde_json::json!({})),
+            committed: false,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        };
+        let empty = mk(None, None).estimated_bytes();
+        assert_eq!(
+            empty,
+            3 + 3 + 32,
+            "names plus the fixed overhead — `+` -> `*` makes an empty event 288 \
+             bytes and `+` -> `-` underflows"
+        );
+
+        // BOTH images count, and independently: a before-only event and an
+        // after-only event of the same width must weigh the same, and an event
+        // carrying both must weigh more than either.
+        let one = vec![RivetValue::Int(1)];
+        let b_only = mk(Some(one.clone()), None).estimated_bytes();
+        let a_only = mk(None, Some(one.clone())).estimated_bytes();
+        let both = mk(Some(one.clone()), Some(one.clone())).estimated_bytes();
+        assert_eq!(b_only, a_only, "the two images are weighed the same way");
+        assert!(b_only > empty, "a value must add to the estimate");
+        assert_eq!(
+            both - empty,
+            2 * (b_only - empty),
+            "both images are SUMMED — dropping either, or folding them with `*`, \
+             makes the sink's memory ceiling describe a different event"
+        );
+
+        // More cells weigh more — a one-cell fixture cannot tell a sum from a max.
+        let two = mk(None, Some(vec![RivetValue::Int(1), RivetValue::Int(2)])).estimated_bytes();
+        assert!(two > a_only, "the per-cell estimates are summed, not maxed");
+    }
 }
 
 #[cfg(test)]
