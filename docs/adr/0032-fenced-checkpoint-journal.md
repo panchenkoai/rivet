@@ -61,20 +61,49 @@ is which store gets which:
 
 Both give the same guarantee; neither is universal.
 
-### What is NOT yet measured, and must be before this is accepted
+### MEASURED against the emulators (2026-08-27), and it changes the design
 
-* whether opendal's declared capability actually holds against each REAL store.
-  S3 gained `If-None-Match: *` (put-if-absent) in late 2024 and opendal 0.55 does
-  not declare it for s3 — that may be an opendal gap rather than an S3 one, and the
-  answer changes whether one shape can serve all four after all;
-* whether MinIO, fake-gcs and Azurite honour the conditional write the same way
-  their real counterparts do. The emulators are what the live suite runs against,
-  so a fence that works only on the real service would be GREEN locally and broken
-  in production — the exact inversion of the usual risk;
-* the read-modify-write window on the s3 shape: `if_match` needs the ETag from a
-  prior read, and two runners reading the same ETag then racing is precisely the
-  case the fence exists to decide. It is decided correctly (one write wins) but the
-  loser must be able to tell "I was fenced" from "the network failed".
+A probe wrote the same key twice with `if_not_exists`, then once more with a STALE
+etag under `if_match`, on each backend:
+
+| store | `if_not_exists` | `if_match` |
+| --- | --- | --- |
+| fs (local) | ENFORCED | no etag reported |
+| MinIO (s3) | **ENFORCED** | ENFORCED |
+| fake-gcs | **IGNORED** — the second write won | **IGNORED** — the stale etag won |
+| Azurite | ENFORCED | **IGNORED** — the stale etag won |
+
+Two conclusions, and the first inverts what the capability table above implies.
+
+**The declared capability is wrong in BOTH directions.** opendal does not declare
+`write_with_if_not_exists` for s3, and MinIO enforces it anyway — the option is
+passed through as `If-None-Match: *` and the store honours it. opendal DOES declare
+it for gcs, and fake-gcs ignores it completely. So a fence that trusts
+`Capability::write_with_if_not_exists` proceeds without fencing on one backend and
+refuses to try on another where it would have worked.
+
+**The emulators are not the services.** fake-gcs ignores both conditions and
+Azurite ignores `if_match`; real GCS has `ifGenerationMatch` and real Azure Blob has
+ETag conditionals, both long-standing. This is the risk this ADR named before
+measuring: the live suite runs on the emulators, so a fence would be exercised
+against stores that silently accept every write. A test asserting REFUSAL fails
+loudly there, which is survivable — the unsurvivable outcome is weakening the test
+to make the emulator pass, and then real GCS is the only place the fence is graded.
+
+### What this forces
+
+1. **The fence must PROBE, not consult a capability flag.** At open, write a probe
+   key twice and require the second to be refused. A destination that cannot fence
+   must say so — and then the choice is explicit: refuse to run, or run unfenced
+   with a warning that names the store.
+2. **`if_not_exists` is the shape**, not ETag CAS: it is enforced on three of four
+   and on the fourth (fake-gcs) neither works, so `if_match` buys nothing while
+   costing a read-modify-write window.
+3. **GCS fencing cannot be graded against fake-gcs.** Either the gcs cell is
+   honestly `unverifiable-on-emulator` in the coverage ledger, or the stand grows a
+   GCS emulator that implements preconditions. Claiming coverage from a green run
+   against a store that ignores the mechanism is the exact defect this repository
+   audits for.
 
 ## Consequences
 
