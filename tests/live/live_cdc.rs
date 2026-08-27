@@ -7504,6 +7504,85 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
     );
 }
 
+/// A MySQL checkpoint from ANOTHER server must be refused, not resumed from.
+///
+/// A MySQL checkpoint is binlog COORDINATES, and coordinates mean nothing outside
+/// the server that wrote them. Point the same config at a different host — a
+/// failover, a restored dump, a copied `url:`, a rebuilt stand — and
+/// `binlog.000042:12345` still parses, still looks plausible, and lands at an
+/// arbitrary point in a DIFFERENT binlog. Whatever is there is captured; whatever
+/// was between is skipped. Silent in both directions.
+///
+/// PostgreSQL cannot have this: its anchor is a slot, which is server-side, so a
+/// foreign one does not exist. MySQL's anchor is a client-side file, which is why
+/// the check has to be explicit — the same asymmetry the anchor-model rule already
+/// records for the idle-first-run case.
+///
+/// The forged uuid is the honest way to test it: standing up a SECOND MySQL to
+/// produce a genuinely foreign checkpoint would test docker, and the thing under
+/// test is what rivet does when the identity does not match.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn a_mysql_checkpoint_from_another_server_is_refused() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_srvid").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl)
+        .relative_checkpoint("./srvid.ckpt")
+        .dest_path(out.path().to_path_buf());
+    rig.run_ok(); // anchors, and records the server's identity
+
+    let ckpt = rig
+        .config_path()
+        .parent()
+        .expect("config dir")
+        .join("srvid.ckpt");
+    let text = std::fs::read_to_string(&ckpt).expect("the anchor wrote a checkpoint");
+    let mut doc: serde_json::Value = serde_json::from_str(&text).expect("checkpoint json");
+    let recorded = doc
+        .get("server_uuid")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !recorded.is_empty(),
+        "the fixture is inert: rivet recorded no server identity, so the check below \
+         would pass over an unverifiable checkpoint and prove nothing"
+    );
+
+    // The SAME checkpoint, relabelled as another server's.
+    doc["server_uuid"] = serde_json::json!("00000000-1111-2222-3333-444444444444");
+    std::fs::write(&ckpt, doc.to_string()).expect("forge the identity");
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10)"))
+        .expect("a change to resume into");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("00000000-1111-2222-3333-444444444444") && said.contains(&recorded),
+        "the refusal must name BOTH servers — an operator whose failover just \
+         happened needs to know which is which. Got:\n{said}"
+    );
+    assert!(
+        said.contains("mode: full"),
+        "and name the recovery: coordinates cannot be carried to a new server at \
+         all, so a re-snapshot is the only path. Got:\n{said}"
+    );
+
+    // The delivered outcome, not the exit status: nothing may have been captured
+    // from the wrong position.
+    assert!(
+        read_cdc_changes(out.path()).is_empty(),
+        "a refused resume must deliver nothing — reading from a foreign server's \
+         coordinates is exactly what the refusal exists to prevent"
+    );
+}
+
 /// REGENERATE `tests/fixtures/pgoutput/*.hex` from the rig's own scenarios.
 ///
 /// The unit tests in `src/source/postgres/pgoutput.rs` grade the decoder against

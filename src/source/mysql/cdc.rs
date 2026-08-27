@@ -174,6 +174,61 @@ impl MysqlChangeStream {
     /// merely malformed — the run's actual error is `checkpoint missing 'file'`.
     ///
     /// One decoder, so the two cannot disagree again.
+    /// Does this checkpoint belong to the server we are about to resume against?
+    ///
+    /// A MySQL checkpoint is `{file, pos}` — binlog COORDINATES, which mean nothing
+    /// outside the server that wrote them. Point rivet at a different host with the
+    /// same config (a failover, a restored dump, a copied `url:`, a stand rebuilt
+    /// under the same name) and `binlog.000042:12345` still parses, still looks
+    /// plausible, and lands at an arbitrary point in a DIFFERENT binlog. Whatever
+    /// is there gets captured; whatever was between gets skipped. Silent both ways.
+    ///
+    /// PostgreSQL cannot have this problem: its resume anchor is a slot, which is
+    /// server-side, so a foreign one simply does not exist. MySQL's anchor is a
+    /// client-side file, so the check has to be explicit — the same asymmetry
+    /// CLAUDE.md's anchor-model rule already records for the idle-first-run case.
+    ///
+    /// TWO tiers, because one of them is not enough on a default install:
+    ///
+    /// * `server_uuid` is unique per server and stable across restarts, and it is
+    ///   present on EVERY MySQL. This is the floor.
+    /// * a GTID set catches what the uuid cannot: the SAME server after a
+    ///   `RESET MASTER`, where the coordinates are stale but the identity matches.
+    ///   Only when `gtid_mode` is ON — which is OFF by default, measured on the
+    ///   stand, so it can never be the only check.
+    ///
+    /// A checkpoint with NO identity is accepted with a warning rather than
+    /// refused: it was written before this existed, and refusing it would strand a
+    /// stream that is probably fine. Saying nothing would be the silent half of the
+    /// bug this closes.
+    pub(crate) fn checkpoint_identity_verdict(
+        ckpt_uuid: Option<&str>,
+        ckpt_gtid: Option<&str>,
+        server_uuid: &str,
+        server_gtid_executed: Option<&str>,
+        gtid_contained: Option<bool>,
+    ) -> CheckpointIdentity {
+        let Some(ckpt_uuid) = ckpt_uuid else {
+            return CheckpointIdentity::Unverifiable;
+        };
+        if ckpt_uuid != server_uuid {
+            return CheckpointIdentity::ForeignServer {
+                checkpoint: ckpt_uuid.to_string(),
+                server: server_uuid.to_string(),
+            };
+        }
+        // Same server. If the checkpoint recorded a GTID set and the server can
+        // answer, the set must still be CONTAINED in what the server has executed —
+        // a `RESET MASTER` empties it while leaving the uuid untouched.
+        match (ckpt_gtid, gtid_contained) {
+            (Some(g), Some(false)) if !g.is_empty() => CheckpointIdentity::GtidNotContained {
+                checkpoint: g.to_string(),
+                server: server_gtid_executed.unwrap_or_default().to_string(),
+            },
+            _ => CheckpointIdentity::Ok,
+        }
+    }
+
     pub(crate) fn resume_from_checkpoint(
         pos: Option<&super::super::cdc::Position>,
         path: &str,
@@ -560,6 +615,40 @@ impl MysqlChangeStream {
     /// MySQL 8.4 REMOVED `SHOW MASTER STATUS` (finding #36, caught by the
     /// version scout); its replacement `SHOW BINARY LOG STATUS` does not exist
     /// before 8.2 — try the new form first, fall back to the old.
+    /// The server's own identity, recorded into every checkpoint rivet writes.
+    ///
+    /// `server_uuid` is present on every MySQL and stable across restarts;
+    /// `gtid_executed` is empty unless `gtid_mode` is ON (which is OFF by default —
+    /// measured, and the reason the uuid is the floor and GTID only ever an extra).
+    fn server_identity(url: &str, tls: Option<&TlsConfig>) -> Result<(String, String)> {
+        use mysql::prelude::Queryable;
+        let mut c = connect_conn(url, tls)?;
+        let uuid: String = c
+            .query_first("SELECT @@server_uuid")?
+            .ok_or_else(|| anyhow::anyhow!("mysql: server reported no @@server_uuid"))?;
+        let gtid: String = c.query_first("SELECT @@gtid_executed")?.unwrap_or_default();
+        Ok((uuid, gtid))
+    }
+
+    /// Ask the SERVER whether the checkpoint's GTID set is still contained in what
+    /// it has executed. `GTID_SUBSET` is the server's own comparison — reimplementing
+    /// set containment over GTID ranges here would be a second definition to drift.
+    fn gtid_is_contained(
+        url: &str,
+        tls: Option<&TlsConfig>,
+        subset: &str,
+        superset: &str,
+    ) -> Option<bool> {
+        use mysql::prelude::Queryable;
+        if subset.is_empty() {
+            return None;
+        }
+        let mut c = connect_conn(url, tls).ok()?;
+        c.exec_first("SELECT GTID_SUBSET(?, ?)", (subset, superset))
+            .ok()
+            .flatten()
+    }
+
     fn current_coordinates(url: &str, tls: Option<&TlsConfig>) -> Result<(String, u64)> {
         let mut c = connect_conn(url, tls)?;
         let row: mysql::Row = match c.query_first("SHOW BINARY LOG STATUS") {
@@ -588,7 +677,11 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
     ) -> Result<()> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        Position(serde_json::json!({ "file": file, "pos": pos })).save(ckpt)
+        let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+        Position(serde_json::json!({
+            "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
+        }))
+        .save(ckpt)
     }
 
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
@@ -622,11 +715,34 @@ impl MysqlChangeStream {
         configured_tables: Vec<String>,
     ) -> Result<Self> {
         if let Some(path) = ckpt
-            && let Some((file, p)) = Self::resume_from_checkpoint(
-                Position::load(path)?.as_ref(),
-                &path.display().to_string(),
-            )?
+            && let Some(pos) = Position::load(path)?
+            && let Some((file, p)) =
+                Self::resume_from_checkpoint(Some(&pos), &path.display().to_string())?
         {
+            // The checkpoint's coordinates address a SPECIFIC server's binlog. Verify
+            // it is this one before resuming: `binlog.000042:12345` parses on every
+            // host and means something different on each, so a foreign checkpoint
+            // starts the stream at an arbitrary point — capturing whatever is there
+            // and skipping whatever was between, silently in both directions.
+            let ckpt_uuid = pos.0.get("server_uuid").and_then(Json::as_str);
+            let ckpt_gtid = pos.0.get("gtid_executed").and_then(Json::as_str);
+            let (server_uuid, server_gtid) = Self::server_identity(url, tls)?;
+            let contained = ckpt_gtid
+                .filter(|g| !g.is_empty())
+                .and_then(|g| Self::gtid_is_contained(url, tls, g, &server_gtid));
+            let verdict = Self::checkpoint_identity_verdict(
+                ckpt_uuid,
+                ckpt_gtid,
+                &server_uuid,
+                Some(server_gtid.as_str()),
+                contained,
+            );
+            if let Some(why) = verdict.refusal() {
+                anyhow::bail!("{why}");
+            }
+            if let Some(warn) = verdict.warning() {
+                log::warn!("{warn}");
+            }
             return Self::open(url, server_id, file, p, mode, tls, configured_tables);
         }
         // First run (no checkpoint yet): anchor at the current position and persist
@@ -660,7 +776,11 @@ impl MysqlChangeStream {
                  trusting the result.",
                 path.display()
             );
-            Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
+            let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+            Position(serde_json::json!({
+                "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
+            }))
+            .save(path)?;
         }
         Self::open(url, server_id, file, pos, mode, tls, configured_tables)
     }
@@ -1565,6 +1685,109 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+    /// Every arm of the checkpoint-identity verdict.
+    ///
+    /// This closes a hole rather than tightening one: a MySQL checkpoint is binlog
+    /// COORDINATES, and nothing stopped a checkpoint written by one server from
+    /// being used against another. `binlog.000042:12345` parses on any host and
+    /// addresses a different binlog on each.
+    #[test]
+    fn a_checkpoint_from_another_server_is_refused_and_says_why() {
+        use super::CheckpointIdentity as C;
+        let a = "feada5c8-8818-11f1-a5e3-0242c0a8e406";
+        let b = "00000000-1111-2222-3333-444444444444";
+
+        // SAME server, no GTID in play — the ordinary resume.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(Some(a), None, a, None, None),
+            C::Ok
+        );
+        assert!(C::Ok.refusal().is_none() && C::Ok.warning().is_none());
+
+        // A DIFFERENT server. The whole point.
+        let v = MysqlChangeStream::checkpoint_identity_verdict(Some(a), None, b, None, None);
+        assert_eq!(
+            v,
+            C::ForeignServer {
+                checkpoint: a.into(),
+                server: b.into()
+            }
+        );
+        let msg = v.refusal().expect("a foreign server must REFUSE");
+        assert!(
+            msg.contains(a) && msg.contains(b) && msg.contains("per-server"),
+            "the refusal must name BOTH servers and the reason — an operator whose \
+             failover just happened needs to know which is which: {msg}"
+        );
+        assert!(
+            msg.contains("mode: full"),
+            "and name the recovery, which is a re-snapshot: the old coordinates \
+             cannot be carried to a new server at all"
+        );
+
+        // NO identity: accepted, but SAID. Refusing would strand a checkpoint
+        // written before this existed; saying nothing is the silent half of the bug.
+        let v = MysqlChangeStream::checkpoint_identity_verdict(None, None, a, None, None);
+        assert_eq!(v, C::Unverifiable);
+        assert!(v.refusal().is_none(), "an old checkpoint must still resume");
+        assert!(
+            v.warning()
+                .expect("but it must SAY so")
+                .contains("per-server"),
+            "the warning has to name the hazard, not just admit ignorance"
+        );
+
+        // SAME server, GTID set NO LONGER contained — a `RESET MASTER` keeps the
+        // uuid and empties the history, which the uuid check alone cannot see.
+        let g = "feada5c8-8818-11f1-a5e3-0242c0a8e406:1-100";
+        let v = MysqlChangeStream::checkpoint_identity_verdict(
+            Some(a),
+            Some(g),
+            a,
+            Some(""),
+            Some(false),
+        );
+        assert_eq!(
+            v,
+            C::GtidNotContained {
+                checkpoint: g.into(),
+                server: String::new()
+            }
+        );
+        assert!(v.refusal().expect("must refuse").contains("RESET MASTER"));
+
+        // …and contained is fine.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(
+                Some(a),
+                Some(g),
+                a,
+                Some(g),
+                Some(true)
+            ),
+            C::Ok
+        );
+        // An EMPTY recorded set is not a claim about anything — gtid_mode was off
+        // when it was written, so containment says nothing and must not refuse.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(
+                Some(a),
+                Some(""),
+                a,
+                Some(""),
+                Some(false)
+            ),
+            C::Ok,
+            "an empty GTID set records `gtid_mode was off`, not `no transactions` — \
+             refusing on it would break every non-GTID deployment, which is the \
+             DEFAULT one"
+        );
+        // The server cannot answer (gtid_mode off NOW): the uuid still governs.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(Some(a), Some(g), a, None, None),
+            C::Ok
+        );
+    }
 
     /// The rule is DETERMINISTIC — a bare name means the connection's own database,
     /// and any other schema is the ambiguity.
@@ -2220,5 +2443,56 @@ mod tests {
                 other => panic!("{bad} must refuse, got {other:?}"),
             }
         }
+    }
+}
+
+/// The outcome of [`MysqlChangeStream::checkpoint_identity_verdict`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointIdentity {
+    /// Same server, and any recorded GTID set is still present.
+    Ok,
+    /// The checkpoint predates identity recording. Accepted, but SAID — an
+    /// unverifiable resume that says nothing is the silent half of the defect.
+    Unverifiable,
+    /// Written by a DIFFERENT server. Its coordinates address another binlog.
+    ForeignServer { checkpoint: String, server: String },
+    /// Same server, but the transactions the checkpoint names are gone —
+    /// `RESET MASTER`, or a rebuild that kept the uuid.
+    GtidNotContained { checkpoint: String, server: String },
+}
+
+impl CheckpointIdentity {
+    /// The refusal text, or `None` when the resume may proceed.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Ok | Self::Unverifiable => None,
+            Self::ForeignServer { checkpoint, server } => Some(format!(
+                "mysql cdc: this checkpoint was written by server `{checkpoint}` and \
+                 the connection is to `{server}`. Binlog coordinates are per-server: \
+                 resuming would start at an arbitrary point in a DIFFERENT binlog, \
+                 capturing whatever is there and skipping whatever was between — \
+                 silently, in both directions. If the source genuinely moved \
+                 (a failover, a restore), re-snapshot (`mode: full`) and start CDC \
+                 from a fresh checkpoint; the old coordinates cannot be carried over."
+            )),
+            Self::GtidNotContained { checkpoint, server } => Some(format!(
+                "mysql cdc: the checkpoint's GTID set `{checkpoint}` is not contained \
+                 in the server's executed set `{server}` — the same server no longer \
+                 has those transactions, which is what a `RESET MASTER` or a rebuild \
+                 leaves behind. The coordinates address a binlog that no longer \
+                 exists. Re-snapshot (`mode: full`) and start from a fresh checkpoint."
+            )),
+        }
+    }
+
+    /// What to WARN about when the resume proceeds but could not be verified.
+    pub(crate) fn warning(&self) -> Option<&'static str> {
+        matches!(self, Self::Unverifiable).then_some(
+            "mysql cdc: this checkpoint carries no server identity, so rivet cannot \
+             confirm it belongs to the server it is resuming against. It was written \
+             before rivet recorded one. Binlog coordinates are per-server — if this \
+             config has ever been pointed at a different host, delete the checkpoint \
+             and re-snapshot rather than trusting the resume.",
+        )
     }
 }
