@@ -7504,6 +7504,111 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
     );
 }
 
+/// The SYMPTOM half of the two-phase probe — now affordable, because the harness
+/// owns the server setting.
+///
+/// I measured this by hand and declined to make it a test: reproducing it needs
+/// `max_prepared_transactions > 0`, which is a `PGC_POSTMASTER` setting and so a
+/// container restart, and a revert that a panicking test would skip. `PgSetting::
+/// set_with_restart` puts the revert in `Drop`, where a panic cannot reach it — so
+/// the whole STATE axis stops being something only a human runs by hand.
+///
+/// This is also the guard's own self-test: it asserts the flip LANDED before
+/// drawing any conclusion, because a probe that silently ran at the default and
+/// found nothing is indistinguishable from a probe that found nothing.
+#[test]
+#[ignore = "live+exclusive: RESTARTS postgres-cdc — set RIVET_TEST_EXCLUSIVE=1"]
+fn a_rolled_back_prepared_transaction_is_never_published_postgres() {
+    use postgres::NoTls;
+
+    // EXCLUSIVE, and GATED rather than serialized. `max_prepared_transactions` is
+    // PGC_POSTMASTER, so proving the symptom needs the container restarted — and
+    // `cargo test` runs tests in PARALLEL, so that restart kills every concurrent
+    // connection to the same stand. MEASURED: this passes alone and takes
+    // `a_bounded_run_reaches_its_bound_across_an_empty_transaction_span` down with
+    // it when both run — a fixture breaking its neighbours, which reads from the
+    // outside exactly like a product failure.
+    //
+    // Serializing would put a lock in all ~40 postgres-cdc tests; a second
+    // container would change the declared stand. Gating is the honest third option
+    // and its cost is stated plainly: this does NOT run in the normal pass. The
+    // mechanism guard (`the_pg_slot_is_not_two_phase_...`) does, needs no restart,
+    // and is what protects the property day to day.
+    if std::env::var("RIVET_TEST_EXCLUSIVE").is_err() {
+        eprintln!(
+            "skipped: restarts postgres-cdc and breaks concurrent tests. Run with \
+             RIVET_TEST_EXCLUSIVE=1 --test-threads=1."
+        );
+        return;
+    }
+
+    let _setting =
+        PgSetting::set_with_restart("max_prepared_transactions", "10", "rivet-postgres-cdc-1");
+    assert_ne!(
+        PgSetting::current("max_prepared_transactions"),
+        "0",
+        "the flip did not land — every assertion below would then pass over a \
+         server that cannot PREPARE at all, which is not evidence of anything"
+    );
+
+    let tbl = unique_name("rivet_2pcsym").to_lowercase();
+    let slot = unique_name("rivet_2pcsym_slot").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let _slot = Slot(slot.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out.path().to_path_buf());
+    rig.run_ok(); // anchor
+
+    // A PREPARED transaction, an unrelated commit while it is outstanding, then a
+    // ROLLBACK. This is the exact shape that made MySQL publish a row that never
+    // existed (measured round 14: source held one row, rivet delivered two).
+    c.batch_execute(&format!(
+        "BEGIN; INSERT INTO {tbl} VALUES (1, 100); PREPARE TRANSACTION 'rivet_p1'"
+    ))
+    .expect("prepare");
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 200)"))
+        .expect("an unrelated commit while the branch is prepared");
+    let outstanding: i64 = c
+        .query_one("SELECT count(*) FROM pg_prepared_xacts", &[])
+        .expect("count prepared")
+        .get(0);
+    assert!(
+        outstanding >= 1,
+        "the fixture is inert: no prepared transaction was outstanding, so there is \
+         nothing that could have been published early"
+    );
+    c.batch_execute("ROLLBACK PREPARED 'rivet_p1'")
+        .expect("roll the branch back");
+
+    let live: Vec<i64> = c
+        .query(&format!("SELECT id FROM {tbl} ORDER BY id"), &[])
+        .expect("read the source")
+        .iter()
+        .map(|r| r.get::<_, i64>(0))
+        .collect();
+    assert_eq!(live, vec![2], "the source must hold only the committed row");
+
+    rig.run_ok();
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        got,
+        [2].into_iter().collect::<std::collections::BTreeSet<i64>>(),
+        "id=1 was ROLLED BACK and must never reach the destination. PostgreSQL is \
+         immune by construction — a non-two-phase slot decodes only at COMMIT \
+         PREPARED and a rollback emits no records — and this asserts the property \
+         rather than the mechanism, so it also fails if the decoding model changes."
+    );
+}
+
 /// PostgreSQL's slot must stay NON-two-phase — the mechanism that makes it immune
 /// to the class round 14 measured on MySQL.
 ///

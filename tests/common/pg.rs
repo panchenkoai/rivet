@@ -142,3 +142,115 @@ impl Drop for Slot {
         }
     }
 }
+
+/// RAII guard for a SERVER-LEVEL PostgreSQL setting — reverts it on scope exit.
+///
+/// The STATE axis is the most productive one this repo has (the `timestamptz`
+/// rendering corruption, `datestyle='German, DMY'` nulling every timestamp,
+/// `bytea_output='escape'` corrupting every bytea, and PostgreSQL's two-phase
+/// immunity were all settled by flipping one server setting), and until now it was
+/// also the most expensive: every probe hand-rolled `ALTER SYSTEM SET`, a container
+/// restart, the probe, and a revert — with the revert conditional on the test
+/// actually reaching the end.
+///
+/// That conditional revert is the real hazard, not the typing. A hand-drifted
+/// container is how this repo produced two false "verified" claims in one day, so
+/// the revert belongs in `Drop` where a panic cannot skip it.
+///
+/// Two flavours because PostgreSQL has two kinds of setting: most are reloadable
+/// (`pg_reload_conf`), while `PGC_POSTMASTER` ones — `max_prepared_transactions`,
+/// `wal_level`, `max_replication_slots` — need the server restarted.
+pub struct PgSetting {
+    name: String,
+    container: Option<&'static str>,
+}
+
+impl PgSetting {
+    /// A reloadable setting: `ALTER SYSTEM SET` + `pg_reload_conf()`.
+    pub fn set(name: &str, value: &str) -> Self {
+        Self::apply(name, value);
+        reload();
+        Self {
+            name: name.to_string(),
+            container: None,
+        }
+    }
+
+    /// A `PGC_POSTMASTER` setting: `ALTER SYSTEM SET` + a container restart, then
+    /// waits for the server to accept connections again. `container` is the docker
+    /// name (`rivet-postgres-cdc-1`).
+    ///
+    /// EXCLUSIVE. The restart kills every open connection to that stand, and
+    /// `cargo test` runs tests in parallel — MEASURED: one restart-using test took
+    /// an unrelated bounded-drain test down with it, which reads as a product
+    /// failure and is a fixture breaking its neighbours. A caller must gate itself
+    /// (an env var plus `--test-threads=1`) or not use this variant. `set` is free
+    /// of the problem entirely, so prefer it whenever the setting is reloadable.
+    pub fn set_with_restart(name: &str, value: &str, container: &'static str) -> Self {
+        Self::apply(name, value);
+        restart(container);
+        Self {
+            name: name.to_string(),
+            container: Some(container),
+        }
+    }
+
+    /// What the server reports for this setting RIGHT NOW — so a test can assert
+    /// the flip took effect before drawing any conclusion from it. A probe that
+    /// silently ran at the default is the "absence is not success" shape.
+    pub fn current(name: &str) -> String {
+        let mut c = connect();
+        c.query_one(&format!("SHOW {name}"), &[])
+            .map(|r| r.get::<_, String>(0))
+            .unwrap_or_default()
+    }
+
+    fn apply(name: &str, value: &str) {
+        let mut c = connect();
+        c.batch_execute(&format!("ALTER SYSTEM SET {name} = '{value}'"))
+            .unwrap_or_else(|e| panic!("ALTER SYSTEM SET {name}: {e}"));
+    }
+}
+
+impl Drop for PgSetting {
+    fn drop(&mut self) {
+        if let Ok(mut c) = postgres::Client::connect(&url(), postgres::NoTls) {
+            let _ = c.batch_execute(&format!("ALTER SYSTEM RESET {}", self.name));
+        }
+        match self.container {
+            Some(name) => restart(name),
+            None => reload(),
+        }
+    }
+}
+
+fn url() -> String {
+    std::env::var("POSTGRES_CDC_URL")
+        .unwrap_or_else(|_| "postgresql://rivet:rivet@127.0.0.1:5434/rivet".to_string())
+}
+
+fn connect() -> postgres::Client {
+    postgres::Client::connect(&url(), postgres::NoTls).expect("connect postgres-cdc")
+}
+
+fn reload() {
+    if let Ok(mut c) = postgres::Client::connect(&url(), postgres::NoTls) {
+        let _ = c.batch_execute("SELECT pg_reload_conf()");
+    }
+}
+
+/// Restart the container and WAIT for the server to answer — returning before it
+/// is up turns every later step into a connection error that reads like a product
+/// failure.
+fn restart(container: &str) {
+    let _ = std::process::Command::new("docker")
+        .args(["restart", container])
+        .output();
+    for _ in 0..60 {
+        if postgres::Client::connect(&url(), postgres::NoTls).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("postgres container `{container}` did not accept connections after a restart");
+}

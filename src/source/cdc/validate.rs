@@ -407,57 +407,15 @@ mod v016_checkpoint_compat {
             &[r#"{"lsn":"0/10"}"#, r#"{"lsn":"0/20"}"#],
         );
 
-        // The manifest is built from the REAL type and serialized, not hand-written
-        // JSON. A hand-written fixture drifts from the struct the moment a field is
-        // added, and the drift only ever shows up as a test its author has to keep
-        // patching — this one took six rounds of `missing field` before it was
-        // replaced by the type itself.
+        // Built from the type via `RunManifest::for_test`, not hand-written JSON.
+        // The first draft WAS hand-written and took six rounds of `missing field`
+        // before it deserialized; a fixture that drifts from the struct fails on
+        // parse rather than on the property it guards.
         let manifest = |part: &str| {
-            use crate::manifest::{
-                ManifestDestination, ManifestPart, ManifestSource, ManifestStatus, PartStatus,
-                RunManifest,
-            };
-            serde_json::to_string(&RunManifest {
-                manifest_version: 1,
-                run_id: "r1".into(),
-                export_name: "t".into(),
-                export_family: "t".into(),
-                mode: "cdc".into(),
-                started_at: "2026-01-01T00:00:00Z".into(),
-                finished_at: "2026-01-01T00:00:01Z".into(),
-                status: ManifestStatus::Success,
-                source: ManifestSource {
-                    engine: "postgres".into(),
-                    schema: None,
-                    table: None,
-                    extraction: None,
-                },
-                destination: ManifestDestination {
-                    kind: "local".into(),
-                    uri: "cdc".into(),
-                },
-                format: "parquet".into(),
-                compression: "zstd".into(),
-                schema_fingerprint: String::new(),
-                row_count: 2,
-                part_count: 1,
-                parts: vec![ManifestPart {
-                    part_id: 0,
-                    path: part.into(),
-                    rows: 2,
-                    size_bytes: 1,
-                    content_fingerprint: "xxh3:0".into(),
-                    content_md5: String::new(),
-                    status: PartStatus::Committed,
-                }],
-                column_checksums: None,
-                checksum_render: None,
-                checksum_key_column: None,
-                row_hash: None,
-                split_window: None,
-            })
-            .expect("serialize the manifest")
+            serde_json::to_string(&crate::manifest::RunManifest::for_test("r1", &[(part, 2)]))
+                .expect("serialize the manifest")
         };
+
         std::fs::write(
             root.join("manifest-r1.json"),
             manifest("cdc-000000.parquet"),

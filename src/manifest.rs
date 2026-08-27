@@ -465,6 +465,68 @@ pub enum PartStatus {
     Quarantined,
 }
 
+#[cfg(test)]
+impl RunManifest {
+    /// A minimal, VALID manifest for a fixture — built from the type, so it cannot
+    /// drift from it.
+    ///
+    /// Exists because hand-written manifest JSON is the "fixture that only its
+    /// author can fix" shape: the first draft of `validate.rs`'s nested-leg test
+    /// took SIX rounds of `missing field` before it deserialized, and every field
+    /// added to `RunManifest` after that would have broken it again silently — the
+    /// test would fail on parse, not on the property it guards, and the next person
+    /// would patch the JSON rather than ask what it was for.
+    ///
+    /// `parts` are `(path, rows)`; everything else is a defensible constant. Adjust
+    /// what a test cares about with struct-update syntax and let the compiler name
+    /// anything new.
+    pub(crate) fn for_test(run_id: &str, parts: &[(&str, i64)]) -> Self {
+        Self {
+            manifest_version: MANIFEST_VERSION,
+            run_id: run_id.into(),
+            export_name: "t".into(),
+            export_family: "t".into(),
+            mode: "cdc".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: "2026-01-01T00:00:01Z".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: None,
+                table: None,
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: "t".into(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: String::new(),
+            row_count: parts.iter().map(|(_, r)| *r).sum(),
+            part_count: parts.len() as u32,
+            parts: parts
+                .iter()
+                .enumerate()
+                .map(|(i, (path, rows))| ManifestPart {
+                    part_id: (i + 1) as u32,
+                    path: (*path).into(),
+                    rows: *rows,
+                    size_bytes: 1,
+                    content_fingerprint: format!("xxh3:{i:016x}"),
+                    content_md5: String::new(),
+                    status: PartStatus::Committed,
+                })
+                .collect(),
+            column_checksums: None,
+            checksum_render: None,
+            checksum_key_column: None,
+            row_hash: None,
+            split_window: None,
+        }
+    }
+}
+
 impl RunManifest {
     /// Sum of `rows` across `Committed` parts.  Used by M5 sanity checks and
     /// by `--reconcile` to compare against source `COUNT(*)`.

@@ -121,3 +121,55 @@ pub fn mysql_globals_guard() -> MysqlGlobalsGuard {
     }
     MysqlGlobalsGuard { _file: file }
 }
+
+/// RAII guard for a MySQL GLOBAL variable — restores the PREVIOUS value on scope
+/// exit, not a hard-coded default.
+///
+/// The sibling of [`crate::common::pg::PgSetting`], and the reason it captures the
+/// prior value rather than resetting: `binlog_row_image` and `binlog_row_metadata`
+/// are exactly the settings a stand may already have tuned away from the server
+/// default, and a guard that "restores" a guess leaves the stand drifted in a way
+/// the next test blames on the product.
+///
+/// No restart: every variable this is used for is dynamic.
+pub struct MysqlGlobal {
+    name: String,
+    prev: String,
+}
+
+impl MysqlGlobal {
+    pub fn set(name: &str, value: &str) -> Self {
+        use mysql::prelude::Queryable;
+        let mut c = mysql_connect();
+        let prev: String = c
+            .query_first::<String, _>(format!("SELECT @@GLOBAL.{name}"))
+            .unwrap_or_else(|e| panic!("read @@GLOBAL.{name}: {e}"))
+            .unwrap_or_else(|| panic!("@@GLOBAL.{name} does not exist"));
+        c.query_drop(format!("SET GLOBAL {name} = '{value}'"))
+            .unwrap_or_else(|e| panic!("SET GLOBAL {name} = {value}: {e}"));
+        Self {
+            name: name.to_string(),
+            prev,
+        }
+    }
+
+    /// What the server reports NOW — assert the flip landed before concluding
+    /// anything from a probe that depends on it.
+    pub fn current(name: &str) -> String {
+        use mysql::prelude::Queryable;
+        mysql_connect()
+            .query_first::<String, _>(format!("SELECT @@GLOBAL.{name}"))
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for MysqlGlobal {
+    fn drop(&mut self) {
+        use mysql::prelude::Queryable;
+        if let Ok(mut c) = std::panic::catch_unwind(mysql_connect) {
+            let _ = c.query_drop(format!("SET GLOBAL {} = '{}'", self.name, self.prev));
+        }
+    }
+}
