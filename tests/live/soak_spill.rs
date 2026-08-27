@@ -355,6 +355,9 @@ fn soak_spill_postgres() {
     if let Ok(r) = std::env::var("RIVET_SOAK_ROLLOVER") {
         rig = rig.cdc_line(&format!("rollover: {r}"));
     }
+    if let Ok(m) = std::env::var("RIVET_SOAK_ROLLOVER_MB") {
+        rig = rig.cdc_line(&format!("rollover_memory_mb: {m}"));
+    }
     let rig = rig.census_oracle();
     let mut seeded = 0usize;
     for cycle in 1..=cycles {

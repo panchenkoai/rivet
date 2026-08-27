@@ -339,16 +339,85 @@ impl TxnFramer {
     }
 }
 
+/// Resident cost of a `serde_json::Value`, for the CDC memory budgets.
+///
+/// The load-bearing arm is `Object`. `serde_json`'s map is a `BTreeMap`, and a
+/// B-tree node is allocated at FULL capacity — so a one-key object like a commit
+/// position costs a whole node, measured at 475 B, not the ~20 bytes its text
+/// suggests. That single fact is 62% of what a buffered CDC change costs, because
+/// the framer clones the position onto every event of a transaction.
+///
+/// Scalars are charged 0: they live INLINE in the parent's slot, which is already
+/// counted by the parent's capacity.
+fn json_resident_bytes(v: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    /// MEASURED, not derived. `serde_json`'s map is a `BTreeMap` whose node is
+    /// allocated at full capacity, so a one-key object costs a whole node — but the
+    /// obvious derivation (`11 * (size_of::<String>() + size_of::<Value>())` = 616)
+    /// over-counts: the real figure is 475 B for `{"lsn":"…"}`, of which ~448 is the
+    /// node itself. Modelling it structurally and trusting the model was wrong in
+    /// BOTH directions here, an hour apart — first 12.7x under, then 1.8x over — so
+    /// the constant is the measurement and
+    /// `the_memory_estimate_tracks_the_real_cost` is what keeps it one.
+    const JSON_OBJECT_NODE_BYTES: usize = 448;
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(s) => s.len(),
+        Value::Array(a) => {
+            a.capacity() * std::mem::size_of::<Value>()
+                + a.iter().map(json_resident_bytes).sum::<usize>()
+        }
+        // An EMPTY map allocates NOTHING — `BTreeMap::new()` has no node until the
+        // first insert — so the node is charged only when there is one.
+        Value::Object(m) if m.is_empty() => 0,
+        Value::Object(m) => {
+            JSON_OBJECT_NODE_BYTES
+                + m.iter()
+                    .map(|(k, val)| k.len() + json_resident_bytes(val))
+                    .sum::<usize>()
+        }
+    }
+}
+
 impl ChangeEvent {
     /// Rough in-memory footprint of this buffered change — drives the sink's
     /// memory-budget rollover (`rollover_memory_mb`). The before/after value
     /// images dominate; schema/table names + a small fixed overhead are added.
     pub(crate) fn estimated_bytes(&self) -> usize {
+        // RESIDENT cost, not payload size. The old model charged
+        // `schema + table + values + 32` and under-counted a narrow event 12.7x
+        // (measured: 61 B charged, 772 B real — see
+        // `spill::event_cost::what_does_one_buffered_change_actually_cost`). Every
+        // budget built on it therefore meant something ~12x larger than it said:
+        // `RIVET_CDC_MAX_TX_BYTES: 2 GiB` was ~25 GiB of real memory, which is not
+        // a guard, and `rollover_memory_mb` rolled far later than an operator
+        // asking for N megabytes would expect.
+        //
+        // Three things the payload view misses, in the order they cost:
+        //
+        // 1. the COMMIT POSITION, which the framer clones onto EVERY event of a
+        //    transaction — 475 B of the 772, because `serde_json`'s object is a
+        //    `BTreeMap` whose node allocates at FULL capacity even for one key;
+        // 2. the struct itself, which sits in the queue's backing array whatever it
+        //    points at;
+        // 3. the per-allocation overhead of the images' `Vec`s.
+        //
+        // `image_names` is deliberately NOT charged: it is an `Arc` shared by every
+        // event of a relation, so charging it per event would over-count by the
+        // transaction's length — the opposite error, and just as wrong.
         let img = |v: &Option<Vec<RivetValue>>| {
-            v.as_ref()
-                .map_or(0, |vs| vs.iter().map(RivetValue::estimated_bytes).sum())
+            v.as_ref().map_or(0, |vs| {
+                vs.capacity() * std::mem::size_of::<RivetValue>()
+                    + vs.iter().map(RivetValue::estimated_bytes).sum::<usize>()
+            })
         };
-        self.schema.len() + self.table.len() + img(&self.before) + img(&self.after) + 32
+        std::mem::size_of::<Self>()
+            + self.schema.len()
+            + self.table.len()
+            + self.poison.as_ref().map_or(0, String::len)
+            + img(&self.before)
+            + img(&self.after)
+            + json_resident_bytes(&self.position.0)
     }
 
     /// Surface this event's DEFERRED decode error ([`poison`](Self::poison)) if it
@@ -1943,11 +2012,27 @@ mod mod_decisions {
             poison: None,
         };
         let empty = mk(None, None).estimated_bytes();
+        // The FIXED cost of a buffered change: the struct in the queue's backing
+        // array, plus the names. No hardcoded total — `size_of` is what makes it
+        // track the type instead of a number someone has to remember to update.
         assert_eq!(
             empty,
-            3 + 3 + 32,
-            "names plus the fixed overhead — `+` -> `*` makes an empty event 288 \
-             bytes and `+` -> `-` underflows"
+            std::mem::size_of::<ChangeEvent>() + 3 + 3,
+            "an empty event still costs the struct itself — charging only the \
+             PAYLOAD is how this estimate came to under-count a real event 12.7x, \
+             which made `RIVET_CDC_MAX_TX_BYTES: 2 GiB` mean ~25 GiB of memory"
+        );
+
+        // The COMMIT POSITION is charged, and it is the dominant term: the framer
+        // clones it onto every event of a transaction, and a one-key JSON object
+        // costs a whole BTreeMap node (measured 475 B). An estimate that ignores it
+        // is wrong by ~60% on every narrow event.
+        let mut positioned = mk(None, None);
+        positioned.position = Position(serde_json::json!({ "lsn": "0/16B2E00" }));
+        assert!(
+            positioned.estimated_bytes() > empty + 400,
+            "the cloned commit position must be charged — it is 475 of the 772 \
+             bytes a narrow event really costs"
         );
 
         // BOTH images count, and independently: a before-only event and an

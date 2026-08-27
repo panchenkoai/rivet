@@ -14,6 +14,19 @@ use crate::error::Result;
 use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, DrainMode, run_capture};
 use crate::state::StateStore;
 
+/// Default memory budget for one CDC part — the byte half of `rollover`.
+///
+/// 256 MiB is chosen to be INERT on the common shape and binding on the pathological
+/// one: the default `rollover: 100_000` narrow events costs ~77 MB (measured 772
+/// B/event), so this never fires there, while a wide-row table that would otherwise
+/// buffer gigabytes now rolls a part instead. Raising it is a config line; the
+/// absence of any default was a memory ceiling that only existed for narrow rows.
+///
+/// It bounds the ORDINARY path. A single transaction larger than the budget still
+/// buffers whole — the sink may not roll mid-transaction — which is the separate
+/// problem `RIVET_CDC_MAX_TX_BYTES` refuses and the soak stand measures.
+pub(crate) const DEFAULT_CDC_ROLLOVER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
 /// export. The metric row is written here (as `run_export_job` does); the
 /// `RunSummary` is returned for the run aggregate.
@@ -639,7 +652,19 @@ fn run_cdc_inner(
             format: export.format,
             max_events: cdc.max_events,
             rollover: cdc.rollover.unwrap_or(100_000),
-            rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
+            // `.or(...)`, never an unconditional assign: an ABSENT `rollover_memory_mb`
+            // must get the protective default, not be read as "no budget" — the
+            // config-clobber shape that once turned a profile's memory cap into
+            // `None` and tripled RSS.
+            //
+            // A DEFAULT at all, because `rollover` alone bounds ROWS and memory is
+            // what runs out: 100_000 narrow events is ~77 MB and 100_000 wide ones is
+            // unbounded, so the row count is a budget only for one row width. Whichever
+            // limit is reached first rolls the part.
+            rollover_memory_bytes: cdc
+                .rollover_memory_mb
+                .map(|mb| mb * 1024 * 1024)
+                .or(Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES)),
             run_id: run_id.to_string(),
             started_at: now,
             state: Some(state),

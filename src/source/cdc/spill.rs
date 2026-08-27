@@ -1781,5 +1781,27 @@ mod event_cost {
         // Touch both so nothing is optimised away.
         assert_eq!(v.len(), N as usize);
         assert_eq!(shared.len(), N as usize);
+
+        // …and the BUDGETS' estimate must track the real cost, within 25% either
+        // way. Both directions are failures, and this function produced both within
+        // an hour: 12.7x UNDER (silent — `RIVET_CDC_MAX_TX_BYTES: 2 GiB` meant ~25
+        // GiB of real memory, so the guard fired long after the machine was in
+        // trouble), then 1.8x OVER (loud, and still wrong: it fails runs that were
+        // fine). The constants in `json_resident_bytes` are pinned by nothing else.
+        //
+        // Asserted HERE rather than in its own test because `ru_maxrss` is a
+        // process-wide monotonic peak: two measurements in one process run as
+        // parallel threads and corrupt each other's deltas — which is exactly what
+        // happened, reporting 1497 B/event where a clean run reports 772.
+        let ratio = (estimated as f64 / N as f64) / per;
+        println!(
+            "budget check: charged {:.0} B/event vs real {per:.0} B/event — {ratio:.2}x",
+            estimated as f64 / N as f64
+        );
+        assert!(
+            (0.75..=1.25).contains(&ratio),
+            "the memory estimate is {ratio:.2}x the real cost. A budget that does \
+             not track what it budgets is not a budget."
+        );
     }
 }
