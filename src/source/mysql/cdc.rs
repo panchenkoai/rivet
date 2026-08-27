@@ -973,25 +973,7 @@ impl MysqlChangeStream {
                     self.tx_bytes = self.tx_bytes.saturating_add(ev.estimated_bytes());
                     self.tx.push(ev);
                 }
-                let cap = crate::source::cdc::max_tx_rows();
-                if self.tx.len() > cap {
-                    anyhow::bail!(
-                        "mysql cdc: a single transaction buffered more than {cap} rows \
-                         before its commit — refusing to buffer unbounded (raise the cap only if \
-                         a transaction this large is genuinely expected)"
-                    );
-                }
-                // Round-2 audit #9: byte backstop — a few large-cell rows stay
-                // under the row cap yet exhaust memory (MySQL streams the binlog
-                // event-by-event, so this is the most load-bearing engine).
-                let byte_cap = crate::source::cdc::max_tx_bytes();
-                if self.tx_bytes > byte_cap {
-                    anyhow::bail!(
-                        "mysql cdc: a single transaction buffered more than {byte_cap} bytes \
-                         (large cells) before its commit — refusing to buffer unbounded (raise \
-                         RIVET_CDC_MAX_TX_BYTES only if a transaction this large is expected)"
-                    );
-                }
+                crate::source::cdc::check_tx_buffer_caps("mysql", self.tx.len(), self.tx_bytes)?;
             }
             // XID = transaction commit. Stamp the commit position on every change
             // in the transaction and mark the last one committed, then release the

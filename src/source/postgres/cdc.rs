@@ -934,26 +934,7 @@ impl PgChangeStream {
                 // transaction, so `peek_changes` already materialised the whole
                 // thing into `rows` — this bails loudly instead of compounding it
                 // into `pending` + the sink buffer, and names the (upstream) fix.
-                let cap = crate::source::cdc::max_tx_rows();
-                if tx.len() > cap {
-                    anyhow::bail!(
-                        "pg cdc: a single transaction has more than {cap} rows — \
-                         it must be buffered whole (a transaction is never split across parts), \
-                         so this would exhaust memory. Split the source transaction, or raise \
-                         the cap only if a transaction this large is genuinely expected."
-                    );
-                }
-                // Round-2 audit #9: byte backstop — a few large-cell rows stay
-                // under the row cap yet exhaust memory.
-                let byte_cap = crate::source::cdc::max_tx_bytes();
-                if tx_bytes > byte_cap {
-                    anyhow::bail!(
-                        "pg cdc: a single transaction buffered more than {byte_cap} bytes \
-                         (large cells) before its commit — it must be buffered whole, so this \
-                         would exhaust memory. Split the source transaction, or raise \
-                         RIVET_CDC_MAX_TX_BYTES only if a transaction this large is expected."
-                    );
-                }
+                crate::source::cdc::check_tx_buffer_caps("pg", tx.len(), tx_bytes)?;
             }
         }
         // Short window (backlog fit in one peek) OR a full window that yielded

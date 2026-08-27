@@ -871,26 +871,7 @@ impl MssqlChangeStream {
             // `__$start_lsn` group can be arbitrarily large. Bail loudly rather
             // than OOM. `@to` bounds the batch at a group boundary, so a group
             // never straddles two polls — the whole group lands in one `batch`.
-            let cap = crate::source::cdc::max_tx_rows();
-            if batch.len() > cap {
-                anyhow::bail!(
-                    "mssql cdc: a single transaction has more than {cap} change rows — \
-                     it must be buffered whole (a transaction is never split across parts), so \
-                     this would exhaust memory. Split the source transaction, or raise the cap \
-                     only if a transaction this large is genuinely expected."
-                );
-            }
-            // Round-2 audit #9: byte backstop — a few large-cell rows stay under
-            // the row cap yet exhaust memory.
-            let byte_cap = crate::source::cdc::max_tx_bytes();
-            if batch_bytes > byte_cap {
-                anyhow::bail!(
-                    "mssql cdc: a single transaction buffered more than {byte_cap} bytes \
-                     (large cells) before its commit — it must be buffered whole, so this would \
-                     exhaust memory. Split the source transaction, or raise RIVET_CDC_MAX_TX_BYTES \
-                     only if a transaction this large is expected."
-                );
-            }
+            crate::source::cdc::check_tx_buffer_caps("mssql", batch.len(), batch_bytes)?;
         }
         // #158: a batch holds one or more transactions, each a run of rows
         // sharing `__$start_lsn`. Close EACH run through the shared framer —

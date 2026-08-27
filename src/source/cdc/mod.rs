@@ -26,6 +26,42 @@ use crate::config::TlsConfig;
 use crate::error::Result;
 use value::RivetValue;
 
+/// The buffered-transaction memory backstop, in ONE place for every adapter.
+///
+/// PostgreSQL, MySQL and SQL Server each buffer a transaction WHOLE — the
+/// never-split invariant — and each grew its own copy of this check: a row cap, a
+/// byte cap, and a refusal message per engine. Three copies of one rule, and none
+/// of them graded, which is the shape this codebase keeps paying for.
+///
+/// Consolidating it is also what makes the next step tractable: turning "refuse an
+/// oversized transaction" into "spill it to disk" then changes ONE decision instead
+/// of three, and the three engines cannot drift on the threshold while it happens.
+///
+/// `Ok(())` while the transaction still fits.
+pub(crate) fn check_tx_buffer_caps(engine: &str, rows: usize, bytes: usize) -> Result<()> {
+    let row_cap = max_tx_rows();
+    if rows > row_cap {
+        anyhow::bail!(
+            "{engine} cdc: a single transaction has more than {row_cap} rows — it must be \
+             buffered whole (a transaction is never split across parts, which is what \
+             makes a crash resume transaction-atomic), so this would exhaust memory. \
+             Split the source transaction, or raise RIVET_CDC_MAX_TX_ROWS only if a \
+             transaction this large is genuinely expected."
+        );
+    }
+    let byte_cap = max_tx_bytes();
+    if bytes > byte_cap {
+        anyhow::bail!(
+            "{engine} cdc: a single transaction has more than {byte_cap} bytes (large \
+             cells) — it must be buffered whole, so this would exhaust memory. The ROW \
+             count is a poor bound here: a few multi-hundred-MB values stay far under \
+             the row cap. Split the source transaction, or raise \
+             RIVET_CDC_MAX_TX_BYTES only if a transaction this large is expected."
+        );
+    }
+    Ok(())
+}
+
 /// The cap a `RIVET_CDC_MAX_TX_*` override resolves to — the pure half of
 /// [`max_tx_rows`] and [`max_tx_bytes`].
 ///

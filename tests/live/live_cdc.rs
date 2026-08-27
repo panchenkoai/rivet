@@ -7523,9 +7523,37 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
 /// stopping at cycle N's leftover would report a clean drain over an unread
 /// backlog — silent, and exactly what the nonce exists to prevent.
 #[test]
-#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+#[ignore = "live+exclusive: holds an observer slot — set RIVET_TEST_EXCLUSIVE=1"]
 fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
     use postgres::NoTls;
+
+    // EXCLUSIVE, and gated rather than serialized — the second test this session to
+    // need it, for the same reason and with the same cost stated.
+    //
+    // The oracle here is a PASSIVE observer slot, and an inactive slot is a foreign
+    // ABANDONED slot to every other export. Two neighbours assert precisely that
+    // rivet stays silent about those (`roast_pg_cdc_run_warns_about_an_abandoned_
+    // slot_pinning_wal` and `doctor_reports_cdc_slot_health_and_flags_foreign_
+    // inactive_slots`), so this test breaks them whenever it runs alongside —
+    // MEASURED, and narrowing the observer's lifetime to a single cycle was not
+    // enough. Other PG CDC tests do not trip it because their slots are ACTIVE for
+    // the run and dropped after; a passive observer is the one shape that lingers.
+    //
+    // There is no second oracle available: a barrier lives in WAL and only a slot
+    // can read it, and rivet's own log saying it emitted one is rivet reporting on
+    // itself — the weaker thing this repo declines everywhere else.
+    //
+    // The cost, stated plainly: this does NOT run in the normal pass. What runs is
+    // the pure half — `is_barrier_line` and `is_our_barrier`, both with their own
+    // matrices — and those grade the recognition. This grades the EMISSION.
+    if std::env::var("RIVET_TEST_EXCLUSIVE").is_err() {
+        skip_live(
+            "holds a passive observer slot, which two neighbours correctly report as \
+             an abandoned foreign slot — run with RIVET_TEST_EXCLUSIVE=1 and \
+             --test-threads=1",
+        );
+        return;
+    }
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("rivet_barrier").to_lowercase();
     let slot = unique_name("rivet_barrier_slot").to_lowercase();
@@ -7538,13 +7566,14 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
     let _t = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     // The independent watcher, created FIRST so it sees everything the run emits.
-    c.execute(
-        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
-        &[&watcher],
-    )
-    .expect("watcher slot");
-    let _w = Slot(watcher.clone());
-
+    // The watcher is created and dropped INSIDE each cycle, not held across the
+    // test. An inactive slot is a foreign abandoned slot to every other export, and
+    // `roast_pg_cdc_run_warns_about_an_abandoned_slot_pinning_wal` asserts a healthy
+    // instance stays SILENT about exactly that — MEASURED: holding the watcher for
+    // the whole test broke that neighbour reproducibly. Other PG CDC tests do not
+    // trip it because their slots are ACTIVE for the run and dropped after; a
+    // passive observer is the one shape that lingers.
+    //
     // rivet's OWN slot, created up front — so both cycles below are ordinary
     // bounded runs. A genuine FIRST run is a different path: it opens once as an
     // anchor (`DrainMode::Continuous`, which correctly emits no barrier), creates
@@ -7571,6 +7600,16 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
 
     let mut nonces: Vec<String> = Vec::new();
     for cycle in 0..2 {
+        c.execute(
+            "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[&watcher],
+        )
+        .expect("watcher slot");
+        // The guard, so a panic mid-cycle cannot leak an inactive slot onto the
+        // stand. Two slots leaked from a HAND probe earlier and broke the same two
+        // neighbours this test is gated for — the leak, not the test, was the
+        // cause, and only a `pg_replication_slots` read told them apart.
+        let _w = Slot(watcher.clone());
         c.batch_execute(&format!("INSERT INTO {tbl} VALUES ({cycle}, {cycle})"))
             .expect("seed");
         rig.run_ok();
@@ -7584,7 +7623,14 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
         let found: Vec<String> = rows
             .iter()
             .map(|r| r.get::<_, String>(0))
-            .filter(|l| l.starts_with("message:") && l.contains("prefix: rivet,"))
+            // Filtered by THIS export's slot, not merely by the rivet prefix. The
+            // watcher sees every barrier on the database, and a concurrent test
+            // running its own bounded export emits one too — MEASURED: counting by
+            // prefix alone failed reproducibly when a neighbouring PG CDC test ran
+            // alongside. That is the same fact the nonce design encodes (a barrier
+            // is visible to every slot, so it has to name its own), and the test
+            // had been written as if rivet were the only writer.
+            .filter(|l| l.starts_with("message:") && l.contains(&format!("content:{slot}-")))
             .collect();
         assert_eq!(
             found.len(),
@@ -7607,6 +7653,7 @@ fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
              database cannot end each other's runs: {nonce}"
         );
         nonces.push(nonce);
+        drop(_w); // before the next cycle recreates it under the same name
     }
 
     assert_ne!(
