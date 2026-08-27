@@ -442,6 +442,44 @@ exclude_re = [
     # warning exists — a server at FULL draining a backlog written under MINIMAL maps
     # by POSITION, and the open-time probe answers about the present.
     "replace warn_positional_once with \\(\\)",
+    # ── `src/source/cdc/mod.rs` live-only bodies (bucket 3, 2026-08-27) ──────────
+    #
+    # Three bodies that open a real source, a real destination or both, so a
+    # `--lib` run reports every mutant in them MISSED whatever the assertions say.
+    # Each was measured by hand — the stub applied, the LIVE CDC suite run, then
+    # reverted — rather than argued from the code:
+    #
+    #   run_capture                -> (vec![], Ok(()))  ⇒  99 of 108 live tests FAIL
+    #   CdcSchemaResolver::resolve -> Ok(vec![])        ⇒  65 fail
+    #   ensure_anchor, Mysql arm deleted                ⇒   6 fail, led by
+    #                                                      cdc_initial_snapshot_covers_
+    #                                                      preexisting_rows_then_streams
+    #   ensure_anchor              -> Ok(())            ⇒   2 fail, led by
+    #                                                      pg_initial_snapshot_vanished_
+    #                                                      slot_fails_loudly_not_recreates
+    #
+    # NOT excluded, deliberately: `delete match arm .. in CdcSchemaResolver::connect`.
+    # It is plausibly covered by the same 65 that `resolve` is, and plausible is not
+    # measured — an exclusion whose oracle was reasoned rather than run is the thing
+    # this block exists to avoid. It stays MISSED until someone runs it.
+    #
+    # And one precision the same session paid for: `cargo mutants --list` shows
+    # CANDIDATES, not results. `replace CdcSchemaResolver::connect -> Result<Self>
+    # with Ok(Default::default())` appears there and is UNVIABLE — the type has no
+    # `Default` — so it was never a survivor at all. Verify an exclusion MATCHED
+    # against `--list`; never read a `--list` entry as a finding.
+    #
+    # The DECISIONS these bodies used to hold have been lifted out and are graded
+    # offline — `maps_by_position`, `pins_log_for_reader`, `tx_cap_from_env`,
+    # `image_name_memo`, `pass_must_roll`, `drain_is_complete`,
+    # `named_image_arity_mismatch`, `positional_image_width_mismatch`. What is left
+    # is sequencing, I/O and error context, which is what the exclusion claims and
+    # all it claims; `live_only_purity_gate` holds each body at a shrink-only
+    # ceiling so a decision cannot quietly move back in.
+    "replace run_capture -> \\(Vec<crate::manifest::RunManifest>, Result<\\(\\)>\\)",
+    "replace CdcSchemaResolver::resolve -> Result<Vec<crate::types::TypeMapping>>",
+    "replace CdcEngine::ensure_anchor -> Result<\\(\\)>",
+    "delete match arm .* in CdcEngine::ensure_anchor",
     "replace PgChangeStream::fill -> Result",
     "replace MysqlChangeStream::fill -> Result",
     # The match GUARD on the MySQL TRUNCATE arm sits inside that same live-only body.

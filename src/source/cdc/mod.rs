@@ -628,6 +628,27 @@ pub(crate) enum RowImage {
     /// wrong rather than merely thin, so this is refused.
     Partial { why: String },
 }
+/// The native column TYPE a catalog listing gives for `column`.
+///
+/// Extracted from `CdcSchemaResolver::resolve`, which is live-only glue — it opens
+/// a connection and reads `information_schema` — so its `*n == m.column_name`
+/// survived a mutation run. `!=` takes the first column that is NOT the one asked
+/// for, so every mapping is enriched with a NEIGHBOUR's native type: a `varchar`
+/// column reported as `int`, silently, in the schema every consumer reads.
+///
+/// The third comparison of this exact shape found this session — `image_cell`'s
+/// name lookup and `image_name_memo`'s were the others — and all three were a
+/// lookup-by-name sitting in a body no offline test could reach.
+pub(crate) fn native_type_for<'a>(
+    catalog: &'a [(String, String)],
+    column: &str,
+) -> Option<&'a str> {
+    catalog
+        .iter()
+        .find(|(name, _)| name == column)
+        .map(|(_, ty)| ty.as_str())
+}
+
 impl CdcEngine {
     /// Can this engine's wire format ever map a row image by POSITION rather than
     /// by column name?
@@ -1216,8 +1237,8 @@ impl CdcSchemaResolver {
                 (&schema, &bare),
             )?;
             for m in &mut mappings {
-                if let Some((_, ct)) = full.iter().find(|(n, _)| *n == m.column_name) {
-                    m.source_native_type = ct.clone();
+                if let Some(ct) = native_type_for(&full, &m.column_name) {
+                    m.source_native_type = ct.to_string();
                 }
             }
         }
@@ -1509,6 +1530,78 @@ mod mod_decisions {
             2 * 1024 * 1024 * 1024,
             "2 GiB — `*` -> `+` collapses it to 3074 bytes, which refuses every \
              transaction that carries more than a couple of rows"
+        );
+    }
+
+    /// A column's native type comes from ITS row in the catalog, not a neighbour's.
+    ///
+    /// TWO columns minimum: with one, `==` and `!=` are indistinguishable because
+    /// there is no neighbour to pick up — the same reason the row-hash injectivity
+    /// guard needed two fields.
+    #[test]
+    fn a_columns_native_type_is_looked_up_by_its_own_name() {
+        let catalog = vec![
+            ("id".to_string(), "bigint".to_string()),
+            ("name".to_string(), "varchar(64)".to_string()),
+        ];
+        assert_eq!(native_type_for(&catalog, "id"), Some("bigint"));
+        assert_eq!(
+            native_type_for(&catalog, "name"),
+            Some("varchar(64)"),
+            "`!=` returns the FIRST row that is not this column, so every mapping \
+             is enriched with a neighbour's native type — a varchar reported as \
+             bigint, in the schema every consumer downstream reads"
+        );
+        assert_eq!(
+            native_type_for(&catalog, "absent"),
+            None,
+            "a column the catalog does not list has no native type; `!=` answers \
+             `bigint` here, which is a type for a column that does not exist"
+        );
+        assert_eq!(native_type_for(&[], "id"), None);
+    }
+
+    /// A checkpoint that cannot be READ is not a checkpoint that is ABSENT.
+    ///
+    /// `Position::load` returns `Ok(None)` on `NotFound` — "first run, anchor here"
+    /// — and propagates every other io error. `replace match guard e.kind() ==
+    /// ErrorKind::NotFound with true` survived, and it collapses the distinction:
+    /// a permissions error, a directory where a file belongs, a dead mount all
+    /// become "no checkpoint", which re-anchors the stream at the CURRENT position
+    /// and permanently skips everything written since. `status: success, rows: 0`.
+    ///
+    /// This is the same class the corrupt-JSON arm above it already refuses in
+    /// prose, one line apart — it just had no test on the io side.
+    #[test]
+    fn an_unreadable_checkpoint_is_an_error_not_an_absent_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // ABSENT — the only case that may read as "first run".
+        assert!(
+            Position::load(&dir.path().join("nope.ckpt"))
+                .expect("a missing checkpoint is not an error")
+                .is_none(),
+            "a file that is not there IS the first run"
+        );
+
+        // PRESENT and valid — the control, so "always error" cannot satisfy this.
+        let ok = dir.path().join("ok.ckpt");
+        std::fs::write(&ok, br#"{"lsn":"0/10"}"#).expect("write a checkpoint");
+        assert!(Position::load(&ok).expect("valid").is_some());
+
+        // UNREADABLE: a DIRECTORY where a file is expected. `read_to_string` fails
+        // with `IsADirectory`/`InvalidInput`, never `NotFound` — so the guard is
+        // what decides, and with it always true this returns `Ok(None)` and the
+        // run re-anchors at NOW.
+        let as_dir = dir.path().join("a_directory.ckpt");
+        std::fs::create_dir(&as_dir).expect("create the impostor");
+        let err = Position::load(&as_dir)
+            .expect_err("a path that cannot be read must ERROR, not read as absent");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("reading checkpoint") && text.contains("a_directory.ckpt"),
+            "the error must name the file it failed to read, or an operator cannot \
+             tell it from the corrupt-JSON case one line above: {text}"
         );
     }
 
