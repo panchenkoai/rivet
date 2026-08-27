@@ -600,9 +600,10 @@ fn to_change_event(
 
     // The `document` column: post-image for insert/update, pre-image (6.0+) for
     // delete.
-    let doc_source = match op {
-        ChangeOp::Delete => cse.full_document_before_change.as_ref(),
-        _ => cse.full_document.as_ref(),
+    let doc_source = if op.values_live_in_before() {
+        cse.full_document_before_change.as_ref()
+    } else {
+        cse.full_document.as_ref()
     };
     // An insert/update whose post-image is absent writes NULL here, and that is a
     // KNOWN GAP with a narrow harmful case — recorded rather than papered over.
@@ -650,9 +651,10 @@ fn to_change_event(
     };
 
     let image = vec![id_val, doc_val];
-    let (before, after) = match op {
-        ChangeOp::Delete => (Some(image), None),
-        _ => (None, Some(image)),
+    let (before, after) = if op.values_live_in_before() {
+        (Some(image), None)
+    } else {
+        (None, Some(image))
     };
 
     let mut ev = ChangeEvent {

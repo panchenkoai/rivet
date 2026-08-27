@@ -70,6 +70,24 @@ impl ChangeOp {
     }
 }
 
+impl ChangeOp {
+    /// Does this op carry its values in the BEFORE image?
+    ///
+    /// A DELETE does; everything else carries them after. One fact, previously
+    /// restated as a `match` in at least three places — `image_cell`, and twice in
+    /// Mongo's `to_change_event`, where BOTH restatements were ungraded (`delete
+    /// match arm ChangeOp::Delete` survived each). With the arm gone a delete reads
+    /// the post-image, which does not exist on a delete, and is then framed as an
+    /// AFTER image: the change is delivered as an insert of NULLs, and the row it
+    /// was meant to retract stays in the destination forever.
+    pub(crate) fn values_live_in_before(self) -> bool {
+        match self {
+            ChangeOp::Delete => true,
+            ChangeOp::Insert | ChangeOp::Update => false,
+        }
+    }
+}
+
 /// An opaque, engine-shaped resume position — MySQL `{file, pos}`, a PostgreSQL
 /// LSN, a SQL Server LSN. Persisted verbatim as the checkpoint; each engine
 /// interprets its own shape when resuming. Compared only for equality.
@@ -1531,6 +1549,32 @@ mod mod_decisions {
             "2 GiB — `*` -> `+` collapses it to 3074 bytes, which refuses every \
              transaction that carries more than a couple of rows"
         );
+    }
+
+    /// Every op answers where its values live, and only DELETE says "before".
+    ///
+    /// One fact that was restated as a `match` in three places, ungraded in each.
+    /// With the delete arm gone in Mongo's `to_change_event`, a delete reads the
+    /// post-image — which does not exist on a delete — and is then framed as an
+    /// AFTER image: the change arrives as an insert of NULLs, and the row it was
+    /// meant to retract stays in the destination forever, with every count
+    /// agreeing.
+    ///
+    /// Enumerated, not spot-checked: `matches!(self, Delete)` and `true` differ
+    /// only on the ops a one-variant fixture would not exercise.
+    #[test]
+    fn only_a_delete_carries_its_values_in_the_before_image() {
+        assert!(
+            ChangeOp::Delete.values_live_in_before(),
+            "a delete has no post-image; reading `after` finds None and the event \
+             carries nothing"
+        );
+        assert!(
+            !ChangeOp::Insert.values_live_in_before(),
+            "an insert's values are the AFTER image — framing them as `before` \
+             delivers a retraction of a row that was just created"
+        );
+        assert!(!ChangeOp::Update.values_live_in_before());
     }
 
     /// A column's native type comes from ITS row in the catalog, not a neighbour's.
