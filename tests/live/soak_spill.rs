@@ -28,6 +28,9 @@
 //!                      the BYTE cap fires and the row cap never does
 //!   RIVET_SOAK_CAP     row cap (default 50); above ROWS for the no-spill baseline
 //!   RIVET_SOAK_BYTE_CAP  byte cap; unset leaves the product default
+//!   RIVET_SOAK_TX_ROWS rows per transaction (default: the whole cycle in one) —
+//!                      the knob that separates "a big transaction is expensive"
+//!                      from "CDC is expensive"
 //!
 //! The oracle is DuckDB, per the rule this repo learned the hard way: rivet's own
 //! count is not evidence about rivet. `row_census` reads the SOURCE table, the
@@ -46,6 +49,33 @@ fn soak_cycles() -> usize {
     env_usize("RIVET_SOAK_CYCLES", 3)
 }
 
+/// MEASURED, PostgreSQL, one cycle, `pad=200` — the table this file exists to keep
+/// honest. Reproduce any row with the knobs above.
+///
+/// | rows | shape | cap | peak RSS |
+/// |---|---|---|---|
+/// | 2 000 | one tx | 50 | 41.7 MB |
+/// | 20 000 | one tx | 50 | 78.5 MB |
+/// | 100 000 | one tx | 50 | 201.1 MB |
+/// | 100 000 | one tx | no spill | 226.1 MB |
+/// | 1 000 000 | one tx | 50 | 1589.7 MB |
+/// | 1 000 000 | one tx | PRODUCT DEFAULTS | 1814.9 MB |
+/// | 1 000 000 | **1000 tx of 1000** | 50 | **233.1 MB** |
+/// | 10 000 000 | one tx | 50 | 12389.6 MB |
+/// | 1 000 000 | one tx, MONGO | n/a | 331.9 MB |
+///
+/// Three things fall out of that table, none of them visible from one row:
+///
+/// 1. The cost tracks TRANSACTION size, not volume. The same million rows is
+///    1589.7 MB in one transaction and 233.1 MB in a thousand — 6.8x, same engine,
+///    same data. Ordinary OLTP traffic is the second shape.
+/// 2. Spilling is worth ~11%, and Mongo says why: it has no transaction buffer and
+///    marks every event its own commit, so its sink CAN roll, and it lands at
+///    331.9 MB where PostgreSQL is at 1589.7 MB.
+/// 3. At PRODUCT DEFAULTS the spill is not even involved below 5M rows / 2 GiB —
+///    a 1M-row transaction costs 1.8 GB and never spills. The caps sit far above
+///    where the memory actually starts to hurt.
+///
 /// Peak RSS any spawned rivet may reach, in bytes.
 ///
 /// Read this with the measurement below, not with the intuition the word "spill"
@@ -66,6 +96,22 @@ fn soak_cycles() -> usize {
 /// `RIVET_SOAK_ROWS`; when the sink learns to spill, that gap is the evidence.
 fn rss_ceiling() -> u64 {
     env_usize("RIVET_SOAK_RSS_MB", 256) as u64 * 1024 * 1024
+}
+
+/// Rows per TRANSACTION — the knob that separates "a big transaction is expensive"
+/// from "CDC is expensive".
+///
+/// Default `0` means "the whole cycle in one transaction", which is the spill
+/// fixture. Set it lower and the same total volume arrives as many small
+/// transactions instead, which is what an ordinary OLTP workload looks like. The
+/// sink rolls a part on a `committed` event, so the two shapes should behave
+/// completely differently — and if they do not, the cost is not about transaction
+/// size at all and every conclusion here changes.
+fn tx_rows() -> usize {
+    match env_usize("RIVET_SOAK_TX_ROWS", 0) {
+        0 => usize::MAX,
+        n => n,
+    }
 }
 
 /// Width of each row's `pad` column — the knob that turns a row-cap fixture into a
@@ -131,10 +177,16 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
 
     let peak = peak_child_rss_bytes();
     println!(
-        "soak/{engine}: {expected} rows over {} cycles, cap {} | peak child RSS \
+        "soak/{engine}: {expected} rows over {} cycles, cap {}, tx {} | peak child \
+         RSS \
          {:.1} MB (was {:.1} MB before) | census {census:?}",
         soak_cycles(),
         cap(),
+        if tx_rows() == usize::MAX {
+            "all-in-one".to_string()
+        } else {
+            tx_rows().to_string()
+        },
         peak as f64 / 1e6,
         rss_before as f64 / 1e6,
     );
@@ -205,8 +257,10 @@ fn assert_cycle_spilled(engine: &str, cycle: usize, stderr: &str) {
         );
         return;
     }
-    if cap() > soak_rows() {
-        // Baseline run: the cap is above the fixture, so nothing spills by design.
+    if cap() > soak_rows() || tx_rows() <= cap() {
+        // Baseline run: no transaction is large enough to cross the cap, so nothing
+        // spills by design — either the cap was raised above the fixture, or the
+        // fixture was split into transactions smaller than the cap.
         assert!(
             !stderr.contains("passed the in-memory cap"),
             "{engine} cycle {cycle}: the cap was raised above the fixture and it \
@@ -271,13 +325,20 @@ fn soak_spill_postgres() {
     let rig = Rig::pg_cdc(&tbl, &slot).census_oracle();
     let mut seeded = 0usize;
     for cycle in 1..=cycles {
-        c.batch_execute(&transaction_over_wide(
-            &tbl,
-            seeded + 1..=seeded + rows,
-            soak_pad(),
-        ))
-        .unwrap();
-        seeded += rows;
+        // Split into transactions of `tx_rows` (default: one transaction for the
+        // whole cycle). Same total volume either way — only the framing differs.
+        let mut left = rows;
+        while left > 0 {
+            let n = left.min(tx_rows());
+            c.batch_execute(&transaction_over_wide(
+                &tbl,
+                seeded + 1..=seeded + n,
+                soak_pad(),
+            ))
+            .unwrap();
+            seeded += n;
+            left -= n;
+        }
         c.batch_execute(&transaction_over_wide(
             &tbl,
             seeded + 1..=seeded + SMALL,
