@@ -984,6 +984,60 @@ from the run's own metrics row. RED against the pre-fix order (`left: Some(0)`,
 the same mutant. When a new test and an old one disagree about a mutant, the
 disagreement is the finding: the old test's blind spot has a name and a boundary.
 
+## A bughunt is a ROTATION OF AXES — a dry round counts only if the axis was new
+
+The failure mode of a hunt is not too little effort, it is the same angle repeated.
+Rounds 6-8 of the 2026-08 CDC hunt collapsed onto prose in one file — the scope was
+picking the findings, not the risk — and widening to the whole subsystem in round 9
+immediately produced silent data loss. Three "converging" rounds that measured
+nothing, and they look exactly like success.
+
+So the unit of a hunt is the AXIS, and each round declares which one it is using.
+The axes that actually produced findings here, with the bite that named each:
+
+| axis | what only it can see | the bite |
+| --- | --- | --- |
+| diff scope | regressions in what you just touched | exhausts in ~3 rounds |
+| whole subsystem | old code the diff never reaches | round 9: real loss |
+| per ENGINE | true on one, false on another | XA is MySQL-only; the tz corruption PG-only |
+| session/server STATE | text renderings off the default | `datestyle='German, DMY'` nulled every timestamp |
+| lifecycle | capture ≠ resume; run N vs N+1; idle first run | MSSQL re-read the whole change table |
+| layer SEAM | who SUPPLIES the value a decider decides on | the retry decider got 0 with 4 parts on disk |
+| message TRUTH | a claim in prose that has become false | rounds 15-17, three classes |
+| evidence (mutants) | decisions nothing grades | the dead byte-cap accumulator |
+| ABSENCE (independent oracle) | what should exist and does not | the manifest clobber |
+| hostile input | non-ASCII, quoting, heterogeneous key types | `TRUNCATE données` panicked the process |
+
+Process rule: **every round names its axis, and a DRY round counts toward the stop
+condition only when that axis was NEW.** Sufficiency is "every axis in the list is
+dry", never "N rounds found nothing" — three dry rounds on one axis is what rounds
+6-8 were. When a new defect CLASS appears, ask which axis would have found it
+earlier; if none would, that is a new axis and it joins the list (that is exactly
+how "message truth" was born — an untrue string kills no mutant and fails no test).
+
+Two orderings that cost real time when got wrong:
+
+1. **Cheap and directional first, expensive and calibrating last.** Mutation testing
+   run before the fixes is wasted cycles — half the survivors evaporate under the
+   repairs you were going to make anyway. Scope, engine, state and truth first;
+   mutants and the independent-oracle sweep after.
+2. **One axis at a time.** Run them in parallel and you cannot say what found what,
+   so you cannot retire an exhausted axis or measure a new one's yield.
+
+The two halves have DIFFERENT convergence, and reading one as the other is the
+headline mistake: **a bughunt finds defects and stops** (round 13 produced two
+data-loss bugs, rounds 15-17 produced none), while **mutation keeps finding missing
+evidence** because it measures a different thing. A dry hunt round means "nothing
+more is visible at this level of attention", not "there are no defects".
+
+Honest limit of the whole method, stated so nobody has to rediscover it: no axis
+sees a TEST AND A CODE THAT AGREE ON A WRONG SPEC. Everything is green on every
+axis when the contract itself is wrong. The only lever there is an external source
+of truth — the engine's documentation, a reference implementation's behaviour, or a
+live experiment on a real server. That is how the `committed` transaction-boundary
+semantics and Debezium's PK-update shape were settled here, and neither was
+reachable from inside the suite.
+
 ## A claim inside a product message is a testable claim — run it
 
 Three rounds of the 2026-08 CDC hunt found nothing by reading code and three
