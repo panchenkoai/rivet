@@ -7535,9 +7535,9 @@ fn a_rolled_back_prepared_transaction_is_never_published_postgres() {
     // mechanism guard (`the_pg_slot_is_not_two_phase_...`) does, needs no restart,
     // and is what protects the property day to day.
     if std::env::var("RIVET_TEST_EXCLUSIVE").is_err() {
-        eprintln!(
-            "skipped: restarts postgres-cdc and breaks concurrent tests. Run with \
-             RIVET_TEST_EXCLUSIVE=1 --test-threads=1."
+        skip_live(
+            "restarts postgres-cdc, which breaks concurrent tests — run with \
+             RIVET_TEST_EXCLUSIVE=1 and --test-threads=1",
         );
         return;
     }
