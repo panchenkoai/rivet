@@ -549,6 +549,41 @@ rather than skipping — the engine with the weakest catalog stats (MySQL) is
 exactly where the pathology is least visible. A sparsity/cost check gated behind
 `row_estimate.is_some()` is a check that abandons the user who needs it most.
 
+## A mutation helper must restore from a SNAPSHOT, never `git checkout`
+
+RED-proving a test means editing the product, running, and putting it back. The
+obvious "put it back" is `git checkout -- <file>` — and it reverts to **HEAD**, so
+every uncommitted change in that file is gone. Measured this session: one helper
+call wiped three files of live, uncommitted work (a new module, a new seam, and the
+wiring between them) in the act of proving a test. The proof succeeded and the
+subject of the proof no longer existed.
+
+Two follow-on traps in the same helper, each of which produced a WRONG verdict
+rather than an obvious failure:
+
+1. **`shutil.copy2` preserves mtime.** Restoring with it leaves the file OLDER than
+   the artifacts built from the mutant, so cargo says `Fresh` and keeps the mutant
+   in the binary — every later run then grades mutated code while the source reads
+   clean (three spill tests failed against a file that no longer held the change).
+   Restore with a plain copy and `touch` the file. Same family as the
+   `target/package` staleness already in this file: when the act of checking mutates
+   what you are checking, the check is blind.
+2. **A killed helper never runs its `finally`.** A timeout mid-batch left `if false
+   {` in the tree. Verify the tree after any mutation batch (`git status`, plus a
+   grep for the mutant text) rather than trusting the restore ran.
+
+And the verdict itself needs a positive control: grepping the output for `FAILED`
+reads a BUILD failure, or a filter that matched no tests, as GREEN — the
+absence-is-not-success rule, arriving through the tool that is supposed to enforce
+it. Require a `test result:` line with a non-zero test count before reading any
+verdict at all.
+
+Process rule: **the restore point is a snapshot of the WORKING TREE taken before the
+mutation, never the committed state**; the helper asserts its anchor matched, asserts
+tests actually ran, and the caller verifies the tree afterwards. Template:
+`scratchpad/red.py`. A cheaper habit that makes all of this survivable: commit the
+work BEFORE the RED pass, so the worst case is a `git checkout` that costs nothing.
+
 ## A green test that was never RED is unverified — mutate the product to prove it
 
 The 2026-07 audit found **63 green tests that could not fail against the exact

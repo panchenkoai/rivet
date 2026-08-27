@@ -8579,3 +8579,192 @@ fn a_bounded_run_reaches_its_bound_across_an_empty_transaction_span() {
          slot still pinned behind it"
     );
 }
+
+// ─── PostgreSQL: a transaction larger than the in-memory cap ─────────────────
+
+/// A transaction past the memory cap SPILLS to disk and delivers exactly the rows a
+/// transaction under the cap delivers.
+///
+/// Before this, crossing the cap FAILED the run: a transaction is buffered whole (it
+/// is never split across parts, which is what makes a crash resume
+/// transaction-atomic), so an oversized one had nowhere to go and capture stopped
+/// until someone split the source transaction or raised a cap. That is a memory
+/// ceiling wearing a refusal.
+///
+/// TWO slots created before the seed, so both legs decode the SAME transaction from
+/// the same WAL: the comparison is then about the spill and nothing else. Leg A runs
+/// under a cap the transaction crosses, leg B under the default it does not.
+///
+/// The oracle is leg B, not a hand-written list: an assertion that the spilled leg
+/// holds 400 rows would pass just as well if BOTH legs were broken the same way,
+/// while "the two legs agree" cannot be satisfied by a bug in the shared path.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
+    use postgres::NoTls;
+    const ROWS: usize = 400;
+    const CAP: usize = 50;
+    /// Rows in the SECOND transaction, which follows the spilled one in the same
+    /// peek window.
+    const TAIL_TX: usize = 3;
+
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_spill_pg");
+    let slot_spill = unique_name("rivet_spill_slot");
+    let slot_plain = unique_name("rivet_plain_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} {ONE_TRANSACTION_DDL}"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    // GUARDED: an aborted test that leaks a slot eats `max_replication_slots` for
+    // every later run on the stand (measured — 32 leaked, and the next run failed
+    // with "all replication slots are in use", which reads as a product bug).
+    let _guards: Vec<Slot> = [&slot_spill, &slot_plain]
+        .iter()
+        .map(|slot| {
+            c.execute(
+                "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+                &[slot],
+            )
+            .unwrap();
+            Slot((*slot).clone())
+        })
+        .collect();
+    // The big transaction, seeded AFTER both slots exist so both decode it…
+    c.batch_execute(&one_transaction_of(&tbl, ROWS)).unwrap();
+    // …and a SECOND one behind it, in the same read window. Handing out a spilled
+    // tail ends the window early to keep commit order, and that early end must not
+    // read as "the window is drained" — with only one transaction the two are
+    // indistinguishable (measured: the guard could be inverted and the test stayed
+    // green). This is the row that goes missing if it does.
+    c.batch_execute(&transaction_over(&tbl, ROWS + 1..=ROWS + TAIL_TX))
+        .unwrap();
+
+    let out_spill = d.path().join("out_spill");
+    let out_plain = d.path().join("out_plain");
+    std::fs::create_dir_all(&out_spill).unwrap();
+    std::fs::create_dir_all(&out_plain).unwrap();
+
+    // Leg A — the cap is crossed at row CAP, so rows CAP..ROWS go to disk.
+    let spill_rig = Rig::pg_cdc(&tbl, &slot_spill).dest_path(out_spill.clone());
+    let a = spill_rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
+    assert!(
+        a.status.success(),
+        "a transaction past the cap must SPILL, not fail the run: {}",
+        String::from_utf8_lossy(&a.stderr)
+    );
+    // The fixture is not inert: prove it really spilled rather than passing because
+    // the cap was never reached. Without this the test would stay green if the cap
+    // env var were ignored entirely.
+    let log_a = String::from_utf8_lossy(&a.stderr).to_string();
+    assert!(
+        log_a.contains("passed the in-memory cap"),
+        "the run must SAY it spilled — a silent spill and a cap that was never \
+         reached are indistinguishable, and this test would then prove nothing \
+         about spilling at all. stderr: {log_a}"
+    );
+    // …and that rows genuinely went to DISK, with memory held at the cap.
+    //
+    // Rows and order alone cannot see this: a spill that quietly keeps buffering
+    // delivers the SAME rows (measured — dropping the `continue` that skips the
+    // in-memory push recreates the tail on every row, so it is empty at commit and
+    // every row arrives from memory, byte-identical output and no memory bound at
+    // all). The split itself is the only externally visible measure, so both halves
+    // are asserted: the ceiling held, and nothing fell between the two segments.
+    let split = log_a
+        .split("delivered ")
+        .filter_map(|s| s.split_once(" rows from memory and "))
+        .find_map(|(head, rest)| {
+            let tail = rest.split_once(" from disk")?.0;
+            Some((
+                head.trim().parse::<usize>().ok()?,
+                tail.trim().parse::<usize>().ok()?,
+            ))
+        });
+    let (from_memory, from_disk) =
+        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log_a}"));
+    assert_eq!(
+        from_memory + from_disk,
+        ROWS,
+        "the two segments must account for the WHOLE transaction — a row that \
+         belongs to neither is a row nobody would miss. stderr: {log_a}"
+    );
+    // CAP + 1: the cap is checked AFTER the row is pushed, so the head holds one
+    // row more than the cap before the spill opens. Asserting the exact ceiling
+    // rather than "most of it went to disk" is what makes this a memory bound.
+    assert_eq!(
+        from_memory,
+        CAP + 1,
+        "memory must stop at the cap — that is the whole point of spilling, and a \
+         head larger than the cap means the ceiling is not being enforced. \
+         stderr: {log_a}"
+    );
+
+    // Leg B — the same transaction under the default cap: no spill.
+    let plain_rig = Rig::pg_cdc(&tbl, &slot_plain).dest_path(out_plain.clone());
+    plain_rig.run_ok();
+
+    let spilled = cdc_id_ops(&out_spill);
+    let buffered = cdc_id_ops(&out_plain);
+    assert_eq!(
+        buffered.len(),
+        ROWS + TAIL_TX,
+        "the unspilled leg is the ORACLE — if it is short the comparison below \
+         proves nothing"
+    );
+    assert_eq!(
+        spilled, buffered,
+        "a spilled transaction must deliver exactly what a buffered one does — \
+         same rows, same order, same ops"
+    );
+
+    // Exactly once: the head is handed out from memory and the tail from disk, and
+    // a row delivered by both paths would be a duplicate no count check would see.
+    let mut ids: Vec<i64> = spilled.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        ROWS + TAIL_TX,
+        "every id exactly once across the memory head, the disk tail, and the \
+         transaction that follows them"
+    );
+    assert_eq!(
+        spilled.last().map(|(id, _)| *id),
+        Some((ROWS + TAIL_TX) as i64),
+        "the transaction AFTER the spilled one must still arrive, and arrive last \
+         — ending the read window to drain a tail defers it, and a run that treats \
+         that early end as `drained` silently leaves it for the next cycle"
+    );
+
+    // The spill file does not outlive the run.
+    fn spill_leaks(dir: &std::path::Path, found: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                spill_leaks(&p, found);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rivet-spill-"))
+            {
+                found.push(p.display().to_string());
+            }
+        }
+    }
+    let mut leaked = Vec::new();
+    spill_leaks(d.path(), &mut leaked);
+    // …and the run-state fallback, which is where a checkpoint-less PG config
+    // (the common slot-anchored shape, and this rig's) actually spills.
+    spill_leaks(std::path::Path::new(".rivet/spill"), &mut leaked);
+    assert!(
+        leaked.is_empty(),
+        "a spill must not outlive the transaction it held — a CDC run leaking one \
+         per oversized transaction fills a disk on a scheduler: {leaked:?}"
+    );
+}

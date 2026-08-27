@@ -273,11 +273,45 @@ impl TxnFramer {
     /// Frame one committed source transaction: `position = commit` on all,
     /// `committed = true` on the last event only. Empty group is a no-op.
     pub(crate) fn close_group(events: &mut [ChangeEvent], commit: &Position) {
+        Self::close_head_of_group(events, commit, 0);
+    }
+
+    /// Close the IN-MEMORY head of a transaction whose tail is still on disk.
+    ///
+    /// A transaction past the memory cap keeps its head in `events` and spills the
+    /// rest as raw wire rows, so the LAST event of the transaction is in the tail
+    /// whenever the tail is non-empty. `committed` must follow the transaction, not
+    /// the segment: marking the head's last event committed would let the sink roll,
+    /// checkpoint and ack MID-transaction, and a crash before the tail's flush would
+    /// advance the slot past the commit — the resume reads strictly after it and the
+    /// tail is gone. That is the `committed`-on-every-event break arriving through a
+    /// second door.
+    ///
+    /// [`Self::close_group`] is this with an empty tail, so the unspilled path and
+    /// the spilled one cannot drift into two rules.
+    pub(crate) fn close_head_of_group(
+        events: &mut [ChangeEvent],
+        commit: &Position,
+        tail_len: usize,
+    ) {
         let n = events.len();
         for (i, ev) in events.iter_mut().enumerate() {
             ev.position = commit.clone();
-            ev.committed = i + 1 == n;
+            ev.committed = tail_len == 0 && i + 1 == n;
         }
+    }
+
+    /// Close ONE event of a spilled tail: `at` is its index within the tail,
+    /// `tail_len` the tail's length. Only the tail's last event closes the
+    /// transaction.
+    pub(crate) fn close_tail_event(
+        event: &mut ChangeEvent,
+        commit: &Position,
+        at: usize,
+        tail_len: usize,
+    ) {
+        event.position = commit.clone();
+        event.committed = at + 1 == tail_len;
     }
 
     /// Mark a stand-alone event as its own commit boundary (#158 — a NAMED decision, not a
@@ -933,6 +967,8 @@ impl CdcEngine {
                     // no slot holding them, whereas a slot created first keeps
                     // every one of them until the corrected run drains it.
                     &[],
+                    // Nothing is read here, so there is nothing to spill.
+                    None,
                 )?);
                 Ok(())
             }
@@ -1024,6 +1060,37 @@ pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: Post
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
 pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) — see the 'MongoDB — change streams' section of docs/reference/cdc.md";
 
+/// Where an oversized transaction spills.
+///
+/// The checkpoint's directory when there is one — somewhere the OPERATOR chose and
+/// keeps rivet's state — and `.rivet/spill` otherwise, which is the directory rivet
+/// already writes `.rivet/runs/<id>/summary.json` into beside the config. Neither is
+/// the system temp: a CDC spill can be gigabytes and a tmpfs takes down more than
+/// rivet.
+///
+/// It always resolves to SOMETHING, and an earlier cut that returned `None` without a
+/// checkpoint was wrong on the engine that needs this most: PostgreSQL CDC is
+/// slot-anchored, so a checkpoint is optional there and most PG configs (and the
+/// test rig's own `pg_cdc`) carry none. The spill would have been unavailable exactly
+/// where transactions are largest.
+///
+/// A `None` return would not have been the safe choice either. This is only ever
+/// consulted on a transaction that has ALREADY passed the memory cap — the case that
+/// used to fail the run outright — so an unwritable directory fails it the same way,
+/// with a clearer message. There is nothing to be conservative about.
+///
+/// Its own subdirectory, so a leaked spill cannot be mistaken for state and a stray
+/// `.bin` never lands next to the checkpoint a resume reads.
+pub(crate) fn spill_dir_for(checkpoint: Option<&std::path::Path>) -> std::path::PathBuf {
+    // A bare filename (`cdc.json`) has an EMPTY parent, not a missing one — joining
+    // onto it would build a RELATIVE `.rivet-spill`, which is the right answer but
+    // only by accident; say it.
+    match checkpoint.and_then(std::path::Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(".rivet-spill"),
+        _ => std::path::Path::new(".rivet").join("spill"),
+    }
+}
+
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
 /// batch path. `cfg.drain` reaches every adapter as-is — the open-time-ceiling
@@ -1106,6 +1173,7 @@ pub(crate) fn create_change_stream(
                     peek,
                     cfg.drain,
                     configured_tables,
+                    Some(spill_dir_for(cfg.checkpoint.as_deref()).as_path()),
                 )
                 .map_err(|e| with_setup_hint(e, PG_CDC_HINT))?,
             ))
@@ -2352,5 +2420,40 @@ mod tests {
         let mut s = Forbidden;
         super::run(&mut s, None, vec!["orders".into()], Some(0))
             .expect("--max-events 0 must be a clean no-op");
+    }
+
+    /// The spill lands beside the CHECKPOINT, or in the directory rivet already
+    /// keeps run state in — never the system temp, and never nowhere.
+    ///
+    /// The "nowhere" case is the one that was wrong first: returning `None` without
+    /// a checkpoint disabled spilling on PostgreSQL, which is slot-anchored and
+    /// usually configured without one — the engine whose transactions are largest.
+    #[test]
+    fn a_spill_goes_beside_the_checkpoint_or_beside_the_run_state() {
+        use std::path::Path;
+        assert_eq!(
+            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
+            Path::new("/var/lib/rivet/.rivet-spill"),
+            "the operator already chose a directory sized for rivet's state"
+        );
+        // A BARE filename has an empty parent, not a missing one.
+        assert_eq!(
+            spill_dir_for(Some(Path::new("cdc.json"))),
+            Path::new(".rivet/spill"),
+            "an empty parent is not a directory — fall back rather than build a \
+             path that is relative by accident"
+        );
+        assert_eq!(
+            spill_dir_for(None),
+            Path::new(".rivet/spill"),
+            "no checkpoint is the COMMON PostgreSQL shape (slot-anchored), not an \
+             exotic one — it must still get a directory, and `.rivet/` is where \
+             rivet already writes run summaries beside the config"
+        );
+        assert!(
+            !spill_dir_for(None).starts_with(std::env::temp_dir()),
+            "never the system temp: a CDC spill can be gigabytes and a tmpfs takes \
+             down more than rivet"
+        );
     }
 }

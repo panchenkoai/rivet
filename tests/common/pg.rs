@@ -326,3 +326,36 @@ pub fn pg_all_null_row(table: &str, id: i64) -> String {
 pub fn in_one_transaction(statements: &[String]) -> String {
     format!("BEGIN;\n{};\nCOMMIT;", statements.join(";\n"))
 }
+
+/// ONE transaction holding `rows` inserts — the fixture an oversized-transaction
+/// test needs.
+///
+/// A single `BEGIN … COMMIT`, because the subject is a transaction LARGER than the
+/// in-memory cap: N separate one-row transactions never reach the cap however many
+/// of them there are. The threshold this fixture has to cross is per-transaction,
+/// which is exactly the kind a row-count fixture misses.
+///
+/// Shaped for [`crate::common::cdc_id_ops`]: `(id INT, v INT, pad TEXT)`, so the
+/// canonical CDC read-back applies without a bespoke reader. The `pad` is
+/// deliberately not tiny — a spill is measured in rows AND bytes, and a two-integer
+/// table can cross a row cap while a byte cap never notices it.
+pub const ONE_TRANSACTION_DDL: &str = "(id INT PRIMARY KEY, v INT, pad TEXT)";
+
+pub fn one_transaction_of(table: &str, rows: usize) -> String {
+    transaction_over(table, 1..=rows)
+}
+
+/// One transaction over an explicit id range — for a fixture that needs a SECOND
+/// transaction after the big one.
+///
+/// A mechanism that ends the read window early (to hand out a spilled tail in
+/// order) is only observable when something follows it in the same window: with a
+/// single transaction, ending the window early and draining it normally look
+/// identical. Measured — the `stopped_to_spool` guard could be inverted with a
+/// one-transaction fixture still green.
+pub fn transaction_over(table: &str, ids: std::ops::RangeInclusive<usize>) -> String {
+    let stmts: Vec<String> = ids
+        .map(|i| format!("INSERT INTO {table} VALUES ({i}, {i}, repeat('x', 200))"))
+        .collect();
+    in_one_transaction(&stmts)
+}

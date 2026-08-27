@@ -27,6 +27,7 @@ use serde_json::json;
 
 use crate::config::TlsConfig;
 use crate::error::Result;
+use crate::source::cdc::spill::{SpillFile, SpillReader};
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
@@ -36,6 +37,16 @@ pub(crate) struct PgChangeStream {
     client: Client,
     slot: String,
     pending: VecDeque<ChangeEvent>,
+    /// Directory for an oversized transaction's spill, or `None` when the run has
+    /// nowhere it knows is sized for it — then the memory cap goes back to being a
+    /// refusal, which is the honest answer rather than filling a tmpfs.
+    spill_dir: Option<std::path::PathBuf>,
+    /// A committed transaction whose tail is on disk, still being handed out.
+    ///
+    /// A field rather than a local of `fill`, because it OUTLIVES the peek window
+    /// that produced it: the rows leave one at a time through `next_change`, which
+    /// is the whole point — the tail never exists in memory as a whole.
+    spooled: Option<SpooledTx>,
     /// Wire budget per `peek` — the memory bound of the drain (O(batch), not
     /// O(total backlog)). One ack cadence (the part rollover); see
     /// [`wire_budget`]. Slot progress past a foreign/empty span larger than one
@@ -612,6 +623,11 @@ impl PgChangeStream {
         Ok(())
     }
 
+    // Eight positional arguments, and a struct would not improve it: every one is
+    // a distinct decision the caller must make consciously (which slot, whether a
+    // resume is expected, the peek budget, the drain bound, what may be routed,
+    // where a spill may go), and a builder would let one be forgotten silently.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         conn_str: &str,
         slot: &str,
@@ -620,6 +636,7 @@ impl PgChangeStream {
         peek: crate::source::cdc::PeekBound,
         mode: DrainMode,
         configured_tables: &[String],
+        spill_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
@@ -765,6 +782,8 @@ impl PgChangeStream {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
+            spill_dir: spill_dir.map(std::path::Path::to_path_buf),
+            spooled: None,
             batch_limit: wire_budget(peek),
             frontier: 0,
             exhausted: false,
@@ -811,6 +830,15 @@ impl PgChangeStream {
         // the row cap alone is a poor bound when cells are large. Reset at BEGIN
         // (the start of accumulation), summed on each push.
         let mut tx_bytes = 0usize;
+        // The in-flight transaction's TAIL, once it has outgrown the memory cap.
+        // Local, like `tx`: `upto_nchanges` only ever stops at a commit boundary, so
+        // a transaction cannot straddle two peek windows.
+        let mut spill: Option<SpillFile> = None;
+        // Set when the window ended EARLY to hand out a spilled tail in order —
+        // which is not the same thing as the window being drained. Conflating them
+        // would end a bounded run at the first oversized transaction, deferring
+        // everything behind it to the next cycle for no reason.
+        let mut stopped_to_spool = false;
         let mut yielded_any = false;
         for r in rows {
             let lsn: String = r.get(0);
@@ -819,27 +847,73 @@ impl PgChangeStream {
                 let commit_lsn = parse_lsn(&lsn).unwrap_or(0);
                 match tx_disposition(commit_lsn, self.frontier, self.bound) {
                     TxDisposition::Yield => {
-                        if !tx.is_empty() {
+                        let tail_len = spill.as_ref().map_or(0, SpillFile::len);
+                        if !tx.is_empty() || tail_len > 0 {
                             self.yielded_data = true;
                         }
                         let commit = Position(json!({ "lsn": lsn }));
                         // #158: the shared close — commit LSN on all, committed on
-                        // the last only (BEGIN…COMMIT frames one transaction here).
-                        // Otherwise a transaction larger than `rollover` rolls +
-                        // acks MID-transaction and a crash before the tail's flush
-                        // loses it (the slot advanced past the commit — resume
-                        // never re-reads it, an at-least-once break).
+                        // the last event of the TRANSACTION (BEGIN…COMMIT frames one
+                        // here). Otherwise a transaction larger than `rollover` rolls
+                        // + acks MID-transaction and a crash before the tail's flush
+                        // loses it (the slot advanced past the commit — resume never
+                        // re-reads it, an at-least-once break). With a spilled tail
+                        // the last event is on DISK, which is exactly what `tail_len`
+                        // tells `close_head_of_group`.
                         let mut group: Vec<ChangeEvent> = std::mem::take(&mut tx);
-                        crate::source::cdc::TxnFramer::close_group(&mut group, &commit);
+                        let head_len = group.len();
+                        crate::source::cdc::TxnFramer::close_head_of_group(
+                            &mut group, &commit, tail_len,
+                        );
                         for ev in group {
                             self.pending.push_back(ev);
                         }
                         self.frontier = commit_lsn;
                         self.frontier_text = Some(lsn.clone());
                         yielded_any = true;
+                        if let Some(sp) = spill.take() {
+                            // What the memory cap actually bought, in the operator's
+                            // terms. Also the only externally visible measure of the
+                            // split: a test can read rows and order back from the
+                            // parquet, but "how much never entered memory" exists
+                            // nowhere else — and a spill that silently keeps
+                            // everything buffered delivers identical rows.
+                            // `warn`, not `info`: the default log level hides
+                            // `info`, so an info-level report of a run's memory
+                            // behaviour is functionally silent — the same reason
+                            // the sparse-chunk diagnostic is a warn. It fires only
+                            // for a transaction that actually spilled, which is
+                            // rare by construction.
+                            log::warn!(
+                                "pg cdc: transaction at {lsn} delivered {} rows from \
+                                 memory and {} from disk ({} bytes spilled)",
+                                head_len,
+                                sp.len(),
+                                sp.bytes()
+                            );
+                            self.spooled = Some(SpooledTx {
+                                reader: sp.into_reader()?,
+                                commit,
+                                at: 0,
+                            });
+                            // END the window here. The tail leaves through
+                            // `next_change` one row at a time, and a LATER
+                            // transaction in this same peek would otherwise reach
+                            // `pending` first and be handed out AHEAD of it —
+                            // re-ordering two transactions and breaking the commit
+                            // order the resume position depends on. Nothing is lost
+                            // by stopping: the peek does not consume, so the next
+                            // `fill` re-reads the rest of this window and `frontier`
+                            // drops what was already yielded.
+                            stopped_to_spool = true;
+                            break;
+                        }
                     }
                     // Already yielded on a prior (un-acked) peek ⇒ drop, idempotent.
-                    TxDisposition::AlreadyYielded => tx.clear(),
+                    TxDisposition::AlreadyYielded => {
+                        tx.clear();
+                        spill = None;
+                    }
                     // Committed after this bounded run opened — the next run's
                     // work. Peeks return transactions in commit order, so
                     // everything after this one is past the bound too: stop.
@@ -869,6 +943,9 @@ impl PgChangeStream {
             } else if data.starts_with("BEGIN") {
                 tx.clear();
                 tx_bytes = 0;
+                // Dropping the file too — a transaction that never reached its
+                // COMMIT in this window is re-read from the slot next time.
+                spill = None;
             } else if let Some((schema, table)) = truncate_targets(&data)
                 .into_iter()
                 .find(|(sc, tb)| truncate_is_ours(sc, tb, &self.configured_tables))
@@ -926,15 +1003,47 @@ impl PgChangeStream {
                 self.exhausted = true;
                 break;
             } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
+                if let Some(sp) = spill.as_mut() {
+                    // Past the cap: keep the RAW wire row and throw the event away.
+                    //
+                    // The parse above is not wasted — it is what tells us this line
+                    // IS a change. A line that decodes to nothing (a marker, a
+                    // future `test_decoding` addition) must not enter the spill,
+                    // because the tail's LENGTH is what decides which row carries
+                    // `committed`; a record that decoded to `None` on the way out
+                    // would leave the flag on a row that is not the last one.
+                    sp.push(&encode_wire_row(&lsn, &data))?;
+                    continue;
+                }
                 tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
                 tx.push(ev);
                 // Memory backstop, matching the MySQL adapter's MAX_TX_ROWS: a
                 // transaction is buffered whole (never split across parts), so an
-                // oversized one grows unbounded. `upto_nchanges` cannot split a
-                // transaction, so `peek_changes` already materialised the whole
-                // thing into `rows` — this bails loudly instead of compounding it
-                // into `pending` + the sink buffer, and names the (upstream) fix.
-                crate::source::cdc::check_tx_buffer_caps("pg", tx.len(), tx_bytes)?;
+                // oversized one grows unbounded.
+                //
+                // Crossing the cap no longer FAILS the run where the operator has
+                // given rivet somewhere to spill: the head stays in memory, the tail
+                // goes to disk as raw wire rows, and the cap becomes the memory
+                // CEILING it was always standing in for. With nowhere to spill it is
+                // still a refusal — filling an unknown filesystem is not an
+                // improvement on a clear error.
+                if let Err(e) = crate::source::cdc::check_tx_buffer_caps("pg", tx.len(), tx_bytes) {
+                    let Some(dir) = self.spill_dir.clone() else {
+                        return Err(e);
+                    };
+                    log::warn!(
+                        "pg cdc: transaction at {lsn} passed the in-memory cap at {} \
+                         rows / {tx_bytes} bytes — spilling the rest to {} rather \
+                         than failing the run. The transaction is still delivered \
+                         whole and atomically; this trades memory for disk. Expect \
+                         this line once per peek until the sink acks past the \
+                         commit — a slot peek does not consume, so an un-acked \
+                         transaction is re-read (and re-spilled) on the next pass.",
+                        tx.len(),
+                        dir.display()
+                    );
+                    spill = Some(SpillFile::create(&dir, "pg-tx")?);
+                }
             }
         }
         // Short window (backlog fit in one peek) OR a full window that yielded
@@ -948,10 +1057,45 @@ impl PgChangeStream {
         // budget escalation, no premature "caught up" while in-bound data
         // remains (the bug the escalation only partially covered: a foreign or
         // empty span larger than the escalated window still exhausted early).
-        if n_rows < self.batch_limit as usize || !yielded_any {
+        if !stopped_to_spool && (n_rows < self.batch_limit as usize || !yielded_any) {
             self.exhausted = true;
         }
         Ok(())
+    }
+
+    /// One row of a spilled tail: decode it, stamp it, and drop the reader once the
+    /// last row is out.
+    ///
+    /// `Ok(None)` only when the tail is finished. A row that decodes to no event is
+    /// an ERROR rather than a skip: the tail's length decides which row carries
+    /// `committed`, so a silently skipped row would move the transaction's end.
+    fn next_spooled(&mut self) -> Result<Option<ChangeEvent>> {
+        let Some(sp) = self.spooled.as_mut() else {
+            return Ok(None);
+        };
+        let Some(rec) = sp.reader.next_record() else {
+            self.spooled = None;
+            return Ok(None);
+        };
+        let (lsn, data) = decode_wire_row(&rec?)?;
+        let at = sp.at;
+        let total = sp.reader.len();
+        let mut ev = parse_test_decoding(&lsn, &data)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "pg cdc spill: row {at} of a {total}-row spilled transaction decodes \
+                 to no change, though only rows that decoded were spilled. The tail \
+                 and the decoder disagree, and delivering the rest would move the \
+                 transaction's commit boundary onto the wrong row."
+            )
+        })?;
+        crate::source::cdc::TxnFramer::close_tail_event(&mut ev, &sp.commit, at, total);
+        sp.at += 1;
+        if sp.at == total {
+            // Last row out — drop the reader now rather than at the next call, so
+            // the file is gone the moment it is no longer needed.
+            self.spooled = None;
+        }
+        Ok(Some(ev))
     }
 
     /// Zero-yield release: called at clean exhaust. A run whose every
@@ -1101,6 +1245,64 @@ fn parse_lsn(lsn: &str) -> Option<u64> {
     Some((u64::from(hi) << 32) | u64::from(lo))
 }
 
+/// A committed transaction's tail, still on disk and streaming out one row at a time.
+struct SpooledTx {
+    reader: SpillReader,
+    /// The transaction's COMMIT position — stamped on every row of the tail, exactly
+    /// as [`crate::source::cdc::TxnFramer::close_group`] stamps the unspilled case.
+    commit: Position,
+    /// How many of the tail's rows have been handed out — what decides which one
+    /// carries `committed`.
+    at: usize,
+}
+
+/// Frame one raw `test_decoding` wire row — `(lsn, data)` — as spill bytes.
+///
+/// RAW, not the parsed event: the row arrived as text and the decoder that reads it
+/// back is the same one the in-memory path uses, so a spilled row and a buffered one
+/// cannot decode differently. Encoding the parsed event instead would mean a second
+/// representation of a change, and a second thing to keep in step.
+///
+/// The `lsn` is length-prefixed rather than delimited because `data` is arbitrary
+/// text: a column value can hold any byte, newline and tab included, so any delimiter
+/// picked out of the payload's own alphabet is a value away from cutting a row in
+/// half.
+fn encode_wire_row(lsn: &str, data: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + lsn.len() + data.len());
+    out.extend_from_slice(&(lsn.len() as u32).to_be_bytes());
+    out.extend_from_slice(lsn.as_bytes());
+    out.extend_from_slice(data.as_bytes());
+    out
+}
+
+/// Inverse of [`encode_wire_row`]. Errors rather than guessing: a record that does
+/// not frame is a torn spill, and the caller must not decode half a row into an
+/// event.
+fn decode_wire_row(rec: &[u8]) -> Result<(String, String)> {
+    if rec.len() < 4 {
+        anyhow::bail!(
+            "pg cdc spill: a record of {} bytes holds no frame",
+            rec.len()
+        );
+    }
+    let n = u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+    let end = 4usize
+        .checked_add(n)
+        .filter(|e| *e <= rec.len())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pg cdc spill: a record declares a {n}-byte lsn the {}-byte frame \
+                 does not hold",
+                rec.len()
+            )
+        })?;
+    let lsn = std::str::from_utf8(&rec[4..end])
+        .map_err(|e| anyhow::anyhow!("pg cdc spill: the lsn is not utf-8: {e}"))?;
+    let data = std::str::from_utf8(&rec[end..])
+        .map_err(|e| anyhow::anyhow!("pg cdc spill: the row is not utf-8: {e}"))?;
+    Ok((lsn.to_string(), data.to_string()))
+}
+
 impl ChangeStream for PgChangeStream {
     fn engine(&self) -> crate::source::cdc::CdcEngine {
         crate::source::cdc::CdcEngine::Postgres
@@ -1112,13 +1314,23 @@ impl ChangeStream for PgChangeStream {
             // the sink, after a durable part) has advanced the slot, so the next
             // peek reads fresh changes. `fill` marks `exhausted` once nothing new
             // remains readable from the current slot position.
-            while self.pending.is_empty() && !self.exhausted {
+            while self.pending.is_empty() && self.spooled.is_none() && !self.exhausted {
                 if let Err(e) = self.fill() {
                     return Some(Err(e));
                 }
             }
             if !self.pending.is_empty() {
                 return self.pending.pop_front().map(Ok);
+            }
+            // A spilled tail outranks another `fill`: its rows belong to a
+            // transaction already framed, and reading more WAL before finishing it
+            // would interleave a later transaction into it.
+            if self.spooled.is_some() {
+                match self.next_spooled() {
+                    Ok(Some(ev)) => return Some(Ok(ev)),
+                    Ok(None) => continue,
+                    Err(e) => return Some(Err(e)),
+                }
             }
             // Exhausted with nothing to yield. A pure-empty span (DDL churn: many
             // row-less transactions) yields no events to the sink, so the sink's
@@ -3064,6 +3276,7 @@ mod tests {
             crate::source::cdc::PeekBound::Sized(10_000),
             DrainMode::Continuous,
             &[], // this test routes nothing — it reads the stream directly
+            None,
         )
         .unwrap();
         admin
@@ -3190,6 +3403,107 @@ mod tests {
                 (*schema, *table),
                 "qualifier `{input}` split wrongly — a mis-split yields identifiers that \
                  never existed, and the router then drops every event for the table"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+
+    /// The wire-row codec round-trips text that would break any delimiter.
+    ///
+    /// `test_decoding` renders a column's VALUE into the line, so the payload's
+    /// alphabet is the payload's — a newline, a tab, a NUL, a non-ASCII byte.
+    /// Anything picked out of that alphabet as a separator is one value away from
+    /// cutting a row in half, which is why the lsn is length-prefixed.
+    #[test]
+    fn a_wire_row_round_trips_through_the_spill_frame() {
+        let cases: &[(&str, &str)] = &[
+            ("0/16B2E00", "table public.t: INSERT: id[integer]:1"),
+            (
+                "0/16B2E00",
+                "table public.t: INSERT: v[text]:'line1\nline2\tand\u{0}more'",
+            ),
+            ("0/1", "table public.t: INSERT: v[text]:'Ω≈ç√∫˜µ 日本語'"),
+            // An EMPTY data line — a record, not a terminator.
+            ("0/1", ""),
+        ];
+        for (lsn, data) in cases {
+            let back = decode_wire_row(&encode_wire_row(lsn, data)).expect("decode");
+            assert_eq!(
+                (back.0.as_str(), back.1.as_str()),
+                (*lsn, *data),
+                "the frame must be transparent to the payload"
+            );
+        }
+    }
+
+    /// A frame that does not hold what it declares is an ERROR, never a partial row.
+    #[test]
+    fn a_malformed_spill_frame_is_refused() {
+        assert!(
+            decode_wire_row(b"\x00\x00").is_err(),
+            "too short to hold a length at all"
+        );
+        assert!(
+            decode_wire_row(&[0, 0, 0, 99, b'a', b'b']).is_err(),
+            "declares a 99-byte lsn in a 6-byte record"
+        );
+    }
+
+    /// A transaction split between memory and disk carries EXACTLY ONE `committed`,
+    /// on its true last row — wherever the split falls.
+    ///
+    /// This is the invariant the spill could quietly break. `committed` marks a
+    /// TRANSACTION boundary: the sink rolls, checkpoints and acks on it, so a flag
+    /// on the head's last row would let a crash before the tail's flush advance the
+    /// slot past the commit, and the resume would read strictly after it. The tail
+    /// would be gone from the source log and the destination both.
+    ///
+    /// Every split is walked, including the two ends: a wholly-spilled transaction
+    /// (empty head) and an unspilled one (empty tail) are the same rule.
+    #[test]
+    fn a_split_transaction_closes_on_its_true_last_row() {
+        use crate::source::cdc::TxnFramer;
+        const N: usize = 5;
+        let commit = Position(json!({ "lsn": "0/DEAD" }));
+        let row = |i: usize| {
+            let mut ev =
+                parse_test_decoding("0/1", &format!("table public.t: INSERT: id[integer]:{i}"))
+                    .expect("parse")
+                    .expect("an event");
+            // Poison the flag so the stamp has to CLEAR it, not merely leave it.
+            ev.committed = true;
+            ev
+        };
+        for head_len in 0..=N {
+            let tail_len = N - head_len;
+            let mut whole: Vec<ChangeEvent> = (0..head_len).map(row).collect();
+            TxnFramer::close_head_of_group(&mut whole, &commit, tail_len);
+            for i in 0..tail_len {
+                let mut ev = row(i);
+                TxnFramer::close_tail_event(&mut ev, &commit, i, tail_len);
+                whole.push(ev);
+            }
+            assert_eq!(whole.len(), N);
+            let flags: Vec<bool> = whole.iter().map(|e| e.committed).collect();
+            assert_eq!(
+                flags.iter().filter(|f| **f).count(),
+                1,
+                "head={head_len} tail={tail_len}: exactly one row closes the \
+                 transaction, got {flags:?}"
+            );
+            assert!(
+                whole.last().expect("N > 0").committed,
+                "head={head_len} tail={tail_len}: the LAST row is the one that \
+                 closes it — a flag anywhere else lets the sink ack mid-transaction"
+            );
+            assert!(
+                whole.iter().all(|e| e.position == commit),
+                "head={head_len} tail={tail_len}: every row of a transaction carries \
+                 its COMMIT position, spilled or not"
             );
         }
     }

@@ -35,7 +35,11 @@ use crate::error::Result;
 /// and half of one is worse than none. That is the same rule the sink applies to a
 /// torn part.
 pub(crate) struct SpillFile {
-    path: PathBuf,
+    /// `None` once [`SpillFile::into_reader`] has handed the file over — the
+    /// reader owns the cleanup from that point, and a `Drop` that deleted it
+    /// anyway would pull the log out from under the read on any platform that
+    /// does not allow an unlinked-but-open file.
+    path: Option<PathBuf>,
     writer: Option<BufWriter<std::fs::File>>,
     records: usize,
     bytes: u64,
@@ -63,7 +67,7 @@ impl SpillFile {
             .truncate(true)
             .open(&path)?;
         Ok(Self {
-            path: path.clone(),
+            path: Some(path),
             writer: Some(BufWriter::new(file)),
             records: 0,
             bytes: 0,
@@ -98,43 +102,117 @@ impl SpillFile {
         self.bytes
     }
 
-    /// Finish writing and read every record back, in order.
+    /// Seal the log and hand back a STREAMING reader over it.
     ///
-    /// Consuming, because a spill is drained ONCE: the transaction it holds is
-    /// released at its commit and the file has no reason to outlive that. Returning
-    /// an iterator instead would invite a second pass over a file already deleted.
-    pub(crate) fn drain(mut self) -> Result<Vec<Vec<u8>>> {
+    /// A `Vec<Vec<u8>>` return would defeat the point: spilling exists to keep an
+    /// oversized transaction OUT of memory, and materialising every record to read
+    /// it back trades one whole-transaction allocation for another plus the disk
+    /// write. The caller pulls one record, decodes it, hands the event on, and
+    /// drops it — so the ceiling is one record, not one transaction.
+    ///
+    /// Consuming, because a spill is read ONCE: the transaction it holds is
+    /// released at its commit and the file has no reason to outlive that.
+    pub(crate) fn into_reader(mut self) -> Result<SpillReader> {
         let Some(w) = self.writer.take() else {
-            anyhow::bail!("cdc spill: drained twice");
+            anyhow::bail!("cdc spill: sealed twice");
         };
         let mut file = w.into_inner().map_err(|e| {
             anyhow::anyhow!("cdc spill: flushing the log before reading it back: {e}")
         })?;
         file.flush()?;
         file.rewind()?;
-        let mut r = BufReader::new(file);
-        let mut out = Vec::with_capacity(self.records);
-        for i in 0..self.records {
-            let mut len = [0u8; 4];
-            r.read_exact(&mut len).map_err(|e| {
-                anyhow::anyhow!(
-                    "cdc spill: record {i} of {} has no length prefix — the log is \
-                     truncated, and a torn transaction is worse than none: {e}",
-                    self.records
-                )
-            })?;
-            let len = u32::from_be_bytes(len) as usize;
-            let mut buf = vec![0u8; len];
-            r.read_exact(&mut buf).map_err(|e| {
-                anyhow::anyhow!(
-                    "cdc spill: record {i} of {} declares {len} bytes the log does not \
-                     hold — truncated: {e}",
-                    self.records
-                )
-            })?;
-            out.push(buf);
+        Ok(SpillReader {
+            // Taken, not cloned: `self` is dropped at the end of this function, and
+            // a `Drop` still holding the path would delete the file the reader is
+            // about to read.
+            path: self.path.take(),
+            reader: BufReader::new(file),
+            read: 0,
+            total: self.records,
+        })
+    }
+
+    /// Read every record back into memory, in order — TESTS only.
+    ///
+    /// Convenient for a round-trip assertion and wrong for the product, for the
+    /// reason [`SpillFile::into_reader`] gives.
+    #[cfg(test)]
+    pub(crate) fn drain(self) -> Result<Vec<Vec<u8>>> {
+        let mut r = self.into_reader()?;
+        let mut out = Vec::new();
+        while let Some(rec) = r.next_record() {
+            out.push(rec?);
         }
         Ok(out)
+    }
+}
+
+/// One-pass reader over a sealed [`SpillFile`], deleting the file when dropped.
+///
+/// The record COUNT is carried from the writer rather than inferred from EOF, so a
+/// log that ends early is a named error instead of a short read. That distinction is
+/// the whole reason this type refuses to be lenient: a spilled transaction read short
+/// is a TORN transaction, the sink would flush it, checkpoint past its commit, and
+/// the tail would be gone from both the source log and the destination.
+pub(crate) struct SpillReader {
+    path: Option<PathBuf>,
+    reader: BufReader<std::fs::File>,
+    read: usize,
+    total: usize,
+}
+
+impl SpillReader {
+    /// How many records the log holds in total — the transaction's tail length,
+    /// which is what tells the caller WHICH record carries the commit flag.
+    pub(crate) fn len(&self) -> usize {
+        self.total
+    }
+
+    /// Records not yet handed out.
+    pub(crate) fn remaining(&self) -> usize {
+        self.total - self.read
+    }
+
+    /// The next record, or `None` once all `len()` of them have been read.
+    ///
+    /// `None` means DONE, never "the file ended sooner than expected" — that is an
+    /// `Err`. Collapsing the two is how half a transaction ships as a whole one.
+    pub(crate) fn next_record(&mut self) -> Option<Result<Vec<u8>>> {
+        if self.read >= self.total {
+            return None;
+        }
+        let i = self.read;
+        self.read += 1;
+        Some(self.read_one(i))
+    }
+
+    fn read_one(&mut self, i: usize) -> Result<Vec<u8>> {
+        let mut len = [0u8; 4];
+        self.reader.read_exact(&mut len).map_err(|e| {
+            anyhow::anyhow!(
+                "cdc spill: record {i} of {} has no length prefix — the log is \
+                 truncated, and a torn transaction is worse than none: {e}",
+                self.total
+            )
+        })?;
+        let len = u32::from_be_bytes(len) as usize;
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact(&mut buf).map_err(|e| {
+            anyhow::anyhow!(
+                "cdc spill: record {i} of {} declares {len} bytes the log does not \
+                 hold — truncated: {e}",
+                self.total
+            )
+        })?;
+        Ok(buf)
+    }
+}
+
+impl Drop for SpillReader {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -144,7 +222,9 @@ impl Drop for SpillFile {
     /// outage. The name carries the pid so a leak can be traced.
     fn drop(&mut self) {
         self.writer.take();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -235,7 +315,9 @@ mod tests {
         let path = {
             let mut s = SpillFile::create(d.path(), "cleanup").expect("create");
             s.push(b"payload").expect("push");
-            s.path.clone()
+            s.path
+                .clone()
+                .expect("the file is still owned by the spill")
         };
         assert!(
             !path.exists(),
@@ -247,7 +329,7 @@ mod tests {
         let path = std::panic::catch_unwind(|| {
             let mut s = SpillFile::create(d.path(), "panicky").expect("create");
             s.push(b"payload").expect("push");
-            let p = s.path.clone();
+            let p = s.path.clone().expect("owned");
             std::panic::panic_any(p);
         })
         .expect_err("the closure panics on purpose");
@@ -267,19 +349,20 @@ mod tests {
         s.push(b"one").expect("push");
         s.push(b"two").expect("push");
         // Cut the file to the first record plus a partial second.
-        let path = s.path.clone();
+        let path = s.path.clone().expect("owned");
         s.writer.take(); // close the writer without dropping the guard
         let full = std::fs::read(&path).expect("read the log");
         std::fs::write(&path, &full[..full.len() - 2]).expect("truncate");
         // Reopen so `drain` reads the truncated file.
         let mut torn = SpillFile::create(d.path(), "torn2").expect("create");
         torn.records = s.records;
-        std::fs::copy(&path, &torn.path).expect("stage the torn log");
+        let torn_path = torn.path.clone().expect("owned");
+        std::fs::copy(&path, &torn_path).expect("stage the torn log");
         torn.writer = Some(BufWriter::new(
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&torn.path)
+                .open(&torn_path)
                 .expect("reopen"),
         ));
         let err = torn.drain().expect_err("a truncated log must ERROR");
@@ -289,5 +372,90 @@ mod tests {
             "the error must name the cause — a short read here is a torn \
              transaction, and the caller has to know that is what happened: {text}"
         );
+    }
+
+    /// The reader hands records out ONE at a time, in order, and stops at `len()`.
+    #[test]
+    fn the_reader_streams_records_in_order_and_counts_down() {
+        let d = dir();
+        let mut s = SpillFile::create(d.path(), "stream").expect("create");
+        for r in [b"a".as_slice(), b"bbbb".as_slice(), b"cc".as_slice()] {
+            s.push(r).expect("push");
+        }
+        let mut r = s.into_reader().expect("seal");
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.remaining(), 3);
+        assert_eq!(r.next_record().expect("one").expect("ok"), b"a".to_vec());
+        assert_eq!(r.remaining(), 2, "remaining must fall as records are read");
+        assert_eq!(r.next_record().expect("two").expect("ok"), b"bbbb".to_vec());
+        assert_eq!(r.next_record().expect("three").expect("ok"), b"cc".to_vec());
+        assert_eq!(r.remaining(), 0);
+        assert!(
+            r.next_record().is_none(),
+            "past the declared count the reader is DONE — a fourth record here \
+             would mean the count and the file disagree"
+        );
+    }
+
+    /// A reader that ends EARLY errors; it does not quietly return `None`.
+    ///
+    /// This is the distinction the type exists for: `None` means the transaction was
+    /// delivered whole, so a truncated log answering `None` would ship half a
+    /// transaction as a complete one — the sink flushes it, checkpoints past its
+    /// commit, and the tail is gone from the source log too.
+    #[test]
+    fn a_short_log_errors_rather_than_ending_the_stream() {
+        let d = dir();
+        let mut s = SpillFile::create(d.path(), "short").expect("create");
+        s.push(b"one").expect("push");
+        s.push(b"two").expect("push");
+        let path = s.path.clone().expect("owned");
+        s.writer.take();
+        let full = std::fs::read(&path).expect("read");
+
+        let mut torn = SpillFile::create(d.path(), "short2").expect("create");
+        torn.records = 2;
+        let torn_path = torn.path.clone().expect("owned");
+        std::fs::write(&torn_path, &full[..full.len() - 2]).expect("truncate");
+        torn.writer = Some(BufWriter::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&torn_path)
+                .expect("reopen"),
+        ));
+        let mut r = torn.into_reader().expect("seal");
+        assert_eq!(
+            r.next_record().expect("first").expect("ok"),
+            b"one".to_vec()
+        );
+        let err = r
+            .next_record()
+            .expect("the count says a second record exists")
+            .expect_err("and the log does not hold it");
+        assert!(
+            format!("{err:#}").contains("truncated"),
+            "the error must name the cause: {err:#}"
+        );
+    }
+
+    /// The file is gone once the READER is dropped — the handover must not leak.
+    #[test]
+    fn the_reader_takes_over_the_cleanup() {
+        let d = dir();
+        let mut s = SpillFile::create(d.path(), "handover").expect("create");
+        s.push(b"payload").expect("push");
+        let path = s.path.clone().expect("owned");
+        let mut r = s.into_reader().expect("seal");
+        assert!(
+            path.exists(),
+            "the file must survive the handover — the reader still needs it"
+        );
+        assert_eq!(
+            r.next_record().expect("one").expect("ok"),
+            b"payload".to_vec()
+        );
+        drop(r);
+        assert!(!path.exists(), "the reader must delete the log it finished");
     }
 }
