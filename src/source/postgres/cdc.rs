@@ -989,6 +989,48 @@ fn wire_budget(peek: crate::source::cdc::PeekBound) -> i32 {
     peek.rows_capped().min(i32::MAX as usize) as i32
 }
 
+/// Is this `test_decoding` line rivet's own barrier, carrying `nonce`?
+///
+/// `until_current` today stops at the first commit past a snapshot of
+/// `pg_current_wal_lsn()` — "everything whose commit LSN is at or below a number we
+/// read", which is approximate at the edges. A barrier makes it exact:
+/// `pg_logical_emit_message` puts a marker in WAL at a definite point, and reaching
+/// it proves everything before it committed BEFORE rivet asked.
+///
+/// The line the server renders, measured on the stand:
+///
+///     message: transactional: 0 prefix: rivet, sz: 20 content:rivet-barrier-abc123
+///
+/// Both halves of the match are load-bearing. The PREFIX stops another tool's
+/// logical message ending a rivet drain — a slot decodes the WHOLE database, so a
+/// foreign marker really does arrive. The NONCE stops a PREVIOUS run's barrier
+/// ending this one: a scheduler emits one per cycle and they all carry the prefix,
+/// so matching on the prefix alone lets cycle N+1 stop at cycle N's leftover and
+/// report a clean drain over an unread backlog.
+///
+/// Deliberately NOT anchored on `sz:` — the size is redundant with the content and
+/// a mismatch there would silently stop matching rather than fail.
+///
+/// The `message: ` prefix is defence in depth rather than the load-bearing check,
+/// and the test says so: `test_decoding` QUOTES text values, so a row whose data is
+/// SHAPED like a barrier still ends its content with `'` and cannot equal the nonce
+/// exactly. Removing the anchor survives its own mutant for that reason — recorded
+/// rather than left looking graded. What actually separates a marker from data here
+/// is the exact content comparison.
+pub(crate) fn is_barrier_line(line: &str, nonce: &str) -> bool {
+    let Some(rest) = line.strip_prefix("message: ") else {
+        return false;
+    };
+    let Some((head, content)) = rest.split_once(" content:") else {
+        return false;
+    };
+    head.contains(&format!("prefix: {BARRIER_PREFIX},")) && content.trim_end() == nonce
+}
+
+/// The prefix rivet stamps on its own logical messages. Shared with the `pgoutput`
+/// reader so both spellings of the barrier agree on whose marker is whose.
+pub(crate) use crate::source::postgres::pgoutput::BARRIER_PREFIX;
+
 /// Parse a `pg_lsn` rendering `X/Y` (two hex halves of a 64-bit position) into a
 /// comparable `u64`. `None` on a malformed value — the frontier check then treats
 /// it as `0` (never drops a real transaction on a parse miss).
@@ -1920,6 +1962,90 @@ fn parse_pg_timestamp(val: &str) -> RivetValue {
 
 #[cfg(test)]
 mod tests {
+    /// The barrier line, against what the SERVER actually renders.
+    ///
+    /// The literal below was captured from the pg-cdc stand, not composed: the
+    /// spacing, the comma after the prefix and the absent space after `content:`
+    /// are all the server's, and a predicate written against a guessed shape
+    /// matches nothing while looking right.
+    #[test]
+    fn only_rivets_own_barrier_with_this_nonce_ends_a_drain() {
+        let real = "message: transactional: 0 prefix: rivet, sz: 20 content:rivet-barrier-abc123";
+        assert!(is_barrier_line(real, "rivet-barrier-abc123"));
+
+        // A PREVIOUS cycle's barrier. Same prefix, different nonce — and a
+        // scheduler emits one per cycle, so this is the ordinary case, not an
+        // exotic one. Matching on the prefix alone would stop cycle N+1 at cycle
+        // N's leftover and report a clean drain over an unread backlog.
+        assert!(
+            !is_barrier_line(real, "rivet-barrier-DIFFERENT"),
+            "the nonce is the only thing separating one cycle's barrier from the next"
+        );
+
+        // Another tool's logical message on the same database. The slot decodes
+        // EVERY database object, so this really does arrive.
+        assert!(
+            !is_barrier_line(
+                "message: transactional: 0 prefix: someone_else, sz: 20 content:rivet-barrier-abc123",
+                "rivet-barrier-abc123"
+            ),
+            "a foreign prefix must never end a rivet drain, whatever it carries"
+        );
+
+        // A prefix that merely STARTS with ours — the comma is what makes the
+        // match exact, and without it `rivet_other` would pass.
+        assert!(!is_barrier_line(
+            "message: transactional: 0 prefix: rivet_other, sz: 20 content:rivet-barrier-abc123",
+            "rivet-barrier-abc123"
+        ));
+
+        // Ordinary change lines are never barriers.
+        for line in [
+            "table public.t: INSERT: id[integer]:1",
+            "BEGIN 12345",
+            "COMMIT 12345",
+            "table public.t: UPDATE: old-key: id[integer]:1 new-tuple: id[integer]:2",
+        ] {
+            assert!(!is_barrier_line(line, "rivet-barrier-abc123"), "{line}");
+        }
+
+        // A ROW whose text value is SHAPED like a barrier. This is why the line
+        // must start with `message: ` and not merely contain the prefix: the same
+        // "data indistinguishable from a marker" class that made
+        // `unchanged-toast-datum` unusable as a signal, one layer over. A column
+        // holding this text is contrived; a column holding a log line, a config
+        // snippet or a captured error is not.
+        assert!(
+            !is_barrier_line(
+                "table public.t: INSERT: id[integer]:1 note[text]:'prefix: rivet, sz: 20 content:rivet-barrier-abc123'",
+                "rivet-barrier-abc123"
+            ),
+            "a ROW is never a barrier, however its values are spelled"
+        );
+        // …and the honest note about WHY that holds, because it is not the
+        // `message: ` anchor doing the work. `test_decoding` QUOTES text values, so
+        // a row's rendering always ends the content with `'` and can never equal
+        // the nonce exactly — witness-searched, and the anchor mutant survives
+        // because of it. The anchor is defence in depth, not the load-bearing
+        // check; the exact content comparison is. Said here rather than left as a
+        // guard that looks graded and is not.
+        assert!(
+            !is_barrier_line(
+                "table public.t: INSERT: note[text]:'prefix: rivet, sz: 1 content:x'",
+                "x"
+            ),
+            "even a minimal row rendering keeps its closing quote"
+        );
+
+        // A CONTENT that merely contains the nonce is not the nonce.
+        assert!(
+            !is_barrier_line(
+                "message: transactional: 0 prefix: rivet, sz: 24 content:rivet-barrier-abc123-x",
+                "rivet-barrier-abc123"
+            ),
+            "a prefix-match on the content would let a longer nonce end the wrong drain"
+        );
+    }
 
     /// Every arm of the infinity predicate, and the doubled-quote path of both
     /// scanners — eleven mutants that the parsers' existing tests could not reach.
