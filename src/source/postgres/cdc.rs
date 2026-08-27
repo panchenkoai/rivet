@@ -89,6 +89,16 @@ pub(crate) struct PgChangeStream {
     /// The `table:` values this run captures — what a TRUNCATE is checked against
     /// before it is allowed to fail the run. See [`truncate_is_ours`].
     configured_tables: Vec<String>,
+    /// The nonce of the BARRIER this bounded run emitted at open, if it could.
+    ///
+    /// Reaching it is an EXACT boundary — everything before it provably committed
+    /// before rivet asked — where [`Self::bound`] is a snapshot of
+    /// `pg_current_wal_lsn()` and therefore approximate at the edges. The LSN
+    /// ceiling stays as the BACKSTOP: if the barrier is never seen (emit failed, a
+    /// message was lost, `pg_logical_emit_message` is unavailable) the run still
+    /// terminates at the ceiling. Failing OPEN is the rule — a delayed termination
+    /// is recoverable, an early exit is a dropped commit.
+    barrier_nonce: Option<String>,
 }
 
 /// The run-start warning emitted when a logical replication slot has to be
@@ -720,6 +730,37 @@ impl PgChangeStream {
         } else {
             None
         };
+        // The BARRIER, emitted after the slot exists for the same reason the bound
+        // is snapshotted there: a commit landing between slot creation and this
+        // point is BEFORE the marker, so it is captured this run rather than lost
+        // between the anchor and the ceiling.
+        //
+        // Best-effort by design. `pg_logical_emit_message` needs no special
+        // privilege but can fail (a read-only transaction, an older server), and a
+        // failure must not stop a run that the LSN ceiling can still bound — the
+        // exactness is an improvement over the ceiling, not a replacement for it.
+        let barrier_nonce = mode
+            .is_bounded()
+            .then(|| {
+                let nonce = format!("{}-{}", slot, run_nonce());
+                match client.execute(
+                    "SELECT pg_logical_emit_message(false, $1, $2)",
+                    &[&BARRIER_PREFIX, &nonce],
+                ) {
+                    Ok(_) => Some(nonce),
+                    Err(e) => {
+                        log::warn!(
+                            "pg cdc: could not emit the drain barrier ({e}); falling back to \
+                         the pg_current_wal_lsn() ceiling, which stops at the first commit \
+                         past an open-time snapshot rather than at an exact marker. The \
+                         run still terminates and loses nothing — the boundary is just \
+                         approximate."
+                        );
+                        None
+                    }
+                }
+            })
+            .flatten();
         Ok(Self {
             client,
             slot: slot.to_string(),
@@ -732,6 +773,7 @@ impl PgChangeStream {
             yielded_data: false,
             frontier_text: None,
             configured_tables: configured_tables.to_vec(),
+            barrier_nonce,
         })
     }
 
@@ -807,6 +849,23 @@ impl PgChangeStream {
                         break;
                     }
                 }
+            } else if self
+                .barrier_nonce
+                .as_deref()
+                .is_some_and(|n| is_barrier_line(&data, n))
+            {
+                // OUR barrier, and therefore the EXACT end of this drain: it was
+                // emitted at open, so everything decoded before it committed before
+                // rivet asked. Whatever the LSN ceiling would have said, this is the
+                // boundary — and unlike the ceiling it cannot include a commit that
+                // raced the snapshot or exclude one that did not.
+                //
+                // `tx` is empty here by construction: a logical message emitted
+                // non-transactionally arrives between transactions, never inside
+                // one. Clearing anyway keeps that assumption from being load-bearing.
+                tx.clear();
+                self.exhausted = true;
+                break;
             } else if data.starts_with("BEGIN") {
                 tx.clear();
                 tx_bytes = 0;
@@ -987,6 +1046,26 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
 /// offline mutation guard for the budget.
 fn wire_budget(peek: crate::source::cdc::PeekBound) -> i32 {
     peek.rows_capped().min(i32::MAX as usize) as i32
+}
+
+/// A per-run nonce for the drain barrier.
+///
+/// Uniqueness across CYCLES is what matters, not unpredictability: a scheduler runs
+/// the same config on an interval and every cycle emits a barrier carrying the same
+/// prefix, so cycle N+1 must not stop at cycle N's leftover marker. The process id
+/// plus a monotonic counter plus the open time separates them without pulling in a
+/// random source.
+fn run_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros())
+    )
 }
 
 /// Is this `test_decoding` line rivet's own barrier, carrying `nonce`?

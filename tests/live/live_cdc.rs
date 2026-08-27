@@ -7504,6 +7504,100 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
     );
 }
 
+/// A bounded run EMITS its barrier, and each cycle's is distinct.
+///
+/// `until_current` bounds a drain. The ceiling is a snapshot of
+/// `pg_current_wal_lsn()` — "everything whose commit LSN is at or below a number we
+/// read" — which is approximate at the edges: a commit racing the snapshot lands
+/// ambiguously. A barrier makes it exact, because reaching a marker rivet itself
+/// placed proves everything before it committed BEFORE rivet asked.
+///
+/// The oracle is a SECOND slot, created before the run and never read by rivet: it
+/// sees the same WAL, so rivet's barrier appears in it verbatim. That is an
+/// independent reader rather than rivet's own report of what it did — the rule this
+/// repo applies to every other outcome.
+///
+/// Two cycles, deliberately. The nonce is the only thing separating one cycle's
+/// barrier from the next, and they all carry the same prefix, so a one-cycle
+/// fixture cannot tell "a fresh nonce per run" from "a constant". Cycle N+1
+/// stopping at cycle N's leftover would report a clean drain over an unread
+/// backlog — silent, and exactly what the nonce exists to prevent.
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+fn a_bounded_run_emits_a_distinct_barrier_per_cycle() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_barrier").to_lowercase();
+    let slot = unique_name("rivet_barrier_slot").to_lowercase();
+    let watcher = unique_name("rivet_barrier_watch").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+
+    // The independent watcher, created FIRST so it sees everything the run emits.
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&watcher],
+    )
+    .expect("watcher slot");
+    let _w = Slot(watcher.clone());
+    let _slot = Slot(slot.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out.path().to_path_buf());
+    let _ = &d;
+
+    let mut nonces: Vec<String> = Vec::new();
+    for cycle in 0..2 {
+        c.batch_execute(&format!("INSERT INTO {tbl} VALUES ({cycle}, {cycle})"))
+            .expect("seed");
+        rig.run_ok();
+
+        let rows = c
+            .query(
+                "SELECT data FROM pg_logical_slot_get_changes($1, NULL, NULL)",
+                &[&watcher],
+            )
+            .expect("read the watcher");
+        let found: Vec<String> = rows
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .filter(|l| l.starts_with("message:") && l.contains("prefix: rivet,"))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "cycle {cycle}: a bounded run must emit exactly ONE barrier. Zero means \
+             the emit failed and the run fell back to the approximate ceiling \
+             (which still terminates — that is the fail-OPEN design — but the \
+             exactness is gone). More than one means a cycle emitted twice and a \
+             later drain can stop at the wrong marker. Saw: {found:?}"
+        );
+        let nonce = found[0]
+            .split(" content:")
+            .nth(1)
+            .expect("the barrier carries content")
+            .trim()
+            .to_string();
+        assert!(
+            nonce.contains(&slot),
+            "the nonce must carry the SLOT, so two exports draining the same \
+             database cannot end each other's runs: {nonce}"
+        );
+        nonces.push(nonce);
+    }
+
+    assert_ne!(
+        nonces[0], nonces[1],
+        "each cycle needs its OWN nonce. With a constant one, cycle N+1 stops at \
+         cycle N's leftover barrier — which sits in the WAL ahead of everything \
+         written since — and reports a clean drain over an unread backlog"
+    );
+}
+
 /// A MySQL checkpoint from ANOTHER server must be refused, not resumed from.
 ///
 /// A MySQL checkpoint is binlog COORDINATES, and coordinates mean nothing outside
