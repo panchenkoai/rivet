@@ -558,6 +558,14 @@ pub(crate) struct MssqlChangeStream {
     /// See `MssqlCdcConfig::from_is_pin`.
     from_is_pin: bool,
     pending: VecDeque<ChangeEvent>,
+    /// Where an oversized poll batch's tail goes. SQL Server's "stream" is a query
+    /// result set — there is no wire to keep — so the tail is written through the
+    /// general tagged frame, like MySQL's.
+    spill_dir: std::path::PathBuf,
+    /// A spilled batch tail, still being handed out. GROUP-aware: unlike PostgreSQL
+    /// and MySQL, one buffer here holds SEVERAL transactions (runs of rows sharing
+    /// `__$start_lsn`), so the boundary is only visible by comparing neighbours.
+    spooled: Option<crate::source::cdc::spill::SpooledGroups>,
     /// Max changes to pull per poll — bounds drain memory to O(batch) instead of
     /// O(total change-table window). See [`crate::source::cdc::PeekBound`].
     batch_limit: i64,
@@ -723,6 +731,9 @@ impl MssqlChangeStream {
             from_lsn: cfg.from_lsn.clone(),
             from_is_pin: cfg.from_is_pin,
             pending: VecDeque::new(),
+            // Overridden by `from_url`, which knows the checkpoint's location.
+            spill_dir: crate::source::cdc::spill_dir_for(None),
+            spooled: None,
             batch_limit: peek.rows_capped() as i64,
             exhausted: false,
             bound,
@@ -731,6 +742,10 @@ impl MssqlChangeStream {
 
     /// Open from a `sqlserver://user:pass@host:port/db` URL + a capture instance
     /// (the factory path).
+    // Eight positional arguments, and a struct would not improve it: each is a
+    // distinct decision the caller must make consciously, and a builder would let
+    // one be forgotten silently. Same call as `PgChangeStream::open`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_url(
         url: &str,
         capture_instance: &str,
@@ -740,6 +755,10 @@ impl MssqlChangeStream {
         mode: DrainMode,
         // Passed through to `open`, which cross-checks it against the catalog.
         configured_tables: &[String],
+        // Where an oversized batch's tail spills — the checkpoint's directory. See
+        // `spill_dir_for`; `open` keeps the `.rivet/spill` fallback for the CLI and
+        // test paths that have no checkpoint.
+        spill_dir: std::path::PathBuf,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -761,6 +780,10 @@ impl MssqlChangeStream {
             mode,
             configured_tables,
         )
+        .map(|mut s| {
+            s.spill_dir = spill_dir;
+            s
+        })
     }
 
     /// Poll ONE **bounded batch** of the change table into `pending`. `@to` is the
@@ -813,6 +836,10 @@ impl MssqlChangeStream {
         // Round-2 audit #9: running byte footprint — the row cap is a poor bound
         // when cells are large.
         let mut batch_bytes = 0usize;
+        // The batch's TAIL, once it has outgrown the memory cap. Local, like
+        // `batch`: `@to` bounds a poll at a group boundary, so nothing here
+        // straddles two polls.
+        let mut spill: Option<crate::source::cdc::spill::SpillFile> = None;
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();
@@ -864,14 +891,41 @@ impl MssqlChangeStream {
                 seq: 0, // stamped by TxnSeq as the stream is consumed
                 poison: None,
             };
+            if let Some(sp) = spill.as_mut() {
+                // Past the cap: the event goes to disk through the general tagged
+                // frame and never enters `batch`. Its `position` already carries the
+                // `__$start_lsn`, so the group boundary is recoverable on the way
+                // out without a second field.
+                sp.push(&crate::source::cdc::spill::encode_event(&ev))?;
+                continue;
+            }
             batch_bytes = batch_bytes.saturating_add(ev.estimated_bytes());
             batch.push((lsn.clone(), ev));
             // Memory backstop (matching MySQL's MAX_TX_ROWS): a transaction is
             // buffered whole (never split across parts), and a single
-            // `__$start_lsn` group can be arbitrarily large. Bail loudly rather
-            // than OOM. `@to` bounds the batch at a group boundary, so a group
-            // never straddles two polls — the whole group lands in one `batch`.
-            crate::source::cdc::check_tx_buffer_caps("mssql", batch.len(), batch_bytes)?;
+            // `__$start_lsn` group can be arbitrarily large. `@to` bounds the batch
+            // at a group boundary, so a group never straddles two polls — the whole
+            // group lands in one `batch`.
+            //
+            // Crossing the cap no longer FAILS the run: the head stays in memory,
+            // the tail goes to disk, and every transaction is still delivered whole
+            // and atomically. Unlike the other engines this buffer holds SEVERAL
+            // transactions, so the tail is group-aware (`SpooledGroups`).
+            if crate::source::cdc::check_tx_buffer_caps("mssql", batch.len(), batch_bytes).is_err()
+            {
+                log::warn!(
+                    "sqlserver cdc: poll batch at {lsn} passed the in-memory cap at \
+                     {} rows / {batch_bytes} bytes — spilling the rest to {} rather \
+                     than failing the run. Every transaction is still delivered \
+                     whole and atomically; this trades memory for disk.",
+                    batch.len(),
+                    self.spill_dir.display()
+                );
+                spill = Some(crate::source::cdc::spill::SpillFile::create(
+                    &self.spill_dir,
+                    "mssql-batch",
+                )?);
+            }
         }
         // #158: a batch holds one or more transactions, each a run of rows
         // sharing `__$start_lsn`. Close EACH run through the shared framer —
@@ -881,6 +935,31 @@ impl MssqlChangeStream {
         // is shared. Marking every row committed would roll mid-transaction.
         let lsns: Vec<String> = batch.iter().map(|(l, _)| l.clone()).collect();
         let mut evs: Vec<ChangeEvent> = batch.into_iter().map(|(_, e)| e).collect();
+        // Seal the tail FIRST: its first row's position is what says whether the
+        // head's LAST group continues onto disk. If it does, that group has not
+        // ended, and closing it in memory would let the sink roll, checkpoint and
+        // ack mid-transaction.
+        let spooled = match spill.take() {
+            None => None,
+            Some(sp) => {
+                log::warn!(
+                    "sqlserver cdc: poll batch delivered {} rows from memory and {} \
+                     from disk ({} bytes spilled)",
+                    evs.len(),
+                    sp.len(),
+                    sp.bytes()
+                );
+                Some(crate::source::cdc::spill::SpooledGroups::new(
+                    sp.into_reader()?,
+                    crate::source::cdc::spill::decode_event,
+                )?)
+            }
+        };
+        let tail_head_lsn = spooled
+            .as_ref()
+            .and_then(crate::source::cdc::spill::SpooledGroups::first_position)
+            .and_then(|p| p.0.get("lsn").and_then(|l| l.as_str()).map(str::to_string));
+
         let mut start = 0;
         while start < evs.len() {
             let mut end = start + 1;
@@ -888,12 +967,24 @@ impl MssqlChangeStream {
                 end += 1;
             }
             let commit = Position(json!({ "lsn": lsns[start] }));
-            crate::source::cdc::TxnFramer::close_group(&mut evs[start..end], &commit);
+            // Only zero vs non-zero is read: this says "part of this transaction is
+            // still on disk", which is all the head needs to know.
+            let continues_on_disk = usize::from(head_group_continues_on_disk(
+                &lsns[start],
+                end == evs.len(),
+                tail_head_lsn.as_deref(),
+            ));
+            crate::source::cdc::TxnFramer::close_head_of_group(
+                &mut evs[start..end],
+                &commit,
+                continues_on_disk,
+            );
             start = end;
         }
         for ev in evs {
             self.pending.push_back(ev);
         }
+        self.spooled = spooled;
         match max_lsn {
             // Advance the internal cursor to @to; the next poll reads past it.
             Some(l) => advance_cursor(&mut self.from_lsn, &mut self.from_is_pin, l),
@@ -902,6 +993,19 @@ impl MssqlChangeStream {
             None => self.exhausted = true,
         }
         Ok(())
+    }
+
+    /// One row of a spilled tail, group-aware: `committed` comes from the row that
+    /// FOLLOWS it, which is why the tail reads one record ahead.
+    fn next_spooled(&mut self) -> Result<Option<ChangeEvent>> {
+        let Some(sp) = self.spooled.as_mut() else {
+            return Ok(None);
+        };
+        let out = sp.next_event(crate::source::cdc::spill::decode_event)?;
+        if out.is_none() || sp.remaining() == 0 {
+            self.spooled = None;
+        }
+        Ok(out)
     }
 }
 
@@ -929,13 +1033,46 @@ impl ChangeStream for MssqlChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         // Refill a bounded batch whenever the buffer drains, advancing the cursor
         // each time, until a poll returns nothing (window drained to the max LSN).
-        while self.pending.is_empty() && !self.exhausted {
+        while self.pending.is_empty() && self.spooled.is_none() && !self.exhausted {
             if let Err(e) = self.fill() {
                 return Some(Err(e));
             }
         }
-        self.pending.pop_front().map(Ok)
+        if let Some(ev) = self.pending.pop_front() {
+            return Some(Ok(ev));
+        }
+        // A spilled tail outranks another poll: its rows belong to transactions
+        // already framed, and reading further would interleave a later one.
+        if self.spooled.is_some() {
+            match self.next_spooled() {
+                Ok(Some(ev)) => return Some(Ok(ev)),
+                Ok(None) => return self.next_change(),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
     }
+}
+
+/// Does the in-memory head's group continue onto the spilled tail?
+///
+/// A NAMED predicate rather than a condition inline in the poll loop, because the
+/// poll loop is live-only glue and this is the decision inside it — and it is a
+/// decision no row-counting test can grade. `committed` never reaches the parquet:
+/// closing a transaction early and closing it correctly deliver EXACTLY the same
+/// rows. What changes is when the sink rolls, checkpoints and acks, so getting this
+/// wrong loses the tail only on the crash that follows. (Measured: inlined, the
+/// mutant `continues_on_disk = 0` was unkillable by the live suite.)
+///
+/// Only the LAST head group can continue: `@to` bounds a poll at a group boundary
+/// and rows arrive in LSN order, so anything spilled comes after everything
+/// buffered.
+fn head_group_continues_on_disk(
+    group_lsn: &str,
+    is_last_head_group: bool,
+    tail_head_lsn: Option<&str>,
+) -> bool {
+    is_last_head_group && tail_head_lsn == Some(group_lsn)
 }
 
 /// `__$operation` → canonical op. 1=delete, 2=insert, 4=update-after; 3 (update
@@ -1660,5 +1797,27 @@ mod tests {
             }
             other => panic!("partial capture must refuse, got {other:?}"),
         }
+    }
+
+    /// Every arm of the head/tail group-boundary question.
+    ///
+    /// The `false` arms are the ones that matter in opposite directions: saying a
+    /// group continues when it does not leaves a transaction never closed (the sink
+    /// holds it and never rolls), and saying it does not when it does closes it
+    /// early — the sink acks mid-transaction and a crash before the tail is written
+    /// advances the resume past the commit.
+    #[test]
+    fn a_head_group_continues_on_disk_only_when_the_tail_starts_in_it() {
+        // The last head group, and the tail starts in the SAME transaction.
+        assert!(head_group_continues_on_disk("0x01", true, Some("0x01")));
+        // The last head group, but the tail starts a DIFFERENT transaction — this
+        // one ended in memory.
+        assert!(!head_group_continues_on_disk("0x01", true, Some("0x02")));
+        // Nothing spilled at all.
+        assert!(!head_group_continues_on_disk("0x01", true, None));
+        // NOT the last head group: a group with another group after it in memory
+        // has ended, whatever is on disk. Rows arrive in LSN order and `@to` bounds
+        // a poll at a group boundary, so a spilled row can only belong to the last.
+        assert!(!head_group_continues_on_disk("0x01", false, Some("0x01")));
     }
 }

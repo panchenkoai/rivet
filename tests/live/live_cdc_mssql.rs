@@ -2469,3 +2469,113 @@ impl Drop for NoCdcDb {
         });
     }
 }
+
+/// A SQL Server poll batch past the memory cap spills, and every transaction in it
+/// is still delivered whole — confirmed by an oracle that shares no code with rivet.
+///
+/// SQL Server's buffer is the shape neither other engine has: it holds SEVERAL
+/// transactions, runs of rows sharing a `__$start_lsn`, and the boundaries are only
+/// visible by comparing neighbours. So its spilled tail reads one record AHEAD —
+/// a row cannot be handed out until the row after it is known, because that is what
+/// says whether it closes its transaction. Getting that wrong is invisible in the
+/// delivered rows: fusing two transactions or splitting one ships exactly the same
+/// data, and only changes when the sink rolls, checkpoints and acks.
+///
+/// TWO transactions on purpose, the second small: with one, a tail that closes
+/// only at its very end and a tail that closes per group are indistinguishable.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_a_batch_past_the_memory_cap_spills_rather_than_failing() {
+    const ROWS: usize = 400;
+    const CAP: usize = 50;
+    const TAIL_TX: usize = 3;
+
+    let _serial = cross_process_serial("mssql_cdc");
+    let table = unique_name("cdc_spill_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} {ONE_TRANSACTION_DDL}"));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // `census_oracle()` owns the workdir, the destination AND the config placement:
+    // the state DB lives beside the config and the DuckDB reader works from inside a
+    // container, so hand-building those paths is the smell the rig removes.
+    let rig = Rig::mssql_cdc(&table, &ci).census_oracle();
+
+    // Two transactions — each one statement, so each is one `__$start_lsn` group.
+    mssql_seed_one_transaction(&table, 1..=ROWS);
+    mssql_seed_one_transaction(&table, ROWS + 1..=ROWS + TAIL_TX);
+    wait_for_capture(&ci, (ROWS + TAIL_TX) as i64);
+
+    let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
+    assert!(
+        out.status.success(),
+        "a batch past the cap must SPILL, not fail the run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // The fixture is not inert, and memory really was bounded. Rows alone cannot see
+    // this: a spill that quietly keeps buffering delivers identical rows.
+    let split = log
+        .split("delivered ")
+        .filter_map(|s| s.split_once(" rows from memory and "))
+        .find_map(|(head, rest)| {
+            let tail = rest.split_once(" from disk")?.0;
+            Some((
+                head.trim().parse::<usize>().ok()?,
+                tail.trim().parse::<usize>().ok()?,
+            ))
+        });
+    let (from_memory, from_disk) =
+        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log}"));
+    assert!(
+        from_disk > 0,
+        "rows must actually reach DISK — a cap that was noticed and never acted on \\
+         reads the same in the parquet. stderr: {log}"
+    );
+    // CAP + 1: the cap is checked after the row is pushed, so the head holds one
+    // row more than the cap before the spill opens.
+    assert_eq!(
+        from_memory,
+        CAP + 1,
+        "memory must stop at the cap — that is the point of spilling, and a head \\
+         larger than the cap means the ceiling is not enforced. stderr: {log}"
+    );
+
+    // THE INDEPENDENT ORACLE — the SOURCE table, the delivered parquet, and rivet's
+    // two ledgers, from one DuckDB session that shares no code with rivet.
+    let census = rig.row_census();
+    assert_eq!(
+        census.source,
+        (ROWS + TAIL_TX) as i64,
+        "the fixture itself must hold what the test thinks it does, or every \\
+         comparison below is against the wrong number: {census:?}"
+    );
+    assert!(
+        census.agrees(),
+        "source, delivered parquet, export_metrics and file_log must all agree — a \\
+         spilled tail that never reached the destination, or reached it without \\
+         being counted, shows up here and nowhere else: {census:?}"
+    );
+
+    // Exactly once, and the SECOND transaction still arrives after the first.
+    let changes = cdc_id_ops(&rig.out_dir());
+    let mut ids: Vec<i64> = changes.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        ROWS + TAIL_TX,
+        "every id exactly once across the memory head and the disk tail"
+    );
+    assert_eq!(
+        changes.last().map(|(id, _)| *id),
+        Some((ROWS + TAIL_TX) as i64),
+        "the transaction after the spilled one must still arrive, and arrive last"
+    );
+}

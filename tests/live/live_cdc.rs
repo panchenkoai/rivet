@@ -8829,8 +8829,8 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     let ckpt = rig.checkpoint();
     // Anchor FIRST, so the stream starts here and drains only what follows.
     write_checkpoint(&mut c, &ckpt);
-    seed_one_transaction(&mut c, &tbl, 1..=ROWS);
-    seed_one_transaction(&mut c, &tbl, ROWS + 1..=ROWS + TAIL_TX);
+    mysql_seed_one_transaction(&mut c, &tbl, 1..=ROWS);
+    mysql_seed_one_transaction(&mut c, &tbl, ROWS + 1..=ROWS + TAIL_TX);
 
     let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
     assert!(

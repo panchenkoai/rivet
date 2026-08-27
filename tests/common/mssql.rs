@@ -459,3 +459,26 @@ pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
             .collect()
     })
 }
+
+/// Seed ONE transaction spanning `ids` on SQL Server — a scenario, not a `format!`
+/// in a test body.
+///
+/// A single set-based `INSERT … SELECT`, which is ONE statement and therefore one
+/// transaction: every row lands in a single `__$start_lsn` group, which is exactly
+/// what an oversized-transaction fixture needs. N separate one-row inserts are N
+/// groups and never reach a per-transaction cap however many of them there are.
+///
+/// Shaped for the DuckDB census and [`crate::common::cdc_id_ops`] — `(id, v)`
+/// integers plus a wide `pad`, so a row cap and a BYTE cap are both reachable and
+/// the source table's row count equals the delivered change count.
+pub fn mssql_seed_one_transaction(table: &str, ids: std::ops::RangeInclusive<usize>) {
+    let (lo, hi) = (*ids.start(), *ids.end());
+    let n = hi.saturating_sub(lo) + 1;
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} (id, v, pad) \
+         SELECT {lo} + q.n - 1, {lo} + q.n - 1, REPLICATE('x', 200) FROM ( \
+             SELECT TOP ({n}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n \
+             FROM sys.all_objects a CROSS JOIN sys.all_objects b \
+         ) q"
+    ));
+}

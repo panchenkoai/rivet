@@ -185,7 +185,7 @@ impl Drop for MysqlGlobal {
 /// integers plus a wide `pad`, so a row cap and a BYTE cap are both reachable, and
 /// the source table's row count equals the delivered change count on an
 /// insert-only fixture.
-pub fn seed_one_transaction(
+pub fn mysql_seed_one_transaction(
     c: &mut mysql::PooledConn,
     table: &str,
     ids: std::ops::RangeInclusive<usize>,

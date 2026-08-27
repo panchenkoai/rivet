@@ -1206,6 +1206,7 @@ pub(crate) fn create_change_stream(
                     peek,
                     cfg.drain,
                     configured_tables,
+                    spill_dir_for(cfg.checkpoint.as_deref()),
                 )
                 .map_err(|e| with_setup_hint(e, MSSQL_CDC_HINT))?,
             ))

@@ -514,6 +514,87 @@ impl SpooledTx {
     }
 }
 
+/// A row closes its transaction when nothing follows it, or what follows belongs to
+/// a different one.
+///
+/// A NAMED predicate rather than a condition inline in the drain: it is the whole
+/// of the group-boundary decision, and the consequence of getting it wrong is not
+/// visible in the delivered rows — `committed` decides when the sink ROLLS, so an
+/// early one lets it checkpoint and ack mid-transaction.
+pub(crate) fn closes_group(this: &Position, next: Option<&Position>) -> bool {
+    next.is_none_or(|n| n.0 != this.0)
+}
+
+/// A spilled tail holding MORE THAN ONE transaction — SQL Server's shape.
+///
+/// PostgreSQL and MySQL buffer exactly one transaction at a time, so their tail
+/// length alone says which row closes it ([`SpooledTx`]). SQL Server's poll buffer
+/// holds a whole batch: several runs of rows sharing a `__$start_lsn`, with the
+/// boundaries only visible by comparing neighbours. So this one reads ONE RECORD
+/// AHEAD — a row cannot be handed out until the row after it is known, because that
+/// is what says whether it closes its transaction.
+///
+/// The lookahead is one record, not one group: a group can be arbitrarily large,
+/// and buffering a whole one would put back exactly the memory the spill removed.
+pub(crate) struct SpooledGroups {
+    reader: SpillReader,
+    /// Decoded, not yet handed out — held so the NEXT row's position can decide
+    /// whether this one closes its transaction.
+    peeked: Option<ChangeEvent>,
+}
+
+impl SpooledGroups {
+    /// Seal a spill into a group-aware tail, priming the lookahead.
+    pub(crate) fn new(
+        reader: SpillReader,
+        decode: impl Fn(&[u8]) -> Result<ChangeEvent>,
+    ) -> Result<Self> {
+        let mut me = Self {
+            reader,
+            peeked: None,
+        };
+        me.peeked = me.read_one(&decode)?;
+        Ok(me)
+    }
+
+    fn read_one(
+        &mut self,
+        decode: &impl Fn(&[u8]) -> Result<ChangeEvent>,
+    ) -> Result<Option<ChangeEvent>> {
+        match self.reader.next_record() {
+            None => Ok(None),
+            Some(rec) => Ok(Some(decode(&rec?)?)),
+        }
+    }
+
+    /// The position of the FIRST row on disk.
+    ///
+    /// The caller needs it to decide whether the IN-MEMORY head's last group
+    /// continues onto disk: if it does, the head's last row must NOT be marked
+    /// committed, because the transaction it belongs to has not ended yet.
+    pub(crate) fn first_position(&self) -> Option<&Position> {
+        self.peeked.as_ref().map(|e| &e.position)
+    }
+
+    /// The next row, with `committed` set from the row that follows it.
+    pub(crate) fn next_event(
+        &mut self,
+        decode: impl Fn(&[u8]) -> Result<ChangeEvent>,
+    ) -> Result<Option<ChangeEvent>> {
+        let Some(mut ev) = self.peeked.take() else {
+            return Ok(None);
+        };
+        self.peeked = self.read_one(&decode)?;
+        ev.committed = closes_group(&ev.position, self.peeked.as_ref().map(|n| &n.position));
+        Ok(Some(ev))
+    }
+
+    /// Rows not yet handed out — the peeked one plus whatever is still on disk.
+    pub(crate) fn remaining(&self) -> usize {
+        self.reader.remaining() + usize::from(self.peeked.is_some())
+    }
+}
+
 // ─── the general fallback encoding ───────────────────────────────────────────
 //
 // PostgreSQL and MongoDB spill the RAW WIRE bytes: the row arrived as text or BSON
@@ -1154,5 +1235,81 @@ mod frame_tests {
              lets the sink roll and ack mid-transaction"
         );
         assert_eq!(sp.remaining(), 0);
+    }
+
+    /// A spilled tail holding SEVERAL transactions closes each one on ITS last row.
+    ///
+    /// SQL Server's poll buffer is not one transaction: it is a batch of runs
+    /// sharing a `__$start_lsn`. A tail that marked only its final row committed
+    /// would fuse every spilled transaction into one — the sink would then hold them
+    /// all before rolling, and a crash would replay the lot. A tail that marked
+    /// every row would roll mid-transaction, which is the at-least-once break.
+    ///
+    /// The fixture is 2-1-2, so it crosses three thresholds a flatter one misses: a
+    /// group of more than one row (a boundary exists to get wrong), a group of
+    /// EXACTLY one (first and last are the same row), and a group boundary that is
+    /// not the end of the tail.
+    #[test]
+    fn a_spilled_batch_closes_each_transaction_on_its_own_last_row() {
+        let d = tempfile::tempdir().expect("dir");
+        let lsns = ["0/A", "0/A", "0/B", "0/C", "0/C"];
+        let mut f = SpillFile::create(d.path(), "groups").expect("create");
+        for (i, l) in lsns.iter().enumerate() {
+            let mut e = ev();
+            e.position = Position(json!({ "lsn": l }));
+            e.after = Some(vec![RivetValue::Int(i as i64)]);
+            // Poisoned, so the drain has to CLEAR it rather than leave it.
+            e.committed = true;
+            f.push(&encode_event(&e)).expect("push");
+        }
+        let mut sp =
+            SpooledGroups::new(f.into_reader().expect("seal"), decode_event).expect("prime");
+        assert_eq!(
+            sp.first_position().map(|p| p.0["lsn"].as_str()),
+            Some(Some("0/A")),
+            "the caller needs the tail's FIRST position to know whether the \
+             in-memory head's last group continues onto disk"
+        );
+        assert_eq!(sp.remaining(), lsns.len());
+
+        let mut got = Vec::new();
+        while let Some(e) = sp.next_event(decode_event).expect("decode") {
+            got.push((
+                e.position.0["lsn"].as_str().expect("lsn").to_string(),
+                e.committed,
+            ));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("0/A".into(), false),
+                ("0/A".into(), true),
+                ("0/B".into(), true),
+                ("0/C".into(), false),
+                ("0/C".into(), true),
+            ],
+            "each transaction closes on its OWN last row — not once at the end of \
+             the tail (which fuses them) and not on every row (which rolls \
+             mid-transaction)"
+        );
+        assert_eq!(sp.remaining(), 0);
+    }
+
+    /// The group-boundary predicate, at its two ends.
+    #[test]
+    fn a_row_closes_its_group_when_nothing_of_it_follows() {
+        let a = Position(json!({ "lsn": "0/A" }));
+        let b = Position(json!({ "lsn": "0/B" }));
+        assert!(closes_group(&a, None), "the last row always closes");
+        assert!(
+            closes_group(&a, Some(&b)),
+            "a different transaction follows"
+        );
+        assert!(
+            !closes_group(&a, Some(&a.clone())),
+            "the same transaction continues — closing here lets the sink ack \
+             mid-transaction, and a crash before the rest advances the resume past \
+             the commit"
+        );
     }
 }
