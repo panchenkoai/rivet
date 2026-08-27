@@ -7504,6 +7504,96 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
     );
 }
 
+/// PostgreSQL's slot must stay NON-two-phase — the mechanism that makes it immune
+/// to the class round 14 measured on MySQL.
+///
+/// The ENGINE axis, applied to a class already proven to exist somewhere. MySQL
+/// binlogs an XA transaction's ROWS at `XA PREPARE`, so a rolled-back branch was
+/// published by the next transaction's commit — measured, source `{2}`, delivered
+/// `{1, 2}`. One engine proves nothing about another, so PostgreSQL's two-phase
+/// sibling (`PREPARE TRANSACTION` / `ROLLBACK PREPARED`) was probed rather than
+/// assumed.
+///
+/// MEASURED 2026-08-27 on the pg-cdc stand with `max_prepared_transactions = 10`
+/// (a server restart, reverted after): prepare, an unrelated commit, then
+/// `ROLLBACK PREPARED` — the source held `{2}` and rivet delivered `{2}`. IMMUNE,
+/// and by construction rather than by luck: with a non-two-phase slot PostgreSQL
+/// decodes a prepared transaction only at `COMMIT PREPARED`, and a rollback emits
+/// no change records at all, so the reader never sees the rows.
+///
+/// This test guards the MECHANISM, not the symptom. Reproducing the symptom needs
+/// `max_prepared_transactions > 0`, which is a server restart no test should own —
+/// and it would only re-measure what the flag already decides. `two_phase = false`
+/// is the whole of the immunity: `pg_create_logical_replication_slot(name,
+/// 'test_decoding')` is the two-argument form, which defaults it off. Add
+/// `two_phase => true` for lower commit latency and PostgreSQL starts decoding at
+/// PREPARE — at which point rivet has MySQL's bug on a second engine, with no
+/// framing for prepared transactions anywhere in the sink.
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+fn the_pg_slot_is_not_two_phase_so_a_prepared_transaction_cannot_be_published_early() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_2pc").to_lowercase();
+    let slot = unique_name("rivet_2pc_slot").to_lowercase();
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let _slot = Slot(slot.clone());
+
+    // RIVET creates the slot, not this test. Pre-creating it here would grade the
+    // test's own `pg_create_logical_replication_slot` call — the fixture-against-
+    // itself shape — and say nothing about the product's.
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out.path().to_path_buf());
+    rig.run_ok();
+
+    // The slot must be a WORKING one, not just a catalog row: a change written after
+    // the anchor has to come back. Without this the test would pass over a slot that
+    // captures nothing — and the conformance gate is right to insist, having caught
+    // exactly this omission here on the first draft.
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .expect("seed after the anchor");
+    rig.run_ok();
+    let got: std::collections::BTreeSet<i64> = read_cdc_changes(out.path())
+        .iter()
+        .map(|ch| ch.id)
+        .collect();
+    assert_eq!(
+        got,
+        [1].into_iter().collect::<std::collections::BTreeSet<i64>>(),
+        "the slot rivet created must actually capture — a two-phase assertion over \
+         an inert slot grades nothing"
+    );
+
+    let row = c
+        .query_one(
+            "SELECT two_phase, plugin FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .expect("rivet must have created its slot during the run");
+    let two_phase: bool = row.get(0);
+    let plugin: String = row.get(1);
+    assert_eq!(
+        plugin, "test_decoding",
+        "the reader this immunity reasons about"
+    );
+    assert!(
+        !two_phase,
+        "the slot became TWO-PHASE. PostgreSQL then decodes a transaction at \\
+         `PREPARE TRANSACTION`, before it is committed — and rivet has no framing \\
+         for a prepared transaction anywhere in the sink, so a `ROLLBACK PREPARED` \\
+         would leave those rows published under the next transaction's position. \\
+         That is exactly what MySQL's XA path did (measured: source held one row, \\
+         rivet delivered two). Enabling two-phase decoding needs the per-xid \\
+         framing FIRST."
+    );
+    let _ = d;
+}
+
 /// A PREPARED XA branch must never be published by another transaction's commit.
 ///
 /// Round 14, and the worst shape a CDC reader can have: not loss, FABRICATION.
