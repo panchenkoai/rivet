@@ -79,6 +79,7 @@ pub(crate) struct MongoChangeStream {
 /// a DDL event we skip (a `drop`/`rename`/`dropDatabase` is not a row change — it
 /// must NOT bail the whole run, especially for an uncaptured collection), or an
 /// `invalidate` that genuinely ended the stream.
+#[derive(Debug, PartialEq, Eq)]
 enum OpClass {
     Row,
     Skip,
@@ -846,6 +847,60 @@ impl ChangeStream for MongoChangeStream {
 
 #[cfg(test)]
 mod tests {
+    /// Three pure decisions a mutation run over this file found ungraded — 22 unique
+    /// survivors in 108 mutants, the weakest ratio of any CDC file so far.
+    ///
+    /// All three decide what a change MEANS, and each fails silently: a
+    /// misclassified op, a delete that carries the wrong image, or a hint that
+    /// buries the diagnosis it was written to surface.
+    #[test]
+    fn op_classification_delete_framing_and_the_diagnosis_check_all_answer() {
+        // CLASSIFY. The row ops must all be Row, Invalidate its own class, and
+        // anything else Skip. `delete match arm` on the row group sends every
+        // insert/update/replace/delete to `_ => Skip`, i.e. capture goes silent
+        // while the run reports success; deleting the Invalidate arm turns a
+        // collection drop into a skipped event instead of the stream restart it is.
+        for op in [
+            OperationType::Insert,
+            OperationType::Update,
+            OperationType::Replace,
+            OperationType::Delete,
+        ] {
+            assert_eq!(
+                classify_op(&op),
+                OpClass::Row,
+                "{op:?} carries a row — classifying it Skip drops the change while \
+                 the run still exits 0"
+            );
+        }
+        assert_eq!(
+            classify_op(&OperationType::Invalidate),
+            OpClass::Invalidate,
+            "an invalidate ends the stream's validity; treating it as Skip keeps \
+             reading from a cursor the server has abandoned"
+        );
+        assert_eq!(classify_op(&OperationType::Drop), OpClass::Skip);
+        assert_eq!(classify_op(&OperationType::DropDatabase), OpClass::Skip);
+        assert_eq!(classify_op(&OperationType::Rename), OpClass::Skip);
+
+        // DIAGNOSIS. `error_names_its_own_cause` decides whether a generic
+        // replica-set hint would BURY a specific one. `-> true` suppresses the hint
+        // on every error including the ones that need it; `-> false` restores the
+        // burial this predicate exists to prevent.
+        assert!(
+            error_names_its_own_cause(&anyhow::anyhow!(
+                "change stream event exceeded the 16 MB BSON limit"
+            )),
+            "an error that already names its own cause must suppress the generic \
+             hint — burying it is what sent an operator to check a topology that \
+             was fine"
+        );
+        assert!(
+            !error_names_its_own_cause(&anyhow::anyhow!("connection refused")),
+            "an opaque driver error needs the setup hint; suppressing it there \
+             leaves the operator with nothing actionable"
+        );
+    }
 
     /// The oversize predicate recognises EITHER spelling, and the capability string
     /// tells the truth about the version it describes.
