@@ -24,6 +24,8 @@ use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 
 use crate::error::Result;
+use crate::source::cdc::value::RivetValue;
+use crate::source::cdc::{ChangeEvent, ChangeOp, Position};
 
 /// A length-prefixed record log in a temp file, deleted when dropped.
 ///
@@ -457,5 +459,601 @@ mod tests {
         );
         drop(r);
         assert!(!path.exists(), "the reader must delete the log it finished");
+    }
+}
+
+// ─── the general fallback encoding ───────────────────────────────────────────
+//
+// PostgreSQL and MongoDB spill the RAW WIRE bytes: the row arrived as text or BSON
+// and the decoder that reads it back is the one the in-memory path uses, so a
+// spilled row and a buffered one cannot decode differently. MySQL's crate hands
+// over PARSED events and SQL Server's "stream" is a query result set — neither has
+// a wire to keep, so their events need an encoding of their own.
+//
+// ARROW IPC was the plan here, on the argument that rivet already turns events into
+// Arrow to write Parquet, so the machinery exists and is tested. Checking that
+// against what the sink actually does shows it is the wrong fit, for a reason that
+// is specific rather than aesthetic: the Arrow type of a column is decided by the
+// SINK, at its first flush, from the export's type mapping — and
+// `sink::refine_decimal_scales` derives a Decimal column's SCALE from the values in
+// that first batch. `RivetValue::Bytes` is deliberately undecided until then (Utf8,
+// Binary, or a Decimal string). An adapter that spilled through Arrow would have to
+// invent a schema BEFORE any of that, so a SQL Server placeholder-scale column
+// would take its scale from whichever rows happened to still be in memory — the
+// spilled tail and the buffered head would disagree about the same column's type.
+// The reuse argument does not survive either: nothing in rivet builds an Arrow
+// union today, so a lossless Arrow encoding of a sum type would be new, untested
+// code exactly like this one, with a schema negotiation on top.
+//
+// So the fallback is a TAGGED frame: one byte of variant tag, everything
+// length-prefixed, values recursive for arrays. It is lossless, self-describing,
+// and — the property that matters — it makes no type decision at all, which is
+// precisely what the sink needs it not to do.
+
+/// Wire tags. Explicit discriminants, never the enum's declaration order: a spill
+/// written before a variant is added must not be read as a different variant after.
+mod tag {
+    pub(super) const NULL: u8 = 0;
+    pub(super) const BOOL: u8 = 1;
+    pub(super) const INT: u8 = 2;
+    pub(super) const UINT: u8 = 3;
+    pub(super) const FLOAT: u8 = 4;
+    pub(super) const DATETIME: u8 = 5;
+    pub(super) const TIME_MICROS: u8 = 6;
+    pub(super) const BYTES: u8 = 7;
+    pub(super) const ARRAY: u8 = 8;
+}
+
+fn put_len(out: &mut Vec<u8>, n: usize) {
+    out.extend_from_slice(&(n as u64).to_be_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_len(out, b.len());
+    out.extend_from_slice(b);
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_bytes(out, s.as_bytes());
+}
+
+/// Cursor over a frame. Every read is bounds-checked and every shortfall is an
+/// error — a spilled transaction read short is a TORN transaction.
+struct Cur<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|e| *e <= self.b.len())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cdc spill: a frame asks for {n} bytes at offset {} of {} — truncated",
+                    self.at,
+                    self.b.len()
+                )
+            })?;
+        let out = &self.b[self.at..end];
+        self.at = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn len(&mut self) -> Result<usize> {
+        let raw = u64::from_be_bytes(self.take(8)?.try_into().expect("8 bytes"));
+        usize::try_from(raw).map_err(|_| {
+            anyhow::anyhow!("cdc spill: a frame declares {raw} bytes, past this platform's usize")
+        })
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>> {
+        let n = self.len()?;
+        Ok(self.take(n)?.to_vec())
+    }
+
+    fn string(&mut self) -> Result<String> {
+        let b = self.bytes()?;
+        String::from_utf8(b).map_err(|e| anyhow::anyhow!("cdc spill: not utf-8: {e}"))
+    }
+}
+
+fn put_value(out: &mut Vec<u8>, v: &RivetValue) {
+    match v {
+        RivetValue::Null => out.push(tag::NULL),
+        RivetValue::Bool(b) => {
+            out.push(tag::BOOL);
+            out.push(u8::from(*b));
+        }
+        RivetValue::Int(i) => {
+            out.push(tag::INT);
+            out.extend_from_slice(&i.to_be_bytes());
+        }
+        RivetValue::UInt(u) => {
+            out.push(tag::UINT);
+            out.extend_from_slice(&u.to_be_bytes());
+        }
+        // The BIT PATTERN, not a rendering: `to_be_bytes` round-trips every f64
+        // including NaN and the two zeros, where a decimal string does not.
+        RivetValue::Float(f) => {
+            out.push(tag::FLOAT);
+            out.extend_from_slice(&f.to_be_bytes());
+        }
+        // Structural: seconds since the epoch plus nanoseconds, never a formatted
+        // string — a text rendering is exactly the session-dependent leg this repo
+        // has been bitten by, and a spill must not introduce one.
+        RivetValue::DateTime(dt) => {
+            out.push(tag::DATETIME);
+            out.extend_from_slice(&dt.and_utc().timestamp().to_be_bytes());
+            out.extend_from_slice(&dt.and_utc().timestamp_subsec_nanos().to_be_bytes());
+        }
+        RivetValue::TimeMicros(us) => {
+            out.push(tag::TIME_MICROS);
+            out.extend_from_slice(&us.to_be_bytes());
+        }
+        RivetValue::Bytes(b) => {
+            out.push(tag::BYTES);
+            put_bytes(out, b);
+        }
+        RivetValue::Array(items) => {
+            out.push(tag::ARRAY);
+            put_len(out, items.len());
+            for it in items {
+                put_value(out, it);
+            }
+        }
+    }
+}
+
+fn get_value(c: &mut Cur<'_>) -> Result<RivetValue> {
+    let t = c.u8()?;
+    Ok(match t {
+        tag::NULL => RivetValue::Null,
+        tag::BOOL => RivetValue::Bool(c.u8()? != 0),
+        tag::INT => RivetValue::Int(i64::from_be_bytes(c.take(8)?.try_into().expect("8"))),
+        tag::UINT => RivetValue::UInt(u64::from_be_bytes(c.take(8)?.try_into().expect("8"))),
+        tag::FLOAT => RivetValue::Float(f64::from_be_bytes(c.take(8)?.try_into().expect("8"))),
+        tag::DATETIME => {
+            let secs = i64::from_be_bytes(c.take(8)?.try_into().expect("8"));
+            let nanos = u32::from_be_bytes(c.take(4)?.try_into().expect("4"));
+            RivetValue::DateTime(
+                chrono::DateTime::from_timestamp(secs, nanos)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cdc spill: {secs}s + {nanos}ns is not a date-time")
+                    })?
+                    .naive_utc(),
+            )
+        }
+        tag::TIME_MICROS => {
+            RivetValue::TimeMicros(i64::from_be_bytes(c.take(8)?.try_into().expect("8")))
+        }
+        tag::BYTES => RivetValue::Bytes(c.bytes()?),
+        tag::ARRAY => {
+            let n = c.len()?;
+            let mut items = Vec::with_capacity(n.min(4096));
+            for _ in 0..n {
+                items.push(get_value(c)?);
+            }
+            RivetValue::Array(items)
+        }
+        // NEVER a lenient default. An unknown tag means the frame and this build
+        // disagree, and guessing NULL would turn that into a column of nulls that
+        // every count and sum check passes — the exact silent-loss shape a
+        // "degrade to null" cell path produces.
+        other => anyhow::bail!("cdc spill: unknown value tag {other}"),
+    })
+}
+
+/// Encode one event for the spill — lossless, and type-decision-free.
+pub(crate) fn encode_event(ev: &ChangeEvent) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.push(match ev.op {
+        ChangeOp::Insert => 0,
+        ChangeOp::Update => 1,
+        ChangeOp::Delete => 2,
+    });
+    put_str(&mut out, &ev.schema);
+    put_str(&mut out, &ev.table);
+    // `position` and `committed` are re-stamped at the commit boundary by the
+    // framer, and carried anyway: a spill that dropped them would be a second place
+    // where the transaction's framing is decided.
+    put_str(&mut out, &ev.position.0.to_string());
+    out.push(u8::from(ev.committed));
+    out.extend_from_slice(&ev.seq.to_be_bytes());
+    put_opt_str(&mut out, ev.poison.as_deref());
+    match ev.image_names.as_deref() {
+        None => out.push(0),
+        Some(names) => {
+            out.push(1);
+            put_len(&mut out, names.len());
+            for n in names {
+                put_str(&mut out, n);
+            }
+        }
+    }
+    put_image(&mut out, ev.before.as_deref());
+    put_image(&mut out, ev.after.as_deref());
+    out
+}
+
+fn put_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        None => out.push(0),
+        Some(v) => {
+            out.push(1);
+            put_str(out, v);
+        }
+    }
+}
+
+/// An image is `None` (absent) or a list of values — and the two are DISTINCT.
+///
+/// `None` means the engine sent no such image (a DELETE has no after-image); an
+/// EMPTY list means it sent one with no columns. Encoding both as "zero values"
+/// would let a spilled DELETE come back looking like an INSERT of nothing.
+fn put_image(out: &mut Vec<u8>, img: Option<&[RivetValue]>) {
+    match img {
+        None => out.push(0),
+        Some(vs) => {
+            out.push(1);
+            put_len(out, vs.len());
+            for v in vs {
+                put_value(out, v);
+            }
+        }
+    }
+}
+
+fn get_image(c: &mut Cur<'_>) -> Result<Option<Vec<RivetValue>>> {
+    if c.u8()? == 0 {
+        return Ok(None);
+    }
+    let n = c.len()?;
+    let mut vs = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        vs.push(get_value(c)?);
+    }
+    Ok(Some(vs))
+}
+
+/// Inverse of [`encode_event`], refusing anything it cannot read exactly.
+pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
+    let mut c = Cur { b: rec, at: 0 };
+    let op = match c.u8()? {
+        0 => ChangeOp::Insert,
+        1 => ChangeOp::Update,
+        2 => ChangeOp::Delete,
+        other => anyhow::bail!("cdc spill: unknown op tag {other}"),
+    };
+    let schema = c.string()?;
+    let table = c.string()?;
+    let position = Position(
+        serde_json::from_str(&c.string()?)
+            .map_err(|e| anyhow::anyhow!("cdc spill: the position is not json: {e}"))?,
+    );
+    let committed = c.u8()? != 0;
+    let seq = u64::from_be_bytes(c.take(8)?.try_into().expect("8"));
+    let poison = if c.u8()? == 0 {
+        None
+    } else {
+        Some(c.string()?)
+    };
+    let image_names: Option<std::sync::Arc<[String]>> = if c.u8()? == 0 {
+        None
+    } else {
+        let n = c.len()?;
+        let mut names = Vec::with_capacity(n.min(4096));
+        for _ in 0..n {
+            names.push(c.string()?);
+        }
+        Some(names.into())
+    };
+    let before = get_image(&mut c)?;
+    let after = get_image(&mut c)?;
+    // TRAILING BYTES are an error, not slack. A frame this build reads as complete
+    // while the writer wrote more means the two disagree about the layout, and
+    // accepting it delivers a silently truncated event.
+    if c.at != rec.len() {
+        anyhow::bail!(
+            "cdc spill: {} trailing byte(s) after a complete event — the frame and \
+             this build disagree about the layout",
+            rec.len() - c.at
+        );
+    }
+    Ok(ChangeEvent {
+        op,
+        schema,
+        table,
+        before,
+        after,
+        position,
+        committed,
+        image_names,
+        seq,
+        poison,
+    })
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev() -> ChangeEvent {
+        ChangeEvent {
+            op: ChangeOp::Update,
+            schema: "public".into(),
+            table: "orders".into(),
+            before: None,
+            after: None,
+            position: Position(json!({ "lsn": "0/ABC" })),
+            committed: false,
+            image_names: None,
+            // NON-ZERO on purpose. With `seq: 0` everywhere, a codec that drops the
+            // field entirely round-trips perfectly — measured, the mutant was
+            // unkillable until this line changed. Same class as a one-row fixture
+            // hiding accumulation arithmetic.
+            seq: 7,
+            poison: None,
+        }
+    }
+
+    /// Compare the DECODED event against the ORIGINAL, field by field.
+    ///
+    /// The first cut compared `encode(decode(encode(e)))` to `encode(e)` and was a
+    /// self-oracle: a LOSSY encode agrees with itself perfectly. Proven — dropping
+    /// the sub-second part of a date-time left it green, because the re-encode
+    /// dropped the same nanoseconds. The oracle has to be the value the test built,
+    /// which is the one thing the codec did not produce.
+    ///
+    /// `ChangeEvent` has no `PartialEq`, so the fields are compared one by one —
+    /// and every field is named here on purpose: a new field defaulted by the
+    /// decoder shows up as a compile error in this destructuring, not as a silent
+    /// pass.
+    fn round_trips(e: &ChangeEvent) {
+        let back = decode_event(&encode_event(e)).expect("decode");
+        let ChangeEvent {
+            op,
+            schema,
+            table,
+            before,
+            after,
+            position,
+            committed,
+            image_names,
+            seq,
+            poison,
+        } = &back;
+        assert_eq!(op.as_str(), e.op.as_str(), "op");
+        assert_eq!(schema, &e.schema, "schema");
+        assert_eq!(table, &e.table, "table");
+        assert_eq!(position.0, e.position.0, "position");
+        assert_eq!(committed, &e.committed, "committed");
+        assert_eq!(seq, &e.seq, "seq");
+        assert_eq!(poison, &e.poison, "poison");
+        assert_eq!(
+            image_names.as_deref(),
+            e.image_names.as_deref(),
+            "image_names"
+        );
+        // NaN != NaN, so the images are compared through their DEBUG rendering,
+        // which distinguishes NaN from a number, -0.0 from 0.0, and a NULL element
+        // from an empty one — everything `PartialEq` gets right plus the one case
+        // it deliberately does not.
+        assert_eq!(format!("{before:?}"), format!("{:?}", e.before), "before");
+        assert_eq!(format!("{after:?}"), format!("{:?}", e.after), "after");
+    }
+
+    /// EVERY `RivetValue` variant survives, including the ones a text rendering
+    /// loses.
+    ///
+    /// A new variant added without a case here is a spill that decodes it as an
+    /// error at best and silently as something else at worst — the reason the tags
+    /// are explicit discriminants rather than declaration order.
+    #[test]
+    fn every_value_variant_round_trips() {
+        let values = vec![
+            RivetValue::Null,
+            RivetValue::Bool(true),
+            RivetValue::Bool(false),
+            RivetValue::Int(i64::MIN),
+            RivetValue::Int(-1),
+            RivetValue::UInt(u64::MAX),
+            // The two zeros and NaN: a decimal RENDERING collapses -0.0 into 0.0
+            // and cannot express NaN, which is why the bit pattern is stored.
+            RivetValue::Float(-0.0),
+            RivetValue::Float(0.0),
+            RivetValue::Float(f64::NAN),
+            RivetValue::Float(f64::NEG_INFINITY),
+            RivetValue::DateTime(
+                chrono::DateTime::from_timestamp(-1, 999_999_999)
+                    .expect("pre-epoch with nanos")
+                    .naive_utc(),
+            ),
+            RivetValue::TimeMicros(-1),
+            RivetValue::Bytes(Vec::new()),
+            // Invalid UTF-8 and an embedded NUL: a cell path that went through a
+            // string would lose both.
+            RivetValue::Bytes(vec![0x00, 0xff, 0xc3, 0x28]),
+            RivetValue::Array(Vec::new()),
+            // A NULL *inside* an array is not the same as an absent element —
+            // Arrow's container display renders both as the empty string, which is
+            // exactly how the row-hash lost them.
+            RivetValue::Array(vec![RivetValue::Null, RivetValue::Bytes(b"a".to_vec())]),
+            // Nested, so the recursion is exercised past one level.
+            RivetValue::Array(vec![RivetValue::Array(vec![RivetValue::Int(1)])]),
+        ];
+        for v in &values {
+            let mut e = ev();
+            e.after = Some(vec![v.clone()]);
+            round_trips(&e);
+        }
+        // EVERY op, not just the fixture's. A codec that maps DELETE onto INSERT
+        // resurrects the row it was deleting, and one op in the fixture cannot see
+        // it (measured — `ChangeOp::Delete => 0` was unkillable).
+        for op in [ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete] {
+            let mut e = ev();
+            e.op = op;
+            e.before = Some(vec![RivetValue::Int(1)]);
+            round_trips(&e);
+        }
+        // …and all of them in ONE image, so a per-value cursor bug that only shows
+        // when a value FOLLOWS another is reachable.
+        let mut e = ev();
+        e.after = Some(values);
+        round_trips(&e);
+    }
+
+    /// Two different events NEVER encode alike.
+    ///
+    /// This is the injectivity question, and one field cannot express it: the ways a
+    /// value imitates a DELIMITER, a LENGTH, or ABSENCE all need a neighbour to
+    /// imitate it against. Each pair below is one of those three.
+    #[test]
+    fn distinct_events_have_distinct_frames() {
+        let mut cases: Vec<(&str, ChangeEvent)> = Vec::new();
+
+        // DELIMITER: the split between two adjacent strings must not be forgeable.
+        let mut a = ev();
+        (a.schema, a.table) = ("a".into(), "bc".into());
+        cases.push(("schema a | table bc", a));
+        let mut b = ev();
+        (b.schema, b.table) = ("ab".into(), "c".into());
+        cases.push(("schema ab | table c", b));
+
+        // ABSENCE: an image the engine never sent vs one it sent empty. A DELETE
+        // carries no after-image; conflating the two makes it an INSERT of nothing.
+        let mut c = ev();
+        c.after = None;
+        cases.push(("after absent", c));
+        let mut d = ev();
+        d.after = Some(Vec::new());
+        cases.push(("after empty", d));
+
+        // ABSENCE again, one level down: no value vs a NULL value vs an empty one.
+        for (name, v) in [
+            ("after [null]", RivetValue::Null),
+            ("after [empty bytes]", RivetValue::Bytes(Vec::new())),
+            ("after [empty array]", RivetValue::Array(Vec::new())),
+        ] {
+            let mut e = ev();
+            e.after = Some(vec![v]);
+            cases.push((name, e));
+        }
+
+        // LENGTH: one array of two vs two arrays of one — same elements, different
+        // structure.
+        let mut f = ev();
+        f.after = Some(vec![RivetValue::Array(vec![
+            RivetValue::Int(1),
+            RivetValue::Int(2),
+        ])]);
+        cases.push(("after [[1,2]]", f));
+        let mut g = ev();
+        g.after = Some(vec![
+            RivetValue::Array(vec![RivetValue::Int(1)]),
+            RivetValue::Array(vec![RivetValue::Int(2)]),
+        ]);
+        cases.push(("after [[1],[2]]", g));
+
+        // The remaining optional fields, each absent vs present-and-empty.
+        let mut h = ev();
+        h.poison = Some(String::new());
+        cases.push(("poison empty", h));
+        let mut i = ev();
+        i.image_names = Some(Vec::<String>::new().into());
+        cases.push(("names empty", i));
+        let mut j = ev();
+        j.committed = true;
+        cases.push(("committed", j));
+        // Each op is a distinct change: a DELETE that shares a frame with an INSERT
+        // of the same row is a row that comes back from the dead.
+        // UPDATE is the base fixture's own op, so only the other two are added —
+        // a third case identical to the base makes this test fail on itself, which
+        // is how this comment exists.
+        for (n, op) in [
+            ("op insert", ChangeOp::Insert),
+            ("op delete", ChangeOp::Delete),
+        ] {
+            let mut e = ev();
+            e.op = op;
+            cases.push((n, e));
+        }
+        // …and a different `seq` is a different change, since `(__pos, __seq)` is
+        // the total order the load dedup sorts by.
+        let mut k = ev();
+        k.seq = 8;
+        cases.push(("seq 8", k));
+
+        for (i, (n1, e1)) in cases.iter().enumerate() {
+            round_trips(e1);
+            for (j, (n2, e2)) in cases.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert_ne!(
+                    encode_event(e1),
+                    encode_event(e2),
+                    "`{n1}` and `{n2}` encode identically — two different changes \
+                     that share one frame is a change the spill cannot give back"
+                );
+            }
+        }
+    }
+
+    /// A frame that is short, long, or carries an unknown tag is REFUSED.
+    ///
+    /// Never a lenient default: an unknown tag decoded as NULL would turn a version
+    /// disagreement into a column of nulls that every count and sum check passes.
+    #[test]
+    fn a_frame_that_does_not_decode_exactly_is_refused() {
+        let mut e = ev();
+        e.after = Some(vec![RivetValue::Int(7)]);
+        let full = encode_event(&e);
+
+        for cut in 1..full.len() {
+            assert!(
+                decode_event(&full[..cut]).is_err(),
+                "a frame truncated to {cut} of {} bytes decoded as a whole event — \
+                 half a change is worse than none",
+                full.len()
+            );
+        }
+        let mut long = full.clone();
+        long.push(0);
+        assert!(
+            decode_event(&long).is_err(),
+            "trailing bytes mean the writer and this build disagree about the \
+             layout; accepting them delivers a silently truncated event"
+        );
+        // A one-value image whose only value is NULL ends with the TAG byte, so
+        // flipping the last byte really does forge an unknown variant. (The first
+        // cut flipped the last byte of an `Int`, which only changes the number —
+        // the mutation has to land on the tag to test the tag.)
+        let mut null_ev = ev();
+        null_ev.after = Some(vec![RivetValue::Null]);
+        let mut bad_tag = encode_event(&null_ev);
+        assert_eq!(
+            bad_tag.last().copied(),
+            Some(tag::NULL),
+            "the fixture must END on the value tag, or this asserts nothing"
+        );
+        *bad_tag.last_mut().expect("non-empty") = 200;
+        assert!(
+            decode_event(&bad_tag).is_err(),
+            "an unknown value tag must ERROR, never degrade to NULL"
+        );
+        assert!(decode_event(&[]).is_err(), "an empty frame is not an event");
+        assert!(
+            decode_event(&[99]).is_err(),
+            "an unknown op tag must ERROR — a spilled DELETE read as an INSERT \
+             would resurrect the row it was deleting"
+        );
     }
 }
