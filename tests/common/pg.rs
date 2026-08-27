@@ -254,3 +254,75 @@ fn restart(container: &str) {
     }
     panic!("postgres container `{container}` did not accept connections after a restart");
 }
+
+// ─── CDC fixture SCENARIOS ────────────────────────────────────────────────────
+//
+// These live here, not in whatever script needed them first, for the reason the
+// rig exists at all: each encodes a THRESHOLD that a naive fixture does not cross,
+// and every one of them was rediscovered the hard way before it was written down.
+// A scenario in a scratch script is a threshold the next person pays for again.
+
+/// A value PostgreSQL must store OUT OF LINE, so a TOASTed column really is one.
+///
+/// THE THRESHOLD: `repeat('y', 9000)` does NOT work. PGLZ compresses it to almost
+/// nothing, the value stays inline, and an UPDATE that leaves it alone emits no
+/// unchanged-TOAST marker at all — MEASURED, and it nearly produced the conclusion
+/// that `pgoutput` does not send the marker. Concatenated md5s are incompressible.
+///
+/// Returns the SQL expression, not a literal: 12 KB of hex in a test body is noise,
+/// and the server generating it is also what makes it genuinely random.
+pub fn incompressible_text_sql(groups: usize) -> String {
+    format!(
+        "(SELECT string_agg(md5(g::text||random()::text),'') \
+         FROM generate_series(1,{groups}) g)"
+    )
+}
+
+/// The column types that broke the TEXT reader, in one table.
+///
+/// Not an arbitrary selection — each one is a defect this repository measured:
+/// quoted/comma text (parser boundaries), an array (142 lines of literal parsing,
+/// and an inner NULL indistinguishable from the word), a non-UTC `timestamptz`
+/// (rendered in the reader's session zone), `uuid` (36-char text nulled by a
+/// 16-byte guard), `bytea` (`bytea_output` sensitive), `numeric` (exactness),
+/// `jsonb`, and an out-of-line TOAST column.
+pub fn pg_hard_types_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table}(\
+           id BIGINT PRIMARY KEY, txt TEXT, arr INT[], ts TIMESTAMPTZ, u UUID, \
+           b BYTEA, n NUMERIC(20,4), f DOUBLE PRECISION, ok BOOLEAN, d DATE, \
+           j JSONB, big TEXT)"
+    )
+}
+
+/// One row of [`pg_hard_types_ddl`] with every column populated.
+pub fn pg_hard_types_row(table: &str, id: i64) -> String {
+    format!(
+        "INSERT INTO {table} VALUES ({id}, 'a,b \"q\"', ARRAY[1,NULL,3], \
+         '2026-03-01 12:00:00+05', '11111111-2222-3333-4444-555555555555', \
+         '\\x00ff', '-12345.6789', 2.5, true, '2026-03-02', '{{\"k\":[1,2]}}', {})",
+        incompressible_text_sql(400)
+    )
+}
+
+/// The same table with every nullable column NULL.
+///
+/// THE THRESHOLD: a NULL *inside* an array value is NOT a NULL cell on the wire.
+/// A fixture carrying only `ARRAY[1,NULL,3]` never produces the `n` tag, and
+/// `Cell::Null -> Cell::Text` SURVIVED it — measured. A row of column-level NULLs
+/// is what grades the tag.
+pub fn pg_all_null_row(table: &str, id: i64) -> String {
+    format!(
+        "INSERT INTO {table} VALUES ({id},NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"
+    )
+}
+
+/// Wrap statements in ONE transaction.
+///
+/// THE THRESHOLD, and the one that has now cost six re-captures across this
+/// codebase: with a SINGLE row per transaction, `committed on the last event`,
+/// `committed on every event` and `committed on the first` are the same answer, so
+/// every one of those mutants survives. Three rows separate all three.
+pub fn in_one_transaction(statements: &[String]) -> String {
+    format!("BEGIN;\n{};\nCOMMIT;", statements.join(";\n"))
+}

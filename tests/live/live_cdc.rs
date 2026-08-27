@@ -7504,6 +7504,128 @@ fn the_reanchor_warning_names_the_config_relative_path_it_looked_at() {
     );
 }
 
+/// REGENERATE `tests/fixtures/pgoutput/*.hex` from the rig's own scenarios.
+///
+/// The unit tests in `src/source/postgres/pgoutput.rs` grade the decoder against
+/// real wire bytes, and those bytes have to come from somewhere. They came from a
+/// scratch Python script first, which is exactly the bespoke-harness shape the rig
+/// exists to refuse: the scenario then has TWO definitions and the one in the
+/// script is the one nobody maintains.
+///
+/// So the scenario lives in `tests/common/pg.rs` — `pg_hard_types_ddl`,
+/// `pg_all_null_row`, `in_one_transaction`, `incompressible_text_sql` — with each
+/// THRESHOLD written beside it, and this test is the one thing that renders it to
+/// bytes. Run it to refresh the fixture after a scenario change:
+///
+///   cargo test --test live_suite regenerate_the_pgoutput_fixture -- --ignored
+///
+/// It is `#[ignore]`d like every live test and it WRITES to the tree, which is why
+/// it says `regenerate` rather than pretending to be a check.
+#[test]
+#[ignore = "live+writes: regenerates tests/fixtures/pgoutput from the pg-cdc stand"]
+fn regenerate_the_pgoutput_fixture_from_the_rig_scenarios() {
+    use postgres::NoTls;
+
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    let tbl = "rivet_pgout_fx";
+    let slot = "rivet_pgout_fx_slot";
+    let pubn = "rivet_pgout_fx_pub";
+
+    let _ = c.batch_execute(&format!(
+        "SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots \
+         WHERE slot_name='{slot}'"
+    ));
+    let _ = c.batch_execute(&format!("DROP PUBLICATION IF EXISTS {pubn}"));
+    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
+
+    c.batch_execute(&pg_hard_types_ddl(tbl))
+        .expect("create the hard-types table");
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.to_string());
+    c.batch_execute(&format!("CREATE PUBLICATION {pubn} FOR TABLE {tbl}"))
+        .expect("publication");
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&slot],
+    )
+    .expect("pgoutput slot");
+    let _slot = Slot(slot.to_string());
+
+    // THREE rows in ONE transaction: see `in_one_transaction`'s note — with one,
+    // three different `committed` mutants are the same answer.
+    c.batch_execute(&in_one_transaction(&[
+        pg_hard_types_row(tbl, 42),
+        pg_all_null_row(tbl, 43),
+        pg_hard_types_row(tbl, 44),
+    ]))
+    .expect("a multi-row transaction");
+    // A second transaction, under DEFAULT identity: the UPDATE leaves `big`
+    // untouched so the unchanged-TOAST tag appears and the pre-image is ABSENT.
+    c.batch_execute(&format!(
+        "BEGIN; UPDATE {tbl} SET txt='u1' WHERE id=42; DELETE FROM {tbl} WHERE id=43; COMMIT;"
+    ))
+    .expect("update + delete under DEFAULT identity");
+    // …then the SAME shape under FULL, which is what makes an absent pre-image
+    // distinguishable from an empty one, plus a TRUNCATE so the typed message is
+    // in the capture rather than only in a hand-built test.
+    c.batch_execute(&format!("ALTER TABLE {tbl} REPLICA IDENTITY FULL"))
+        .expect("full identity");
+    c.batch_execute(&format!(
+        "BEGIN; UPDATE {tbl} SET txt='u-full' WHERE id=44; COMMIT;"
+    ))
+    .expect("update under FULL identity");
+    c.batch_execute(&format!("TRUNCATE {tbl}"))
+        .expect("truncate");
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pgoutput");
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    for (file, binary) in [("messages.hex", false), ("binary_values.hex", true)] {
+        // Each read CONSUMES the slot, so re-seed between them.
+        if binary {
+            c.batch_execute(&in_one_transaction(&[
+                pg_hard_types_row(tbl, 52),
+                pg_all_null_row(tbl, 53),
+                pg_hard_types_row(tbl, 54),
+            ]))
+            .expect("re-seed for the binary capture");
+            c.batch_execute(&format!("ALTER TABLE {tbl} REPLICA IDENTITY DEFAULT"))
+                .expect("back to default identity");
+            c.batch_execute(&format!(
+                "BEGIN; UPDATE {tbl} SET txt='u2' WHERE id=52; DELETE FROM {tbl} WHERE id=53; COMMIT;"
+            ))
+            .expect("re-seed update + delete");
+            c.batch_execute(&format!("ALTER TABLE {tbl} REPLICA IDENTITY FULL"))
+                .expect("full identity");
+            c.batch_execute(&format!(
+                "BEGIN; UPDATE {tbl} SET txt='u2-full' WHERE id=54; COMMIT;"
+            ))
+            .expect("re-seed full-identity update");
+            c.batch_execute(&format!("TRUNCATE {tbl}"))
+                .expect("re-seed truncate");
+        }
+        let sql = format!(
+            "SELECT encode(data,'hex') FROM pg_logical_slot_get_binary_changes($1, NULL, NULL, \
+             'proto_version','1','publication_names','{pubn}'{}) ",
+            if binary { ",'binary','true'" } else { "" }
+        );
+        let rows = c.query(sql.as_str(), &[&slot]).expect("read the slot");
+        let hex: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        assert!(
+            hex.len() >= 8,
+            "{file}: captured only {} messages — the scenario did not produce a \
+             fixture worth grading against",
+            hex.len()
+        );
+        std::fs::write(dir.join(file), hex.join("\n") + "\n").expect("write the fixture");
+        eprintln!(
+            "wrote {} ({} messages)",
+            dir.join(file).display(),
+            hex.len()
+        );
+    }
+
+    let _ = c.batch_execute(&format!("DROP PUBLICATION IF EXISTS {pubn}"));
+}
+
 /// The SYMPTOM half of the two-phase probe — now affordable, because the harness
 /// owns the server setting.
 ///

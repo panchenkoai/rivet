@@ -444,6 +444,305 @@ fn numeric_text(raw: &[u8]) -> Result<String> {
     })
 }
 
+/// Fill an UPDATE's unchanged-TOAST cells from the pre-image, where it has them.
+///
+/// A pre-image cell that is ITSELF a marker is not a source — that recovers the
+/// marker, reports success, and ships it as data. The text reader had the same
+/// guard and it was ungraded until this session; here the two are different bytes
+/// so the check is exact rather than a string comparison.
+fn merge_unchanged_toast(after: &[Cell], before: Option<&[Cell]>) -> Vec<Cell> {
+    let Some(before) = before else {
+        return after.to_vec();
+    };
+    after
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| match (cell, before.get(i)) {
+            // NO `pre != ToastUnchanged` guard, and the difference from the text
+            // reader is the point. There, the marker is a STRING, so copying it
+            // across "recovers" a value and clears the unchanged flag — the guard
+            // is load-bearing and its absence ships the placeholder as data (found
+            // and fixed earlier this session). Here cloning a marker yields a
+            // marker, which `decode_tuple` refuses on the next line, so the guard
+            // is provably redundant: witness-searched, the two forms agree on every
+            // input. An unkillable mutant means redundant code, not an exclusion.
+            (Cell::ToastUnchanged, Some(pre)) => pre.clone(),
+            _ => cell.clone(),
+        })
+        .collect()
+}
+
+/// Assembles [`Message`]s into [`ChangeEvent`]s, holding the relation cache the
+/// protocol requires.
+///
+/// `pgoutput` sends a `Relation` ONCE per table per connection and then references
+/// it by OID, so a stateless decode cannot name the table a row belongs to. That
+/// cache is the only state here — everything else is a function of the message.
+///
+/// The transaction framing is the load-bearing part, and it is the rule CLAUDE.md
+/// already states for every adapter: `committed` marks the LAST event of a source
+/// transaction, never every event. `pgoutput` gives that boundary explicitly
+/// (`Begin` … `Commit`), which is exactly what the text reader had to infer — and
+/// what PostgreSQL and SQL Server both got wrong once, marking every event
+/// committed and breaking at-least-once on a crash mid-transaction.
+#[derive(Default)]
+pub(crate) struct Assembler {
+    relations: std::collections::HashMap<u32, RelationInfo>,
+    /// Rows of the transaction currently open, held until its `Commit`.
+    open: Vec<PendingRow>,
+    /// A refusal inside the CURRENT transaction poisons the rest of it.
+    ///
+    /// Without this, a caller that logs an error and keeps feeding gets a PARTIAL
+    /// transaction: measured on the fixture, a refused UPDATE followed by its
+    /// sibling DELETE yielded a one-row "transaction" that never existed. The
+    /// at-least-once contract is transaction-atomic, so half of one is worse than
+    /// none — and the caller is not the place to remember that.
+    poisoned: Option<String>,
+}
+
+struct RelationInfo {
+    schema: String,
+    table: String,
+    columns: Vec<Column>,
+    /// Built once per relation, shared by every event that references it — the
+    /// sink compares these by `Arc::ptr_eq` to memoise its column lookup.
+    names: std::sync::Arc<[String]>,
+}
+
+struct PendingRow {
+    op: crate::source::cdc::ChangeOp,
+    relation_id: u32,
+    before: Option<Vec<crate::source::cdc::value::RivetValue>>,
+    after: Option<Vec<crate::source::cdc::value::RivetValue>>,
+}
+
+impl Assembler {
+    /// Feed one message. Returns the transaction's events when it COMMITS, and
+    /// nothing before then.
+    ///
+    /// Buffering to the commit is not an optimisation — it is what lets the last
+    /// event carry `committed`, which is the only point the sink may roll a part
+    /// and advance the checkpoint.
+    pub(crate) fn push(&mut self, msg: Message) -> Result<Vec<crate::source::cdc::ChangeEvent>> {
+        // A `Begin` clears the poison; everything else inside a poisoned
+        // transaction is refused with the ORIGINAL cause, so the caller sees why
+        // rather than a cascade of consequences.
+        if let Some(why) = self.poisoned.clone()
+            && !matches!(msg, Message::Begin { .. })
+        {
+            if matches!(msg, Message::Commit { .. }) {
+                self.open.clear();
+            }
+            anyhow::bail!("{why}");
+        }
+        let out = self.push_inner(msg);
+        if let Err(e) = &out {
+            self.poisoned = Some(format!("{e:#}"));
+            self.open.clear();
+        }
+        out
+    }
+
+    fn push_inner(&mut self, msg: Message) -> Result<Vec<crate::source::cdc::ChangeEvent>> {
+        use crate::source::cdc::ChangeOp;
+        match msg {
+            Message::Begin { .. } => {
+                // A `Begin` while rows are open means the previous transaction never
+                // committed — the stream is not what we think it is. Dropping them
+                // silently is how a partial transaction reaches the destination.
+                self.poisoned = None;
+                if !self.open.is_empty() {
+                    anyhow::bail!(
+                        "pgoutput: BEGIN with {} row(s) still open from an uncommitted \
+                         transaction — refusing rather than shipping a partial one",
+                        self.open.len()
+                    );
+                }
+                Ok(Vec::new())
+            }
+            Message::Relation {
+                relation_id,
+                namespace,
+                name,
+                columns,
+            } => {
+                let names: std::sync::Arc<[String]> =
+                    columns.iter().map(|c| c.name.clone()).collect();
+                self.relations.insert(
+                    relation_id,
+                    RelationInfo {
+                        schema: namespace,
+                        table: name,
+                        columns,
+                        names,
+                    },
+                );
+                Ok(Vec::new())
+            }
+            Message::Insert { relation_id, after } => {
+                let after = self.decode_tuple(relation_id, &after)?;
+                self.open.push(PendingRow {
+                    op: ChangeOp::Insert,
+                    relation_id,
+                    before: None,
+                    after: Some(after),
+                });
+                Ok(Vec::new())
+            }
+            Message::Update {
+                relation_id,
+                before,
+                after,
+            } => {
+                // RECOVER an unchanged-TOAST cell from the pre-image before
+                // decoding. `REPLICA IDENTITY FULL` does not stop the server
+                // omitting an unchanged TOASTed value from the NEW tuple — identity
+                // shapes the OLD one — so refusing here would refuse every UPDATE
+                // that leaves a large column alone, which is most of them. The text
+                // reader already recovers exactly this; the difference is that here
+                // the marker is a TAG, so "the pre-image is itself a marker" is a
+                // distinguishable case rather than a string collision.
+                let after = merge_unchanged_toast(&after, before.as_deref());
+                let before = before
+                    .as_deref()
+                    .map(|t| self.decode_tuple(relation_id, t))
+                    .transpose()?;
+                let after = self.decode_tuple(relation_id, &after)?;
+                self.open.push(PendingRow {
+                    op: ChangeOp::Update,
+                    relation_id,
+                    before,
+                    after: Some(after),
+                });
+                Ok(Vec::new())
+            }
+            Message::Delete {
+                relation_id,
+                before,
+            } => {
+                let before = self.decode_tuple(relation_id, &before)?;
+                self.open.push(PendingRow {
+                    op: ChangeOp::Delete,
+                    relation_id,
+                    before: Some(before),
+                    after: None,
+                });
+                Ok(Vec::new())
+            }
+            Message::Commit { commit_lsn, .. } => Ok(self.close(commit_lsn)),
+            // A TRUNCATE removes rows with no per-row events, so nothing downstream
+            // can retract them — the same refusal the text reader already makes,
+            // and here it arrives as a typed message instead of a parsed statement.
+            Message::Truncate { relation_ids } => {
+                let named: Vec<String> = relation_ids
+                    .iter()
+                    .map(|id| {
+                        self.relations.get(id).map_or_else(
+                            || format!("oid {id}"),
+                            |r| format!("{}.{}", r.schema, r.table),
+                        )
+                    })
+                    .collect();
+                anyhow::bail!(
+                    "pgoutput: TRUNCATE of {} — this reader cannot represent it as a \
+                     change. Every row the truncate removed would sit in the \
+                     destination with no DELETE to retract it. Recover in rivet's own \
+                     order: re-anchor FIRST (a fresh checkpoint), THEN re-snapshot \
+                     (`mode: full`).",
+                    named.join(", ")
+                )
+            }
+            Message::Other(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Close the open transaction, stamping the commit position on every row and
+    /// `committed` on the LAST one only.
+    fn close(&mut self, commit_lsn: u64) -> Vec<crate::source::cdc::ChangeEvent> {
+        let position = crate::source::cdc::Position(serde_json::json!({
+            "lsn": format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xFFFF_FFFF)
+        }));
+        let rows: Vec<PendingRow> = std::mem::take(&mut self.open);
+        let last = rows.len().saturating_sub(1);
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let rel = self.relations.get(&r.relation_id);
+                crate::source::cdc::ChangeEvent {
+                    op: r.op,
+                    schema: rel.map_or_else(String::new, |x| x.schema.clone()),
+                    table: rel.map_or_else(String::new, |x| x.table.clone()),
+                    before: r.before,
+                    after: r.after,
+                    position: position.clone(),
+                    committed: i == last,
+                    image_names: rel.map(|x| x.names.clone()),
+                    seq: 0, // stamped by TxnSeq as the stream is consumed
+                    poison: None,
+                }
+            })
+            .collect()
+    }
+
+    fn decode_tuple(
+        &self,
+        relation_id: u32,
+        cells: &[Cell],
+    ) -> Result<Vec<crate::source::cdc::value::RivetValue>> {
+        use crate::source::cdc::value::RivetValue as V;
+        let Some(rel) = self.relations.get(&relation_id) else {
+            anyhow::bail!(
+                "pgoutput: a row referenced relation {relation_id} before its \
+                 Relation message — the protocol sends one first, so this means a \
+                 message was dropped"
+            );
+        };
+        if cells.len() != rel.columns.len() {
+            anyhow::bail!(
+                "pgoutput: {}.{}: a row image carries {} value(s) under {} column(s)",
+                rel.schema,
+                rel.table,
+                cells.len(),
+                rel.columns.len()
+            );
+        }
+        cells
+            .iter()
+            .zip(&rel.columns)
+            .map(|(cell, col)| match cell {
+                Cell::Null => Ok(V::Null),
+                Cell::Binary(raw) => value_from_binary(col.type_oid, raw),
+                // An unchanged-TOAST cell is NOT a value. The text reader had to
+                // defer this as a `poison` because the marker was indistinguishable
+                // from data; here it is its own tag, so the refusal can be exact.
+                // Still a marker AFTER the pre-image merge means there was no
+                // pre-image to recover from — the table's replica identity does not
+                // carry one. Refusing is the only honest answer: writing the marker
+                // would put the words `unchanged-toast-datum` where data belongs,
+                // and writing NULL would erase a value that still exists.
+                Cell::ToastUnchanged => anyhow::bail!(
+                    "pgoutput: {}.{}: column `{}` is an unchanged TOAST value this \
+                     UPDATE did not carry, and no pre-image holds it. Set REPLICA \
+                     IDENTITY FULL on the table so the old row travels with the \
+                     change, then re-capture.",
+                    rel.schema,
+                    rel.table,
+                    col.name
+                ),
+                Cell::Text(_) => anyhow::bail!(
+                    "pgoutput: {}.{}: column `{}` arrived in TEXT form. The slot must \
+                     be read with `binary=true`; the text rendering is shaped by the \
+                     session's datestyle/bytea_output/TimeZone, which is the defect \
+                     class this reader exists to remove.",
+                    rel.schema,
+                    rel.table,
+                    col.name
+                ),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,10 +788,10 @@ mod tests {
             .map(|b| decode(b).unwrap_or_else(|e| panic!("decode {b:02x?}: {e}")))
             .collect();
         let count = |f: fn(&Message) -> bool| msgs.iter().filter(|m| f(m)).count();
-        assert_eq!(count(|m| matches!(m, Message::Begin { .. })), 6);
-        assert_eq!(count(|m| matches!(m, Message::Commit { .. })), 6);
+        assert_eq!(count(|m| matches!(m, Message::Begin { .. })), 4);
+        assert_eq!(count(|m| matches!(m, Message::Commit { .. })), 4);
         assert_eq!(count(|m| matches!(m, Message::Relation { .. })), 3);
-        assert_eq!(count(|m| matches!(m, Message::Insert { .. })), 2);
+        assert_eq!(count(|m| matches!(m, Message::Insert { .. })), 3);
         assert_eq!(count(|m| matches!(m, Message::Update { .. })), 2);
         assert_eq!(count(|m| matches!(m, Message::Delete { .. })), 1);
         assert_eq!(count(|m| matches!(m, Message::Truncate { .. })), 1);
@@ -521,13 +820,24 @@ mod tests {
                 _ => None,
             })
             .expect("the capture contains a Relation");
-        assert_eq!((rel.0.as_str(), rel.1.as_str()), ("public", "fx_t"));
+        assert_eq!(
+            (rel.0.as_str(), rel.1.as_str()),
+            ("public", "rivet_pgout_fx")
+        );
         let names: Vec<&str> = rel.2.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["id", "txt", "arr", "ts", "u", "b", "j", "big"]);
+        assert_eq!(
+            names,
+            [
+                "id", "txt", "arr", "ts", "u", "b", "n", "f", "ok", "d", "j", "big"
+            ]
+        );
         // Type OIDs, so a value decoder never has to guess: int8, text, _int4,
         // timestamptz, uuid, bytea, jsonb, text.
         let oids: Vec<u32> = rel.2.iter().map(|c| c.type_oid).collect();
-        assert_eq!(oids, [20, 25, 1007, 1184, 2950, 17, 3802, 25]);
+        assert_eq!(
+            oids,
+            [20, 25, 1007, 1184, 2950, 17, 1700, 701, 16, 1082, 3802, 25]
+        );
         // The KEY is `id` alone under the identity in force at capture time.
         let keys: Vec<&str> = rel
             .2
@@ -625,7 +935,7 @@ mod tests {
             .expect("the FULL-identity UPDATE must carry one");
         assert_eq!(
             full.len(),
-            8,
+            12,
             "REPLICA IDENTITY FULL sends every column, so the pre-image is the whole \
              row — an empty tuple here would read as `the row had no values`"
         );
@@ -642,7 +952,18 @@ mod tests {
                 _ => None,
             })
             .expect("the capture contains a DELETE");
-        assert_eq!(del.len(), 8, "under FULL the whole row rides the pre-image");
+        // TWELVE cells, not one — and that is the wire's shape, measured. A tuple
+        // ALWAYS has as many cells as the relation has columns; the replica
+        // identity decides which of them carry a VALUE, and a key-only image pads
+        // the rest with the NULL tag. (I assumed a key-only image was narrower and
+        // the fixture corrected me — which is also why the arity guard in
+        // `decode_tuple` can be an equality and not a bound.)
+        assert_eq!(del.len(), 12, "a tuple is always as wide as its relation");
+        assert!(
+            del.iter().filter(|c| **c == Cell::Null).count() >= 10,
+            "under DEFAULT identity only the key carries a value; the rest are the \
+             NULL tag, not absent cells"
+        );
     }
 
     /// Truncation is its OWN message, not a DDL statement to be string-matched.
@@ -707,7 +1028,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(inserts.len(), 2, "one populated row and one all-NULL row");
+        assert_eq!(
+            inserts.len(),
+            3,
+            "three rows in one transaction — see the framing test for why"
+        );
 
         let decoded: Vec<V> = inserts[0]
             .iter()
@@ -724,7 +1049,11 @@ mod tests {
             let i = cols.iter().position(|c| c.name == name).expect("column");
             &decoded[i]
         };
-        assert_eq!(by("id"), &V::Int(42));
+        assert_eq!(
+            by("id"),
+            &V::Int(52),
+            "the binary capture re-seeds with 52/53/54"
+        );
         assert_eq!(by("txt"), &V::Bytes(br#"a,b "q""#.to_vec()));
         assert_eq!(by("ok"), &V::Bool(true));
         assert_eq!(by("f"), &V::Float(2.5));
@@ -786,6 +1115,355 @@ mod tests {
         assert!(
             format!("{err:#}").contains("no binary decoder"),
             "an unmapped type must name itself and refuse: {err:#}"
+        );
+    }
+
+    /// The transaction framing, from the same real capture.
+    ///
+    /// `committed` must mark the LAST event of a source transaction and no other.
+    /// Both PostgreSQL and SQL Server once set it on EVERY event, and the cost was
+    /// measured: a transaction larger than `rollover` rolled and checkpointed
+    /// mid-transaction, and a crash before the tail flushed advanced the resume
+    /// position past the commit — 7 of 12 rows gone. Here the boundary is explicit
+    /// on the wire, so the rule is enforced rather than inferred.
+    #[test]
+    fn a_transaction_yields_nothing_until_its_commit_and_marks_only_its_last_event() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pgoutput/binary_values.hex");
+        let msgs: Vec<Message> = std::fs::read_to_string(&path)
+            .expect("fixture")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let b: Vec<u8> = (0..l.len() / 2)
+                    .map(|i| u8::from_str_radix(&l[i * 2..i * 2 + 2], 16).expect("hex"))
+                    .collect();
+                decode(&b).expect("decode")
+            })
+            .collect();
+
+        let mut a = Assembler::default();
+        let mut yielded: Vec<Vec<crate::source::cdc::ChangeEvent>> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for m in msgs {
+            let is_commit = matches!(m, Message::Commit { .. });
+            match a.push(m) {
+                Ok(out) if is_commit => yielded.push(out),
+                Ok(out) => assert!(
+                    out.is_empty(),
+                    "nothing may be yielded before the COMMIT — an event released \
+                     early cannot carry the transaction's own commit position"
+                ),
+                Err(e) => refused.push(format!("{e:#}")),
+            }
+        }
+
+        // The capture holds four transactions and TWO of them are REFUSALS, which
+        // is the correct outcome and worth asserting rather than filtering out:
+        // the DEFAULT-identity UPDATE cannot be represented (its TOASTed column did
+        // not travel) and a TRUNCATE cannot be represented at all.
+        // DISTINCT causes, not occurrences: a poisoned transaction refuses every
+        // later message with the ORIGINAL cause, which is the point — the caller
+        // sees why rather than a cascade of consequences.
+        let causes: std::collections::BTreeSet<&str> = refused.iter().map(String::as_str).collect();
+        assert_eq!(
+            causes.len(),
+            2,
+            "two distinct refusals — the unchanged TOAST and the TRUNCATE: {causes:#?}"
+        );
+        assert!(
+            causes.iter().any(|e| e.contains("unchanged TOAST")),
+            "the DEFAULT-identity UPDATE must refuse, naming the column: {refused:?}"
+        );
+        assert!(
+            causes.iter().any(|e| e.contains("TRUNCATE")),
+            "a TRUNCATE has no per-row representation: {refused:?}"
+        );
+
+        // What DID assemble: the three-row insert transaction, and the
+        // FULL-identity UPDATE. The refused transaction contributes an empty yield
+        // at its COMMIT, which is correct — its rows never entered `open`.
+        let real: Vec<&Vec<crate::source::cdc::ChangeEvent>> =
+            yielded.iter().filter(|t| !t.is_empty()).collect();
+        assert_eq!(
+            real.iter().map(|t| t.len()).collect::<Vec<_>>(),
+            vec![3, 1],
+            "MULTI-row transactions, deliberately: with one row per transaction \
+             `i == last`, `true` and `i == 0` are the same answer and every one of \
+             those mutants survives — measured, and the sixth time this session a \
+             fixture had to cross a threshold before the assertion could bite"
+        );
+
+        for tx in &real {
+            let flags: Vec<bool> = tx.iter().map(|e| e.committed).collect();
+            let want: Vec<bool> = (0..tx.len()).map(|i| i == tx.len() - 1).collect();
+            assert_eq!(
+                flags, want,
+                "exactly the LAST event of a transaction is `committed`; setting it \
+                 on every event is what let a crash advance the slot past a commit \
+                 whose tail was never flushed"
+            );
+            let first = &tx[0].position;
+            assert!(
+                tx.iter().all(|e| &e.position == first),
+                "one transaction, one commit position — a per-event position would \
+                 let the checkpoint land mid-transaction"
+            );
+        }
+
+        let ev = &real[0][0];
+        assert_eq!(
+            (ev.schema.as_str(), ev.table.as_str()),
+            ("public", "rivet_pgout_fx")
+        );
+        assert_eq!(
+            ev.image_names.as_deref().map(|n| n.len()),
+            Some(12),
+            "the image is name-addressed from the Relation message, so the sink maps \
+             by NAME and the positional-corruption class cannot arise"
+        );
+    }
+
+    /// The relation cache is REQUIRED by the protocol, and its absence is an error.
+    #[test]
+    fn a_row_before_its_relation_message_is_refused_not_guessed() {
+        let mut a = Assembler::default();
+        let err = a
+            .push(Message::Insert {
+                relation_id: 999,
+                after: vec![Cell::Null],
+            })
+            .expect_err("a row with no known relation must fail");
+        assert!(
+            format!("{err:#}").contains("before its Relation message"),
+            "the error must name the cause; guessing a schema/table here routes \
+             events to a relation nobody configured: {err:#}"
+        );
+    }
+
+    /// An unchanged-TOAST cell is refused with the column named, not written out.
+    #[test]
+    fn an_unchanged_toast_cell_is_refused_and_names_the_column() {
+        let mut a = Assembler::default();
+        a.push(Message::Relation {
+            relation_id: 1,
+            namespace: "public".into(),
+            name: "t".into(),
+            columns: vec![Column {
+                name: "big".into(),
+                type_oid: 25,
+                type_modifier: -1,
+                is_key: false,
+            }],
+        })
+        .expect("relation");
+        let err = a
+            .push(Message::Update {
+                relation_id: 1,
+                before: None,
+                after: vec![Cell::ToastUnchanged],
+            })
+            .expect_err("an unchanged TOAST value is not a value");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("big") && text.contains("REPLICA IDENTITY FULL"),
+            "{text}"
+        );
+    }
+
+    /// A tuple whose width disagrees with the relation is refused.
+    ///
+    /// The capture cannot produce this — the server always sends as many cells as
+    /// the relation has columns — so it is constructed. That is the honest shape
+    /// here: a guard against a message the wire should never send still has to be
+    /// graded, or it is a comment. MySQL's arity guard was ungraded offline for the
+    /// same reason and cost a round to find.
+    #[test]
+    fn a_tuple_wider_or_narrower_than_its_relation_is_refused() {
+        let rel = || Message::Relation {
+            relation_id: 1,
+            namespace: "public".into(),
+            name: "t".into(),
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                    is_key: true,
+                },
+                Column {
+                    name: "v".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                    is_key: false,
+                },
+            ],
+        };
+        let cell = |n: i64| Cell::Binary(n.to_be_bytes().to_vec());
+
+        for (label, cells) in [
+            ("too narrow", vec![cell(1)]),
+            ("too wide", vec![cell(1), cell(2), cell(3)]),
+        ] {
+            let mut a = Assembler::default();
+            a.push(rel()).expect("relation");
+            let err = a
+                .push(Message::Insert {
+                    relation_id: 1,
+                    after: cells,
+                })
+                .expect_err(
+                    "a tuple that disagrees with its relation must be REFUSED — \
+                     mapping it by position puts values into the wrong columns, \
+                     which is the class a name-addressed image exists to remove",
+                );
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("public.t") && text.contains("column(s)"),
+                "{label}: the refusal must name the relation and both widths: {text}"
+            );
+        }
+    }
+
+    /// A pre-image cell that is ITSELF a marker is not a recovery source.
+    ///
+    /// Constructed, because the capture does not produce it — and that is the point.
+    /// The text reader had exactly this guard, ungraded, until this session: taking
+    /// the marker from a marker "recovers" it, clears the unchanged flag, and ships
+    /// the placeholder as data while reporting success. Here the marker is a TAG, so
+    /// the check is exact instead of a string comparison, but the mistake is the
+    /// same one and it survives a fixture that never puts a marker on both sides.
+    #[test]
+    fn a_pre_image_cell_that_is_also_a_marker_cannot_recover_anything() {
+        let mut a = Assembler::default();
+        a.push(Message::Relation {
+            relation_id: 1,
+            namespace: "public".into(),
+            name: "t".into(),
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                    is_key: true,
+                },
+                Column {
+                    name: "big".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                    is_key: false,
+                },
+            ],
+        })
+        .expect("relation");
+        a.push(Message::Begin {
+            final_lsn: 1,
+            xid: 1,
+        })
+        .expect("begin");
+
+        let id = Cell::Binary(7i64.to_be_bytes().to_vec());
+        let err = a
+            .push(Message::Update {
+                relation_id: 1,
+                // BOTH images carry the marker for `big`.
+                before: Some(vec![id.clone(), Cell::ToastUnchanged]),
+                after: vec![id, Cell::ToastUnchanged],
+            })
+            .expect_err("a marker cannot be recovered from a marker");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("big") && text.contains("no pre-image holds it"),
+            "the refusal must name the column and say the pre-image is no help — \
+             copying the marker across reports a clean recovery and writes the \
+             placeholder where data belongs: {text}"
+        );
+
+        // …and the SAME shape recovers when the pre-image holds a real value.
+        let mut b = Assembler::default();
+        b.push(Message::Relation {
+            relation_id: 1,
+            namespace: "public".into(),
+            name: "t".into(),
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                    is_key: true,
+                },
+                Column {
+                    name: "big".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                    is_key: false,
+                },
+            ],
+        })
+        .expect("relation");
+        b.push(Message::Begin {
+            final_lsn: 1,
+            xid: 1,
+        })
+        .expect("begin");
+        let id = Cell::Binary(7i64.to_be_bytes().to_vec());
+        b.push(Message::Update {
+            relation_id: 1,
+            before: Some(vec![id.clone(), Cell::Binary(b"real".to_vec())]),
+            after: vec![id, Cell::ToastUnchanged],
+        })
+        .expect("a real pre-image value IS a recovery source");
+        let out = b
+            .push(Message::Commit {
+                commit_lsn: 16,
+                end_lsn: 16,
+            })
+            .expect("commit");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].after.as_ref().and_then(|v| v.get(1)),
+            Some(&crate::source::cdc::value::RivetValue::Bytes(
+                b"real".to_vec()
+            )),
+            "the unchanged column takes the pre-image's REAL value"
+        );
+    }
+
+    /// A BEGIN while rows are still open means a transaction never committed.
+    #[test]
+    fn a_begin_over_an_uncommitted_transaction_is_refused() {
+        let mut a = Assembler::default();
+        a.push(Message::Relation {
+            relation_id: 1,
+            namespace: "public".into(),
+            name: "t".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 20,
+                type_modifier: -1,
+                is_key: true,
+            }],
+        })
+        .expect("relation");
+        a.push(Message::Begin {
+            final_lsn: 1,
+            xid: 1,
+        })
+        .expect("begin");
+        a.push(Message::Insert {
+            relation_id: 1,
+            after: vec![Cell::Binary(42i64.to_be_bytes().to_vec())],
+        })
+        .expect("insert");
+        let err = a
+            .push(Message::Begin {
+                final_lsn: 2,
+                xid: 2,
+            })
+            .expect_err("a second BEGIN with rows open must fail");
+        assert!(
+            format!("{err:#}").contains("still open"),
+            "dropping the open rows silently ships a partial transaction: {err:#}"
         );
     }
 
