@@ -190,13 +190,33 @@ pub fn mysql_seed_one_transaction(
     table: &str,
     ids: std::ops::RangeInclusive<usize>,
 ) {
+    mysql_seed_one_transaction_wide(c, table, ids, 200);
+}
+
+/// [`mysql_seed_one_transaction`] with the `pad` width chosen — the HEAVY-row
+/// fixture, which crosses the BYTE cap where a narrow one only crosses the row cap.
+///
+/// MySQL has no `generate_series`, so the rows are batched into multi-row `INSERT`s
+/// inside ONE explicit transaction: still a single transaction at any size, without
+/// a round trip per row (a million of those measures the driver, not rivet).
+pub fn mysql_seed_one_transaction_wide(
+    c: &mut mysql::PooledConn,
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+    pad: usize,
+) {
     use mysql::prelude::Queryable;
+    const PER_STATEMENT: usize = 1000;
     c.query_drop("START TRANSACTION").expect("begin");
-    for i in ids {
-        c.query_drop(format!(
-            "INSERT INTO {table} VALUES ({i}, {i}, REPEAT('x', 200))"
-        ))
-        .expect("insert");
+    let mut it = ids.peekable();
+    while it.peek().is_some() {
+        let values: Vec<String> = it
+            .by_ref()
+            .take(PER_STATEMENT)
+            .map(|i| format!("({i}, {i}, REPEAT('x', {pad}))"))
+            .collect();
+        c.query_drop(format!("INSERT INTO {table} VALUES {}", values.join(", ")))
+            .expect("insert");
     }
     c.query_drop("COMMIT").expect("commit");
 }

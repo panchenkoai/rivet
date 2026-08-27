@@ -354,8 +354,27 @@ pub fn one_transaction_of(table: &str, rows: usize) -> String {
 /// identical. Measured — the `stopped_to_spool` guard could be inverted with a
 /// one-transaction fixture still green.
 pub fn transaction_over(table: &str, ids: std::ops::RangeInclusive<usize>) -> String {
-    let stmts: Vec<String> = ids
-        .map(|i| format!("INSERT INTO {table} VALUES ({i}, {i}, repeat('x', 200))"))
-        .collect();
-    in_one_transaction(&stmts)
+    transaction_over_wide(table, ids, 200)
+}
+
+/// [`transaction_over`] with the `pad` width chosen — for a HEAVY-row fixture.
+///
+/// The row cap and the BYTE cap are different activation thresholds: a narrow row
+/// crosses `RIVET_CDC_MAX_TX_ROWS` while `RIVET_CDC_MAX_TX_BYTES` never fires, and
+/// a wide one (a `content_items`-shaped table: long text, JSON, markup) does the
+/// opposite. A fixture that only ever crosses the row cap tests half the guard.
+///
+/// ONE set-based statement, so it is one transaction at any size — the per-row
+/// `INSERT` form builds a multi-megabyte SQL string at a million rows and measures
+/// the seeding rather than rivet.
+pub fn transaction_over_wide(
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+    pad: usize,
+) -> String {
+    let (lo, hi) = (*ids.start(), *ids.end());
+    format!(
+        "INSERT INTO {table} SELECT g, g, repeat('x', {pad}) FROM \
+         generate_series({lo}, {hi}) g"
+    )
 }

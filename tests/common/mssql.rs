@@ -472,11 +472,26 @@ pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
 /// integers plus a wide `pad`, so a row cap and a BYTE cap are both reachable and
 /// the source table's row count equals the delivered change count.
 pub fn mssql_seed_one_transaction(table: &str, ids: std::ops::RangeInclusive<usize>) {
+    mssql_seed_one_transaction_wide(table, ids, 200);
+}
+
+/// [`mssql_seed_one_transaction`] with the `pad` width chosen — the HEAVY-row
+/// fixture, which crosses the BYTE cap where a narrow one only crosses the row cap.
+///
+/// `REPLICATE` past 8000 needs an explicit `VARCHAR(MAX)` operand, or it silently
+/// truncates at 8000 — a wide fixture that quietly stops being wide would report a
+/// byte cap that was never crossed.
+pub fn mssql_seed_one_transaction_wide(
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+    pad: usize,
+) {
     let (lo, hi) = (*ids.start(), *ids.end());
     let n = hi.saturating_sub(lo) + 1;
     mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} (id, v, pad) \
-         SELECT {lo} + q.n - 1, {lo} + q.n - 1, REPLICATE('x', 200) FROM ( \
+         SELECT {lo} + q.n - 1, {lo} + q.n - 1, REPLICATE(CAST('x' AS VARCHAR(MAX)), {pad}) \
+         FROM ( \
              SELECT TOP ({n}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n \
              FROM sys.all_objects a CROSS JOIN sys.all_objects b \
          ) q"

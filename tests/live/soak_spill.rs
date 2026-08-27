@@ -1,9 +1,17 @@
-//! SOAK STAND — the spill path under repetition, on every engine that has one.
+//! SOAK STAND — the spill path under repetition, on every CDC engine.
 //!
 //! The unit tests answer "is one spilled transaction correct?". This answers the
 //! questions that only repetition can: does the memory ceiling HOLD across cycles,
 //! do the spill files accumulate, does the destination still hold every source row
 //! after N runs into one prefix, and do rivet's own ledgers still add up.
+//!
+//! MongoDB is here too, and it is the CONTROL. It has no transaction buffer at all
+//! — no `tx`, no cap, and `TxnFramer::single_event_commit` marks every event its own
+//! commit — so there is nothing to spill AND the sink may roll after any event.
+//! That makes it the one engine with an end-to-end memory ceiling, which the other
+//! three do not have (see `rss_ceiling`). Running it beside them turns that from an
+//! argument into two numbers: Mongo's peak RSS should stay FLAT as
+//! `RIVET_SOAK_ROWS` grows, where the SQL engines' climbs.
 //!
 //! It is a REGRESSION stand, not a one-off: every cycle re-seeds, re-runs and
 //! re-checks, so the same command can be run before a release, after a refactor, or
@@ -15,6 +23,11 @@
 //!   RIVET_SOAK_CYCLES  cycles per engine (default 3)
 //!   RIVET_SOAK_ROWS    rows in each cycle's oversized transaction (default 2000)
 //!   RIVET_SOAK_RSS_MB  peak-RSS ceiling for any rivet spawned (default 256)
+//!   RIVET_SOAK_PAD     bytes in each row's wide column (default 200) — raise it
+//!                      and lower ROWS for a `content_items`-shaped table, where
+//!                      the BYTE cap fires and the row cap never does
+//!   RIVET_SOAK_CAP     row cap (default 50); above ROWS for the no-spill baseline
+//!   RIVET_SOAK_BYTE_CAP  byte cap; unset leaves the product default
 //!
 //! The oracle is DuckDB, per the rule this repo learned the hard way: rivet's own
 //! count is not evidence about rivet. `row_census` reads the SOURCE table, the
@@ -53,6 +66,24 @@ fn soak_cycles() -> usize {
 /// `RIVET_SOAK_ROWS`; when the sink learns to spill, that gap is the evidence.
 fn rss_ceiling() -> u64 {
     env_usize("RIVET_SOAK_RSS_MB", 256) as u64 * 1024 * 1024
+}
+
+/// Width of each row's `pad` column — the knob that turns a row-cap fixture into a
+/// BYTE-cap one.
+///
+/// `check_tx_buffer_caps` fails on rows OR bytes, and a narrow fixture only ever
+/// crosses the row half. A `content_items`-shaped table (long text, JSON, markup) is
+/// the opposite case: few rows, each large, so `RIVET_CDC_MAX_TX_BYTES` is what
+/// fires. Raise this and lower `RIVET_SOAK_ROWS` to soak that half.
+fn soak_pad() -> usize {
+    env_usize("RIVET_SOAK_PAD", 200)
+}
+
+/// The BYTE cap the soak runs under, or `None` to leave the product default.
+fn byte_cap() -> Option<usize> {
+    std::env::var("RIVET_SOAK_BYTE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -126,6 +157,22 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
     );
 }
 
+/// One soak cycle's run, under whichever cap(s) the stand was asked for.
+///
+/// Both caps in one place: a caller that set only the byte cap must not silently
+/// get the row cap's default as well, which would spill for the wrong reason and
+/// report a byte-cap soak that never crossed a byte threshold.
+fn run_cycle(rig: &Rig) -> std::process::Output {
+    let rows_cap = cap().to_string();
+    let mut envs: Vec<(&str, &str)> = vec![("RIVET_CDC_MAX_TX_ROWS", &rows_cap)];
+    let bytes_cap;
+    if let Some(b) = byte_cap() {
+        bytes_cap = b.to_string();
+        envs.push(("RIVET_CDC_MAX_TX_BYTES", &bytes_cap));
+    }
+    rig.run_with_envs(&envs)
+}
+
 fn spill_files_under(dir: &std::path::Path) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -146,6 +193,18 @@ fn spill_files_under(dir: &std::path::Path) -> Vec<String> {
 /// Without this the whole soak passes on a build where spilling never happens: the
 /// rows are identical either way. It is the fixture-is-not-inert check, per cycle.
 fn assert_cycle_spilled(engine: &str, cycle: usize, stderr: &str) {
+    if engine == "mongo" {
+        // The CONTROL: nothing to spill, by construction. Asserted rather than
+        // skipped — if Mongo ever grows a transaction buffer, this is the line that
+        // says the control has stopped being one.
+        assert!(
+            !stderr.contains("passed the in-memory cap"),
+            "mongo cycle {cycle}: mongo has no transaction buffer (every event is \
+             its own commit), so a spill here means the engine changed shape and \
+             the memory claim below is no longer about a control"
+        );
+        return;
+    }
     if cap() > soak_rows() {
         // Baseline run: the cap is above the fixture, so nothing spills by design.
         assert!(
@@ -212,14 +271,22 @@ fn soak_spill_postgres() {
     let rig = Rig::pg_cdc(&tbl, &slot).census_oracle();
     let mut seeded = 0usize;
     for cycle in 1..=cycles {
-        c.batch_execute(&transaction_over(&tbl, seeded + 1..=seeded + rows))
-            .unwrap();
+        c.batch_execute(&transaction_over_wide(
+            &tbl,
+            seeded + 1..=seeded + rows,
+            soak_pad(),
+        ))
+        .unwrap();
         seeded += rows;
-        c.batch_execute(&transaction_over(&tbl, seeded + 1..=seeded + SMALL))
-            .unwrap();
+        c.batch_execute(&transaction_over_wide(
+            &tbl,
+            seeded + 1..=seeded + SMALL,
+            soak_pad(),
+        ))
+        .unwrap();
         seeded += SMALL;
 
-        let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &cap().to_string());
+        let out = run_cycle(&rig);
         assert!(
             out.status.success(),
             "postgres cycle {cycle} failed: {}",
@@ -265,12 +332,12 @@ fn soak_spill_mysql() {
 
     let mut seeded = 0usize;
     for cycle in 1..=cycles {
-        mysql_seed_one_transaction(&mut c, &tbl, seeded + 1..=seeded + rows);
+        mysql_seed_one_transaction_wide(&mut c, &tbl, seeded + 1..=seeded + rows, soak_pad());
         seeded += rows;
-        mysql_seed_one_transaction(&mut c, &tbl, seeded + 1..=seeded + SMALL);
+        mysql_seed_one_transaction_wide(&mut c, &tbl, seeded + 1..=seeded + SMALL, soak_pad());
         seeded += SMALL;
 
-        let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &cap().to_string());
+        let out = run_cycle(&rig);
         assert!(
             out.status.success(),
             "mysql cycle {cycle} failed: {}",
@@ -303,16 +370,16 @@ fn soak_spill_mssql() {
     let rig = Rig::mssql_cdc(&table, &ci).census_oracle();
     let mut seeded = 0usize;
     for cycle in 1..=cycles {
-        mssql_seed_one_transaction(&table, seeded + 1..=seeded + rows);
+        mssql_seed_one_transaction_wide(&table, seeded + 1..=seeded + rows, soak_pad());
         seeded += rows;
-        mssql_seed_one_transaction(&table, seeded + 1..=seeded + SMALL);
+        mssql_seed_one_transaction_wide(&table, seeded + 1..=seeded + SMALL, soak_pad());
         seeded += SMALL;
         // The capture job is ASYNCHRONOUS: running before it has copied the rows
         // reads a short window and the next cycle re-reads it, which looks like a
         // resume bug rather than a fixture that did not wait.
         wait_for_capture(&ci, seeded as i64);
 
-        let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &cap().to_string());
+        let out = run_cycle(&rig);
         assert!(
             out.status.success(),
             "mssql cycle {cycle} failed: {}",
@@ -321,4 +388,50 @@ fn soak_spill_mssql() {
         assert_cycle_spilled("mssql", cycle, &String::from_utf8_lossy(&out.stderr));
     }
     assert_soak_is_sound(&rig, "mssql", seeded, rss_before);
+}
+
+// ─── MongoDB — the control ───────────────────────────────────────────────────
+
+/// Mongo has NOTHING to spill, and that is the point of running it here.
+///
+/// Every event is its own commit (`single_event_commit`), so the sink may roll after
+/// any of them and never holds a transaction. Its peak RSS should therefore stay
+/// flat as `RIVET_SOAK_ROWS` grows, where PostgreSQL/MySQL/SQL Server climb — the
+/// two numbers together are what make "the sink is the binding constraint" a
+/// measurement instead of a claim.
+#[test]
+#[ignore = "soak: requires docker compose up -d mongo-rs"]
+fn soak_spill_mongo() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let (cycles, rows) = (soak_cycles(), soak_rows());
+    let rss_before = peak_child_rss_bytes();
+
+    let db = unique_name("soak_spill_mg");
+    let m = MongoTest::connect(27018, &db);
+    m.drop_collection("t");
+
+    let rig = Rig::mongo_cdc("t")
+        .source_url(&MongoTest::url(27018, &db))
+        .census_oracle();
+    // Pin the anchor over the empty collection first: Mongo resumes from a token,
+    // and a cycle seeded before the anchor exists is a cycle the stream never sees.
+    rig.run_ok();
+
+    let mut seeded = 0usize;
+    for cycle in 1..=cycles {
+        m.append_padded("t", seeded + 1..=seeded + rows, soak_pad());
+        seeded += rows;
+        m.append_padded("t", seeded + 1..=seeded + SMALL, soak_pad());
+        seeded += SMALL;
+
+        let out = run_cycle(&rig);
+        assert!(
+            out.status.success(),
+            "mongo cycle {cycle} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_cycle_spilled("mongo", cycle, &String::from_utf8_lossy(&out.stderr));
+    }
+    assert_soak_is_sound(&rig, "mongo", seeded, rss_before);
 }

@@ -248,3 +248,30 @@ impl MongoTest {
         })
     }
 }
+
+impl MongoTest {
+    /// Append `ids` as `{_id, v, pad}` documents — the soak stand's seed, matching
+    /// the SQL engines' `(id, v, pad)` shape so one census and one read-back oracle
+    /// serve every engine.
+    ///
+    /// APPENDS rather than recreating: a soak cycles, and `seed_int_id` drops the
+    /// collection first, which would make each cycle's census compare against a
+    /// source that no longer holds the earlier cycles.
+    ///
+    /// Batched, because a million single inserts measure the driver's round trips.
+    /// Each insert is still its OWN commit here — Mongo has no multi-document
+    /// transaction in this path, which is exactly the property the soak checks.
+    pub fn append_padded(&self, name: &str, ids: std::ops::RangeInclusive<usize>, pad: usize) {
+        const PER_BATCH: usize = 1000;
+        let padding = "x".repeat(pad);
+        let mut it = ids.peekable();
+        while it.peek().is_some() {
+            let docs: Vec<Document> = it
+                .by_ref()
+                .take(PER_BATCH)
+                .map(|i| doc! { "_id": i as i64, "v": i as i64, "pad": padding.clone() })
+                .collect();
+            self.insert_many(name, docs);
+        }
+    }
+}
