@@ -658,9 +658,10 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
         let scale = events
             .iter()
             .filter_map(|e| {
-                let img = match e.op {
-                    ChangeOp::Delete => e.before.as_ref(),
-                    _ => e.after.as_ref(),
+                let img = if e.op.values_live_in_before() {
+                    e.before.as_ref()
+                } else {
+                    e.after.as_ref()
                 };
                 img.and_then(|v| v.get(i))
             })
@@ -726,9 +727,10 @@ pub(crate) fn image_cell<'e>(
     ncols: usize,
     memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
 ) -> Option<&'e RivetValue> {
-    let vals = match e.op {
-        ChangeOp::Delete => e.before.as_ref()?,
-        _ => e.after.as_ref()?,
+    let vals = if e.op.values_live_in_before() {
+        e.before.as_ref()?
+    } else {
+        e.after.as_ref()?
     };
     match &e.image_names {
         Some(names) => match memo

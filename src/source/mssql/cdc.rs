@@ -845,9 +845,10 @@ impl MssqlChangeStream {
             }
             let Some(op) = map_op(op_code) else { continue };
             // after-image for insert/update; the key (before-image) for delete
-            let (before, after) = match op {
-                ChangeOp::Delete => (Some(values), None),
-                _ => (None, Some(values)),
+            let (before, after) = if op.values_live_in_before() {
+                (Some(values), None)
+            } else {
+                (None, Some(values))
             };
             let ev = ChangeEvent {
                 op,
