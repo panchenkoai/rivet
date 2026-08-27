@@ -28,6 +28,8 @@
 //!                      the BYTE cap fires and the row cap never does
 //!   RIVET_SOAK_CAP     row cap (default 50); above ROWS for the no-spill baseline
 //!   RIVET_SOAK_BYTE_CAP  byte cap; unset leaves the product default
+//!   RIVET_SOAK_ROLLOVER  sink rollover (default 100_000) — what BOUNDS ordinary
+//!                      CDC memory, since the sink holds at most this many events
 //!   RIVET_SOAK_TX_ROWS rows per transaction (default: the whole cycle in one) —
 //!                      the knob that separates "a big transaction is expensive"
 //!                      from "CDC is expensive"
@@ -63,6 +65,22 @@ fn soak_cycles() -> usize {
 /// | 1 000 000 | **1000 tx of 1000** | 50 | **233.1 MB** |
 /// | 10 000 000 | one tx | 50 | 12389.6 MB |
 /// | 1 000 000 | one tx, MONGO | n/a | 331.9 MB |
+///
+/// And the shape an ordinary workload actually has — many SMALL transactions,
+/// release build, product-default caps:
+///
+/// | rows | tx size | rollover | peak RSS |
+/// |---|---|---|---|
+/// | 200 000 | 1000 | 100 000 (default) | 216.4 MB |
+/// | 1 000 000 | 1000 | 100 000 (default) | 228.5 MB |
+/// | 1 000 000 | 1000 | 10 000 | 44.7 MB |
+///
+/// Five times the volume costs 5% more memory: ordinary CDC is BOUNDED, and what
+/// bounds it is `rollover` — the sink holds at most that many events before writing
+/// a part. Cutting it 10x cuts memory ~11x above rivet's ~27 MB floor. A big
+/// transaction is precisely the case where that bound stops applying, because the
+/// sink may not roll mid-transaction; the ceiling becomes
+/// `max(rollover, largest transaction) x ~1 KB`.
 ///
 /// Three things fall out of that table, none of them visible from one row:
 ///
@@ -329,7 +347,15 @@ fn soak_spill_postgres() {
     // destination prefix on every cycle. That is the scheduler's own shape
     // (`until_current` on an interval), and the shape where a part-name collision
     // silently overwrote a prior run's data.
-    let rig = Rig::pg_cdc(&tbl, &slot).census_oracle();
+    let mut rig = Rig::pg_cdc(&tbl, &slot);
+    // `rollover` is what BOUNDS ordinary CDC memory: the sink holds at most this
+    // many events before writing a part, so the floor is `rollover` x the per-event
+    // cost. Overridable so the stand can measure that relationship rather than
+    // assert it — the default (100_000) is a choice, not a law.
+    if let Ok(r) = std::env::var("RIVET_SOAK_ROLLOVER") {
+        rig = rig.cdc_line(&format!("rollover: {r}"));
+    }
+    let rig = rig.census_oracle();
     let mut seeded = 0usize;
     for cycle in 1..=cycles {
         // Split into transactions of `tx_rows` (default: one transaction for the
