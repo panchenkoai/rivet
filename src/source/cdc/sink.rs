@@ -516,7 +516,8 @@ pub(crate) fn run_to_files(
             // buffers are empty; it just persists the checkpoint + acks. The
             // checkpoint only ever lands on `last_commit` (a transaction boundary),
             // so a `max_events` stop mid-span still checkpoints a whole transaction.
-            if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
+            let buffered_rows: usize = sinks.iter().map(|s| s.buf.len()).sum();
+            if pass_must_roll(unacked_commit, buffered_rows) {
                 roll_all(
                     &mut sinks,
                     stream,
@@ -536,7 +537,7 @@ pub(crate) fn run_to_files(
             }
             // A pass that yielded nothing has drained to the bound; `max_events`
             // stops the whole run at the cap.
-            if hit_max || yielded_this_pass == 0 {
+            if drain_is_complete(hit_max, yielded_this_pass) {
                 break;
             }
         }
@@ -661,7 +662,11 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
                 _ => None,
             })
             .max();
-        if let Some(s) = scale.filter(|s| *s > 0) {
+        // No `.filter(|s| *s > 0)`: the arm above binds only `Decimal128(p, 0)`, so
+        // a scale of 0 would reassign the value the field already holds. The filter
+        // was unkillable — `>` and `>=` are observationally identical here — and an
+        // unkillable mutant is redundant code, not an exclusion to write down.
+        if let Some(s) = scale {
             m.arrow_type = Some(DataType::Decimal128(p, s as i8));
         }
     }
@@ -685,6 +690,89 @@ fn run_token(run_id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// One cell of a row image — resolved by NAME when the image carries names, by
+/// POSITION when it does not.
+///
+/// Hoisted out of `flush` because it was NESTED inside it. `flush` is live-only
+/// glue, so nothing offline could reach this, and a mutation run over
+/// `src/source/cdc/sink.rs` measured FOUR survivors in these few lines — every
+/// decision it makes:
+///
+/// * `n == col` → `!=` picks the first column that is NOT the one asked for,
+///   so every cell comes back holding a neighbour's value;
+/// * the `vals.len() == ncols` guard → `true` restores the pre-round-13 read
+///   (a short image indexed by position, reading past its end), → `false`
+///   degrades a mid-window RENAME to NULL, which is the silent-loss shape the
+///   guard was added against.
+///
+/// It is pure — an event, an index, a name, an arity and a memo in; a borrowed
+/// value out — so nesting bought nothing and cost the grade. See
+/// `image_cell_resolves_by_name_and_falls_back_only_at_matching_arity`.
+pub(crate) fn image_cell<'e>(
+    e: &'e ChangeEvent,
+    i: usize,
+    col: &str,
+    ncols: usize,
+    memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
+) -> Option<&'e RivetValue> {
+    let vals = match e.op {
+        ChangeOp::Delete => e.before.as_ref()?,
+        _ => e.after.as_ref()?,
+    };
+    match &e.image_names {
+        Some(names) => match memo
+            .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
+            .map(|(_, j)| j)
+            .unwrap_or_else(|| names.iter().position(|n| n == col))
+        {
+            Some(j) => vals.get(j),
+            // Name absent: a mid-window RENAME leaves the value under
+            // its OLD name — when the arity still matches, position is
+            // trustworthy and the value must not silently degrade to
+            // NULL. Arity mismatch (mid-window ADD/DROP) ⇒ the column
+            // genuinely has no value in this image ⇒ NULL.
+            None if vals.len() == ncols => vals.get(i),
+            None => None,
+        },
+        None => vals.get(i),
+    }
+}
+
+/// Must this drain pass ROLL — flush, checkpoint and ack?
+///
+/// Two reasons, and the second is the one that is easy to lose. Buffered rows
+/// obviously have to reach a part. But a pass that consumed only UNCAPTURED or
+/// empty WAL has nothing buffered and still must roll: on a consume-retention
+/// engine the reader only slides forward when the sink ACKS, so skipping the roll
+/// re-reads the same window forever (`roast_pg_cdc_reaches_open_bound_past_a_large_
+/// uncaptured_transaction`, and the DDL-churn slot pin beside it).
+///
+/// `||` → `&&` makes the ack wait for rows that an uncaptured span never produces;
+/// deleting the `!` rolls only while the buffers are EMPTY, which is every case
+/// except the one that has data. Both survived a mutation run over this file
+/// because `run_to_files` is live-only glue and nothing offline reached the
+/// condition inside it.
+/// Takes the buffered ROW COUNT rather than a bool, so the emptiness test lives
+/// here too. A first cut took `any_buffered: bool` and left
+/// `sinks.iter().any(|s| !s.buf.is_empty())` at the call site — the `delete !`
+/// mutant then SURVIVED the predicate's own unit matrix, because the predicate
+/// could not see how its argument was computed. Moving an operator out of glue is
+/// not the same as grading it; the signature has to swallow the decision.
+pub(crate) fn pass_must_roll(unacked_commit: bool, buffered_rows: usize) -> bool {
+    unacked_commit || buffered_rows > 0
+}
+
+/// Has the drain loop finished — the cap, or a pass that yielded nothing?
+///
+/// `yielded == 0` is the bound-reached signal: the re-drain loop keeps re-peeking
+/// fresh log after each ack, so "this pass produced no event" is the only honest
+/// end. `== 0` → `!= 0` inverts it into "stop as soon as anything arrives",
+/// i.e. one pass per run; `||` → `&&` never stops at the cap unless the source
+/// also happens to be empty.
+pub(crate) fn drain_is_complete(hit_max: bool, yielded_this_pass: usize) -> bool {
+    hit_max || yielded_this_pass == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -820,35 +908,6 @@ fn flush(
         // into the resolved schema — positional mapping put a non-first PK's
         // value into column 0 and NULLed the PK, silently losing the delete
         // downstream. Unnamed images stay positional (full rows).
-        fn image_cell<'e>(
-            e: &'e ChangeEvent,
-            i: usize,
-            col: &str,
-            ncols: usize,
-            memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
-        ) -> Option<&'e RivetValue> {
-            let vals = match e.op {
-                ChangeOp::Delete => e.before.as_ref()?,
-                _ => e.after.as_ref()?,
-            };
-            match &e.image_names {
-                Some(names) => match memo
-                    .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
-                    .map(|(_, j)| j)
-                    .unwrap_or_else(|| names.iter().position(|n| n == col))
-                {
-                    Some(j) => vals.get(j),
-                    // Name absent: a mid-window RENAME leaves the value under
-                    // its OLD name — when the arity still matches, position is
-                    // trustworthy and the value must not silently degrade to
-                    // NULL. Arity mismatch (mid-window ADD/DROP) ⇒ the column
-                    // genuinely has no value in this image ⇒ NULL.
-                    None if vals.len() == ncols => vals.get(i),
-                    None => None,
-                },
-                None => vals.get(i),
-            }
-        }
         // O(1) name lookup for the common case: all events in a flush share
         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
         // column's image index once and reuse it by pointer identity.
@@ -1462,6 +1521,270 @@ mod tests {
             seq: 0,
             poison: None,
         }
+    }
+
+    /// Every decision `image_cell` makes, one case each — the four mutants that
+    /// survived a run over this file before it was hoisted out of `flush`.
+    ///
+    /// Two FIELDS throughout, never one: with a single column there is no
+    /// neighbour to pick up and `n == col` → `!=` is indistinguishable from the
+    /// truth. Same reason the row-hash injectivity guard needed two.
+    #[test]
+    fn image_cell_resolves_by_name_and_falls_back_only_at_matching_arity() {
+        use std::sync::Arc;
+        let names: Arc<[String]> = Arc::from(vec!["a".to_string(), "b".to_string()]);
+        let ev = |vals: Vec<RivetValue>, names: Option<Arc<[String]>>| ChangeEvent {
+            after: Some(vals),
+            image_names: names,
+            ..insert(0)
+        };
+
+        // BY NAME: `b` is at index 1 whatever the caller's positional `i` says.
+        // `n == col` → `!=` returns index 0 here — a neighbour's value, silently.
+        let e = ev(
+            vec![RivetValue::Int(10), RivetValue::Int(20)],
+            Some(names.clone()),
+        );
+        assert_eq!(
+            image_cell(&e, 0, "b", 2, None),
+            Some(&RivetValue::Int(20)),
+            "a named image resolves by NAME; matching the first column that is NOT \
+             the one asked for hands every cell its neighbour's value"
+        );
+        assert_eq!(image_cell(&e, 1, "a", 2, None), Some(&RivetValue::Int(10)));
+
+        // The MEMO is a pointer-identity shortcut and must agree with the search.
+        let memo = Some((&names, names.iter().position(|n| n == "b")));
+        assert_eq!(image_cell(&e, 0, "b", 2, memo), Some(&RivetValue::Int(20)));
+        // A memo for a DIFFERENT names-Arc must be ignored, not trusted.
+        let other: Arc<[String]> = Arc::from(vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(
+            image_cell(&e, 9, "b", 2, Some((&other, Some(0)))),
+            Some(&RivetValue::Int(20)),
+            "the memo is keyed by Arc identity; a stale one must fall back to the \
+             search rather than index another table's layout"
+        );
+
+        // NAME ABSENT, ARITY MATCHES — a mid-window RENAME. The value is there,
+        // under its old name, and position is trustworthy. `== ncols` → `false`
+        // degrades it to NULL: the silent-loss shape this arm exists to refuse.
+        assert_eq!(
+            image_cell(&e, 1, "renamed", 2, None),
+            Some(&RivetValue::Int(20)),
+            "a renamed column keeps its value at the same position while the arity \
+             agrees — returning None here is a column that silently becomes NULL"
+        );
+
+        // NAME ABSENT, ARITY DIFFERS — a mid-window ADD/DROP, or a partial image.
+        // The column genuinely has no value here. `== ncols` → `true` restores the
+        // pre-round-13 read: index past the end of a short image.
+        //
+        // The index must land INSIDE the short image, or the two branches agree by
+        // accident and the guard is untested: with `i` past the end, `vals.get(i)`
+        // is `None` and so is the correct answer. Measured — a first draft used
+        // `i = 1` over a 1-value image and the `-> true` mutant SURVIVED it. Here
+        // the image holds two values under a three-column table, so position 0 is
+        // readable and wrong: exactly a MINIMAL row image handing back a
+        // neighbour's cell under the name of a column it does not carry.
+        let three: std::sync::Arc<[String]> =
+            Arc::from(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let short = ev(
+            vec![RivetValue::Int(10), RivetValue::Int(20)],
+            Some(three.clone()),
+        );
+        assert_eq!(
+            image_cell(&short, 0, "absent", 3, None),
+            None,
+            "a short image has no value for a column it does not name; reading it by \
+             position returns the FIRST column's value under another column's name"
+        );
+        // …and past the end too, so the arm is exercised on both sides.
+        assert_eq!(image_cell(&short, 2, "absent", 3, None), None);
+
+        // A DELETE reads the BEFORE image, an INSERT/UPDATE the AFTER.
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Int(7), RivetValue::Int(8)]),
+            after: None,
+            image_names: Some(names.clone()),
+            ..insert(0)
+        };
+        assert_eq!(image_cell(&del, 0, "b", 2, None), Some(&RivetValue::Int(8)));
+        assert_eq!(image_cell(&del, 0, "a", 2, None), Some(&RivetValue::Int(7)));
+
+        // NO NAMES: purely positional, the pre-names engines' shape.
+        let anon = ev(vec![RivetValue::Int(10), RivetValue::Int(20)], None);
+        assert_eq!(
+            image_cell(&anon, 1, "b", 2, None),
+            Some(&RivetValue::Int(20))
+        );
+        assert_eq!(image_cell(&anon, 5, "b", 2, None), None);
+    }
+
+    /// The drain loop's two decisions, every combination — four mutants that
+    /// survived while they were `if` conditions inside live-only glue.
+    #[test]
+    fn a_pass_rolls_for_rows_or_for_an_unacked_commit_and_the_drain_ends_only_when_dry() {
+        // ROLL. The uncaptured-span case is the load-bearing one: nothing buffered,
+        // and the ack still has to happen or a consume-retention reader re-reads the
+        // same window forever.
+        assert!(
+            pass_must_roll(true, 0),
+            "an unacked commit boundary with NO buffered rows must still roll — that \
+             is what advances the slot past an uncaptured or empty span"
+        );
+        assert!(pass_must_roll(false, 1), "buffered rows must reach a part");
+        assert!(pass_must_roll(true, 3));
+        assert!(
+            !pass_must_roll(false, 0),
+            "nothing consumed and nothing buffered is not a roll; rolling here would \
+             checkpoint a position the run never reached"
+        );
+
+        // END. `yielded == 0` is the only honest bound signal in a re-drain loop:
+        // each pass re-peeks fresh log after acking, so a non-empty pass says
+        // nothing about whether more is coming.
+        assert!(
+            drain_is_complete(false, 0),
+            "a pass that yielded nothing has drained to the bound"
+        );
+        assert!(
+            !drain_is_complete(false, 1),
+            "a pass that yielded events must be followed by another — stopping here \
+             is one pass per run, which is the starvation the re-drain loop replaced"
+        );
+        assert!(
+            drain_is_complete(true, 5),
+            "the cap stops the run even mid-stream, or `max_events` is advisory"
+        );
+        assert!(drain_is_complete(true, 0));
+    }
+
+    /// A DELETE's decimal scale comes from the BEFORE image.
+    ///
+    /// `refine_decimal_scales` is pure and had no unit test at all, so `delete match
+    /// arm ChangeOp::Delete` survived: with it gone a delete reads `after`, which is
+    /// `None` on every delete, so a batch of deletes keeps scale 0 and every decimal
+    /// is written TRUNCATED to whole units. Counts and row totals all agree.
+    #[test]
+    fn a_deletes_decimal_scale_is_read_from_the_before_image() {
+        let mut cols = vec![TypeMapping {
+            column_name: "amount".into(),
+            source_native_type: "numeric".into(),
+            rivet_type: crate::types::RivetType::Decimal {
+                precision: 18,
+                scale: 0,
+            },
+            arrow_type: Some(DataType::Decimal128(18, 0)),
+            ..int_col().remove(0)
+        }];
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Bytes(b"12.345".to_vec())]),
+            after: None,
+            ..insert(0)
+        };
+        refine_decimal_scales(&mut cols, std::slice::from_ref(&del));
+        assert_eq!(
+            cols[0].arrow_type,
+            Some(DataType::Decimal128(18, 3)),
+            "a delete carries its values in `before`; reading `after` finds None and \
+             leaves scale 0, which writes 12.345 as 12"
+        );
+
+        // The insert/update side, so the arm that stays is not the only one graded.
+        let mut cols2 = cols.clone();
+        cols2[0].arrow_type = Some(DataType::Decimal128(18, 0));
+        let ins = ChangeEvent {
+            after: Some(vec![RivetValue::Bytes(b"9.87".to_vec())]),
+            ..insert(0)
+        };
+        refine_decimal_scales(&mut cols2, std::slice::from_ref(&ins));
+        assert_eq!(cols2[0].arrow_type, Some(DataType::Decimal128(18, 2)));
+
+        // The WIDEST scale in the batch wins — one row would make `.max()` and
+        // `.min()` and `.last()` all agree.
+        let mut cols3 = cols.clone();
+        cols3[0].arrow_type = Some(DataType::Decimal128(18, 0));
+        let batch = [
+            ChangeEvent {
+                after: Some(vec![RivetValue::Bytes(b"1.5".to_vec())]),
+                ..insert(0)
+            },
+            ChangeEvent {
+                after: Some(vec![RivetValue::Bytes(b"2.0625".to_vec())]),
+                ..insert(1)
+            },
+            ChangeEvent {
+                after: Some(vec![RivetValue::Bytes(b"3.25".to_vec())]),
+                ..insert(2)
+            },
+        ];
+        refine_decimal_scales(&mut cols3, &batch);
+        assert_eq!(
+            cols3[0].arrow_type,
+            Some(DataType::Decimal128(18, 4)),
+            "a narrower scale than the batch's widest silently truncates the widest row"
+        );
+    }
+
+    /// The schema may only DECLARE a type `build_column` will actually produce.
+    ///
+    /// `ensure_schema` is pure and this guard had no unit test, so `replace match
+    /// guard value::is_buildable(dt) with true` survived. With it always true the
+    /// field is declared from `arrow_type` verbatim, while the array builder still
+    /// falls back to `Utf8` for a type it cannot build — schema and data disagree,
+    /// which is the one thing the fallback exists to prevent.
+    #[test]
+    fn a_type_the_array_builder_cannot_build_is_declared_utf8_not_verbatim() {
+        let unbuildable = DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(10, 2),
+            true,
+        )));
+        assert!(
+            !value::is_buildable(&unbuildable),
+            "the fixture is inert: this type must be one the builder REFUSES, or \
+             both arms agree and the guard is untested"
+        );
+        let mut cols = vec![TypeMapping {
+            column_name: "amounts".into(),
+            source_native_type: "numeric[]".into(),
+            arrow_type: Some(unbuildable),
+            ..int_col().remove(0)
+        }];
+        let mut schema = None;
+        let sch = ensure_schema(
+            &mut schema,
+            &mut cols,
+            &[insert(0)],
+            &crate::config::RowHash::default(),
+        );
+        let f = sch
+            .field_with_name("amounts")
+            .expect("the column is declared");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Utf8,
+            "a type the array builder falls back to Utf8 for must be DECLARED Utf8 — \
+             declaring it verbatim makes the schema describe data that is never written"
+        );
+
+        // The buildable side, so the arm that stays is graded too.
+        let mut cols2 = int_col();
+        let mut schema2 = None;
+        let sch2 = ensure_schema(
+            &mut schema2,
+            &mut cols2,
+            &[insert(0)],
+            &crate::config::RowHash::default(),
+        );
+        assert_eq!(
+            sch2.field_with_name("v").expect("declared").data_type(),
+            &DataType::Int64,
+            "a buildable type keeps its own width; degrading everything to Utf8 would \
+             satisfy the assertion above and lose every type in the stream"
+        );
     }
 
     fn int_col() -> Vec<TypeMapping> {
