@@ -15,6 +15,7 @@
 
 pub(crate) mod identity;
 pub(crate) mod sink;
+pub(crate) mod spill;
 pub(crate) mod validate;
 pub(crate) mod value;
 
