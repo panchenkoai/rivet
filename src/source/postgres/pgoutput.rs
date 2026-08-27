@@ -295,6 +295,155 @@ fn expect_tag(r: &mut Reader<'_>, want: u8) -> Result<()> {
     Ok(())
 }
 
+/// Turn one BINARY `pgoutput` cell into a [`RivetValue`], dispatching on the type
+/// OID the `Relation` message carried.
+///
+/// This is where the format's real payoff lands. `test_decoding` hands over the
+/// type's TEXT rendering, so every one of these becomes a parse — and each parse is
+/// shaped by session state the reader does not control. Here the server sends the
+/// type's own binary form and `postgres_types::FromSql` decodes it, the SAME
+/// implementations the batch export already trusts for the identical wire format.
+///
+/// An OID with no arm is a REFUSAL, not a guess. Falling back to "keep the bytes as
+/// text" is how a type nobody mapped becomes a column of hex in the destination,
+/// which every count and sum agrees with.
+pub(crate) fn value_from_binary(
+    oid: u32,
+    raw: &[u8],
+) -> Result<crate::source::cdc::value::RivetValue> {
+    use crate::source::cdc::value::RivetValue as V;
+    use postgres_types::{FromSql, Type};
+
+    let Some(ty) = Type::from_oid(oid) else {
+        anyhow::bail!("pgoutput: no PostgreSQL type for OID {oid}");
+    };
+    fn de<'a, T: FromSql<'a>>(ty: &Type, raw: &'a [u8], what: &str) -> Result<T> {
+        T::from_sql(ty, raw)
+            .map_err(|e| anyhow::anyhow!("pgoutput: decoding {what} (oid {}): {e}", ty.oid()))
+    }
+    Ok(match oid {
+        16 => V::Bool(de::<bool>(&ty, raw, "bool")?),
+        20 => V::Int(de::<i64>(&ty, raw, "int8")?),
+        21 => V::Int(de::<i16>(&ty, raw, "int2")? as i64),
+        23 => V::Int(de::<i32>(&ty, raw, "int4")? as i64),
+        700 => V::Float(de::<f32>(&ty, raw, "float4")? as f64),
+        701 => V::Float(de::<f64>(&ty, raw, "float8")?),
+        // timestamptz is an INSTANT on the wire: microseconds from 2000-01-01 UTC,
+        // with no rendering and so no `TimeZone`/`datestyle` to get wrong. That is
+        // the whole of the class this repo measured three defects in.
+        // `.naive_utc()` and `.naive_local()` are the SAME call on a `DateTime<Utc>`
+        // — the type parameter makes them identical, so that mutant is equivalent by
+        // construction rather than ungraded. What is NOT equivalent is the type
+        // parameter itself: decode as `Local` and the instant shifts by the host's
+        // offset, which is the +9h corruption class in a new place.
+        1184 => {
+            V::DateTime(de::<chrono::DateTime<chrono::Utc>>(&ty, raw, "timestamptz")?.naive_utc())
+        }
+        1114 => V::DateTime(de::<chrono::NaiveDateTime>(&ty, raw, "timestamp")?),
+        1082 => V::DateTime(
+            de::<chrono::NaiveDate>(&ty, raw, "date")?
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time"),
+        ),
+        // uuid: 16 raw bytes, so no hyphen-strip and no length guard — the shape
+        // that turned an entire column NULL when the text rendering was 36 chars.
+        2950 => V::Bytes(de::<uuid::Uuid>(&ty, raw, "uuid")?.as_bytes().to_vec()),
+        17 => V::Bytes(de::<Vec<u8>>(&ty, raw, "bytea")?),
+        // json/jsonb/numeric/text all travel as bytes rivet already renders; jsonb's
+        // binary form carries a 1-byte version prefix that `FromSql` strips.
+        114 | 3802 => V::Bytes(
+            serde_json::to_vec(&de::<serde_json::Value>(&ty, raw, "json")?)
+                .map_err(|e| anyhow::anyhow!("pgoutput: re-encoding json: {e}"))?,
+        ),
+        25 | 1042 | 1043 => V::Bytes(de::<String>(&ty, raw, "text")?.into_bytes()),
+        1700 => V::Bytes(numeric_text(raw)?.into_bytes()),
+        // One-dimensional arrays of the element types the batch list builder makes.
+        1005 => array_of(de::<Vec<Option<i16>>>(&ty, raw, "int2[]")?, |v| {
+            V::Int(v as i64)
+        }),
+        1007 => array_of(de::<Vec<Option<i32>>>(&ty, raw, "int4[]")?, |v| {
+            V::Int(v as i64)
+        }),
+        1016 => array_of(de::<Vec<Option<i64>>>(&ty, raw, "int8[]")?, V::Int),
+        1000 => array_of(de::<Vec<Option<bool>>>(&ty, raw, "bool[]")?, V::Bool),
+        1021 => array_of(de::<Vec<Option<f32>>>(&ty, raw, "float4[]")?, |v| {
+            V::Float(v as f64)
+        }),
+        1022 => array_of(de::<Vec<Option<f64>>>(&ty, raw, "float8[]")?, V::Float),
+        1009 => array_of(de::<Vec<Option<String>>>(&ty, raw, "text[]")?, |v| {
+            V::Bytes(v.into_bytes())
+        }),
+        _ => anyhow::bail!(
+            "pgoutput: column type `{}` (oid {oid}) has no binary decoder. Refusing \
+             rather than passing the raw bytes through as text — an unmapped type \
+             that ships as hex is a column every count and sum agrees with and no \
+             consumer can read.",
+            ty.name()
+        ),
+    })
+}
+
+fn array_of<T>(
+    items: Vec<Option<T>>,
+    f: impl Fn(T) -> crate::source::cdc::value::RivetValue,
+) -> crate::source::cdc::value::RivetValue {
+    use crate::source::cdc::value::RivetValue as V;
+    V::Array(items.into_iter().map(|o| o.map_or(V::Null, &f)).collect())
+}
+
+/// PostgreSQL `numeric` in its binary form -> exact decimal text.
+///
+/// `postgres-types` has no `FromSql` for it, so this is the one type the format
+/// does not hand over ready-made. The layout is base-10000 digit groups:
+/// ndigits, weight, sign, dscale, then the groups.
+fn numeric_text(raw: &[u8]) -> Result<String> {
+    if raw.len() < 8 {
+        anyhow::bail!("pgoutput: numeric header truncated ({} bytes)", raw.len());
+    }
+    let g = |i: usize| i16::from_be_bytes([raw[i], raw[i + 1]]);
+    let (ndigits, weight, sign, dscale) = (g(0) as usize, g(2) as i32, g(4) as u16, g(6) as usize);
+    match sign {
+        0xC000 => return Ok("NaN".into()),
+        0xD000 => return Ok("Infinity".into()),
+        0xF000 => return Ok("-Infinity".into()),
+        _ => {}
+    }
+    if raw.len() < 8 + ndigits * 2 {
+        anyhow::bail!("pgoutput: numeric digits truncated");
+    }
+    let digits: Vec<i16> = (0..ndigits).map(|i| g(8 + i * 2)).collect();
+    let mut int_part = String::new();
+    for d in 0..=weight.max(0) {
+        let v = digits.get(d as usize).copied().unwrap_or(0);
+        if d == 0 {
+            int_part.push_str(&v.to_string());
+        } else {
+            int_part.push_str(&format!("{v:04}"));
+        }
+    }
+    if int_part.is_empty() {
+        int_part.push('0');
+    }
+    let mut frac = String::new();
+    let mut d = weight + 1;
+    while frac.len() < dscale {
+        let v = if d < 0 {
+            0
+        } else {
+            digits.get(d as usize).copied().unwrap_or(0)
+        };
+        frac.push_str(&format!("{v:04}"));
+        d += 1;
+    }
+    frac.truncate(dscale);
+    let neg = if sign == 0x4000 { "-" } else { "" };
+    Ok(if dscale == 0 {
+        format!("{neg}{int_part}")
+    } else {
+        format!("{neg}{int_part}.{frac}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +662,131 @@ mod tests {
             .expect("the capture contains a TRUNCATE");
         assert_eq!(ids.len(), 1, "one table was truncated");
         assert_ne!(ids[0], 0, "a relation OID is never zero");
+    }
+
+    /// Every value type, decoded from the type's OWN BINARY FORM.
+    ///
+    /// A second capture, taken with `binary=true`, because the first was text-mode
+    /// and text cells cannot grade a binary decoder — the fixture must produce the
+    /// tag the code under test consumes.
+    ///
+    /// This is the payoff measured end to end: `timestamptz` arrives as an INSTANT
+    /// (no `TimeZone` to strip, no `datestyle` to parse), `bytea` as raw bytes (no
+    /// `\x` and no `bytea_output`), `uuid` as its 16 bytes (no hyphen strip and no
+    /// length guard), and an array as elements (no `{1,NULL,3}` to parse, and its
+    /// inner NULL is a real one rather than the four letters).
+    #[test]
+    fn every_binary_value_decodes_through_its_type_oid() {
+        use crate::source::cdc::value::RivetValue as V;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pgoutput/binary_values.hex");
+        let msgs: Vec<Message> = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let b: Vec<u8> = (0..l.len() / 2)
+                    .map(|i| u8::from_str_radix(&l[i * 2..i * 2 + 2], 16).expect("hex"))
+                    .collect();
+                decode(&b).expect("decode")
+            })
+            .collect();
+
+        let cols = msgs
+            .iter()
+            .find_map(|m| match m {
+                Message::Relation { columns, .. } => Some(columns.clone()),
+                _ => None,
+            })
+            .expect("a Relation");
+        let inserts: Vec<&Vec<Cell>> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Message::Insert { after, .. } => Some(after),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inserts.len(), 2, "one populated row and one all-NULL row");
+
+        let decoded: Vec<V> = inserts[0]
+            .iter()
+            .zip(&cols)
+            .map(|(cell, col)| match cell {
+                Cell::Null => V::Null,
+                Cell::Binary(raw) => value_from_binary(col.type_oid, raw)
+                    .unwrap_or_else(|e| panic!("{}: {e}", col.name)),
+                other => panic!("{}: expected a BINARY cell, got {other:?}", col.name),
+            })
+            .collect();
+
+        let by = |name: &str| -> &V {
+            let i = cols.iter().position(|c| c.name == name).expect("column");
+            &decoded[i]
+        };
+        assert_eq!(by("id"), &V::Int(42));
+        assert_eq!(by("txt"), &V::Bytes(br#"a,b "q""#.to_vec()));
+        assert_eq!(by("ok"), &V::Bool(true));
+        assert_eq!(by("f"), &V::Float(2.5));
+        assert_eq!(
+            by("arr"),
+            &V::Array(vec![V::Int(1), V::Null, V::Int(3)]),
+            "the array's inner NULL is a real NULL, not the four letters `NULL` that \
+             the text form is indistinguishable from"
+        );
+        assert_eq!(
+            by("u"),
+            &V::Bytes(vec![
+                0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
+                0x55, 0x55
+            ]),
+            "16 raw bytes — the text form is 36 chars, which is what turned a whole \
+             uuid column NULL when a builder guarded on length"
+        );
+        assert_eq!(
+            by("b"),
+            &V::Bytes(vec![0x00, 0xff]),
+            "raw bytes, no `\\x` prefix"
+        );
+        assert_eq!(
+            by("n"),
+            &V::Bytes(b"-12345.6789".to_vec()),
+            "numeric is exact decimal text, sign and scale preserved"
+        );
+        assert_eq!(by("j"), &V::Bytes(br#"{"k":[1,2]}"#.to_vec()));
+        // `2026-03-01 12:00:00+05` is `07:00:00Z` — an INSTANT, with no session
+        // rendering in between. The +9h corruption class cannot arise here.
+        assert_eq!(
+            by("ts"),
+            &V::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 3, 1)
+                    .unwrap()
+                    .and_hms_opt(7, 0, 0)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            by("d"),
+            &V::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 3, 2)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+            )
+        );
+
+        // The all-NULL row: every cell is the NULL TAG, never a decoded value.
+        assert!(
+            inserts[1].iter().skip(1).all(|c| *c == Cell::Null),
+            "every nullable column of the all-NULL row must be `Cell::Null`"
+        );
+
+        // An unmapped OID REFUSES rather than passing bytes through.
+        let err = value_from_binary(3220, b"\x00\x00\x00\x01").expect_err("pg_lsn has no arm");
+        assert!(
+            format!("{err:#}").contains("no binary decoder"),
+            "an unmapped type must name itself and refuse: {err:#}"
+        );
     }
 
     /// Truncated input FAILS rather than returning a half-read message.
