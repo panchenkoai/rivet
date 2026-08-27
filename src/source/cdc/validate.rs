@@ -157,12 +157,27 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
         // `rivet validate --depth full` outright, and moving that one file aside made
         // the same command exit 0. It broke every `rivet validate && deploy` gate.
         //
-        // A key with a separator is a nested leg by construction — the copies this
-        // prefix owns sit directly under it.
-        if m.key.contains('/') {
+        // A separator in the key RELATIVE TO THIS PREFIX means a nested leg; the
+        // copies this prefix owns sit directly under it.
+        //
+        // Relative, because `list_prefix` returns FULL keys — `cdc/manifest-r1.json`,
+        // not `manifest-r1.json`. The first cut of this guard tested the whole key,
+        // so it skipped EVERY copy including this prefix's own, and `check_positions`
+        // fell through to the canonical `manifest.json`. On the prefix that has none
+        // — a daemon or crashed CDC run, where only the run-unique copies exist —
+        // that is a false-clean `PASSED, 0 parts verified`, which is exactly the
+        // #173 defect this fallback was written to remove. Nothing caught it: the
+        // broken guard survived the lib suite AND all 106 live CDC tests, because
+        // every one of them leaves a canonical manifest behind.
+        let rel = m
+            .key
+            .strip_prefix(prefix)
+            .unwrap_or(&m.key)
+            .trim_start_matches('/');
+        if rel.contains('/') {
             continue;
         }
-        let base = m.key.rsplit('/').next().unwrap_or("");
+        let base = rel;
         if crate::manifest::is_run_unique_manifest_name(base) {
             manifests.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
         }
@@ -264,6 +279,141 @@ mod v016_checkpoint_compat {
         Position::load(&path)
             .unwrap_or_else(|e| panic!("{name}: a v0.16 checkpoint must still load: {e:#}"))
             .unwrap_or_else(|| panic!("{name}: loader reported the fixture as ABSENT"))
+    }
+
+    /// The nested-leg skip must actually skip — measured ungraded by BOTH suites.
+    ///
+    /// `check_positions` lists the prefix RECURSIVELY, so an `initial: snapshot`
+    /// export's `<prefix>/snapshot/manifest-<run_id>.json` was swept up with the CDC
+    /// leg's own copies. Its `parts[].path` is relative to `snapshot/`, so validate
+    /// looked for those parts at the CDC root and reported `could not complete: No
+    /// such file or directory`, exit 1, on a correct export — breaking every
+    /// `rivet validate && deploy` gate on the documented production shape.
+    ///
+    /// The guard was added earlier this session and shipped with nothing grading it:
+    /// deleting it survives the lib suite AND all 106 live CDC tests (both measured
+    /// 2026-08-27). A guard nothing can fail is a guard nobody can trust to still be
+    /// there — which is the whole point of this file's mutation pass.
+    #[test]
+    fn a_nested_snapshot_legs_manifest_is_not_read_as_this_prefixs_own() {
+        use std::sync::Arc;
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("dest root");
+        let root = dir.path().join("cdc");
+        std::fs::create_dir_all(root.join("snapshot")).expect("nested leg");
+
+        // One parquet with a monotonic `__pos`, at the CDC root.
+        let write_part = |at: &std::path::Path, vals: &[&str]| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "__pos",
+                DataType::Utf8,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vals.to_vec()))],
+            )
+            .expect("batch");
+            let f = std::fs::File::create(at).expect("part file");
+            let mut w = ArrowWriter::try_new(f, schema, None).expect("writer");
+            w.write(&batch).expect("write");
+            w.close().expect("close");
+        };
+        write_part(
+            &root.join("cdc-000000.parquet"),
+            &[r#"{"lsn":"0/10"}"#, r#"{"lsn":"0/20"}"#],
+        );
+
+        // The manifest is built from the REAL type and serialized, not hand-written
+        // JSON. A hand-written fixture drifts from the struct the moment a field is
+        // added, and the drift only ever shows up as a test its author has to keep
+        // patching — this one took six rounds of `missing field` before it was
+        // replaced by the type itself.
+        let manifest = |part: &str| {
+            use crate::manifest::{
+                ManifestDestination, ManifestPart, ManifestSource, ManifestStatus, PartStatus,
+                RunManifest,
+            };
+            serde_json::to_string(&RunManifest {
+                manifest_version: 1,
+                run_id: "r1".into(),
+                export_name: "t".into(),
+                export_family: "t".into(),
+                mode: "cdc".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                finished_at: "2026-01-01T00:00:01Z".into(),
+                status: ManifestStatus::Success,
+                source: ManifestSource {
+                    engine: "postgres".into(),
+                    schema: None,
+                    table: None,
+                    extraction: None,
+                },
+                destination: ManifestDestination {
+                    kind: "local".into(),
+                    uri: "cdc".into(),
+                },
+                format: "parquet".into(),
+                compression: "zstd".into(),
+                schema_fingerprint: String::new(),
+                row_count: 2,
+                part_count: 1,
+                parts: vec![ManifestPart {
+                    part_id: 0,
+                    path: part.into(),
+                    rows: 2,
+                    size_bytes: 1,
+                    content_fingerprint: "xxh3:0".into(),
+                    content_md5: String::new(),
+                    status: PartStatus::Committed,
+                }],
+                column_checksums: None,
+                checksum_render: None,
+                checksum_key_column: None,
+                row_hash: None,
+                split_window: None,
+            })
+            .expect("serialize the manifest")
+        };
+        std::fs::write(
+            root.join("manifest-r1.json"),
+            manifest("cdc-000000.parquet"),
+        )
+        .expect("this leg's own copy");
+        // The nested leg's copy — its part path is relative to `snapshot/`, so a
+        // reader that adopts it looks for `<cdc-root>/snap-000000.parquet`, which
+        // does not exist. That is the exit-1 the guard exists to prevent.
+        std::fs::write(
+            root.join("snapshot").join("manifest-r9.json"),
+            manifest("snap-000000.parquet"),
+        )
+        .expect("nested leg's copy");
+
+        let dest =
+            crate::destination::local::LocalDestination::new(&crate::config::DestinationConfig {
+                destination_type: crate::config::DestinationType::Local,
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .expect("local destination");
+        let got = super::check_positions(&dest, "cdc")
+            .expect("a correct export must not fail validation because a nested leg exists");
+        assert_eq!(
+            got.parts, 1,
+            "only THIS prefix's manifest may be adopted; counting the nested leg's \
+             makes validate read parts that were never written here"
+        );
+        assert_eq!(got.rows, 2);
+        assert!(
+            got.violations.is_empty(),
+            "a monotonic single run has no backwards jump: {:?}",
+            got.violations
+        );
     }
 
     #[test]
