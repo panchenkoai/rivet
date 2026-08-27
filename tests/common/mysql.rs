@@ -173,3 +173,30 @@ impl Drop for MysqlGlobal {
         }
     }
 }
+
+/// Seed ONE transaction spanning `ids` — the fixture an oversized-transaction test
+/// needs, and a scenario rather than a `format!` in a test body.
+///
+/// A single `START TRANSACTION … COMMIT`, because the subject is a transaction
+/// LARGER than the in-memory cap: N separate one-row transactions never reach the
+/// cap however many of them there are.
+///
+/// Shaped for [`crate::common::cdc_id_ops`] and for the DuckDB census — `(id, v)`
+/// integers plus a wide `pad`, so a row cap and a BYTE cap are both reachable, and
+/// the source table's row count equals the delivered change count on an
+/// insert-only fixture.
+pub fn seed_one_transaction(
+    c: &mut mysql::PooledConn,
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+) {
+    use mysql::prelude::Queryable;
+    c.query_drop("START TRANSACTION").expect("begin");
+    for i in ids {
+        c.query_drop(format!(
+            "INSERT INTO {table} VALUES ({i}, {i}, REPEAT('x', 200))"
+        ))
+        .expect("insert");
+    }
+    c.query_drop("COMMIT").expect("commit");
+}

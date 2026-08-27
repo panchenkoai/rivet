@@ -462,6 +462,58 @@ mod tests {
     }
 }
 
+/// A committed transaction whose tail is on disk, streaming out one row at a time.
+///
+/// Shared by every engine that spills, because the rule it enforces is not
+/// engine-specific: each row of the tail carries the transaction's COMMIT position,
+/// and only the LAST row closes the transaction. Two copies of that rule is one
+/// copy too many — a `committed` flag on the wrong row lets the sink roll,
+/// checkpoint and ack MID-transaction, and a crash before the tail's flush advances
+/// the resume position past the commit.
+///
+/// What differs per engine is only how a record DECODES (raw wire rows for
+/// PostgreSQL, the tagged frame above for MySQL and SQL Server), which is why the
+/// decoder arrives as a closure rather than as a second implementation of this.
+pub(crate) struct SpooledTx {
+    reader: SpillReader,
+    commit: Position,
+    at: usize,
+}
+
+impl SpooledTx {
+    pub(crate) fn new(reader: SpillReader, commit: Position) -> Self {
+        Self {
+            reader,
+            commit,
+            at: 0,
+        }
+    }
+
+    /// Rows still on disk — what tells the caller the tail is not yet finished.
+    pub(crate) fn remaining(&self) -> usize {
+        self.reader.remaining()
+    }
+
+    /// The next row of the tail, decoded and stamped, or `None` once it is done.
+    pub(crate) fn next_event(
+        &mut self,
+        decode: impl FnOnce(&[u8]) -> Result<ChangeEvent>,
+    ) -> Result<Option<ChangeEvent>> {
+        let Some(rec) = self.reader.next_record() else {
+            return Ok(None);
+        };
+        let mut ev = decode(&rec?)?;
+        crate::source::cdc::TxnFramer::close_tail_event(
+            &mut ev,
+            &self.commit,
+            self.at,
+            self.reader.len(),
+        );
+        self.at += 1;
+        Ok(Some(ev))
+    }
+}
+
 // ─── the general fallback encoding ───────────────────────────────────────────
 //
 // PostgreSQL and MongoDB spill the RAW WIRE bytes: the row arrived as text or BSON
@@ -1055,5 +1107,52 @@ mod frame_tests {
             "an unknown op tag must ERROR — a spilled DELETE read as an INSERT \
              would resurrect the row it was deleting"
         );
+    }
+
+    /// A drained tail carries the commit position on every row and `committed` on
+    /// exactly ONE — the last.
+    ///
+    /// This grades `SpooledTx` itself, which the live tests cannot: they count rows,
+    /// and every arrangement of the flag delivers the same rows. What the flag
+    /// decides is when the sink ROLLS — a `committed` on an early row lets it flush,
+    /// checkpoint and ack MID-transaction, and a crash before the rest is written
+    /// advances the resume position past the commit. The rows are all present right
+    /// up until the crash that loses them.
+    ///
+    /// Measured: stamping every tail row committed was unkillable by the live suite.
+    #[test]
+    fn a_drained_tail_closes_on_its_last_row_only() {
+        let d = tempfile::tempdir().expect("dir");
+        // THREE rows: with one, "first" and "last" are the same row; with two, so
+        // are "every" and "the last two".
+        const N: usize = 3;
+        let mut f = SpillFile::create(d.path(), "tail").expect("create");
+        for i in 0..N {
+            let mut e = ev();
+            e.after = Some(vec![RivetValue::Int(i as i64)]);
+            // Poisoned, so the stamp has to CLEAR it rather than merely leave it.
+            e.committed = true;
+            f.push(&encode_event(&e)).expect("push");
+        }
+        let commit = Position(json!({ "lsn": "0/FEED" }));
+        let mut sp = SpooledTx::new(f.into_reader().expect("seal"), commit.clone());
+
+        let mut flags = Vec::new();
+        while let Some(e) = sp.next_event(decode_event).expect("decode") {
+            assert_eq!(
+                e.position.0, commit.0,
+                "every row of a spilled tail carries the transaction's COMMIT \
+                 position — the resume position depends on it"
+            );
+            flags.push(e.committed);
+        }
+        assert_eq!(flags.len(), N, "the whole tail must come back");
+        assert_eq!(
+            flags,
+            vec![false, false, true],
+            "exactly the LAST row closes the transaction; a flag anywhere else \
+             lets the sink roll and ack mid-transaction"
+        );
+        assert_eq!(sp.remaining(), 0);
     }
 }

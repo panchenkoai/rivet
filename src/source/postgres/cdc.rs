@@ -27,7 +27,7 @@ use serde_json::json;
 
 use crate::config::TlsConfig;
 use crate::error::Result;
-use crate::source::cdc::spill::{SpillFile, SpillReader};
+use crate::source::cdc::spill::{SpillFile, SpooledTx};
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
@@ -891,11 +891,7 @@ impl PgChangeStream {
                                 sp.len(),
                                 sp.bytes()
                             );
-                            self.spooled = Some(SpooledTx {
-                                reader: sp.into_reader()?,
-                                commit,
-                                at: 0,
-                            });
+                            self.spooled = Some(SpooledTx::new(sp.into_reader()?, commit));
                             // END the window here. The tail leaves through
                             // `next_change` one row at a time, and a LATER
                             // transaction in this same peek would otherwise reach
@@ -1073,29 +1069,23 @@ impl PgChangeStream {
         let Some(sp) = self.spooled.as_mut() else {
             return Ok(None);
         };
-        let Some(rec) = sp.reader.next_record() else {
-            self.spooled = None;
-            return Ok(None);
-        };
-        let (lsn, data) = decode_wire_row(&rec?)?;
-        let at = sp.at;
-        let total = sp.reader.len();
-        let mut ev = parse_test_decoding(&lsn, &data)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "pg cdc spill: row {at} of a {total}-row spilled transaction decodes \
-                 to no change, though only rows that decoded were spilled. The tail \
-                 and the decoder disagree, and delivering the rest would move the \
-                 transaction's commit boundary onto the wrong row."
-            )
+        let out = sp.next_event(|rec| {
+            let (lsn, data) = decode_wire_row(rec)?;
+            parse_test_decoding(&lsn, &data)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pg cdc spill: a spilled row decodes to no change, though only \
+                     rows that decoded were spilled. The tail and the decoder \
+                     disagree, and delivering the rest would move the transaction's \
+                     commit boundary onto the wrong row."
+                )
+            })
         })?;
-        crate::source::cdc::TxnFramer::close_tail_event(&mut ev, &sp.commit, at, total);
-        sp.at += 1;
-        if sp.at == total {
-            // Last row out — drop the reader now rather than at the next call, so
-            // the file is gone the moment it is no longer needed.
+        if out.is_none() || sp.remaining() == 0 {
+            // Drop the reader as soon as the tail is done, so the file is gone the
+            // moment it is no longer needed rather than at the next call.
             self.spooled = None;
         }
-        Ok(Some(ev))
+        Ok(out)
     }
 
     /// Zero-yield release: called at clean exhaust. A run whose every
@@ -1243,17 +1233,6 @@ fn parse_lsn(lsn: &str) -> Option<u64> {
     let hi = u32::from_str_radix(hi.trim(), 16).ok()?;
     let lo = u32::from_str_radix(lo.trim(), 16).ok()?;
     Some((u64::from(hi) << 32) | u64::from(lo))
-}
-
-/// A committed transaction's tail, still on disk and streaming out one row at a time.
-struct SpooledTx {
-    reader: SpillReader,
-    /// The transaction's COMMIT position — stamped on every row of the tail, exactly
-    /// as [`crate::source::cdc::TxnFramer::close_group`] stamps the unspilled case.
-    commit: Position,
-    /// How many of the tail's rows have been handed out — what decides which one
-    /// carries `committed`.
-    at: usize,
 }
 
 /// Frame one raw `test_decoding` wire row — `(lsn, data)` — as spill bytes.

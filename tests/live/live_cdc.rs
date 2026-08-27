@@ -8642,13 +8642,16 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     c.batch_execute(&transaction_over(&tbl, ROWS + 1..=ROWS + TAIL_TX))
         .unwrap();
 
-    let out_spill = d.path().join("out_spill");
     let out_plain = d.path().join("out_plain");
-    std::fs::create_dir_all(&out_spill).unwrap();
     std::fs::create_dir_all(&out_plain).unwrap();
 
     // Leg A — the cap is crossed at row CAP, so rows CAP..ROWS go to disk.
-    let spill_rig = Rig::pg_cdc(&tbl, &slot_spill).dest_path(out_spill.clone());
+    //
+    // `census_oracle()` owns the workdir, the destination AND the config placement:
+    // the state DB lives beside the config and the DuckDB reader works from inside a
+    // container, so hand-building those paths is the smell the rig removes.
+    let spill_rig = Rig::pg_cdc(&tbl, &slot_spill).census_oracle();
+    let out_spill = spill_rig.out_dir();
     let a = spill_rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
     assert!(
         a.status.success(),
@@ -8705,6 +8708,25 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     // Leg B — the same transaction under the default cap: no spill.
     let plain_rig = Rig::pg_cdc(&tbl, &slot_plain).dest_path(out_plain.clone());
     plain_rig.run_ok();
+
+    // THE INDEPENDENT ORACLE — four numbers from one DuckDB session, sharing no
+    // code with rivet: the SOURCE table, the delivered parquet, and rivet's two
+    // ledgers. The fixture is insert-only, so every source row is exactly one
+    // change and the four are comparable. Reading rivet's parquet with rivet's own
+    // reader (below) says the run is self-consistent; only this says it is RIGHT.
+    let census = spill_rig.row_census();
+    assert_eq!(
+        census.source,
+        (ROWS + TAIL_TX) as i64,
+        "the fixture itself must hold what the test thinks it does, or every \
+         comparison below is against the wrong number: {census:?}"
+    );
+    assert!(
+        census.agrees(),
+        "source, delivered parquet, export_metrics and file_log must all agree — \
+         a spilled tail that never reached the destination, or reached it without \
+         being counted, shows up here and nowhere else: {census:?}"
+    );
 
     let spilled = cdc_id_ops(&out_spill);
     let buffered = cdc_id_ops(&out_plain);
@@ -8766,5 +8788,116 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
         leaked.is_empty(),
         "a spill must not outlive the transaction it held — a CDC run leaking one \
          per oversized transaction fills a disk on a scheduler: {leaked:?}"
+    );
+}
+
+// ─── MySQL: a transaction larger than the in-memory cap ──────────────────────
+
+/// A MySQL transaction past the memory cap spills through the GENERAL frame and
+/// delivers everything — confirmed by an oracle that shares no code with rivet.
+///
+/// MySQL's crate hands over PARSED events, so unlike PostgreSQL there is no wire to
+/// keep: the tail goes to disk through the tagged frame. That is a second encoding,
+/// and a second encoding is a second thing that can lose a value silently — which
+/// is why the oracle here is not rivet reading its own parquet back.
+///
+/// Four numbers from one DuckDB session: the SOURCE table, the delivered parquet,
+/// `export_metrics.total_rows`, and `file_log.row_count`. An insert-only fixture
+/// makes them comparable — every source row is exactly one change — so all four
+/// agreeing means the spilled tail reached the destination and rivet's own ledgers
+/// know it. Counting rivet's parquet with rivet's reader could not say that.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW + REPLICATION grant)"]
+fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
+    const ROWS: usize = 400;
+    const CAP: usize = 50;
+    /// The transaction that FOLLOWS the spilled one — with only one transaction,
+    /// draining a tail and ending the stream are indistinguishable.
+    const TAIL_TX: usize = 3;
+
+    let tbl = unique_name("cdc_spill_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} {ONE_TRANSACTION_DDL}"))
+        .unwrap();
+    let _t = Table(tbl.clone());
+
+    // `census_oracle()` owns the workdir, the destination AND the config placement:
+    // the state DB lives beside the config and the oracle reads from inside a
+    // container, so hand-building those paths is the smell the rig removes.
+    let rig = Rig::mysql_cdc(&tbl).census_oracle();
+    let ckpt = rig.checkpoint();
+    // Anchor FIRST, so the stream starts here and drains only what follows.
+    write_checkpoint(&mut c, &ckpt);
+    seed_one_transaction(&mut c, &tbl, 1..=ROWS);
+    seed_one_transaction(&mut c, &tbl, ROWS + 1..=ROWS + TAIL_TX);
+
+    let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
+    assert!(
+        out.status.success(),
+        "a transaction past the cap must SPILL, not fail the run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // The fixture is not inert, and memory really was bounded. Rows alone cannot
+    // see this: a spill that quietly keeps buffering delivers identical rows.
+    let split = log
+        .split("delivered ")
+        .filter_map(|s| s.split_once(" rows from memory and "))
+        .find_map(|(head, rest)| {
+            let tail = rest.split_once(" from disk")?.0;
+            Some((
+                head.trim().parse::<usize>().ok()?,
+                tail.trim().parse::<usize>().ok()?,
+            ))
+        });
+    let (from_memory, from_disk) =
+        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log}"));
+    assert_eq!(
+        from_memory + from_disk,
+        ROWS,
+        "the two segments must account for the WHOLE transaction — a row in \
+         neither is a row nobody would miss. stderr: {log}"
+    );
+    // CAP + 1: the cap is checked after the row is pushed, so the head holds one
+    // row more than the cap before the spill opens.
+    assert_eq!(
+        from_memory,
+        CAP + 1,
+        "memory must stop at the cap — that is the point of spilling, and a head \
+         larger than the cap means the ceiling is not enforced. stderr: {log}"
+    );
+
+    // THE INDEPENDENT ORACLE. Not rivet's verdict, not rivet's reader.
+    let census = rig.row_census();
+    assert_eq!(
+        census.source,
+        (ROWS + TAIL_TX) as i64,
+        "the fixture itself must hold what the test thinks it does, or every \
+         comparison below is against the wrong number: {census:?}"
+    );
+    assert!(
+        census.agrees(),
+        "source, delivered parquet, export_metrics and file_log must all agree — \
+         a spilled tail that never reached the destination, or reached it without \
+         being counted, shows up here and nowhere else: {census:?}"
+    );
+
+    // Exactly once, and in order: the head comes from memory and the tail from
+    // disk, and a row delivered by both paths is a duplicate no count check sees.
+    let changes = cdc_id_ops(&rig.out_dir());
+    let mut ids: Vec<i64> = changes.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        ROWS + TAIL_TX,
+        "every id exactly once across the memory head and the disk tail"
+    );
+    assert_eq!(
+        changes.last().map(|(id, _)| *id),
+        Some((ROWS + TAIL_TX) as i64),
+        "the transaction AFTER the spilled one must still arrive, and arrive last"
     );
 }
