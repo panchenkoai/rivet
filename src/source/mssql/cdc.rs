@@ -561,7 +561,7 @@ pub(crate) struct MssqlChangeStream {
     /// Where an oversized poll batch's tail goes. SQL Server's "stream" is a query
     /// result set — there is no wire to keep — so the tail is written through the
     /// general tagged frame, like MySQL's.
-    spill_dir: std::path::PathBuf,
+    spill_dir: Option<std::path::PathBuf>,
     /// A spilled batch tail, still being handed out. GROUP-aware: unlike PostgreSQL
     /// and MySQL, one buffer here holds SEVERAL transactions (runs of rows sharing
     /// `__$start_lsn`), so the boundary is only visible by comparing neighbours.
@@ -758,7 +758,7 @@ impl MssqlChangeStream {
         // Where an oversized batch's tail spills — the checkpoint's directory. See
         // `spill_dir_for`; `open` keeps the `.rivet/spill` fallback for the CLI and
         // test paths that have no checkpoint.
-        spill_dir: std::path::PathBuf,
+        spill_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -911,8 +911,16 @@ impl MssqlChangeStream {
             // the tail goes to disk, and every transaction is still delivered whole
             // and atomically. Unlike the other engines this buffer holds SEVERAL
             // transactions, so the tail is group-aware (`SpooledGroups`).
-            if crate::source::cdc::check_tx_buffer_caps("mssql", batch.len(), batch_bytes).is_err()
+            if let Err(cap_error) =
+                crate::source::cdc::check_tx_buffer_caps("mssql", batch.len(), batch_bytes)
             {
+                // No spill directory named ⇒ the cap keeps its original meaning:
+                // REFUSE. Spilling does not bound memory end to end (see
+                // `spill_dir_for`), so it must not silently replace a guard that
+                // does refuse.
+                let Some(dir) = self.spill_dir.clone() else {
+                    return Err(cap_error);
+                };
                 log::warn!(
                     "sqlserver cdc: poll batch at {lsn} passed the in-memory cap at \
                      {} rows / {batch_bytes} bytes — spilling the rest to {} rather \
@@ -923,10 +931,10 @@ impl MssqlChangeStream {
                      falls only modestly — measured ~11% on a 100k-row transaction, \
                      not to the cap.",
                     batch.len(),
-                    self.spill_dir.display()
+                    dir.display()
                 );
                 spill = Some(crate::source::cdc::spill::SpillFile::create(
-                    &self.spill_dir,
+                    &dir,
                     "mssql-batch",
                 )?);
             }

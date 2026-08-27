@@ -177,9 +177,10 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
 
     let peak = peak_child_rss_bytes();
     println!(
-        "soak/{engine}: {expected} rows over {} cycles, cap {}, tx {} | peak child \
-         RSS \
+        "soak/{engine}[{}]: {expected} rows over {} cycles, cap {}, tx {} | peak \
+         child RSS \
          {:.1} MB (was {:.1} MB before) | census {census:?}",
+        rivet_bin_label(),
         soak_cycles(),
         cap(),
         if tx_rows() == usize::MAX {
@@ -216,7 +217,13 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
 /// report a byte-cap soak that never crossed a byte threshold.
 fn run_cycle(rig: &Rig) -> std::process::Output {
     let rows_cap = cap().to_string();
-    let mut envs: Vec<(&str, &str)> = vec![("RIVET_CDC_MAX_TX_ROWS", &rows_cap)];
+    // Spilling is OPT-IN (see `spill_dir_for`): with no directory named, the cap
+    // keeps its original meaning and REFUSES. A soak that forgot this would exercise the
+    // refusal path and call it a spill.
+    let mut envs: Vec<(&str, &str)> = vec![
+        ("RIVET_CDC_MAX_TX_ROWS", &rows_cap),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+    ];
     let bytes_cap;
     if let Some(b) = byte_cap() {
         bytes_cap = b.to_string();

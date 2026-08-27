@@ -9,6 +9,54 @@ use std::process::{Command, Output};
 /// Absolute path to the `rivet` binary built for this integration test.
 pub const RIVET_BIN: &str = env!("CARGO_BIN_EXE_rivet");
 
+/// The binary the tests actually run — `RIVET_BIN`, unless `RIVET_BIN_OVERRIDE`
+/// names another one.
+///
+/// Exists for exactly one job: measuring the CURRENT tree against a PREVIOUS
+/// RELEASE. The comparison has to run the same fixture through both, and a release
+/// binary cannot be reached through `CARGO_BIN_EXE_rivet`, which cargo fixes at
+/// compile time. Downloading the published artifact (never rebuilding the parent —
+/// the release profile is fat-LTO and each build is minutes) is the documented way
+/// to get the other side.
+///
+/// LOUD by construction: an override that a later run forgets about would grade the
+/// wrong binary while every signal says the tests passed, which is the staleness
+/// class this repo has already paid for twice. So it announces itself on stderr the
+/// first time it is read, and [`rivet_bin_label`] puts the version into the
+/// measurement's own output — the place a reader is actually looking.
+pub fn rivet_bin() -> &'static str {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| match std::env::var("RIVET_BIN_OVERRIDE") {
+        Ok(p) if !p.is_empty() => {
+            assert!(
+                std::path::Path::new(&p).is_file(),
+                "RIVET_BIN_OVERRIDE={p} is not a file — a typo here silently grades \
+                 the wrong binary, so it is refused rather than ignored"
+            );
+            eprintln!("NOTE: RIVET_BIN_OVERRIDE is set — running {p}, NOT this tree's build");
+            p
+        }
+        _ => RIVET_BIN.to_string(),
+    })
+}
+
+/// `rivet --version` of whatever [`rivet_bin`] resolved to, for a measurement to
+/// print. A number without the binary that produced it is not a comparison.
+pub fn rivet_bin_label() -> String {
+    let v = Command::new(rivet_bin())
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let v = v.trim().to_string();
+    if std::env::var("RIVET_BIN_OVERRIDE").is_ok_and(|p| !p.is_empty()) {
+        format!("{v} (override)")
+    } else {
+        format!("{v} (this tree)")
+    }
+}
+
 /// Absolute path to the `rivet-mcp` binary built for this integration test.
 pub const RIVET_MCP_BIN: &str = env!("CARGO_BIN_EXE_rivet-mcp");
 
@@ -24,7 +72,7 @@ pub fn write_config(tmpdir: &tempfile::TempDir, yaml: &str) -> PathBuf {
 /// cannot be spawned (which indicates a build-time problem, not a test
 /// failure).
 pub fn run_rivet(args: &[&str]) -> Output {
-    Command::new(RIVET_BIN)
+    Command::new(rivet_bin())
         .args(args)
         .output()
         .expect("spawn rivet binary")
@@ -32,7 +80,7 @@ pub fn run_rivet(args: &[&str]) -> Output {
 
 /// `run_rivet` with extra environment variables (fault hooks, log levels).
 pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(RIVET_BIN);
+    let mut cmd = Command::new(rivet_bin());
     cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -51,7 +99,7 @@ pub fn run_rivet_bounded(
     timeout: std::time::Duration,
 ) -> Option<std::time::Duration> {
     let start = std::time::Instant::now();
-    let mut child = Command::new(RIVET_BIN)
+    let mut child = Command::new(rivet_bin())
         .args(["run", "--config", cfg.to_str().unwrap()])
         .spawn()
         .expect("spawn rivet binary");
@@ -73,7 +121,7 @@ pub fn run_rivet_bounded(
 /// visible in stderr.  Use this when a test needs to assert on warning messages
 /// emitted via the log crate (plan validation warnings, quality warnings, etc.).
 pub fn run_rivet_with_warn_log(args: &[&str]) -> Output {
-    Command::new(RIVET_BIN)
+    Command::new(rivet_bin())
         .args(args)
         .env("RUST_LOG", "warn")
         .output()
@@ -122,7 +170,7 @@ pub fn run_rivet_args_bounded_env(
     let path = dir.path().join("stdout");
     let stdout = std::fs::File::create(&path).expect("stdout capture file");
     let start = std::time::Instant::now();
-    let mut cmd = Command::new(RIVET_BIN);
+    let mut cmd = Command::new(rivet_bin());
     cmd.args(args).stdout(stdout);
     for (k, v) in envs {
         cmd.env(k, v);

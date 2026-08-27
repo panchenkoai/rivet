@@ -40,10 +40,22 @@ use value::RivetValue;
 ///
 /// `Ok(())` while the transaction still fits.
 pub(crate) fn check_tx_buffer_caps(engine: &str, rows: usize, bytes: usize) -> Result<()> {
+    // WHAT the buffer holds differs by engine, and the message must say the true
+    // one. PostgreSQL and MySQL buffer exactly one transaction; SQL Server's poll
+    // reads a BATCH — several runs of rows sharing a `__$start_lsn` — so telling its
+    // operator "a single transaction has more than N rows" sends them looking for a
+    // huge transaction that may not exist. Unifying the three engines' backstops
+    // into one home (511ead5) collapsed this distinction and made the SQL Server
+    // message untrue; a claim in a product message is a testable claim.
+    let subject = if engine == "mssql" {
+        "one poll batch (one or more transactions)"
+    } else {
+        "a single transaction"
+    };
     let row_cap = max_tx_rows();
     if rows > row_cap {
         anyhow::bail!(
-            "{engine} cdc: a single transaction has more than {row_cap} rows — it must be \
+            "{engine} cdc: {subject} has more than {row_cap} rows — it must be \
              buffered whole (a transaction is never split across parts, which is what \
              makes a crash resume transaction-atomic), so this would exhaust memory. \
              Split the source transaction, or raise RIVET_CDC_MAX_TX_ROWS only if a \
@@ -53,7 +65,7 @@ pub(crate) fn check_tx_buffer_caps(engine: &str, rows: usize, bytes: usize) -> R
     let byte_cap = max_tx_bytes();
     if bytes > byte_cap {
         anyhow::bail!(
-            "{engine} cdc: a single transaction has more than {byte_cap} bytes (large \
+            "{engine} cdc: {subject} has more than {byte_cap} bytes (large \
              cells) — it must be buffered whole, so this would exhaust memory. The ROW \
              count is a poor bound here: a few multi-hundred-MB values stay far under \
              the row cap. Split the source transaction, or raise \
@@ -1060,35 +1072,48 @@ pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: Post
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
 pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) — see the 'MongoDB — change streams' section of docs/reference/cdc.md";
 
-/// Where an oversized transaction spills.
+/// Where an oversized transaction spills — `None` unless the operator named a
+/// directory in `RIVET_CDC_SPILL_DIR`.
 ///
-/// The checkpoint's directory when there is one — somewhere the OPERATOR chose and
-/// keeps rivet's state — and `.rivet/spill` otherwise, which is the directory rivet
-/// already writes `.rivet/runs/<id>/summary.json` into beside the config. Neither is
-/// the system temp: a CDC spill can be gigabytes and a tmpfs takes down more than
-/// rivet.
+/// OPT-IN, and the reason is a measurement rather than caution. Spilling was built
+/// to replace the cap's refusal ("a transaction past the cap fails the run") with
+/// something better. It is not better yet: the sink cannot roll a part
+/// mid-transaction (`RolloverPolicy::should_roll` requires `committed`, the
+/// invariant that makes crash resume transaction-atomic), so it holds the whole
+/// transaction whatever the adapter does. Measured on a 100k-row transaction: 202 MB
+/// with spilling, 226 MB without — ~11%, not a ceiling.
 ///
-/// It always resolves to SOMETHING, and an earlier cut that returned `None` without a
-/// checkpoint was wrong on the engine that needs this most: PostgreSQL CDC is
-/// slot-anchored, so a checkpoint is optional there and most PG configs (and the
-/// test rig's own `pg_cdc`) carry none. The spill would have been unavailable exactly
-/// where transactions are largest.
+/// So spilling ON BY DEFAULT would trade a guard that works for a mitigation that
+/// mostly does not: the run stops failing loudly and proceeds toward the same OOM,
+/// now with a false sense of protection. Four live tests
+/// (`roast_*_oversized_transaction_bails_loud_not_oom`,
+/// `cdc_oversized_transaction_by_bytes_bails_loudly`) pin that guard on three
+/// engines and are the only reason this was caught.
 ///
-/// A `None` return would not have been the safe choice either. This is only ever
-/// consulted on a transaction that has ALREADY passed the memory cap — the case that
-/// used to fail the run outright — so an unwritable directory fails it the same way,
-/// with a clearer message. There is nothing to be conservative about.
-///
-/// Its own subdirectory, so a leaked spill cannot be mistaken for state and a stray
-/// `.bin` never lands next to the checkpoint a resume reads.
-pub(crate) fn spill_dir_for(checkpoint: Option<&std::path::Path>) -> std::path::PathBuf {
-    // A bare filename (`cdc.json`) has an EMPTY parent, not a missing one — joining
-    // onto it would build a RELATIVE `.rivet-spill`, which is the right answer but
-    // only by accident; say it.
-    match checkpoint.and_then(std::path::Path::parent) {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(".rivet-spill"),
-        _ => std::path::Path::new(".rivet").join("spill"),
+/// Naming the directory is also the honest way to ask: a CDC spill can be gigabytes,
+/// and writing them into `.rivet/spill` because rivet felt like it is not a decision
+/// rivet gets to make. When the SINK learns to spill too, this becomes a default
+/// worth arguing for — and the soak stand's 202-vs-226 gap is where that argument
+/// will be settled.
+pub(crate) fn spill_dir_for(checkpoint: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let named = std::env::var("RIVET_CDC_SPILL_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    if named == "1" || named.eq_ignore_ascii_case("true") {
+        // A truthy value means "spill, you pick where": beside the CHECKPOINT, which
+        // is a directory the operator already chose and sized for rivet's state, and
+        // `.rivet/spill` when there is none. Never the system temp — a CDC spill can
+        // be gigabytes and a tmpfs takes down more than rivet.
+        //
+        // A bare filename (`cdc.json`) has an EMPTY parent, not a missing one —
+        // joining onto it would build a RELATIVE path, which is the right answer but
+        // only by accident; say it.
+        return Some(match checkpoint.and_then(std::path::Path::parent) {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(".rivet-spill"),
+            _ => std::path::Path::new(".rivet").join("spill"),
+        });
     }
+    Some(std::path::PathBuf::from(named))
 }
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
@@ -1173,7 +1198,7 @@ pub(crate) fn create_change_stream(
                     peek,
                     cfg.drain,
                     configured_tables,
-                    Some(spill_dir_for(cfg.checkpoint.as_deref()).as_path()),
+                    spill_dir_for(cfg.checkpoint.as_deref()).as_deref(),
                 )
                 .map_err(|e| with_setup_hint(e, PG_CDC_HINT))?,
             ))
@@ -2423,38 +2448,84 @@ mod tests {
             .expect("--max-events 0 must be a clean no-op");
     }
 
-    /// The spill lands beside the CHECKPOINT, or in the directory rivet already
-    /// keeps run state in — never the system temp, and never nowhere.
+    /// Spilling is OPT-IN, and where it lands follows what the operator named.
     ///
-    /// The "nowhere" case is the one that was wrong first: returning `None` without
-    /// a checkpoint disabled spilling on PostgreSQL, which is slot-anchored and
-    /// usually configured without one — the engine whose transactions are largest.
+    /// The default is `None`, which is the whole point: with no directory named the
+    /// cap keeps its original meaning and REFUSES an oversized transaction. Spilling
+    /// on by default would replace a guard that works with a mitigation that mostly
+    /// does not — measured at ~11%, because the sink holds the transaction whatever
+    /// the adapter does. Four live tests pin that refusal on three engines and are
+    /// the only reason this was caught.
     #[test]
-    fn a_spill_goes_beside_the_checkpoint_or_beside_the_run_state() {
+    fn spilling_is_off_until_a_directory_is_named() {
         use std::path::Path;
+        let guard = EnvGuard::unset("RIVET_CDC_SPILL_DIR");
         assert_eq!(
             spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
-            Path::new("/var/lib/rivet/.rivet-spill"),
-            "the operator already chose a directory sized for rivet's state"
+            None,
+            "with nothing named, an oversized transaction must still FAIL — a \
+             silent spill would remove the OOM guard and say nothing"
         );
-        // A BARE filename has an empty parent, not a missing one.
+
+        // A truthy value: rivet picks, beside the checkpoint the operator chose.
+        guard.set("1");
+        assert_eq!(
+            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
+            Some(Path::new("/var/lib/rivet/.rivet-spill").to_path_buf()),
+        );
+        // A bare filename has an EMPTY parent, not a missing one.
         assert_eq!(
             spill_dir_for(Some(Path::new("cdc.json"))),
-            Path::new(".rivet/spill"),
+            Some(Path::new(".rivet/spill").to_path_buf()),
             "an empty parent is not a directory — fall back rather than build a \
              path that is relative by accident"
         );
         assert_eq!(
             spill_dir_for(None),
-            Path::new(".rivet/spill"),
-            "no checkpoint is the COMMON PostgreSQL shape (slot-anchored), not an \
-             exotic one — it must still get a directory, and `.rivet/` is where \
-             rivet already writes run summaries beside the config"
+            Some(Path::new(".rivet/spill").to_path_buf()),
+            "PostgreSQL CDC is slot-anchored and usually has no checkpoint, so the \
+             engine whose transactions are largest must still get a directory"
         );
         assert!(
-            !spill_dir_for(None).starts_with(std::env::temp_dir()),
+            !spill_dir_for(None)
+                .expect("named")
+                .starts_with(std::env::temp_dir()),
             "never the system temp: a CDC spill can be gigabytes and a tmpfs takes \
              down more than rivet"
         );
+
+        // An explicit path is used verbatim.
+        guard.set("/mnt/big/spill");
+        assert_eq!(
+            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
+            Some(Path::new("/mnt/big/spill").to_path_buf()),
+            "a named directory wins over any default — that is the point of naming it"
+        );
+    }
+
+    /// Save/restore one env var around a test that must read it.
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let prior = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self { key, prior }
+        }
+        fn set(&self, v: &str) {
+            unsafe { std::env::set_var(self.key, v) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }

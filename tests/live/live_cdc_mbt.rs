@@ -1391,8 +1391,17 @@ fn roast_mysql_cdc_oversized_transaction_bails_loud_not_oom() {
     );
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("more than 10 rows") && err.contains("buffer unbounded"),
-        "the failure must name the cap and the refuse-to-buffer-unbounded reason — got:\n{err}"
+        // The message's LOAD-BEARING parts, not an incidental phrase: which cap was
+        // hit, why the transaction cannot simply be split across parts, and what the
+        // operator can do. An earlier version asserted the words "buffer unbounded",
+        // which the message stopped containing when the three engines' backstops
+        // were unified into one home (511ead5) — the test then pinned a sentence
+        // nothing produced, and nobody ran it. Assert the CLAIMS, not the wording.
+        err.contains("more than 10 rows")
+            && err.contains("buffered whole")
+            && err.contains("RIVET_CDC_MAX_TX_ROWS"),
+        "the failure must name the cap, why the transaction is buffered whole, and \
+         the way out — got:\n{err}"
     );
 }
 
@@ -1432,8 +1441,15 @@ fn roast_mssql_cdc_oversized_transaction_bails_loud_not_oom() {
     );
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
-        err.contains("more than 10 change rows") && err.contains("buffered whole"),
-        "the failure must name the cap and the never-split-a-transaction reason — got:\n{err}"
+        // SQL Server's buffer is a poll BATCH, not one transaction, and the message
+        // must say so: an operator told "a single transaction" would go looking for a
+        // huge transaction that need not exist. Asserted here because that wording is
+        // what makes the message actionable on THIS engine.
+        err.contains("more than 10 rows")
+            && err.contains("one poll batch")
+            && err.contains("buffered whole"),
+        "the failure must name the cap, WHAT is buffered on this engine, and the \
+         never-split-a-transaction reason — got:\n{err}"
     );
 }
 

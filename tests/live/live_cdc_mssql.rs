@@ -2482,7 +2482,13 @@ fn mssql_cdc_a_batch_past_the_memory_cap_spills_rather_than_failing() {
     mssql_seed_one_transaction(&table, ROWS + 1..=ROWS + TAIL_TX);
     wait_for_capture(&ci, (ROWS + TAIL_TX) as i64);
 
-    let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
+    // Spilling is OPT-IN (`spill_dir_for`): with no directory named, the cap keeps
+    // its original meaning and REFUSES the transaction. Without this the test would
+    // exercise the refusal path and read it as a spill that produced no rows.
+    let out = rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string()),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+    ]);
     assert!(
         out.status.success(),
         "a batch past the cap must SPILL, not fail the run: {}",

@@ -58,7 +58,7 @@ pub(crate) struct MysqlChangeStream {
     /// Where an oversized transaction's tail goes. MySQL's crate hands over PARSED
     /// events — there is no wire to keep — so the tail is written through the
     /// general tagged frame rather than PostgreSQL's raw rows.
-    spill_dir: std::path::PathBuf,
+    spill_dir: Option<std::path::PathBuf>,
     /// The in-flight transaction's tail, once it has outgrown the memory cap.
     ///
     /// A FIELD, not a local: a MySQL transaction spans many `fill` calls (one per
@@ -825,12 +825,20 @@ impl MysqlChangeStream {
     /// always resolves — this is only ever reached on a transaction that would
     /// previously have failed the run outright.
     fn open_spill_if_past_cap(&mut self, log_pos: u64) -> Result<()> {
-        if self.spill.is_some()
-            || crate::source::cdc::check_tx_buffer_caps("mysql", self.tx.len(), self.tx_bytes)
-                .is_ok()
-        {
+        if self.spill.is_some() {
             return Ok(());
         }
+        let Err(cap_error) =
+            crate::source::cdc::check_tx_buffer_caps("mysql", self.tx.len(), self.tx_bytes)
+        else {
+            return Ok(());
+        };
+        // No spill directory named ⇒ the cap keeps its original meaning: REFUSE.
+        // See `spill_dir_for` — spilling does not bound memory end to end, so it
+        // must not silently replace a guard that does refuse.
+        let Some(dir) = self.spill_dir.clone() else {
+            return Err(cap_error);
+        };
         log::warn!(
             "mysql cdc: transaction at {}:{log_pos} passed the in-memory cap at {} \
              rows / {} bytes — spilling the rest to {} rather than failing the run, \
@@ -842,11 +850,10 @@ impl MysqlChangeStream {
             self.file,
             self.tx.len(),
             self.tx_bytes,
-            self.spill_dir.display()
+            dir.display()
         );
         self.spill = Some(crate::source::cdc::spill::SpillFile::create(
-            &self.spill_dir,
-            "mysql-tx",
+            &dir, "mysql-tx",
         )?);
         Ok(())
     }

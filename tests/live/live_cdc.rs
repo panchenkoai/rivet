@@ -8652,7 +8652,13 @@ fn pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     // container, so hand-building those paths is the smell the rig removes.
     let spill_rig = Rig::pg_cdc(&tbl, &slot_spill).census_oracle();
     let out_spill = spill_rig.out_dir();
-    let a = spill_rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
+    // Spilling is OPT-IN (`spill_dir_for`): with no directory named, the cap keeps
+    // its original meaning and REFUSES the transaction. Without this the test would
+    // exercise the refusal path and read it as a spill that produced no rows.
+    let a = spill_rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string()),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+    ]);
     assert!(
         a.status.success(),
         "a transaction past the cap must SPILL, not fail the run: {}",
@@ -8832,7 +8838,13 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     mysql_seed_one_transaction(&mut c, &tbl, 1..=ROWS);
     mysql_seed_one_transaction(&mut c, &tbl, ROWS + 1..=ROWS + TAIL_TX);
 
-    let out = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string());
+    // Spilling is OPT-IN (`spill_dir_for`): with no directory named, the cap keeps
+    // its original meaning and REFUSES the transaction. Without this the test would
+    // exercise the refusal path and read it as a spill that produced no rows.
+    let out = rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string()),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+    ]);
     assert!(
         out.status.success(),
         "a transaction past the cap must SPILL, not fail the run: {}",
