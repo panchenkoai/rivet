@@ -47,6 +47,76 @@ pub(crate) struct SpillFile {
     bytes: u64,
 }
 
+/// The pid a spill file's name carries, if it is one of ours.
+///
+/// The label can itself hold dashes (`pg-tx`, `mssql-batch`), so the pid is the
+/// segment between the LAST dash and the extension — not the third field.
+pub(crate) fn spill_file_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("rivet-spill-")?
+        .strip_suffix(".bin")?
+        .rsplit_once('-')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// Remove spill files left behind by a process that is no longer running.
+///
+/// `Drop` does not run on SIGKILL, so a hard-killed rivet leaves its spill on disk —
+/// one per oversized transaction, which fills a disk on a scheduler. The name
+/// carries the writer's pid, and pid LIVENESS is the authoritative, clock-free
+/// discriminator: the spill directory is local, so the pid is local too.
+///
+/// Deliberately one-directional about doubt. A pid number can be REUSED by an
+/// unrelated process, and in that case this spares a file that is genuinely dead —
+/// wasted disk, which a later sweep under a different pid landscape reclaims.
+/// Deleting a file a LIVE writer is still appending to would tear a transaction in
+/// half. Same rule as the orphan GC: gate the ambiguous case on a lifecycle signal,
+/// and where it is unclear, spare.
+pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) -> bool) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return; // no directory yet is not an error — there is nothing to sweep
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        let Some(pid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(spill_file_pid)
+        else {
+            continue; // not ours; never touch a file we did not name
+        };
+        if is_alive(pid) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("cdc spill: removed an orphan left by pid {pid}"),
+            // Best effort: a sweep that failed a run would turn tidy-up into an
+            // outage, and a file it could not remove costs disk, not correctness.
+            Err(err) => log::debug!("cdc spill: could not remove {}: {err}", path.display()),
+        }
+    }
+}
+
+/// Whether a local process is running.
+///
+/// `kill(pid, 0)` sends no signal and reports reachability. `EPERM` means the
+/// process EXISTS and is not ours, which is still alive — reading it as dead would
+/// delete another user's in-flight spill.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// No portable liveness probe off unix, and a wrong answer here DELETES data, so
+/// the answer is "alive" — the sweep does nothing rather than guessing. A leaked
+/// spill costs disk; a deleted live one tears a transaction.
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
 impl SpillFile {
     /// Create one in `dir`, named for the caller so a leaked file says who left it.
     ///
@@ -56,6 +126,10 @@ impl SpillFile {
     /// is sized for the data.
     pub(crate) fn create(dir: &std::path::Path, label: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        // Once per process, at the first spill: a hard-killed predecessor cannot
+        // have cleaned up after itself, and nothing else ever will.
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(|| sweep_dead_spills(dir, pid_is_alive));
         let path = dir.join(format!("rivet-spill-{label}-{}.bin", std::process::id()));
         // read+write, not `File::create`: `drain` rewinds and reads the same
         // handle back, and a write-only descriptor fails there with `Bad file
@@ -373,6 +447,69 @@ mod tests {
             text.contains("truncated"),
             "the error must name the cause — a short read here is a torn \
              transaction, and the caller has to know that is what happened: {text}"
+        );
+    }
+
+    /// A dead writer's spill is collected; a LIVE one's is spared; anything rivet
+    /// did not name is untouched.
+    ///
+    /// The liveness probe arrives as a parameter so all three arms are reachable
+    /// offline — a test using the real `kill(pid, 0)` could assert the live arm (its
+    /// own pid) and would have to GUESS a dead one, which is exactly the pid reuse
+    /// this is careful about.
+    #[test]
+    fn a_sweep_collects_dead_spills_and_spares_live_ones() {
+        let d = dir();
+        let live = d.path().join("rivet-spill-pg-tx-111.bin");
+        let dead = d.path().join("rivet-spill-mssql-batch-222.bin");
+        let foreign = d.path().join("some-other-tool.bin");
+        for f in [&live, &dead, &foreign] {
+            std::fs::write(f, b"x").expect("stage");
+        }
+        sweep_dead_spills(d.path(), |pid| pid == 111);
+        assert!(
+            live.exists(),
+            "a spill whose writer is still running must be SPARED — deleting one \
+             mid-append tears the transaction it holds"
+        );
+        assert!(
+            !dead.exists(),
+            "a spill whose writer is gone is an orphan: Drop cannot run on SIGKILL, \
+             so nothing else will ever remove it"
+        );
+        assert!(
+            foreign.exists(),
+            "a file rivet did not name is not rivet's to delete"
+        );
+    }
+
+    /// The pid comes from the LAST dash, because labels hold dashes too.
+    #[test]
+    fn a_spill_name_yields_the_writer_pid() {
+        assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.bin"), Some(4242));
+        assert_eq!(
+            spill_file_pid("rivet-spill-mssql-batch-7.bin"),
+            Some(7),
+            "the label itself holds dashes, so the pid is not the third field"
+        );
+        assert_eq!(spill_file_pid("some-other-tool-9.bin"), None);
+        assert_eq!(spill_file_pid("rivet-spill-pg-tx-.bin"), None);
+        assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.txt"), None);
+    }
+
+    /// A LIVE process really is reported alive by the PRODUCTION probe.
+    ///
+    /// The arms above use an injected probe, which grades the sweep and says nothing
+    /// about `kill(pid, 0)` itself — and that is the half where a wrong answer
+    /// DELETES data. This pins the direction that matters, with the one pid the test
+    /// can be certain about: its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_liveness_probe_reports_this_process_alive() {
+        assert!(
+            pid_is_alive(std::process::id()),
+            "if the probe cannot see its own process, the sweep deletes every spill \
+             it finds, including one being written right now"
         );
     }
 
