@@ -93,6 +93,22 @@ pub(crate) enum Message {
     Truncate {
         relation_ids: Vec<u32>,
     },
+    /// A logical message — `pg_logical_emit_message()`. rivet uses one as a
+    /// BARRIER: emit a nonce, drain until it comes back, and everything before it
+    /// provably committed before rivet asked. That is an exact boundary where
+    /// `pg_current_wal_lsn()` gives an approximate one.
+    ///
+    /// It arrives ONLY when the slot is read with `messages=true` AND
+    /// `binary=true` — MEASURED twice, on the fixture and on an isolated probe:
+    /// with `messages=true, binary=false` the tag is simply absent. (`test_decoding`
+    /// renders it either way, so this is specific to pgoutput's text mode.) A reader
+    /// that emits a barrier and omits either option waits for something that will
+    /// never come, so all three belong together or none of them does.
+    Logical {
+        transactional: bool,
+        prefix: String,
+        content: Vec<u8>,
+    },
     /// `O`rigin, `Y` type, and the streaming variants. Named rather than dropped so
     /// a caller can decide; silently skipping an unknown message is how a protocol
     /// bump becomes a silent gap.
@@ -279,6 +295,17 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message> {
             }
             Message::Truncate { relation_ids }
         }
+        b'M' => {
+            let transactional = r.u8()? != 0;
+            let _lsn = r.u64()?;
+            let prefix = r.cstr()?;
+            let len = r.u32()? as usize;
+            Message::Logical {
+                transactional,
+                prefix,
+                content: r.take(len)?.to_vec(),
+            }
+        }
         other => Message::Other(other as char),
     })
 }
@@ -442,6 +469,27 @@ fn numeric_text(raw: &[u8]) -> Result<String> {
     } else {
         format!("{neg}{int_part}.{frac}")
     })
+}
+
+/// The prefix rivet stamps on its own logical messages, so a barrier emitted by
+/// something else on the same database is never mistaken for ours.
+pub(crate) const BARRIER_PREFIX: &str = "rivet";
+
+/// Is this message OUR barrier, carrying `nonce`?
+///
+/// Both halves matter and each has been a real bug shape elsewhere in this tree.
+/// The PREFIX stops another tool's logical message ending a rivet drain early — a
+/// slot decodes the whole database, so someone else's marker really can arrive.
+/// The NONCE stops a PREVIOUS run's barrier ending this one: the same config run on
+/// an interval emits a barrier per cycle, and they all share the prefix, so
+/// matching on the prefix alone would let cycle N+1 stop at cycle N's leftover and
+/// report a clean drain over an unread backlog.
+pub(crate) fn is_our_barrier(msg: &Message, nonce: &str) -> bool {
+    matches!(
+        msg,
+        Message::Logical { prefix, content, .. }
+            if prefix == BARRIER_PREFIX && content == nonce.as_bytes()
+    )
 }
 
 /// Fill an UPDATE's unchanged-TOAST cells from the pre-image, where it has them.
@@ -652,7 +700,10 @@ impl Assembler {
                     named.join(", ")
                 )
             }
-            Message::Other(_) => Ok(Vec::new()),
+            // A barrier is not a change. It is also not something to swallow: the
+            // caller decides whether this is ITS nonce, and a reader that dropped
+            // it here would drain past its own boundary.
+            Message::Logical { .. } | Message::Other(_) => Ok(Vec::new()),
         }
     }
 
@@ -1268,6 +1319,89 @@ mod tests {
         assert!(
             text.contains("big") && text.contains("REPLICA IDENTITY FULL"),
             "{text}"
+        );
+    }
+
+    /// The BARRIER: rivet's own logical message, and only rivet's.
+    ///
+    /// `until_current` bounds a drain. Today that bound is a snapshot of
+    /// `pg_current_wal_lsn()` — "everything whose commit LSN is at or below a number
+    /// we read", which is approximate at the edges. A nonce barrier makes it exact:
+    /// emit a message, drain until it comes back, and everything before it provably
+    /// committed before rivet asked.
+    ///
+    /// Both halves of the match are load-bearing, and each is a bug shape this tree
+    /// has seen elsewhere. The PREFIX stops another tool's logical message ending a
+    /// rivet drain early — a slot decodes the whole database, so a foreign marker
+    /// really does arrive. The NONCE stops a PREVIOUS run's barrier ending this one:
+    /// a scheduler emits one per cycle and they all share the prefix, so matching on
+    /// the prefix alone lets cycle N+1 stop at cycle N's leftover and report a clean
+    /// drain over an unread backlog.
+    #[test]
+    fn a_barrier_is_recognised_by_prefix_and_nonce_and_by_nothing_else() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pgoutput/binary_values.hex");
+        let msgs: Vec<Message> = std::fs::read_to_string(&path)
+            .expect("fixture")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let b: Vec<u8> = (0..l.len() / 2)
+                    .map(|i| u8::from_str_radix(&l[i * 2..i * 2 + 2], 16).expect("hex"))
+                    .collect();
+                decode(&b).expect("decode")
+            })
+            .collect();
+
+        let barrier = msgs
+            .iter()
+            .find(|m| matches!(m, Message::Logical { .. }))
+            .expect(
+                "the capture must carry a barrier — it is emitted with \
+                 `messages=true` and `binary=true`, and MEASURED, either option \
+                 missing makes the tag vanish silently",
+            );
+        let Message::Logical {
+            transactional,
+            prefix,
+            content,
+        } = barrier
+        else {
+            unreachable!()
+        };
+        assert!(
+            !transactional,
+            "a barrier is emitted non-transactionally, so it \
+             lands at a definite point rather than at some commit's"
+        );
+        assert_eq!(prefix, BARRIER_PREFIX);
+        assert_eq!(content, b"fixture-barrier-nonce");
+
+        assert!(is_our_barrier(barrier, "fixture-barrier-nonce"));
+        assert!(
+            !is_our_barrier(barrier, "some-other-nonce"),
+            "a PREVIOUS cycle's barrier must not end THIS drain — every cycle shares \
+             the prefix, so the nonce is the only thing separating them"
+        );
+        // A foreign tool's message on the same database.
+        assert!(
+            !is_our_barrier(
+                &Message::Logical {
+                    transactional: false,
+                    prefix: "someone_else".into(),
+                    content: b"fixture-barrier-nonce".to_vec(),
+                },
+                "fixture-barrier-nonce"
+            ),
+            "the slot decodes the WHOLE database; another tool's marker carrying the \
+             same bytes must not end a rivet drain"
+        );
+        // And no ordinary change is ever a barrier.
+        assert!(
+            msgs.iter()
+                .filter(|m| !matches!(m, Message::Logical { .. }))
+                .all(|m| !is_our_barrier(m, "fixture-barrier-nonce")),
+            "only a logical message can be a barrier"
         );
     }
 

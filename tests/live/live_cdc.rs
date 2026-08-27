@@ -7681,9 +7681,16 @@ fn regenerate_the_pgoutput_fixture_from_the_rig_scenarios() {
             c.batch_execute(&format!("TRUNCATE {tbl}"))
                 .expect("re-seed truncate");
         }
+        // A BARRIER, emitted before the read so the capture carries one: rivet uses
+        // a nonce message to bound a drain exactly, and `messages=true` is what
+        // makes it arrive at all — without the option the tag is simply absent
+        // (measured), so a reader that emits a barrier and omits the option waits
+        // forever.
+        c.batch_execute("SELECT pg_logical_emit_message(false, 'rivet', 'fixture-barrier-nonce')")
+            .expect("emit a barrier");
         let sql = format!(
             "SELECT encode(data,'hex') FROM pg_logical_slot_get_binary_changes($1, NULL, NULL, \
-             'proto_version','1','publication_names','{pubn}'{}) ",
+             'proto_version','1','publication_names','{pubn}','messages','true'{}) ",
             if binary { ",'binary','true'" } else { "" }
         );
         let rows = c.query(sql.as_str(), &[&slot]).expect("read the slot");
