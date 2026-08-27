@@ -2727,6 +2727,52 @@ mod tests {
         assert_eq!(after[1], RivetValue::Bytes(b"b".to_vec()));
     }
 
+    /// A pre-image that is ITSELF unchanged-TOAST is not a recovery source.
+    ///
+    /// `recover_unchanged_toast` looks for a pre-image column `pre.name == col.name
+    /// && !pre.toast_unchanged`. The name half was graded; the SECOND half was not,
+    /// and dropping it survives the whole lib suite.
+    ///
+    /// What that costs: when both images carry the marker — which is what
+    /// PostgreSQL emits for a large column that changed in NEITHER the old nor the
+    /// new tuple under FULL — the marker string is copied in as the VALUE,
+    /// `toast_unchanged` is cleared, and the column drops out of `unrecovered`. So
+    /// the parser reports a clean recovery, no poison is raised, and the
+    /// destination receives the literal text `unchanged-toast-datum` where the
+    /// data belongs. That is the exact silent corruption the surrounding code was
+    /// written to remove, reintroduced through the fallback that removes it.
+    #[test]
+    fn a_pre_image_that_is_also_unchanged_toast_cannot_recover_anything() {
+        // BOTH tuples carry the marker for `big`.
+        let line = "table public.t: UPDATE: \
+                    old-key: id[integer]:1 big[text]:unchanged-toast-datum \
+                    new-tuple: id[integer]:1 big[text]:unchanged-toast-datum";
+        let ev = parse_test_decoding("0/ABC", line)
+            .expect("the refusal is deferred, never an immediate bail")
+            .expect("the event is still produced for commit-boundary tracking");
+        let msg = ev.poison.expect(
+            "nothing was recovered, so this column must be POISONED — accepting the \
+             marker from a pre-image that is itself a marker writes the literal \
+             text `unchanged-toast-datum` into the destination and reports success",
+        );
+        assert!(msg.contains("big"), "must name the column, got: {msg}");
+
+        // The value SLOT still carries the marker, and that is correct: the contract
+        // is the deferred poison, not a scrubbed value. Nothing may consume an event
+        // without calling `raise_poison` first (the rule the slot's own docs state),
+        // so the marker is unreachable rather than absent. A first draft of this
+        // test asserted the stronger "the marker never reaches a value slot" and
+        // FAILED against correct code — a test can be wrong about the contract as
+        // easily as the code can be wrong about the world.
+        //
+        // What must hold is that the column is not silently CLEARED of its
+        // unrecovered status, which is what dropping `!pre.toast_unchanged` does.
+        assert!(
+            ev.after.is_some(),
+            "the event is still produced; only its consumption is gated"
+        );
+    }
+
     // The DEFAULT replica-identity case: no pre-image value for the toasted
     // column exists anywhere in the WAL, so the parser must refuse to fabricate
     // the marker as data — but as a DEFERRED `poison`, not an immediate bail. The
