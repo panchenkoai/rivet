@@ -337,8 +337,9 @@ fn cleanup_target<'a>(
                  prefix would remove parts that run has already committed, and on a \
                  CDC/incremental export the source position has advanced past them. Re-run the \
                  load once the extract has finished — or, if this is a DEAD crash remnant \
-                 (no extract is actually running), inspect it with `rivet state runs \
-                 --running` and close it with `rivet state finish-run --run-id <id>`.",
+                 (no extract is actually running), inspect it with `rivet state runs -c \
+                 <config> --running` and close it with `rivet state finish-run -c <config> \
+                 --run-id <id>`.",
                 plan.table, plan.gcs_prefix
             );
             None

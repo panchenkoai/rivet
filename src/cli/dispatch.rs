@@ -815,7 +815,7 @@ fn show_runs(config: &str, running_only: bool, last: usize) -> Result<()> {
         println!(
             "\nA `running` row with NO live extract is a crash remnant: it makes gc spare \
              the prefix and cleanup refuse, forever (supersession needs a newer SUCCESS). \
-             Close one you KNOW is dead with `rivet state finish-run --run-id <id>`."
+             Close one you KNOW is dead with `rivet state finish-run -c <config> --run-id <id>`."
         );
     }
     Ok(())
