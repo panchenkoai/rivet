@@ -825,8 +825,18 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
             # doctor's last line is always the same generic epilogue — 39 gcs cells
             # failed with nothing but "one or more preflight checks failed" in the
             # log, and the [FAIL] line that names the actual check was discarded.
-            for line in (p.out or "").strip().splitlines()[-25:]:
+            # BOTH streams: rivet's doctor prints its [FAIL] lines to stdout and
+            # its final error to stderr, and the first version of this read only
+            # `p.out` — which on this Proc is a property that may not even combine
+            # them. Take the two fields the Proc actually has.
+            for line in ((p.stdout or "") + "\n" + (p.stderr or "")).strip().splitlines()[-25:]:
                 print(f"      | {line}")
+            # …and to a FILE, because the print above has been swallowed twice
+            # (the parallel cell pool's capture) — a diagnosis that depends on
+            # stdout surviving the harness is not a diagnosis.
+            with open("/tmp/oracle-stage-failures.log", "a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {cell.engine} {cell.label} · {st} exit={p.returncode} ===\n")
+                fh.write(f"argv: {' '.join(args)}\n--- stdout ---\n{p.stdout}\n--- stderr ---\n{p.stderr}\n")
             _unreached(led, cell, tag, st)
             return
         # Console-surface: the check verdict block (per engine × store × pipeline).
