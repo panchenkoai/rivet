@@ -238,6 +238,10 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let cdc_cfg = crate::source::cdc::CdcConfig {
         url: url.clone(),
         checkpoint: ckpt.clone(),
+        // The CLI has no config file, so the CWD is the honest anchor here: the
+        // operator typed the command in a shell whose directory they chose. The
+        // config-driven path anchors to the config's directory instead.
+        config_dir: std::path::PathBuf::from("."),
         drain: DrainMode::from_until_current(a.until_current),
         // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
@@ -338,7 +342,13 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             format: fmt,
             max_events: a.max_events,
             rollover: a.rollover,
-            rollover_memory_bytes: None,
+            // The SAME protective default the config path applies — absence must not
+            // mean "no byte budget" on the ad-hoc CLI either: `--rollover` bounds ROWS,
+            // and a wide-row table would buffer unbounded to the row cap. The named
+            // runner-bypass shape, at an entry point instead of a runner.
+            rollover_memory_bytes: Some(
+                crate::pipeline::cdc_job::DEFAULT_CDC_ROLLOVER_MEMORY_BYTES,
+            ),
             run_id: now.clone(),
             started_at: now,
             // The ad-hoc `rivet cdc` subcommand runs without a config, and so

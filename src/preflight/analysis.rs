@@ -431,7 +431,11 @@ pub(crate) fn chunk_sparsity_from_counts(
     max_i: i64,
     chunk_size: usize,
 ) -> ChunkSparsityInfo {
-    let range_span = (max_i - min_i).max(1);
+    // CHECKED: a signed key spanning near the full i64 domain (a hash-distributed
+    // bigint) overflows the plain subtraction — debug panics, release wraps to a
+    // garbage span that then feeds the sparsity math. The sibling estimator in
+    // this file (`check_oversized_chunk`) was hardened the same way.
+    let range_span = max_i.checked_sub(min_i).unwrap_or(i64::MAX).max(1);
     let density = row_count as f64 / range_span as f64;
     let logical_windows = if chunk_size == 0 {
         0

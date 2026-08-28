@@ -81,6 +81,21 @@ impl RivetValue {
 
     /// Rough in-memory footprint of this cell — drives the sink's memory-budget
     /// rollover. Heap length for `Bytes`; the scalar width otherwise.
+    /// DECODED payload size — the value's own bytes, no allocator overhead.
+    /// See `ChangeEvent::payload_bytes` for why this is not `estimated_bytes`.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match self {
+            RivetValue::Null | RivetValue::Bool(_) => 1,
+            RivetValue::Int(_)
+            | RivetValue::UInt(_)
+            | RivetValue::Float(_)
+            | RivetValue::TimeMicros(_) => 8,
+            RivetValue::DateTime(_) => 12,
+            RivetValue::Bytes(b) => b.len(),
+            RivetValue::Array(v) => v.iter().map(RivetValue::payload_bytes).sum::<usize>(),
+        }
+    }
+
     pub(crate) fn estimated_bytes(&self) -> usize {
         match self {
             RivetValue::Null | RivetValue::Bool(_) => 1,

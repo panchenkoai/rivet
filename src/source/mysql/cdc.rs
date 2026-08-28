@@ -619,7 +619,8 @@ impl MysqlChangeStream {
             tables: HashMap::new(),
             pending: VecDeque::new(),
             // Overridden by `open_or_resume`, which knows the checkpoint's location.
-            spill_dir: crate::source::cdc::spill_dir_for(None),
+            // Overridden by `open_or_resume`, the one production constructor.
+            spill_dir: None,
             spill: None,
             spooled: None,
             spill_error: None,
@@ -736,12 +737,13 @@ impl MysqlChangeStream {
         mode: DrainMode,
         tls: Option<&TlsConfig>,
         configured_tables: Vec<String>,
+        spill_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        // Derived here rather than passed in: this is the one constructor the
-        // production path uses, and it already holds the checkpoint whose directory
-        // the spill shares. `open`/`open_from_current` are the anchor and test
-        // helpers and keep the `.rivet/spill` fallback.
-        let spill_dir = crate::source::cdc::spill_dir_for(ckpt);
+        // PASSED IN, not derived: resolving the directory needs the CONFIG's dir
+        // (the anchor for every relative path this run resolves), which only the
+        // caller holds. An earlier version derived it here from the checkpoint
+        // alone and fell back to a cwd-relative path — the shipped image runs at
+        // `/`, where that is an EACCES at the exact moment the cap is crossed.
         let with_dir = |mut s: Self| {
             s.spill_dir = spill_dir.clone();
             s
@@ -848,7 +850,7 @@ impl MysqlChangeStream {
              which is what this used to do. The transaction is still delivered whole \
              and atomically. Note this moves the ADAPTER's copy to disk; the sink \
              still holds the whole transaction (a part is never split across one), so \
-             peak memory falls only modestly — measured ~11% on a 100k-row \
+             peak memory falls only modestly — measured ~11% on PostgreSQL's 100k-row \
              transaction, not to the cap.",
             self.file,
             self.tx.len(),
@@ -1163,6 +1165,28 @@ impl MysqlChangeStream {
                     )
                 }) {
                     anyhow::bail!(xa_prepare_refusal_message(&ev.schema, &ev.table));
+                }
+                // A SPILLED tail makes the "nothing of ours" verdict below
+                // unreachable honestly: the scan above covers only the in-memory
+                // head, and past the cap every later row went to disk without
+                // entering `tx` — so a branch whose captured rows sit only in the
+                // tail would pass the scan and `self.spill = None` would DELETE
+                // them, permanently and silently. Refuse instead: nothing has been
+                // handed to the sink, so the bail loses nothing (at-least-once
+                // re-reads from the checkpoint), and the message names both facts
+                // the operator needs.
+                if let Some(sp) = &self.spill {
+                    anyhow::bail!(
+                        "mysql cdc: an XA PREPARE arrived while this transaction's \
+                         tail ({} row(s)) is spilled to disk, so rivet cannot see \
+                         whether the branch touches a captured table. Refusing \
+                         rather than guessing: dropping a branch whose captured \
+                         rows sit only in the spilled tail would lose them \
+                         silently. Either raise RIVET_CDC_MAX_TX_ROWS/_BYTES past \
+                         this branch's size, or commit the XA branch promptly so \
+                         it frames normally.",
+                        sp.len()
+                    );
                 }
                 // Nothing of ours in the branch: drop it rather than leave it for the
                 // next commit to stamp and fuse. The sink would route these rows away,
@@ -2467,6 +2491,7 @@ mod tests {
             DrainMode::BoundedAtOpen,
             None,
             Vec::new(),
+            None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
         assert!(
@@ -2494,6 +2519,7 @@ mod tests {
             DrainMode::BoundedAtOpen,
             None,
             Vec::new(),
+            None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
         let got = s2
@@ -2546,6 +2572,7 @@ mod tests {
             DrainMode::Continuous,
             None,
             Vec::new(),
+            None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
         let b = s2

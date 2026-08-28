@@ -391,6 +391,23 @@ impl ChangeEvent {
     /// Rough in-memory footprint of this buffered change — drives the sink's
     /// memory-budget rollover (`rollover_memory_mb`). The before/after value
     /// images dominate; schema/table names + a small fixed overhead are added.
+    /// DECODED payload size — what "bytes read from the source" means.
+    ///
+    /// A separate method from [`Self::estimated_bytes`] because the two units
+    /// serve different masters and conflating them was a measured regression:
+    /// when `estimated_bytes` was re-based to RESIDENT cost (struct + cloned
+    /// position + Vec slots), the `bytes_read` metric silently inflated ~4-13x
+    /// and stopped being comparable with the batch path's Arrow-columnar figure
+    /// — the exact comparability #196 introduced it for. The BUDGETS want
+    /// resident cost; the METRIC wants this.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        let img = |v: &Option<Vec<RivetValue>>| {
+            v.as_ref()
+                .map_or(0, |vs| vs.iter().map(RivetValue::payload_bytes).sum())
+        };
+        self.schema.len() + self.table.len() + img(&self.before) + img(&self.after)
+    }
+
     pub(crate) fn estimated_bytes(&self) -> usize {
         // RESIDENT cost, not payload size. The old model charged
         // `schema + table + values + 32` and under-counted a narrow event 12.7x
@@ -743,6 +760,10 @@ pub(crate) struct CdcConfig {
     /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN;
     /// MongoDB via the resume token).
     pub checkpoint: Option<PathBuf>,
+    /// The CONFIG's directory — the anchor for every relative path this run
+    /// resolves (checkpoint already arrives resolved; the spill dir resolves
+    /// against this). Never the process cwd: the shipped image runs at `/`.
+    pub config_dir: PathBuf,
     /// How this capture run ends — see [`DrainMode`], the canonical home of the
     /// termination contract.
     pub drain: DrainMode,
@@ -1198,7 +1219,10 @@ pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB chang
 /// rivet gets to make. When the SINK learns to spill too, this becomes a default
 /// worth arguing for — and the soak stand's 202-vs-226 gap is where that argument
 /// will be settled.
-pub(crate) fn spill_dir_for(checkpoint: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+pub(crate) fn spill_dir_for(
+    checkpoint: Option<&std::path::Path>,
+    config_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let raw = std::env::var("RIVET_CDC_SPILL_DIR").ok()?;
     // TRIMMED: a `.env` line or a YAML `environment:` entry trivially carries a
     // trailing space, and `"1 "` would otherwise become a directory literally named
@@ -1211,26 +1235,37 @@ pub(crate) fn spill_dir_for(checkpoint: Option<&std::path::Path>) -> Option<std:
     // trap: `RIVET_CDC_SPILL_DIR=0`, written to DISABLE spilling, fell through to
     // the path arm and enabled it into a directory named `0` — while disabling the
     // oversized-transaction refusal, which is the guard this switch exists to keep.
-    // The two readings of `0` are opposite, so the wrong one must not be the quiet
-    // one.
     if ["0", "false", "off", "no"].contains(&named.to_ascii_lowercase().as_str()) {
         return None;
     }
-    if named == "1" || named.eq_ignore_ascii_case("true") || named.eq_ignore_ascii_case("yes") {
-        // A truthy value means "spill, you pick where": beside the CHECKPOINT, which
-        // is a directory the operator already chose and sized for rivet's state, and
-        // `.rivet/spill` when there is none. Never the system temp — a CDC spill can
-        // be gigabytes and a tmpfs takes down more than rivet.
-        //
-        // A bare filename (`cdc.json`) has an EMPTY parent, not a missing one —
-        // joining onto it would build a RELATIVE path, which is the right answer but
-        // only by accident; say it.
+    // …and the truthy list carries `on` because the falsy one carries `off`: an
+    // operator mirroring an accepted spelling must not get a directory named `on`.
+    // These four are also exactly the strings YAML-1.1 tooling treats as booleans.
+    if ["1", "true", "yes", "on"].contains(&named.to_ascii_lowercase().as_str()) {
+        // A truthy value means "spill, you pick where": beside the CHECKPOINT when
+        // there is one — a directory the operator already chose and sized for
+        // rivet's state — and beside the CONFIG otherwise. Never the system temp (a
+        // CDC spill can be gigabytes and a tmpfs takes down more than rivet), and
+        // never the process CWD: the shipped image runs with cwd=`/` and a non-root
+        // user, so a cwd-relative `.rivet/spill` worked for weeks and then failed
+        // with a path-less EACCES at the exact moment the cap was crossed — and on
+        // a host, spills landed per-INVOCATION-cwd where no later sweep could find
+        // them. `resolve_checkpoint`'s doc records the same cwd-anchor causing loss
+        // for checkpoints; this is the same rule applied to the spill.
         return Some(match checkpoint.and_then(std::path::Path::parent) {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join(".rivet-spill"),
-            _ => std::path::Path::new(".rivet").join("spill"),
+            _ => config_dir.join(".rivet").join("spill"),
         });
     }
-    Some(std::path::PathBuf::from(named))
+    // An explicit path: relative forms anchor to the CONFIG's directory, exactly
+    // like `cdc.checkpoint:` — one config must not read two locations depending on
+    // where the process happened to start.
+    let p = std::path::Path::new(named);
+    Some(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        config_dir.join(p)
+    })
 }
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
@@ -1278,6 +1313,7 @@ pub(crate) fn create_change_stream(
                     cfg.drain,
                     tls,
                     configured_tables.clone(),
+                    spill_dir_for(cfg.checkpoint.as_deref(), &cfg.config_dir),
                 )
                 .map_err(|e| with_setup_hint(e, MYSQL_CDC_HINT))?,
             ))
@@ -1315,7 +1351,7 @@ pub(crate) fn create_change_stream(
                     peek,
                     cfg.drain,
                     configured_tables,
-                    spill_dir_for(cfg.checkpoint.as_deref()).as_deref(),
+                    spill_dir_for(cfg.checkpoint.as_deref(), &cfg.config_dir).as_deref(),
                 )
                 .map_err(|e| with_setup_hint(e, PG_CDC_HINT))?,
             ))
@@ -1348,7 +1384,7 @@ pub(crate) fn create_change_stream(
                     peek,
                     cfg.drain,
                     configured_tables,
-                    spill_dir_for(cfg.checkpoint.as_deref()),
+                    spill_dir_for(cfg.checkpoint.as_deref(), &cfg.config_dir),
                 )
                 .map_err(|e| with_setup_hint(e, MSSQL_CDC_HINT))?,
             ))
@@ -2373,6 +2409,7 @@ mod tests {
         let ckpt = d.path().join("ck.json");
         std::fs::write(&ckpt, b"{not valid json").unwrap();
         let cfg = CdcConfig {
+            config_dir: std::path::PathBuf::from("."),
             url: "mysql://rivet:rivet@127.0.0.1:1/rivet".into(),
             checkpoint: Some(ckpt),
             drain: DrainMode::BoundedAtOpen,
@@ -2629,79 +2666,115 @@ mod tests {
             .expect("--max-events 0 must be a clean no-op");
     }
 
-    /// Spilling is OPT-IN, and where it lands follows what the operator named.
+    /// The metric's unit and the budget's unit are DIFFERENT, on purpose.
     ///
-    /// The default is `None`, which is the whole point: with no directory named the
-    /// cap keeps its original meaning and REFUSES an oversized transaction. Spilling
-    /// on by default would replace a guard that works with a mitigation that mostly
-    /// does not — measured at ~11%, because the sink holds the transaction whatever
-    /// the adapter does. Four live tests pin that refusal on three engines and are
-    /// the only reason this was caught.
+    /// One `estimated_bytes` feeding both was a measured regression: re-basing the
+    /// estimate to resident cost silently inflated `bytes_read` ~13x on narrow
+    /// rows and broke comparability with the batch path — the exact thing the
+    /// metric exists for. This pins the split: payload counts the VALUES, resident
+    /// counts the allocation, and the gap between them is the position clone +
+    /// struct overhead that must never leak into "bytes read from the source".
+    #[test]
+    fn payload_bytes_counts_values_and_estimated_bytes_counts_memory() {
+        let mut ev = ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "s".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vec![RivetValue::Int(1), RivetValue::Bytes(vec![b'x'; 100])]),
+            position: Position(serde_json::json!({ "lsn": "0/1" })),
+            committed: false,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        };
+        let payload = ev.payload_bytes();
+        assert_eq!(
+            payload,
+            1 + 1 + 8 + 100,
+            "payload = schema + table + the values' own bytes, nothing else"
+        );
+        assert!(
+            ev.estimated_bytes() > payload + 400,
+            "resident must exceed payload by at least the position clone — if the \
+             two converge, one of them changed meaning and a metric or a budget is \
+             now lying"
+        );
+        // The position is RESIDENT cost, never payload: re-stamping it must not
+        // move the metric's number.
+        let before = ev.payload_bytes();
+        ev.position = Position(serde_json::json!({ "lsn": "0/FFFFFFFF", "extra": "x" }));
+        assert_eq!(
+            ev.payload_bytes(),
+            before,
+            "the commit position is bookkeeping, not data read from the source"
+        );
+    }
+
+    /// Spilling is OPT-IN, and every resolved location is CONFIG-anchored.
+    ///
+    /// The default is `None`: with no directory named the cap keeps its original
+    /// meaning and REFUSES an oversized transaction. And nothing here is ever
+    /// cwd-relative — the shipped image runs at `/` with a non-root user, where a
+    /// cwd-anchored `.rivet/spill` worked for weeks and then failed with a
+    /// path-less EACCES at the exact moment the cap was crossed; on a host it
+    /// scattered per-invocation orphans no later sweep could find.
     #[test]
     fn spilling_is_off_until_a_directory_is_named() {
         use std::path::Path;
+        let cfg = Path::new("/etc/rivet");
         let guard = EnvGuard::unset("RIVET_CDC_SPILL_DIR");
         assert_eq!(
-            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
+            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json")), cfg),
             None,
             "with nothing named, an oversized transaction must still FAIL — a \
              silent spill would remove the OOM guard and say nothing"
         );
 
-        // A truthy value: rivet picks, beside the checkpoint the operator chose.
-        guard.set("1");
-        assert_eq!(
-            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
-            Some(Path::new("/var/lib/rivet/.rivet-spill").to_path_buf()),
-        );
-        // A bare filename has an EMPTY parent, not a missing one.
-        assert_eq!(
-            spill_dir_for(Some(Path::new("cdc.json"))),
-            Some(Path::new(".rivet/spill").to_path_buf()),
-            "an empty parent is not a directory — fall back rather than build a \
-             path that is relative by accident"
-        );
-        assert_eq!(
-            spill_dir_for(None),
-            Some(Path::new(".rivet/spill").to_path_buf()),
-            "PostgreSQL CDC is slot-anchored and usually has no checkpoint, so the \
-             engine whose transactions are largest must still get a directory"
-        );
-        assert!(
-            !spill_dir_for(None)
-                .expect("named")
-                .starts_with(std::env::temp_dir()),
-            "never the system temp: a CDC spill can be gigabytes and a tmpfs takes \
-             down more than rivet"
-        );
-
-        // FALSY values mean OFF. Recognising truthiness in one direction only made
-        // `RIVET_CDC_SPILL_DIR=0` — written to DISABLE spilling — enable it into a
-        // directory named `0`, while disabling the refusal this switch exists to
-        // keep. The two readings of `0` are opposite; the wrong one must not win.
+        // FALSY values mean OFF, and `on` must be truthy because `off` is falsy:
+        // an operator mirroring an accepted spelling must not get a directory
+        // literally named `on`. These pairs are exactly what YAML-1.1 tooling
+        // treats as booleans.
         for off in ["0", "false", "FALSE", "off", "no", "  "] {
             guard.set(off);
             assert_eq!(
-                spill_dir_for(None),
+                spill_dir_for(None, cfg),
                 None,
                 "`RIVET_CDC_SPILL_DIR={off:?}` must mean OFF, not a directory of \
                  that name"
             );
         }
-        // …and a truthy value with stray whitespace is still the switch, not a
-        // directory literally named `1 ` — a `.env` line trivially carries one.
-        guard.set(" 1 ");
+        for on in ["1", " 1 ", "true", "yes", "ON"] {
+            guard.set(on);
+            assert_eq!(
+                spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json")), cfg),
+                Some(Path::new("/var/lib/rivet/.rivet-spill").to_path_buf()),
+                "`{on:?}` is the switch, not a directory name"
+            );
+        }
+
+        // Truthy with NO checkpoint: beside the CONFIG, never the cwd. This is
+        // the common PostgreSQL shape (slot-anchored, no checkpoint) — the engine
+        // whose transactions are largest must get an ABSOLUTE directory.
+        guard.set("1");
         assert_eq!(
-            spill_dir_for(None),
-            Some(Path::new(".rivet/spill").to_path_buf())
+            spill_dir_for(None, cfg),
+            Some(Path::new("/etc/rivet/.rivet/spill").to_path_buf()),
         );
 
-        // An explicit path is used verbatim.
+        // An explicit ABSOLUTE path is used verbatim; a RELATIVE one anchors to
+        // the config dir, exactly like `cdc.checkpoint:` — one config must not
+        // read two locations depending on where the process started.
         guard.set("/mnt/big/spill");
         assert_eq!(
-            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json"))),
+            spill_dir_for(Some(Path::new("/var/lib/rivet/cdc.json")), cfg),
             Some(Path::new("/mnt/big/spill").to_path_buf()),
-            "a named directory wins over any default — that is the point of naming it"
+        );
+        guard.set("spill-here");
+        assert_eq!(
+            spill_dir_for(None, cfg),
+            Some(Path::new("/etc/rivet/spill-here").to_path_buf()),
+            "a relative explicit path anchors to the CONFIG's directory"
         );
     }
 

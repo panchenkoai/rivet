@@ -512,6 +512,15 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     // would get the useless generic "error" bucket. The alternate form joins
     // the chain so the auth/connectivity needles below match the true cause.
     let msg = format!("{err:#}").to_lowercase();
+    // Connect-time server errors that are NOT auth, peeled off before the
+    // `db error` catch-all below claims them (each verified against the server's
+    // actual rendering: 3D000 / 53300 / 57P03).
+    if msg.contains("does not exist") && msg.contains("database") {
+        return "unknown database";
+    }
+    if msg.contains("too many connections") || msg.contains("starting up") {
+        return "transient";
+    }
     if msg.contains("password")
         || msg.contains("authentication")
         || msg.contains("access denied")
@@ -519,8 +528,12 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
         || msg.contains("login failed")
         // Postgres top-level Display when the real cause (auth) is nested and
         // `{:#}` still collapses to the bare wrapper — a server-side `DbError`
-        // is never a connectivity failure (those say "connect"/"refused"), so
-        // mapping it to auth is the actionable bucket, not a misroute.
+        // is never a connectivity failure (those say "connect"/"refused"). But
+        // "never connectivity" is not "always auth": three ordinary connect-time
+        // DbErrors are neither, and the three arms ABOVE this catch-all peel
+        // them off so a wrong-database-name typo stops being answered with
+        // "verify the user/password" — a hint that sends the operator to fix
+        // credentials they never had a problem with.
         || msg.contains("db error")
     {
         "auth error"
@@ -646,6 +659,20 @@ pub(crate) fn source_error_hint(
     }
 
     match category {
+        // The two connect-time DbError shapes peeled off before the auth
+        // catch-all — each hint names the actual fix, where "verify the
+        // user/password" sent the operator to credentials they never had a
+        // problem with.
+        "unknown database" => Some(
+            "The database named in the URL does not exist on this server. Check \
+             the path segment of the connection URL — credentials are fine (the \
+             server authenticated you far enough to say so).",
+        ),
+        "transient" => Some(
+            "The server refused the connection for a TRANSIENT reason (connection \
+             cap reached, or still starting up). Retry shortly; if it persists, \
+             check max_connections / the pooler, not the credentials.",
+        ),
         "auth error" => Some(match source_type {
             SourceType::Postgres => {
                 "Verify the user/password and that pg_hba.conf permits your client IP. The user also needs SELECT on the target tables and USAGE on the schema."

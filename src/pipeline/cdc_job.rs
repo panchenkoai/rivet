@@ -612,6 +612,7 @@ fn run_cdc_inner(
         CdcCapture {
             export_name: export.name.clone(),
             cdc_cfg: CdcConfig {
+                config_dir: config_dir.to_path_buf(),
                 url,
                 checkpoint: cdc
                     .checkpoint
@@ -777,7 +778,19 @@ mod tests {
     fn resolve_checkpoint_prefers_the_config_dir_and_keeps_an_existing_cwd_file() {
         let cfg_dir = tempfile::tempdir().expect("config dir");
         let cwd_dir = tempfile::tempdir().expect("cwd");
-        let _guard = std::env::set_current_dir(cwd_dir.path());
+        // A REAL guard. The first version bound `set_current_dir`'s io::Result to
+        // `_guard`, which restores nothing — the whole lib-test process then
+        // finished its life inside a DELETED tempdir, and every concurrently
+        // scheduled test shared the hijacked cwd. Process-global state needs a
+        // restore in Drop, like the repo's EnvGuard.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _guard = CwdGuard(std::env::current_dir().expect("cwd"));
+        std::env::set_current_dir(cwd_dir.path()).expect("enter the temp cwd");
 
         // ABSOLUTE: used verbatim, and never empty — the `-> Default::default()`
         // mutant returns an empty path, which `Position::load` reads as "no

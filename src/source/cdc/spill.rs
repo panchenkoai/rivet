@@ -97,7 +97,14 @@ pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) ->
         else {
             continue; // not ours; never touch a file we did not name
         };
-        if is_alive(pid) {
+        // `pid == our own` is an ORPHAN, not a live writer — and the shipped
+        // container makes this the COMMON case, not a curiosity: with
+        // `ENTRYPOINT ["rivet"]` every generation is pid 1, so a SIGKILLed
+        // (OOM-killed) run leaves `…-1.bin` files that the restarted pid-1
+        // process would probe, see "alive" (itself), and spare forever. The
+        // sweep runs BEFORE this process creates its first spill in the
+        // directory, so a file bearing our pid cannot be ours.
+        if pid != std::process::id() && is_alive(pid) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -143,10 +150,24 @@ impl SpillFile {
     /// is sized for the data.
     pub(crate) fn create(dir: &std::path::Path, label: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        // Once per process, at the first spill: a hard-killed predecessor cannot
-        // have cleaned up after itself, and nothing else ever will.
-        static SWEPT: std::sync::Once = std::sync::Once::new();
-        SWEPT.call_once(|| sweep_dead_spills(dir, pid_is_alive));
+        // Per DIRECTORY, not per process: a run with two CDC exports whose
+        // checkpoints live in different directories spills into both, and a
+        // process-wide `Once` (the first version) swept only whichever came
+        // first — the second directory's orphans lived forever. A readdir per
+        // spill-open is cheap next to the spill itself.
+        {
+            static SWEPT: std::sync::Mutex<Option<std::collections::BTreeSet<PathBuf>>> =
+                std::sync::Mutex::new(None);
+            let mut seen = SWEPT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seen
+                .get_or_insert_with(Default::default)
+                .insert(dir.to_path_buf())
+            {
+                sweep_dead_spills(dir, pid_is_alive);
+            }
+        }
         // `{label}-{seq}-{pid}`: the pid stays LAST so the sweep's parse is a
         // single `rsplit_once`, and the counter makes the name unique WITHIN a
         // process. Today one process drives one CDC stream, so label+pid would not
@@ -549,7 +570,17 @@ mod tests {
         for f in [&live, &dead, &foreign] {
             std::fs::write(f, b"x").expect("stage");
         }
-        sweep_dead_spills(d.path(), |pid| pid == 111);
+        // …and a file bearing OUR OWN pid, which the shipped container makes the
+        // common orphan shape: `ENTRYPOINT ["rivet"]` runs every generation as
+        // pid 1, so a SIGKILLed run's `…-1.bin` is probed by the next pid-1
+        // process — which would see "alive" (itself) and spare it forever. The
+        // sweep runs before this process writes its first spill, so a file with
+        // our pid CANNOT be ours.
+        let own = d
+            .path()
+            .join(format!("rivet-spill-pg-tx-9-{}.bin", std::process::id()));
+        std::fs::write(&own, b"x").expect("stage own-pid orphan");
+        sweep_dead_spills(d.path(), |pid| pid == 111 || pid == std::process::id());
         assert!(
             live.exists(),
             "a spill whose writer is still running must be SPARED — deleting one \
@@ -563,6 +594,12 @@ mod tests {
         assert!(
             foreign.exists(),
             "a file rivet did not name is not rivet's to delete"
+        );
+        assert!(
+            !own.exists(),
+            "a spill bearing OUR pid is a previous generation's orphan (pid \
+             namespaces recycle pid 1 every restart) — sparing it because the \
+             probe sees ourselves leaks gigabytes per OOM-kill, forever"
         );
     }
 
@@ -851,11 +888,16 @@ impl SpooledGroups {
 
 // ─── the general fallback encoding ───────────────────────────────────────────
 //
-// PostgreSQL and MongoDB spill the RAW WIRE bytes: the row arrived as text or BSON
-// and the decoder that reads it back is the one the in-memory path uses, so a
-// spilled row and a buffered one cannot decode differently. MySQL's crate hands
-// over PARSED events and SQL Server's "stream" is a query result set — neither has
-// a wire to keep, so their events need an encoding of their own.
+// PostgreSQL spills the RAW WIRE bytes: the row arrived as text and the decoder
+// that reads it back is the one the in-memory path uses, so a spilled row and a
+// buffered one cannot decode differently. MySQL's crate hands over PARSED events
+// and SQL Server's "stream" is a query result set — neither has a wire to keep, so
+// their events need an encoding of their own. MongoDB spills NOTHING, by
+// construction rather than omission: it has no transaction buffer at all (every
+// change-stream event is its own commit), which is why it serves as the soak
+// stand's CONTROL — an earlier version of this comment listed it beside
+// PostgreSQL as a raw-BSON spiller, and a contributor adding Mongo buffering
+// would have believed the encoding decision already covered it.
 //
 // ARROW IPC was the plan here, on the argument that rivet already turns events into
 // Arrow to write Parquet, so the machinery exists and is tested. Checking that

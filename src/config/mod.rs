@@ -490,6 +490,47 @@ impl Config {
 
         for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
             let cdc = e.cdc.as_ref();
+            // ZERO is refused for both rollover knobs, the same guard chunk_size
+            // has. `0` is not "disable": `buf >= 0` is always true, so a zero
+            // budget rolls a part on EVERY committed transaction — a file
+            // explosion (one parquet + one PUT per txn), silently, while the
+            // operator who typed 0 meant "no cap". `None` is the documented way
+            // to get row-count-only; absence gets the protective default.
+            if let Some(c) = cdc {
+                if c.rollover == Some(0) {
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_ROLLOVER_INVALID,
+                        "export '{}': cdc.rollover must be >= 1 (got 0). A zero \
+                         rollover rolls a part on every committed transaction; \
+                         omit the field for the default (100000).",
+                        e.name
+                    );
+                }
+                if c.rollover_memory_mb == Some(0) {
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_ROLLOVER_INVALID,
+                        "export '{}': cdc.rollover_memory_mb must be >= 1 (got 0). \
+                         A zero byte budget rolls a part on every committed \
+                         transaction; omit the field for the default (256 MiB).",
+                        e.name
+                    );
+                }
+                // Checked at VALIDATION, where the error can name the field: the
+                // runtime multiply (`mb * 1024 * 1024`) wraps in release, and a
+                // wrapped budget of 0 is the file explosion above wearing a
+                // plausible-looking huge number.
+                if let Some(mb) = c.rollover_memory_mb
+                    && mb.checked_mul(1024 * 1024).is_none()
+                {
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_ROLLOVER_INVALID,
+                        "export '{}': cdc.rollover_memory_mb {} overflows a byte \
+                         count on this platform.",
+                        e.name,
+                        mb
+                    );
+                }
+            }
             match self.source.source_type {
                 SourceType::Postgres => {
                     let slot = cdc
@@ -2355,6 +2396,44 @@ mod sec_config_validation {
             msg.contains("accept_invalid_certs") || msg.to_lowercase().contains("verify"),
             "the surfaced error must name the dangerous knob / mode contradiction; got: {msg}"
         );
+    }
+
+    /// `rollover: 0` and `rollover_memory_mb: 0` are REFUSED at validation.
+    ///
+    /// Zero is not "disable": `buf >= 0` is always true, so a zero budget rolls a
+    /// part on EVERY committed transaction — a silent file explosion the operator
+    /// who typed 0 never asked for. Same guard chunk_size has; `None` (omit the
+    /// field) is the documented way to get the default.
+    #[test]
+    fn cdc_rollover_zero_is_refused_not_a_file_explosion() {
+        let base = r#"
+source:
+  type: postgres
+  url: postgresql://u:p@127.0.0.1/db
+exports:
+  - name: t
+    table: public.t
+    mode: cdc
+    format: parquet
+    cdc:
+      ROLLOVER_LINE
+    destination: {type: local, path: /tmp/out/}
+"#;
+        for (line, needle) in [
+            ("rollover: 0", "rollover must be >= 1"),
+            ("rollover_memory_mb: 0", "rollover_memory_mb must be >= 1"),
+            // The multiply is checked at VALIDATION, where the error can name the
+            // field — at runtime it wraps in release, and a wrapped budget of 0 is
+            // the same explosion wearing a huge plausible number.
+            ("rollover_memory_mb: 999999999999999999", "overflows"),
+        ] {
+            let yaml = base.replace("ROLLOVER_LINE", line);
+            let err = Config::from_yaml(&yaml).expect_err(line).to_string();
+            assert!(
+                err.contains(needle),
+                "`{line}` must be refused with a message naming the fix — got: {err}"
+            );
+        }
     }
 }
 

@@ -478,9 +478,16 @@ pub(crate) fn run_to_files(
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
-                    let eb = ev.estimated_bytes();
-                    total_bytes += eb;
-                    read_bytes.fetch_add(eb as u64, std::sync::atomic::Ordering::Relaxed);
+                    // TWO units on purpose: the rollover budget wants RESIDENT
+                    // cost (what the buffer actually holds), the bytes-read metric
+                    // wants DECODED payload (comparable with the batch path's
+                    // figure). One `eb` feeding both silently inflated the metric
+                    // ~4-13x when the estimate was re-based to resident.
+                    total_bytes += ev.estimated_bytes();
+                    read_bytes.fetch_add(
+                        ev.payload_bytes() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     sink.buf.push(ev);
                     total_rows += 1;
                     emitted += 1;
@@ -2616,6 +2623,46 @@ mod tests {
             state: None,
             read_bytes: Default::default(),
         }
+    }
+
+    /// `read_bytes` counts PAYLOAD, produced by the real producer — not resident.
+    ///
+    /// The boundary test the regression demanded: a unit on `payload_bytes` alone
+    /// could not catch the sink feeding the metric from `estimated_bytes` (the
+    /// mutant survived it — the decider was right and the SUPPLIER was wrong). So
+    /// this drives the real drive loop and reads the counter at the boundary: the
+    /// total must equal the events' payload sum exactly, and the resident sum —
+    /// which exceeds it by the cloned position + struct overhead — must NOT fit.
+    /// One `eb` feeding both consumers inflated the metric ~13x on narrow rows and
+    /// broke comparability with the batch path's figure.
+    #[test]
+    fn read_bytes_counts_payload_not_resident() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let events: Vec<ChangeEvent> = (1..=4).map(insert).collect();
+        let payload: u64 = events.iter().map(|e| e.payload_bytes() as u64).sum();
+        let resident: u64 = events.iter().map(|e| e.estimated_bytes() as u64).sum();
+        assert!(
+            resident > payload * 2,
+            "the fixture is inert unless the two units DIFFER visibly — if they \
+             converge, this test can no longer tell which one the sink counted"
+        );
+
+        let mut stream = FakeStream {
+            events: events.into(),
+            acked: Vec::new(),
+        };
+        let config = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        let counter = std::sync::Arc::clone(&config.read_bytes);
+        let (_m, r) = run_to_files(&mut stream, config);
+        r.unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            payload,
+            "bytes_read must be the DECODED payload — the number comparable with \
+             the batch path — never the resident bookkeeping cost"
+        );
     }
 
     /// `max_events` must be a SOFT cap that lands on a commit boundary — the same

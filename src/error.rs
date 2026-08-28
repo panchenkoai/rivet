@@ -247,6 +247,7 @@ pub mod codes {
     /// (PostgreSQL slot / MySQL server_id / checkpoint path) — including the
     /// defaults colliding, which is what a naive multi-table CDC config hits.
     pub const CONFIG_CDC_RESOURCE_CONFLICT: &str = "RIVET_CONFIG_CDC_RESOURCE_CONFLICT";
+    pub const CONFIG_CDC_ROLLOVER_INVALID: &str = "RIVET_CONFIG_CDC_ROLLOVER_INVALID";
     /// An export mode is not supported by the configured source type — today
     /// this is a non-SQL source (MongoDB) with any `mode:` other than `full`
     /// (chunked / incremental / keyset / time-window / cdc all need SQL).

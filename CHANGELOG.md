@@ -1,5 +1,24 @@
 # Changelog
 
+### Unreleased
+
+- **CDC memory budgets measure memory now, with an operator-visible surface.**
+  `rollover_memory_mb` gained a default (256 MiB) so absence no longer means "no
+  byte budget" — wide-row tables roll parts by resident size where they previously
+  buffered to the row cap; part counts can change for such configs. The
+  `RIVET_CDC_MAX_TX_*` caps are measured in RESIDENT cost (what the buffer actually
+  holds) instead of a payload estimate that under-counted ~12.7x, so a transaction
+  that slipped under the old 2 GiB figure may now refuse — the refusal was always
+  the intent, the old number was not a guard. Zero is rejected for both rollover
+  knobs at validation (`0` meant "roll a part on every transaction", not
+  "disable"). `bytes_read` metrics keep the DECODED-payload unit and stay
+  comparable with batch exports.
+- **Opt-in transaction spilling (`RIVET_CDC_SPILL_DIR`).** A transaction past the
+  cap can spill its tail to disk instead of failing (PostgreSQL/MySQL/SQL Server;
+  MongoDB needs none by construction). Off by default: it moves the adapter's copy
+  only (~11% of peak RSS measured on PostgreSQL), so the caps stay the honest
+  guard. Every resolved location is config-anchored, never cwd-relative.
+
 ## Unreleased
 
 - **A service-account key file is now minted IN PROCESS — `gcloud` is off the
