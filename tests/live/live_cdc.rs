@@ -7782,6 +7782,21 @@ fn a_mysql_checkpoint_from_another_server_is_refused() {
 fn regenerate_the_pgoutput_fixture_from_the_rig_scenarios() {
     use postgres::NoTls;
 
+    // EXPLICIT opt-in, because this test WRITES checked-in goldens and its name
+    // contains `cdc` by way of the module it lives in — so `--run-ignored all -E
+    // test(/cdc/)`, the ordinary way to run the CDC suite, selected it and silently
+    // rewrote both fixtures. The offline decoder tests then graded a fresh capture
+    // instead of the committed bytes, which is the compatibility guarantee those
+    // fixtures exist to hold. A golden that any broad filter can regenerate is not
+    // a golden.
+    if std::env::var("RIVET_REGENERATE_FIXTURES").is_err() {
+        skip_live(
+            "regenerate_the_pgoutput_fixture: set RIVET_REGENERATE_FIXTURES=1 to \
+             rewrite tests/fixtures/pgoutput — it is a generator, not a check",
+        );
+        return;
+    }
+
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     let tbl = "rivet_pgout_fx";
     let slot = "rivet_pgout_fx_slot";
