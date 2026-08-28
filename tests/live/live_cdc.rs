@@ -9060,3 +9060,117 @@ fn roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_transacti
          transaction's commit"
     );
 }
+
+/// Round-5 completeness critic: the DRAIN leg's `_rivet_row_hash` graded by the
+/// INDEPENDENT implementation (`dev/release_oracle/rowhash.py`: DuckDB's own
+/// JSON rendering of the parquet + python xxhash — neither rivet's reader nor
+/// rivet's hasher). Until now every CDC row-hash assertion checked PRESENCE and
+/// schema parity only, while the sink's comment claimed "the same Rust render
+/// as the snapshot" untested — and rounds 2-4 edited the drain's value path.
+/// The corpus carries the injectivity ghosts (NULL, empty string, an embedded
+/// unit separator, a comma-joined value): a render divergence on the drain leg
+/// hashes the same logical row differently, silently defeating the one
+/// cross-leg integrity column. RED against un-framing the canonical image in
+/// `src/enrich.rs` (the v1 bare-separator bug shape).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + host duckdb + python3+xxhash"]
+fn cdc_drain_row_hash_matches_the_independent_implementation() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_rowhash_val");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, a VARCHAR(64) NULL, b VARCHAR(64) NOT NULL)"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mysql_cdc(&tbl)
+        .export_line("meta_columns: { row_hash: true }")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
+    run_rivet_ok(&cfg); // anchor run (captures nothing)
+
+    // The injectivity-ghost corpus: NULL vs empty, an embedded \x1f (the v1
+    // separator), a comma-joined value (the container-display ghost).
+    c.exec_drop(
+        format!("INSERT INTO {tbl} (id, a, b) VALUES (?,?,?),(?,?,?),(?,?,?),(?,?,?)"),
+        (
+            1,
+            Option::<String>::None,
+            "plain",
+            2,
+            Some(String::new()),
+            "x",
+            3,
+            Some("a\u{1f}b".to_string()),
+            "sep",
+            4,
+            Some("a, b".to_string()),
+            "[c]",
+        ),
+    )
+    .unwrap();
+    run_rivet_ok(&cfg); // drain leg -> out/cdc-*.parquet
+
+    // Leg 1 of the oracle: DuckDB (host CLI) renders the drain parquet.
+    let q = format!(
+        "SELECT id, a, b, _rivet_row_hash AS h FROM read_parquet('{}/cdc-*.parquet') ORDER BY id",
+        out.display()
+    );
+    let duck = std::process::Command::new("duckdb")
+        .args(["-json", "-c", &q])
+        .output()
+        .expect("host duckdb CLI (brew install duckdb) — the independent reader");
+    assert!(
+        duck.status.success(),
+        "duckdb read failed: {}",
+        String::from_utf8_lossy(&duck.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&duck.stdout).expect("duckdb -json output");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(
+        rows.len(),
+        4,
+        "fixture: all four corpus rows must be captured"
+    );
+
+    // Leg 2: python + xxhash recompute the canonical image per
+    // dev/release_oracle/rowhash.py — a different hasher AND a different
+    // framing implementation than src/enrich.rs.
+    let py_script = d.path().join("check.py");
+    std::fs::write(
+        &py_script,
+        format!(
+            "import sys, json\nsys.path.insert(0, '{repo}/dev/release_oracle')\nfrom rowhash import row_hash_of\nrows = json.load(sys.stdin)\nfor r in rows:\n    cells = [str(r['id']), r['a'], r['b']]\n    exp = row_hash_of(cells)\n    got = int(r['h'])\n    assert exp == got, f\"row {{r['id']}}: independent={{exp}} rivet={{got}}\"\nprint('OK', len(rows))\n",
+            repo = env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(&py_script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 with xxhash — the independent hasher");
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(&duck.stdout).unwrap();
+    let py_out = child.wait_with_output().unwrap();
+    assert!(
+        py_out.status.success(),
+        "the independent implementation DISAGREES with the drain leg's \
+         _rivet_row_hash:\n{}\n{}",
+        String::from_utf8_lossy(&py_out.stdout),
+        String::from_utf8_lossy(&py_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&py_out.stdout).contains("OK 4"),
+        "positive control: the checker must have graded all four rows"
+    );
+}

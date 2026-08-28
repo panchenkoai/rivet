@@ -1291,3 +1291,85 @@ fn a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export() {
         "a short export must not leave a _SUCCESS marker for a downstream loader to trust"
     );
 }
+
+// ─── Round-5: destination-probed resume (gc-between-attempts) ────────────────
+
+/// A committed part deleted from the destination BETWEEN attempts (a gc pass
+/// after `state finish-run`, a foreign-host gc) must be RE-EXPORTED, not
+/// re-declared sight-unseen. The crash leaves NO manifest.json (finalize never
+/// ran), so this drives the no-manifest M8 branch — the one that used to
+/// declare straight from the state DB: pre-fix the resume finalized Success +
+/// `_SUCCESS` naming the deleted file, and the chunk's 50 rows were silently
+/// absent from the destination (RED-proven against the unprobed rehydrate).
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_resume_reexports_a_chunk_whose_part_was_deleted_between_attempts() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("r5_gc_between");
+    let rig = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .duckdb_oracle();
+    let _cfg = rig.config_path();
+
+    // Crash after chunk 1 completes: chunks 0+1 durable, chunk 2 pending, and —
+    // the branch under test — NO manifest.json yet.
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:1")],
+    );
+    assert!(!crash.status.success());
+    // The exit-status oracle alone grades nothing (a fixture broken for a
+    // SECOND reason also exits non-zero): require the PANIC hook itself.
+    assert!(
+        String::from_utf8_lossy(&crash.stderr).contains("after_chunk_complete"),
+        "the crash must be OUR injected panic; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+    let out = rig.out_dir();
+    let listing: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert!(
+        !out.join("manifest.json").is_file(),
+        "fixture: the crash must precede ANY terminal manifest, or this test \
+         exercises the with-manifest M8 branch instead; out dir: {listing:?}"
+    );
+
+    // The between-attempts gc: chunk 0's part vanishes from the destination.
+    let victim = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("chunk0") && n.ends_with(".parquet"))
+        })
+        .expect("chunk 0's committed part must exist before the delete");
+    std::fs::remove_file(&victim).unwrap();
+
+    // Resume: the probe must notice, reset chunk 0, and re-export it.
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
+    assert!(
+        resume.status.success(),
+        "resume must re-export the deleted chunk; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    // The DESTINATION holds every seeded row again — the DuckDB oracle, not
+    // rivet's ledger, says so. Pre-fix this read 100 of 150.
+    rig.assert_complete(
+        "id",
+        150,
+        "a chunk deleted between attempts must be re-exported, never re-declared",
+    );
+}

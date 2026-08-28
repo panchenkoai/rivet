@@ -2671,3 +2671,89 @@ fn roast_mssql_cdc_a_crash_mid_spilled_tail_loses_no_group_on_resume() {
         "the crashed run's spill must be collected by the resume's sweep: {leaked:?}"
     );
 }
+
+/// The OTHER half of the snapshot-done OR — the MARKER-ONLY leg, which the
+/// comment at cdc_job.rs has always promised ("pre-v14 runs and setups without
+/// state still skip correctly") with zero tests behind it (round-5 completeness
+/// critic). The state-row leg is proven by the test above; this one deletes the
+/// STATE DB between runs (a pre-v14 upgrade, a rebuilt host, a stateless
+/// setup) while `snapshot/_SUCCESS` survives at the destination. Run 2 must
+/// skip the snapshot on the marker alone — a broken marker leg re-snapshots
+/// every such upgrade and appends a duplicated baseline into `__changes`
+/// under `status: success`. RED against `|| false`-ing the marker side of the
+/// OR in `snapshot_plan`'s done-check.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_a_marker_only_snapshot_survives_a_fresh_state_db() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_marker");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT); \
+         INSERT INTO dbo.{table} VALUES (1,10),(2,20);"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot");
+    rig.run_ok();
+    let snap = out.join("snapshot");
+    let baseline: std::collections::BTreeSet<String> = files_with_extension(&snap, "parquet")
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !baseline.is_empty(),
+        "run 1 must produce a baseline — without one this test grades nothing"
+    );
+    assert!(
+        snap.join("_SUCCESS").is_file(),
+        "fixture: the snapshot leg must leave its completion marker"
+    );
+
+    // The pre-v14 upgrade / rebuilt-host shape: the state DB is GONE, the
+    // destination (marker included) and the checkpoint file survive.
+    let state_db = rig.config_path().parent().unwrap().join(".rivet_state.db");
+    assert!(
+        state_db.is_file(),
+        "fixture: the rig's state DB must exist where this test deletes it"
+    );
+    std::fs::remove_file(&state_db).unwrap();
+
+    rig.run_ok();
+    let after: std::collections::BTreeSet<String> = files_with_extension(&snap, "parquet")
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        after, baseline,
+        "a fresh state DB with the marker intact must NOT re-snapshot — new part \
+         names here mean a duplicated baseline appended under status: success"
+    );
+    // The outcome, not only the file-set: the original baseline is still the
+    // READABLE 2 rows (a wiped-and-rewritten set of the same names would lie
+    // to the name comparison above).
+    assert_eq!(
+        read_all_parts(&snap)
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        2,
+        "run 1's baseline must be byte-for-byte the one still standing"
+    );
+}

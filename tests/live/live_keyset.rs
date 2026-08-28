@@ -2311,3 +2311,90 @@ fn keyset_part_names_do_not_double_the_export_name() {
         );
     }
 }
+
+/// Round-5 lifecycle HIGH, keyset flavor: a committed page part deleted from
+/// the destination BETWEEN attempts (a gc pass after `state finish-run`, a
+/// foreign-host gc) must make the resume REFUSE — keyset has no per-part
+/// re-export (the cursor has moved past the page), so the pre-fix behavior
+/// re-declared the deleted file sight-unseen: Success + `_SUCCESS` naming
+/// parquet that does not exist, the page's rows silently absent. The refusal
+/// names the remedy (`state reset-chunks` / fresh prefix). RED against
+/// disabling the destination probe in `rehydrate_keyset_pages_probed`.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_resume_refuses_when_a_committed_page_was_deleted_between_attempts() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_gone_page");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 2000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_gone_exp");
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 200");
+    let cfg = rig.config_path();
+
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")],
+    );
+    assert!(!crash.status.success());
+    assert!(
+        String::from_utf8_lossy(&crash.stderr).contains("keyset_parallel_range_committed"),
+        "the crash must be OUR injected panic; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    // The between-attempts gc: every durable parquet vanishes — including the
+    // done range's committed pages, the ones the resume would re-declare.
+    let out = rig.out_dir();
+    let mut deleted = 0;
+    for e in std::fs::read_dir(&out).unwrap().flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "parquet") {
+            std::fs::remove_file(&path).unwrap();
+            deleted += 1;
+        }
+    }
+    assert!(
+        deleted > 0,
+        "fixture: the crash must have left durable parquet"
+    );
+
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        !resume.status.success(),
+        "resume must REFUSE to declare deleted pages, not finalize Success over a hole"
+    );
+    let err = String::from_utf8_lossy(&resume.stderr);
+    assert!(
+        err.contains("GONE from the destination"),
+        "the refusal must name the cause; stderr:\n{err}"
+    );
+    assert!(
+        err.contains("reset-chunks"),
+        "the refusal must name the remedy; stderr:\n{err}"
+    );
+    assert!(
+        !out.join("_SUCCESS").is_file(),
+        "no completion marker may exist after the refusal"
+    );
+}
