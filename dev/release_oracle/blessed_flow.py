@@ -821,6 +821,12 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
             time.sleep(1.5)
             p = rivet(*args, env=env, timeout=scenarios.NO_TIMEOUT)
         if not _stage(led, cell, tag, st, p.ok, f"exit={p.returncode} " + (p.out.strip().splitlines()[-1][:120] if p.ok and p.out.strip() else _why(p))):
+            # The FULL output, because the one-line `_why` is the last line and
+            # doctor's last line is always the same generic epilogue — 39 gcs cells
+            # failed with nothing but "one or more preflight checks failed" in the
+            # log, and the [FAIL] line that names the actual check was discarded.
+            for line in (p.out or "").strip().splitlines()[-25:]:
+                print(f"      | {line}")
             _unreached(led, cell, tag, st)
             return
         # Console-surface: the check verdict block (per engine × store × pipeline).
