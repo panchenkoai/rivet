@@ -393,6 +393,34 @@ pub(crate) fn completed_units_in_prefix(
 /// unit above the gap is neither re-covered (dup) nor abandoned to a re-sample (gap). Returns
 /// `None` (caller re-samples: a genuine first run) only when NO unit windows are found at all.
 /// Read-only.
+/// The run-varying placeholder a `--split` destination carries, or `None` when
+/// the prefix is split-safe.
+///
+/// Split's whole recovery model assumes the prefix is a STABLE identity: the
+/// units persist their windows there, `--resume` reconstructs the partition
+/// from them, and `stamp_ceased_units` closes what a reconstruction ceased.
+/// Every one of those expands the destination `for_today` at its own moment —
+/// so a `{date}` prefix makes a crash-before-midnight + resume-after-midnight
+/// read TODAY's (empty) prefix: the resume silently re-runs the whole giant
+/// from scratch while yesterday's `running` markers stay wedged forever, the
+/// exact freeze the stamp exists to close (round-5 completeness critic). A
+/// `{run_id}` prefix breaks the identity on EVERY resume. Refused loudly at
+/// the split entry instead — a split needs a placeholder-free (or
+/// run-stable) prefix.
+pub(crate) fn split_unsafe_placeholder(
+    dest: &crate::config::DestinationConfig,
+) -> Option<&'static str> {
+    for field in [dest.prefix.as_deref(), dest.path.as_deref()] {
+        let Some(text) = field else { continue };
+        for token in ["{date}", "{run_id}"] {
+            if text.contains(token) {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn reconstruct_units_from_prefix(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
@@ -572,6 +600,29 @@ mod tests {
         }
     }
 
+    /// A `{date}`/`{run_id}` prefix breaks split's stable-identity model (the
+    /// resume + the stamp expand `for_today` at their own moments), so the
+    /// split entry refuses it. Stable placeholders (`{export}`, `{table}`)
+    /// stay allowed. RED against removing the refusal call in run.rs — via the
+    /// predicate here, which the bail routes through.
+    #[test]
+    fn a_run_varying_placeholder_is_split_unsafe_and_a_stable_one_is_not() {
+        let mut dest = crate::config::DestinationConfig {
+            prefix: Some("exports/{date}/orders".into()),
+            ..Default::default()
+        };
+        assert_eq!(split_unsafe_placeholder(&dest), Some("{date}"));
+        dest.prefix = Some("exports/{run_id}".into());
+        assert_eq!(split_unsafe_placeholder(&dest), Some("{run_id}"));
+        dest.prefix = Some("exports/{export}".into());
+        assert_eq!(split_unsafe_placeholder(&dest), None);
+        dest.prefix = None;
+        dest.path = Some("/out/{date}".into());
+        assert_eq!(split_unsafe_placeholder(&dest), Some("{date}"));
+        dest.path = Some("/out/orders".into());
+        assert_eq!(split_unsafe_placeholder(&dest), None);
+    }
+
     /// ROUND-4 split-wedge closure, BOTH halves through the real fn: a
     /// reconstruction kept 5 units; ceased ordinal #6 left a `running` ledger
     /// row AND a `running` bucket marker — neither can ever be superseded (no
@@ -589,6 +640,10 @@ mod tests {
         };
         for (run, name, status) in [
             ("r1", "orders#1", crate::manifest::ManifestStatus::Running),
+            // ordinal == kept: the SHRINK-BY-ONE trailing crash, the most common
+            // shape — a `>` mutant in the bucket-half compare spares exactly it
+            // (round-5 completeness critic predicted this survivor).
+            ("r5", "orders#5", crate::manifest::ManifestStatus::Running),
             ("r6", "orders#6", crate::manifest::ManifestStatus::Running),
         ] {
             let m = unit_manifest(run, name, status);
@@ -599,14 +654,17 @@ mod tests {
             .unwrap();
         }
         let state = crate::state::StateStore::open_in_memory().unwrap();
-        for (run, name) in [("r1", "orders#1"), ("r6", "orders#6")] {
+        for (run, name) in [("r1", "orders#1"), ("r5", "orders#5"), ("r6", "orders#6")] {
             state
                 .begin_run(run, name, "gs://b/orders", "2026-08-21T00:00:00Z")
                 .unwrap();
         }
 
         let stamped = stamp_ceased_units(&dest, "orders", "orders", 5, &state);
-        assert_eq!(stamped, 2, "one ledger row + one bucket marker");
+        assert_eq!(
+            stamped, 4,
+            "two ledger rows + two bucket markers (#5 and #6)"
+        );
 
         // Ledger half: r6 terminal, r1 still live.
         let active = state.active_run_ids_on_prefix("gs://b/orders").unwrap();
@@ -625,6 +683,11 @@ mod tests {
             .status
         };
         assert_eq!(read("r6"), crate::manifest::ManifestStatus::Interrupted);
+        assert_eq!(
+            read("r5"),
+            crate::manifest::ManifestStatus::Interrupted,
+            "ordinal == kept ceased too — a > compare would spare exactly it"
+        );
         assert_eq!(read("r1"), crate::manifest::ManifestStatus::Running);
 
         // The wedge is CLOSED: once the live unit finishes, nothing reads active
@@ -641,7 +704,7 @@ mod tests {
             serde_json::to_vec(&done).unwrap(),
         )
         .unwrap();
-        let keyed: Vec<(String, crate::manifest::RunManifest)> = ["r1", "r6"]
+        let keyed: Vec<(String, crate::manifest::RunManifest)> = ["r1", "r5", "r6"]
             .iter()
             .map(|run| {
                 (

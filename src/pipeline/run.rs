@@ -1730,6 +1730,21 @@ pub(crate) fn run_pool(
                 // yields different boundaries, and the name-based skip below then covers a
                 // different key range than was exported → silent gap). Re-probe only when there
                 // is no prior split in the prefix (a genuine first run).
+                // A run-varying placeholder breaks split's stable-prefix identity
+                // (resume + stamp expand `for_today` at their own moments — a
+                // cross-midnight resume reads an EMPTY prefix, silently re-runs
+                // the giant and leaves yesterday's markers wedged). Refuse now,
+                // before any unit exists (round-5).
+                if let Some(token) = super::split::split_unsafe_placeholder(&base.destination) {
+                    anyhow::bail!(
+                        "apply --pool --split: export '{}' writes to a destination with the \
+                         run-varying placeholder {token} — a split resume reconstructs its \
+                         partition FROM the prefix, so the prefix must be one stable location \
+                         across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
+                         which are stable) for the split export.",
+                        base.name
+                    );
+                }
                 let units_opt = match resume
                     .then(|| {
                         super::split::reconstruct_units_from_prefix(
