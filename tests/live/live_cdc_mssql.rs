@@ -2556,3 +2556,118 @@ fn mssql_cdc_a_batch_past_the_memory_cap_spills_rather_than_failing() {
         "the transaction after the spilled one must still arrive, and arrive last"
     );
 }
+
+/// A crash while a SPILLED tail is being handed out must lose nothing on resume.
+///
+/// SQL Server is the one engine where this window exists at all: its spilled tail
+/// holds SEVERAL transactions (`SpooledGroups`), each group's last row is a real
+/// commit boundary, so the sink can roll + checkpoint + ack MID-tail — between two
+/// spilled groups — and crash before the rest is delivered. PostgreSQL and MySQL
+/// spill exactly one transaction, whose only commit is the tail's last row, so
+/// their sink cannot act until the tail is fully drained and no such window opens.
+///
+/// The crash tests that exist never set `RIVET_CDC_SPILL_DIR`, so until this test
+/// no crash had ever fired with a spill file on disk — the spilled path did not
+/// inherit the atomicity proof, it merely sat beside it.
+///
+/// Three transactions of 5 over a cap of 4 and rollover of 5: every transaction
+/// crosses the cap (its tail spills), and each group's commit lets the sink roll.
+/// The crash lands at `cdc_after_checkpoint_before_ack` — the checkpoint has
+/// advanced past the delivered groups, the rest of the tail is undelivered, and the
+/// reader (with the spill file) dies with the process. Resume must re-read from the
+/// checkpoint and deliver the remainder: the union of both runs holds every row
+/// exactly, or the tail died with the crashed process.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn roast_mssql_cdc_a_crash_mid_spilled_tail_loses_no_group_on_resume() {
+    const TXS: usize = 3;
+    /// SEVEN on purpose — not five, and the difference is the whole test. With
+    /// `PER_TX` equal to the rollover, every possible roll lands exactly on a group
+    /// boundary, so even a mutant that closes the tail's every row "commits" only
+    /// at points where the checkpoint is accidentally legal — measured, two such
+    /// mutants stayed green. At 7 over a rollover of 5, an early close rolls MID-
+    /// group: the checkpoint advances past a commit whose last two rows are still
+    /// in the dying process's spill, and the resume skips them — 19 of 21.
+    const PER_TX: usize = 7;
+
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("cdc_spillcrash_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} {ONE_TRANSACTION_DDL}"));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // THREE transactions — one statement each, so one `__$start_lsn` group each.
+    for t in 0..TXS {
+        mssql_seed_one_transaction(&table, t * PER_TX + 1..=(t + 1) * PER_TX);
+    }
+    wait_for_capture(&ci, (TXS * PER_TX) as i64);
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mssql_cdc(&table, &ci)
+        .cdc("rollover: 5")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+
+    // Run 1: the cap forces every transaction's tail onto disk, and the crash fires
+    // at the first roll — after the checkpoint, before the ack — with the rest of
+    // the spilled tail still undelivered in the dying process.
+    let crashed = rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", "4"),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+        ("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack"),
+    ]);
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+    let log1 = String::from_utf8_lossy(&crashed.stderr).to_string();
+    assert!(
+        log1.contains("passed the in-memory cap"),
+        "the fixture is inert unless run 1 actually SPILLED before crashing — \
+         without this line the crash fired on the unspilled path and the test \
+         proves nothing about it. stderr: {log1}"
+    );
+
+    // Run 2: same checkpoint, same destination — the scheduler's own resume shape.
+    // The spill is re-created from the re-read, so the env var stays set.
+    let out2 = rig.run_with_envs(&[("RIVET_CDC_MAX_TX_ROWS", "4"), ("RIVET_CDC_SPILL_DIR", "1")]);
+    assert!(
+        out2.status.success(),
+        "the resume run must succeed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (1..=(TXS * PER_TX) as i64).collect();
+    assert_eq!(
+        got, want,
+        "every row of every spilled group must survive the mid-tail crash — a \
+         missing group means the checkpoint advanced past a commit whose rows died \
+         with the crashed process's spill file"
+    );
+
+    // And the crashed process's spill file must not still be on disk after the
+    // resume: its writer is dead, the sweep runs at the next spill, and one leaked
+    // multi-GB file per crash fills a disk on a scheduler.
+    let leaked: Vec<String> = std::fs::read_dir(ckpt.parent().unwrap().join(".rivet-spill"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path().display().to_string())
+                .filter(|p| p.contains("rivet-spill-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leaked.is_empty(),
+        "the crashed run's spill must be collected by the resume's sweep: {leaked:?}"
+    );
+}

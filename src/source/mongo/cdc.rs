@@ -360,11 +360,24 @@ impl MongoChangeStream {
             }
         }
         let cap = probe_capability_on(&session);
-        log::info!(
-            "mongodb cdc: server {} — capture tier: {}",
-            cap.server_version,
-            cap.tier()
-        );
+        // The LOSSY tier is a warn: "deletes carry _id only" is a fidelity loss the
+        // operator should see, and the default log level hides info — the same rule
+        // that governs PostgreSQL's REPLICA IDENTITY warning for the identical
+        // condition. The capable tier stays info; announcing full fidelity loudly
+        // would train operators to ignore the level.
+        if cap.major >= 6 {
+            log::info!(
+                "mongodb cdc: server {} — capture tier: {}",
+                cap.server_version,
+                cap.tier()
+            );
+        } else {
+            log::warn!(
+                "mongodb cdc: server {} — capture tier: {}",
+                cap.server_version,
+                cap.tier()
+            );
+        }
         let stream = session
             .block_on(async {
                 session

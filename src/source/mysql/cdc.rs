@@ -819,11 +819,14 @@ impl MysqlChangeStream {
 
     /// Open the spill once the buffered transaction passes the in-memory cap.
     ///
-    /// Crossing the cap no longer FAILS the run: the head stays in memory, the tail
+    /// With a spill directory NAMED (`RIVET_CDC_SPILL_DIR` — see `spill_dir_for`),
+    /// crossing the cap no longer fails the run: the head stays in memory, the tail
     /// goes to disk through the general tagged frame, and the transaction is still
-    /// delivered whole and atomically. See `spill_dir_for` for why a directory
-    /// always resolves — this is only ever reached on a transaction that would
-    /// previously have failed the run outright.
+    /// delivered whole and atomically. Without one the cap keeps its original
+    /// meaning and REFUSES — an earlier version of this comment said the directory
+    /// "always resolves", which was true for one day and then reverted, because
+    /// spilling does not bound memory end to end and must not silently replace a
+    /// guard that does refuse.
     fn open_spill_if_past_cap(&mut self, log_pos: u64) -> Result<()> {
         if self.spill.is_some() {
             return Ok(());

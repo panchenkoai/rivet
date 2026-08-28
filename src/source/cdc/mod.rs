@@ -65,11 +65,18 @@ pub(crate) fn check_tx_buffer_caps(engine: &str, rows: usize, bytes: usize) -> R
     let byte_cap = max_tx_bytes();
     if bytes > byte_cap {
         anyhow::bail!(
-            "{engine} cdc: {subject} has more than {byte_cap} bytes (large \
-             cells) — it must be buffered whole, so this would exhaust memory. The ROW \
-             count is a poor bound here: a few multi-hundred-MB values stay far under \
-             the row cap. Split the source transaction, or raise \
-             RIVET_CDC_MAX_TX_BYTES only if a transaction this large is expected."
+            // No "(large cells)" diagnosis: the estimate is RESIDENT memory now
+            // (struct + position + names + values), so ~2.8M narrow rows cross the
+            // default 2 GiB with no large value anywhere — the old wording sent the
+            // operator hunting multi-hundred-MB cells that need not exist. At
+            // resident rates the byte cap also fires BEFORE the 5M-row cap on any
+            // realistic row, so it is the guard that actually speaks.
+            "{engine} cdc: {subject} needs more than {byte_cap} bytes of buffer \
+             memory — it must be buffered whole (a transaction is never split \
+             across parts), so this would exhaust memory. The estimate is resident \
+             cost, so wide cells and sheer row count both land here. Split the \
+             source transaction, or raise RIVET_CDC_MAX_TX_BYTES only if this much \
+             buffering is genuinely acceptable."
         );
     }
     Ok(())
@@ -1087,9 +1094,18 @@ impl CdcEngine {
                     // everything since the loss — and on MSSQL would actively
                     // destroy the min-LSN over-read floor. Fail loudly.
                     anyhow::bail!(
+                        // BOTH signals, because they are OR-ed: `snapshot_done` reads
+                        // the state DB's `cdc_snapshot` row (authoritative) OR the
+                        // destination's `snapshot/_SUCCESS` marker (legacy co-signal).
+                        // An earlier hint named only the marker — an operator who
+                        // deleted it still had `done == true` from the row, and the
+                        // identical bail fired again on the next run, forever.
                         "{} cdc: checkpoint '{}' is missing but prior-run evidence exists — \
-                         re-snapshot (delete the snapshot/_SUCCESS markers) to accept a new \
-                         anchor, or restore the checkpoint file",
+                         either restore the checkpoint file, or re-snapshot: clear the \
+                         export's `cdc_snapshot` row in the state DB AND delete the \
+                         destination's snapshot/_SUCCESS marker (the two done-signals \
+                         are OR-ed, so leaving either in place skips the snapshot; see \
+                         cdc-failure-modes.md)",
                         self.label(),
                         ckpt.display()
                     );

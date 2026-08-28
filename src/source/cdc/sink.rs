@@ -938,8 +938,10 @@ fn flush(
                 "cdc: an event for table '{}' carries {} column(s) but the resolved \
                  schema has {} — a DDL landed inside this capture window, and mapping \
                  by position would put values into the WRONG columns. Recover by \
-                 re-snapshotting the table (delete its snapshot/_SUCCESS marker under \
-                 `initial: snapshot`) or by resetting the checkpoint past the DDL. \
+                 re-snapshotting the table — clear its `cdc_snapshot` row in the \
+                 state DB AND delete its snapshot/_SUCCESS marker (the two done- \
+                 signals are OR-ed; leaving either in place skips the snapshot) — or \
+                 by resetting the checkpoint past the DDL. \
                  To make mid-stream DDL safe going forward, set \
                  binlog_row_metadata=FULL on the MySQL server (8.0.1+) — rivet then \
                  maps binlog images by column NAME and this error class disappears.",
