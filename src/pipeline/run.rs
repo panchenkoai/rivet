@@ -1740,7 +1740,23 @@ pub(crate) fn run_pool(
                     })
                     .flatten()
                 {
-                    Some(u) => Some(u),
+                    Some(u) => {
+                        // The reconstruction may have SHRUNK the partition (a
+                        // trailing-adjacent crash: the open tail absorbed the
+                        // crashed units). Stamp the ceased ordinals' ledger rows
+                        // + bucket markers terminal NOW — this is the only
+                        // moment that knows they ceased, and unstamped they
+                        // wedge gc/cleanup on the shared prefix forever
+                        // (round-4; born with the reconstruction in #217).
+                        super::split::stamp_ceased_units(
+                            &base.destination,
+                            &base.family(),
+                            &base.name,
+                            u.len(),
+                            &state,
+                        );
+                        Some(u)
+                    }
                     None => super::split::probe_and_synthesize(&config, &base, &config_dir, *n)?,
                 };
                 match units_opt {

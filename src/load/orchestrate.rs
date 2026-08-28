@@ -336,7 +336,9 @@ fn cleanup_target<'a>(
                 "  cleanup [{}]: SKIPPED — a run is writing into {} right now. Deleting the \
                  prefix would remove parts that run has already committed, and on a \
                  CDC/incremental export the source position has advanced past them. Re-run the \
-                 load once the extract has finished.",
+                 load once the extract has finished — or, if this is a DEAD crash remnant \
+                 (no extract is actually running), inspect it with `rivet state runs \
+                 --running` and close it with `rivet state finish-run --run-id <id>`.",
                 plan.table, plan.gcs_prefix
             );
             None

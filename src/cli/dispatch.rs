@@ -768,11 +768,85 @@ fn dispatch_state(action: StateAction) -> Result<()> {
         StateAction::Progression { config, export } => {
             pipeline::show_progression(&config, export.as_deref())
         }
+        StateAction::Runs {
+            config,
+            running,
+            last,
+        } => show_runs(&config, running, last),
+        StateAction::FinishRun { config, run_id } => finish_run_cmd(&config, &run_id),
         StateAction::Loads {
             config,
             target,
             last,
         } => show_loads(&config, target.as_deref(), last),
+    }
+}
+
+/// `rivet state runs`: the run-status ledger, newest first — the rows
+/// gc_orphans / cleanup_source / the consumed-exclusion actually read.
+fn show_runs(config: &str, running_only: bool, last: usize) -> Result<()> {
+    let store = StateStore::open(config)?;
+    let rows = store.recent_run_status(last, running_only)?;
+    if rows.is_empty() {
+        let msg = if running_only {
+            "no running rows — no run-status row is freezing any prefix"
+        } else {
+            "no runs recorded in the state DB yet"
+        };
+        println!("{msg}");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<20} {:<11} {:<25} {:<25} PREFIX",
+        "RUN ID", "EXPORT", "STATUS", "STARTED", "FINISHED"
+    );
+    for r in &rows {
+        let finished = if r.finished_at.is_empty() {
+            "-"
+        } else {
+            r.finished_at.as_str()
+        };
+        println!(
+            "{:<28} {:<20} {:<11} {:<25} {:<25} {}",
+            r.run_id, r.export_name, r.status, r.started_at, finished, r.prefix
+        );
+    }
+    if running_only {
+        println!(
+            "\nA `running` row with NO live extract is a crash remnant: it makes gc spare \
+             the prefix and cleanup refuse, forever (supersession needs a newer SUCCESS). \
+             Close one you KNOW is dead with `rivet state finish-run --run-id <id>`."
+        );
+    }
+    Ok(())
+}
+
+/// `rivet state finish-run`: stamp a dead run's row `interrupted`. Refuses
+/// loudly on a typo'd id and no-ops honestly on an already-terminal row —
+/// only a `running` row is ever touched.
+fn finish_run_cmd(config: &str, run_id: &str) -> Result<()> {
+    use crate::state::FinishOutcome;
+    let store = StateStore::open(config)?;
+    match store.finish_run_checked(run_id, &chrono::Utc::now().to_rfc3339())? {
+        FinishOutcome::Stamped => {
+            println!(
+                "run '{run_id}' stamped `interrupted` — gc/cleanup on its prefix are \
+                 unblocked. Only do this for runs you KNOW are dead: a LIVE run stamped \
+                 here loses the protection that spares its in-flight parts from gc."
+            );
+            Ok(())
+        }
+        FinishOutcome::AlreadyTerminal(status) => {
+            println!(
+                "run '{run_id}' is already terminal (`{status}`) — nothing to do; it does \
+                 not freeze any prefix"
+            );
+            Ok(())
+        }
+        FinishOutcome::NotFound => anyhow::bail!(
+            "no run-status row has run_id '{run_id}' — check `rivet state runs`; refusing \
+             to report success for a stamp that touched nothing"
+        ),
     }
 }
 

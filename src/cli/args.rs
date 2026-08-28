@@ -516,6 +516,26 @@ pub enum StateAction {
         #[arg(short, long)]
         export: Option<String>,
     },
+    /// Show the run-status ledger (extraction-run lifecycle rows gc/cleanup read)
+    Runs {
+        #[arg(short, long)]
+        config: String,
+        /// Show only `running` rows — the ones that can freeze a prefix
+        #[arg(long)]
+        running: bool,
+        /// Number of recent rows to show
+        #[arg(short, long, default_value = "50")]
+        last: usize,
+    },
+    /// Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful
+    /// successor) — the escape hatch for a prefix frozen by a stale `running` row
+    FinishRun {
+        #[arg(short, long)]
+        config: String,
+        /// The run id to close (find it with `rivet state runs --running`)
+        #[arg(long)]
+        run_id: String,
+    },
     /// Show the load ledger (`rivet load` runs recorded in the state DB)
     Loads {
         #[arg(short, long)]

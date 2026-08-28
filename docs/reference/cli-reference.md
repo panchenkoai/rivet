@@ -17,6 +17,8 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state reset-chunks`↴](#rivet-state-reset-chunks)
 * [`rivet state chunks`↴](#rivet-state-chunks)
 * [`rivet state progression`↴](#rivet-state-progression)
+* [`rivet state runs`↴](#rivet-state-runs)
+* [`rivet state finish-run`↴](#rivet-state-finish-run)
 * [`rivet state loads`↴](#rivet-state-loads)
 * [`rivet completions`↴](#rivet-completions)
 * [`rivet init`↴](#rivet-init)
@@ -188,6 +190,8 @@ Manage export state
 * `reset-chunks` — Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 * `chunks` — Show chunk checkpoint status for an export
 * `progression` — Show committed / verified export boundaries (the last fully-exported cursor position)
+* `runs` — Show the run-status ledger (extraction-run lifecycle rows gc/cleanup read)
+* `finish-run` — Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful successor) — the escape hatch for a prefix frozen by a stale `running` row
 * `loads` — Show the load ledger (`rivet load` runs recorded in the state DB)
 
 
@@ -277,6 +281,35 @@ Show committed / verified export boundaries (the last fully-exported cursor posi
 
 * `-c`, `--config <CONFIG>`
 * `-e`, `--export <EXPORT>` — Show progression for a specific export
+
+
+
+## `rivet state runs`
+
+Show the run-status ledger (extraction-run lifecycle rows gc/cleanup read)
+
+**Usage:** `rivet state runs [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `--running` — Show only `running` rows — the ones that can freeze a prefix
+* `-l`, `--last <LAST>` — Number of recent rows to show
+
+  Default value: `50`
+
+
+
+## `rivet state finish-run`
+
+Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful successor) — the escape hatch for a prefix frozen by a stale `running` row
+
+**Usage:** `rivet state finish-run --config <CONFIG> --run-id <RUN_ID>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `--run-id <RUN_ID>` — The run id to close (find it with `rivet state runs --running`)
 
 
 
