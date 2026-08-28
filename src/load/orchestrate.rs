@@ -893,9 +893,13 @@ fn full_done_line(inputs: &LoadInputs, report: &load::LoadReport) -> String {
 /// the PKs the re-snapshot fixed. The shape is detectable co-located: snapshot
 /// URIs in THIS load + a non-empty loaded-ledger for the target. First-cycle
 /// snapshot+changes (no prior loads) is the normal shape — no warning.
-fn rebaseline_warning(uris: &[String], target_fqtn: &str, prior_loaded: bool) -> Option<String> {
+fn rebaseline_warning(
+    uris: &[String],
+    target_fqtn: &str,
+    prior_loaded_runs: usize,
+) -> Option<String> {
     let has_snapshot = uris.iter().any(|u| u.contains("/snapshot/"));
-    if !has_snapshot || !prior_loaded {
+    if !has_snapshot || prior_loaded_runs == 0 {
         return None;
     }
     Some(format!(
@@ -942,11 +946,12 @@ fn load_one_cdc(
         |loader, store, inputs| {
             // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
             // into a __changes prior cycles already fed (see rebaseline_warning).
-            let prior_loaded = state
+            let prior_loaded_runs = state
                 .and_then(|s| s.loaded_source_run_ids(&loader.fqtn(&plan.table)).ok())
-                .is_some_and(|ids| !ids.is_empty());
+                .map(|ids| ids.len())
+                .unwrap_or(0);
             if let Some(w) =
-                rebaseline_warning(&inputs.uris, &loader.fqtn(&plan.table), prior_loaded)
+                rebaseline_warning(&inputs.uris, &loader.fqtn(&plan.table), prior_loaded_runs)
             {
                 eprintln!("{w}");
             }
@@ -1170,15 +1175,15 @@ mod load_ledger_tests {
         let snap = vec!["gs://b/p/snapshot/part-0.parquet".to_string()];
         let cdc = vec!["gs://b/p/cdc-000000.parquet".to_string()];
         assert!(
-            rebaseline_warning(&snap, "p.d.t", true)
+            rebaseline_warning(&snap, "p.d.t", 3)
                 .is_some_and(|w| w.contains("TRUNCATE") && w.contains("p.d.t__changes"))
         );
         assert!(
-            rebaseline_warning(&snap, "p.d.t", false).is_none(),
+            rebaseline_warning(&snap, "p.d.t", 0).is_none(),
             "first cycle"
         );
         assert!(
-            rebaseline_warning(&cdc, "p.d.t", true).is_none(),
+            rebaseline_warning(&cdc, "p.d.t", 3).is_none(),
             "changes-only"
         );
     }
