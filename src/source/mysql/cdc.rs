@@ -120,9 +120,11 @@ impl MysqlChangeStream {
     /// Measured against a real server at `MINIMAL`, three changes to a three-column
     /// table:
     ///
-    ///     insert | 1 | 10.5000 | alpha        <- fine
-    ///     update |   |         |              <- NO KEY, no value: 99.9 is gone
-    ///     delete | 2 |         |              <- key only
+    /// ```text
+    /// insert | 1 | 10.5000 | alpha        <- fine
+    /// update |   |         |              <- NO KEY, no value: 99.9 is gone
+    /// delete | 2 |         |              <- key only
+    /// ```
     ///
     /// and the run printed `status: success`, `rows: 4`, with no warning of any
     /// kind. An UPDATE row with a NULL key cannot even be applied to the right row,

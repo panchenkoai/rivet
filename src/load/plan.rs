@@ -173,8 +173,10 @@ impl LoadMode {
 /// a schema-qualified source table produced FOUR segments and the warehouse read
 /// the extra one as part of the dataset:
 ///
-///     table: public.orders  ->  rivet-data-tool.rivet_e2e.public.orders
-///     Not found: Dataset rivet-data-tool:rivet_e2e.public
+/// ```text
+/// table: public.orders  ->  rivet-data-tool.rivet_e2e.public.orders
+/// Not found: Dataset rivet-data-tool:rivet_e2e.public
+/// ```
 ///
 /// A hard failure with a message that blames a dataset the operator never named.
 ///
