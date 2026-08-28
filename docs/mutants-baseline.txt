@@ -1373,10 +1373,13 @@ src/pipeline/summary.rs:998:48: replace + with - in format_block
 src/pipeline/summary.rs:998:53: replace + with * in format_block
 src/pipeline/summary.rs:998:53: replace + with - in format_block
 
-# ── 2026-08-28 adjudication: mongo/cdc.rs (full run, 130 mutants) and the FIRST
-# 138 of mssql/cdc.rs's 280 (the run hit its wall-clock cap mid-file; the rest is
-# being re-run and will be adjudicated when it lands — an absent verdict is not a
-# clean one). Everything below is LIVE-GUARDED: `open`/`fill`/`next_change`/
+# ── 2026-08-28 adjudication: mongo/cdc.rs (full run, 130 mutants) and
+# mssql/cdc.rs (full run, 280: 90 caught, 52 unviable, 138 missed = 69 unique).
+# An earlier version of this comment said the mssql run was "cut off at 138 of
+# 280" — wrong, and worth recording HOW: 138 was the MISSED count read as a
+# progress count, because the driver's log carries only missed/timeout lines and
+# the summary line had scrolled past. A re-run of the full file produced the
+# identical missed set, which is what settled it. Everything below is LIVE-GUARDED: `open`/`fill`/`next_change`/
 # `connect` and the probe helpers are driver-bound glue whose oracles are the live
 # suites (`live_cdc_mongo.rs`, `live_cdc_mssql.rs` — resume, until_current,
 # type-matrix, crash/atomicity, and the spilled-tail crash test), plus the
