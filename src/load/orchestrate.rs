@@ -403,6 +403,15 @@ struct LoadInputs {
     /// LATER load of the same warehouse table from a DIFFERENT database can be
     /// refused instead of silently replacing these rows.
     source_ident: String,
+    /// Which runs were still WRITING at the moment the manifests were FETCHED —
+    /// sampled BEFORE the fetch, in [`prepare_load`]. `record` unions this with
+    /// its own record-time sample: a run that finishes DURING the warehouse copy
+    /// is active in neither sample alone taken at record time, yet the manifest
+    /// this load consumed was its mid-flight snapshot — recording it consumed
+    /// would strand every part it flushed after the fetch, permanently
+    /// (round-4 TOCTOU). `None` = the sample could not be taken (stateless, or
+    /// the query failed): record then consumes NOTHING this cycle.
+    active_at_fetch: Option<std::collections::HashSet<String>>,
 }
 
 /// The prior source identity that CONFLICTS with the one this load carries, or
@@ -443,6 +452,24 @@ fn prepare_load(
     target_fqtn: &str,
     allow_source_drift: bool,
 ) -> Result<Option<LoadInputs>> {
+    // Sampled BEFORE the manifests are read, deliberately: a run that finishes
+    // between this sample and the fetch stays in the set and is merely
+    // re-appended next cycle (at-least-once, absorbed by the current-state
+    // view). The reverse order — sample after fetch — reopens the TOCTOU this
+    // exists to close: finish-then-fetch would read the run as consumable
+    // against a manifest snapshot older than its last parts.
+    let active_at_fetch = state.and_then(|s| match s.active_run_ids_on_prefix(&plan.gcs_prefix) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            log::warn!(
+                "load: cannot tell which runs are writing into {} at fetch time ({e:#}) — \
+                 this cycle will not record any run as consumed, so nothing they write \
+                 later is stranded",
+                plan.gcs_prefix
+            );
+            None
+        }
+    });
     let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
     // Refuse a prefix shared by two exports BEFORE selecting/summing/cleaning:
     // the load sums every manifest here and cleanup wipes the prefix recursively,
@@ -525,6 +552,7 @@ fn prepare_load(
         uris,
         source_run_ids,
         source_ident,
+        active_at_fetch,
     }))
 }
 
@@ -557,6 +585,10 @@ struct LoadCtx<'a> {
     /// Set once the manifests are known (after `prepare_load`), so the ledger row
     /// records WHERE the rows came from and not merely that they arrived.
     source_ident: String,
+    /// [`LoadInputs::active_at_fetch`], copied beside `source_ident` — `record`
+    /// unions it with its own record-time sample so a run that finished DURING
+    /// the copy is still excluded from the consumed set.
+    active_at_fetch: Option<std::collections::HashSet<String>>,
 }
 
 /// The source runs this load may record as CONSUMED: everything it read, MINUS
@@ -624,7 +656,7 @@ impl LoadCtx<'_> {
         // forever — the harm the comment above describes. Treating the answer as
         // "assume they are all active" records none of them, and the next cycle
         // re-evaluates: at-least-once, which the current-state view absorbs.
-        let active = match s.active_run_ids_on_prefix(self.source_prefix) {
+        let mut active = match s.active_run_ids_on_prefix(self.source_prefix) {
             Ok(a) => a,
             Err(e) => {
                 log::warn!(
@@ -636,6 +668,17 @@ impl LoadCtx<'_> {
                 source_run_ids.iter().cloned().collect()
             }
         };
+        // UNION with the fetch-time sample: this method runs AFTER the warehouse
+        // copy, so a run that finished (or was resumed and finished) during the
+        // copy is absent from the record-time set — but the manifest this load
+        // consumed was fetched while it was still writing, i.e. a mid-flight
+        // snapshot. Consuming it would strand its post-fetch parts forever.
+        // No fetch-time sample at all (the query failed) → consume nothing;
+        // the next cycle re-evaluates, which the dedup view absorbs.
+        match &self.active_at_fetch {
+            Some(at_fetch) => active.extend(at_fetch.iter().cloned()),
+            None => active.extend(source_run_ids.iter().cloned()),
+        }
         let source_run_ids = consumable_run_ids(source_run_ids, &active);
         if let Some(note) = active_run_note(active.len(), self.source_prefix) {
             eprintln!("{note}");
@@ -711,6 +754,7 @@ fn execute_load<R>(
         mode: job.mode,
         source_prefix: job.plan.gcs_prefix.as_str(),
         source_ident: String::new(),
+        active_at_fetch: None,
     };
     let inputs = match prepare_load(
         &store,
@@ -721,6 +765,7 @@ fn execute_load<R>(
     )? {
         Some(i) => {
             ctx.source_ident = i.source_ident.clone();
+            ctx.active_at_fetch = i.active_at_fetch.clone();
             i
         }
         None => {
@@ -1043,6 +1088,7 @@ mod load_ledger_tests {
     fn ctx<'a>(state: &'a StateStore, load_id: &'a str) -> LoadCtx<'a> {
         LoadCtx {
             source_ident: String::new(),
+            active_at_fetch: Some(Default::default()),
             source_prefix: "gs://b/p/",
             state: Some(state),
             load_id,
@@ -1179,6 +1225,7 @@ mod load_ledger_tests {
         // Stateless load (state=None): recording must not panic and writes nothing.
         let c = LoadCtx {
             source_ident: String::new(),
+            active_at_fetch: None,
             state: None,
             load_id: "L1",
             export_name: "orders",
@@ -1250,6 +1297,124 @@ mod live_only_decisions {
         let p = dir.path().join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    /// A minimal Success manifest whose one part exists in the store — enough for
+    /// `prepare_load` to fetch, select and integrity-check it.
+    fn success_manifest(run: &str, part: &str) -> crate::manifest::RunManifest {
+        use crate::manifest::*;
+        RunManifest {
+            manifest_version: MANIFEST_VERSION,
+            run_id: run.into(),
+            export_name: "orders".into(),
+            export_family: "orders".into(),
+            mode: "cdc".into(),
+            started_at: "2026-08-21T00:00:00Z".into(),
+            finished_at: "2026-08-21T00:01:00Z".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: Some("public".into()),
+                table: Some("orders".into()),
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "gcs".into(),
+                uri: "gs://b/base".into(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: "xxh3:0123456789abcdef".into(),
+            row_count: 1,
+            part_count: 1,
+            parts: vec![ManifestPart {
+                part_id: 0,
+                path: part.into(),
+                rows: 1,
+                size_bytes: 1,
+                content_fingerprint: "xxh3:0123456789abcdef".into(),
+                content_md5: String::new(),
+                status: PartStatus::Committed,
+            }],
+            column_checksums: None,
+            checksum_render: None,
+            checksum_key_column: None,
+            row_hash: None,
+            split_window: None,
+        }
+    }
+
+    /// THE ROUND-4 TOCTOU, at the boundary and through the real producer: a run
+    /// LIVE when `prepare_load` fetched the manifests finishes DURING the
+    /// warehouse copy — by record time it is active in neither a record-time
+    /// sample nor the ledger, yet the manifest this load consumed was its
+    /// mid-flight snapshot. Recording it consumed strands every part it flushed
+    /// after the fetch, permanently (`select_runs` skips consumed run_ids).
+    ///
+    /// `active_at_fetch` is produced by the REAL `prepare_load` over a real fs
+    /// store + state DB (not fabricated — the fabricated-input class is exactly
+    /// how this went unobserved), then `finish_run` lands between prepare and
+    /// record, as the copy window does. RED against dropping the fetch-time
+    /// union in `record` (the pre-fix record-time-only sampling).
+    #[test]
+    fn a_run_finishing_during_the_copy_is_not_recorded_as_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        for (run, part) in [("run-live", "live-0.parquet"), ("r-done", "done-0.parquet")] {
+            write_at(&dir, &format!("base/{part}"), b"x");
+            let m = success_manifest(run, part);
+            write_at(
+                &dir,
+                &format!("base/manifest-{run}.json"),
+                &serde_json::to_vec(&m).unwrap(),
+            );
+        }
+        let state = state_with_active_run(prefix); // r-live is WRITING at fetch time
+        // …under the run_id the manifests carry:
+        let plan = plan_at(LoadMode::Cdc, prefix);
+        let inputs = prepare_load(&store, &plan, Some(&state), "p.d.orders", false)
+            .unwrap()
+            .expect("two unloaded Success runs must select");
+        // Not inert: the fetch-time sample really names the live run.
+        assert_eq!(
+            inputs
+                .active_at_fetch
+                .as_ref()
+                .map(|a| a.contains("run-live")),
+            Some(true),
+            "the fixture must catch the run mid-write, or this test grades nothing"
+        );
+        assert_eq!(inputs.source_run_ids.len(), 2);
+
+        // The copy window: the run finishes AFTER the fetch, BEFORE record.
+        state
+            .finish_run("run-live", "success", "2026-08-21T00:02:00Z")
+            .unwrap();
+
+        let ctx = LoadCtx {
+            state: Some(&state),
+            load_id: "load-1",
+            export_name: "orders",
+            target_fqtn: "proj.ds.orders",
+            warehouse: "bigquery",
+            mode: LoadMode::Cdc,
+            source_prefix: prefix,
+            source_ident: inputs.source_ident.clone(),
+            active_at_fetch: inputs.active_at_fetch.clone(), // execute_load's copy
+        };
+        ctx.record_success(&inputs.source_run_ids, 2);
+
+        let loaded = state.loaded_source_run_ids("proj.ds.orders").unwrap();
+        assert!(
+            loaded.contains("r-done"),
+            "positive control: the run terminal at FETCH time is consumed, got {loaded:?}"
+        );
+        assert!(
+            !loaded.contains("run-live") && !loaded.contains("r-live"),
+            "a run live at fetch time finished during the copy — consuming it strands its \
+             post-fetch parts: {loaded:?}"
+        );
     }
 
     /// A state store with `run` recorded `running` on `prefix` — the ledger's
@@ -1524,6 +1689,7 @@ mod live_only_decisions {
             uris: vec!["gs://b/base/part-000000.parquet".into()],
             source_run_ids: vec!["r1".into()],
             source_ident: "postgres:public.orders".into(),
+            active_at_fetch: Some(Default::default()),
         };
 
         let appended = load::CdcLoadReport {

@@ -8929,6 +8929,45 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     );
 }
 
+/// An anchor whose identity query FAILS must refuse to write the checkpoint —
+/// never quietly write an UNVERIFIABLE one.
+///
+/// `unwrap_or_default` here shipped an empty `server_uuid` on any transient blip
+/// of the second query (measured on a loaded CI runner, where the sibling test's
+/// inertness guard caught the empty uuid) — an anchor the foreign-server refusal
+/// can never check. The healthy stand cannot produce the failure, so the fault
+/// hook is the only honest fixture; without it the swallowing mutant is
+/// equivalent on every test environment.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW + REPLICATION grant)"]
+fn mysql_anchor_refuses_to_write_an_unverifiable_checkpoint() {
+    let tbl = unique_name("cdc_anchor_id");
+    let mut c = conn();
+    use mysql::prelude::Queryable;
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl);
+    let out = rig.run_with_envs(&[("RIVET_TEST_ERROR_AT", "mysql_identity_query")]);
+    assert!(
+        !out.status.success(),
+        "an anchor that cannot record the server's identity must FAIL, not write \
+         a checkpoint the resume can never verify"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("UNVERIFIABLE anchor"),
+        "the refusal must say WHY the anchor was not written: {err}"
+    );
+    assert!(
+        !rig.checkpoint().exists(),
+        "no checkpoint may exist — a half-anchor with an empty uuid is exactly \
+         the artifact this refusal exists to prevent"
+    );
+}
+
 /// A rolled-back MyISAM statement is framed as its OWN transaction — it must not be
 /// fused into the next one's commit.
 ///

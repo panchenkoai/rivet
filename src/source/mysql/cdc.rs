@@ -646,6 +646,11 @@ impl MysqlChangeStream {
     /// measured, and the reason the uuid is the floor and GTID only ever an extra).
     fn server_identity(url: &str, tls: Option<&TlsConfig>) -> Result<(String, String)> {
         use mysql::prelude::Queryable;
+        // Fault hook: the identity query's transient failure is the state the
+        // no-swallowing contract exists for, and a healthy stand can never
+        // produce it — without this, the mutant restoring `unwrap_or_default`
+        // is equivalent on every test environment.
+        crate::test_hook::maybe_fail_at("mysql_identity_query")?;
         let mut c = connect_conn(url, tls)?;
         let uuid: String = c
             .query_first("SELECT @@server_uuid")?
@@ -701,7 +706,22 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
     ) -> Result<()> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+        // `?`, never `unwrap_or_default`: swallowing the error wrote a checkpoint
+        // with an EMPTY uuid — an unverifiable anchor that silently disables the
+        // whole foreign-server refusal this identity exists for, on any transient
+        // blip of the second query (the first, `current_coordinates`, had just
+        // succeeded on the same connection path — measured on a loaded E2E runner,
+        // where the inertness guard in the live test caught the empty uuid). An
+        // anchor rivet cannot later verify must not be created quietly; failing
+        // here is retryable and loud.
+        let (uuid, gtid) = Self::server_identity(url, tls).map_err(|e| {
+            anyhow::anyhow!(
+                "mysql cdc: could not record the server's identity for the new \
+                 checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: a \
+                 checkpoint without a server_uuid cannot be checked against a \
+                 foreign server on resume"
+            )
+        })?;
         Position(serde_json::json!({
             "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
         }))
@@ -810,7 +830,21 @@ impl MysqlChangeStream {
                  trusting the result.",
                 path.display()
             );
-            let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+            // `?`, never `unwrap_or_default` — the SECOND site of the same
+            // swallowing `pin_checkpoint_at_current` had, and the one the config
+            // path actually takes: a transient blip of the identity query wrote a
+            // checkpoint with an EMPTY uuid, an unverifiable anchor that silently
+            // disables the foreign-server refusal (measured on a loaded CI
+            // runner, where the live test's inertness guard caught the empty
+            // uuid). Refusing is retryable and loud; a half-anchor is forever.
+            let (uuid, gtid) = Self::server_identity(url, tls).map_err(|e| {
+                anyhow::anyhow!(
+                    "mysql cdc: could not record the server's identity for the new \
+                     checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: \
+                     a checkpoint without a server_uuid cannot be checked against a \
+                     foreign server on resume"
+                )
+            })?;
             Position(serde_json::json!({
                 "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
             }))

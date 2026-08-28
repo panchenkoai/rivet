@@ -489,6 +489,13 @@ mod tests {
     /// the loser's `rename` failed with ENOENT. Names are unique per writer now,
     /// so a stale temp is merely litter: this test pins that it does not affect
     /// the write, and that the debris is still recognisable as ours to sweep.
+    ///
+    /// MESSAGE TRUTH (round-4): no sweeper EXISTS today — nothing in the tree
+    /// deletes `.{name}.*.tmp` debris (gc_orphans lists only `.parquet`; the
+    /// spill sweep matches only `rivet-spill-*.bin`). The pin above guards the
+    /// debris staying RECOGNISABLE so a future sweep stays possible; it does
+    /// not promise one runs. A crash leaks exactly one dot-file per in-flight
+    /// write — disk lint, cleaned by hand or by a future sweeper.
     #[test]
     fn stale_temp_from_crashed_run_does_not_affect_the_next_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -513,7 +520,8 @@ mod tests {
             temps,
             vec![".data.csv.tmp".to_string()],
             "this write leaves no temp of its own, and the stale one is untouched \
-             (dot-prefixed and .tmp-suffixed, so a sweep can still find it)"
+             (dot-prefixed and .tmp-suffixed, so a FUTURE sweep could find it — \
+             none exists today; see the doc above)"
         );
     }
 

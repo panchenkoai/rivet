@@ -104,7 +104,14 @@ impl RivetValue {
             | RivetValue::Float(_)
             | RivetValue::TimeMicros(_) => 8,
             RivetValue::DateTime(_) => 12,
-            RivetValue::Bytes(b) => b.len(),
+            // CAPACITY, not len — the model's contract is RESIDENT cost, and the
+            // one producer whose Bytes carry real slack is Mongo: its document
+            // cell comes through `serde_json::to_string`, whose doubling growth
+            // leaves capacity/len in (1, 2]. Charging len under-counted a
+            // large-document stream up to 2x — outside the calibration contract
+            // that already caught a 12.7x under and a 1.8x over. A no-op for the
+            // exact-capacity engines (PG's to_vec, MySQL's clone).
+            RivetValue::Bytes(b) => b.capacity(),
             // The Vec's SLOTS plus the elements — the same accounting
             // `ChangeEvent::estimated_bytes` gives the top-level image. A flat `+ 16`
             // charged a 1000-element `integer[]` 8 KB where its slots alone are 32 KB

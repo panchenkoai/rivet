@@ -520,7 +520,10 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
         // The login failed." — the trailing sentence matched the `login failed`
         // needle and answered a wrong DATABASE NAME with a credentials hint. The
         // opening phrase is the discriminating one, so it is checked first.
-        || msg.contains("Cannot open database")
+        // lowercase: the haystack is lowercased at the top of this fn — the first
+        // version of this needle carried capitals and was dead on arrival
+        // (round-4 fuzz sweep), un-fixing the very case its comment describes.
+        || msg.contains("cannot open database")
     {
         return "unknown database";
     }
@@ -1030,6 +1033,20 @@ exports:
     }
 
     // ── regression coverage for the broadened needles (fixes #1/#2) ──────────
+
+    /// MSSQL 4060 routes to "unknown database", NOT auth — through the REAL fn,
+    /// whose haystack is LOWERCASED: the first needle carried capitals and was
+    /// dead on arrival, so this exact input fell through to the trailing
+    /// "login failed" sentence and got the credentials hint its own comment
+    /// claimed to have fixed. RED against re-capitalizing the needle.
+    #[test]
+    fn mssql_wrong_database_is_not_an_auth_error() {
+        let err = anyhow::anyhow!(
+            "Cannot open database \"prod_reporting\" requested by the login. \
+             The login failed. Login failed for user 'rivet'."
+        );
+        assert_eq!(categorize_source_error(&err), "unknown database");
+    }
 
     // The pg auth reason is nested in `.source()`; only `{:#}` surfaces it.
     // This proves the categorizer reads the alternate form, not just the bare

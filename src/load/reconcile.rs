@@ -203,9 +203,13 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
 ///   unmanifested part is dead crash debris → delete.
 ///
 /// The ledger read is the SEAM. A co-located / shared-Postgres load gets a
-/// precise `active`; a stateless or foreign-host load passes `active = true`
-/// (conservative — spare rather than risk a live cross-host extract's parts),
-/// which the bucket-manifest `running`-status projection later refines.
+/// precise `active`; a stateless load has NO ledger to ask (`ledger_says_active
+/// (None)` is false — "the manifest signal decides alone") and a foreign-host
+/// load reads a fresh empty DB (`Some(Ok(false))`) — for BOTH, the bucket's
+/// `running`-marker projection is the ONLY spare signal, which is why marker
+/// supersession is success-only (round-4: this sentence used to claim they
+/// "pass `active = true`", and a reader citing it would conclude the marker
+/// rule cannot matter — it is all that stands between gc and a live run).
 /// Returns `(removed, bytes)`.
 #[allow(private_interfaces)]
 pub fn gc_orphans(
@@ -215,9 +219,11 @@ pub fn gc_orphans(
     active: bool,
 ) -> Result<(usize, u64)> {
     let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
-    // Success parts → keep. Failed/Interrupted parts → terminal (their run is
-    // done, so deletable regardless of `active`). A part in NEITHER set has no
-    // manifest at all — the ambiguous case `active` gates.
+    // Success parts → keep. Failed/Interrupted parts → terminal ONLY once a
+    // newer same-family Success supersedes their run (until then a checkpoint
+    // resume may still adopt them); then deletable regardless of `active`. A
+    // part in NEITHER set has no manifest at all — the ambiguous case `active`
+    // gates.
     let census = ManifestCensus::new(keyed);
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -241,7 +247,19 @@ pub fn gc_orphans(
                 // referencing parts that are gone (post-0.24.3 review HIGH). Spare exactly those
                 // (KEEP); everything else stays terminal debris, deletable even while an
                 // UNRELATED export's run is active (no over-defer of genuine crash leftovers).
-                if census.adopted_by_active_running(run) {
+                // …and the live-resume spare has an idle sibling (round-4 HIGH):
+                // BETWEEN attempts of a checkpoint-resumable export there is no
+                // Running marker at all, yet the next `--resume` will rehydrate
+                // these very parts into its manifest WITHOUT re-probing the
+                // destination (keyset has no M8 preamble) — deleting them here
+                // makes that resume finalize Success + `_SUCCESS` naming parquet
+                // that no longer exists. So a Failed run's parts stay spared
+                // until the run is SUPERSEDED (a newer same-family SUCCESS — the
+                // resume completed; whatever it adopted is now declared under
+                // the Success arm above, and the remainder is genuine debris).
+                // Cost of the spare: an abandoned export's crash debris lives
+                // until a successful pass — bounded, and the safe direction.
+                if census.adopted_by_active_running(run) || !census.superseded(run) {
                     keep.extend(resolve_parts(key, m));
                 } else {
                     terminal.extend(resolve_parts(key, m));
@@ -1328,14 +1346,57 @@ mod tests {
     }
 
     #[test]
-    fn gc_orphans_deletes_a_terminal_runs_parts_even_while_a_run_is_active() {
-        // A Failed/Interrupted run's parts are terminal crash debris — deleted
-        // regardless of `active`, since no LIVE run is streaming THEM. Passing
-        // active=true proves the `active` gate applies only to UNmanifested parts.
+    fn gc_orphans_deletes_a_superseded_terminal_runs_parts_even_while_a_run_is_active() {
+        // A Failed run whose export has SINCE PASSED (newer same-family Success)
+        // is terminal crash debris — deleted regardless of `active`, since no
+        // resume will ever adopt it again. Passing active=true proves the
+        // `active` gate applies only to UNmanifested parts. (Round-4: without
+        // the Success successor these parts are SPARED — the next `--resume`
+        // rehydrates them destination-blind; see the sibling test below.)
         let (store, _g) = fs_store(&[("base/f-000.parquet", b"x".to_vec())]);
         let mut kv = keyed("base/manifest-f.json", "f", "f-000.parquet");
         kv.1.status = ManifestStatus::Failed;
-        assert_eq!(gc_orphans(&store, "gs://b/base", &[kv], true).unwrap().0, 1);
+        kv.1.started_at = "2026-01-01T00:00:00Z".into();
+        let mut ok = manifest("f2", 10, Some(10)); // Success, same export family
+        ok.started_at = "2026-01-02T00:00:00Z".into();
+        let ok = ("base/manifest-f2.json".to_string(), ok);
+        assert_eq!(
+            gc_orphans(&store, "gs://b/base", &[kv, ok], true)
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    /// ROUND-4 HIGH (keyset × gc): between two attempts of a checkpoint-resumable
+    /// export there is NO live run — the crashed attempt's Failed manifest names
+    /// its committed pages, and the next `--resume` rehydrates exactly those
+    /// parts from the state DB without probing the destination. gc firing in that
+    /// window used to delete them (the old unconditional terminal arm), so the
+    /// resume finalized Success + `_SUCCESS` naming parquet that no longer
+    /// exists — rows silently absent while every count reads clean. RED against
+    /// `terminal.extend` without the supersession gate.
+    #[test]
+    fn gc_orphans_spares_a_failed_runs_parts_until_a_success_supersedes_it() {
+        let (store, _g) = fs_store(&[("base/page0.parquet", b"x".to_vec())]);
+        let mut failed = keyed("base/manifest-r0.json", "r0", "page0.parquet");
+        failed.1.status = ManifestStatus::Failed;
+        failed.1.started_at = "2026-01-01T00:00:00Z".into();
+        // No successor at all — the between-attempts window. active=false: no
+        // ledger row, no marker; pre-fix this deleted the page.
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[failed], false).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a Failed run's committed pages are the next resume's payload, not debris"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("page0.parquet")),
+            "the committed page must survive the between-attempts gc"
+        );
     }
 
     #[test]
@@ -1458,14 +1519,25 @@ mod tests {
             "two still-Running split siblings must count as active even when a later-started \
              sibling has already finished — else a cross-host gc deletes their in-flight parts"
         );
-        // A crash SUCCESSOR (same export_name, newer start) MUST still supersede the crashed marker.
+        // A merely-RUNNING re-run of the same unit does NOT supersede (ledger
+        // parity, round-4): the successor cannot prove the older writer died,
+        // and it keeps the prefix active by itself — nothing is lost by waiting.
         let crashed = unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z");
         let successor = unit("orders#0", ManifestStatus::Running, "2026-01-02T00:00:00Z");
-        let rerun = [crashed, successor];
+        let rerun = [crashed.clone(), successor];
+        let census = ManifestCensus::new(&rerun);
+        assert!(
+            !census.superseded(&census.runs()[0]),
+            "a running successor proves nothing about the older marker"
+        );
+        assert!(census.active_running());
+        // Its SUCCESS does: a finished full pass retires the crashed marker.
+        let done = unit("orders#0", ManifestStatus::Success, "2026-01-02T00:00:00Z");
+        let rerun = [crashed, done];
         let census = ManifestCensus::new(&rerun);
         assert!(
             census.superseded(&census.runs()[0]),
-            "a re-run of the SAME unit (orders#0) must still supersede its crashed marker"
+            "a SUCCESS re-run of the SAME unit (orders#0) supersedes its crashed marker"
         );
     }
 
@@ -1513,16 +1585,21 @@ mod tests {
 
     #[test]
     fn gc_orphans_removes_a_superseded_running_marker_but_spares_a_live_one() {
-        // r1 crashed leaving a `running` marker; r2 (newer, same export) is the
-        // live run. The DEAD superseded marker must be GC'd (else it accumulates
-        // forever — gc otherwise only lists `.parquet`); the LIVE one must survive
-        // (it is the active signal). Gated on supersession, so `active=true`.
+        // r1 crashed leaving a `running` marker; r2 (newer, same export) RAN TO
+        // SUCCESS. The DEAD superseded marker must be GC'd (else it accumulates
+        // forever — gc otherwise only lists `.parquet`). Success-only (round-4
+        // ledger parity): when the successor is merely another RUNNING marker —
+        // plain overlap, either could be live — NEITHER marker is swept, because
+        // deleting a live run's marker mid-flight destroys the one signal that
+        // protects its unmanifested parts from the next cross-host gc.
         let (store, _g) = fs_store(&[
             ("base/manifest-r1.json", b"{}".to_vec()), // superseded running marker
-            ("base/manifest-r2.json", b"{}".to_vec()), // live running marker (newest)
+            ("base/manifest-r2.json", b"{}".to_vec()), // the successor's manifest
         ]);
         let r1 = running("r1", "2026-01-01T00:00:01Z");
-        let r2 = running("r2", "2026-01-01T00:00:02Z");
+        let mut ok = manifest("r2", 10, Some(10)); // Success, same export
+        ok.started_at = "2026-01-01T00:00:02Z".into();
+        let r2 = ("base/manifest-r2.json".to_string(), ok);
         let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true).unwrap();
         assert_eq!(removed, 1, "only the superseded running marker is removed");
         let left = store.list_files("base").unwrap();
@@ -1532,8 +1609,22 @@ mod tests {
         );
         assert!(
             left.iter().any(|k| k.ends_with("manifest-r2.json")),
-            "the live (non-superseded) running marker survives — it is the active signal"
+            "the successor's manifest survives"
         );
+
+        // Overlap: two running markers, no Success — both survive the sweep.
+        let (store, _g) = fs_store(&[
+            ("base/manifest-r1.json", b"{}".to_vec()),
+            ("base/manifest-r2.json", b"{}".to_vec()),
+        ]);
+        let r1 = running("r1", "2026-01-01T00:00:01Z");
+        let r2 = running("r2", "2026-01-01T00:00:02Z");
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true).unwrap();
+        assert_eq!(
+            removed, 0,
+            "an overlapping running successor sweeps NOTHING"
+        );
+        assert_eq!(store.list_files("base").unwrap().len(), 2);
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {

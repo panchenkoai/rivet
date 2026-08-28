@@ -47,3 +47,10 @@ scenarios:
     mysql:    { na: "binlog coords read by panic-safe field access (.get(\"file\") / .get(\"pos\")); no bson-backed type deserialization" }
     mssql:    { na: "from-LSN read by panic-safe field access; no bson-backed type deserialization" }
     mongo:    { test: mongo_resume_token }
+
+  - id: fuzz_spill_frame_decode
+    what: "the CDC spill tagged frame (length-prefixed on-disk record log) — a persisted, corruptible input like the checkpoint row; round-4 found a nesting-bomb SIGSEGV and a 4 GiB length-prefix pre-alloc here by hand"
+    postgres: { na: "PostgreSQL spills RAW test_decoding wire rows, not the tagged frame — the re-decode goes through parse_test_decoding, which the fuzz_cdc_wire_decode row already targets; decode_wire_row framing is bounds-checked (checked_add, length-prefixed, utf8-refused)" }
+    mysql:    { test: spill_frame_decode }
+    mssql:    { test: spill_frame_decode }
+    mongo:    { na: "Mongo spills NOTHING by construction (the control engine in the spill design) — no adapter-side buffer ever reaches SpooledTx, so there is no frame to parse" }

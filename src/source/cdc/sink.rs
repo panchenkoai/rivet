@@ -2656,6 +2656,76 @@ mod tests {
         }
     }
 
+    /// A destination that delegates to the real local one but FAILS exactly the
+    /// terminal writes (`manifest*` / `_SUCCESS`) — the one failure shape
+    /// `FailingDestination` (which fails EVERYTHING) can never reach: with it the
+    /// drain dies at the first flush and the `(Ok(()), Some(e))` arm plus the
+    /// sibling-gating never run.
+    struct ManifestFailingDest {
+        inner: Box<dyn crate::destination::Destination>,
+    }
+    impl crate::destination::Destination for ManifestFailingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            let name = key.rsplit('/').next().unwrap_or(key);
+            if name.starts_with("manifest") || name == "_SUCCESS" {
+                anyhow::bail!("injected: terminal write of '{key}' refused");
+            }
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A failed TERMINAL manifest write is the run's OUTCOME — never a success
+    /// with a stale manifest.
+    ///
+    /// This arm had never executed in any test: the only injector failed every
+    /// write, so the drain died first and `(Ok(()), Some(e))` was dead weight a
+    /// mutant could flip to `(manifests, Ok(()))` — a run whose `_SUCCESS` never
+    /// landed reporting success in metrics and journal while the prefix carries
+    /// no completion marker and a stale canonical manifest.
+    #[test]
+    fn a_failed_terminal_manifest_write_fails_the_run_and_writes_no_success() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = ManifestFailingDest {
+            inner: local_dest(&d),
+        };
+        let cols = int_col();
+        let mut e1 = insert(1);
+        e1.committed = true;
+        let mut stream = FakeStream {
+            events: vec![e1].into(),
+            acked: Vec::new(),
+        };
+        let (m, r) = run_to_files(&mut stream, cfg(&dest, &cols, FormatType::Parquet, 100));
+        assert!(
+            r.is_err(),
+            "the terminal write failed — reporting Ok would let metrics and the \
+             journal record a success no completion marker supports"
+        );
+        assert!(
+            !m.is_empty(),
+            "the manifests are still RETURNED — discarding them on a write error \
+             would throw away the record of what IS durable"
+        );
+        assert!(
+            !d.path().join("_SUCCESS").exists(),
+            "no _SUCCESS may exist for a run whose terminal write failed"
+        );
+        // The data part itself is durable — only the terminal records failed.
+        let parts: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+            .collect();
+        assert_eq!(parts.len(), 1, "the flushed part must survive");
+    }
+
     /// The cross-part checksum fold is SUM, recorded with the Sum render stamp —
     /// graded on TWO parts with EQUAL sums, the one fixture where every wrong
     /// fold shows its face.

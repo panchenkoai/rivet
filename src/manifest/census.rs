@@ -112,12 +112,19 @@ impl<'a> ManifestCensus<'a> {
         &self.runs
     }
 
-    /// A `running` manifest is SUPERSEDED when a NEWER run of the SAME family
-    /// exists (a higher `started_at`) — it crashed and its successor already
-    /// re-ran, so it no longer protects anything. The ONE clock-free staleness
-    /// predicate, shared by [`Self::active_running`] (spare the non-superseded)
-    /// and `gc_orphans`'s marker-GC sweep (delete the superseded). The ledger
-    /// enforces the same rule in SQL — that copy cannot share this Rust.
+    /// A `running` manifest is SUPERSEDED only when a NEWER **Success** of the
+    /// SAME family exists — a full pass genuinely happened after it, so the
+    /// marker no longer protects anything. A newer FAILED manifest proves
+    /// somebody TRIED, not that this run died (an overlapping cycle that fails
+    /// fast must not retire a live writer's marker); a newer RUNNING marker
+    /// proves even less — and costs nothing to ignore, because that successor
+    /// keeps [`Self::active_running`] true by itself. The ONE clock-free
+    /// staleness predicate, shared by [`Self::active_running`] (spare the
+    /// non-superseded) and `gc_orphans`'s marker-GC sweep (delete the
+    /// superseded). The ledger enforces the same rule in SQL
+    /// (`r2.status = 'success'`, both spellings) — that copy cannot share this
+    /// Rust, and round-4 caught this copy still on the pre-fix any-newer rule
+    /// while its doc claimed parity.
     ///
     /// FAMILY, not name: a CDC run's `running` marker carries the EXPORT name
     /// while the drain's terminal manifest carries the TABLE string, so with
@@ -134,7 +141,8 @@ impl<'a> ManifestCensus<'a> {
     /// only a DIFFERENT sibling (`orders#1` vs `orders#0`) is excluded.
     pub fn superseded(&self, run: &CensusRun<'_>) -> bool {
         self.runs.iter().any(|o| {
-            o.family == run.family()
+            o.manifest.status == ManifestStatus::Success
+                && o.family == run.family()
                 && o.manifest.started_at > run.manifest.started_at
                 && !split_siblings(o, run)
         })
@@ -578,6 +586,47 @@ mod tests {
             keyed.into_iter().next().unwrap(),
             ("base/manifest-r2.json".to_string(), rerun),
         ];
+        let census = ManifestCensus::new(&keyed);
+        assert!(census.superseded(&census.runs()[0]));
+        assert!(!census.active_running());
+    }
+
+    /// Census twin of the ledger's `a_newer_failed_run_does_not_supersede_a_live_one`
+    /// (round-3 fixed the SQL spellings; round-4 found THIS spelling still on the
+    /// any-newer rule). A newer FAILED manifest — the overlap-then-fail-fast cycle —
+    /// and a newer RUNNING marker both leave the older live marker ACTIVE; only a
+    /// newer SUCCESS retires it. RED against dropping the Success requirement.
+    #[test]
+    fn a_newer_failed_or_running_run_does_not_supersede_a_live_marker() {
+        let live = {
+            let mut x = m("r0", "orders", "orders");
+            x.status = ManifestStatus::Running;
+            x.started_at = "2026-08-21T00:00:00Z".into();
+            x.finished_at = String::new();
+            x
+        };
+        for status in [ManifestStatus::Failed, ManifestStatus::Running] {
+            let successor = {
+                let mut x = m("r1", "orders", "orders");
+                x.status = status;
+                x.started_at = "2026-08-21T00:05:00Z".into();
+                x
+            };
+            let keyed = vec![keyed("r0", live.clone()), keyed("r1", successor)];
+            let census = ManifestCensus::new(&keyed);
+            assert!(
+                !census.superseded(&census.runs()[0]),
+                "a newer {status:?} proves somebody tried, not that the live run died"
+            );
+            assert!(
+                census.active_running(),
+                "the live marker must keep protecting its unmanifested parts"
+            );
+        }
+        // And the release: a newer SUCCESS genuinely supersedes.
+        let mut done = m("r2", "orders", "orders");
+        done.started_at = "2026-08-21T00:10:00Z".into();
+        let keyed = vec![keyed("r0", live), keyed("r2", done)];
         let census = ManifestCensus::new(&keyed);
         assert!(census.superseded(&census.runs()[0]));
         assert!(!census.active_running());

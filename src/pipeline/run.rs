@@ -1643,10 +1643,12 @@ pub(crate) fn run_pool(
     // config.exports slot to borrow, and everything downstream (`by_name`,
     // `queue`) borrows from THIS vec.
     //
-    // #167 per-unit resume: with `--split` the prefix-level _SUCCESS is AMBIGUOUS
-    // (a split prefix's _SUCCESS is written per-unit, so it is present the moment
-    // ONE unit finishes) — pre-skipping the giant on it would drop a partially-
-    // complete split. So when `--split` is set the pre-skip is deferred to a
+    // #167 per-unit resume: with `--split` the prefix-level _SUCCESS says the
+    // WHOLE giant completed (units suppress their own marker; the pool writes
+    // the one marker after every unit succeeds) — but a crash can leave a
+    // partially-complete split with NO marker, and pre-skipping the giant on
+    // the marker's absence alone cannot tell "never ran" from "half done". So
+    // when `--split` is set the pre-skip is deferred to a
     // PER-UNIT skip AFTER the split (below); without `--split` the normal
     // prefix-level skip applies here unchanged.
     let mut effective: Vec<ExportConfig> = config
@@ -1900,6 +1902,14 @@ pub(crate) fn run_pool(
             }
         });
         if effective.is_empty() {
+            // Every split unit is complete — but this return sits ABOVE the
+            // pool's prefix-`_SUCCESS` writer, so a crash in the
+            // [last unit's Success → marker] window would leave the marker
+            // missing FOREVER (this is the only path that ever looks again).
+            // Repair it before declaring "nothing to run" (round-4).
+            if let Some((dest_config, family)) = &split_info {
+                finalize::repair_missing_split_marker(dest_config, family);
+            }
             // This return sits ABOVE the schedule + makespan block, so a run
             // that got here prints neither — and the `--split` notice above
             // points forward at exactly that makespan line. Cancel the pointer

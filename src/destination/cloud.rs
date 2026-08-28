@@ -333,6 +333,16 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         } else {
             let mut src = std::fs::File::open(local_path)?;
             let mut dst = self.op.writer(&key)?.into_std_write();
+            // KNOWN LEAK on the error path (round-4, MED): a copy/close failure
+            // propagates without aborting the multipart upload — opendal's
+            // BLOCKING writer exposes no `abort()` (the async one does), so the
+            // orphaned upload's parts stay billed-but-invisible until the
+            // bucket's lifecycle rule reaps them. Two halves to the fix, one
+            // shipped: (1) docs require an incomplete-multipart lifecycle rule
+            // on every bucket (load-bearing regardless — an abort call itself
+            // dies with the process on a crash); (2) an explicit abort needs
+            // this branch moved onto the ASYNC writer driven via the runtime —
+            // tracked, not attempted inline on the hot upload path.
             std::io::copy(&mut src, &mut dst)?;
             dst.close()?;
             // Streamed (multipart / block-list): no full-object checksum.

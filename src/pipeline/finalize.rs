@@ -814,6 +814,34 @@ pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
 /// re-run after a partial failure does not redo work already done. Reuses the
 /// same probe as [`warn_if_prefix_has_completed_run`]; a streaming destination
 /// (stdout) or a probe error counts as "not complete" (re-run it).
+/// Repair the prefix `_SUCCESS` a `--split --resume` found MISSING with every
+/// unit already complete — the crash-in-[last unit's Success → pool marker]
+/// window. That resume path returns "nothing to run" ABOVE the pool's marker
+/// writer, and nothing else ever looks at the prefix again, so without this the
+/// marker stays missing forever while rivet reports complete — every
+/// `_SUCCESS`-keyed consumer waits indefinitely (round-4). Best-effort like the
+/// pool writer: a marker is a fast-path signal, never data integrity.
+pub(crate) fn repair_missing_split_marker(
+    dest_config: &crate::config::DestinationConfig,
+    family: &str,
+) {
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
+    let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
+    if destination_has_success(&expanded) {
+        return;
+    }
+    match write_split_success_marker(&expanded) {
+        Ok(()) => log::info!(
+            "apply --pool --split: every unit of '{family}' is complete but the prefix \
+             _SUCCESS was missing (a crash between the last unit and the marker) — wrote it"
+        ),
+        Err(e) => log::warn!(
+            "apply --pool --split: prefix _SUCCESS for '{family}' is missing and could \
+             not be repaired: {e:#}"
+        ),
+    }
+}
+
 pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -> bool {
     use crate::manifest::SUCCESS_FILENAME;
     let Ok(d) = crate::destination::create_destination(dest) else {
@@ -1504,6 +1532,35 @@ mod tests {
         // An unopenable destination counts as "not complete" (re-run it).
         let bad = cfg_local(Some("/nonexistent/definitely/missing"), None);
         assert!(!destination_has_success(&bad));
+    }
+
+    /// The crash-in-[last unit → marker] window repair: a complete split prefix
+    /// (canonical manifest present, no `_SUCCESS`) gets the marker written by
+    /// the `--split --resume` nothing-to-run path; an already-marked prefix is
+    /// untouched (idempotent — no clobber of the existing body). RED against
+    /// removing the repair call: the marker would stay missing forever.
+    #[test]
+    fn repair_missing_split_marker_writes_only_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_local(Some(&dir.path().to_string_lossy()), None);
+        // The last unit's canonical manifest is in the prefix; the pool died
+        // before the marker.
+        std::fs::write(dir.path().join("manifest.json"), b"{\"parts\":[]}").unwrap();
+        assert!(!destination_has_success(&cfg), "fixture: marker absent");
+        repair_missing_split_marker(&cfg, "orders");
+        assert!(
+            destination_has_success(&cfg),
+            "every unit complete + no marker -> the resume path must repair it"
+        );
+        let body = std::fs::read_to_string(dir.path().join("_SUCCESS")).unwrap();
+        // Idempotent: a second call must not rewrite (marker already present).
+        std::fs::write(dir.path().join("manifest.json"), b"{\"parts\":[1]}").unwrap();
+        repair_missing_split_marker(&cfg, "orders");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("_SUCCESS")).unwrap(),
+            body,
+            "an existing marker is never clobbered by a later repair pass"
+        );
     }
 
     fn cfg_s3(bucket: &str, prefix: Option<&str>) -> DestinationConfig {

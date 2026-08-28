@@ -411,14 +411,27 @@ impl SpillReader {
             )
         })?;
         let len = u32::from_be_bytes(len) as usize;
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact(&mut buf).map_err(|e| {
-            anyhow::anyhow!(
+        // Bounded pre-allocation: one corrupt length prefix can declare up to
+        // 4 GiB, and `vec![0u8; len]` commits that much memory BEFORE
+        // `read_exact` refuses (round-4 fuzz sweep). Grow through a capped
+        // `take`-reader instead, so a lying prefix costs at most one chunk.
+        let mut buf = Vec::with_capacity(len.min(1 << 20));
+        let got = std::io::Read::take(&mut self.reader, len as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cdc spill: record {i} of {} declares {len} bytes the log does not \
+                     hold — truncated: {e}",
+                    self.total
+                )
+            })?;
+        if got != len {
+            anyhow::bail!(
                 "cdc spill: record {i} of {} declares {len} bytes the log does not \
-                 hold — truncated: {e}",
+                 hold — truncated at {got}",
                 self.total
-            )
-        })?;
+            );
+        }
         Ok(buf)
     }
 }
@@ -764,10 +777,65 @@ mod tests {
             spill_file_pid("rivet-spill-mssql-batch-7-9-deadbeef.bin"),
             Some(9)
         );
-        // The short-lived pre-token shape.
+        // The `{label}-{pid}` fallback shape. HONESTY (round-4): the REAL
+        // pre-token production name was `{label}-{seq}-{pid}.bin`, for which the
+        // primary branch fires and returns the SEQ — usually 0 — as the "pid".
+        // Harmless today: on unix flock decides and the pid only feeds a log
+        // line; off unix the probe never deletes. What matters is the Some/None
+        // SHAPE (a rivet spill is recognised, a foreign file is not); do NOT
+        // wire the VALUE into any decision without fixing the parse first.
         assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.bin"), Some(4242));
         assert_eq!(spill_file_pid("some-other-tool-9.bin"), None);
         assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.txt"), None);
+    }
+
+    /// A corrupt frame of nested `ARRAY(len=1)` units must come back as an
+    /// `Err`, never a stack overflow: each 9-byte unit used to cost one stack
+    /// frame, so a few MB of corruption was a SIGSEGV no caller could catch
+    /// (round-4 fuzz sweep). RED against removing the depth cap — with it gone
+    /// this test dies by signal rather than failing an assert.
+    #[test]
+    fn a_nesting_bomb_is_refused_not_a_stack_overflow() {
+        // 200_000 levels of ARRAY(1) — far past the cap, far below what would
+        // fit legitimate data.
+        let mut frame = Vec::new();
+        for _ in 0..200_000 {
+            frame.push(tag::ARRAY);
+            frame.extend_from_slice(&1u64.to_be_bytes());
+        }
+        frame.push(tag::NULL);
+        let mut c = Cur { b: &frame, at: 0 };
+        let err = get_value(&mut c).expect_err("a nesting bomb must be refused");
+        assert!(
+            err.to_string().contains("nesting"),
+            "the refusal must name the cause: {err:#}"
+        );
+    }
+
+    /// A record whose length prefix LIES (declares 4 GiB the file does not hold)
+    /// must refuse after reading what is actually there — never pre-commit the
+    /// declared allocation (round-4: `vec![0u8; len]` committed up to 4 GiB from
+    /// one corrupt u32 before `read_exact` could refuse).
+    #[test]
+    fn a_lying_length_prefix_refuses_without_committing_the_declared_bytes() {
+        let d = dir();
+        let mut s = SpillFile::create(d.path(), "liar").expect("create");
+        s.push(b"real record").expect("push");
+        // Seal first (flushes + rewinds), THEN corrupt the bytes on disk: the
+        // reader's first pull sees the rewritten inode.
+        let mut r = s.into_reader().expect("seal");
+        let path = r.path.clone().expect("reader owns the path");
+        let mut bytes = std::fs::read(&path).expect("read spill");
+        bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("rewrite");
+        let err = r
+            .next_record()
+            .expect("one record")
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("truncated"),
+            "the refusal must name truncation: {err:#}"
+        );
     }
 
     /// The PRODUCTION probe, all three arms: alive, dead, and exists-but-foreign.
@@ -1194,6 +1262,25 @@ fn put_value(out: &mut Vec<u8>, v: &RivetValue) {
 }
 
 fn get_value(c: &mut Cur<'_>) -> Result<RivetValue> {
+    get_value_at(c, 0)
+}
+
+/// Nesting ceiling for ARRAY frames. No engine produces depth past LOW single
+/// digits (only PostgreSQL builds `RivetValue::Array` at all, and PG spills raw
+/// wire bytes — this frame never carries its arrays), so the cap only ever
+/// fires on CORRUPTION: a repeated 9-byte `ARRAY(len=1)` unit recurses once per
+/// nesting level, and a few MB of it is hundreds of thousands of stack frames —
+/// a SIGSEGV, not an `Err`, which no caller can catch (round-4 fuzz sweep).
+const MAX_VALUE_DEPTH: u32 = 128;
+
+fn get_value_at(c: &mut Cur<'_>, depth: u32) -> Result<RivetValue> {
+    if depth > MAX_VALUE_DEPTH {
+        // Refuse, never recurse on: past the cap this is a corrupt frame, and a
+        // stack overflow is a crash no `Result` can report.
+        anyhow::bail!(
+            "cdc spill: value nesting deeper than {MAX_VALUE_DEPTH} — the frame is corrupt"
+        );
+    }
     let t = c.u8()?;
     Ok(match t {
         tag::NULL => RivetValue::Null,
@@ -1220,7 +1307,7 @@ fn get_value(c: &mut Cur<'_>) -> Result<RivetValue> {
             let n = c.len()?;
             let mut items = Vec::with_capacity(n.min(4096));
             for _ in 0..n {
-                items.push(get_value(c)?);
+                items.push(get_value_at(c, depth + 1)?);
             }
             RivetValue::Array(items)
         }

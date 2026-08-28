@@ -2169,6 +2169,25 @@ mod mod_decisions {
              transaction's length, which is the opposite error and just as wrong"
         );
 
+        // A Bytes value carrying ALLOCATOR SLACK is charged its capacity — the
+        // Mongo shape: `serde_json::to_string`'s doubling growth leaves
+        // capacity/len in (1, 2], and Mongo's whole event is one such cell, so
+        // charging len under-counted a large-document stream up to 2x. The
+        // exact-capacity engines are unaffected (capacity == len there).
+        let mut slack = Vec::with_capacity(1024);
+        slack.extend_from_slice(&[b'x'; 600]); // len 600, capacity 1024
+        assert!(
+            slack.capacity() > slack.len(),
+            "the fixture must carry slack"
+        );
+        let with_slack = mk(None, Some(vec![RivetValue::Bytes(slack)])).estimated_bytes();
+        let exact = mk(None, Some(vec![RivetValue::Bytes(vec![b'x'; 600])])).estimated_bytes();
+        assert!(
+            with_slack >= exact + 300,
+            "resident must charge the CAPACITY ({with_slack} vs exact {exact}) — \
+             len-charging is how a 256 MiB budget held ~512 MiB of documents"
+        );
+
         // A nested ARRAY is charged its Vec's slots, like the top-level image —
         // a flat constant under-counted a 1000-element `integer[]` ~4x.
         let flat = mk(None, Some(vec![RivetValue::Int(1)])).estimated_bytes();
