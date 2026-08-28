@@ -1811,6 +1811,28 @@ mod tests {
         }
     }
 
+    /// Every `__$operation` code, both directions — the mutants run found all six
+    /// arm-mutants MISSED, because the only oracle was the live suite.
+    ///
+    /// The skips are as load-bearing as the maps: op 3 is the update BEFORE-image,
+    /// and mapping it would deliver every update twice (once as the stale image);
+    /// an unknown code mapped to anything would invent an operation.
+    #[test]
+    fn map_op_maps_the_three_ops_and_skips_the_before_image() {
+        assert_eq!(map_op(1), Some(ChangeOp::Delete));
+        assert_eq!(map_op(2), Some(ChangeOp::Insert));
+        assert_eq!(map_op(4), Some(ChangeOp::Update));
+        for skipped in [0, 3, 5, -1, i32::MAX] {
+            assert_eq!(
+                map_op(skipped),
+                None,
+                "code {skipped} must be SKIPPED — op 3 is the update before-image \
+                 (mapping it doubles every update), and an unknown code mapped to \
+                 anything invents an operation"
+            );
+        }
+    }
+
     /// Every arm of the head/tail group-boundary question.
     ///
     /// The `false` arms are the ones that matter in opposite directions: saying a

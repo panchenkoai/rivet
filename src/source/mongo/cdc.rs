@@ -105,6 +105,42 @@ fn token_data(v: &serde_json::Value) -> Option<String> {
     v.get("_data").and_then(|d| d.as_str()).map(String::from)
 }
 
+/// `token_data` is the resume token's identity — the string every bound and resume
+/// decision compares. All three mutants on it were MISSED (live-suite-only oracle):
+/// `-> None` silently disables the open-time bound, `-> Some("")` makes every poll
+/// look past-bound, `-> Some("xyzzy")` anchors resume at a fiction.
+#[cfg(test)]
+mod token_data_tests {
+    use super::*;
+
+    #[test]
+    fn token_data_plucks_the_data_string_and_nothing_else() {
+        assert_eq!(
+            token_data(&serde_json::json!({ "_data": "82ABCD" })),
+            Some("82ABCD".to_string())
+        );
+        assert_eq!(
+            token_data(&serde_json::json!({ "_data": "" })),
+            Some(String::new()),
+            "an EMPTY _data is still a token — collapsing it to None would make \
+             an empty-token checkpoint re-anchor instead of resuming"
+        );
+        for absent in [
+            serde_json::json!({}),
+            serde_json::json!({ "_data": 7 }),
+            serde_json::json!({ "other": "82ABCD" }),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                token_data(&absent),
+                None,
+                "{absent}: no string _data means NO token — inventing one would \
+                 compare bounds against a fiction"
+            );
+        }
+    }
+}
+
 /// Pure bound verdicts (#161): Mongo was the only engine whose `until_current`
 /// stop rules lived inline in the drain loop instead of a testable transition
 /// (its siblings: MySQL `commit_past_bound`, PG `tx_disposition`, MSSQL
