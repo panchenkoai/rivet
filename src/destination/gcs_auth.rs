@@ -529,6 +529,18 @@ pub fn try_authorized_user_loader() -> Result<Option<AdcUserTokenLoader>> {
 /// The ONE reader of the ADC file: both token sources in this module go through
 /// it, so a credential shape rivet learns to read is learned once.
 pub(crate) fn load_adc_credentials() -> Result<Option<AdcCredentials>> {
+    // An EXPLICITLY-set GOOGLE_APPLICATION_CREDENTIALS pointing at a missing
+    // file is an ERROR, not "no credentials": the old Ok(None) fell through to
+    // a hint telling the operator to set the very variable they had just set,
+    // never mentioning the missing file (round-6 hostile-input probe).
+    if let Ok(p) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+        && !std::path::Path::new(&p).exists()
+    {
+        anyhow::bail!(
+            "GOOGLE_APPLICATION_CREDENTIALS is set to '{p}', but no file exists there — \
+             fix the path (or unset the variable to fall back to gcloud ADC)"
+        );
+    }
     let path = match adc_path() {
         Some(p) if p.exists() => p,
         _ => return Ok(None),

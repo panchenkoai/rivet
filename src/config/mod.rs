@@ -803,6 +803,36 @@ impl Config {
         // green and `rivet run` failed later — after a live DB probe, or (mode: cdc)
         // with a misleading "requires table:". Enforce them at config-load so check
         // and run agree, mirroring the chunk_dense/chunk_by_days guards.
+        // Round-6 hostile-input: two prefix shapes that are ALWAYS a mistake and
+        // fail success-shaped (the export writes somewhere the load never
+        // lists, "up to date" forever): a `..` traversal segment (on an
+        // fs-backed store the objects escape the bucket directory entirely)
+        // and an embedded scheme (`gs://bucket/x` PASTED into `prefix:` —
+        // doubled with the config's own bucket into `gs://b/gs://b/x`).
+        for field in [
+            ("prefix", export.destination.prefix.as_deref()),
+            ("path", export.destination.path.as_deref()),
+        ] {
+            let (name, Some(v)) = field else { continue };
+            if v.split(['/', '\\']).any(|seg| seg == "..") {
+                anyhow::bail!(
+                    "export '{}': destination {name} '{}' contains a `..` segment — the \
+                     objects would land OUTSIDE the configured location and every later \
+                     load/list would read an empty prefix as 'up to date'.",
+                    export.name,
+                    v.escape_default()
+                );
+            }
+            if name == "prefix" && v.contains("://") {
+                anyhow::bail!(
+                    "export '{}': destination prefix '{}' embeds a URI scheme — `prefix:` \
+                     is bucket-relative (the bucket comes from `bucket:`); a pasted \
+                     `gs://...` doubles into a key the load layer never finds.",
+                    export.name,
+                    v.escape_default()
+                );
+            }
+        }
         if let Some(col) = export.partition_by.as_deref() {
             if col.trim().is_empty() {
                 anyhow::bail!("export '{}': partition_by must name a column", export.name);
@@ -2458,6 +2488,31 @@ mod sec_config_validation {
     /// `format: csv` under a `load:` block is refused — the loaders read parquet
     /// only, and the alternative was a load that prints "nothing to load", exits
     /// 0, and never marks the runs consumed: a permanently silent pipeline.
+    /// Round-6: the two success-shaped prefix mistakes are refused at validate —
+    /// a `..` segment (objects escape the configured location) and a pasted URI
+    /// scheme (`gs://` doubling). Both used to export exit-0 and read as
+    /// "up to date" forever on the load side.
+    #[test]
+    fn a_traversal_or_scheme_prefix_is_refused_at_validate() {
+        for (prefix, needle) in [
+            ("exports/../escape/", ".."),
+            ("gs://bh6-bucket/inner/", "URI scheme"),
+        ] {
+            let yaml = format!(
+                "source:\n  type: postgres\n  url: postgres://x/x\nexports:\n  - name: e1\n    \
+                 query: SELECT 1\n    destination:\n      type: gcs\n      bucket: b\n      \
+                 prefix: \"{prefix}\"\n    format: parquet\n"
+            );
+            let err = Config::from_yaml(&yaml).expect_err(prefix).to_string();
+            assert!(err.contains(needle), "{prefix}: {err}");
+        }
+        // A dotted-but-not-traversal prefix stays legal.
+        let ok = "source:\n  type: postgres\n  url: postgres://x/x\nexports:\n  - name: e1\n    \
+                  query: SELECT 1\n    destination:\n      type: gcs\n      bucket: b\n      \
+                  prefix: exports/v1.2/\n    format: parquet\n";
+        Config::from_yaml(ok).expect("a version-dotted prefix is not a traversal");
+    }
+
     #[test]
     fn a_csv_export_under_a_load_block_is_refused_loudly() {
         let base = r#"

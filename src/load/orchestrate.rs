@@ -498,6 +498,18 @@ fn prepare_load(
         }
     });
     let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    // Round-6: "up to date — every extraction run already loaded" was printed
+    // for BOTH "all runs consumed" and "this prefix holds NOTHING" — and the
+    // second is what a typo'd/mis-encoded prefix produces, forever, exit 0.
+    // Say the empty-prefix truth before the optimistic line.
+    if keyed.is_empty() {
+        eprintln!(
+            "  load [{}]: found NO manifests under {} — nothing was ever staged \
+             here. If an export should have landed, check the prefix for typos \
+             (a wrong prefix reads as permanently 'up to date').",
+            plan.table, plan.gcs_prefix
+        );
+    }
     // Refuse a prefix shared by two exports BEFORE selecting/summing/cleaning:
     // the load sums every manifest here and cleanup wipes the prefix recursively,
     // so a shared base prefix would cross-contaminate the count and delete a
@@ -874,6 +886,28 @@ fn full_done_line(inputs: &LoadInputs, report: &load::LoadReport) -> String {
 /// dedup view over it. The manifests' summed `row_count` gates the rows *this*
 /// load appends (before/after the append) — the file→warehouse leg for an
 /// accumulating, at-least-once log.
+/// The RE-baseline warning, or `None`. Round-6 (proven on the verbatim view
+/// SQL): a re-snapshot row carries NULL `__pos` and LOSES the dedup to every
+/// already-loaded change row — so appending a snapshot leg into a `__changes`
+/// that prior cycles already fed serves pre-gap values silently for exactly
+/// the PKs the re-snapshot fixed. The shape is detectable co-located: snapshot
+/// URIs in THIS load + a non-empty loaded-ledger for the target. First-cycle
+/// snapshot+changes (no prior loads) is the normal shape — no warning.
+fn rebaseline_warning(uris: &[String], target_fqtn: &str, prior_loaded: bool) -> Option<String> {
+    let has_snapshot = uris.iter().any(|u| u.contains("/snapshot/"));
+    if !has_snapshot || !prior_loaded {
+        return None;
+    }
+    Some(format!(
+        "  WARNING: this load appends a RE-baseline (snapshot parquet) into \
+         `{target_fqtn}__changes`, which prior cycles already fed. Snapshot rows \
+         carry NULL `__pos` and LOSE the dedup to every already-loaded change row \
+         — the current-state view will keep serving PRE-GAP values for the rows \
+         this re-snapshot fixed. TRUNCATE `{target_fqtn}__changes` and re-run this \
+         load so the baseline stands alone (cdc-failure-modes.md)."
+    ))
+}
+
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -906,6 +940,16 @@ fn load_one_cdc(
             );
         },
         |loader, store, inputs| {
+            // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
+            // into a __changes prior cycles already fed (see rebaseline_warning).
+            let prior_loaded = state
+                .and_then(|s| s.loaded_source_run_ids(&loader.fqtn(&plan.table)).ok())
+                .is_some_and(|ids| !ids.is_empty());
+            if let Some(w) =
+                rebaseline_warning(&inputs.uris, &loader.fqtn(&plan.table), prior_loaded)
+            {
+                eprintln!("{w}");
+            }
             // The driver gates the appended delta against the manifests' summed
             // `row_count` and cleans up (only) after the gate passes.
             let cleanup = cleanup_target(plan, store, state);
@@ -1115,6 +1159,27 @@ mod load_ledger_tests {
         assert!(
             !err.contains("content_items"),
             "must NOT label the table as the export: {err}"
+        );
+    }
+
+    /// Round-6 re-baseline guard: fires only on snapshot-URIs × prior-loads —
+    /// the first cycle (snapshot, no prior loads) and a changes-only cycle stay
+    /// silent. RED against dropping either conjunct.
+    #[test]
+    fn rebaseline_warning_fires_only_on_a_second_baseline() {
+        let snap = vec!["gs://b/p/snapshot/part-0.parquet".to_string()];
+        let cdc = vec!["gs://b/p/cdc-000000.parquet".to_string()];
+        assert!(
+            rebaseline_warning(&snap, "p.d.t", true)
+                .is_some_and(|w| w.contains("TRUNCATE") && w.contains("p.d.t__changes"))
+        );
+        assert!(
+            rebaseline_warning(&snap, "p.d.t", false).is_none(),
+            "first cycle"
+        );
+        assert!(
+            rebaseline_warning(&cdc, "p.d.t", true).is_none(),
+            "changes-only"
         );
     }
 

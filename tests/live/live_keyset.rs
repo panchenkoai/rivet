@@ -2390,11 +2390,46 @@ fn keyset_resume_refuses_when_a_committed_page_was_deleted_between_attempts() {
         "the refusal must name the cause; stderr:\n{err}"
     );
     assert!(
-        err.contains("reset-chunks"),
-        "the refusal must name the remedy; stderr:\n{err}"
+        err.contains("state reset") && !err.contains("reset-chunks"),
+        "the refusal must name the WORKING remedy — round-6 live-proved \
+         reset-chunks clears tables keyset never writes, stranding the operator \
+         in a refusal loop; stderr:\n{err}"
     );
     assert!(
         !out.join("_SUCCESS").is_file(),
         "no completion marker may exist after the refusal"
+    );
+
+    // THE REMEDY MUST WORK from the refused state (a hint is a testable claim):
+    // follow it verbatim, then the next run must do a fresh full pass.
+    let reset = std::process::Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "state",
+            "reset",
+            "-c",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reset.status.success(),
+        "the named remedy must run clean; stderr:\n{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let rerun = run_rivet_export(&cfg, &export);
+    assert!(
+        rerun.status.success(),
+        "after the remedy the export must complete; stderr:\n{}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap())
+            .expect("manifest.json after the remedied run");
+    assert_eq!(
+        m["row_count"].as_i64(),
+        Some(2000),
+        "the remedied run must deliver the whole table"
     );
 }

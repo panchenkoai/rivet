@@ -465,6 +465,22 @@ fn build_plans(
         let table = warehouse_table_name(&source_table, &export.name);
 
         let dest = &export.destination;
+        // Round-6 HIGH: the load layer builds a GCS client UNCONDITIONALLY, so a
+        // `type: s3` destination with a `load:` block silently listed a
+        // SAME-NAMED GCS bucket (stranger-claimable) — empty → permanently
+        // "up to date", exit 0; cleanup/gc would target that foreign prefix.
+        // Both warehouse loaders are GCS-only (Snowflake rewrites gs://→gcs://),
+        // so refuse anything else loudly at plan time.
+        if dest.destination_type != crate::config::DestinationType::Gcs {
+            anyhow::bail!(
+                "export `{}` has `load:` but its destination is `type: {:?}` — the load \
+                 layer reads GCS only (Snowflake via storage integration, BigQuery via \
+                 LOAD DATA). Stage the export to a gcs destination, or drop the load \
+                 block.",
+                export.name,
+                dest.destination_type
+            );
+        }
         let bucket = dest.bucket.as_deref().with_context(|| {
             format!(
                 "export `{}` has no destination `bucket` — a GCS destination is required",
@@ -561,7 +577,20 @@ fn build_plans(
             crate::config::ExportMode::Incremental => LoadMode::Incremental,
             crate::config::ExportMode::Full => LoadMode::Full, // whole result set
             crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
-            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window
+            crate::config::ExportMode::TimeWindow => {
+                // Full OVERWRITE by design — and said out loud (round-6): each
+                // load replaces the warehouse table with the CURRENT window, so
+                // history past `days_window` is capped, not accumulated. An
+                // accumulation-minded operator loses history silently otherwise.
+                eprintln!(
+                    "  note: export `{}` is mode: time_window — each load OVERWRITES the \
+                     warehouse table with the current window; rows older than the window \
+                     are dropped from the warehouse (append-history needs mode: \
+                     incremental).",
+                    export.name
+                );
+                LoadMode::Full
+            }
         };
         // Effective load config: the shared top-level `load:`, with this export's
         // own `load:` block overriding the table-specific fields (pk, cleanup, …).
@@ -783,6 +812,44 @@ mod tests {
     /// resolution: the export→report name match (`==`→`!=`) and the `fail`/`warn`
     /// `target_status` arms. Also pins mode mapping, the `gs://` prefix, table
     /// resolution, and the cursor column.
+    /// Round-6 HIGH: a non-GCS destination with a `load:` block used to build a
+    /// GCS client anyway — a same-named FOREIGN GCS bucket got listed (empty →
+    /// "up to date" forever, exit 0; cleanup/gc would target it). RED against
+    /// removing the destination_type gate in build_plans.
+    #[test]
+    fn a_load_block_on_a_non_gcs_destination_is_refused() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: alpha
+    table: alpha_tbl
+    mode: full
+    format: parquet
+    destination:
+      type: s3
+      bucket: b1
+      prefix: exports/alpha/
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let reports = vec![report("alpha", vec![col("id", TargetStatus::Ok)])];
+        let err = build_plans(&cfg, &load, reports)
+            .expect_err("s3 + load: must refuse at plan time")
+            .to_string();
+        assert!(
+            err.contains("S3") && err.contains("load"),
+            "must name the mismatch and the block: {err}"
+        );
+    }
+
     #[test]
     fn build_plans_matches_by_name_maps_statuses_and_mode() {
         let cfg = crate::config::Config::from_yaml(

@@ -68,12 +68,19 @@ fn rehydrate_keyset_pages_probed(
         super::chunked::rehydrate_manifest_parts_probed(st, run_id, summary, probe.as_ref())?;
     if !missing.is_empty() {
         let names: Vec<&str> = missing.iter().map(|(_, n)| n.as_str()).collect();
+        // The remedy is `state reset`, NOT `state reset-chunks`: keyset resume
+        // keys on `export_state.resume_run_id` + `keyset_range`, which
+        // reset-chunks does not touch (it clears chunk_task/chunk_run — tables
+        // keyset never writes). Round-6 live-proved the wrong hint strands the
+        // operator in a refusal loop; `state reset` drops the export_state row
+        // (cursor included, which incremental-keyset needs cleared too) and the
+        // next run does a fresh full pass.
         anyhow::bail!(
             "keyset resume: {} committed page part(s) are GONE from the destination \
              ({}) — a gc/cleanup pass deleted them between attempts. Refusing to \
              finalize a Success manifest naming deleted files (their rows would be \
-             silently absent). Re-run WITHOUT the checkpoint (`rivet state \
-             reset-chunks -c <config> --export {}`) so the whole range is re-read, \
+             silently absent). Reset this export's keyset state (`rivet state \
+             reset -c <config> --export {}`) so the whole range is re-read, \
              or point the export at a fresh prefix.",
             names.len(),
             names.join(", "),

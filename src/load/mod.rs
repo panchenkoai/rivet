@@ -114,9 +114,13 @@ fn is_safe_load_ident(s: &str) -> bool {
 /// it — default-deny, fail loud rather than escape-and-hope.
 fn ensure_safe_load_uris(uris: &[String]) -> Result<()> {
     for u in uris {
+        // `*` is in the deny set because BigQuery expands ONE wildcard per
+        // `uris=[...]` entry — a planted object name containing `*` would widen
+        // the load past the manifest-declared file set (round-6; Snowflake's
+        // FILES= is literal, but one deny set guards both).
         if let Some(bad) = u
             .chars()
-            .find(|&c| c == '\'' || c == '\\' || c.is_control())
+            .find(|&c| c == '\'' || c == '\\' || c == '*' || c.is_control())
         {
             bail!(
                 "refusing to load: Parquet URI `{}` contains {:?}, which is unsafe to splice \
@@ -265,7 +269,10 @@ fn append_and_view(
     }
     ensure_safe_load_uris(uris)?;
     if pk.is_empty() {
-        bail!("{label} load of `{table}` needs a primary key for the dedup view (pass --pk)");
+        bail!(
+            "{label} load of `{table}` needs a primary key for the dedup view — add \
+             `pk: [<column>]` under the export's `load:` block (no --pk flag exists)"
+        );
     }
     // Gate the PK columns at the SHARED seam: both the CDC and the INCREMENTAL
     // driver splice them into the dedup view's `PARTITION BY` via quote_ident

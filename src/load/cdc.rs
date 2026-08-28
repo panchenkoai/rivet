@@ -197,7 +197,18 @@ pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
 /// full-snapshot parquet, so their `__op`/`__pos` are NULL in `__changes`. The
 /// flag is `COALESCE(.. , FALSE)` (a NULL `__op` is a live snapshot insert, not a
 /// delete — otherwise `WHERE NOT __is_deleted` drops the whole backfill), and the
-/// order ranks NULL `__pos` last (see below) so a later change always wins.
+/// order ranks NULL `__pos` last (see below) so a later change beats the FIRST
+/// baseline.
+///
+/// KNOWN LIMIT (round-6, proven on the verbatim view SQL): "later change wins"
+/// is TRUE only against the first snapshot. A RE-baseline (slot-loss/binlog-purge
+/// recovery re-snapshot) appends NEW NULL-`__pos` rows beside the OLD change
+/// rows — and loses to all of them, so the view silently serves pre-gap values
+/// for exactly the PKs the re-snapshot exists to fix (two snapshots for one PK
+/// even tie nondeterministically). The recovery bail and cdc-failure-modes.md
+/// therefore prescribe truncating `__changes` before the post-recovery load,
+/// and `run_load_cdc` warns when it detects the shape. The structural fix —
+/// the snapshot leg stamping its anchor position instead of NULL — is tracked.
 ///
 /// The subquery + `__rn` structure (rather than a `QUALIFY`) is deliberate: the
 /// flag must reflect the *winning* row per PK, computed **after** `ROW_NUMBER`.

@@ -326,7 +326,7 @@ fn build_create_changes_sql(fqtn: &str, schema: &str, pk: &[String]) -> String {
     let cluster_cols = pk
         .iter()
         .take(MAX_CLUSTER_COLUMNS)
-        .cloned()
+        .map(|c| format!("`{c}`"))
         .collect::<Vec<_>>()
         .join(", ");
     format!("CREATE TABLE IF NOT EXISTS `{fqtn}` (\n{schema}\n)\nCLUSTER BY {cluster_cols};")
@@ -421,7 +421,8 @@ fn table_shape_clauses(partition_by: &Option<String>, cluster_by: &[String]) -> 
         s.push_str(&format!("\nPARTITION BY {expr}"));
     }
     if !cluster_by.is_empty() {
-        s.push_str(&format!("\nCLUSTER BY {}", cluster_by.join(", ")));
+        let quoted: Vec<String> = cluster_by.iter().map(|c| format!("`{c}`")).collect();
+        s.push_str(&format!("\nCLUSTER BY {}", quoted.join(", ")));
     }
     s
 }
@@ -448,9 +449,14 @@ fn from_files(uris: &[String]) -> String {
 /// Parquet on load — for FREE (a load job, not a query) — so JSON / DATETIME /
 /// TIME / NUMERIC / … land natively without a post-load CTAS. Verified live.
 fn build_schema(specs: &[TargetColumnSpec]) -> String {
+    // Backticked, like build_alter_add_columns_sql always was: names are
+    // pre-gated to plain idents, so quoting is always safe — and without it a
+    // reserved-word column (`end`, `order`, `interval`; `start`/`end` pairs
+    // are everywhere) died on BigQuery's raw syntax error AFTER the extract
+    // was paid, while cdc.rs promised backticks made it safe (round-6).
     specs
         .iter()
-        .map(|s| format!("  {} {}", s.column_name, s.target_type))
+        .map(|s| format!("  `{}` {}", s.column_name, s.target_type))
         .collect::<Vec<_>>()
         .join(",\n")
 }
@@ -571,9 +577,9 @@ mod tests {
             typed("json_col", "JSON"),
             typed("dt_col", "DATETIME"),
         ]);
-        assert!(s.contains("id INT64"));
-        assert!(s.contains("json_col JSON"));
-        assert!(s.contains("dt_col DATETIME"));
+        assert!(s.contains("`id` INT64"));
+        assert!(s.contains("`json_col` JSON"));
+        assert!(s.contains("`dt_col` DATETIME"));
     }
 
     #[test]
@@ -582,7 +588,8 @@ mod tests {
         let sql = build_load_data_sql("p.d.orders", true, &schema, &None, &[], &uris());
         assert!(sql.starts_with("LOAD DATA OVERWRITE `p.d.orders` ("));
         // Native types declared inline → BigQuery coerces on load, for free.
-        assert!(sql.contains("json_col JSON"));
+        // Backticked (round-6): a reserved-word column must survive the DDL.
+        assert!(sql.contains("`json_col` JSON"));
         assert!(sql.contains("format = 'PARQUET'"));
         assert!(sql.contains("'gs://b/a.parquet'"));
         assert!(!sql.contains("PARTITION BY"));
@@ -607,7 +614,7 @@ mod tests {
             &uris(),
         );
         assert!(sql.contains("PARTITION BY DATE(created_at)"));
-        assert!(sql.contains("CLUSTER BY customer_id, region"));
+        assert!(sql.contains("CLUSTER BY `customer_id`, `region`"));
     }
 
     #[test]
@@ -615,15 +622,22 @@ mod tests {
         let schema = build_schema(&[typed("__op", "STRING"), typed("id", "INT64")]);
         let sql = build_create_changes_sql("p.d.orders__changes", &schema, &["id".into()]);
         assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `p.d.orders__changes` ("));
-        assert!(sql.contains("CLUSTER BY id"));
+        assert!(sql.contains("CLUSTER BY `id`"));
         // A >4-column PK is capped to BigQuery's clustering limit.
         let wide: Vec<String> = ["a", "b", "c", "d", "e"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let sql2 = build_create_changes_sql("t", &schema, &wide);
-        assert!(sql2.contains("CLUSTER BY a, b, c, d"));
-        assert!(!sql2.contains(", e"));
+        let bt = |c: &str| format!("`{c}`");
+        assert!(sql2.contains(&format!(
+            "CLUSTER BY {}, {}, {}, {}",
+            bt("a"),
+            bt("b"),
+            bt("c"),
+            bt("d")
+        )));
+        assert!(!sql2.contains(&bt("e")));
     }
 
     #[test]
