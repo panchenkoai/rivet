@@ -193,7 +193,14 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
          part declares — lands here: {census:?}"
     );
 
-    let peak = peak_child_rss_bytes();
+    // The DELTA, not the absolute. `peak_child_rss_bytes` is
+    // `getrusage(RUSAGE_CHILDREN).ru_maxrss` — a monotonic high-water mark over
+    // EVERY child this test binary has reaped, so the absolute value is the largest
+    // rivet any sibling test ever spawned. Asserting on it graded other tests; under
+    // the documented `-E test(...)` invocation the four engine soaks also run
+    // concurrently. This is the same `ru_maxrss` trap the event-cost measurement
+    // hit, one file over, in the stand whose whole purpose is the memory claim.
+    let peak = peak_child_rss_bytes().saturating_sub(rss_before);
     println!(
         "soak/{engine}[{}]: {expected} rows over {} cycles, cap {}, tx {} | peak \
          child RSS \
@@ -219,7 +226,16 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
         rss_ceiling() as f64 / 1e6,
     );
 
-    let leaked = spill_files_under(std::path::Path::new(".rivet/spill"));
+    // BOTH places a spill can land, because `spill_dir_for` picks by whether the
+    // config has a checkpoint: beside it (`<ckpt dir>/.rivet-spill`) when there is
+    // one, and `.rivet/spill` when there is not. Checking only the second made this
+    // assertion real on the checkpoint-LESS PostgreSQL rig and vacuous on the MySQL
+    // and SQL Server ones, which carry a checkpoint — while the failure message
+    // named the engine, so it read as covering all four.
+    let mut leaked = spill_files_under(std::path::Path::new(".rivet/spill"));
+    if let Some(ckpt_dir) = rig.checkpoint().parent() {
+        leaked.extend(spill_files_under(&ckpt_dir.join(".rivet-spill")));
+    }
     assert!(
         leaked.is_empty(),
         "{engine}: spill files outlived the runs that wrote them. One per oversized \

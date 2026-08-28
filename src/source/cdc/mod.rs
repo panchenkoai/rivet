@@ -358,7 +358,8 @@ fn json_resident_bytes(v: &serde_json::Value) -> usize {
     /// node itself. Modelling it structurally and trusting the model was wrong in
     /// BOTH directions here, an hour apart — first 12.7x under, then 1.8x over — so
     /// the constant is the measurement and
-    /// `the_memory_estimate_tracks_the_real_cost` is what keeps it one.
+    /// the budget assertion inside
+    /// `what_does_one_buffered_change_actually_cost` is what keeps it one.
     const JSON_OBJECT_NODE_BYTES: usize = 448;
     match v {
         Value::Null | Value::Bool(_) | Value::Number(_) => 0,
@@ -402,19 +403,36 @@ impl ChangeEvent {
         //    points at;
         // 3. the per-allocation overhead of the images' `Vec`s.
         //
-        // `image_names` is deliberately NOT charged: it is an `Arc` shared by every
-        // event of a relation, so charging it per event would over-count by the
-        // transaction's length — the opposite error, and just as wrong.
+        // `image_names` is charged AMORTISED, because whether it is shared depends
+        // on the ENGINE and the first version of this comment got that wrong: it
+        // asserted the `Arc` is "shared by every event of a relation", which holds
+        // for MySQL (cached per TABLE_MAP) and Mongo (a static) and is FALSE for
+        // PostgreSQL (`postgres/cdc.rs`: a fresh `Arc` and a fresh `String` per
+        // column, per row) and SQL Server (`mssql/cdc.rs`: a fresh `Vec<String>`
+        // inside the per-row loop). On those two the names are real, retained,
+        // per-event memory — measured at ~434 B/event for 10 columns — and skipping
+        // them put the estimate back under the tolerance it was just fixed to meet.
+        //
+        // `strong_count` answers it exactly and cheaply: one Arc held by N buffered
+        // events reads N and each pays 1/N; a fresh Arc per event reads 1 and pays
+        // in full. No engine-specific branch, and it stays right if a producer
+        // starts or stops sharing.
         let img = |v: &Option<Vec<RivetValue>>| {
             v.as_ref().map_or(0, |vs| {
                 vs.capacity() * std::mem::size_of::<RivetValue>()
                     + vs.iter().map(RivetValue::estimated_bytes).sum::<usize>()
             })
         };
+        let names = self.image_names.as_ref().map_or(0, |a| {
+            let own: usize =
+                a.len() * std::mem::size_of::<String>() + a.iter().map(String::len).sum::<usize>();
+            own / std::sync::Arc::strong_count(a).max(1)
+        });
         std::mem::size_of::<Self>()
             + self.schema.len()
             + self.table.len()
             + self.poison.as_ref().map_or(0, String::len)
+            + names
             + img(&self.before)
             + img(&self.after)
             + json_resident_bytes(&self.position.0)
@@ -1165,10 +1183,24 @@ pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB chang
 /// worth arguing for — and the soak stand's 202-vs-226 gap is where that argument
 /// will be settled.
 pub(crate) fn spill_dir_for(checkpoint: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
-    let named = std::env::var("RIVET_CDC_SPILL_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())?;
-    if named == "1" || named.eq_ignore_ascii_case("true") {
+    let raw = std::env::var("RIVET_CDC_SPILL_DIR").ok()?;
+    // TRIMMED: a `.env` line or a YAML `environment:` entry trivially carries a
+    // trailing space, and `"1 "` would otherwise become a directory literally named
+    // `1 ` — spilling ON, into junk, for a value the operator meant as the switch.
+    let named = raw.trim();
+    if named.is_empty() {
+        return None;
+    }
+    // FALSY values mean OFF. Recognising truthiness in one direction only was the
+    // trap: `RIVET_CDC_SPILL_DIR=0`, written to DISABLE spilling, fell through to
+    // the path arm and enabled it into a directory named `0` — while disabling the
+    // oversized-transaction refusal, which is the guard this switch exists to keep.
+    // The two readings of `0` are opposite, so the wrong one must not be the quiet
+    // one.
+    if ["0", "false", "off", "no"].contains(&named.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    if named == "1" || named.eq_ignore_ascii_case("true") || named.eq_ignore_ascii_case("yes") {
         // A truthy value means "spill, you pick where": beside the CHECKPOINT, which
         // is a directory the operator already chose and sized for rivet's state, and
         // `.rivet/spill` when there is none. Never the system temp — a CDC spill can
@@ -2035,6 +2067,54 @@ mod mod_decisions {
              bytes a narrow event really costs"
         );
 
+        // IMAGE NAMES are charged, amortised by how many events share the Arc.
+        // PostgreSQL and SQL Server build a FRESH one per row, so on those engines
+        // the names are real per-event memory; the first version of this estimate
+        // skipped them on a comment asserting the Arc is always shared, which is
+        // true of MySQL and Mongo only.
+        let names: std::sync::Arc<[String]> =
+            std::sync::Arc::from(["alpha", "beta"].map(String::from).to_vec());
+        let mut exclusive = mk(None, None);
+        exclusive.image_names = Some(names.clone());
+        drop(names); // the event now holds the only reference — it pays in full
+        let solo = exclusive.estimated_bytes();
+        assert!(
+            solo > empty + 2 * std::mem::size_of::<String>(),
+            "an Arc held by ONE event is that event's memory and must be charged"
+        );
+
+        // Shared by many events, each pays a share — otherwise a transaction's
+        // worth of events would each be charged the whole relation's names.
+        let shared: std::sync::Arc<[String]> =
+            std::sync::Arc::from(["alpha", "beta"].map(String::from).to_vec());
+        let many: Vec<ChangeEvent> = (0..8)
+            .map(|_| {
+                let mut e = mk(None, None);
+                e.image_names = Some(shared.clone());
+                e
+            })
+            .collect();
+        assert!(
+            many[0].estimated_bytes() < solo,
+            "the SAME names shared across events must cost each of them less than \
+             an exclusive copy — charging in full would over-count by the \
+             transaction's length, which is the opposite error and just as wrong"
+        );
+
+        // A nested ARRAY is charged its Vec's slots, like the top-level image —
+        // a flat constant under-counted a 1000-element `integer[]` ~4x.
+        let flat = mk(None, Some(vec![RivetValue::Int(1)])).estimated_bytes();
+        let arr = mk(
+            None,
+            Some(vec![RivetValue::Array(vec![RivetValue::Int(1); 100])]),
+        )
+        .estimated_bytes();
+        assert!(
+            arr > flat + 100 * std::mem::size_of::<RivetValue>(),
+            "an array's SLOTS cost as much as any other Vec's — PostgreSQL is the \
+             engine that produces them and the one whose budget was blind to them"
+        );
+
         // BOTH images count, and independently: a before-only event and an
         // after-only event of the same width must weigh the same, and an event
         // carrying both must weigh more than either.
@@ -2577,6 +2657,27 @@ mod tests {
                 .starts_with(std::env::temp_dir()),
             "never the system temp: a CDC spill can be gigabytes and a tmpfs takes \
              down more than rivet"
+        );
+
+        // FALSY values mean OFF. Recognising truthiness in one direction only made
+        // `RIVET_CDC_SPILL_DIR=0` — written to DISABLE spilling — enable it into a
+        // directory named `0`, while disabling the refusal this switch exists to
+        // keep. The two readings of `0` are opposite; the wrong one must not win.
+        for off in ["0", "false", "FALSE", "off", "no", "  "] {
+            guard.set(off);
+            assert_eq!(
+                spill_dir_for(None),
+                None,
+                "`RIVET_CDC_SPILL_DIR={off:?}` must mean OFF, not a directory of \
+                 that name"
+            );
+        }
+        // …and a truthy value with stray whitespace is still the switch, not a
+        // directory literally named `1 ` — a `.env` line trivially carries one.
+        guard.set(" 1 ");
+        assert_eq!(
+            spill_dir_for(None),
+            Some(Path::new(".rivet/spill").to_path_buf())
         );
 
         // An explicit path is used verbatim.

@@ -1640,8 +1640,22 @@ pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
 /// `COMMIT` on its own (the non-transactional-engine and binlog-format path) and
 /// `XA COMMIT <xid>`. Deliberately NOT `XA PREPARE` — prepared is not committed, and
 /// releasing there would publish rows a later `XA ROLLBACK` erases. Not `BEGIN`,
-/// `SAVEPOINT` or `ROLLBACK` either, none of which end a transaction with data to
-/// publish.
+/// `SAVEPOINT` or `ROLLBACK` either.
+///
+/// That last exclusion is MEASURED, so nobody re-derives it: a `ROLLBACK` arm here would be dead code, and
+/// a dangerous one. It was written and then removed after two `SHOW BINLOG EVENTS`
+/// probes on the stand (MySQL 8.0.46, `binlog_format=ROW`):
+///
+/// * a mixed InnoDB+MyISAM transaction rolled back logs ONLY the MyISAM rows — the
+///   InnoDB ones are rolled back UNWRITTEN, so a captured InnoDB table has nothing
+///   buffered when the rollback arrives;
+/// * a pure MyISAM transaction rolled back logs `BEGIN … Write_rows … `**`COMMIT`** —
+///   the rows are permanent, so the server frames them as their own transaction.
+///
+/// So no shape reaches this file with rows buffered AND a `ROLLBACK` marker, and
+/// treating one as "discard the buffer" would DELETE rows that are still in the
+/// source. `roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_
+/// transaction` pins the real contract instead.
 fn is_commit_statement(sql: &str) -> bool {
     let t = sql.trim().trim_end_matches(';').trim();
     if t.eq_ignore_ascii_case("commit") {
@@ -2266,6 +2280,7 @@ mod tests {
             );
         }
     }
+
     use super::*;
 
     /// The compression guard's decision, offline. Anything unrecognized — an

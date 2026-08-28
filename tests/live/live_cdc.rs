@@ -8928,3 +8928,96 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
         "the transaction AFTER the spilled one must still arrive, and arrive last"
     );
 }
+
+/// A rolled-back MyISAM statement is framed as its OWN transaction — it must not be
+/// fused into the next one's commit.
+///
+/// This test exists because an investigation claimed the opposite defect and TWO
+/// `SHOW BINLOG EVENTS` probes refuted it. Recorded here so the next reader inherits
+/// the measurement rather than the guess:
+///
+/// * a mixed InnoDB+MyISAM transaction rolled back logs ONLY the MyISAM rows — the
+///   InnoDB ones never reach the binlog, so a captured InnoDB table has nothing
+///   buffered when the rollback arrives;
+/// * a pure MyISAM transaction rolled back logs `BEGIN … Write_rows … COMMIT` —
+///   those rows are PERMANENT (MyISAM cannot roll back), so the server frames them
+///   as their own committed transaction and rivet is right to deliver them.
+///
+/// The proposed fix — discard the buffer on a `ROLLBACK` marker — was written and
+/// then removed: no shape reaches rivet with rows buffered AND a rollback marker,
+/// and if one ever did, discarding would DELETE rows still present in the source.
+///
+/// What IS worth pinning is the framing, which no count can see: the surviving rows
+/// and the later transaction's rows must carry DIFFERENT commit positions. Fusing
+/// two transactions delivers exactly the same rows and corrupts `(__pos, __seq)`,
+/// the total order the load dedup sorts by.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW + REPLICATION grant)"]
+fn roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_transaction() {
+    use mysql::prelude::Queryable;
+    const KEPT_BY_MYISAM: usize = 6;
+    const COMMITTED: usize = 3;
+
+    let tbl = unique_name("cdc_rollback_my");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    // MyISAM ON PURPOSE — it is the mechanism, not a detail. An InnoDB table's
+    // rolled-back rows never reach the binlog at all, so the scenario would be
+    // unexpressible and the test would pass on any code.
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} {ONE_TRANSACTION_DDL} ENGINE=MyISAM"
+    ))
+    .unwrap();
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl).census_oracle();
+    // Anchor BEFORE the churn: MySQL's checkpoint is client-side coordinates, so a
+    // run without one re-anchors to "now" and would see neither transaction.
+    let row: mysql::Row = c
+        .query_first("SHOW MASTER STATUS")
+        .expect("show master status")
+        .expect("binlog enabled");
+    let (file, pos): (String, u64) = (row.get(0).unwrap(), row.get(1).unwrap());
+    std::fs::write(
+        rig.checkpoint(),
+        format!(r#"{{"file":"{file}","pos":{pos}}}"#),
+    )
+    .unwrap();
+
+    mysql_seed_rolled_back_transaction(&mut c, &tbl, 1..=KEPT_BY_MYISAM);
+    mysql_seed_one_transaction(&mut c, &tbl, 100..=99 + COMMITTED);
+
+    rig.run_ok();
+
+    // BOTH groups arrive: the MyISAM rows are permanent, so dropping them would be
+    // the data loss, not the fix.
+    let changes = read_cdc_changes(&rig.out_dir());
+    let mut ids: Vec<i64> = changes.iter().map(|c| c.id).collect();
+    ids.sort_unstable();
+    let mut expected: Vec<i64> = (1..=KEPT_BY_MYISAM as i64).collect();
+    expected.extend(100..=99 + COMMITTED as i64);
+    assert_eq!(
+        ids, expected,
+        "a MyISAM rollback KEEPS its rows — they are in the binlog and in the \
+         source, so rivet must deliver them. Dropping them would be the loss."
+    );
+
+    // …under DIFFERENT commit positions. This is the half a count cannot see: two
+    // transactions fused into one deliver exactly these rows and corrupt the order
+    // the load dedup sorts by.
+    let pos_of = |want: i64| {
+        changes
+            .iter()
+            .find(|c| c.id == want)
+            .map(|c| c.pos.clone())
+            .unwrap_or_else(|| panic!("id {want} missing from the delivered changes"))
+    };
+    assert_ne!(
+        pos_of(1),
+        pos_of(100),
+        "the rolled-back statement and the committed transaction are TWO \
+         transactions and must carry two commit positions — one shared position \
+         means the buffer survived its marker and was published under the next \
+         transaction's commit"
+    );
+}

@@ -220,3 +220,32 @@ pub fn mysql_seed_one_transaction_wide(
     }
     c.query_drop("COMMIT").expect("commit");
 }
+
+/// Seed a transaction whose rows REACH the binlog and are then closed with
+/// `ROLLBACK` — the shape that leaves a discarded buffer for the next transaction.
+///
+/// MEASURED on the stand, because the obvious fixture does not work: in a mixed
+/// InnoDB+MyISAM transaction MySQL logs ONLY the MyISAM rows and rolls the InnoDB
+/// ones back without writing them, so a captured InnoDB table has nothing in rivet's
+/// buffer when the ROLLBACK arrives and the test passes on the broken code. Probed
+/// with `SHOW BINLOG EVENTS`: the window holds `Table_map(probe_ntx)`,
+/// `Write_rows`, `Query` — no trace of the InnoDB inserts.
+///
+/// So the CAPTURED table must be the non-transactional one. `table` is expected to
+/// be `ENGINE=MyISAM`; its rows cannot be rolled back, so the server keeps them,
+/// logs them, and closes the statement with `ROLLBACK` instead of an `Xid`.
+pub fn mysql_seed_rolled_back_transaction(
+    c: &mut mysql::PooledConn,
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+) {
+    use mysql::prelude::Queryable;
+    c.query_drop("START TRANSACTION").expect("begin");
+    for i in ids {
+        c.query_drop(format!(
+            "INSERT INTO {table} VALUES ({i}, {i}, REPEAT('r', 8))"
+        ))
+        .expect("insert into the captured non-transactional table");
+    }
+    c.query_drop("ROLLBACK").expect("rollback");
+}
