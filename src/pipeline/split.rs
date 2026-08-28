@@ -229,15 +229,25 @@ fn read_unit_manifests(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
 ) -> Vec<crate::manifest::RunManifest> {
+    try_read_unit_manifests(dest_config, family).unwrap_or_default()
+}
+
+/// The strict twin: an Err is a LISTING/OPEN failure, distinct from "listed
+/// fine, zero unit manifests". `reconstruct_units_from_prefix` must tell them
+/// apart (round-5 lifecycle): its `None` contract means "genuine first run —
+/// caller re-samples", and re-sampling because a cloud listing BLIPPED is the
+/// original finding-2 silent gap resurrected by a transient error (fresh
+/// boundaries + name-based skip over old-window Success units). Skip-callers
+/// keep the lenient shape — an empty skip set merely re-runs everything.
+fn try_read_unit_manifests(
+    dest_config: &crate::config::DestinationConfig,
+    family: &str,
+) -> anyhow::Result<Vec<crate::manifest::RunManifest>> {
     use crate::manifest::{RunManifest, is_run_unique_manifest_name};
     let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
     let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
-    let Ok(dest) = crate::destination::create_destination(&expanded) else {
-        return Vec::new();
-    };
-    let Ok(listing) = dest.list_prefix("") else {
-        return Vec::new();
-    };
+    let dest = crate::destination::create_destination(&expanded)?;
+    let listing = dest.list_prefix("")?;
     let mut out = Vec::new();
     for meta in listing {
         let base = meta.key.rsplit('/').next().unwrap_or("");
@@ -250,25 +260,35 @@ fn read_unit_manifests(
             out.push(m);
         }
     }
-    out
+    Ok(out)
 }
 
-/// Terminal-stamp everything a reconstruction CEASED — ordinals at/past `kept`.
+/// Terminal-stamp the LEDGER rows of split units a reconstruction CEASED —
+/// ordinals at/past `kept`.
 ///
 /// A trailing-adjacent crash shrinks the reconstructed partition (the open tail
-/// absorbs the crashed range), so `{giant}#kept..` will never run again under
-/// this lineage. Their leftovers wedge the prefix FOREVER without this: a
-/// `running` bucket MARKER of a ceased ordinal is a split sibling to every
-/// later unit manifest (siblings never supersede) and no same-name SUCCESS will
-/// ever land, so `census.active_running()` stays true — and the ledger row
-/// wedges `has_active_run_on_prefix` the same way (round-4; born with the
-/// reconstruction in #217). Both halves are stamped here, at the one moment
-/// that KNOWS an ordinal ceased: the bucket marker is rewritten
-/// `Running → Interrupted` (same run_id, finished_at set), the ledger rows go
-/// through [`StateStore::interrupt_ceased_split_units`]. Best-effort on the
-/// bucket half (a failed rewrite leaves the old wedge, never corrupts data).
+/// absorbs the crashed range), so `{giant}#kept..` never run again under this
+/// lineage — no SUCCESS of those names can ever supersede their rows, and an
+/// unstamped `running` row wedges `has_active_run_on_prefix` (and with it
+/// gc/cleanup on the whole shared prefix) FOREVER (round-4; born with the
+/// reconstruction in #217).
 ///
-/// Returns how many artifacts were stamped (markers + ledger rows).
+/// LEDGER-ONLY, deliberately (round-5 refuter). A first cut also rewrote the
+/// ceased ordinals' bucket markers Running → Interrupted — but "ceased" is
+/// inferred from manifest ABSENCE, which is exactly what a LIVE trailing unit
+/// of an overlapping pool looks like (cron double-fire): rewriting ITS marker
+/// strips the one signal that spares its in-flight parts from a cross-host gc,
+/// converting a benign overlap into data loss. Stamping only the ledger is
+/// safe in that race — the live unit's marker keeps the census active, and its
+/// own finalize re-arms the row. The dead ordinals' markers are retired by
+/// gc's terminal-ledger sweep arm instead (`gc_orphans`: a Running marker
+/// whose run_id has a TERMINAL ledger row is a dead crash marker), which reads
+/// the stamp this function wrote. Residual: a STATELESS deployment never
+/// learns the ledger verdict, so its ceased markers wait for a same-name
+/// Success that cannot come — documented, conservative direction.
+///
+/// Prefix-scoped: on a shared state DB, another config's same-name giant on a
+/// different prefix must not be touched.
 pub(crate) fn stamp_ceased_units(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
@@ -276,84 +296,92 @@ pub(crate) fn stamp_ceased_units(
     kept: usize,
     state: &crate::state::StateStore,
 ) -> usize {
-    use crate::manifest::{ManifestStatus, RunManifest, is_run_unique_manifest_name};
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
+    let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
+    let prefix = crate::pipeline::finalize::destination_uri_for_manifest(&expanded);
     let now = chrono::Utc::now().to_rfc3339();
-    let mut stamped = 0usize;
-
-    // Ledger half first — it is the half gc/cleanup actually read co-located.
-    match state.interrupt_ceased_split_units(giant_name, kept, &now) {
+    match state.interrupt_ceased_split_units(giant_name, &prefix, kept, &now) {
         Ok(names) => {
             if !names.is_empty() {
                 log::info!(
                     "apply --pool --split: stamped {} ceased unit ledger row(s) interrupted \
-                     ({}) — the reconstructed partition has {kept} unit(s)",
+                     ({}) — the reconstructed partition has {kept} unit(s); their bucket \
+                     markers are retired by the next gc pass's terminal-ledger sweep",
                     names.len(),
                     names.join(", ")
                 );
-                stamped += names.len();
             }
+            names.len()
         }
-        Err(e) => log::warn!(
-            "apply --pool --split: could not stamp ceased unit ledger rows for \
-             '{giant_name}': {e:#}"
-        ),
+        Err(e) => {
+            log::warn!(
+                "apply --pool --split: could not stamp ceased unit ledger rows for \
+                 '{giant_name}': {e:#}"
+            );
+            0
+        }
     }
+}
 
-    // Bucket half: rewrite ceased ordinals' Running markers to Interrupted.
-    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
-    let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
-    let Ok(dest) = crate::destination::create_destination(&expanded) else {
-        return stamped;
-    };
-    let Ok(listing) = dest.list_prefix("") else {
-        return stamped;
-    };
-    let unit_prefix = format!("{giant_name}#");
-    for meta in listing {
-        let base = meta.key.rsplit('/').next().unwrap_or("");
-        if !is_run_unique_manifest_name(base) {
+/// Do the prefix's completed unit windows TILE the key space — ordinals
+/// contiguous from 0, open bottom on #0, open top on the last, and every
+/// interior boundary shared (`unit[i].hi == unit[i+1].lo`)?
+///
+/// The repair path's gate (round-5 lifecycle): `completed_units_in_prefix` is
+/// generation-blind, so a crashed gen-1 + partially-run gen-2 can name every
+/// ordinal "complete" while their windows come from DIFFERENT boundary sets —
+/// a union with a genuine never-exported gap. rivet's own Full load is saved
+/// by `ensure_single_generation`, but minting a `_SUCCESS` over that state
+/// hands external `_SUCCESS`-keyed consumers a gapped dataset silently. The
+/// existing bottoms/tops check cannot see a FRANKEN interior (one bottom, one
+/// top, mismatched middle) — this adjacency walk can.
+///
+/// Latest Success per ordinal wins (same rule the skip uses). `false` on any
+/// incoherence — including unreadable listings (refuse to certify blind).
+pub(crate) fn completed_units_tile(
+    dest_config: &crate::config::DestinationConfig,
+    family: &str,
+) -> bool {
+    use crate::manifest::ManifestStatus;
+    let mut latest: std::collections::BTreeMap<usize, crate::manifest::RunManifest> =
+        Default::default();
+    for m in read_unit_manifests(dest_config, family) {
+        if m.status != ManifestStatus::Success || m.split_window.is_none() {
             continue;
         }
-        let Ok(bytes) = dest.read(&meta.key) else {
+        // Ordinal from the LAST `#` — the caller (repair) knows only the
+        // FAMILY, and a unit's name is `{giant}#{ord}` for a giant in it.
+        let Some(ord) = m
+            .export_name
+            .rsplit_once('#')
+            .and_then(|(_, s)| s.parse::<usize>().ok())
+        else {
             continue;
         };
-        let Ok(mut m) = serde_json::from_slice::<RunManifest>(&bytes) else {
-            continue;
-        };
-        let ceased = m.status == ManifestStatus::Running
-            && m.export_name
-                .strip_prefix(&unit_prefix)
-                .and_then(|s| s.parse::<usize>().ok())
-                .is_some_and(|ord| ord >= kept);
-        if !ceased {
-            continue;
-        }
-        m.status = ManifestStatus::Interrupted;
-        m.finished_at = now.clone();
-        let ok = serde_json::to_vec_pretty(&m)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                let tmp = tempfile::NamedTempFile::new()?;
-                std::fs::write(tmp.path(), &bytes)?;
-                dest.write(tmp.path(), &meta.key)?;
-                Ok(())
-            });
-        match ok {
-            Ok(()) => {
-                log::info!(
-                    "apply --pool --split: stamped ceased unit marker '{}' interrupted ({})",
-                    m.export_name,
-                    meta.key
-                );
-                stamped += 1;
+        match latest.get(&ord) {
+            Some(cur) if cur.finished_at >= m.finished_at => {}
+            _ => {
+                latest.insert(ord, m);
             }
-            Err(e) => log::warn!(
-                "apply --pool --split: could not stamp ceased unit marker '{}': {e:#}",
-                m.export_name
-            ),
         }
     }
-    stamped
+    if latest.is_empty() {
+        return false;
+    }
+    let n = latest.len();
+    if !latest.keys().copied().eq(0..n) {
+        return false; // a hole in the ordinals is not a complete partition
+    }
+    let windows: Vec<_> = latest
+        .values()
+        .map(|m| m.split_window.clone().expect("filtered Some"))
+        .collect();
+    if windows[0].lo.is_some() || windows[n - 1].hi.is_some() {
+        return false;
+    }
+    windows
+        .windows(2)
+        .all(|w| w[0].hi.is_some() && w[0].hi == w[1].lo)
 }
 
 /// The Success unit names under the split prefix — the per-unit resume skip set. KNOWN LIMIT
@@ -425,6 +453,26 @@ pub(crate) fn reconstruct_units_from_prefix(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
     giant: &ExportConfig,
+) -> anyhow::Result<Option<Vec<ExportConfig>>> {
+    // A LISTING failure must not read as "no prior split": the caller would
+    // re-sample fresh boundaries and the (independent, possibly-succeeding)
+    // completed-units listing would then name-skip old-window units — the
+    // finding-2 silent gap, resurrected by one transient cloud error
+    // (round-5 lifecycle). Refuse loudly; a resume can be retried.
+    let manifests = try_read_unit_manifests(dest_config, family).map_err(|e| {
+        anyhow::anyhow!(
+            "apply --pool --split --resume: cannot LIST the split prefix to reconstruct \
+             the prior partition ({e:#}) — refusing to re-sample fresh boundaries over an \
+             unreadable prefix (that is how a resume silently gaps). Retry when the \
+             destination is reachable."
+        )
+    })?;
+    Ok(reconstruct_units_from_manifests(manifests, giant))
+}
+
+fn reconstruct_units_from_manifests(
+    manifests: Vec<crate::manifest::RunManifest>,
+    giant: &ExportConfig,
 ) -> Option<Vec<ExportConfig>> {
     // A resume must not RESURRECT a split the fresh path would now refuse. `probe_and_synthesize`
     // gates new splits through `splittable_key` (e.g. it refuses `keyset_incremental`), but
@@ -443,7 +491,7 @@ pub(crate) fn reconstruct_units_from_prefix(
     // to decide whether the reconstructed OPEN TAIL is a genuine completed tail or a WIDENED one
     // absorbing a trailing crash (below).
     let mut manifested: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for m in read_unit_manifests(dest_config, family) {
+    for m in manifests {
         let (Some(w), Some(ord)) = (
             m.split_window.as_ref(),
             m.export_name
@@ -623,13 +671,15 @@ mod tests {
         assert_eq!(split_unsafe_placeholder(&dest), None);
     }
 
-    /// ROUND-4 split-wedge closure, BOTH halves through the real fn: a
-    /// reconstruction kept 5 units; ceased ordinal #6 left a `running` ledger
-    /// row AND a `running` bucket marker — neither can ever be superseded (no
-    /// `orders#6` will run again; every later unit manifest is a split
-    /// sibling), so gc/cleanup on the shared prefix wedge forever. The stamp
-    /// turns both Interrupted; the LIVE ordinal #1 is untouched. RED against
-    /// removing either half (the assert on that half fails).
+    /// ROUND-4 wedge closure, revised by the round-5 refuter: the stamp is
+    /// LEDGER-ONLY (a first cut also rewrote bucket markers — but manifest
+    /// ABSENCE cannot tell a ceased ordinal from a LIVE trailing unit of an
+    /// overlapping pool, and rewriting a live unit's marker strips the one
+    /// signal sparing its in-flight parts). The ceased ordinals' markers are
+    /// retired by gc's terminal-ledger sweep arm, which reads the stamp this
+    /// fn wrote — proven here end to end: stamp → ledger terminal (live
+    /// ordinal untouched, foreign prefix untouched) → sweep retires exactly
+    /// the stamped ordinals' markers → both activity signals read idle.
     #[test]
     fn stamp_ceased_units_closes_both_wedge_halves() {
         let dir = tempfile::tempdir().unwrap();
@@ -638,15 +688,8 @@ mod tests {
             path: Some(dir.path().to_string_lossy().into_owned()),
             ..Default::default()
         };
-        for (run, name, status) in [
-            ("r1", "orders#1", crate::manifest::ManifestStatus::Running),
-            // ordinal == kept: the SHRINK-BY-ONE trailing crash, the most common
-            // shape — a `>` mutant in the bucket-half compare spares exactly it
-            // (round-5 completeness critic predicted this survivor).
-            ("r5", "orders#5", crate::manifest::ManifestStatus::Running),
-            ("r6", "orders#6", crate::manifest::ManifestStatus::Running),
-        ] {
-            let m = unit_manifest(run, name, status);
+        for (run, name) in [("r1", "orders#1"), ("r5", "orders#5"), ("r6", "orders#6")] {
+            let m = unit_manifest(run, name, crate::manifest::ManifestStatus::Running);
             std::fs::write(
                 dir.path().join(format!("manifest-{run}.json")),
                 serde_json::to_vec(&m).unwrap(),
@@ -654,27 +697,23 @@ mod tests {
             .unwrap();
         }
         let state = crate::state::StateStore::open_in_memory().unwrap();
+        let prefix = crate::pipeline::finalize::destination_uri_for_manifest(&dest);
         for (run, name) in [("r1", "orders#1"), ("r5", "orders#5"), ("r6", "orders#6")] {
             state
-                .begin_run(run, name, "gs://b/orders", "2026-08-21T00:00:00Z")
+                .begin_run(run, name, &prefix, "2026-08-21T00:00:00Z")
                 .unwrap();
         }
 
+        // kept = 5: ordinals 5 and 6 ceased (5 == kept is the shrink-by-one
+        // shape a `>` mutant would spare), ordinal 1 lives.
         let stamped = stamp_ceased_units(&dest, "orders", "orders", 5, &state);
-        assert_eq!(
-            stamped, 4,
-            "two ledger rows + two bucket markers (#5 and #6)"
-        );
-
-        // Ledger half: r6 terminal, r1 still live.
-        let active = state.active_run_ids_on_prefix("gs://b/orders").unwrap();
+        assert_eq!(stamped, 2, "two ceased ledger rows (#5, #6)");
+        let active = state.active_run_ids_on_prefix(&prefix).unwrap();
         assert!(active.contains("r1"), "the live ordinal must stay live");
-        assert!(
-            !active.contains("r6"),
-            "the ceased ordinal must be terminal"
-        );
+        assert!(!active.contains("r5") && !active.contains("r6"));
 
-        // Bucket half: the ceased marker reads Interrupted, the live one Running.
+        // The stamp did NOT touch any marker — a live unit's protection is
+        // never stripped by inference from absence.
         let read = |run: &str| -> crate::manifest::ManifestStatus {
             serde_json::from_slice::<crate::manifest::RunManifest>(
                 &std::fs::read(dir.path().join(format!("manifest-{run}.json"))).unwrap(),
@@ -682,33 +721,59 @@ mod tests {
             .unwrap()
             .status
         };
-        assert_eq!(read("r6"), crate::manifest::ManifestStatus::Interrupted);
-        assert_eq!(
-            read("r5"),
-            crate::manifest::ManifestStatus::Interrupted,
-            "ordinal == kept ceased too — a > compare would spare exactly it"
-        );
-        assert_eq!(read("r1"), crate::manifest::ManifestStatus::Running);
+        for run in ["r1", "r5", "r6"] {
+            assert_eq!(read(run), crate::manifest::ManifestStatus::Running);
+        }
 
-        // The wedge is CLOSED: once the live unit finishes, nothing reads active
-        // on either signal.
+        // The unit's own finalize completes #1; gc's terminal-ledger sweep arm
+        // then retires the stamped ordinals' markers — and only theirs.
         state
             .finish_run("r1", "success", "2026-08-21T02:00:00Z")
             .unwrap();
-        assert!(!state.has_active_run_on_prefix("gs://b/orders").unwrap());
-        // …and the unit's own finalize replaces its marker with the Success
-        // manifest (as production does) — the census must then read idle too.
         let done = unit_manifest("r1", "orders#1", crate::manifest::ManifestStatus::Success);
         std::fs::write(
             dir.path().join("manifest-r1.json"),
             serde_json::to_vec(&done).unwrap(),
         )
         .unwrap();
+        let gcs = crate::destination::gcs::GcsStore::open_fs(
+            dir.path().parent().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        let base = dir.path().file_name().unwrap().to_string_lossy();
         let keyed: Vec<(String, crate::manifest::RunManifest)> = ["r1", "r5", "r6"]
             .iter()
             .map(|run| {
                 (
-                    format!("base/manifest-{run}.json"),
+                    format!("{base}/manifest-{run}.json"),
+                    serde_json::from_slice(
+                        &std::fs::read(dir.path().join(format!("manifest-{run}.json"))).unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let dead: std::collections::HashSet<String> = ["r5", "r6"]
+            .iter()
+            .filter(|r| matches!(state.run_status_of(r).unwrap(), Some(st) if st != "running"))
+            .map(|r| r.to_string())
+            .collect();
+        assert_eq!(dead.len(), 2, "the stamp fed the sweep both ceased ids");
+        let (removed, _) = crate::load::reconcile::gc_orphans(
+            &gcs,
+            &format!("gs://b/{base}"),
+            &keyed,
+            false,
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(removed, 2, "exactly the ceased ordinals' markers are swept");
+        assert!(!state.has_active_run_on_prefix(&prefix).unwrap());
+        let keyed: Vec<(String, crate::manifest::RunManifest)> = ["r1"]
+            .iter()
+            .map(|run| {
+                (
+                    format!("{base}/manifest-{run}.json"),
                     serde_json::from_slice(
                         &std::fs::read(dir.path().join(format!("manifest-{run}.json"))).unwrap(),
                     )
@@ -719,7 +784,7 @@ mod tests {
         let census = crate::manifest::census::ManifestCensus::new(&keyed);
         assert!(
             !census.active_running(),
-            "no marker may keep reading live once the kept units finished"
+            "no marker may keep reading live once the stamp + sweep both ran"
         );
     }
 
@@ -900,6 +965,7 @@ mod tests {
         write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
 
         let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .unwrap()
             .expect("reconstruct must recover the partition from the persisted windows");
 
         // The EXACT original partition, gap-free and overlap-free — NOT a re-sample of the
@@ -952,7 +1018,9 @@ mod tests {
         // The config is now keyset_incremental → not splittable.
         giant.keyset_incremental = true;
         assert!(
-            reconstruct_units_from_prefix(&giant.destination, "daily", &giant).is_none(),
+            reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+                .unwrap()
+                .is_none(),
             "a resume must not resurrect a split for a config that is no longer splittable"
         );
     }
@@ -978,6 +1046,7 @@ mod tests {
         write_unit_manifest(dir.path(), "daily#1", "r1", Some("250"), Some("500"));
 
         let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .unwrap()
             .expect("reconstruct");
         assert_eq!(
             wins_of(&units),
@@ -1016,6 +1085,7 @@ mod tests {
         write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
 
         let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .unwrap()
             .expect("a leading adjacent crash must NOT collapse to None (that re-samples)");
         assert_eq!(
             wins_of(&units),
@@ -1049,6 +1119,7 @@ mod tests {
         write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
 
         let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .unwrap()
             .expect("reconstruct");
         assert_eq!(
             wins_of(&units),
@@ -1102,6 +1173,7 @@ mod tests {
         write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
 
         let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .unwrap()
             .expect("reconstruct");
         assert!(
             units.iter().all(|u| u.chunk_checkpoint),

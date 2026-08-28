@@ -984,12 +984,27 @@ fn migrate(conn: &Connection) -> Result<()> {
     // but the operator is then handed "no such table: file_manifest" instead of
     // the truth, which names neither the cause nor the remedy.
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
-        anyhow::anyhow!(
-            "state: could not acquire the migration lock within the busy timeout ({e}). \
-             Another rivet process is migrating this state database; wait for it to finish \
-             and retry. Running the migration ladder without the lock is what produces \
-             'no such table' / 'duplicate column' failures on a shared backend."
-        )
+        // NOTADB is a DIFFERENT disease than BUSY: garbage bytes in the file
+        // are not another process's lock, and telling the operator to "wait
+        // for it to finish" strands them waiting on a phantom (round-5 — the
+        // corrupt-DB probe surfaced this wrong-cause-first headline through
+        // the new `state` CLI).
+        let msg = e.to_string();
+        if msg.contains("file is not a database") || msg.contains("database disk image") {
+            anyhow::anyhow!(
+                "state: {msg} — the state DB file is CORRUPT (or not a SQLite file at \
+                 all), not locked. Move it aside and re-run (rivet rebuilds state; \
+                 incremental cursors and skip-ledgers start fresh), or restore it from \
+                 a backup."
+            )
+        } else {
+            anyhow::anyhow!(
+                "state: could not acquire the migration lock within the busy timeout ({e}). \
+                 Another rivet process is migrating this state database; wait for it to \
+                 finish and retry. Running the migration ladder without the lock is what \
+                 produces 'no such table' / 'duplicate column' failures on a shared backend."
+            )
+        }
     })?;
     let out = migrate_locked(conn);
     let _ = conn.execute_batch(if out.is_ok() { "COMMIT;" } else { "ROLLBACK;" });

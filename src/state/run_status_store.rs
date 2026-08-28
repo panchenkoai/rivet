@@ -138,6 +138,20 @@ impl StateStore {
     /// since the skip set is keyed on the run_id alone. Excluding exactly the
     /// active runs leaves them retryable while every terminal run is still
     /// recorded, so a completed run is never re-loaded.
+    /// The status of ONE run-status row, or `None` when no row exists — the gc
+    /// marker sweep's ledger probe: a `Running` BUCKET marker whose ledger row
+    /// is TERMINAL is a dead crash marker even though no Success ever
+    /// superseded it (an abandoned export's marker can never be superseded —
+    /// round-5, three agents independently). Co-located only; a stateless gc
+    /// has no ledger and keeps the conservative supersession-only sweep.
+    pub fn run_status_of(&self, run_id: &str) -> Result<Option<String>> {
+        let sql = "SELECT status FROM run_status WHERE run_id = ?1";
+        Ok(self
+            .query(sql, &[run_id.into()], |r| r.text(0))?
+            .into_iter()
+            .next())
+    }
+
     /// The run-status rows, newest first — `rivet state runs`. `running_only`
     /// narrows to the rows that can freeze a prefix (gc/cleanup read them).
     pub fn recent_run_status(&self, last: usize, running_only: bool) -> Result<Vec<RunStatusRow>> {
@@ -175,16 +189,26 @@ impl StateStore {
     /// with every message telling the operator to wait for a run that will
     /// never finish.
     pub fn finish_run_checked(&self, run_id: &str, finished_at: &str) -> Result<FinishOutcome> {
+        // ATOMIC: the UPDATE itself carries the status guard, and Stamped is
+        // derived from rows-affected — a run finalizing `success` between a
+        // SELECT and an unconditional UPDATE would be downgraded to
+        // `interrupted`, possibly un-superseding an older stale row the
+        // success had just retired (round-5 refuter). The SELECT afterwards
+        // only names which of the two remaining answers is true.
+        let n = self.execute(
+            "UPDATE run_status SET status = 'interrupted', finished_at = ?2
+             WHERE run_id = ?1 AND status = 'running'",
+            &[run_id.into(), finished_at.into()],
+        )?;
+        if n > 0 {
+            return Ok(FinishOutcome::Stamped);
+        }
         let sql = "SELECT status FROM run_status WHERE run_id = ?1";
         let status = self.query(sql, &[run_id.into()], |r| r.text(0))?;
-        let Some(status) = status.into_iter().next() else {
-            return Ok(FinishOutcome::NotFound);
-        };
-        if status != "running" {
-            return Ok(FinishOutcome::AlreadyTerminal(status));
+        match status.into_iter().next() {
+            Some(status) => Ok(FinishOutcome::AlreadyTerminal(status)),
+            None => Ok(FinishOutcome::NotFound),
         }
-        self.finish_run(run_id, "interrupted", finished_at)?;
-        Ok(FinishOutcome::Stamped)
     }
 
     /// Terminal-stamp the `running` rows of split units a `--split --resume`
@@ -203,12 +227,22 @@ impl StateStore {
     pub fn interrupt_ceased_split_units(
         &self,
         giant: &str,
+        prefix: &str,
         kept: usize,
         finished_at: &str,
     ) -> Result<Vec<String>> {
+        // PREFIX-SCOPED (round-5 refuter): on a shared-Postgres state DB two
+        // configs can both carry a split giant named `orders` — a name-only
+        // stamp would close the OTHER config's live rows. Same containment
+        // predicate as `active_run_ids_on_prefix`.
         let sql = "SELECT r.run_id, r.export_name FROM run_status r
-                   WHERE r.export_name LIKE ?1 || '#%' AND r.status = 'running'";
-        let rows = self.query(sql, &[giant.into()], |r| (r.text(0), r.text(1)))?;
+                   WHERE r.export_name LIKE ?1 || '#%' AND r.status = 'running'
+                     AND (rtrim(r.prefix, '/') = rtrim(?2, '/')
+                          OR r.prefix LIKE rtrim(?2, '/') || '/%'
+                          OR rtrim(?2, '/') LIKE rtrim(r.prefix, '/') || '/%')";
+        let rows = self.query(sql, &[giant.into(), prefix.into()], |r| {
+            (r.text(0), r.text(1))
+        })?;
         let mut stamped = Vec::new();
         for (run_id, name) in rows {
             let ceased = name
@@ -297,8 +331,16 @@ mod tests {
         }
         s.begin_run("rx", "unrelated", "gs://b/other", "2026-08-21T00:00:00Z")
             .unwrap();
+        // A FOREIGN config's same-name giant on ANOTHER prefix must survive.
+        s.begin_run(
+            "rf",
+            "orders#7",
+            "gs://other/orders",
+            "2026-08-21T00:00:00Z",
+        )
+        .unwrap();
         let stamped = s
-            .interrupt_ceased_split_units("orders", 5, "2026-08-21T01:00:00Z")
+            .interrupt_ceased_split_units("orders", "gs://b/orders", 5, "2026-08-21T01:00:00Z")
             .unwrap();
         let mut names = stamped.clone();
         names.sort();
@@ -319,6 +361,10 @@ mod tests {
              prefix must read idle — this is the wedge the stamp exists to close"
         );
         assert!(s.has_active_run_on_prefix("gs://b/other").unwrap());
+        assert!(
+            s.has_active_run_on_prefix("gs://other/orders").unwrap(),
+            "the OTHER config's same-name giant is out of scope — prefix-scoping is the guard"
+        );
     }
 
     /// The load's skip set is keyed on `run_id` alone, and a CDC run's manifest

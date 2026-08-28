@@ -380,7 +380,31 @@ fn maybe_gc_orphans(
         ledger_active,
         load::reconcile::has_active_running_manifest(&keyed),
     );
-    match load::reconcile::gc_orphans(store, &plan.gcs_prefix, &keyed, active) {
+    // Which `running` MARKERS the ledger already knows are dead (`state
+    // finish-run`, the split ceased-ordinal stamp): their run_id has a
+    // TERMINAL row, so the sweep may retire the marker even though no Success
+    // ever superseded it. Stateless → empty → conservative sweep only.
+    let dead_marker_run_ids: std::collections::HashSet<String> = match state {
+        Some(s) => keyed
+            .iter()
+            .filter(|(_, m)| m.status == crate::manifest::ManifestStatus::Running)
+            .filter(|(_, m)| {
+                matches!(
+                    s.run_status_of(&m.run_id),
+                    Ok(Some(status)) if status != "running"
+                )
+            })
+            .map(|(_, m)| m.run_id.clone())
+            .collect(),
+        None => Default::default(),
+    };
+    match load::reconcile::gc_orphans(
+        store,
+        &plan.gcs_prefix,
+        &keyed,
+        active,
+        &dead_marker_run_ids,
+    ) {
         Ok((0, _)) => {}
         Ok((n, bytes)) => {
             println!(
@@ -678,12 +702,20 @@ impl LoadCtx<'_> {
         // snapshot. Consuming it would strand its post-fetch parts forever.
         // No fetch-time sample at all (the query failed) → consume nothing;
         // the next cycle re-evaluates, which the dedup view absorbs.
+        let fetch_sample_missing = self.active_at_fetch.is_none();
         match &self.active_at_fetch {
             Some(at_fetch) => active.extend(at_fetch.iter().cloned()),
             None => active.extend(source_run_ids.iter().cloned()),
         }
         let source_run_ids = consumable_run_ids(source_run_ids, &active);
-        if let Some(note) = active_run_note(active.len(), self.source_prefix) {
+        // The "still writing" note is for runs OBSERVED active. When the
+        // fetch-time sample is missing, `active` was padded with every run as
+        // a consume-nothing fail-safe — printing "N runs still writing" about
+        // runs that are merely unverifiable is false (round-5); the fetch-time
+        // warn already told the operator nothing will be recorded this cycle.
+        if !fetch_sample_missing
+            && let Some(note) = active_run_note(active.len(), self.source_prefix)
+        {
             eprintln!("{note}");
         }
         let source_run_ids = &source_run_ids[..];

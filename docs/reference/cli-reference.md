@@ -309,7 +309,7 @@ Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful succ
 ###### **Options:**
 
 * `-c`, `--config <CONFIG>`
-* `--run-id <RUN_ID>` — The run id to close (find it with `rivet state runs --running`)
+* `--run-id <RUN_ID>` — The run id to close (find it with `rivet state runs -c <config> --running`)
 
 
 

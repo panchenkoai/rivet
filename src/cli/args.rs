@@ -532,7 +532,7 @@ pub enum StateAction {
     FinishRun {
         #[arg(short, long)]
         config: String,
-        /// The run id to close (find it with `rivet state runs --running`)
+        /// The run id to close (find it with `rivet state runs -c <config> --running`)
         #[arg(long)]
         run_id: String,
     },

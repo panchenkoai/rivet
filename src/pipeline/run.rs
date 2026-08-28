@@ -1745,16 +1745,15 @@ pub(crate) fn run_pool(
                         base.name
                     );
                 }
-                let units_opt = match resume
-                    .then(|| {
-                        super::split::reconstruct_units_from_prefix(
-                            &base.destination,
-                            &base.family(),
-                            &base,
-                        )
-                    })
-                    .flatten()
-                {
+                let reconstructed = match resume {
+                    true => super::split::reconstruct_units_from_prefix(
+                        &base.destination,
+                        &base.family(),
+                        &base,
+                    )?,
+                    false => None,
+                };
+                let units_opt = match reconstructed {
                     Some(u) => {
                         // The reconstruction may have SHRUNK the partition (a
                         // trailing-adjacent crash: the open tail absorbed the

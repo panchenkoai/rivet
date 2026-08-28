@@ -116,6 +116,16 @@ pub(crate) fn spill_file_pid(name: &str) -> Option<u32> {
 /// Deleting a file a LIVE writer is still appending to would tear a transaction in
 /// half. Same rule as the orphan GC: gate the ambiguous case on a lifecycle signal,
 /// and where it is unclear, spare.
+/// Sweep with the PRODUCTION liveness probe — the CDC open calls this once per
+/// run so an orphan does not wait for the NEXT spill to be born in the same
+/// dir (round-5 lifecycle: the likeliest spill producer is a one-off giant
+/// backfill transaction that also crashed the run — its multi-GB file leaked
+/// until another transaction crossed the cap in the same directory, possibly
+/// never).
+pub(crate) fn sweep_dead_spills_now(dir: &std::path::Path) {
+    sweep_dead_spills(dir, pid_is_alive);
+}
+
 pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) -> bool) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return; // no directory yet is not an error — there is nothing to sweep
@@ -263,11 +273,20 @@ impl SpillFile {
             use std::os::fd::AsRawFd as _;
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
+                // This branch runs on a file `create_new` JUST made — no other
+                // writer can hold it. A failing flock here means the FILESYSTEM
+                // refused the lock (NFS without lockd → ENOLCK, some FUSE/SMB →
+                // EOPNOTSUPP) — and flock is the sweep's liveness signal, so
+                // continuing would leave a spill the sweep could later mistake
+                // for an orphan mid-write. (Round-5: the old text asserted an
+                // impossible live neighbour, for a case that cannot reach here.)
                 anyhow::bail!(
-                    "cdc spill: {} exists AND is locked by a live writer — the \
-                     startup-token name should have made this impossible; refusing \
-                     to touch it",
-                    path.display()
+                    "cdc spill: this filesystem refused flock on {} ({}) — the lock is \
+                     the crash-liveness signal spills depend on. Point RIVET_CDC_SPILL_DIR \
+                     at a local filesystem (flock-capable), or raise the rollover memory \
+                     cap so this transaction stays in memory.",
+                    path.display(),
+                    std::io::Error::last_os_error()
                 );
             }
         }

@@ -605,7 +605,7 @@ mod tests {
             "cleanup_source must REFUSE a bucket-root prefix, not remove_all(\"\")"
         );
         assert!(
-            reconcile::gc_orphans(&store, "gs://bucket/", &[], false).is_err(),
+            reconcile::gc_orphans(&store, "gs://bucket/", &[], false, &Default::default()).is_err(),
             "gc_orphans must REFUSE a bucket-root prefix, not list+delete the whole bucket"
         );
         // Nothing was deleted — both independent exports survive intact.

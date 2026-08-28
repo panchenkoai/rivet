@@ -1298,6 +1298,14 @@ pub(crate) fn create_change_stream(
     // slot/CDC grants hint below (dogfood LOW).
     crate::source::require_url_has_host(url)?;
     let tls = cfg.tls.as_ref();
+    // Sweep crashed runs' spill orphans ONCE per open — not only when a NEW
+    // spill is born in the same dir (round-5 lifecycle: a one-off giant
+    // transaction that also crashed the run leaked its multi-GB spill until
+    // another transaction crossed the cap there, possibly never). flock decides
+    // liveness, so a concurrent run's held spill is spared.
+    if let Some(dir) = spill_dir_for(cfg.checkpoint.as_deref(), &cfg.config_dir) {
+        spill::sweep_dead_spills_now(&dir);
+    }
     // The engine identity IS the opts variant — no re-resolution from the URL.
     match &cfg.engine {
         CdcEngineOpts::Mysql {

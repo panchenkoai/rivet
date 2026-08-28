@@ -830,6 +830,23 @@ pub(crate) fn repair_missing_split_marker(
     if destination_has_success(&expanded) {
         return;
     }
+    // GENERATION GATE (round-5 lifecycle HIGH): "every unit complete" came from
+    // a generation-blind name-skip — a crashed gen-1 + partial gen-2 can name
+    // every ordinal complete while their windows come from different boundary
+    // sets, i.e. a union with a genuine never-exported gap. Minting `_SUCCESS`
+    // there hands external consumers a gapped dataset silently; refuse unless
+    // the completed windows actually TILE. rivet's own Full load stays guarded
+    // by `ensure_single_generation` either way.
+    if !crate::pipeline::split::completed_units_tile(dest_config, family) {
+        log::warn!(
+            "apply --pool --split: prefix _SUCCESS for '{family}' is missing, but the \
+             completed unit windows do NOT tile one partition (mixed split generations, \
+             or unreadable manifests) — refusing to write a completion marker over a \
+             possible gap. Re-run the giant into a fresh prefix, or clear the stale \
+             generation's manifests."
+        );
+        return;
+    }
     match write_split_success_marker(&expanded) {
         Ok(()) => log::info!(
             "apply --pool --split: every unit of '{family}' is complete but the prefix \
@@ -1544,8 +1561,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_local(Some(&dir.path().to_string_lossy()), None);
         // The last unit's canonical manifest is in the prefix; the pool died
-        // before the marker.
+        // before the marker. The units' own Success manifests TILE — the
+        // round-5 generation gate certifies completion from them.
         std::fs::write(dir.path().join("manifest.json"), b"{\"parts\":[]}").unwrap();
+        for (run, name, lo, hi) in [
+            ("u0", "orders#0", None, Some("m")),
+            ("u1", "orders#1", Some("m"), None),
+        ] {
+            let mut m = split_unit_success(run, name);
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(str::to_string),
+                hi: hi.map(str::to_string),
+            });
+            std::fs::write(
+                dir.path().join(format!("manifest-{run}.json")),
+                serde_json::to_vec(&m).unwrap(),
+            )
+            .unwrap();
+        }
         assert!(!destination_has_success(&cfg), "fixture: marker absent");
         repair_missing_split_marker(&cfg, "orders");
         assert!(
@@ -1561,6 +1595,70 @@ mod tests {
             body,
             "an existing marker is never clobbered by a later repair pass"
         );
+
+        // FRANKEN generations (round-5 lifecycle HIGH): windows that do not
+        // tile — #1's lo does not meet #0's hi — must REFUSE the mint: an
+        // external `_SUCCESS` consumer would read a gapped dataset silently.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_local(Some(&dir.path().to_string_lossy()), None);
+        std::fs::write(dir.path().join("manifest.json"), b"{\"parts\":[]}").unwrap();
+        for (run, name, lo, hi) in [
+            ("u0", "orders#0", None, Some("b1")),
+            ("u1", "orders#1", Some("c1"), None), // gen-2 boundary: (b1, c1] never exported
+        ] {
+            let mut m = split_unit_success(run, name);
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(str::to_string),
+                hi: hi.map(str::to_string),
+            });
+            std::fs::write(
+                dir.path().join(format!("manifest-{run}.json")),
+                serde_json::to_vec(&m).unwrap(),
+            )
+            .unwrap();
+        }
+        repair_missing_split_marker(&cfg, "orders");
+        assert!(
+            !destination_has_success(&cfg),
+            "non-tiling completed windows must never mint a _SUCCESS"
+        );
+    }
+
+    /// A minimal Success split-unit manifest for the repair fixtures.
+    fn split_unit_success(run: &str, name: &str) -> crate::manifest::RunManifest {
+        use crate::manifest::*;
+        RunManifest {
+            manifest_version: MANIFEST_VERSION,
+            run_id: run.into(),
+            export_name: name.into(),
+            export_family: "orders".into(),
+            mode: "batch".into(),
+            started_at: "2026-08-21T00:00:00Z".into(),
+            finished_at: "2026-08-21T00:01:00Z".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: None,
+                table: Some("orders".into()),
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: "file:///out".into(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: "xxh3:0123456789abcdef".into(),
+            row_count: 0,
+            part_count: 0,
+            parts: vec![],
+            column_checksums: None,
+            checksum_render: None,
+            checksum_key_column: None,
+            row_hash: None,
+            split_window: None,
+        }
     }
 
     fn cfg_s3(bucket: &str, prefix: Option<&str>) -> DestinationConfig {

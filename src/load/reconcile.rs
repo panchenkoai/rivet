@@ -217,6 +217,14 @@ pub fn gc_orphans(
     gcs_prefix: &str,
     keyed: &[(String, RunManifest)],
     active: bool,
+    // `running` MARKERS whose run_id the LEDGER says is TERMINAL — dead crash
+    // markers even though no Success ever superseded them (an abandoned
+    // export's marker can never be superseded; `state finish-run` and the
+    // split ceased-ordinal stamp both produce exactly this state — round-5,
+    // three agents independently). The caller computes this from the state
+    // store; a stateless load passes empty and keeps the conservative
+    // supersession-only sweep.
+    dead_marker_run_ids: &std::collections::HashSet<String>,
 ) -> Result<(usize, u64)> {
     let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
     // Success parts → keep. Failed/Interrupted parts → terminal ONLY once a
@@ -257,8 +265,12 @@ pub fn gc_orphans(
                 // until the run is SUPERSEDED (a newer same-family SUCCESS — the
                 // resume completed; whatever it adopted is now declared under
                 // the Success arm above, and the remainder is genuine debris).
-                // Cost of the spare: an abandoned export's crash debris lives
-                // until a successful pass — bounded, and the safe direction.
+                // Cost of the spare: a NEVER-succeeding export (nightly
+                // crash-loop) accumulates every attempt's partial parquet until
+                // its first Success ever lands — unbounded in that shape, and
+                // accepted: the safe direction, with `cleanup_source` as the
+                // deliberate-delete escape (round-5 corrected an earlier
+                // "bounded" claim here).
                 if census.adopted_by_active_running(run) || !census.superseded(run) {
                     keep.extend(resolve_parts(key, m));
                 } else {
@@ -295,7 +307,10 @@ pub fn gc_orphans(
     // the ACTIVE signal and MUST survive — deletion here is gated on SUPERSESSION,
     // never on `active`.
     for run in census.runs() {
-        if run.manifest.status == ManifestStatus::Running && census.superseded(run) {
+        let dead_by_ledger = dead_marker_run_ids.contains(&run.manifest.run_id);
+        if run.manifest.status == ManifestStatus::Running
+            && (census.superseded(run) || dead_by_ledger)
+        {
             removed_bytes += store.stat_size(run.key).unwrap_or(0);
             store.remove(run.key)?;
             removed += 1;
@@ -1303,7 +1318,8 @@ mod tests {
         ]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
         // No run is active on this prefix → the unmanifested part is dead debris.
-        let (removed, bytes) = gc_orphans(&store, "gs://b/base", &keyed, false).unwrap();
+        let (removed, bytes) =
+            gc_orphans(&store, "gs://b/base", &keyed, false, &Default::default()).unwrap();
         assert_eq!(removed, 1, "only the unmanifested part is removed");
         assert_eq!(bytes, 4, "'junk' is 4 bytes");
         let mut left = store.list_files("base").unwrap();
@@ -1324,7 +1340,9 @@ mod tests {
         let (store, _g) = fs_store(&[("base/r1-000.parquet", b"a".to_vec())]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
         assert_eq!(
-            gc_orphans(&store, "gs://b/base", &keyed, false).unwrap().0,
+            gc_orphans(&store, "gs://b/base", &keyed, false, &Default::default())
+                .unwrap()
+                .0,
             0
         );
     }
@@ -1336,7 +1354,8 @@ mod tests {
             ("base/orphan.parquet", b"x".to_vec()),         // top-level orphan
         ]);
         let keyed = vec![keyed("base/snapshot/manifest-s.json", "s", "s-000.parquet")];
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed, false).unwrap();
+        let (removed, _) =
+            gc_orphans(&store, "gs://b/base", &keyed, false, &Default::default()).unwrap();
         assert_eq!(removed, 1, "the top-level orphan goes");
         assert_eq!(
             store.list_files("base/snapshot").unwrap(),
@@ -1361,7 +1380,7 @@ mod tests {
         ok.started_at = "2026-01-02T00:00:00Z".into();
         let ok = ("base/manifest-f2.json".to_string(), ok);
         assert_eq!(
-            gc_orphans(&store, "gs://b/base", &[kv, ok], true)
+            gc_orphans(&store, "gs://b/base", &[kv, ok], true, &Default::default())
                 .unwrap()
                 .0,
             1
@@ -1384,7 +1403,8 @@ mod tests {
         failed.1.started_at = "2026-01-01T00:00:00Z".into();
         // No successor at all — the between-attempts window. active=false: no
         // ledger row, no marker; pre-fix this deleted the page.
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &[failed], false).unwrap();
+        let (removed, _) =
+            gc_orphans(&store, "gs://b/base", &[failed], false, &Default::default()).unwrap();
         assert_eq!(
             removed, 0,
             "a Failed run's committed pages are the next resume's payload, not debris"
@@ -1414,7 +1434,14 @@ mod tests {
         failed.1.started_at = "2026-01-01T00:00:00Z".into();
         // r1: the live resume of the SAME export — a newer Running marker adopting r0's parts.
         let live = running("r1", "2026-01-02T00:00:00Z");
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &[failed, live], true).unwrap();
+        let (removed, _) = gc_orphans(
+            &store,
+            "gs://b/base",
+            &[failed, live],
+            true,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             removed, 0,
             "a terminal run's parts that an active same-export resume is reusing must be spared"
@@ -1441,7 +1468,8 @@ mod tests {
             ("base/inflight.parquet", b"x".to_vec()), // unmanifested, a live run's part
         ]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed, true).unwrap();
+        let (removed, _) =
+            gc_orphans(&store, "gs://b/base", &keyed, true, &Default::default()).unwrap();
         assert_eq!(
             removed, 0,
             "an unmanifested part is spared while a run is active"
@@ -1466,7 +1494,9 @@ mod tests {
         ]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
         assert_eq!(
-            gc_orphans(&store, "gs://b/base", &keyed, false).unwrap().0,
+            gc_orphans(&store, "gs://b/base", &keyed, false, &Default::default())
+                .unwrap()
+                .0,
             1,
             "with no active run, an unmanifested orphan is collected"
         );
@@ -1600,7 +1630,8 @@ mod tests {
         let mut ok = manifest("r2", 10, Some(10)); // Success, same export
         ok.started_at = "2026-01-01T00:00:02Z".into();
         let r2 = ("base/manifest-r2.json".to_string(), ok);
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true).unwrap();
+        let (removed, _) =
+            gc_orphans(&store, "gs://b/base", &[r1, r2], true, &Default::default()).unwrap();
         assert_eq!(removed, 1, "only the superseded running marker is removed");
         let left = store.list_files("base").unwrap();
         assert!(
@@ -1619,12 +1650,41 @@ mod tests {
         ]);
         let r1 = running("r1", "2026-01-01T00:00:01Z");
         let r2 = running("r2", "2026-01-01T00:00:02Z");
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true).unwrap();
+        let (removed, _) =
+            gc_orphans(&store, "gs://b/base", &[r1, r2], true, &Default::default()).unwrap();
         assert_eq!(
             removed, 0,
             "an overlapping running successor sweeps NOTHING"
         );
         assert_eq!(store.list_files("base").unwrap().len(), 2);
+    }
+
+    /// ROUND-5 (three agents): a `running` marker whose run_id the LEDGER says
+    /// is TERMINAL is a dead crash marker even though no Success ever
+    /// superseded it — an abandoned export's marker CANNOT be superseded, so
+    /// without this arm `state finish-run` unblocked the ledger half while the
+    /// marker kept cleanup refusing forever (and the CLI's success message
+    /// lied). The arm retires exactly the ledger-terminal markers; an id the
+    /// ledger still calls running (or an empty set — the stateless caller)
+    /// keeps the conservative supersession-only sweep. RED against removing
+    /// `|| dead_by_ledger`.
+    #[test]
+    fn the_sweep_retires_a_running_marker_whose_ledger_row_is_terminal() {
+        let (store, _g) = fs_store(&[
+            ("base/manifest-r1.json", b"{}".to_vec()),
+            ("base/manifest-r2.json", b"{}".to_vec()),
+        ]);
+        let r1 = running("r1", "2026-01-01T00:00:01Z");
+        let r2 = running("r2", "2026-01-01T00:00:02Z");
+        let dead = std::collections::HashSet::from(["r1".to_string()]);
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true, &dead).unwrap();
+        assert_eq!(removed, 1, "only the ledger-terminal marker is swept");
+        let left = store.list_files("base").unwrap();
+        assert!(!left.iter().any(|k| k.ends_with("manifest-r1.json")));
+        assert!(
+            left.iter().any(|k| k.ends_with("manifest-r2.json")),
+            "a marker the ledger still calls running survives"
+        );
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {
@@ -2172,7 +2232,8 @@ mod tests {
 
         // 4. gc_orphans deletes the orphan over real GCS — a REAL single-object
         // DELETE against the emulator — keeping the manifested part + manifest.
-        let (removed, _bytes) = gc_orphans(&store, &gs, &keyed, false).unwrap();
+        let (removed, _bytes) =
+            gc_orphans(&store, &gs, &keyed, false, &Default::default()).unwrap();
         assert_eq!(
             removed, 1,
             "exactly the orphan parquet is GC'd over real GCS"

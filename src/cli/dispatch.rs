@@ -784,11 +784,32 @@ fn dispatch_state(action: StateAction) -> Result<()> {
 
 /// `rivet state runs`: the run-status ledger, newest first — the rows
 /// gc_orphans / cleanup_source / the consumed-exclusion actually read.
+/// The two run-status commands REFUSE a missing config file: `StateStore::open`
+/// derives the DB path from the config's DIRECTORY and would silently create a
+/// fresh empty DB — and these commands' empty output is a VERDICT ("no row is
+/// freezing any prefix"), so a typo'd `-c` mid-incident reads as a false
+/// all-clear (round-5 hostile-input probe, live-verified).
+fn require_config_file(config: &str) -> Result<()> {
+    if std::path::Path::new(config).is_file() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "config '{config}' is not a file — refusing to answer from the state DB its \
+         directory would imply (a fresh empty DB reads as an all-clear verdict)"
+    )
+}
+
 fn show_runs(config: &str, running_only: bool, last: usize) -> Result<()> {
+    require_config_file(config)?;
     let store = StateStore::open(config)?;
     let rows = store.recent_run_status(last, running_only)?;
     if rows.is_empty() {
-        let msg = if running_only {
+        // `--last 0` clips everything: an empty listing then says NOTHING about
+        // the DB, and "no running rows" would be an actively false all-clear
+        // (round-5 hostile-input probe).
+        let msg = if last == 0 {
+            "--last 0 shows no rows by construction — raise it to inspect the ledger"
+        } else if running_only {
             "no running rows — no run-status row is freezing any prefix"
         } else {
             "no runs recorded in the state DB yet"
@@ -826,13 +847,17 @@ fn show_runs(config: &str, running_only: bool, last: usize) -> Result<()> {
 /// only a `running` row is ever touched.
 fn finish_run_cmd(config: &str, run_id: &str) -> Result<()> {
     use crate::state::FinishOutcome;
+    require_config_file(config)?;
     let store = StateStore::open(config)?;
     match store.finish_run_checked(run_id, &chrono::Utc::now().to_rfc3339())? {
         FinishOutcome::Stamped => {
             println!(
-                "run '{run_id}' stamped `interrupted` — gc/cleanup on its prefix are \
-                 unblocked. Only do this for runs you KNOW are dead: a LIVE run stamped \
-                 here loses the protection that spares its in-flight parts from gc."
+                "run '{run_id}' stamped `interrupted` — the ledger no longer counts it as \
+                 writing. If the export writes to a CLOUD destination, its crash left a \
+                 `running` marker in the bucket too; the next `rivet load` over this state \
+                 DB retires that marker in its gc pass (a load from another host cannot, \
+                 and keeps sparing conservatively). Only stamp runs you KNOW are dead: a \
+                 LIVE co-located run stamped here loses its ledger-side gc protection."
             );
             Ok(())
         }
@@ -844,8 +869,8 @@ fn finish_run_cmd(config: &str, run_id: &str) -> Result<()> {
             Ok(())
         }
         FinishOutcome::NotFound => anyhow::bail!(
-            "no run-status row has run_id '{run_id}' — check `rivet state runs`; refusing \
-             to report success for a stamp that touched nothing"
+            "no run-status row has run_id '{run_id}' — check `rivet state runs -c \
+             <config>`; refusing to report success for a stamp that touched nothing"
         ),
     }
 }
