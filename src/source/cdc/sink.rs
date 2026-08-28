@@ -1231,7 +1231,7 @@ mod tests {
     /// DECIDER was well tested. Its SUPPLIER was not: `total_bytes += eb` → `*=`
     /// pins the accumulator at 0 forever, and the mutant survived the lib suite AND
     /// the whole live CDC suite (106 tests, measured). Both halves correct, the seam
-    /// between them observed by nothing — the third defect class in CLAUDE.md, and
+    /// between them observed by nothing — the third defect class in the process rules, and
     /// the one mutation testing is structurally blind to when you only mutate the
     /// consumer.
     ///

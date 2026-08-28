@@ -3093,7 +3093,7 @@ mod tests {
     // `unchanged-toast-datum` marker in the new tuple. The old parser wrote that
     // literal string into the column (silent corruption). With REPLICA IDENTITY
     // FULL the real value rides the `old-key` pre-image — recover it by NAME.
-    // (Wire format proven live: see `docs`/CLAUDE.md; the pre-image carries the
+    // (Wire format proven live: see `docs`/the process rules; the pre-image carries the
     // real value under FULL, only the marker under DEFAULT.)
     #[test]
     fn unchanged_toast_recovers_from_full_pre_image() {

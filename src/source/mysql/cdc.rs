@@ -204,7 +204,7 @@ impl MysqlChangeStream {
     /// PostgreSQL cannot have this problem: its resume anchor is a slot, which is
     /// server-side, so a foreign one simply does not exist. MySQL's anchor is a
     /// client-side file, so the check has to be explicit — the same asymmetry
-    /// CLAUDE.md's anchor-model rule already records for the idle-first-run case.
+    /// the process rules's anchor-model rule already records for the idle-first-run case.
     ///
     /// TWO tiers, because one of them is not enough on a default install:
     ///

@@ -527,7 +527,7 @@ fn merge_unchanged_toast(after: &[Cell], before: Option<&[Cell]>) -> Vec<Cell> {
 /// it by OID, so a stateless decode cannot name the table a row belongs to. That
 /// cache is the only state here — everything else is a function of the message.
 ///
-/// The transaction framing is the load-bearing part, and it is the rule CLAUDE.md
+/// The transaction framing is the load-bearing part, and it is the rule the process rules
 /// already states for every adapter: `committed` marks the LAST event of a source
 /// transaction, never every event. `pgoutput` gives that boundary explicitly
 /// (`Begin` … `Commit`), which is exactly what the text reader had to infer — and

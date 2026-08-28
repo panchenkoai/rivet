@@ -73,7 +73,7 @@ WHAT THE BASH GOT WRONG (each marked `DEVIATION:` at its site)
    parts got distinct filenames — but `src/pipeline/single.rs:386` stamps parts
    `%Y%m%d_%H%M%S_%3f`, i.e. milliseconds, so the sleep only guaranteed the cell
    can no longer catch a regression back to second granularity (the inverted-sleep
-   class in CLAUDE.md, which cost this repo 3-of-6 lost incremental deltas). Gone.
+   class in the process rules, which cost this repo 3-of-6 lost incremental deltas). Gone.
    The `sleep 0.5` before the metrics read stays: it waits on another process's
    SQLite WAL, not on a filename stamp.
 9. **The MinIO bucket was never created, and nothing said so.** `mc alias set

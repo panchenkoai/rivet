@@ -259,7 +259,7 @@ That split has two silent failures, and neither is a bug in the code above:
 1. **The two live in different durability domains.** The data lands in object
    storage; the cursor lands on a container's disk. A run in a fresh container
    finds no cursor and re-anchors — the "enable CDC during a quiet period" shape
-   CLAUDE.md already records for MySQL, one layer up from the engine.
+   the process rules already records for MySQL, one layer up from the engine.
 2. **Nothing arbitrates two writers.** PostgreSQL refuses a second consumer of a
    replication slot, so that engine is protected by the server. MySQL, MongoDB
    and SQL Server are not: two processes on one checkpoint path both advance it

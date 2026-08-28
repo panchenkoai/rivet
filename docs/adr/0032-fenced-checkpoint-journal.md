@@ -135,6 +135,6 @@ CHEAPER — but it only fences deployments that share a state database. A statel
 or foreign-host runner is exactly the split-brain case, and it would remain
 undetected.
 
-**Do nothing and document it.** Honest, and what the anchor-model rule in CLAUDE.md
+**Do nothing and document it.** Honest, and what the anchor-model rule in the process rules
 currently does: it names which engines have a server-side anchor and which do not.
 The gap is that a documented hazard on three of four engines is still a hazard.

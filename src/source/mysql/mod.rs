@@ -464,7 +464,7 @@ impl<'a> MysqlSessionGuard<'a> {
         // ONLY correct when backslash is an escape char. Under a server default of
         // NO_BACKSLASH_ESCAPES a boundary like 'C:\data' would parse as a DIFFERENT
         // value than the `?`-bound next-page cursor, silently dropping/dup'ing the
-        // row on that boundary (the encode-leg class CLAUDE.md pins for PG). Removing
+        // row on that boundary (the encode-leg class the process rules pins for PG). Removing
         // just that flag keeps the server's other modes (strictness etc.) intact.
         guard
             .conn

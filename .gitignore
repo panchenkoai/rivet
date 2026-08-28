@@ -141,3 +141,7 @@ __pycache__/
 # fingerprint/incremental paths or an implausible number of files.
 /target-*/
 .mutants-cache/
+
+# Claude instructions live in ~/.claude (private), never in the public tree.
+CLAUDE.md
+CLAUDE.local.md

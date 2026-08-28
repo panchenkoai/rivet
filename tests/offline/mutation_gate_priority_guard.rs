@@ -22,7 +22,7 @@
 //!    two tests here run the real classifier and assert exactly that.
 //! 2. **The workflow still CALLS it, and handles every verdict it can produce.**
 //!    A classifier nobody invokes is the dead-code-behind-a-green-cell shape
-//!    CLAUDE.md names (`verify_blessed_path` was registered `test` for four
+//!    the process rules names (`verify_blessed_path` was registered `test` for four
 //!    engines with no call site anywhere); a state the workflow does not handle
 //!    is a verdict that arrives as an empty string and is treated as "fine".
 //!
@@ -258,7 +258,7 @@ fn only_a_function_measured_at_zero_leaves_the_graded_class() {
 /// job that self-tests it.
 ///
 /// Registration is a claim about behaviour; only a call site is evidence
-/// (CLAUDE.md, after `blessed_path.verify_blessed_path` sat behind four green
+/// (the process rules, after `blessed_path.verify_blessed_path` sat behind four green
 /// matrix cells with no caller in the tree). The needles are matched against
 /// the job's `run:` shell with comments stripped, so the long comment blocks
 /// above each command — which name these very invocations — cannot satisfy it.
@@ -343,7 +343,7 @@ fn the_mutation_gate_actually_invokes_the_prioritiser() {
 ///
 /// The vocabulary is DERIVED from the script (`--states`), never re-typed here:
 /// a hand-written list grades only the states its author already knew, which is
-/// the defect (CLAUDE.md, "derive the enumerated dimension, never type it in").
+/// the defect (the process rules, "derive the enumerated dimension, never type it in").
 /// A state the workflow neither sets nor reads arrives at the blocking verdict
 /// job as an empty string, and an empty string is exactly what that job treats
 /// as "nothing to worry about".

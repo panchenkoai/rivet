@@ -217,7 +217,7 @@ fn roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn pg_incremental_cursor_survives_a_non_utc_session_timezone() {
-    // CLAUDE.md session-state rule: the PG timestamptz incremental cursor boundary
+    // the session-state process rule: the PG timestamptz incremental cursor boundary
     // is re-injected as an OFFSET-LESS naive-UTC literal into `WHERE col > '<lit>'`
     // and PostgreSQL parses a naive literal in the SESSION TimeZone. On a non-UTC
     // session (a common production default) the boundary shifts by the zone offset,

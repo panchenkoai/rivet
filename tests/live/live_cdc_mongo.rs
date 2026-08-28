@@ -425,7 +425,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     // runs_lose_nothing): run 1 stops at a PREFIX of a live-writer stream, run 2
     // drains the deferred tail, and the distinct-id union re-read from the parquet
     // equals the SOURCE id set. This test completes the per-engine union set the
-    // CLAUDE.md until_current rule names.
+    // the process rules until_current rule names.
     //
     // Two contracts here, with different weights (per that rule):
     //  - TERMINATION is LOAD-BEARING on Mongo: the open-time cluster-time bound

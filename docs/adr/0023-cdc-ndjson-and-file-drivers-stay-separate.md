@@ -88,7 +88,7 @@ transaction. The atomicity invariant is untouched — the part still closes only
 at the commit boundary; only the BYTES in between are allowed to leave RAM. The
 threshold is a tuning knob with a protective default, merged with `is_some()`
 like its siblings, so a bare profile cannot clobber it to "unbounded" (the
-config-clobber rule in CLAUDE.md).
+config-clobber rule in the process rules).
 
 **Primary prior art.** PostgreSQL does exactly this on the server side:
 `logical_decoding_work_mem` bounds the reorder buffer and spills a transaction
@@ -102,7 +102,7 @@ the commit-boundary invariant unchanged, streaming does not.
 memory bound, captured under a hard RSS ceiling: complete and atomic (all rows
 in one part, none split across a checkpoint), peak RSS flat. The mutant is the
 spill threshold set to infinity — the test must OOM or go RED. Per the fixture
-rule in CLAUDE.md the transaction must exceed the bound by enough to force more
+rule in the process rules the transaction must exceed the bound by enough to force more
 than one spill, or the spill's own accumulation arithmetic is untested by
 construction.
 
@@ -126,7 +126,7 @@ mitigation anywhere. The other engines are covered by construction: a
 PostgreSQL slot is server-side and cannot be carried to another server; SQL
 Server floors at `fn_cdc_get_min_lsn` (over-reads, never skips); MongoDB's
 resume token is rejected by a server that does not recognise it. MySQL alone
-accepts a foreign coordinate silently — the same engine that CLAUDE.md already
+accepts a foreign coordinate silently — the same engine that the process rules already
 singles out as having no server-side anchor at all.
 
 **Decision (proposed).** The checkpoint carries the source's lineage identity,
@@ -150,5 +150,5 @@ the lineage error, not capture. The mutant is the containment check removed. It
 must be a real two-server fixture — the stand already runs
 `rivet-mysql-primary-1` and `rivet-mysql-replica-1` — not a hand-edited
 checkpoint field, or the test grades its own forgery instead of the product's
-check (the fabricated-input class in CLAUDE.md). And per the exit-status rule,
+check (the fabricated-input class in the process rules). And per the exit-status rule,
 assert the specific error, not merely a non-zero exit.

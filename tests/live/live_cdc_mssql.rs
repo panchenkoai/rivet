@@ -173,7 +173,7 @@ fn mssql_cdc_sum_reconciles_across_intra_txn_updates() {
     );
 }
 
-// Idle-first-run anchor model (per-engine, see CLAUDE.md): SQL Server has no
+// Idle-first-run anchor model (per-engine, see the anchor-model process rule): SQL Server has no
 // client-side anchor to pin — a run without a checkpoint floors at
 // `fn_cdc_get_min_lsn` (over-reads, never skips). This test pins that property:
 // if a no-checkpoint run ever starts at the *max* LSN instead, a change landing

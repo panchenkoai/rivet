@@ -245,7 +245,7 @@ jobs:
     # in it, so neither a required-check setting nor a `needs:` can observe what
     # it did. What it did is therefore PUBLISHED as job outputs and asserted by
     # the blocking `Mutants (coverage verdict)` job below — the coverage-ledger
-    # rule from CLAUDE.md: the claim "these files are graded" has to be read off
+    # process rule: the claim "these files are graded" has to be read off
     # the call site, not asserted about it.
     continue-on-error: true
     outputs:

@@ -277,7 +277,7 @@ impl TxnSeq {
 /// load-bearing rule, previously four inline copies inside live-server `fill`
 /// loops (mysql/pg/mssql), each re-deriving the same loss argument in prose —
 /// the exact shape that shipped the PG/MSSQL `committed:true`-on-every-event
-/// bugs (see CLAUDE.md's committed-flag section).
+/// bugs (see the process rules's committed-flag section).
 ///
 /// The rule: stamp the group's commit `position` on EVERY event, and mark ONLY
 /// its LAST event `committed`. The sink rolls (flush → checkpoint → ack) on a
@@ -1037,7 +1037,7 @@ impl CdcEngine {
 
     /// Ensure the resume anchor EXISTS — `initial: snapshot` step ① and the
     /// single entry point for anchor creation (idempotent: a present anchor is
-    /// never moved). The per-engine anchor models (see CLAUDE.md):
+    /// never moved). The per-engine anchor models (see the process rules):
     /// PG pins server-side at slot creation; MySQL has NO server-side anchor —
     /// the checkpoint is pinned at first open; MSSQL floors at
     /// `fn_cdc_get_min_lsn` without one (over-reads, never skips).

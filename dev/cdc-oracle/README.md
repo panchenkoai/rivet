@@ -6,7 +6,7 @@ rivet's existing CDC oracles compare **the destination to the source** — DuckD
 the manifest-declared parts against what the database holds. That catches loss and
 duplication, and it cannot catch a case where rivet and the test agree on a wrong
 answer: the "test and code agree on a wrong spec" blind spot the mutation layer is
-also blind to (see CLAUDE.md, "Scope honesty").
+also blind to (see the process rules, "Scope honesty").
 
 Debezium is a third point. It reads the same log, on the same server, at the same
 time, and it is the reference implementation every other tool is measured against.

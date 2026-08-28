@@ -1081,7 +1081,7 @@ mod tests {
     // ── edge cases: remediation hints must recover from the DEGRADED state ────
     // Regression guard for the bug class where the resolver proposes a post-load
     // cast that cannot actually recover an already-lossy value (e.g. a UINT64
-    // that overflowed into INT64). See CLAUDE.md "Remediation hints must recover
+    // that overflowed into INT64). See the process rules "Remediation hints must recover
     // from the degraded state".
 
     #[test]

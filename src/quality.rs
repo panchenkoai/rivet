@@ -275,7 +275,7 @@ pub fn failure_message(export_name: &str, context: Option<&str>, failing: &[&str
 /// rule must be produced by the export, or the gate is a silent no-op — the
 /// uniqueness loop `index_of(col)` skips a missing column (0 duplicates, "pass")
 /// and the null-ratio loop's `unwrap_or(0)` treats a missing column as 0 nulls
-/// ("pass"). Per CLAUDE.md ("never a silent no-op"), a quality rule that can
+/// ("pass"). Per the process rules ("never a silent no-op"), a quality rule that can
 /// never evaluate is a configuration error, not a pass.
 ///
 /// `available` is the set of column names the export actually produces (the
@@ -429,7 +429,7 @@ pub fn check_uniqueness(
     // `index_of(col)` returns `Err`, the inner loop is skipped, 0 duplicates are
     // counted and the gate silently "passes". Surface it as a Fail (naming the
     // available columns) instead, regardless of row count, so the gate cannot
-    // vanish (CLAUDE.md: never a silent no-op).
+    // vanish (the process rules: never a silent no-op).
     let available = available_columns(batches);
     let mut issues = Vec::new();
     for col_name in columns {
@@ -830,7 +830,7 @@ mod tests {
     }
 
     // ─── #33 regression: a quality rule on a ghost column must be LOUD ────────
-    // (CLAUDE.md "never a silent no-op"). The old code skipped a missing
+    // (the process rules: "never a silent no-op"). The old code skipped a missing
     // uniqueness column (index_of → Err → 0 dups → pass) and treated a missing
     // null-ratio column as 0 nulls (unwrap_or(0) → pass); both vanished.
 

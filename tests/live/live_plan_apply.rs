@@ -736,7 +736,7 @@ fn tput_success_rows(state_db: &std::path::Path, export: &str) -> Vec<TputRow> {
 ///
 /// ## Why the fixture sleeps — and why that is NOT the forbidden sleep
 ///
-/// CLAUDE.md forbids "a sleep in a test that compensates for PRODUCT behaviour"
+/// the process rules forbid "a sleep in a test that compensates for PRODUCT behaviour"
 /// and REQUIRES that "fixtures must cross the mechanism's activation threshold".
 /// This is the second one. The self-check DELIBERATELY refuses pairs that are
 /// too small or too short to mean anything (`aggregate::incomparable`):

@@ -387,7 +387,7 @@ fn dd_scalar_i64(res: &serde_json::Value) -> i64 {
         .unwrap_or_else(|e| panic!("duckdb scalar not an int: {e} ({res})"))
 }
 
-/// The silent-loss oracle CLAUDE.md prescribes but the cross-product coverage
+/// The silent-loss oracle the process rules prescribe but the cross-product coverage
 /// audit found NOWHERE for pg/mysql/mssql/mongo: a per-column NULL-profile (+
 /// distinct-count on scalars) of the DESTINATION parquet vs the SOURCE table.
 /// Counts/sums of hand-picked columns pass while a column silently degrades to

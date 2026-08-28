@@ -725,7 +725,7 @@ pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()
 ///
 /// Unlike [`check_success_gate_for_resume`] this is **non-destructive and
 /// non-fatal**: we never auto-delete the operator's prior data, and we never
-/// change the run's exit code.  But the drift must not be *silent* (CLAUDE.md:
+/// change the run's exit code.  But the drift must not be *silent* (the process rules:
 /// degraded/lossy paths must be loud), so when the prefix already holds a
 /// completed run we emit a prominent `WARN` naming the prefix and the exact
 /// risk, and point at the safe recoveries (`--resume`, or clear the prefix).

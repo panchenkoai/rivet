@@ -945,7 +945,7 @@ mod tests {
         // it: an earlier version of this test rsplit the schema off ITSELF and
         // compared two `overrides_for_table` calls, so it stayed green against a
         // product that had stopped narrowing at all (the self-oracle class in
-        // CLAUDE.md). `overrides_for_unit` is the single function every call
+        // the process rules). `overrides_for_unit` is the single function every call
         // site — capture and resolver — now routes through, so mutating it goes
         // RED here.
         let unit = "public.orders";

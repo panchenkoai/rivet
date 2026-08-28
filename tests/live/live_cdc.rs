@@ -390,7 +390,7 @@ fn cdc_sum_reconciles_across_intra_txn_updates() {
     );
 }
 
-// Idle-first-run anchor model (per-engine, see CLAUDE.md): MySQL's ONLY resume
+// Idle-first-run anchor model (per-engine, see the anchor-model process rule): MySQL's ONLY resume
 // anchor is the client checkpoint file, and the sink writes it at part commits —
 // so the first checkpointed open must persist its coordinates immediately, or an
 // idle bounded run (zero changes drained) leaves no anchor and the next run
@@ -1067,7 +1067,7 @@ fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
-    // Session-state rendering (CLAUDE.md): test_decoding renders values in the
+    // Session-state rendering (the process rules): test_decoding renders values in the
     // polling session's FORMAT, not just its timezone. A non-default database
     // `datestyle` ('German, DMY') nulled every timestamp (rivet's ISO parser
     // failed on DMY text) and a non-hex `bytea_output` ('escape') corrupted every
@@ -2759,7 +2759,7 @@ fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
     );
 }
 
-// Idle-first-run anchor model (per-engine, see CLAUDE.md): PostgreSQL pins the
+// Idle-first-run anchor model (per-engine, see the anchor-model process rule): PostgreSQL pins the
 // resume position server-side the moment the slot is created — so a first run
 // that drains ZERO changes still anchors, and a change landing between two idle
 // scheduler cycles is captured by the next one. This pins that property (the
@@ -3717,7 +3717,7 @@ fn roast_pg_cdc_refuses_a_partitioned_parent_before_acking_the_slot() {
     // other one — `mode: full` reads THROUGH the parent, because a batch SELECT
     // resolves partitions the way any query does and never sees a wire identity
     // at all. Untested, "snapshot the parent with mode: full" would be a remedy
-    // nobody had run — the class CLAUDE.md records as a hint that cannot recover
+    // nobody had run — the class the process rules records as a hint that cannot recover
     // from the state it is offered in.
     let snapshot = Rig::pg_batch(&format!("public.{parent}"))
         .source_url(cdc_db.url())
@@ -6235,7 +6235,7 @@ fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
 /// The loss is a SUBSET, which is what makes it the dangerous half: transactions that
 /// touch no JSON column are captured normally, so counts and sums keep reconciling.
 ///
-/// Non-default-state test (CLAUDE.md): the default is exactly where the bug hides, so
+/// Non-default-state test (the process rules): the default is exactly where the bug hides, so
 /// the setting is flipped and restored by a guard rather than assumed.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]

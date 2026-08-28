@@ -3,7 +3,7 @@
 //!
 //! The point is **structural** typing: temporals are extracted from the driver
 //! value's own components (`mysql::Value::Date(y, m, d, …)`), never re-parsed from
-//! a rendered string — so the naive-timestamp hazard CLAUDE.md forbids never
+//! a rendered string — so the naive-timestamp hazard the process rules forbids never
 //! arises. Decimals are carried as their exact source bytes and converted to
 //! `Decimal128` losslessly at build time.
 //!

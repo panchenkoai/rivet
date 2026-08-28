@@ -558,7 +558,7 @@ mod tests {
     // manifest-authoritative and prefers the run-unique copy, so the repaired
     // parts were silently dropped at load while every count/gate passed. Assert
     // on the manifest COPY (not a data re-read — a re-read can't see a sidecar
-    // clobber; CLAUDE.md sidecar rule).
+    // clobber; the process rules sidecar rule).
     #[test]
     fn repair_updates_the_run_unique_manifest_copy_not_just_the_canonical() {
         use crate::config::{DestinationConfig, DestinationType};

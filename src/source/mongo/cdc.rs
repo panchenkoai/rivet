@@ -211,7 +211,7 @@ async fn server_identity(
 /// - PostgreSQL, MySQL and SQL Server keep a CATCH-UP exit (a short/empty peek,
 ///   `BINLOG_DUMP_NON_BLOCK`'s EOF, the capture job's scan gap). With the bound
 ///   unset they still terminate — late, not never — so failing OPEN there is the
-///   right call, as CLAUDE.md records.
+///   right call, as the process rules records.
 /// - MongoDB has NO such backstop. `past_time_bound` is `false` for every event
 ///   once the bound is `None`, so the only remaining exit is the empty-poll check
 ///   — and under sustained writes `next_if_any` keeps returning events, so it
@@ -526,7 +526,7 @@ impl MongoChangeStream {
 /// prior checkpoint). MongoDB has no server-side anchor — a change stream opened
 /// without a token starts at "now" — so the coordinates must be persisted
 /// immediately, or an idle first run would let the next run re-anchor forward and
-/// skip everything in between (the MySQL binlog anchor rule, per CLAUDE.md).
+/// skip everything in between (the MySQL binlog anchor rule, per the process rules).
 pub(crate) fn pin_checkpoint_at_current(
     url: &str,
     tls: Option<&TlsConfig>,
