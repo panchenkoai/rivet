@@ -289,7 +289,9 @@ fn test_csv_special_chars_regression() {
     assert_eq!(lines[2], "\"with,comma\"");
     assert_eq!(lines[3], "\"with\"\"quote\"");
     assert_eq!(lines[4], "\"with,\"\"both\"");
-    assert_eq!(lines[5], "");
+    // Round-7: a PRESENT empty string is `""` — bare-nothing is NULL's
+    // rendering, and the two collided byte-identically for months.
+    assert_eq!(lines[5], "\"\"");
 }
 
 // ─── Parquet Golden: multi-batch round-trip ──────────────────
