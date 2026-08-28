@@ -50,6 +50,7 @@ exclude_globs = [
 ]
 
 exclude_re = [
+
     # The `escaped` guard in `split_qualified_ident` (src/source/postgres/cdc.rs):
     # `b'"' if in_quotes && next == b'"'`. Stubbing the guard to `false` is
     # EQUIVALENT, and the argument is short enough to check rather than trust.

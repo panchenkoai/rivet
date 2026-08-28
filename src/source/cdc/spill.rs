@@ -114,18 +114,24 @@ pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) ->
 /// `kill(pid, 0)` sends no signal and reports reachability. `EPERM` means the
 /// process EXISTS and is not ours, which is still alive — reading it as dead would
 /// delete another user's in-flight spill.
-#[cfg(unix)]
+/// ONE function with the platform split INSIDE, not two `#[cfg]` siblings: as two
+/// functions, the `not(unix)` stub was a separate mutation target that no machine
+/// running mutants can ever compile IN — a permanently-missed mutant that invited
+/// an exclusion, and the first exclusion written for it matched the unix arm's
+/// mutants too. Off unix there is no portable liveness probe, and a wrong answer
+/// here DELETES data, so the answer is "alive": the sweep does nothing rather than
+/// guessing — a leaked spill costs disk; a deleted live one tears a transaction.
 fn pid_is_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// No portable liveness probe off unix, and a wrong answer here DELETES data, so
-/// the answer is "alive" — the sweep does nothing rather than guessing. A leaked
-/// spill costs disk; a deleted live one tears a transaction.
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 impl SpillFile {
@@ -564,19 +570,53 @@ mod tests {
         assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.txt"), None);
     }
 
-    /// A LIVE process really is reported alive by the PRODUCTION probe.
+    /// The PRODUCTION probe, all three arms: alive, dead, and exists-but-foreign.
     ///
-    /// The arms above use an injected probe, which grades the sweep and says nothing
-    /// about `kill(pid, 0)` itself — and that is the half where a wrong answer
-    /// DELETES data. This pins the direction that matters, with the one pid the test
-    /// can be certain about: its own.
+    /// The sweep tests above use an injected probe, which grades the sweep and says
+    /// nothing about `kill(pid, 0)` itself. Each arm fails in its own direction: a
+    /// probe that cannot see a LIVE process deletes a spill being written right now;
+    /// one that reports a DEAD process alive never collects an orphan (the mutant
+    /// `pid_is_alive -> true` survived the suite until the dead arm was added); and
+    /// reading EPERM as dead deletes another user's in-flight spill.
     #[cfg(unix)]
     #[test]
-    fn the_real_liveness_probe_reports_this_process_alive() {
+    fn the_real_liveness_probe_tells_alive_dead_and_foreign_apart() {
         assert!(
             pid_is_alive(std::process::id()),
             "if the probe cannot see its own process, the sweep deletes every spill \
              it finds, including one being written right now"
+        );
+
+        // A pid the test KNOWS is dead: spawn a child, wait for it, probe its pid.
+        // Reaping it first is what makes this deterministic — an un-reaped child is
+        // a zombie, which `kill(pid, 0)` still reaches. (A recycled pid could in
+        // principle be live again, but recycling within microseconds of the reap
+        // would have to wrap the whole pid space; accepted.)
+        let dead = std::process::Command::new("true")
+            .status()
+            .map(|_| ())
+            .and_then(|()| {
+                let child = std::process::Command::new("true").spawn()?;
+                let pid = child.id();
+                let mut child = child;
+                child.wait()?;
+                Ok(pid)
+            })
+            .expect("spawn+reap a short-lived child");
+        assert!(
+            !pid_is_alive(dead),
+            "a reaped child's pid must read DEAD — a probe that says alive here \
+             never collects any orphan, and the sweep exists for nothing"
+        );
+
+        // Pid 1 exists on every unix and is not ours, so an unprivileged probe gets
+        // EPERM — which must read ALIVE: the process is real, merely foreign, and
+        // deleting its spill would tear another user's transaction. (Under root the
+        // call succeeds outright and the assertion holds through the other arm.)
+        assert!(
+            pid_is_alive(1),
+            "EPERM means the process EXISTS — reading it as dead deletes another \
+             user's in-flight spill"
         );
     }
 
@@ -1422,8 +1462,19 @@ mod frame_tests {
         let commit = Position(json!({ "lsn": "0/FEED" }));
         let mut sp = SpooledTx::new(f.into_reader().expect("seal"), commit.clone());
 
+        // `remaining` must COUNT DOWN as the tail drains: the engines' `next_spooled`
+        // drop the reader the moment it hits zero, so a `remaining` pinned at 0
+        // (the surviving mutant) would drop the tail after its FIRST row — the rest
+        // of the transaction silently gone. Only the final `== 0` was asserted, and
+        // that is the one value the mutant agrees with.
+        assert_eq!(sp.remaining(), N, "all rows still on disk before the drain");
         let mut flags = Vec::new();
         while let Some(e) = sp.next_event(decode_event).expect("decode") {
+            assert_eq!(
+                sp.remaining(),
+                N - flags.len() - 1,
+                "remaining must fall by exactly one per drained row"
+            );
             assert_eq!(
                 e.position.0, commit.0,
                 "every row of a spilled tail carries the transaction's COMMIT \
