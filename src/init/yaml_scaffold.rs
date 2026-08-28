@@ -386,6 +386,23 @@ fn is_decimal_type(data_type: &str) -> bool {
 
 /// Mirror of the validation in [`crate::config::models::validate_table_shortcut_ident`]:
 /// accepts `<name>` or `<schema>.<name>` with ASCII-only identifier characters.
+/// Quote a `schema.table` (or bare table) with the ENGINE's identifier quotes,
+/// so the generated SQL addresses the catalog-exact relation — never its
+/// lowercase fold (round-7: `FROM CaseTwin` read `casetwin`'s rows with every
+/// check green). Embedded quote characters are doubled per each dialect.
+fn quote_relation(qualified: &str, source_type: &str) -> String {
+    let quote = |part: &str| match source_type {
+        "mysql" => format!("`{}`", part.replace('`', "``")),
+        "mssql" => format!("[{}]", part.replace(']', "]]")),
+        _ => format!("\"{}\"", part.replace('"', "\"\"")),
+    };
+    qualified
+        .split('.')
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn is_simple_pg_ident(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.is_empty() || parts.len() > 2 {
@@ -394,8 +411,14 @@ fn is_simple_pg_ident(s: &str) -> bool {
     parts.iter().all(|p| {
         let mut chars = p.chars();
         match chars.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            // LOWERCASE-only (round-7 HIGH): the catalog name is case-EXACT,
+            // but an unquoted identifier FOLDS to lowercase — so `table:
+            // CaseTwin` silently read the OTHER table `casetwin` when both
+            // existed (every check green, the wrong rows exported). A name
+            // that is not already its own fold must go through the quoted
+            // `query:` form instead.
+            Some(c) if c.is_ascii_lowercase() || c == '_' => {
+                chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
             }
             _ => false,
         }
@@ -477,9 +500,18 @@ fn export_block_lines(
         // column list to spell out. Always emit `table:` for a Mongo source.
         lines.push(format!("    table: {qualified_table}"));
     } else {
+        // QUOTED relation (round-7): the catalog name is case-exact and may
+        // carry any character; interpolating it raw either case-folds to a
+        // DIFFERENT table (silent wrong rows) or dies on the first reserved
+        // word. Column list stays as the catalog gave it — quoting each column
+        // too would be noise for the common case; a camel-case COLUMN still
+        // folds, which the operator sees loudly at check (unknown column).
         lines.push("    query: >".to_string());
         lines.push(format!("      SELECT {col_list}"));
-        lines.push(format!("      FROM {qualified_table}"));
+        lines.push(format!(
+            "      FROM {}",
+            quote_relation(&qualified_table, source_type)
+        ));
     }
     // Inline rationale above `mode:` so the operator can see *why* this
     // mode got picked, not just *what*. Easy to delete; the suggestion
@@ -666,7 +698,12 @@ fn cdc_export_lines(
         "    format: parquet".to_string(),
         "    cdc:".to_string(),
         format!(
-            "      checkpoint: ./cdc/{}.ckpt  # resume position; omit to tail from now",
+            // Engine-honest (round-7): "omit to tail from now" was true for
+            // MySQL/Mongo only — PG anchors server-side at the slot (omitting
+            // merely disarms the slot-loss hard error), and MSSQL with no
+            // checkpoint re-reads the ENTIRE retained change table every run.
+            "      checkpoint: ./cdc/{}.ckpt  # resume position; keep it (semantics of \
+omitting differ per engine — see cdc.md)",
             cdc_ident(&info.table)
         ),
         "      until_current: true  # drain to the current log end and exit (good for a scheduler); omit to stream"
@@ -997,6 +1034,23 @@ fn memory_capped_parallel(suggested: usize, avg_row_bytes: i64, budget_mb: u64) 
 
 #[cfg(test)]
 mod tests {
+    /// Round-7 HIGH: a catalog name that is not its own lowercase fold must
+    /// NEVER become an unquoted `table:`/`FROM` (PG folds it to the OTHER
+    /// table, silently exporting wrong rows with every check green). RED
+    /// against re-widening the gate to case-blind.
+    #[test]
+    fn a_mixed_case_name_is_not_a_simple_ident_and_quotes_per_engine() {
+        assert!(is_simple_pg_ident("public.orders"));
+        assert!(!is_simple_pg_ident("public.CaseTwin"));
+        assert!(!is_simple_pg_ident("Orders"));
+        assert_eq!(
+            quote_relation("public.CaseTwin", "postgres"),
+            "\"public\".\"CaseTwin\""
+        );
+        assert_eq!(quote_relation("Db.Weird", "mysql"), "`Db`.`Weird`");
+        assert_eq!(quote_relation("dbo.Order", "mssql"), "[dbo].[Order]");
+    }
+
     use super::*;
 
     #[test]

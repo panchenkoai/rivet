@@ -301,6 +301,16 @@ pub(crate) enum TokenSourceKind {
 impl Auth {
     fn resolve(http: &reqwest::blocking::Client) -> Result<Self> {
         let static_token = std::env::var("RIVET_BQ_ACCESS_TOKEN").ok();
+        // Static FIRST, before the ADC read: round-6 made a set-but-missing
+        // GOOGLE_APPLICATION_CREDENTIALS a loud error, and reading ADC eagerly
+        // here let that bail defeat the RIVET_BQ_ACCESS_TOKEN escape hatch —
+        // the one knob that exists precisely for environments where ADC is
+        // broken (round-7 refuter).
+        if let Some(tok) = static_token.as_deref()
+            && !tok.trim().is_empty()
+        {
+            return Ok(Auth::Static(Zeroizing::new(tok.to_string())));
+        }
         let adc = gcs_auth::load_adc_credentials()?;
         match choose_token_source(static_token.as_deref(), adc.is_some()) {
             TokenSourceKind::Static => Ok(Auth::Static(Zeroizing::new(

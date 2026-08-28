@@ -893,23 +893,40 @@ fn full_done_line(inputs: &LoadInputs, report: &load::LoadReport) -> String {
 /// the PKs the re-snapshot fixed. The shape is detectable co-located: snapshot
 /// URIs in THIS load + a non-empty loaded-ledger for the target. First-cycle
 /// snapshot+changes (no prior loads) is the normal shape — no warning.
-fn rebaseline_warning(
-    uris: &[String],
-    target_fqtn: &str,
-    prior_loaded_runs: usize,
-) -> Option<String> {
-    let has_snapshot = uris.iter().any(|u| u.contains("/snapshot/"));
-    if !has_snapshot || prior_loaded_runs == 0 {
-        return None;
-    }
-    Some(format!(
-        "  WARNING: this load appends a RE-baseline (snapshot parquet) into \
-         `{target_fqtn}__changes`, which prior cycles already fed. Snapshot rows \
-         carry NULL `__pos` and LOSE the dedup to every already-loaded change row \
-         — the current-state view will keep serving PRE-GAP values for the rows \
-         this re-snapshot fixed. TRUNCATE `{target_fqtn}__changes` and re-run this \
-         load so the baseline stands alone (cdc-failure-modes.md)."
-    ))
+/// Is this load's URI set a RE-baseline shape — a snapshot leg under THIS
+/// plan's own prefix? Prefix-anchored (round-7 refuter): a bare
+/// `contains("/snapshot/")` false-fired forever on an operator prefix with a
+/// `snapshot` segment and on a multiplex TABLE literally named `snapshot`,
+/// prescribing a destructive truncate every cycle.
+fn rebaseline_shape(uris: &[String], plan_prefix: &str) -> bool {
+    let base = plan_prefix.trim_end_matches('/');
+    uris.iter().any(|u| {
+        u.strip_prefix(base)
+            .map(|rest| rest.trim_start_matches('/'))
+            .is_some_and(|rest| rest.starts_with("snapshot/"))
+    })
+}
+
+/// The RE-baseline REFUSAL (round-7 refuter, HIGH): the first cut was a warn
+/// printed while the load PROCEEDED — so the runs got consumed, and the
+/// prescribed "truncate + re-run" then selected nothing: the operator who
+/// obeyed verbatim emptied the warehouse table with exit 0. Now the load
+/// REFUSES BEFORE appending (nothing consumed), and the condition comes from
+/// the WAREHOUSE (`changes_has_prior_changes`), never the ledger — after the
+/// prescribed truncate the recovery re-run probes an empty log and sails
+/// through, while ledger rows (which survive a truncate) would have deadlocked
+/// it forever.
+fn rebaseline_refusal(target_fqtn: &str) -> String {
+    format!(
+        "refusing to append a RE-baseline: this load carries snapshot parquet, but \
+         `{target_fqtn}__changes` already holds real change rows — a re-snapshot row \
+         carries NULL `__pos` and LOSES the dedup to every prior change, so the \
+         current-state view would keep serving PRE-GAP values for exactly the rows \
+         this re-snapshot fixed. Nothing was consumed by this refusal. Recovery: \
+         1) TRUNCATE TABLE `{target_fqtn}__changes`; 2) re-run this same `rivet load` \
+         — it will then append the baseline into the empty log and proceed \
+         (cdc-failure-modes.md)."
+    )
 }
 
 fn load_one_cdc(
@@ -946,14 +963,12 @@ fn load_one_cdc(
         |loader, store, inputs| {
             // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
             // into a __changes prior cycles already fed (see rebaseline_warning).
-            let prior_loaded_runs = state
-                .and_then(|s| s.loaded_source_run_ids(&loader.fqtn(&plan.table)).ok())
-                .map(|ids| ids.len())
-                .unwrap_or(0);
-            if let Some(w) =
-                rebaseline_warning(&inputs.uris, &loader.fqtn(&plan.table), prior_loaded_runs)
-            {
-                eprintln!("{w}");
+            let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
+            if shape {
+                let prior = loader.changes_has_prior_changes(&plan.table)?;
+                if prior {
+                    anyhow::bail!("{}", rebaseline_refusal(&loader.fqtn(&plan.table)));
+                }
             }
             // The driver gates the appended delta against the manifests' summed
             // `row_count` and cleans up (only) after the gate passes.
@@ -1167,25 +1182,41 @@ mod load_ledger_tests {
         );
     }
 
-    /// Round-6 re-baseline guard: fires only on snapshot-URIs × prior-loads —
-    /// the first cycle (snapshot, no prior loads) and a changes-only cycle stay
-    /// silent. RED against dropping either conjunct.
+    /// Round-7 rebuild of the round-6 guard: the SHAPE is prefix-anchored (a
+    /// `snapshot` segment in the operator's own prefix, or a multiplex table
+    /// named `snapshot`, must not read as a re-baseline), and the REFUSAL
+    /// message prescribes the truncate-then-rerun sequence that the
+    /// warehouse-probed condition makes safe. RED against un-anchoring the
+    /// shape (bare contains) and against dropping either message half.
     #[test]
-    fn rebaseline_warning_fires_only_on_a_second_baseline() {
-        let snap = vec!["gs://b/p/snapshot/part-0.parquet".to_string()];
-        let cdc = vec!["gs://b/p/cdc-000000.parquet".to_string()];
-        assert!(
-            rebaseline_warning(&snap, "p.d.t", 3)
-                .is_some_and(|w| w.contains("TRUNCATE") && w.contains("p.d.t__changes"))
-        );
-        assert!(
-            rebaseline_warning(&snap, "p.d.t", 0).is_none(),
-            "first cycle"
-        );
-        assert!(
-            rebaseline_warning(&cdc, "p.d.t", 3).is_none(),
-            "changes-only"
-        );
+    fn rebaseline_shape_is_prefix_anchored_and_the_refusal_names_the_sequence() {
+        let plan_prefix = "gs://b/exports/orders";
+        // The real snapshot leg under THIS plan's prefix.
+        assert!(rebaseline_shape(
+            &["gs://b/exports/orders/snapshot/part-0.parquet".into()],
+            plan_prefix
+        ));
+        // A cdc-only cycle is not a baseline.
+        assert!(!rebaseline_shape(
+            &["gs://b/exports/orders/cdc-000000.parquet".into()],
+            plan_prefix
+        ));
+        // An operator prefix CONTAINING a snapshot segment is not a baseline
+        // (the round-6 substring bug fired forever here).
+        assert!(!rebaseline_shape(
+            &["gs://b/analytics/snapshot/orders/cdc-000000.parquet".into()],
+            "gs://b/analytics/snapshot/orders"
+        ));
+        // A multiplex TABLE named `snapshot`: its sub-prefix is the PLAN prefix
+        // for its own load, so its cdc parts do not read as a baseline either.
+        assert!(!rebaseline_shape(
+            &["gs://b/exports/base/snapshot/cdc-000000.parquet".into()],
+            "gs://b/exports/base/snapshot"
+        ));
+        let msg = rebaseline_refusal("p.d.t");
+        assert!(msg.contains("TRUNCATE TABLE `p.d.t__changes`"));
+        assert!(msg.contains("re-run this same"));
+        assert!(msg.contains("Nothing was consumed"));
     }
 
     const TARGET: &str = "proj.ds.orders";

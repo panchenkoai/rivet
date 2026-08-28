@@ -24,6 +24,8 @@ mod cdc_axis_matrix_guard;
 mod memory_throttle_wiring;
 #[path = "offline/skip_is_not_a_pass_guard.rs"]
 mod skip_is_not_a_pass_guard;
+#[path = "offline/validate_cdc_union.rs"]
+mod validate_cdc_union;
 
 #[path = "offline/cdc_cli_surface_guard.rs"]
 mod cdc_cli_surface_guard;

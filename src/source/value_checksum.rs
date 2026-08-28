@@ -742,6 +742,14 @@ fn validate_one_manifest_checksums(
     // dest may be a cloud backend); keep the temp files alive for the re-read.
     let mut tmps: Vec<tempfile::NamedTempFile> = Vec::with_capacity(manifest.parts.len());
     for part in &manifest.parts {
+        // Committed only (round-7): a Quarantined audit entry's file was MOVED
+        // to _quarantine/ — reading it here errors (exit 1) or, half-moved,
+        // folds quarantined rows into the checksum (false corruption). The
+        // presence reconcile and both folds already filter; this reader must
+        // agree.
+        if part.status != crate::manifest::PartStatus::Committed {
+            continue;
+        }
         let body = dest.read(&join_key(prefix, &part.path))?;
         let mut tmp = tempfile::NamedTempFile::new()?;
         tmp.write_all(&body)?;

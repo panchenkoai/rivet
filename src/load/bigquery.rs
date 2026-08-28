@@ -205,6 +205,23 @@ impl BigQueryLoader {
 }
 
 impl TargetLoader for BigQueryLoader {
+    fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
+        let fqtn = self.fqtn(&format!("{table}__changes"));
+        // LIMIT 1 inside: existence, not a full count, on an unbounded log.
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM `{fqtn}` WHERE __pos IS NOT NULL LIMIT 1)"
+        );
+        match self
+            .api()?
+            .run_query_scalar(&sql, &self.labels("probe", table))
+        {
+            Ok(n) => Ok(n > 0),
+            // A missing __changes table is the FIRST cycle, not an error.
+            Err(e) if format!("{e:#}").contains("Not found") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn fqtn(&self, table: &str) -> String {
         format!("{}.{}.{}", self.project, self.dataset, table)
     }

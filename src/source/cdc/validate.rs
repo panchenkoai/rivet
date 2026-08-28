@@ -214,12 +214,33 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
     for manifest in &manifests {
         let mut items: Vec<(u32, String)> = Vec::new();
         for part in &manifest.parts {
-            let body = dest.read(&join_key(prefix, &part.path))?;
-            items.extend(
-                read_pos_column(body)?
-                    .into_iter()
-                    .map(|p| (part.part_id, p)),
-            );
+            if part.status != crate::manifest::PartStatus::Committed {
+                continue;
+            }
+            // A DECLARED part that is missing or undecodable is VERIFIED-WRONG
+            // (a violation in the verdict), not could-not-verify: the manifest
+            // promises the part and the destination refutes the promise —
+            // round-7 measured the old `?` propagation grading a permanently
+            // deleted part as retryable exit 1 while the headline said PASSED.
+            let body = match dest.read(&join_key(prefix, &part.path)) {
+                Ok(b) => b,
+                Err(e) => {
+                    violations.push(format!(
+                        "declared part '{}' (run {}) is missing or unreadable at the \
+                         destination: {e:#}",
+                        part.path, manifest.run_id
+                    ));
+                    continue;
+                }
+            };
+            match read_pos_column(body) {
+                Ok(ps) => items.extend(ps.into_iter().map(|p| (part.part_id, p))),
+                Err(e) => violations.push(format!(
+                    "declared part '{}' (run {}) does not decode as the Parquet the \
+                     manifest committed: {e:#}",
+                    part.path, manifest.run_id
+                )),
+            }
         }
         let (f, l, v) = check_order(&items);
         parts += manifest.parts.len();

@@ -615,6 +615,15 @@ fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) 
     let mut seen: std::collections::BTreeSet<String> =
         merged.parts.iter().map(|p| p.path.clone()).collect();
     for unit in census.split_units(&canonical.export_family) {
+        // Success-only (round-7): a crashed unit's Failed/Interrupted copy
+        // declares parts gc legitimately deletes as terminal debris — folding
+        // them into the presence target armed a false PartMissing
+        // stop-the-line after a documented gc pass. The filter lives HERE, in
+        // the fold, because `split_units` is the family's identity (markers
+        // included) for every other consumer.
+        if unit.manifest.status != crate::manifest::ManifestStatus::Success {
+            continue;
+        }
         for p in &unit.manifest.parts {
             if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
                 merged.parts.push(p.clone());
@@ -634,12 +643,25 @@ fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) 
     // it. Every field printed was internally consistent; nothing said that "0 parts
     // verified" was a statement about the manifest rather than about the prefix.
     //
-    // Deliberately NOT widened to a non-empty canonical: there a plain export's
-    // historical copies really are superseded snapshots, and presence-checking a
-    // legitimately cleaned old part would false-fail.
-    if merged.parts.is_empty() && !canonical.export_family.is_empty() {
+    // Widened to CDC canonicals whatever their part count (round-7 HIGH,
+    // measured): a CDC prefix ACCUMULATES — the dataset consumers read is the
+    // UNION of the run-unique copies, so with a non-empty canonical every
+    // HISTORICAL cycle's parts were absent from the presence check (and
+    // census-subtracted from the untracked sweep): deleting a prior cycle's
+    // part validated `PASSED, exit 0`. The batch rationale (historical copies
+    // are superseded snapshots; presence-checking a cleaned old part would
+    // false-fail) is exactly why this stays NARROW: `mode == "cdc"` or an
+    // empty canonical, never a plain export's history.
+    //
+    // Success-only (round-7 sibling find): a Failed/Interrupted copy's parts
+    // are terminal debris `gc_orphans` legitimately deletes — folding them
+    // armed a false PartMissing stop-the-line after a documented gc pass.
+    if (merged.parts.is_empty() || canonical.mode == "cdc") && !canonical.export_family.is_empty() {
         for run in census.runs() {
             if run.family() != canonical.export_family {
+                continue;
+            }
+            if run.manifest.status != crate::manifest::ManifestStatus::Success {
                 continue;
             }
             for p in &run.manifest.parts {

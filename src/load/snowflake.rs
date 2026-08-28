@@ -222,6 +222,22 @@ impl TargetLoader for SnowflakeLoader {
         Ok(after.saturating_sub(before))
     }
 
+    fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
+        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
+        let tag = sanitize_tag(table);
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = 'rivet_probe_{tag}';\n\
+             SELECT COUNT(*) AS PROBE_ FROM (SELECT 1 FROM {changes_fqtn} \
+             WHERE __pos IS NOT NULL LIMIT 1);"
+        );
+        match self.run_snow(&sql) {
+            Ok(v) => Ok(extract_named(&v, "PROBE_").unwrap_or(0) > 0),
+            // A missing __changes table is the FIRST cycle, not an error.
+            Err(e) if format!("{e:#}").contains("does not exist") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn warehouse(&self) -> crate::load::cdc::Warehouse {
         crate::load::cdc::Warehouse::Snowflake
     }
