@@ -515,10 +515,26 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     // Connect-time server errors that are NOT auth, peeled off before the
     // `db error` catch-all below claims them (each verified against the server's
     // actual rendering: 3D000 / 53300 / 57P03).
-    if msg.contains("does not exist") && msg.contains("database") {
+    if (msg.contains("does not exist") && msg.contains("database"))
+        // SQL Server's 4060 says "Cannot open database … requested by the login.
+        // The login failed." — the trailing sentence matched the `login failed`
+        // needle and answered a wrong DATABASE NAME with a credentials hint. The
+        // opening phrase is the discriminating one, so it is checked first.
+        || msg.contains("Cannot open database")
+    {
         return "unknown database";
     }
-    if msg.contains("too many connections") || msg.contains("starting up") {
+    // ALL of 53300's renderings, measured against the stand's own PostgreSQL:
+    // the max_connections cap says "sorry, too many clients already" or
+    // "remaining connection slots are reserved" — NEITHER contains "too many
+    // connections", which only the per-role/per-DB CONNECTION LIMIT arm renders.
+    // The first cut matched the one phrasing and sent the other two to the auth
+    // catch-all: "verify the user/password" for a full server.
+    if msg.contains("too many connections")
+        || msg.contains("too many clients")
+        || msg.contains("connection slots are reserved")
+        || msg.contains("starting up")
+    {
         return "transient";
     }
     if msg.contains("password")

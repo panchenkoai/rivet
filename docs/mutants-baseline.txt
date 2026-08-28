@@ -1472,3 +1472,16 @@ src/source/mssql/cdc.rs:978:48: replace == with != in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:979:21: replace += with *= in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:979:21: replace += with -= in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:986:21: replace == with != in MssqlChangeStream::fill
+
+# ── 2026-08-28 adjudication: src/source/cdc/sink.rs (full run, 188: 134 caught,
+# 46 unviable, 6 timeouts — the timeouts were the drain_is_complete never-stop
+# mutants hanging the FakeStream loop, now a loud fuse panic instead). ONE
+# survivor, LIVE-GUARDED: `yielded_this_pass += → *=` freezes the counter at 0,
+# which is indistinguishable on a single-pass FakeStream (the drive loop ends
+# after pass one either way, correctly) and only observable on a RE-DRAINING
+# reader — PostgreSQL's non-consuming peek, whose re-drain loop is exactly what
+# the counter exists for. Oracles: roast_pg_cdc_reaches_open_bound_past_a_large_
+# uncaptured_transaction + roast_pg_cdc_empty_transaction_churn_must_not_pin_the_
+# slot (tests/live/live_cdc.rs) — both starve if a zero-yield pass reads as
+# complete while in-bound data remains.
+src/source/cdc/sink.rs:454:35: replace += with *= in run_to_files

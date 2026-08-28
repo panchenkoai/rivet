@@ -71,6 +71,18 @@ impl StateStore {
     /// so the stale `running` no longer protects anything). Supersession, not a
     /// clock — the reconciliation is record-vs-record, never record-vs-`now`.
     pub fn has_active_run_on_prefix(&self, prefix: &str) -> Result<bool> {
+        // SUPERSESSION requires a newer SUCCESS, not merely a newer terminal row.
+        // The first cut accepted any non-running successor, and a FAILED one
+        // proves nothing: under the documented overlap model (interval overrun,
+        // cron double-fire) cycle N+1 can start, fail at open (cycle N holds the
+        // slot), and finish terminal while N is still streaming — the inference
+        // "newer terminal ⇒ the old run crashed and was re-run" then declared
+        // the LIVE run dead, `gc_orphans` collected its just-flushed unmanifested
+        // parts in the flush→manifest window, and the ack advanced the source
+        // past them: gone from both ends, manifest says Success. A newer SUCCESS
+        // over the same export genuinely proves a full pass happened after the
+        // stale row; a newer failure only proves somebody tried.
+        //
         // A running, non-superseded run whose write prefix OVERLAPS this prefix —
         // either direction, so a query at ANY granularity matches:
         //   * equal (batch: run and load prefix coincide),
@@ -90,7 +102,7 @@ impl StateStore {
                          SELECT 1 FROM run_status r2
                          WHERE r2.export_name = r.export_name
                            AND r2.started_at > r.started_at
-                           AND r2.status <> 'running')
+                           AND r2.status = 'success')
                    LIMIT 1";
         Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
     }
@@ -115,7 +127,7 @@ impl StateStore {
                          SELECT 1 FROM run_status r2
                          WHERE r2.export_name = r.export_name
                            AND r2.started_at > r.started_at
-                           AND r2.status <> 'running')";
+                           AND r2.status = 'success')";
         Ok(self
             .query(sql, &[prefix.into()], |r| r.text(0))?
             .into_iter()
@@ -317,6 +329,48 @@ mod tests {
         assert!(
             !s.has_active_run_on_prefix("gs://b/exports/users/").unwrap(),
             "a run on a DIFFERENT prefix does not make this one active"
+        );
+    }
+
+    /// A newer FAILED run does not supersede a live one — only a SUCCESS does.
+    ///
+    /// The overlap model makes this load-bearing: cycle N streams while cycle
+    /// N+1 starts, fails at open (N holds the slot), and lands terminal. The
+    /// old predicate read any newer terminal row as "the old run crashed and
+    /// was re-run", declared the LIVE run inactive, and `gc_orphans` then
+    /// collected its just-flushed unmanifested parts while the ack advanced the
+    /// source past them — gone from both ends under a Success manifest.
+    #[test]
+    fn a_newer_failed_run_does_not_supersede_a_live_one() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.begin_run("old", "orders", P, "2026-08-28T10:00:00Z")
+            .unwrap();
+        s.begin_run("new", "orders", P, "2026-08-28T10:05:00Z")
+            .unwrap();
+        s.finish_run("new", "failed", "2026-08-28T10:05:01Z")
+            .unwrap();
+        assert!(
+            s.has_active_run_on_prefix(P).unwrap(),
+            "a FAILED successor proves somebody tried, not that the old run is \
+             dead — treating it as supersession lets gc delete a live run's \
+             just-flushed parts"
+        );
+        // BOTH predicates — they are one rule in two spellings, and the second
+        // (`active_run_ids`) is what the load's consumed-exclusion reads; a fix
+        // landing on only one lets the load consume the live run's growing
+        // manifest and strand its later parts.
+        assert_eq!(
+            s.active_run_ids_on_prefix(P).unwrap(),
+            std::collections::HashSet::from(["old".to_string()]),
+            "the live run must still be NAMED active for the load's exclusion"
+        );
+        s.begin_run("new2", "orders", P, "2026-08-28T10:10:00Z")
+            .unwrap();
+        s.finish_run("new2", "success", "2026-08-28T10:11:00Z")
+            .unwrap();
+        assert!(
+            !s.has_active_run_on_prefix(P).unwrap(),
+            "a newer SUCCESS is the one honest supersession signal"
         );
     }
 

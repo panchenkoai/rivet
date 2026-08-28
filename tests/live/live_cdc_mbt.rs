@@ -734,8 +734,11 @@ fn run_ok(cfg: &std::path::Path) {
 // Finding #38 — Form B was a silent no-op for CDC: the manifest recorded
 // `column_checksums: None`, so `rivet validate` skipped the value leg on CDC
 // prefixes while looking green. The sink already computed the arrow-side sum
-// per column per part (Form A); it now XOR-accumulates them into the
-// manifest, and validate's re-read must agree — or name the column.
+// per column per part (Form A); it SUM-accumulates them into the manifest
+// (`wrapping_add` — an earlier comment here said "XOR-accumulates", naming
+// exactly the operator the code refuses: under `^` two parts with equal
+// column sums cancel to zero), and validate's re-read must agree — or name
+// the column.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {

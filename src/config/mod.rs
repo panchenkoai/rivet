@@ -406,6 +406,7 @@ impl Config {
             self.validate_export(export)?;
         }
         self.validate_cdc_resource_conflicts()?;
+        self.validate_csv_exports_are_not_loaded()?;
         self.validate_non_sql_source_modes()?;
         Ok(())
     }
@@ -481,12 +482,40 @@ impl Config {
     /// the RESOLVED values (defaults included). SQL Server `capture_instance`
     /// sharing is deliberately allowed: the change-table poll is read-only and
     /// resume state lives in the per-export checkpoint.
+    /// `format: csv` × a `load:` block is REFUSED: the load path lists
+    /// `*.parquet` only, so a CSV prefix resolves to zero URIs and the load
+    /// prints "produced no files — nothing to load" and exits 0 — success-shaped,
+    /// forever (the run ids are deliberately not recorded consumed, so every
+    /// later load re-skips the same rows). A pipeline that silently loads
+    /// nothing is worse than one that refuses to start; until the loaders learn
+    /// CSV, the config must not promise what the load cannot do.
+    fn validate_csv_exports_are_not_loaded(&self) -> crate::error::Result<()> {
+        if self.load.is_none() && self.exports.iter().all(|e| e.load.is_none()) {
+            return Ok(());
+        }
+        for e in &self.exports {
+            let loaded = self.load.is_some() || e.load.is_some();
+            if loaded && e.format == crate::config::FormatType::Csv {
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CSV_LOAD_UNSUPPORTED,
+                    "export '{}': `format: csv` cannot feed a `load:` block — the \
+                     warehouse loaders read parquet parts only, so this load would \
+                     report \"nothing to load\" and exit 0 while the CSV data sits \
+                     unloaded forever. Use `format: parquet` for loaded exports, or \
+                     drop the load block for this one.",
+                    e.name
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_cdc_resource_conflicts(&self) -> crate::error::Result<()> {
         use std::collections::HashMap;
 
         let mut slots: HashMap<String, &str> = HashMap::new();
         let mut server_ids: HashMap<u32, &str> = HashMap::new();
-        let mut checkpoints: HashMap<&str, &str> = HashMap::new();
+        let mut checkpoints: HashMap<std::path::PathBuf, &str> = HashMap::new();
 
         for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
             let cdc = e.cdc.as_ref();
@@ -569,8 +598,30 @@ impl Config {
                 // checkpoint check below.
                 SourceType::Mongo => {}
             }
+            // RESOLVED, not the raw string — the function's own doc promises "on
+            // the RESOLVED values", and the runtime maps every relative path
+            // through the config dir (`resolve_checkpoint`), so `./cdc/x.ckpt`
+            // (init's own scaffold form) and `cdc/x.ckpt` are ONE file the raw
+            // comparison called two. With `parallel_exports` the miss became two
+            // streams acking one resume file concurrently; the next run resumed
+            // from whichever wrote last and silently skipped the other's span.
+            // Validation has no config-dir, so it NORMALISES both spellings the
+            // same way the resolver does (component-wise, `.` dropped) — equal
+            // normalised relatives resolve equal absolutely, whatever the dir.
             if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())
-                && let Some(prev) = checkpoints.insert(ckpt, &e.name)
+                && let Some(prev) = checkpoints.insert(
+                    // `components()` KEEPS a leading `./` (only interior dots are
+                    // normalised — measured: the first cut of this fix compared
+                    // `[CurDir, cdc, x]` with `[cdc, x]` and still called them
+                    // two), so CurDir is filtered explicitly. The resolver never
+                    // sees it either: `config_dir.join(p)` makes every dot
+                    // interior before ITS components() pass.
+                    std::path::Path::new(ckpt)
+                        .components()
+                        .filter(|c| !matches!(c, std::path::Component::CurDir))
+                        .collect::<std::path::PathBuf>(),
+                    &e.name,
+                )
             {
                 crate::config_bail!(
                     crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
@@ -2404,6 +2455,78 @@ mod sec_config_validation {
     /// part on EVERY committed transaction — a silent file explosion the operator
     /// who typed 0 never asked for. Same guard chunk_size has; `None` (omit the
     /// field) is the documented way to get the default.
+    /// `format: csv` under a `load:` block is refused — the loaders read parquet
+    /// only, and the alternative was a load that prints "nothing to load", exits
+    /// 0, and never marks the runs consumed: a permanently silent pipeline.
+    #[test]
+    fn a_csv_export_under_a_load_block_is_refused_loudly() {
+        let base = r#"
+source:
+  type: postgres
+  url: postgresql://u:p@127.0.0.1/db
+LOAD_BLOCK
+exports:
+  - name: t
+    table: public.t
+    format: FORMAT
+    destination: {type: local, path: /tmp/out/}
+"#;
+        let cfg = base
+            .replace("LOAD_BLOCK", "load: {target: duckdb, path: /tmp/w.db}")
+            .replace("FORMAT", "csv");
+        let err = Config::from_yaml(&cfg).expect_err("csv + load").to_string();
+        assert!(
+            err.contains("cannot feed a `load:` block"),
+            "must name the interaction and the fix: {err}"
+        );
+        // Parquet under the same load block stays valid — the guard is about the
+        // FORMAT, not the load feature.
+        Config::from_yaml(
+            &base
+                .replace("LOAD_BLOCK", "load: {target: duckdb, path: /tmp/w.db}")
+                .replace("FORMAT", "parquet"),
+        )
+        .expect("parquet + load must validate");
+        // …and CSV WITHOUT a load block stays valid — csv is first-class for
+        // exports; only the unload-able promise is refused.
+        Config::from_yaml(&base.replace("LOAD_BLOCK", "").replace("FORMAT", "csv"))
+            .expect("csv without load must validate");
+    }
+
+    /// Two CDC checkpoints that RESOLVE to one path are one conflict, whatever
+    /// their spelling — `./cdc/x.ckpt` (init's own scaffold form) and
+    /// `cdc/x.ckpt` are the same file, and the raw-string comparison called them
+    /// two. Two streams then acked one resume file; the next run resumed from
+    /// whichever wrote last and silently skipped the other's span.
+    #[test]
+    fn equivalent_checkpoint_spellings_are_one_conflict() {
+        let cfg = r#"
+source:
+  type: mssql
+  url: sqlserver://u:p@127.0.0.1/db
+exports:
+  - name: a
+    table: dbo.a
+    mode: cdc
+    format: parquet
+    cdc: {capture_instance: dbo_a, checkpoint: "./cdc/x.ckpt"}
+    destination: {type: local, path: /tmp/a/}
+  - name: b
+    table: dbo.b
+    mode: cdc
+    format: parquet
+    cdc: {capture_instance: dbo_b, checkpoint: "cdc/x.ckpt"}
+    destination: {type: local, path: /tmp/b/}
+"#;
+        let err = Config::from_yaml(cfg)
+            .expect_err("one file, two spellings")
+            .to_string();
+        assert!(
+            err.contains("same checkpoint path"),
+            "the guard must compare RESOLVED paths, as its own doc promises: {err}"
+        );
+    }
+
     #[test]
     fn cdc_rollover_zero_is_refused_not_a_file_explosion() {
         let base = r#"

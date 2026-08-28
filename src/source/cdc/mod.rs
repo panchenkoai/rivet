@@ -188,7 +188,19 @@ impl Position {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating checkpoint directory '{}'", parent.display()))?;
         }
-        let tmp = path.with_extension("tmp");
+        // A WRITER-UNIQUE tmp, never the fixed `.tmp` sibling: two processes
+        // saving one checkpoint (an overlapping scheduler cycle, or two exports
+        // misconfigured onto one path) interleaved their writes into the SAME
+        // tmp file — create-truncate and write are two syscalls — and the rename
+        // then promoted a file holding one saver's JSON with the other's tail:
+        // invalid at load, and the load error's own remedy (delete to re-anchor)
+        // skips the window if followed. pid+nanos, so namespaces (two pid-1
+        // containers on one volume) cannot collide either.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_extension(format!("tmp.{}.{nanos:x}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec(&self.0)?)
             .with_context(|| format!("writing checkpoint '{}'", path.display()))?;
         std::fs::rename(&tmp, path)
@@ -721,7 +733,10 @@ impl DrainMode {
 /// WHOLE (never split across parts), so an oversized one would grow the tx buffer
 /// unbounded. Each adapter caps its per-transaction buffer at this and bails
 /// loudly rather than OOM. Default 5M rows (a real OLTP transaction is far
-/// below). `RIVET_CDC_MAX_TX_ROWS` overrides it — test-only, so the cap is
+/// below). `RIVET_CDC_MAX_TX_ROWS` overrides it — an OPERATOR override (the
+/// refusal messages prescribe raising it when a transaction this large is
+/// genuinely expected; an earlier doc said "test-only" while the product's own
+/// errors said otherwise), and the way tests make the cap
 /// reachable without seeding a 5-million-row transaction. Read once.
 pub(crate) fn max_tx_rows() -> usize {
     use std::sync::OnceLock;
@@ -739,7 +754,8 @@ pub(crate) fn max_tx_rows() -> usize {
 /// rows of multi-hundred-MB TEXT/BLOB stay far under 5M rows yet exhaust memory.
 /// Each adapter also caps the transaction's running `estimated_bytes` at this and
 /// bails loudly. Default 2 GiB (a real OLTP transaction is far below).
-/// `RIVET_CDC_MAX_TX_BYTES` overrides it — test-only, so the cap is reachable
+/// `RIVET_CDC_MAX_TX_BYTES` overrides it — an operator override, like its row
+/// sibling, and the way tests make the cap reachable
 /// without seeding a multi-GB transaction. Read once.
 pub(crate) fn max_tx_bytes() -> usize {
     use std::sync::OnceLock;

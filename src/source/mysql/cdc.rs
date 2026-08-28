@@ -1176,17 +1176,7 @@ impl MysqlChangeStream {
                 // re-reads from the checkpoint), and the message names both facts
                 // the operator needs.
                 if let Some(sp) = &self.spill {
-                    anyhow::bail!(
-                        "mysql cdc: an XA PREPARE arrived while this transaction's \
-                         tail ({} row(s)) is spilled to disk, so rivet cannot see \
-                         whether the branch touches a captured table. Refusing \
-                         rather than guessing: dropping a branch whose captured \
-                         rows sit only in the spilled tail would lose them \
-                         silently. Either raise RIVET_CDC_MAX_TX_ROWS/_BYTES past \
-                         this branch's size, or commit the XA branch promptly so \
-                         it frames normally.",
-                        sp.len()
-                    );
+                    anyhow::bail!("{}", xa_prepare_spilled_tail_refusal_message(sp.len()));
                 }
                 // Nothing of ours in the branch: drop it rather than leave it for the
                 // next commit to stamp and fuse. The sink would route these rows away,
@@ -1635,6 +1625,38 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
 /// It also refuses a branch that goes on to COMMIT, because at `XA PREPARE` there is
 /// nothing to distinguish the two — the outcome is a Query event that has not been
 /// read yet. Over-refusing is the safe direction: the alternative shipped a
+/// The XA+spill refusal — a HARD STOP, and the message says so.
+///
+/// The first version prescribed "commit the XA branch promptly so it frames
+/// normally", which clears the condition in NO world: the refusal fires at the
+/// `XA_prepare_log_event`, the checkpoint has not advanced, and an `XA COMMIT` is
+/// appended AFTER the PREPARE — so every re-run replays the same rows from the
+/// checkpoint, re-crosses the same cap, re-spills, and bails at the SAME immutable
+/// PREPARE before ever reaching the commit. The sibling plain-XA refusal had
+/// already measured exactly this loop ("run, refuse, re-run, refuse") and its
+/// message says "does NOT clear by re-running"; this one said neither. A refusal
+/// that can persist for hours (XA's whole point) must tell the operator the
+/// stream is STOPPED, and name the ladder honestly: raising the caps un-wedges
+/// only a branch that turns out NOT to touch a captured table — if it is ours,
+/// the next rung is the plain refusal, whose escape (re-anchor FIRST, then
+/// re-snapshot) is the one that always works.
+pub(crate) fn xa_prepare_spilled_tail_refusal_message(tail_rows: usize) -> String {
+    format!(
+        "mysql cdc: an XA PREPARE arrived while this transaction's tail \
+         ({tail_rows} row(s)) is spilled to disk, so rivet cannot see whether the \
+         branch touches a captured table — and dropping a branch whose captured \
+         rows sit only in the tail would lose them silently. This is a HARD STOP: \
+         the PREPARE event is permanent in the binlog, so re-running refuses again \
+         at the same event; committing the branch does not clear it (the commit \
+         lands AFTER the PREPARE the re-read stops at). To proceed: raise \
+         RIVET_CDC_MAX_TX_ROWS/_BYTES past this branch's size so the whole branch \
+         is scanned in memory — if the branch does not touch a captured table, \
+         capture then continues; if it does, the plain XA refusal fires next with \
+         its own recovery (re-anchor the checkpoint past the branch FIRST, then \
+         re-snapshot the captured tables)."
+    )
+}
+
 /// rolled-back row as committed.
 pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
     let qualified = if schema.is_empty() {
@@ -1857,6 +1879,41 @@ mod tests {
     /// COORDINATES, and nothing stopped a checkpoint written by one server from
     /// being used against another. `binlog.000042:12345` parses on any host and
     /// addresses a different binlog on each.
+    /// The XA+spill refusal tells the operator the truth: hard stop, re-running
+    /// refuses again, committing does not clear it, and the ladder out.
+    ///
+    /// The first version said "commit the XA branch promptly so it frames
+    /// normally" — impossible in every world (the commit lands AFTER the PREPARE
+    /// the re-read stops at), on a refusal that can legitimately persist for
+    /// hours. Each pinned phrase below is a CLAIM the code makes true; drift the
+    /// message and this names which promise broke.
+    #[test]
+    fn the_xa_spill_refusal_names_the_stop_the_loop_and_the_ladder() {
+        let msg = xa_prepare_spilled_tail_refusal_message(7);
+        assert!(msg.contains("7 row(s)"), "names the spilled tail size");
+        assert!(msg.contains("HARD STOP"), "says the stream is stopped");
+        assert!(
+            msg.contains("re-running refuses again"),
+            "says the loop out loud — the PREPARE is permanent in the binlog"
+        );
+        assert!(
+            msg.contains("committing the branch does not clear it"),
+            "the first version prescribed exactly this non-remedy"
+        );
+        assert!(
+            msg.contains("RIVET_CDC_MAX_TX_ROWS"),
+            "the one rung that can un-wedge a not-ours branch"
+        );
+        assert!(
+            msg.contains("re-anchor") && msg.contains("re-snapshot"),
+            "the always-working escape, in the load-bearing order"
+        );
+        assert!(
+            !msg.contains("frames normally"),
+            "the retired false promise must not drift back in"
+        );
+    }
+
     #[test]
     fn a_checkpoint_from_another_server_is_refused_and_says_why() {
         use super::CheckpointIdentity as C;

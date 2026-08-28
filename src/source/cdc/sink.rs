@@ -1208,6 +1208,21 @@ mod tests {
 
     /// A fake stream that yields a fixed list of changes and records every `ack`,
     /// so the test can assert the durable sequence ran once per committed part.
+    /// The runaway fuse every test stream's `next_change` calls FIRST: a drive
+    /// loop that stops terminating (a `drain_is_complete` mutant) must fail as a
+    /// loud panic in milliseconds, not a per-mutant 33-second harness timeout —
+    /// six mutants survived that way, each a stalled CI job wearing a verdict.
+    /// One counter across all streams: the budget is per test PROCESS, which is
+    /// exactly the resource a hang consumes.
+    fn runaway_fuse() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        assert!(
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100_000,
+            "a test stream was polled 100_000 times — the drive loop is not \
+             terminating (drain_is_complete never fired)"
+        );
+    }
+
     struct FakeStream {
         events: VecDeque<ChangeEvent>,
         acked: Vec<Position>,
@@ -1219,6 +1234,20 @@ mod tests {
         }
 
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            runaway_fuse();
+            // A RUNAWAY FUSE, panicking loudly instead of hanging. The drive
+            // loop re-drains until `drain_is_complete` says stop; a mutant that
+            // never says stop (`-> false`, `|| -> &&`) spun this stream's empty
+            // tail forever and survived as a 33-second TIMEOUT per mutant — a
+            // stalled CI job where an assertion should be, the same class the
+            // spill's drain loops had. 10_000 calls is three orders past any
+            // fixture here.
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            assert!(
+                CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10_000,
+                "FakeStream polled 10_000 times — the drive loop is not \
+                 terminating (drain_is_complete never fired)"
+            );
             self.events.pop_front().map(Ok)
         }
         fn ack(&mut self, position: &Position) -> Result<()> {
@@ -1502,6 +1531,7 @@ mod tests {
         }
 
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            runaway_fuse();
             self.events.pop_front().map(Ok)
         }
         fn ack(&mut self, _position: &Position) -> Result<()> {
@@ -1592,6 +1622,7 @@ mod tests {
             }
 
             fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+                runaway_fuse();
                 match self.events.pop_front() {
                     Some(e) => Some(Ok(e)),
                     // Exhausted -> the read itself fails, mid-drain.
@@ -2625,6 +2656,64 @@ mod tests {
         }
     }
 
+    /// The cross-part checksum fold is SUM, recorded with the Sum render stamp —
+    /// graded on TWO parts with EQUAL sums, the one fixture where every wrong
+    /// fold shows its face.
+    ///
+    /// On one part `0.wrapping_add(s) == 0 ^ s == s`: every operator agrees, so
+    /// the only pre-existing coverage (a one-part live cell) could not fail
+    /// against `^=` — under which two equal parts cancel to ZERO, "a checksum
+    /// that verified anything" (the production comment's own words) — nor
+    /// against dropping the render stamp, which sends validate's re-read to the
+    /// v1 XOR fold and false-reports healthy multi-part prefixes corrupt.
+    #[test]
+    fn the_cross_part_checksum_fold_survives_two_equal_parts() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        // TWO transactions with IDENTICAL values — equal per-part column sums,
+        // the XOR-annihilation witness — at rollover 1, so each rolls its own part.
+        let mut e1 = insert(7);
+        e1.committed = true;
+        let mut e2 = insert(7);
+        e2.committed = true;
+        let mut stream = FakeStream {
+            events: vec![e1, e2].into(),
+            acked: Vec::new(),
+        };
+        let (m, r) = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 1),
+        );
+        r.unwrap();
+        let manifest = m.into_iter().next().expect("one table");
+        assert!(
+            manifest.parts.len() >= 2,
+            "the fixture is inert below TWO parts — every fold operator is \
+             identical on one"
+        );
+        let sums = manifest
+            .column_checksums
+            .as_ref()
+            .expect("the sink records Form B checksums");
+        let v: u64 = sums
+            .iter()
+            .find(|c| c.name == "v")
+            .map(|c| c.checksum.parse().expect("a numeric checksum"))
+            .expect("the data column is summed");
+        assert_ne!(
+            v, 0,
+            "two equal parts must NOT cancel — zero here is the annihilating XOR \
+             fold back from the dead"
+        );
+        assert_eq!(
+            manifest.checksum_render.as_deref(),
+            Some(crate::source::value_checksum::CHECKSUM_RENDER_ID),
+            "without the render stamp, validate's re-read falls back to the v1 \
+             XOR fold and false-reports healthy multi-part prefixes corrupt"
+        );
+    }
+
     /// `read_bytes` counts PAYLOAD, produced by the real producer — not resident.
     ///
     /// The boundary test the regression demanded: a unit on `payload_bytes` alone
@@ -3017,6 +3106,14 @@ mod tests {
 
         assert_eq!(manifests.len(), 2, "one manifest per table");
         assert_eq!(manifests[0].export_name, "a");
+        // The FAMILY is the parent export on BOTH tables — the field exists so
+        // the load guard can group the drain with its snapshot leg, and a flip
+        // to `out.table` here would make `identity_family` see two families in
+        // one prefix and refuse rivet's own output at the first name≠table load.
+        // This fixture already crosses the threshold (export "t", tables a/b);
+        // it just never asserted the field.
+        assert_eq!(manifests[0].export_family, "t");
+        assert_eq!(manifests[1].export_family, "t");
         assert_eq!(manifests[0].row_count, 2);
         assert_eq!(manifests[1].export_name, "b");
         assert_eq!(manifests[1].row_count, 1);

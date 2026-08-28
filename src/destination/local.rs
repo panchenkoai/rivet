@@ -80,8 +80,21 @@ fn stage_copy(src: &Path, tmp: &Path) -> Result<()> {
 fn staging_name(file_name: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    // pid + STARTUP NANOS, not pid alone: in the shipped container every
+    // generation is pid 1, so a SIGKILL mid-stage left `.name.1.K.tmp` and the
+    // next generation's `create_new` at the same ordinal K hit EEXIST — a
+    // deterministic wedge blaming "an adversary" on every retry until manual
+    // cleanup. The startup stamp makes the name unique per process INSTANCE, so
+    // a predecessor's debris can never occupy this run's slot.
+    static STARTUP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let stamp = STARTUP.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    });
     format!(
-        ".{file_name}.{}.{}.tmp",
+        ".{file_name}.{}-{stamp:x}.{}.tmp",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )

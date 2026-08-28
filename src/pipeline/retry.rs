@@ -251,6 +251,12 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
 
     // Capacity errors -- retry with longer delay
     if msg.contains("too many connections")
+        // 53300's OTHER renderings — the max_connections cap says "sorry, too
+        // many clients already" / "remaining connection slots are reserved";
+        // "too many connections" is only the per-role/per-DB CONNECTION LIMIT
+        // arm. Same gap, same fix as the doctor's categorizer.
+        || msg.contains("too many clients")
+        || msg.contains("connection slots are reserved")
         || msg.contains("the database system is starting up")
         || msg.contains("the database system is shutting down")
     {

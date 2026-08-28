@@ -14,6 +14,25 @@ use crate::error::Result;
 use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, DrainMode, run_capture};
 use crate::state::StateStore;
 
+/// The byte-rollover budget one export runs under — the NAMED supplier of the
+/// sink's `rollover_memory_bytes`, extracted so the offline gate can grade it.
+///
+/// Inline, this decision was ungraded BY CONSTRUCTION: the default is chosen to
+/// be inert on narrow rows (no live fixture trips it), the sink's byte-cap test
+/// sets the field directly (bypassing this supplier — the fabricated-input
+/// seam), and the expression sat inside live-only glue. A regression to
+/// `.map(..)` alone would ship green everywhere and silently remove the memory
+/// ceiling for wide-row streams.
+///
+/// `.or(..)`, never an unconditional assign: an ABSENT `rollover_memory_mb`
+/// gets the protective default rather than reading as "no budget" — the
+/// config-clobber shape. The multiply cannot overflow here: validation refuses
+/// any `mb` whose byte count would (`validate_cdc_resource_conflicts`).
+pub(crate) fn cdc_rollover_memory_bytes(mb: Option<usize>) -> Option<usize> {
+    mb.map(|mb| mb * 1024 * 1024)
+        .or(Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES))
+}
+
 /// Default memory budget for one CDC part — the byte half of `rollover`.
 ///
 /// 256 MiB is chosen to be INERT on the common shape and binding on the pathological
@@ -662,10 +681,7 @@ fn run_cdc_inner(
             // what runs out: 100_000 narrow events is ~77 MB and 100_000 wide ones is
             // unbounded, so the row count is a budget only for one row width. Whichever
             // limit is reached first rolls the part.
-            rollover_memory_bytes: cdc
-                .rollover_memory_mb
-                .map(|mb| mb * 1024 * 1024)
-                .or(Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES)),
+            rollover_memory_bytes: cdc_rollover_memory_bytes(cdc.rollover_memory_mb),
             run_id: run_id.to_string(),
             started_at: now,
             state: Some(state),
@@ -1157,5 +1173,22 @@ mod tests {
         // Nothing done, no checkpoint → snapshot, and no evidence means the
         // anchor is a legitimate first anchor, not a loud failure.
         assert_eq!(snapshot_plan(&[false], false), (vec![0], false));
+    }
+
+    /// Both arms of the byte-budget supplier — the decision the sink's own test
+    /// bypasses by setting the field directly.
+    #[test]
+    fn the_byte_budget_defaults_on_absence_and_converts_on_presence() {
+        assert_eq!(
+            cdc_rollover_memory_bytes(None),
+            Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES),
+            "absence must get the PROTECTIVE default, never read as 'no budget' \
+             — losing this arm silently removes the wide-row memory ceiling"
+        );
+        assert_eq!(
+            cdc_rollover_memory_bytes(Some(32)),
+            Some(32 * 1024 * 1024),
+            "a configured value is megabytes, converted — not passed through raw"
+        );
     }
 }

@@ -346,9 +346,9 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             // mean "no byte budget" on the ad-hoc CLI either: `--rollover` bounds ROWS,
             // and a wide-row table would buffer unbounded to the row cap. The named
             // runner-bypass shape, at an entry point instead of a runner.
-            rollover_memory_bytes: Some(
-                crate::pipeline::cdc_job::DEFAULT_CDC_ROLLOVER_MEMORY_BYTES,
-            ),
+            // Through the NAMED supplier, so this entry point and the config path
+            // cannot drift into two defaults.
+            rollover_memory_bytes: crate::pipeline::cdc_job::cdc_rollover_memory_bytes(None),
             run_id: now.clone(),
             started_at: now,
             // The ad-hoc `rivet cdc` subcommand runs without a config, and so

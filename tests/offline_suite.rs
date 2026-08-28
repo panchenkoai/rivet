@@ -28,6 +28,8 @@ mod cdc_cli_surface_guard;
 
 #[path = "offline/cdc_evidence_matrix_guard.rs"]
 mod cdc_evidence_matrix_guard;
+#[path = "offline/changelog_guard.rs"]
+mod changelog_guard;
 #[path = "offline/chunking_matrix_guard.rs"]
 mod chunking_matrix_guard;
 #[path = "offline/cli_contract.rs"]

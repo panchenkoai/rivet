@@ -1,6 +1,6 @@
 # Changelog
 
-### Unreleased
+## Unreleased
 
 - **CDC memory budgets measure memory now, with an operator-visible surface.**
   `rollover_memory_mb` gained a default (256 MiB) so absence no longer means "no
@@ -11,15 +11,15 @@
   that slipped under the old 2 GiB figure may now refuse — the refusal was always
   the intent, the old number was not a guard. Zero is rejected for both rollover
   knobs at validation (`0` meant "roll a part on every transaction", not
-  "disable"). `bytes_read` metrics keep the DECODED-payload unit and stay
-  comparable with batch exports.
+  "disable"). `bytes_read` metrics return to approximately the released DECODED-payload
+  unit (the old +32/event constant is gone — percent-level on realistic rows)
+  and stay comparable with batch exports.
 - **Opt-in transaction spilling (`RIVET_CDC_SPILL_DIR`).** A transaction past the
   cap can spill its tail to disk instead of failing (PostgreSQL/MySQL/SQL Server;
   MongoDB needs none by construction). Off by default: it moves the adapter's copy
   only (~11% of peak RSS measured on PostgreSQL), so the caps stay the honest
-  guard. Every resolved location is config-anchored, never cwd-relative.
+  guard. On the config-driven path every resolved location is config-anchored (the ad-hoc `rivet cdc` CLI anchors to the invoking shell's directory — the directory the operator chose).
 
-## Unreleased
 
 - **A service-account key file is now minted IN PROCESS — `gcloud` is off the
   BigQuery path for it.** With `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
