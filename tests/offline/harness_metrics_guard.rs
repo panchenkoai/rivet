@@ -130,7 +130,7 @@ fn shaped(tag: &str, raw: &str) -> serde_json::Value {
 /// counts that went in.
 ///
 /// The oracle is HAND-WRITTEN, not recomputed from the emitter's own arithmetic
-/// (CLAUDE.md's self-oracle rule: a test that derives `expected` from the code
+/// (the process rules' self-oracle rule: a test that derives `expected` from the code
 /// it guards cannot catch the bug). 2/(2+25) and 13/19 are typed out below
 /// because a reader has to be able to check them by eye.
 ///

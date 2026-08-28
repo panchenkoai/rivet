@@ -44,6 +44,11 @@ pub fn duckdb_run_sql_json(sql: &str) -> serde_json::Value {
         r#"
 import duckdb, json, sys
 con = duckdb.connect()
+# The progress bar writes to STDOUT, which is the channel this helper parses as
+# JSON. It only appears once an operation runs long enough — an extension DOWNLOAD
+# does — so the first caller to `INSTALL … FROM community` broke the parse with
+# `trailing characters at line 1 column 5`. Off for every query, not just that one.
+con.execute("SET enable_progress_bar=false")
 cur = con.execute({sql_repr})
 cols = [d[0] for d in cur.description] if cur.description else []
 out_rows = []
@@ -438,4 +443,211 @@ pub fn duckdb_distinct_i64_set(
             })
         })
         .collect()
+}
+
+/// Which source a DuckDB oracle should read, and how it reaches it from INSIDE the
+/// `rivet-duckdb` container.
+///
+/// The container talks to the stand over the compose network, so a host DSN
+/// (`127.0.0.1:5434`) is useless there — every arm below carries the SERVICE name.
+/// That asymmetry is exactly the kind of thing a per-test hand-rolled DSN gets
+/// wrong once and then silently reads zero rows from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OracleEngine {
+    Postgres,
+    PostgresCdc,
+    MysqlCdc,
+    MssqlCdc,
+    MongoRs,
+}
+
+impl OracleEngine {
+    /// The DuckDB extension this engine needs. `postgres`/`mysql` ship in core;
+    /// `mssql`/`mongo` are COMMUNITY extensions and publish no build below DuckDB
+    /// 1.5.0 — which is why the stand pins that floor (measured: 404 for every
+    /// version through 1.4.1, 200 from 1.5.0).
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::PostgresCdc => "postgres",
+            Self::MysqlCdc => "mysql",
+            Self::MssqlCdc => "mssql",
+            Self::MongoRs => "mongo",
+        }
+    }
+
+    fn is_community(self) -> bool {
+        matches!(self, Self::MssqlCdc | Self::MongoRs)
+    }
+
+    /// The install/load prelude — every query that reads a source must run it.
+    pub fn load_sql(self) -> String {
+        let e = self.extension();
+        if self.is_community() {
+            format!("INSTALL {e} FROM community; LOAD {e};")
+        } else {
+            format!("INSTALL {e}; LOAD {e};")
+        }
+    }
+
+    /// SQL that makes this engine's data readable, and the table expression to read
+    /// FROM. MongoDB has no `ATTACH` — its extension exposes the `mongo_scan(uri,
+    /// db, collection)` table function instead — so the two are returned together
+    /// rather than assuming every engine attaches.
+    pub fn source_sql(self, database: &str, table: &str) -> (String, String) {
+        match self {
+            Self::Postgres => (
+                format!(
+                    "ATTACH 'postgresql://rivet:rivet@postgres:5432/{database}' \
+                     AS src (TYPE postgres, READ_ONLY);"
+                ),
+                format!("src.{table}"),
+            ),
+            Self::PostgresCdc => (
+                format!(
+                    "ATTACH 'postgresql://rivet:rivet@postgres-cdc:5432/{database}' \
+                     AS src (TYPE postgres, READ_ONLY);"
+                ),
+                format!("src.{table}"),
+            ),
+            Self::MysqlCdc => (
+                format!(
+                    "ATTACH 'host=mysql-cdc port=3306 user=root password=rivet \
+                     database={database}' AS src (TYPE mysql, READ_ONLY);"
+                ),
+                format!("src.{table}"),
+            ),
+            Self::MssqlCdc => (
+                format!(
+                    "ATTACH 'Server=mssql-cdc,1433;Database={database};UID=sa;\
+                     PWD=Rivet_Passw0rd!;TrustServerCertificate=true' \
+                     AS src (TYPE mssql, READ_ONLY);"
+                ),
+                // SQL Server qualifies by schema; a bare name does not resolve.
+                format!("src.dbo.{table}"),
+            ),
+            Self::MongoRs => (
+                String::new(),
+                format!(
+                    "mongo_scan('mongodb://mongo-rs:27017/?directConnection=true', \
+                     '{database}', '{table}')"
+                ),
+            ),
+        }
+    }
+}
+
+/// Row counts of the SOURCE, the DELIVERED parquet, and what rivet RECORDED about
+/// the run — read by one DuckDB session, from three places that share no code.
+///
+/// rivet's own summary is not evidence about rivet, and neither is a re-read of the
+/// destination on its own: a run can deliver the right number of rows from the wrong
+/// relation, or record a number no artifact supports. The state DB (SQLite by
+/// default, the "metabase") carries `export_metrics.total_rows` and
+/// `file_log.row_count`, and both attach natively — so the comparison that matters
+/// is one query, not three tools and a human diff.
+///
+/// `state_db` is the `.rivet_state.db` beside the config; `dest_glob` and the state
+/// path must both be CONTAINER paths (see [`duckdb_shared_workdir`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct RowCensus {
+    pub source: i64,
+    pub delivered: i64,
+    pub metrics: i64,
+    pub file_log: i64,
+}
+
+impl RowCensus {
+    /// True when all four agree — the only shape that means "this run is sound".
+    pub fn agrees(&self) -> bool {
+        self.source == self.delivered
+            && self.delivered == self.metrics
+            && self.metrics == self.file_log
+    }
+}
+
+pub fn duckdb_row_census(
+    engine: OracleEngine,
+    database: &str,
+    table: &str,
+    dest_glob: &str,
+    state_db: &str,
+    export_name: &str,
+) -> RowCensus {
+    let (attach, from) = engine.source_sql(database, table);
+    let sql = format!(
+        "{load} INSTALL sqlite; LOAD sqlite; {attach} \
+         ATTACH '{state_db}' AS st (TYPE sqlite, READ_ONLY); \
+         SELECT (SELECT count(*) FROM {from}) AS source, \
+                (SELECT count(*) FROM read_parquet('{dest_glob}')) AS delivered, \
+                (SELECT coalesce(sum(total_rows), 0) FROM st.export_metrics \
+                  WHERE export_name = '{export_name}') AS metrics, \
+                (SELECT coalesce(sum(row_count), 0) FROM st.file_log \
+                  WHERE export_name = '{export_name}') AS file_log",
+        load = engine.load_sql(),
+    );
+    let v = duckdb_run_sql_json(&sql);
+    // A community extension that will not install is almost always the stand's
+    // duckdb pin, not the query — say so where the reader is, rather than leaving
+    // an HTTP 404 to be decoded.
+    assert!(
+        !v["rows"].as_array().is_none_or(Vec::is_empty),
+        "the census query returned nothing. If the error mentions a 404 for `{}`, \
+         the duckdb container predates 1.5.0 — the community `mssql`/`mongo` \
+         extensions publish no build below it. Recreate it: \
+         `docker compose up -d --force-recreate duckdb`",
+        engine.extension()
+    );
+    let n = |i: usize| -> i64 {
+        v["rows"][0][i]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(-1)
+    };
+    RowCensus {
+        source: n(0),
+        delivered: n(1),
+        metrics: n(2),
+        file_log: n(3),
+    }
+}
+
+/// SQL that lets the oracle read a BUCKET EMULATOR directly — MinIO today, and any
+/// S3-compatible endpoint by the same shape.
+///
+/// The independent oracle covered sources, the destination's local files and rivet's
+/// state DB, and stopped at the bucket — so a cloud-destination claim was checked by
+/// re-reading rivet's own verdict. That is exactly the gap the leading-slash bug
+/// lived in: `rivet validate` called one object both PART_MISSING and
+/// UNTRACKED_OBJECT on perfectly correct data, and only a reader that shares no code
+/// with rivet can say which half was the lie. MEASURED after the fix — DuckDB read
+/// `s3://leadtest/lead/x/*.parquet` as 500 rows / 500 distinct / sum 250500, matching
+/// the source's arithmetic exactly.
+///
+/// `minio:9000` is the CONTAINER-side endpoint: the oracle runs inside
+/// `rivet-duckdb`, where the host's `127.0.0.1:9000` reaches nothing — and a bucket
+/// that reads as empty is indistinguishable from an export that wrote nothing.
+pub fn duckdb_minio_prelude() -> String {
+    "INSTALL httpfs; LOAD httpfs; \
+     CREATE OR REPLACE SECRET s (TYPE s3, KEY_ID 'minioadmin', SECRET 'minioadmin', \
+       ENDPOINT 'minio:9000', USE_SSL false, URL_STYLE 'path');"
+        .to_string()
+}
+
+/// Row count of every parquet under an s3 prefix, read by DuckDB from the emulator.
+///
+/// Asserts the glob matched something first: `read_parquet` over an empty match is
+/// an error, but a caller that swallowed it would read zero as "the export delivered
+/// nothing" rather than "the oracle looked in the wrong place".
+pub fn duckdb_s3_parquet_rows(bucket: &str, prefix: &str) -> i64 {
+    let p = prefix.trim_matches('/');
+    let v = duckdb_run_sql_json(&format!(
+        "{} SELECT count(*) FROM read_parquet('s3://{bucket}/{p}/**/*.parquet')",
+        duckdb_minio_prelude()
+    ));
+    v["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            panic!("duckdb read nothing under s3://{bucket}/{p}/ — a bucket that reads as empty and an export that wrote nothing look identical, so this is never a valid answer")
+        })
 }

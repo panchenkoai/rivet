@@ -541,7 +541,7 @@ fn bytes_to_str(b: &[u8]) -> Option<&str> {
 /// MySQL column typing means valid rows always fit; a failure here is a genuine
 /// type mismatch (e.g. an override that mis-declares the width, or a BIGINT
 /// UNSIGNED value > i64::MAX routed through a signed builder) and must surface
-/// loudly — never corrupt into a wrap. See CLAUDE.md "Remediation hints must
+/// loudly — never corrupt into a wrap. See the process rules "Remediation hints must
 /// recover from the degraded state".
 fn narrow<T>(v: i128, column_type: &str) -> Result<T>
 where

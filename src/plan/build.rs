@@ -132,7 +132,21 @@ pub fn build_plan(
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),
-        source_table: export.table.clone(),
+        // The LABEL, where the two differ. `plan.source_table` has exactly one
+        // consumer — the manifest's recorded identity in `finalize` — and the two
+        // legs of one `initial: snapshot` export must record the SAME source or
+        // `ensure_single_export` refuses the whole prefix at load time. Round-5
+        // measured that refusal on SQL Server with a bare `table:`: the drain wrote
+        // `mssql:orders` (the configured string) while the leg, whose `table` is now
+        // the catalog read, wrote `mssql:dbo.orders`. Both identities contain a
+        // colon, so the coarsening fold that rescues the batch leg deliberately does
+        // not apply — and the break surfaces only at `rivet load`, on artifacts that
+        // are already durable, blaming the operator's prefix layout for a naming
+        // split inside rivet.
+        source_table: export
+            .snapshot_label
+            .clone()
+            .or_else(|| export.table.clone()),
         base_query,
         is_split_unit: export.split.is_some(),
         // Thread the split window into the plan so finalize records it in the manifest —

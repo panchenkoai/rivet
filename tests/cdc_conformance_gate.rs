@@ -377,12 +377,17 @@ fn derived_capture_marker_set_is_pinned() {
     let expected: Vec<&str> = vec![
         "cli(",
         "cli_env(",
+        "cli_in_dir(",
         "drain_and_read(",
         "run(",
         "run_and_read(",
         "run_args(",
         "run_args_env(",
         "run_expect_fail(",
+        // `Rig::run_in_dir` — the working-directory seam added for the relative
+        // `cdc.checkpoint:` contract (a relative path must follow the CONFIG, not the
+        // process CWD). It spawns rivet, so it is a capture marker like its siblings.
+        "run_in_dir(",
         "run_ok(",
         "run_ok_capture(",
         "run_rivet(",
@@ -745,6 +750,13 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("manifest.json")
                 // the mssql change-row replay oracle (read_cdc_rows' sibling);
                 || chunk.contains("read_cdc_changes(")
+                // the four-way DuckDB census — the SOURCE table, the delivered
+                // parquet and rivet's two ledgers, from a session sharing no code
+                // with the product. Registered for the soak stand, whose whole
+                // oracle this is; it is a strictly stronger claim than a re-read,
+                // since a run that recorded rows no part declares fails it too.
+                || chunk.contains("row_census(")
+                || chunk.contains("assert_soak_is_sound(")
                 // The read-back DERIVED value the scenario smokes assert on.
                 // drain_and_read(/run_and_read( themselves are NOT outcome
                 // markers: they sit in the derived CAPTURE set too, so a
@@ -783,6 +795,14 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // …and the same command driven through the rig, which supplies
                 // the config flag itself.
                 || chunk.contains("cli(&[\"validate\"")
+                // `rivet check` writes NOTHING — it types the source and reports.
+                // Demanding "what was delivered" from it asks a question with no
+                // answer, the same way it does for `validate`; the report itself is
+                // the outcome, and its ABSENCE is the defect such a test guards
+                // (round-9: an unreadable cdc catalog made `check --type-report`
+                // print a verdict and exit 0 with no column table at all).
+                || chunk.contains("\"check\",")
+                || chunk.contains("cli(&[\"check\"")
                 // External-warehouse oracles (the strongest read-back in the
                 // suite): the CDC parquet is loaded and queried by another engine.
                 || chunk.contains("duckdb_run_sql_json(")

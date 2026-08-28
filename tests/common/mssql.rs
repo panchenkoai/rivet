@@ -459,3 +459,76 @@ pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
             .collect()
     })
 }
+
+/// Seed ONE transaction spanning `ids` on SQL Server — a scenario, not a `format!`
+/// in a test body.
+///
+/// A single set-based `INSERT … SELECT`, which is ONE statement and therefore one
+/// transaction: every row lands in a single `__$start_lsn` group, which is exactly
+/// what an oversized-transaction fixture needs. N separate one-row inserts are N
+/// groups and never reach a per-transaction cap however many of them there are.
+///
+/// Shaped for the DuckDB census and [`crate::common::cdc_id_ops`] — `(id, v)`
+/// integers plus a wide `pad`, so a row cap and a BYTE cap are both reachable and
+/// the source table's row count equals the delivered change count.
+pub fn mssql_seed_one_transaction(table: &str, ids: std::ops::RangeInclusive<usize>) {
+    mssql_seed_one_transaction_wide(table, ids, 200);
+}
+
+/// [`mssql_seed_one_transaction`] with the `pad` width chosen — the HEAVY-row
+/// fixture, which crosses the BYTE cap where a narrow one only crosses the row cap.
+///
+/// `REPLICATE` past 8000 needs an explicit `VARCHAR(MAX)` operand, or it silently
+/// truncates at 8000 — a wide fixture that quietly stops being wide would report a
+/// byte cap that was never crossed.
+pub fn mssql_seed_one_transaction_wide(
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+    pad: usize,
+) {
+    let (lo, hi) = (*ids.start(), *ids.end());
+    let n = hi.saturating_sub(lo) + 1;
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} (id, v, pad) \
+         SELECT {lo} + q.n - 1, {lo} + q.n - 1, REPLICATE(CAST('x' AS VARCHAR(MAX)), {pad}) \
+         FROM ( \
+             SELECT TOP ({n}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n \
+             FROM sys.all_objects a CROSS JOIN sys.all_objects b \
+         ) q"
+    ));
+}
+
+// ─── CDC scenarios, shared by the live suite and the soak stand ──────────────
+//
+// Private to `live_cdc_mssql.rs` until the soak stand needed them. A scenario that
+// two suites need is harness, not test body — the same rule that put the transaction
+// seeds here.
+
+/// Enable CDC on the database (idempotent) + the table, creating capture instance
+/// `ci`. The capture job (SQL Server Agent) then populates `cdc.<ci>_CT`.
+pub fn enable_cdc(table: &str, ci: &str) {
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+}
+
+/// Block until the capture job has copied at least `want` rows into the change
+/// table — the job runs asynchronously, so the test must wait for it.
+pub fn wait_for_capture(ci: &str, want: i64) {
+    // 60s ceiling: the SQL Server Agent capture job is asynchronous and its
+    // scan interval stretches under a loaded E2E runner — a 30s bound flaked
+    // one test at ~456s suite wall-clock (r6 CI). Doubling the ceiling matches
+    // the async reality; it does NOT mask a bug (a real drop still times out).
+    for _ in 0..120 {
+        if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
+}

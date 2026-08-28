@@ -224,13 +224,60 @@ impl TableSink<'_> {
 /// (`public.orders` — matches schema AND table). Adapters always emit schema
 /// and table separately; comparing the config string verbatim against the
 /// bare event table silently routed ZERO events for qualified configs.
-pub(crate) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
+/// Warn ONCE per (schema, table) per process that images are mapping by position.
+///
+/// The truth about a MySQL binlog image is on the wire — a `TABLE_MAP` written at
+/// `binlog_row_metadata=MINIMAL` carries no column names, whatever the server's
+/// setting is today. `row_metadata_warning` (the open-time probe) is the early
+/// hint; this is the one that cannot be wrong.
+fn warn_positional_once(schema: &str, table: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{schema}.{table}");
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.insert(key.clone()) {
+        log::warn!(
+            "cdc: {key}: this change image carries no column NAMES, so values are \
+             mapped by POSITION. On MySQL that is `binlog_row_metadata = MINIMAL` \
+             (the server default) — note the events replay the setting in force when \
+             they were WRITTEN, so a server switched to FULL still drains a MINIMAL \
+             backlog this way. A same-arity DDL that reorders columns then silently \
+             SWAPS them; an arity-changing one aborts the flush. Set \
+             `binlog_row_metadata = FULL` (8.0.1+) and re-capture from before the DDL"
+        );
+    }
+}
+
+/// Does this configured `table:` name the relation an event came from?
+///
+/// The ENGINE decides how many readings a dotted string has, and passing it is not
+/// ceremony: on a store with schemas, `a.b` may be a qualifier; on one without, it
+/// can only be a name. While Mongo shared SQL's two-reading rule, a collection whose
+/// first segment equalled the DATABASE name matched twice — `table: shopdb.orders`
+/// took both the collection literally named `shopdb.orders` and the sibling
+/// `orders`, interleaving two collections into one destination with every count
+/// intact (round-3B bughunt).
+pub(crate) fn table_matches(
+    engine: super::CdcEngine,
+    cfg: &str,
+    schema: &str,
+    table: &str,
+) -> bool {
     // Full-name match FIRST: a MongoDB collection name may contain dots
     // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
     // `schema.table` dropped every event (bug-hunt: 0-row success forever). This
     // is safe for SQL — no real table is literally named `schema.table`.
     if cfg == table {
         return true;
+    }
+    // A document store has no schema to qualify with, so there is no second
+    // reading — the full-name arm above was the whole answer.
+    if engine == super::CdcEngine::Mongo {
+        return false;
     }
     // Otherwise a SQL `schema.table` qualifier.
     match cfg.split_once('.') {
@@ -392,6 +439,15 @@ pub(crate) fn run_to_files(
     // re-runs, and the changes are already gone from the log.
     let drain: Result<()> = (|| {
         loop {
+            // Graded LIVE, not offline, and deliberately not excluded: `+= -> *=`
+            // pins this at 0, `drain_is_complete` then ends the loop after one pass,
+            // and the re-drain starvation tests go RED — measured 2026-08-27, six of
+            // them, led by roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_
+            // transaction. An exclusion would have to name `+= in run_to_files`,
+            // which also matches `total_rows`, `emitted` and `total_bytes` — all
+            // three graded (the first two by the lib suite, the third by
+            // `the_byte_rollover_cap_really_rolls_and_is_not_a_dead_accumulator`).
+            // Over-excluding graded mutants is worse than leaving one MISSED.
             let mut yielded_this_pass = 0usize;
             while let Some(ev) = stream.next_change() {
                 let mut ev = ev?;
@@ -417,7 +473,7 @@ pub(crate) fn run_to_files(
                 // the `continue` used to.
                 if let Some(sink) = sinks
                     .iter_mut()
-                    .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
+                    .find(|s| table_matches(cfg.engine, &s.out.table, &ev.schema, &ev.table))
                 {
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
@@ -469,7 +525,8 @@ pub(crate) fn run_to_files(
             // buffers are empty; it just persists the checkpoint + acks. The
             // checkpoint only ever lands on `last_commit` (a transaction boundary),
             // so a `max_events` stop mid-span still checkpoints a whole transaction.
-            if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
+            let buffered_rows: usize = sinks.iter().map(|s| s.buf.len()).sum();
+            if pass_must_roll(unacked_commit, buffered_rows) {
                 roll_all(
                     &mut sinks,
                     stream,
@@ -489,7 +546,7 @@ pub(crate) fn run_to_files(
             }
             // A pass that yielded nothing has drained to the bound; `max_events`
             // stops the whole run at the cap.
-            if hit_max || yielded_this_pass == 0 {
+            if drain_is_complete(hit_max, yielded_this_pass) {
                 break;
             }
         }
@@ -601,9 +658,10 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
         let scale = events
             .iter()
             .filter_map(|e| {
-                let img = match e.op {
-                    ChangeOp::Delete => e.before.as_ref(),
-                    _ => e.after.as_ref(),
+                let img = if e.op.values_live_in_before() {
+                    e.before.as_ref()
+                } else {
+                    e.after.as_ref()
                 };
                 img.and_then(|v| v.get(i))
             })
@@ -614,7 +672,11 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
                 _ => None,
             })
             .max();
-        if let Some(s) = scale.filter(|s| *s > 0) {
+        // No `.filter(|s| *s > 0)`: the arm above binds only `Decimal128(p, 0)`, so
+        // a scale of 0 would reassign the value the field already holds. The filter
+        // was unkillable — `>` and `>=` are observationally identical here — and an
+        // unkillable mutant is redundant code, not an exclusion to write down.
+        if let Some(s) = scale {
             m.arrow_type = Some(DataType::Decimal128(p, s as i8));
         }
     }
@@ -638,6 +700,149 @@ fn run_token(run_id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// One cell of a row image — resolved by NAME when the image carries names, by
+/// POSITION when it does not.
+///
+/// Hoisted out of `flush` because it was NESTED inside it. `flush` is live-only
+/// glue, so nothing offline could reach this, and a mutation run over
+/// `src/source/cdc/sink.rs` measured FOUR survivors in these few lines — every
+/// decision it makes:
+///
+/// * `n == col` → `!=` picks the first column that is NOT the one asked for,
+///   so every cell comes back holding a neighbour's value;
+/// * the `vals.len() == ncols` guard → `true` restores the pre-round-13 read
+///   (a short image indexed by position, reading past its end), → `false`
+///   degrades a mid-window RENAME to NULL, which is the silent-loss shape the
+///   guard was added against.
+///
+/// It is pure — an event, an index, a name, an arity and a memo in; a borrowed
+/// value out — so nesting bought nothing and cost the grade. See
+/// `image_cell_resolves_by_name_and_falls_back_only_at_matching_arity`.
+pub(crate) fn image_cell<'e>(
+    e: &'e ChangeEvent,
+    i: usize,
+    col: &str,
+    ncols: usize,
+    memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
+) -> Option<&'e RivetValue> {
+    let vals = if e.op.values_live_in_before() {
+        e.before.as_ref()?
+    } else {
+        e.after.as_ref()?
+    };
+    match &e.image_names {
+        Some(names) => match memo
+            .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
+            .map(|(_, j)| j)
+            .unwrap_or_else(|| names.iter().position(|n| n == col))
+        {
+            Some(j) => vals.get(j),
+            // Name absent: a mid-window RENAME leaves the value under
+            // its OLD name — when the arity still matches, position is
+            // trustworthy and the value must not silently degrade to
+            // NULL. Arity mismatch (mid-window ADD/DROP) ⇒ the column
+            // genuinely has no value in this image ⇒ NULL.
+            None if vals.len() == ncols => vals.get(i),
+            None => None,
+        },
+        None => vals.get(i),
+    }
+}
+
+/// Must this drain pass ROLL — flush, checkpoint and ack?
+///
+/// Two reasons, and the second is the one that is easy to lose. Buffered rows
+/// obviously have to reach a part. But a pass that consumed only UNCAPTURED or
+/// empty WAL has nothing buffered and still must roll: on a consume-retention
+/// engine the reader only slides forward when the sink ACKS, so skipping the roll
+/// re-reads the same window forever (`roast_pg_cdc_reaches_open_bound_past_a_large_
+/// uncaptured_transaction`, and the DDL-churn slot pin beside it).
+///
+/// `||` → `&&` makes the ack wait for rows that an uncaptured span never produces;
+/// deleting the `!` rolls only while the buffers are EMPTY, which is every case
+/// except the one that has data. Both survived a mutation run over this file
+/// because `run_to_files` is live-only glue and nothing offline reached the
+/// condition inside it.
+/// Takes the buffered ROW COUNT rather than a bool, so the emptiness test lives
+/// here too. A first cut took `any_buffered: bool` and left
+/// `sinks.iter().any(|s| !s.buf.is_empty())` at the call site — the `delete !`
+/// mutant then SURVIVED the predicate's own unit matrix, because the predicate
+/// could not see how its argument was computed. Moving an operator out of glue is
+/// not the same as grading it; the signature has to swallow the decision.
+pub(crate) fn pass_must_roll(unacked_commit: bool, buffered_rows: usize) -> bool {
+    unacked_commit || buffered_rows > 0
+}
+
+/// Has the drain loop finished — the cap, or a pass that yielded nothing?
+///
+/// `yielded == 0` is the bound-reached signal: the re-drain loop keeps re-peeking
+/// fresh log after each ack, so "this pass produced no event" is the only honest
+/// end. `== 0` → `!= 0` inverts it into "stop as soon as anything arrives",
+/// i.e. one pass per run; `||` → `&&` never stops at the cap unless the source
+/// also happens to be empty.
+pub(crate) fn drain_is_complete(hit_max: bool, yielded_this_pass: usize) -> bool {
+    hit_max || yielded_this_pass == 0
+}
+
+/// A NAMED image whose value count disagrees with its name count — a PARTIAL
+/// image. `Some((values, names))` when they disagree, and the caller formats.
+///
+/// Round 13's guard, which lived as an `if` inside `flush` and was proven only by a
+/// live test (`SET GLOBAL binlog_row_image=MINIMAL`, one UPDATE). Offline, its `!=`
+/// → `==` mutant survived: refusing every image whose arity AGREES is the whole
+/// stream, so a green suite said nothing about the case that matters.
+///
+/// A key-only DELETE is not a counter-example: PostgreSQL names only the key
+/// columns it also supplies, so its lengths agree.
+pub(crate) fn named_image_arity_mismatch(ev: &ChangeEvent) -> Option<(usize, usize)> {
+    let names = ev.image_names.as_deref()?;
+    let n = ev.after.as_ref().or(ev.before.as_ref()).map_or(0, Vec::len);
+    (n != names.len()).then_some((n, names.len()))
+}
+
+/// A NAMELESS image mapped by POSITION whose width disagrees with the schema —
+/// a DDL landed inside the capture window. `Some(values)` when it does.
+///
+/// The DELETE arm is `>` and not `!=` on purpose: a key-only delete legitimately
+/// carries FEWER values than the table has columns, so only an image WIDER than the
+/// schema is evidence of drift. `>` → `<` inverts that into "refuse every key-only
+/// delete and accept every wide one" — it survived offline because the condition
+/// sat inside live-only glue.
+pub(crate) fn positional_image_width_mismatch(ev: &ChangeEvent, ncols: usize) -> Option<usize> {
+    if ev.image_names.is_some() {
+        return None;
+    }
+    let is_delete = ev.op == ChangeOp::Delete;
+    let vals = if is_delete {
+        ev.before.as_ref()?
+    } else {
+        ev.after.as_ref()?
+    };
+    let n = vals.len();
+    let bad = if is_delete { n > ncols } else { n != ncols };
+    bad.then_some(n)
+}
+
+/// The O(1) name-lookup memo `image_cell` takes: this column's index in the
+/// image-names vector every event in the flush shares.
+///
+/// Extracted for the reason `pass_must_roll` was: the decision was at the CALL
+/// SITE. `image_cell`'s own matrix passes the memo in, so `n == col` here — a
+/// different `==` from the one inside the predicate — sat in live-only glue and its
+/// `!=` mutant survived. A wrong memo is silent and total: every event in the flush
+/// shares one names-Arc, so a memo pointing at the wrong index maps EVERY row of
+/// that column to a neighbour's value.
+///
+/// `None` when no event carries names (the positional engines) — then `image_cell`
+/// indexes by position and there is nothing to memoise.
+pub(crate) fn image_name_memo<'a>(
+    events: &'a [ChangeEvent],
+    col: &str,
+) -> Option<(&'a std::sync::Arc<[String]>, Option<usize>)> {
+    let names = events.iter().find_map(|e| e.image_names.as_ref())?;
+    Some((names, names.iter().position(|n| n == col)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,36 +884,69 @@ fn flush(
         // row-image carries everything) — a SHORTER delete image maps by
         // prefix; an image WIDER than the schema, or a non-delete image of
         // ANY other arity, proves a stale pre-DDL layout.
-        let is_delete = ev.op == ChangeOp::Delete;
         if ev.image_names.is_some() {
-            continue; // named image — mapped by name, arity-proof for any op
+            // Named, but NOT unconditionally trustworthy — this bypass used to be
+            // `continue`, and a partial row image walked straight through it.
+            //
+            // MySQL builds `image_names` from the TABLE_MAP's full column list while
+            // the VALUES come from `BinlogRow::unwrap()`, which yields only the
+            // columns set in the image bitmap. Under `binlog_row_image = MINIMAL` (or
+            // NOBLOB, or a per-SESSION override the open-time `@@global` probe cannot
+            // see) the two disagree, `image_cell` resolves every name past the end of
+            // the short value vector, and the row lands ALL NULL. MEASURED on the
+            // mysql-cdc stand: an UPDATE written under MINIMAL delivered
+            // `id=NULL, a=NULL, b=NULL` at `status: success, rows: 1`, no warning,
+            // checkpoint advanced past it — the change gone for good.
+            //
+            // The events replay the setting in force when they were WRITTEN, which is
+            // the same present-tense trap the `binlog_row_metadata` probe below
+            // already documents. Arity is the evidence that survives the wire.
+            //
+            // A key-only DELETE is not a counter-example: PostgreSQL names only the
+            // key columns it also supplies, so its lengths agree.
+            let Some((n, nnames)) = named_image_arity_mismatch(ev) else {
+                continue; // named AND complete — mapped by name, arity-proof for any op
+            };
+            anyhow::bail!(
+                "cdc: {}.{}: a row image carries {n} value(s) under {} column \
+                     name(s) — a PARTIAL image, which rivet cannot map without \
+                     fabricating the missing cells as NULL. On MySQL this is \
+                     `binlog_row_image` set to something other than FULL when the \
+                     change was WRITTEN (a session override counts, and the open-time \
+                     probe reads only the global). Set `binlog_row_image = FULL` and \
+                     re-capture from before the affected DDL/DML; the changes are \
+                     still in the binlog, so this is a delay rather than a loss.",
+                ev.schema,
+                ev.table,
+                nnames
+            );
         }
-        let img = if is_delete {
-            ev.before.as_ref()
-        } else {
-            ev.after.as_ref()
-        };
-        let bad = |n: usize| {
-            if is_delete {
-                n > columns.len()
-            } else {
-                n != columns.len()
-            }
-        };
-        if let Some(vals) = img
-            && bad(vals.len())
-        {
+        // A NAMELESS image maps by POSITION, and this is the only place that knows
+        // it for certain. The open-time probe asks the server what
+        // `binlog_row_metadata` is set to NOW; these events replay whatever was in
+        // force when they were WRITTEN. MEASURED: a server at FULL draining a
+        // backlog written under MINIMAL, with a same-arity `MODIFY .. AFTER`
+        // across the resume boundary, produced `a='BBB', b='AAA'` — swapped,
+        // status success, and ZERO warnings, because the probe answered a question
+        // about the present.
+        //
+        // Once per table per flush, not per event: a MINIMAL backlog is every
+        // event, and a line per row is a line nobody reads.
+        warn_positional_once(&ev.schema, &ev.table);
+        if let Some(n) = positional_image_width_mismatch(ev, columns.len()) {
             anyhow::bail!(
                 "cdc: an event for table '{}' carries {} column(s) but the resolved \
                  schema has {} — a DDL landed inside this capture window, and mapping \
                  by position would put values into the WRONG columns. Recover by \
-                 re-snapshotting the table (delete its snapshot/_SUCCESS marker under \
-                 `initial: snapshot`) or by resetting the checkpoint past the DDL. \
+                 re-snapshotting the table — clear its `cdc_snapshot` row in the \
+                 state DB AND delete its snapshot/_SUCCESS marker (the two done- \
+                 signals are OR-ed; leaving either in place skips the snapshot) — or \
+                 by resetting the checkpoint past the DDL. \
                  To make mid-stream DDL safe going forward, set \
                  binlog_row_metadata=FULL on the MySQL server (8.0.1+) — rivet then \
                  maps binlog images by column NAME and this error class disappears.",
                 ev.table,
-                vals.len(),
+                n,
                 columns.len()
             );
         }
@@ -726,40 +964,10 @@ fn flush(
         // into the resolved schema — positional mapping put a non-first PK's
         // value into column 0 and NULLed the PK, silently losing the delete
         // downstream. Unnamed images stay positional (full rows).
-        fn image_cell<'e>(
-            e: &'e ChangeEvent,
-            i: usize,
-            col: &str,
-            ncols: usize,
-            memo: Option<(&std::sync::Arc<[String]>, Option<usize>)>,
-        ) -> Option<&'e RivetValue> {
-            let vals = match e.op {
-                ChangeOp::Delete => e.before.as_ref()?,
-                _ => e.after.as_ref()?,
-            };
-            match &e.image_names {
-                Some(names) => match memo
-                    .filter(|(m, _)| std::sync::Arc::ptr_eq(m, names))
-                    .map(|(_, j)| j)
-                    .unwrap_or_else(|| names.iter().position(|n| n == col))
-                {
-                    Some(j) => vals.get(j),
-                    // Name absent: a mid-window RENAME leaves the value under
-                    // its OLD name — when the arity still matches, position is
-                    // trustworthy and the value must not silently degrade to
-                    // NULL. Arity mismatch (mid-window ADD/DROP) ⇒ the column
-                    // genuinely has no value in this image ⇒ NULL.
-                    None if vals.len() == ncols => vals.get(i),
-                    None => None,
-                },
-                None => vals.get(i),
-            }
-        }
         // O(1) name lookup for the common case: all events in a flush share
         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
         // column's image index once and reuse it by pointer identity.
-        let memo_arc = events.iter().find_map(|e| e.image_names.as_ref());
-        let memo = memo_arc.map(|names| (names, names.iter().position(|n| n == &m.column_name)));
+        let memo = image_name_memo(events, &m.column_name);
         let render = value::render_type(m.arrow_type.as_ref());
         let owned: Option<Vec<Option<RivetValue>>> = fix.as_ref().map(|fix| {
             events
@@ -960,6 +1168,7 @@ fn build_manifest(
 
 #[cfg(test)]
 mod tests {
+    use crate::source::cdc::CdcEngine;
     use std::collections::VecDeque;
 
     use super::*;
@@ -998,6 +1207,10 @@ mod tests {
     }
 
     impl ChangeStream for FakeStream {
+        fn engine(&self) -> super::super::CdcEngine {
+            super::super::CdcEngine::Postgres
+        }
+
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
             self.events.pop_front().map(Ok)
         }
@@ -1012,6 +1225,73 @@ mod tests {
     // the commit bookkeeping dropped the boundary — checkpoint never advanced,
     // the captured rows re-read (and re-written) on every scheduler cycle.
     // The boundary is a STREAM property: it must be recorded before routing.
+    /// `rollover_memory_bytes` really rolls — the BYTE cap, driven end to end.
+    ///
+    /// `should_roll` is pure and its unit matrix feeds `buf_bytes` every arm, so the
+    /// DECIDER was well tested. Its SUPPLIER was not: `total_bytes += eb` → `*=`
+    /// pins the accumulator at 0 forever, and the mutant survived the lib suite AND
+    /// the whole live CDC suite (106 tests, measured). Both halves correct, the seam
+    /// between them observed by nothing — the third defect class in the process rules, and
+    /// the one mutation testing is structurally blind to when you only mutate the
+    /// consumer.
+    ///
+    /// What it costs in production: with the byte cap silently dead, a stream of wide
+    /// rows buffers to the ROW cap instead, so the memory ceiling an operator set is
+    /// not the one they get.
+    ///
+    /// The row cap is set far above the event count on purpose, so the ONLY thing
+    /// that can split these parts is bytes.
+    #[test]
+    fn the_byte_rollover_cap_really_rolls_and_is_not_a_dead_accumulator() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let events: Vec<ChangeEvent> = (1..=6).map(insert).collect();
+        let one = events[0].estimated_bytes();
+        assert!(
+            one > 0,
+            "the fixture is inert: an event must weigh something"
+        );
+
+        let mut stream = FakeStream {
+            events: events.into(),
+            acked: Vec::new(),
+        };
+        let cfg = SinkConfig {
+            // Rows can never trigger: 100 ≫ 6.
+            rollover_memory_bytes: Some(one * 2),
+            ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 100)
+        };
+        let (m, r) = run_to_files(&mut stream, cfg);
+        r.unwrap();
+        let manifest = m.into_iter().next().expect("one table, one manifest");
+        assert_eq!(manifest.row_count, 6, "every event must still be delivered");
+        // EXACTLY three, not merely "more than one". The cap is `>=`, so it rolls AT
+        // two events' worth, giving 2+2+2; `>` would roll only past it, giving 3+3.
+        // Both are "more than one part", so the loose assertion could not tell the
+        // boundary apart — measured, the `>= -> >` mutant survived it.
+        // The manifest's part_ids are 1-BASED, matching what the batch path records.
+        // `(i + 1)` -> `i * 1` renumbers them 0..n-1: still unique, so the manifest's
+        // own consistency check passes, and the ledger keys parts by file name so
+        // nothing cross-references them either — the mutant is behaviourally
+        // equivalent and survived. The `+ 1` is not redundant though: it is a wire
+        // convention a downstream consumer can join on, so it is PINNED here rather
+        // than deleted. (Contrast the `*s > 0` filter in `refine_decimal_scales`,
+        // which guarded a write that changed nothing and was removed.)
+        assert_eq!(
+            manifest.parts.iter().map(|p| p.part_id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "CDC manifest part ids are 1-based and contiguous; a silent renumbering \
+             is a wire-format change for anything joining on them"
+        );
+        assert_eq!(
+            manifest.part_count, 3,
+            "6 events at a byte cap of exactly two events' worth must land in three \
+             parts: one part means the byte accumulator never moved and the cap is \
+             decoration, two means it rolls one event late"
+        );
+    }
+
     #[test]
     fn commit_boundary_on_an_uncaptured_table_still_advances_the_checkpoint() {
         let d = tempfile::tempdir().unwrap();
@@ -1104,21 +1384,52 @@ mod tests {
     #[test]
     fn table_matches_handles_bare_and_qualified_configs() {
         assert!(
-            table_matches("orders", "public", "orders"),
+            table_matches(CdcEngine::Postgres, "orders", "public", "orders"),
             "bare matches any schema"
         );
         assert!(
-            table_matches("public.orders", "public", "orders"),
+            table_matches(CdcEngine::Postgres, "public.orders", "public", "orders"),
             "qualified matches"
         );
         assert!(
-            !table_matches("audit.orders", "public", "orders"),
+            !table_matches(CdcEngine::Postgres, "audit.orders", "public", "orders"),
             "wrong schema differs"
         );
         assert!(
-            !table_matches("orders", "public", "users"),
+            !table_matches(CdcEngine::Postgres, "orders", "public", "users"),
             "different table differs"
         );
+    }
+
+    /// Mongo has NO schema qualifier, so the `schema.table` split arm must not run
+    /// there — and while it did, one config matched two collections.
+    ///
+    /// Round-3B bughunt. A collection whose first dot-segment equals the DATABASE
+    /// name (db `shopdb`, collections `orders` and `shopdb.orders` — both legal)
+    /// matched `table: shopdb.orders` twice: once by full name, once by the split.
+    /// Two collections' events interleaved into one destination under a green run,
+    /// invisible to any count.
+    ///
+    /// The split arm exists for SQL's `schema.table`; on a store with no schemas it
+    /// is a second reading of a string that has only one.
+    #[test]
+    fn a_mongo_dotted_name_never_splits_into_a_schema_qualifier() {
+        assert!(
+            table_matches(CdcEngine::Mongo, "shopdb.orders", "shopdb", "shopdb.orders"),
+            "the collection LITERALLY named `shopdb.orders` is the only reading"
+        );
+        assert!(
+            !table_matches(CdcEngine::Mongo, "shopdb.orders", "shopdb", "orders"),
+            "the sibling collection `orders` must NOT also match — that is the \
+             interleave: two collections into one destination, counts intact"
+        );
+        // SQL keeps both arms: `schema.table` is a real qualifier there.
+        assert!(table_matches(
+            CdcEngine::Postgres,
+            "public.orders",
+            "public",
+            "orders"
+        ));
     }
 
     #[test]
@@ -1126,9 +1437,19 @@ mod tests {
         // A MongoDB collection literally named `my.data` (dots are legal, no
         // schema concept) must route by its FULL name — before this it was
         // mis-split into schema=`my`, table=`data` and routed ZERO events forever.
-        assert!(table_matches("my.data", "shopdb", "my.data"));
+        assert!(table_matches(
+            CdcEngine::Mongo,
+            "my.data",
+            "shopdb",
+            "my.data"
+        ));
         // Still distinguishes a genuinely different collection.
-        assert!(!table_matches("my.data", "shopdb", "my.other"));
+        assert!(!table_matches(
+            CdcEngine::Mongo,
+            "my.data",
+            "shopdb",
+            "my.other"
+        ));
     }
 
     // The nameless (binlog_row_metadata=MINIMAL) guard path: an image whose
@@ -1169,6 +1490,10 @@ mod tests {
         ack_count: usize,
     }
     impl ChangeStream for ManifestBeforeAckStream {
+        fn engine(&self) -> super::super::CdcEngine {
+            super::super::CdcEngine::Postgres
+        }
+
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
             self.events.pop_front().map(Ok)
         }
@@ -1255,6 +1580,10 @@ mod tests {
             acked: Vec<Position>,
         }
         impl ChangeStream for FailAfter {
+            fn engine(&self) -> super::super::CdcEngine {
+                super::super::CdcEngine::Postgres
+            }
+
             fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
                 match self.events.pop_front() {
                     Some(e) => Some(Ok(e)),
@@ -1314,6 +1643,409 @@ mod tests {
             seq: 0,
             poison: None,
         }
+    }
+
+    /// Every decision `image_cell` makes, one case each — the four mutants that
+    /// survived a run over this file before it was hoisted out of `flush`.
+    ///
+    /// Two FIELDS throughout, never one: with a single column there is no
+    /// neighbour to pick up and `n == col` → `!=` is indistinguishable from the
+    /// truth. Same reason the row-hash injectivity guard needed two.
+    #[test]
+    fn image_cell_resolves_by_name_and_falls_back_only_at_matching_arity() {
+        use std::sync::Arc;
+        let names: Arc<[String]> = Arc::from(vec!["a".to_string(), "b".to_string()]);
+        let ev = |vals: Vec<RivetValue>, names: Option<Arc<[String]>>| ChangeEvent {
+            after: Some(vals),
+            image_names: names,
+            ..insert(0)
+        };
+
+        // BY NAME: `b` is at index 1 whatever the caller's positional `i` says.
+        // `n == col` → `!=` returns index 0 here — a neighbour's value, silently.
+        let e = ev(
+            vec![RivetValue::Int(10), RivetValue::Int(20)],
+            Some(names.clone()),
+        );
+        assert_eq!(
+            image_cell(&e, 0, "b", 2, None),
+            Some(&RivetValue::Int(20)),
+            "a named image resolves by NAME; matching the first column that is NOT \
+             the one asked for hands every cell its neighbour's value"
+        );
+        assert_eq!(image_cell(&e, 1, "a", 2, None), Some(&RivetValue::Int(10)));
+
+        // The MEMO is a pointer-identity shortcut and must agree with the search —
+        // and it comes from `image_name_memo`, not hand-built here, so this grades
+        // the real producer. A closure re-implementing the rule would pass against
+        // the very mutant it is written to catch.
+        let batch = [e.clone()];
+        let memo = image_name_memo(&batch, "b");
+        assert_eq!(
+            memo.expect("the batch carries names").1,
+            Some(1),
+            "the memo must point at `b`'s own index; matching the first name that is \
+             NOT `b` maps every row of that column to a neighbour's value"
+        );
+        assert_eq!(
+            image_name_memo(&batch, "absent")
+                .expect("the batch carries names")
+                .1,
+            None,
+            "a column the image does not name has no memo — a Some here would index \
+             the wrong cell for the whole flush"
+        );
+        assert!(
+            image_name_memo(&[insert(0)], "v").is_none(),
+            "no event carries names ⇒ no memo; the positional engines index by \
+             position and have nothing to memoise"
+        );
+        assert_eq!(image_cell(&e, 0, "b", 2, memo), Some(&RivetValue::Int(20)));
+        // A memo for a DIFFERENT names-Arc must be ignored, not trusted.
+        let other: Arc<[String]> = Arc::from(vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(
+            image_cell(&e, 9, "b", 2, Some((&other, Some(0)))),
+            Some(&RivetValue::Int(20)),
+            "the memo is keyed by Arc identity; a stale one must fall back to the \
+             search rather than index another table's layout"
+        );
+
+        // NAME ABSENT, ARITY MATCHES — a mid-window RENAME. The value is there,
+        // under its old name, and position is trustworthy. `== ncols` → `false`
+        // degrades it to NULL: the silent-loss shape this arm exists to refuse.
+        assert_eq!(
+            image_cell(&e, 1, "renamed", 2, None),
+            Some(&RivetValue::Int(20)),
+            "a renamed column keeps its value at the same position while the arity \
+             agrees — returning None here is a column that silently becomes NULL"
+        );
+
+        // NAME ABSENT, ARITY DIFFERS — a mid-window ADD/DROP, or a partial image.
+        // The column genuinely has no value here. `== ncols` → `true` restores the
+        // pre-round-13 read: index past the end of a short image.
+        //
+        // The index must land INSIDE the short image, or the two branches agree by
+        // accident and the guard is untested: with `i` past the end, `vals.get(i)`
+        // is `None` and so is the correct answer. Measured — a first draft used
+        // `i = 1` over a 1-value image and the `-> true` mutant SURVIVED it. Here
+        // the image holds two values under a three-column table, so position 0 is
+        // readable and wrong: exactly a MINIMAL row image handing back a
+        // neighbour's cell under the name of a column it does not carry.
+        let three: std::sync::Arc<[String]> =
+            Arc::from(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let short = ev(
+            vec![RivetValue::Int(10), RivetValue::Int(20)],
+            Some(three.clone()),
+        );
+        assert_eq!(
+            image_cell(&short, 0, "absent", 3, None),
+            None,
+            "a short image has no value for a column it does not name; reading it by \
+             position returns the FIRST column's value under another column's name"
+        );
+        // …and past the end too, so the arm is exercised on both sides.
+        assert_eq!(image_cell(&short, 2, "absent", 3, None), None);
+
+        // A DELETE reads the BEFORE image, an INSERT/UPDATE the AFTER.
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Int(7), RivetValue::Int(8)]),
+            after: None,
+            image_names: Some(names.clone()),
+            ..insert(0)
+        };
+        assert_eq!(image_cell(&del, 0, "b", 2, None), Some(&RivetValue::Int(8)));
+        assert_eq!(image_cell(&del, 0, "a", 2, None), Some(&RivetValue::Int(7)));
+
+        // NO NAMES: purely positional, the pre-names engines' shape.
+        let anon = ev(vec![RivetValue::Int(10), RivetValue::Int(20)], None);
+        assert_eq!(
+            image_cell(&anon, 1, "b", 2, None),
+            Some(&RivetValue::Int(20))
+        );
+        assert_eq!(image_cell(&anon, 5, "b", 2, None), None);
+    }
+
+    /// The drain loop's two decisions, every combination — four mutants that
+    /// survived while they were `if` conditions inside live-only glue.
+    #[test]
+    fn a_pass_rolls_for_rows_or_for_an_unacked_commit_and_the_drain_ends_only_when_dry() {
+        // ROLL. The uncaptured-span case is the load-bearing one: nothing buffered,
+        // and the ack still has to happen or a consume-retention reader re-reads the
+        // same window forever.
+        assert!(
+            pass_must_roll(true, 0),
+            "an unacked commit boundary with NO buffered rows must still roll — that \
+             is what advances the slot past an uncaptured or empty span"
+        );
+        assert!(pass_must_roll(false, 1), "buffered rows must reach a part");
+        assert!(pass_must_roll(true, 3));
+        assert!(
+            !pass_must_roll(false, 0),
+            "nothing consumed and nothing buffered is not a roll; rolling here would \
+             checkpoint a position the run never reached"
+        );
+
+        // END. `yielded == 0` is the only honest bound signal in a re-drain loop:
+        // each pass re-peeks fresh log after acking, so a non-empty pass says
+        // nothing about whether more is coming.
+        assert!(
+            drain_is_complete(false, 0),
+            "a pass that yielded nothing has drained to the bound"
+        );
+        assert!(
+            !drain_is_complete(false, 1),
+            "a pass that yielded events must be followed by another — stopping here \
+             is one pass per run, which is the starvation the re-drain loop replaced"
+        );
+        assert!(
+            drain_is_complete(true, 5),
+            "the cap stops the run even mid-stream, or `max_events` is advisory"
+        );
+        assert!(drain_is_complete(true, 0));
+    }
+
+    /// A DELETE's decimal scale comes from the BEFORE image.
+    ///
+    /// `refine_decimal_scales` is pure and had no unit test at all, so `delete match
+    /// arm ChangeOp::Delete` survived: with it gone a delete reads `after`, which is
+    /// `None` on every delete, so a batch of deletes keeps scale 0 and every decimal
+    /// is written TRUNCATED to whole units. Counts and row totals all agree.
+    #[test]
+    fn a_deletes_decimal_scale_is_read_from_the_before_image() {
+        let mut cols = vec![TypeMapping {
+            column_name: "amount".into(),
+            source_native_type: "numeric".into(),
+            rivet_type: crate::types::RivetType::Decimal {
+                precision: 18,
+                scale: 0,
+            },
+            arrow_type: Some(DataType::Decimal128(18, 0)),
+            ..int_col().remove(0)
+        }];
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Bytes(b"12.345".to_vec())]),
+            after: None,
+            ..insert(0)
+        };
+        refine_decimal_scales(&mut cols, std::slice::from_ref(&del));
+        assert_eq!(
+            cols[0].arrow_type,
+            Some(DataType::Decimal128(18, 3)),
+            "a delete carries its values in `before`; reading `after` finds None and \
+             leaves scale 0, which writes 12.345 as 12"
+        );
+
+        // The insert/update side, so the arm that stays is not the only one graded.
+        let mut cols2 = cols.clone();
+        cols2[0].arrow_type = Some(DataType::Decimal128(18, 0));
+        let ins = ChangeEvent {
+            after: Some(vec![RivetValue::Bytes(b"9.87".to_vec())]),
+            ..insert(0)
+        };
+        refine_decimal_scales(&mut cols2, std::slice::from_ref(&ins));
+        assert_eq!(cols2[0].arrow_type, Some(DataType::Decimal128(18, 2)));
+
+        // The WIDEST scale in the batch wins — one row would make `.max()` and
+        // `.min()` and `.last()` all agree.
+        let mut cols3 = cols.clone();
+        cols3[0].arrow_type = Some(DataType::Decimal128(18, 0));
+        let batch = [
+            ChangeEvent {
+                after: Some(vec![RivetValue::Bytes(b"1.5".to_vec())]),
+                ..insert(0)
+            },
+            ChangeEvent {
+                after: Some(vec![RivetValue::Bytes(b"2.0625".to_vec())]),
+                ..insert(1)
+            },
+            ChangeEvent {
+                after: Some(vec![RivetValue::Bytes(b"3.25".to_vec())]),
+                ..insert(2)
+            },
+        ];
+        refine_decimal_scales(&mut cols3, &batch);
+        assert_eq!(
+            cols3[0].arrow_type,
+            Some(DataType::Decimal128(18, 4)),
+            "a narrower scale than the batch's widest silently truncates the widest row"
+        );
+    }
+
+    /// The schema may only DECLARE a type `build_column` will actually produce.
+    ///
+    /// `ensure_schema` is pure and this guard had no unit test, so `replace match
+    /// guard value::is_buildable(dt) with true` survived. With it always true the
+    /// field is declared from `arrow_type` verbatim, while the array builder still
+    /// falls back to `Utf8` for a type it cannot build — schema and data disagree,
+    /// which is the one thing the fallback exists to prevent.
+    #[test]
+    fn a_type_the_array_builder_cannot_build_is_declared_utf8_not_verbatim() {
+        let unbuildable = DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(10, 2),
+            true,
+        )));
+        assert!(
+            !value::is_buildable(&unbuildable),
+            "the fixture is inert: this type must be one the builder REFUSES, or \
+             both arms agree and the guard is untested"
+        );
+        let mut cols = vec![TypeMapping {
+            column_name: "amounts".into(),
+            source_native_type: "numeric[]".into(),
+            arrow_type: Some(unbuildable),
+            ..int_col().remove(0)
+        }];
+        let mut schema = None;
+        let sch = ensure_schema(
+            &mut schema,
+            &mut cols,
+            &[insert(0)],
+            &crate::config::RowHash::default(),
+        );
+        let f = sch
+            .field_with_name("amounts")
+            .expect("the column is declared");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Utf8,
+            "a type the array builder falls back to Utf8 for must be DECLARED Utf8 — \
+             declaring it verbatim makes the schema describe data that is never written"
+        );
+
+        // The buildable side, so the arm that stays is graded too.
+        let mut cols2 = int_col();
+        let mut schema2 = None;
+        let sch2 = ensure_schema(
+            &mut schema2,
+            &mut cols2,
+            &[insert(0)],
+            &crate::config::RowHash::default(),
+        );
+        assert_eq!(
+            sch2.field_with_name("v").expect("declared").data_type(),
+            &DataType::Int64,
+            "a buildable type keeps its own width; degrading everything to Utf8 would \
+             satisfy the assertion above and lose every type in the stream"
+        );
+    }
+
+    /// Both arity guards, every arm — four mutants that survived while these were
+    /// `if` conditions inside `flush`.
+    ///
+    /// The NAMED one is round 13's partial-image guard, proven live (`SET GLOBAL
+    /// binlog_row_image=MINIMAL`, one UPDATE, an all-NULL row) and ungraded offline:
+    /// `!=` → `==` refuses every image whose arity AGREES, i.e. the whole stream, so
+    /// a green suite said nothing about the case that matters.
+    #[test]
+    fn a_partial_named_image_and_a_post_ddl_positional_image_are_both_refused() {
+        use std::sync::Arc;
+        let names: Arc<[String]> =
+            Arc::from(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let named = |vals: Vec<i64>| ChangeEvent {
+            after: Some(vals.into_iter().map(RivetValue::Int).collect()),
+            image_names: Some(names.clone()),
+            ..insert(0)
+        };
+
+        assert_eq!(
+            named_image_arity_mismatch(&named(vec![1, 2, 3])),
+            None,
+            "a complete named image is mapped by NAME and is arity-proof — refusing \
+             it stops every stream rivet can actually read"
+        );
+        assert_eq!(
+            named_image_arity_mismatch(&named(vec![1])),
+            Some((1, 3)),
+            "one value under three names is a MINIMAL row image; mapping it resolves \
+             every name past the end of the vector and the row lands all NULL"
+        );
+        // WIDER than its names too — the inequality is not a one-sided `<`.
+        assert_eq!(
+            named_image_arity_mismatch(&named(vec![1, 2, 3, 4])),
+            Some((4, 3))
+        );
+        // A key-only PG DELETE names only what it supplies, so its lengths agree.
+        let key_only: Arc<[String]> = Arc::from(vec!["a".to_string()]);
+        let del = ChangeEvent {
+            op: ChangeOp::Delete,
+            before: Some(vec![RivetValue::Int(1)]),
+            after: None,
+            image_names: Some(key_only),
+            ..insert(0)
+        };
+        assert_eq!(
+            named_image_arity_mismatch(&del),
+            None,
+            "PostgreSQL names only the key columns it also supplies — refusing this \
+             would refuse every PG delete"
+        );
+        // A NAMELESS image is not this guard's business.
+        assert_eq!(
+            named_image_arity_mismatch(&ChangeEvent {
+                after: Some(vec![RivetValue::Int(1)]),
+                image_names: None,
+                ..insert(0)
+            }),
+            None
+        );
+
+        // POSITIONAL. Three schema columns throughout.
+        let anon = |op: ChangeOp, vals: Vec<i64>| {
+            let v: Vec<RivetValue> = vals.into_iter().map(RivetValue::Int).collect();
+            match op {
+                ChangeOp::Delete => ChangeEvent {
+                    op: ChangeOp::Delete,
+                    before: Some(v),
+                    after: None,
+                    image_names: None,
+                    ..insert(0)
+                },
+                _ => ChangeEvent {
+                    after: Some(v),
+                    image_names: None,
+                    ..insert(0)
+                },
+            }
+        };
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2, 3]), 3),
+            None
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2]), 3),
+            Some(2),
+            "a non-delete of any other width proves a stale pre-DDL layout; mapping \
+             it by position puts values into the WRONG columns"
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Insert, vec![1, 2, 3, 4]), 3),
+            Some(4)
+        );
+
+        // The DELETE arm is `>` and not `!=` ON PURPOSE, and this is the pair that
+        // says so: SHORTER is legitimate (a key-only delete), WIDER is drift.
+        // `>` → `<` swaps exactly these two answers.
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1]), 3),
+            None,
+            "a key-only delete carries fewer values than the table has columns and \
+             maps by prefix — refusing it is an outage on every engine that emits one"
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1, 2, 3]), 3),
+            None,
+            "a FULL delete image carries every column — MySQL's `binlog_row_image = \
+             FULL` emits exactly this, and it is the BOUNDARY: without it `>` and \
+             `>=` agree on every fixture and the mutant survives (measured)"
+        );
+        assert_eq!(
+            positional_image_width_mismatch(&anon(ChangeOp::Delete, vec![1, 2, 3, 4]), 3),
+            Some(4),
+            "an image WIDER than the schema is drift whatever the op"
+        );
     }
 
     fn int_col() -> Vec<TypeMapping> {

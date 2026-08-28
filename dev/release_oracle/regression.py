@@ -1304,11 +1304,30 @@ def _check_stand_under_lock(led: Ledger, p: Proc, container: str, said_so: bool,
 
 
 def verify_field_symptom_replay(led: Ledger) -> None:
-    prev = _require_prev_binary(
-        led, _R_ENGINE, _FR_VERSION, "replay", _FR_STORE, "field symptom replay"
-    )
-    if prev is None:
-        return
+    # The stage doc above names this moment: once the fix ships, the NEWEST release
+    # no longer sheds, criterion 1 goes permanently red, and the two honest options
+    # are to PIN this stage's baseline to the last regressing release or to retire
+    # the fixture. This is the pin, made explicit rather than by re-pointing
+    # `RIVET_PREV_RELEASE_BIN` (which the perf/differential stages also read and
+    # which must stay the LATEST release): `RIVET_FIELD_REPLAY_BIN` names the
+    # release that CARRIES the regression — 0.24.4 for the governor fixture —
+    # and without it the stage falls back to the prev binary, whose failure mode
+    # criterion 1 already reports honestly.
+    pinned = os.environ.get("RIVET_FIELD_REPLAY_BIN", "").strip()
+    if pinned:
+        prev = Path(pinned)
+        if not prev.is_file():
+            led.failed(_R_ENGINE, _FR_VERSION, "replay", _FR_STORE,
+                       f"field replay: RIVET_FIELD_REPLAY_BIN={pinned} is not a file — "
+                       "a typo here would silently grade the wrong binary",
+                       "pinned replay binary missing")
+            return
+    else:
+        prev = _require_prev_binary(
+            led, _R_ENGINE, _FR_VERSION, "replay", _FR_STORE, "field symptom replay"
+        )
+        if prev is None:
+            return
 
     prev_ver = run([str(prev), "--version"]).stdout.splitlines()
     led.phase(

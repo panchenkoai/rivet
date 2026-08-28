@@ -92,11 +92,22 @@ shapes:
         RANGE-partitioned `mpart` captured both inserted rows through a config
         naming the parent, on the rivet-mysql-cdc-1 stand."
     mongo:
-      na: "A change stream's `ns` is the collection the write addressed, and Mongo
-        has no parent/child relation whose events surface under a different name —
-        there is no second identity for a cross-check to compare against. The
-        engine's routing risk is the dotted-collection-name case, already covered by
-        table_matches' full-name-first arm (sink.rs:227-234)."
+      sound: "mongo_cdc_warns_when_a_configured_collection_does_not_exist
+        (live_cdc_mongo.rs) — RED against this shape's mutant, MEASURED 2026-08-26:
+        with the open-time cross-check disabled (`if false &&`), a config naming a
+        collection the database does not hold ran to `status: success, rows: 0` with
+        no warning of any kind, and the test failed on the missing name.
+        The cell was `na` until 2026-08-25 on a reason that answered a narrower
+        question — Mongo has no SECOND identity (a change stream's `ns` is the
+        collection the write addressed, no parent/child relation surfaces events
+        under another name), so the cross-check compares against the catalog's
+        PRESENCE rather than against a rival name. That is the same failure this
+        shape grades: a configured table no event can name, shipped green.
+        Loud here means a WARNING, not a bail, and the asymmetry is structural: a
+        Mongo collection is created by its first write, so refusing an absent name
+        would break the legitimate start-the-stream-then-write setup. The SQL
+        engines bail because their unroutable relation EXISTS and can never emit
+        under the configured name — a permanent error, not a pending one."
 
   - id: readback_is_manifest_scoped
     what: >
@@ -120,7 +131,7 @@ shapes:
         mutant left it green. read_cdc_changes resolves via declared_parquet_parts — the union over the immutable manifest-<run_id>.json
         copies — so every caller of cdc_id_ops/read_cdc_changes reads what the run
         DECLARED. Proven to bite before it was wired in:
-        the_declared_parts_oracle_reads_short_of_the_glob_when_a_manifest_under_declares
+        the_cdc_reader_reads_the_manifest_declared_parts_not_the_directory
         stages two durable parts with one named by no manifest; the glob reads 6, the
         declared reader 3. Whole CDC live suite re-run after the switch: 157/157."
     mysql:
@@ -228,7 +239,7 @@ shapes:
     postgres:
       sound: "TRUNCATE — the one that mattered — now bails: truncate_target +
         truncate_is_ours + truncate_refusal_message (src/source/postgres/cdc.rs),
-        graded offline by a_truncate_is_recognised_and_refused_only_for_the_captured_tables
+        graded offline by a_truncate_is_recognised_across_a_relation_list_and_refused_only_for_ours
         and live by roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging.
         RED against two mutants on different asserts: the guard removed (back to the
         measured `status: success, rows: 2` over an EMPTY source) and the refusal
@@ -239,7 +250,7 @@ shapes:
       sound: "the Xid-less group is closed by is_commit_statement (COMMIT / XA COMMIT,
         #ebc9d87), and the OTHER silent QUERY-event drop — TRUNCATE — now bails:
         truncate_target + truncate_refusal_message (src/source/mysql/cdc.rs), graded by
-        a_mysql_truncate_statement_resolves_the_table_it_names offline and
+        a_mysql_truncate_statement_resolves_the_table_it_names (src/source/mysql/cdc.rs) offline and
         roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging live. RED
         against two mutants on different asserts: the guard disabled (back to the
         measured `status: success, rows: 2` over an EMPTY source) and the addressing
@@ -468,3 +479,70 @@ shapes:
         delete (measured {_id:9,v:'doomed'}, not the earlier 'seed'). RED against
         `ChangeOp::Delete => cse.full_document` — and the disagreement is the finding: the
         pre-existing delete test stays GREEN against that same mutant." 
+
+  - id: every_reading_of_one_config_agrees
+    what: >
+      A CDC export's `table:` is read by MORE THAN ONE subsystem — the event router,
+      the schema probe, the `initial: snapshot` baseline, the preflight type report
+      that `rivet load` plans the warehouse from, and the manifest's recorded
+      identity. Each resolves the string independently. They must all land on ONE
+      relation, and where an engine's CATALOG can name it (a SQL Server capture
+      instance, a PostgreSQL candidate query) the catalog is what they must follow —
+      never the connection's default schema and never a name split by a rule the
+      engine does not have.
+    mutant: >
+      Point any ONE reading back at the raw configured string (drop the resolved pair
+      from the schema probe, from the snapshot leg's read, from the preflight query,
+      or split a Mongo collection name on the first dot). A sound cell goes RED on
+      the CONTENT — wrong columns, a fabricated baseline, a foreign identity in the
+      manifest — never on a count, because every count stays plausible.
+      MEASURED on SQL Server 2026-08-26: with the schema probe reading the default
+      schema, an export ran `status: success`, exit 0, no warning, and the parquet
+      carried a decoy table's columns while the captured relation's only data column
+      was absent entirely; the `initial: snapshot` leg deposited a row that had never
+      existed in the captured table into that table's own prefix.
+    postgres:
+      sound: "pg_cdc_classification_asks_about_the_resolved_relation_not_the_search_path_one
+        (live_cdc.rs) — RED before the fix on a run that printed two contradictory
+        sentences: a WARN that the name resolves to deep.vv, then an Error that it is
+        a VIEW and to capture the base table it reads — the relation the warning had
+        just elected. PostgreSQL's readings are the candidate query, classification
+        and the schema probe."
+    mysql:
+      sound: "roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds
+        (live_cdc.rs) — MySQL's second reader is the SERVER-WIDE binlog, which the
+        privilege-filtered catalog structurally cannot see, so agreement here means
+        the catalog precheck and the wire guard refuse the same config. RED against
+        removing either half; both postures measured (root sees both databases and
+        bails at the precheck; the `rivet` user's filtered catalog passes and the
+        wire guard bails on the first foreign event)."
+    mssql:
+      sound: "mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema
+        + mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema
+        + mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable
+        (live_cdc_mssql.rs). Three readings, three tests: the drain's probe, the
+        snapshot baseline, and `rivet check` (whose report `rivet load` plans the
+        warehouse schema from — asserted in the first test). Each RED-proven against
+        the reading it guards. This engine earned the shape: it is the only one whose
+        `table:` is accompanied by a second identifier (`capture_instance:`) that
+        settles the question outright, and it was the last to consult it."
+    mongo:
+      sound: "mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling
+        (live_cdc_mongo.rs) — Mongo's disagreement is not about schemas but about how
+        many READINGS a dotted name has. RED-proven twice on one fixture: with the
+        router's split arm restored the capture takes the sibling collection too
+        ({dotted, sibling} vs {dotted}), and with finalize's engine-blind split
+        restored the snapshot leg's manifest records {schema: <db>, table: orders} —
+        a different, existing collection. The database is not a schema."
+
+  - id: spill_crash_mid_tail_atomicity
+    what: "with RIVET_CDC_SPILL_DIR set, a transaction past the memory cap keeps its head in memory and its tail on disk — and a CRASH while that tail is being handed out must lose nothing on resume. The framing decides this: only the tail's true last row (per transaction) may carry `committed`, or the sink rolls + checkpoints past a commit whose remaining rows die with the crashed process's spill file"
+    mutant: "spill.rs::closes_group -> true (every spilled row closes its group): the sink rolls mid-group, the checkpoint advances past the group's commit, and the resume skips the rows still in the dead process's spill"
+    postgres:
+      na: "the crash window cannot OPEN here: PostgreSQL spills exactly one transaction, whose only `committed` row is the tail's very end (`close_head_of_group` marks nothing while `tail_len > 0`, `close_tail_event` only `at+1 == len`) — so `should_roll` first fires when the tail is fully drained and the sink cannot act mid-tail. The framing itself is graded offline (`a_split_transaction_closes_on_its_true_last_row`, spill.rs) and the delivery end-to-end by pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing (live_cdc.rs)."
+    mysql:
+      na: "same structural closure as postgres — one transaction per spill, its single commit at the tail's end, so no sink action is possible mid-tail. The seal-failure ordering (`spill_error` checked before `pending` is popped) keeps a half-transaction from shipping when sealing itself fails; delivery end-to-end by mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing (live_cdc.rs)."
+    mssql:
+      sound: "roast_mssql_cdc_a_crash_mid_spilled_tail_loses_no_group_on_resume (live_cdc_mssql.rs) — the ONE engine where the window exists: its tail holds SEVERAL `__$start_lsn` groups, each group's last row a real commit, so the sink can roll + checkpoint + ack between spilled groups and crash before the rest. PER_TX=7 over rollover 5, because at 5 every roll lands on a group boundary and the early-close mutant 'commits' only where the checkpoint is accidentally legal (measured: two mutants green at PER_TX=5). RED: 19 of 21 rows, the checkpoint past a commit whose last two rows died with the process."
+    mongo:
+      na: "no transaction buffer exists to spill: every change-stream event is its own commit (`single_event_commit`), the sink may roll after any event, and the soak stand asserts the no-spill property as its CONTROL (`assert_cycle_spilled`, soak_spill.rs) — if Mongo ever grows a buffer, that assertion says the control stopped being one."

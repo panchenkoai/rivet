@@ -289,7 +289,7 @@ fn fill_sql(p: Poll<'_>) -> String {
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
             THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
-— re-snapshot the table (mode: full) and restart CDC from a fresh checkpoint.', 1; \
+— restart CDC from a fresh checkpoint FIRST, then re-snapshot the table (mode: full): snapshotting first leaves the changes in between in neither.', 1; \
          DECLARE @to binary(10) = NULL; \
          IF @from IS NOT NULL AND @max IS NOT NULL AND @from <= @max \
             SELECT @to = MAX(s) FROM (SELECT TOP ({batch}) __$start_lsn AS s \
@@ -401,6 +401,149 @@ pub(crate) struct MssqlCdcConfig {
 }
 
 /// Polls a CDC change table and yields canonical changes.
+/// The relation a capture instance names, from `cdc.change_tables` — the catalog
+/// answer, reusable by callers that need it BEFORE a stream exists.
+///
+/// The `initial: snapshot` leg is planned before any stream opens, so it had no way
+/// to ask and read the CONFIGURED string instead: on a fixture where the default
+/// schema holds a same-named decoy, the baseline it deposited in the captured
+/// table's own prefix was the DECOY's row — data that never existed in the relation
+/// being captured, under a green run.
+pub(crate) fn source_object_of_capture_instance(
+    url: &str,
+    capture_instance: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<Option<(String, String)>> {
+    // The same gate `from_url` applies — a plan-time lookup must not be the one
+    // path that dials remote plaintext.
+    require_tls_or_loopback(url, tls)?;
+    let p = crate::source::mssql::parse_mssql_url(url)?;
+    let cfg = &MssqlCdcConfig {
+        host: p.host,
+        port: p.port,
+        database: p.database,
+        user: p.user,
+        password: p.password,
+        capture_instance: capture_instance.to_string(),
+        from_lsn: None,
+        from_is_pin: false,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut client = rt.block_on(connect(cfg, tls))?;
+
+    // Three outcomes, kept APART. Collapsing them into `Ok(None)` — which the first
+    // cut did, with `.ok()?` — let a mistyped `capture_instance:`, a login without
+    // SELECT on the cdc schema, and a network blip all fall back to the configured
+    // string: silently restoring the pre-fix behaviour for exactly the config most
+    // likely to be wrong. Round-4 DEMONSTRATED the cost: a typo'd instance wrote a
+    // fabricated snapshot baseline AND marked it done, so correcting the typo never
+    // backfilled the real rows — the fabrication was permanent.
+    let rows = rt
+        .block_on(async {
+            client
+                .query(
+                    "SELECT OBJECT_SCHEMA_NAME(source_object_id), \
+                            OBJECT_NAME(source_object_id) \
+                     FROM cdc.change_tables WHERE capture_instance = @P1",
+                    &[&cfg.capture_instance.as_str()],
+                )
+                .await
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "sqlserver cdc: reading cdc.change_tables for capture instance \
+                 '{capture_instance}' (the login needs SELECT on the cdc schema): {e}"
+            )
+        })?;
+    let row = rt.block_on(async { rows.into_row().await }).map_err(|e| {
+        anyhow::anyhow!(
+            "sqlserver cdc: reading the cdc.change_tables row for capture \
+                 instance '{capture_instance}': {e}"
+        )
+    })?;
+    // A FOURTH outcome the first cut folded back into "no such instance", making
+    // that comment a lie four lines after it was written: the row EXISTS while
+    // `OBJECT_SCHEMA_NAME(source_object_id)` is NULL, because the source table was
+    // dropped and SQL Server has not yet cleaned the capture instance up (MEASURED
+    // on the stand — the `cdc.change_tables` row outlives the table). Calling that
+    // "the catalog does not know this instance" sent the operator to
+    // `sp_cdc_enable_table`, which from THAT state fails 22926 "capture instance
+    // already exists" — a remediation that cannot recover from the degraded state,
+    // the exact class this repo has a rule about. The recovery is to disable first.
+    let named: Option<(Option<String>, Option<String>)> = row.map(|row| {
+        let s: Option<&str> = row.get(0);
+        let t: Option<&str> = row.get(1);
+        (s.map(str::to_string), t.map(str::to_string))
+    });
+    classify_source_object(capture_instance, named)
+}
+
+/// What a `cdc.change_tables` lookup MEANS — the decision, pulled out of the I/O.
+///
+/// Live-only glue may sequence and connect; it must not decide. The reason this is
+/// a function is that its third case cannot be reproduced live on demand: SQL Server
+/// cleans an orphaned capture instance up within a second or two of the drop, so a
+/// live test racing that window documents a flake rather than the contract. It is
+/// nonetheless REAL and was measured on the stand — the `cdc.change_tables` row
+/// outlives its source table, and `OBJECT_SCHEMA_NAME(source_object_id)` returns
+/// NULL while the row is still there.
+///
+/// Folding that case into "no such capture instance" — which the first cut did, four
+/// lines under a comment asserting `None` now meant one thing — sent the operator to
+/// `sp_cdc_enable_table`, which from THAT state fails 22926 "capture instance already
+/// exists". A remediation must recover from the ALREADY-DEGRADED state.
+fn classify_source_object(
+    capture_instance: &str,
+    named: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<(String, String)>> {
+    match named {
+        // The catalog has no such capture instance.
+        None => Ok(None),
+        Some((Some(s), Some(t))) => Ok(Some((s, t))),
+        // The row is there and the object names are not. TWO causes produce this,
+        // and the first version named only the rarer one — then prescribed a command
+        // that DESTROYS the capture instance if the other cause is the real one.
+        //
+        // 1. METADATA VISIBILITY, and this is the likely one: SQL Server returns NULL
+        //    from `OBJECT_SCHEMA_NAME`/`OBJECT_NAME` when the caller has no permission
+        //    on the object. rivet's OWN documented least-privilege reader
+        //    (`GRANT SELECT ON SCHEMA::cdc`, docs/reference/cdc.md) is exactly such a
+        //    login. MEASURED on the stand: `sa` sees `dbo`/`lp6`, the documented
+        //    reader sees NULL/NULL — same row, same healthy instance, table present.
+        // 2. A transient ORPHAN: the table was dropped without disabling capture, so
+        //    the row briefly outlives its object. MEASURED: the Agent's capture job
+        //    clears it within a few seconds on its own.
+        //
+        // The old hint told the operator to run `sp_cdc_disable_table`. On cause 1
+        // that SUCCEEDS and drops a healthy capture instance together with every
+        // change it still holds; on cause 2 it FAILS (Msg 22931, "Source table does
+        // not exist"), and so does recreating the table first (Msg 22960). Wrong on
+        // both branches — one destructive, one impossible. The rule this violated is
+        // the one the commit that wrote it cited: a remediation must recover from the
+        // ALREADY-DEGRADED state.
+        //
+        // Refusing is still right — resolution is what stops a fabricated snapshot
+        // baseline, and "we cannot read the names" is not "the configured string is
+        // fine". Only the diagnosis changes.
+        Some(_) => anyhow::bail!(
+            "sqlserver cdc: cdc.change_tables has a row for capture instance \
+             '{capture_instance}', but its source object's schema and name read back \
+             as NULL, so rivet cannot tell which relation it captures. Two causes, \
+             in order of likelihood: (1) this login lacks permission on the source \
+             TABLE — SQL Server hides object names from a principal that cannot see \
+             the object, and a reader granted only `SELECT ON SCHEMA::cdc` hits this \
+             on a perfectly healthy instance; grant it SELECT on the captured table. \
+             (2) the table was dropped without disabling capture first, leaving the \
+             row briefly orphaned — SQL Server Agent's capture job clears that within \
+             seconds, so re-run shortly. Do NOT run `sp_cdc_disable_table` here: under \
+             cause (1) it succeeds and destroys a working capture instance along with \
+             every change it holds, and under cause (2) it fails with Msg 22931."
+        ),
+    }
+}
+
 pub(crate) struct MssqlChangeStream {
     rt: tokio::runtime::Runtime,
     client: Client<Compat<TcpStream>>,
@@ -415,6 +558,14 @@ pub(crate) struct MssqlChangeStream {
     /// See `MssqlCdcConfig::from_is_pin`.
     from_is_pin: bool,
     pending: VecDeque<ChangeEvent>,
+    /// Where an oversized poll batch's tail goes. SQL Server's "stream" is a query
+    /// result set — there is no wire to keep — so the tail is written through the
+    /// general tagged frame, like MySQL's.
+    spill_dir: Option<std::path::PathBuf>,
+    /// A spilled batch tail, still being handed out. GROUP-aware: unlike PostgreSQL
+    /// and MySQL, one buffer here holds SEVERAL transactions (runs of rows sharing
+    /// `__$start_lsn`), so the boundary is only visible by comparing neighbours.
+    spooled: Option<crate::source::cdc::spill::SpooledGroups>,
     /// Max changes to pull per poll — bounds drain memory to O(batch) instead of
     /// O(total change-table window). See [`crate::source::cdc::PeekBound`].
     batch_limit: i64,
@@ -516,9 +667,14 @@ impl MssqlChangeStream {
         // Checked with the SAME predicate the sink routes by, deliberately: a
         // check that asks a different question is not a check.
         if !configured_tables.is_empty()
-            && !configured_tables
-                .iter()
-                .any(|c| crate::source::cdc::sink::table_matches(c, &schema, &table))
+            && !configured_tables.iter().any(|c| {
+                crate::source::cdc::sink::table_matches(
+                    crate::source::cdc::CdcEngine::Mssql,
+                    c,
+                    &schema,
+                    &table,
+                )
+            })
         {
             anyhow::bail!(
                 "sqlserver cdc: capture instance '{}' emits changes for `{}.{}` (from \
@@ -575,6 +731,9 @@ impl MssqlChangeStream {
             from_lsn: cfg.from_lsn.clone(),
             from_is_pin: cfg.from_is_pin,
             pending: VecDeque::new(),
+            // Overridden by `from_url`, which knows the checkpoint's location.
+            spill_dir: crate::source::cdc::spill_dir_for(None),
+            spooled: None,
             batch_limit: peek.rows_capped() as i64,
             exhausted: false,
             bound,
@@ -583,6 +742,10 @@ impl MssqlChangeStream {
 
     /// Open from a `sqlserver://user:pass@host:port/db` URL + a capture instance
     /// (the factory path).
+    // Eight positional arguments, and a struct would not improve it: each is a
+    // distinct decision the caller must make consciously, and a builder would let
+    // one be forgotten silently. Same call as `PgChangeStream::open`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_url(
         url: &str,
         capture_instance: &str,
@@ -592,6 +755,10 @@ impl MssqlChangeStream {
         mode: DrainMode,
         // Passed through to `open`, which cross-checks it against the catalog.
         configured_tables: &[String],
+        // Where an oversized batch's tail spills — the checkpoint's directory. See
+        // `spill_dir_for`; `open` keeps the `.rivet/spill` fallback for the CLI and
+        // test paths that have no checkpoint.
+        spill_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -613,6 +780,10 @@ impl MssqlChangeStream {
             mode,
             configured_tables,
         )
+        .map(|mut s| {
+            s.spill_dir = spill_dir;
+            s
+        })
     }
 
     /// Poll ONE **bounded batch** of the change table into `pending`. `@to` is the
@@ -665,6 +836,10 @@ impl MssqlChangeStream {
         // Round-2 audit #9: running byte footprint — the row cap is a poor bound
         // when cells are large.
         let mut batch_bytes = 0usize;
+        // The batch's TAIL, once it has outgrown the memory cap. Local, like
+        // `batch`: `@to` bounds a poll at a group boundary, so nothing here
+        // straddles two polls.
+        let mut spill: Option<crate::source::cdc::spill::SpillFile> = None;
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();
@@ -697,9 +872,10 @@ impl MssqlChangeStream {
             }
             let Some(op) = map_op(op_code) else { continue };
             // after-image for insert/update; the key (before-image) for delete
-            let (before, after) = match op {
-                ChangeOp::Delete => (Some(values), None),
-                _ => (None, Some(values)),
+            let (before, after) = if op.values_live_in_before() {
+                (Some(values), None)
+            } else {
+                (None, Some(values))
             };
             let ev = ChangeEvent {
                 op,
@@ -715,32 +891,52 @@ impl MssqlChangeStream {
                 seq: 0, // stamped by TxnSeq as the stream is consumed
                 poison: None,
             };
+            if let Some(sp) = spill.as_mut() {
+                // Past the cap: the event goes to disk through the general tagged
+                // frame and never enters `batch`. Its `position` already carries the
+                // `__$start_lsn`, so the group boundary is recoverable on the way
+                // out without a second field.
+                sp.push(&crate::source::cdc::spill::encode_event(&ev))?;
+                continue;
+            }
             batch_bytes = batch_bytes.saturating_add(ev.estimated_bytes());
             batch.push((lsn.clone(), ev));
             // Memory backstop (matching MySQL's MAX_TX_ROWS): a transaction is
             // buffered whole (never split across parts), and a single
-            // `__$start_lsn` group can be arbitrarily large. Bail loudly rather
-            // than OOM. `@to` bounds the batch at a group boundary, so a group
-            // never straddles two polls — the whole group lands in one `batch`.
-            let cap = crate::source::cdc::max_tx_rows();
-            if batch.len() > cap {
-                anyhow::bail!(
-                    "mssql cdc: a single transaction has more than {cap} change rows — \
-                     it must be buffered whole (a transaction is never split across parts), so \
-                     this would exhaust memory. Split the source transaction, or raise the cap \
-                     only if a transaction this large is genuinely expected."
+            // `__$start_lsn` group can be arbitrarily large. `@to` bounds the batch
+            // at a group boundary, so a group never straddles two polls — the whole
+            // group lands in one `batch`.
+            //
+            // Crossing the cap no longer FAILS the run: the head stays in memory,
+            // the tail goes to disk, and every transaction is still delivered whole
+            // and atomically. Unlike the other engines this buffer holds SEVERAL
+            // transactions, so the tail is group-aware (`SpooledGroups`).
+            if let Err(cap_error) =
+                crate::source::cdc::check_tx_buffer_caps("mssql", batch.len(), batch_bytes)
+            {
+                // No spill directory named ⇒ the cap keeps its original meaning:
+                // REFUSE. Spilling does not bound memory end to end (see
+                // `spill_dir_for`), so it must not silently replace a guard that
+                // does refuse.
+                let Some(dir) = self.spill_dir.clone() else {
+                    return Err(cap_error);
+                };
+                log::warn!(
+                    "sqlserver cdc: poll batch at {lsn} passed the in-memory cap at \
+                     {} rows / {batch_bytes} bytes — spilling the rest to {} rather \
+                     than failing the run, which is what this used to do. Every \
+                     transaction is still delivered whole and atomically. Note this \
+                     moves the ADAPTER's copy to disk; the sink still holds a whole \
+                     transaction (a part is never split across one), so peak memory \
+                     falls only modestly — measured ~11% on a 100k-row transaction, \
+                     not to the cap.",
+                    batch.len(),
+                    dir.display()
                 );
-            }
-            // Round-2 audit #9: byte backstop — a few large-cell rows stay under
-            // the row cap yet exhaust memory.
-            let byte_cap = crate::source::cdc::max_tx_bytes();
-            if batch_bytes > byte_cap {
-                anyhow::bail!(
-                    "mssql cdc: a single transaction buffered more than {byte_cap} bytes \
-                     (large cells) before its commit — it must be buffered whole, so this would \
-                     exhaust memory. Split the source transaction, or raise RIVET_CDC_MAX_TX_BYTES \
-                     only if a transaction this large is expected."
-                );
+                spill = Some(crate::source::cdc::spill::SpillFile::create(
+                    &dir,
+                    "mssql-batch",
+                )?);
             }
         }
         // #158: a batch holds one or more transactions, each a run of rows
@@ -751,6 +947,31 @@ impl MssqlChangeStream {
         // is shared. Marking every row committed would roll mid-transaction.
         let lsns: Vec<String> = batch.iter().map(|(l, _)| l.clone()).collect();
         let mut evs: Vec<ChangeEvent> = batch.into_iter().map(|(_, e)| e).collect();
+        // Seal the tail FIRST: its first row's position is what says whether the
+        // head's LAST group continues onto disk. If it does, that group has not
+        // ended, and closing it in memory would let the sink roll, checkpoint and
+        // ack mid-transaction.
+        let spooled = match spill.take() {
+            None => None,
+            Some(sp) => {
+                log::warn!(
+                    "sqlserver cdc: poll batch delivered {} rows from memory and {} \
+                     from disk ({} bytes spilled)",
+                    evs.len(),
+                    sp.len(),
+                    sp.bytes()
+                );
+                Some(crate::source::cdc::spill::SpooledGroups::new(
+                    sp.into_reader()?,
+                    crate::source::cdc::spill::decode_event,
+                )?)
+            }
+        };
+        let tail_head_lsn = spooled
+            .as_ref()
+            .and_then(crate::source::cdc::spill::SpooledGroups::first_position)
+            .and_then(|p| p.0.get("lsn").and_then(|l| l.as_str()).map(str::to_string));
+
         let mut start = 0;
         while start < evs.len() {
             let mut end = start + 1;
@@ -758,12 +979,24 @@ impl MssqlChangeStream {
                 end += 1;
             }
             let commit = Position(json!({ "lsn": lsns[start] }));
-            crate::source::cdc::TxnFramer::close_group(&mut evs[start..end], &commit);
+            // Only zero vs non-zero is read: this says "part of this transaction is
+            // still on disk", which is all the head needs to know.
+            let continues_on_disk = usize::from(head_group_continues_on_disk(
+                &lsns[start],
+                end == evs.len(),
+                tail_head_lsn.as_deref(),
+            ));
+            crate::source::cdc::TxnFramer::close_head_of_group(
+                &mut evs[start..end],
+                &commit,
+                continues_on_disk,
+            );
             start = end;
         }
         for ev in evs {
             self.pending.push_back(ev);
         }
+        self.spooled = spooled;
         match max_lsn {
             // Advance the internal cursor to @to; the next poll reads past it.
             Some(l) => advance_cursor(&mut self.from_lsn, &mut self.from_is_pin, l),
@@ -773,19 +1006,85 @@ impl MssqlChangeStream {
         }
         Ok(())
     }
+
+    /// One row of a spilled tail, group-aware: `committed` comes from the row that
+    /// FOLLOWS it, which is why the tail reads one record ahead.
+    fn next_spooled(&mut self) -> Result<Option<ChangeEvent>> {
+        let Some(sp) = self.spooled.as_mut() else {
+            return Ok(None);
+        };
+        let out = sp.next_event(crate::source::cdc::spill::decode_event)?;
+        if out.is_none() || sp.remaining() == 0 {
+            self.spooled = None;
+        }
+        Ok(out)
+    }
 }
 
 impl ChangeStream for MssqlChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Mssql
+    }
+
+    /// The capture instance names its source object in `cdc.change_tables`, so this
+    /// engine ALWAYS knows the real pair — and it is the engine that most needs to
+    /// say so, being the only one whose `table:` is accompanied by a second
+    /// identifier (`capture_instance:`) that settles the question outright. Gated on
+    /// the same predicate the sink routes by, so an output this stream does not feed
+    /// keeps its own configured name.
+    fn resolved_identity(&self, configured: &str) -> Option<(String, String)> {
+        crate::source::cdc::sink::table_matches(
+            crate::source::cdc::CdcEngine::Mssql,
+            configured,
+            &self.schema,
+            &self.table,
+        )
+        .then(|| (self.schema.clone(), self.table.clone()))
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         // Refill a bounded batch whenever the buffer drains, advancing the cursor
         // each time, until a poll returns nothing (window drained to the max LSN).
-        while self.pending.is_empty() && !self.exhausted {
+        while self.pending.is_empty() && self.spooled.is_none() && !self.exhausted {
             if let Err(e) = self.fill() {
                 return Some(Err(e));
             }
         }
-        self.pending.pop_front().map(Ok)
+        if let Some(ev) = self.pending.pop_front() {
+            return Some(Ok(ev));
+        }
+        // A spilled tail outranks another poll: its rows belong to transactions
+        // already framed, and reading further would interleave a later one.
+        if self.spooled.is_some() {
+            match self.next_spooled() {
+                Ok(Some(ev)) => return Some(Ok(ev)),
+                Ok(None) => return self.next_change(),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
     }
+}
+
+/// Does the in-memory head's group continue onto the spilled tail?
+///
+/// A NAMED predicate rather than a condition inline in the poll loop, because the
+/// poll loop is live-only glue and this is the decision inside it — and it is a
+/// decision no row-counting test can grade. `committed` never reaches the parquet:
+/// closing a transaction early and closing it correctly deliver EXACTLY the same
+/// rows. What changes is when the sink rolls, checkpoints and acks, so getting this
+/// wrong loses the tail only on the crash that follows. (Measured: inlined, the
+/// mutant `continues_on_disk = 0` was unkillable by the live suite.)
+///
+/// Only the LAST head group can continue: `@to` bounds a poll at a group boundary
+/// and rows arrive in LSN order, so anything spilled comes after everything
+/// buffered.
+fn head_group_continues_on_disk(
+    group_lsn: &str,
+    is_last_head_group: bool,
+    tail_head_lsn: Option<&str>,
+) -> bool {
+    is_last_head_group && tail_head_lsn == Some(group_lsn)
 }
 
 /// `__$operation` → canonical op. 1=delete, 2=insert, 4=update-after; 3 (update
@@ -974,6 +1273,88 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+    /// The three outcomes of a `cdc.change_tables` lookup, kept apart.
+    ///
+    /// The middle one is why this is a unit test: an orphaned capture instance (row
+    /// present, source object dropped) is cleaned up by SQL Server within a second or
+    /// two, so a live test racing that window would document a flake. The state is
+    /// real and was measured on the stand; the DECISION about it belongs here, where
+    /// a mutant can grade it.
+    #[test]
+    fn a_lookup_tells_a_missing_instance_from_unreadable_object_names() {
+        assert_eq!(
+            super::classify_source_object("dbo_orders", None).expect("no row is not an error"),
+            None,
+            "no row means the catalog does not know this instance — the caller then \
+             says so and points at sp_cdc_enable_table, which is the right repair \
+             for THAT state"
+        );
+        assert_eq!(
+            super::classify_source_object(
+                "dbo_orders",
+                Some((Some("dbo".into()), Some("orders".into()))),
+            )
+            .expect("a complete row resolves"),
+            Some(("dbo".to_string(), "orders".to_string()))
+        );
+        let err = super::classify_source_object("dbo_orders", Some((None, None)))
+            .expect_err("a row whose source object is gone is neither a resolution nor an absence")
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("permission"),
+            "NULL object names are produced by METADATA VISIBILITY far more often \
+             than by a dropped table — rivet's own documented least-privilege reader \
+             (`GRANT SELECT ON SCHEMA::cdc`) reads NULL/NULL on a healthy instance \
+             (MEASURED against `sa` on the same row). A message that names only the \
+             rare cause sends the operator to repair something that is not broken: \
+             {err}"
+        );
+        // POSITIVE, not a list of phrasings to avoid. The first version of this
+        // assertion banned two exact strings, and round 7 walked straight past it:
+        // rewording the last sentence to "To clear it, execute
+        // `sys.sp_cdc_disable_table` … and then re-enable capture" restored the
+        // destructive advice with the test still green (measured — 1 passed). A
+        // negative substring check enumerates the ways a mistake can be SPELLED; the
+        // warning either survives a rewrite or the test fails, which is the only
+        // formulation a reword cannot slip through.
+        // Round 8 measured what the positive check still missed: two mutants kept
+        // the `Do NOT run` sentence and stayed green — one DELETING the GRANT remedy
+        // (the actual repair for the likely cause), one REVERSING the causes so the
+        // rare orphan leads and prescribing "recreate the table", which round 6
+        // measured as impossible (Msg 22960). A message can carry the right warning
+        // and still send the operator to the wrong place, so the ORDER and the REPAIR
+        // are pinned too.
+        let permission_at = err.find("permission").expect("the likely cause is named");
+        let dropped_at = err.find("dropped").expect("the rare cause is named");
+        assert!(
+            permission_at < dropped_at,
+            "the causes must be ordered by LIKELIHOOD — metadata visibility is what a \
+             least-privilege reader hits every run, a dropped table is a few-second \
+             window. Leading with the rare one sends the operator to repair something \
+             that is not broken: {err}"
+        );
+        assert!(
+            err.contains("grant it SELECT on the captured table"),
+            "and the repair for that likely cause must be IN the message — measured, \
+             granting SELECT on the base table makes OBJECT_SCHEMA_NAME return the \
+             name and rivet proceed. Without it the operator is told what is wrong and \
+             not what to do: {err}"
+        );
+        assert!(
+            err.contains("Do NOT run `sp_cdc_disable_table`"),
+            "the message must carry the explicit warning, not merely avoid one \
+             phrasing of the advice. MEASURED both branches: under the permission \
+             cause that command SUCCEEDS and destroys a working capture instance with \
+             every change it still holds; under the orphan cause it FAILS with Msg \
+             22931. Destructive on one branch, impossible on the other — an operator \
+             has to be told so in the message itself: {err}"
+        );
+        assert!(
+            !err.contains("does not know"),
+            "and it must not claim the instance is unknown when the row is right \
+             there — that is a different state with a different repair: {err}"
+        );
+    }
 
     fn ckpt(j: serde_json::Value) -> crate::source::cdc::Position {
         crate::source::cdc::Position(j)
@@ -1160,6 +1541,22 @@ mod tests {
         assert_eq!(numeric_to_decimal_string(15005, 2), "150.05");
         assert_eq!(numeric_to_decimal_string(-7500, 3), "-7.500");
         assert_eq!(numeric_to_decimal_string(42, 0), "42");
+
+        // THE BOUNDARY: `digits.len() == scale`, where the padding decision flips.
+        // `<=` -> `<` survives every case above, because all of them have more
+        // digits than scale. Here it drops the leading zero and emits `.5`, which
+        // is not a decimal literal any reader is obliged to accept — and it reaches
+        // the destination as the column's value.
+        assert_eq!(
+            numeric_to_decimal_string(5, 1),
+            "0.5",
+            "one digit at scale 1 is the boundary; `<` emits `.5`"
+        );
+        assert_eq!(numeric_to_decimal_string(-5, 1), "-0.5");
+        // One BELOW the boundary, so the pad width itself is graded: `scale + 1 -
+        // len` must leave room for the integer zero, not just the fraction.
+        assert_eq!(numeric_to_decimal_string(5, 3), "0.005");
+        assert_eq!(numeric_to_decimal_string(0, 2), "0.00");
         assert_eq!(numeric_to_decimal_string(5, 2), "0.05");
     }
 
@@ -1412,5 +1809,49 @@ mod tests {
             }
             other => panic!("partial capture must refuse, got {other:?}"),
         }
+    }
+
+    /// Every `__$operation` code, both directions — the mutants run found all six
+    /// arm-mutants MISSED, because the only oracle was the live suite.
+    ///
+    /// The skips are as load-bearing as the maps: op 3 is the update BEFORE-image,
+    /// and mapping it would deliver every update twice (once as the stale image);
+    /// an unknown code mapped to anything would invent an operation.
+    #[test]
+    fn map_op_maps_the_three_ops_and_skips_the_before_image() {
+        assert_eq!(map_op(1), Some(ChangeOp::Delete));
+        assert_eq!(map_op(2), Some(ChangeOp::Insert));
+        assert_eq!(map_op(4), Some(ChangeOp::Update));
+        for skipped in [0, 3, 5, -1, i32::MAX] {
+            assert_eq!(
+                map_op(skipped),
+                None,
+                "code {skipped} must be SKIPPED — op 3 is the update before-image \
+                 (mapping it doubles every update), and an unknown code mapped to \
+                 anything invents an operation"
+            );
+        }
+    }
+
+    /// Every arm of the head/tail group-boundary question.
+    ///
+    /// The `false` arms are the ones that matter in opposite directions: saying a
+    /// group continues when it does not leaves a transaction never closed (the sink
+    /// holds it and never rolls), and saying it does not when it does closes it
+    /// early — the sink acks mid-transaction and a crash before the tail is written
+    /// advances the resume past the commit.
+    #[test]
+    fn a_head_group_continues_on_disk_only_when_the_tail_starts_in_it() {
+        // The last head group, and the tail starts in the SAME transaction.
+        assert!(head_group_continues_on_disk("0x01", true, Some("0x01")));
+        // The last head group, but the tail starts a DIFFERENT transaction — this
+        // one ended in memory.
+        assert!(!head_group_continues_on_disk("0x01", true, Some("0x02")));
+        // Nothing spilled at all.
+        assert!(!head_group_continues_on_disk("0x01", true, None));
+        // NOT the last head group: a group with another group after it in memory
+        // has ended, whatever is on disk. Rows arrive in LSN order and `@to` bounds
+        // a poll at a group boundary, so a spilled row can only belong to the last.
+        assert!(!head_group_continues_on_disk("0x01", false, Some("0x01")));
     }
 }

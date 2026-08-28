@@ -276,7 +276,7 @@ def main():
 
     # Warmup — a fresh table's first inserts are cold (page allocation / WAL init),
     # which confounds the baseline-vs-under-cdc latency comparison. Warm the table
-    # so both measured phases reflect steady state (CLAUDE.md: measure warm, not cold).
+    # so both measured phases reflect steady state (the process rules: measure warm, not cold).
     print("Warmup (discarded) ...")
     w = PacedWriter()
     w.start()

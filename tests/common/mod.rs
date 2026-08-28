@@ -106,7 +106,34 @@ pub fn skip_live(why: &str) {
         .name()
         .unwrap_or("<unnamed test>")
         .to_string();
-    eprintln!("RIVET-SKIP {who} — {why}");
+    let line = format!("RIVET-SKIP {who} — {why}");
+    eprintln!("{line}");
+    // ...and to a FILE, because the eprintln alone is unreadable. libtest CAPTURES
+    // and discards a PASSING test's stderr, and a skip is a pass — so without
+    // `--nocapture`, which no workflow passes, the marker was as invisible as the
+    // four spellings it replaced. MEASURED: 0 occurrences in a normal run, 1 with
+    // --nocapture. A file survives capture, parallelism and the test binary exiting.
+    //
+    // Append-only and best-effort: a test must never fail because its skip could not
+    // be recorded. `RIVET_SKIP_LOG` lets a lane put it somewhere it will look;
+    // otherwise it lands beside the build output.
+    let path = std::env::var("RIVET_SKIP_LOG").unwrap_or_else(|_| {
+        format!(
+            "{}/rivet-skips.log",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into())
+        )
+    });
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 pub fn unique_name(prefix: &str) -> String {
@@ -231,4 +258,33 @@ pub fn quiet_window_guard() -> QuietWindowGuard {
         );
     }
     QuietWindowGuard { _file: file }
+}
+
+/// Peak resident memory of any child process this test binary has reaped, in bytes.
+///
+/// `getrusage(RUSAGE_CHILDREN)` reports the MAXIMUM over all reaped children rather
+/// than the last one's, so it is monotonic — which is exactly the shape a ceiling
+/// assertion wants: "no rivet this test ever spawned went past X". It cannot
+/// attribute a peak to one child, and does not need to.
+///
+/// `ru_maxrss` is BYTES on macOS and KILOBYTES on Linux — one field with two
+/// meanings, and reading it wrong is a 1024× error in whichever direction hides the
+/// failure. Normalised here so no caller has to remember.
+#[cfg(unix)]
+pub fn peak_child_rss_bytes() -> u64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) } != 0 {
+        return 0;
+    }
+    let raw = ru.ru_maxrss.max(0) as u64;
+    if cfg!(target_os = "macos") {
+        raw
+    } else {
+        raw * 1024
+    }
+}
+
+#[cfg(not(unix))]
+pub fn peak_child_rss_bytes() -> u64 {
+    0
 }

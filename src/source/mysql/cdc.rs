@@ -55,6 +55,24 @@ pub(crate) struct MysqlChangeStream {
     /// The current transaction's rows, held until the `XID` (commit) event so the
     /// whole transaction is released atomically with the commit position.
     tx: Vec<ChangeEvent>,
+    /// Where an oversized transaction's tail goes. MySQL's crate hands over PARSED
+    /// events — there is no wire to keep — so the tail is written through the
+    /// general tagged frame rather than PostgreSQL's raw rows.
+    spill_dir: Option<std::path::PathBuf>,
+    /// The in-flight transaction's tail, once it has outgrown the memory cap.
+    ///
+    /// A FIELD, not a local: a MySQL transaction spans many `fill` calls (one per
+    /// binlog event), unlike PostgreSQL's, which is framed inside a single peek.
+    spill: Option<crate::source::cdc::spill::SpillFile>,
+    /// A committed transaction whose tail is still being handed out from disk.
+    spooled: Option<crate::source::cdc::spill::SpooledTx>,
+    /// A failure while SEALING a spill, raised on the next `next()`.
+    ///
+    /// `close_transaction_at` returns a bool (it means "keep reading"), so it has
+    /// nowhere to put an error. Dropping one would deliver the head of a
+    /// transaction without its tail — a half-transaction the sink would flush and
+    /// checkpoint past, which is the loss this whole path exists to avoid.
+    spill_error: Option<anyhow::Error>,
     /// Running byte footprint of `tx` (round-2 audit #9): the row cap alone is a
     /// poor bound when cells are large. Reset when `tx` is drained/cleared.
     tx_bytes: usize,
@@ -75,6 +93,9 @@ pub(crate) struct MysqlChangeStream {
     /// `None` at once instead of consuming — and re-deferring — the past-bound
     /// events the next run will re-read from the checkpoint.
     past_bound: bool,
+    /// The connection's own database — what a BARE configured name means. Compared
+    /// against each event's schema on the wire; see `bare_name_spans_databases`.
+    own_db: String,
 }
 
 impl MysqlChangeStream {
@@ -159,6 +180,143 @@ impl MysqlChangeStream {
     /// evidence of a bad setting: MySQL 5.7 has no way to carry names, the sink
     /// maps positionally there by construction, and a warning naming a variable
     /// that does not exist is one an operator cannot act on.
+    /// Read a resume position out of a checkpoint that has already PARSED.
+    ///
+    /// The MSSQL peer of this (`mssql::cdc::resume_from_checkpoint`) exists because
+    /// the runner and `doctor` had drifted into two readings of one file. MySQL had
+    /// the same split and the doctor side was the LOOSER one: it read `file` with
+    /// `.unwrap_or_default()` and `pos` with `.unwrap_or(0)`, so a malformed
+    /// checkpoint rendered as `Loaded { file: "", pos: 0 }` and was then graded
+    /// "below binlog retention (file purged) — the next run fails with ERROR 1236",
+    /// hinting RE-SNAPSHOT. Wrong cause, and a destructive remedy for a file that is
+    /// merely malformed — the run's actual error is `checkpoint missing 'file'`.
+    ///
+    /// One decoder, so the two cannot disagree again.
+    /// Does this checkpoint belong to the server we are about to resume against?
+    ///
+    /// A MySQL checkpoint is `{file, pos}` — binlog COORDINATES, which mean nothing
+    /// outside the server that wrote them. Point rivet at a different host with the
+    /// same config (a failover, a restored dump, a copied `url:`, a stand rebuilt
+    /// under the same name) and `binlog.000042:12345` still parses, still looks
+    /// plausible, and lands at an arbitrary point in a DIFFERENT binlog. Whatever
+    /// is there gets captured; whatever was between gets skipped. Silent both ways.
+    ///
+    /// PostgreSQL cannot have this problem: its resume anchor is a slot, which is
+    /// server-side, so a foreign one simply does not exist. MySQL's anchor is a
+    /// client-side file, so the check has to be explicit — the same asymmetry
+    /// the process rules's anchor-model rule already records for the idle-first-run case.
+    ///
+    /// TWO tiers, because one of them is not enough on a default install:
+    ///
+    /// * `server_uuid` is unique per server and stable across restarts, and it is
+    ///   present on EVERY MySQL. This is the floor.
+    /// * a GTID set catches what the uuid cannot: the SAME server after a
+    ///   `RESET MASTER`, where the coordinates are stale but the identity matches.
+    ///   Only when `gtid_mode` is ON — which is OFF by default, measured on the
+    ///   stand, so it can never be the only check.
+    ///
+    /// A checkpoint with NO identity is accepted with a warning rather than
+    /// refused: it was written before this existed, and refusing it would strand a
+    /// stream that is probably fine. Saying nothing would be the silent half of the
+    /// bug this closes.
+    pub(crate) fn checkpoint_identity_verdict(
+        ckpt_uuid: Option<&str>,
+        ckpt_gtid: Option<&str>,
+        server_uuid: &str,
+        server_gtid_executed: Option<&str>,
+        gtid_contained: Option<bool>,
+    ) -> CheckpointIdentity {
+        let Some(ckpt_uuid) = ckpt_uuid else {
+            return CheckpointIdentity::Unverifiable;
+        };
+        if ckpt_uuid != server_uuid {
+            return CheckpointIdentity::ForeignServer {
+                checkpoint: ckpt_uuid.to_string(),
+                server: server_uuid.to_string(),
+            };
+        }
+        // Same server. If the checkpoint recorded a GTID set and the server can
+        // answer, the set must still be CONTAINED in what the server has executed —
+        // a `RESET MASTER` empties it while leaving the uuid untouched.
+        match (ckpt_gtid, gtid_contained) {
+            (Some(g), Some(false)) if !g.is_empty() => CheckpointIdentity::GtidNotContained {
+                checkpoint: g.to_string(),
+                server: server_gtid_executed.unwrap_or_default().to_string(),
+            },
+            _ => CheckpointIdentity::Ok,
+        }
+    }
+
+    pub(crate) fn resume_from_checkpoint(
+        pos: Option<&super::super::cdc::Position>,
+        path: &str,
+    ) -> Result<Option<(String, u64)>> {
+        let Some(pos) = pos else {
+            return Ok(None);
+        };
+        let file = pos
+            .0
+            .get("file")
+            .and_then(Json::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "checkpoint '{path}' parses as JSON but carries no 'file' — refusing to \
+                     treat it as absent, which would re-anchor at the CURRENT binlog \
+                     position and silently skip every change since it was written. Restore \
+                     the file, or delete it to accept a fresh anchor."
+                )
+            })?
+            .to_string();
+        let p = pos.0.get("pos").and_then(Json::as_u64).ok_or_else(|| {
+            anyhow::anyhow!("checkpoint '{path}' parses as JSON but carries no 'pos'")
+        })?;
+        Ok(Some((file, p)))
+    }
+
+    /// A BARE configured name has matched an event from a schema that is NOT the
+    /// connection's own database.
+    ///
+    /// DETERMINISTIC, and the first cut was not. It compared against the FIRST schema
+    /// seen in the current run and kept that memory in a per-run `HashMap`, so a run
+    /// in which only the foreign database wrote recorded IT as "first" and captured
+    /// its rows in silence. MEASURED: `table: hunt_ord` with `rivet.hunt_ord` and
+    /// `hunt_other.hunt_ord` present, one insert into the foreign one, `status:
+    /// success, rows: 1` and an independent read showing `insert | 99 |
+    /// FOREIGN-ROW` — a row from a database the config never named and the
+    /// connection cannot see. Under `until_current` on a schedule, "only one of the
+    /// two wrote this cycle" is the ORDINARY case, not the rare one.
+    ///
+    /// The rule now matches what the rest of the product already means by a bare
+    /// name: rivet's own routability check reads it as `TABLE_SCHEMA = DATABASE()`,
+    /// so an event from any other schema is not what the operator asked for. No
+    /// memory, no run boundary, no ordering.
+    ///
+    /// The catalog cannot answer this on MySQL, which is why it is checked on the
+    /// WIRE: `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE`
+    /// hands over the whole server's binlog — as root the catalog listed
+    /// `other_db, rivet`, as the `rivet` user it listed `rivet` alone, and the export
+    /// received other_db's row regardless.
+    pub(crate) fn bare_name_spans_databases(
+        configured: &str,
+        own_db: &str,
+        saw: &str,
+    ) -> Option<String> {
+        if configured.contains('.') || saw == own_db {
+            return None;
+        }
+        Some(format!(
+            "mysql cdc: `{configured}` is unqualified, so it means the connection's own \
+             database (`{own_db}`) — but an event for that name arrived from `{saw}`. The \
+             binlog dump is server-wide and routing matches a bare name in any schema, so \
+             `{saw}.{configured}`'s rows would land in this export; under the default \
+             binlog_row_metadata=MINIMAL the wire carries no column names, so they are \
+             mapped by POSITION under THIS table's names. No catalog check can warn about \
+             this: information_schema is filtered by privilege, so a database this \
+             connection cannot see still reaches the binlog. Qualify it \
+             (`{saw}.{configured}`) if that is the one you meant."
+        ))
+    }
+
     pub(crate) fn row_metadata_warning(metadata: Option<&str>) -> Option<String> {
         let m = metadata?;
         if m.eq_ignore_ascii_case("FULL") {
@@ -241,20 +399,164 @@ impl MysqlChangeStream {
         configured: &[String],
     ) -> Result<()> {
         use mysql::prelude::Queryable as _;
+        // The connection's own database — what a BARE configured name means.
+        let own_db_for_resolution: String = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_default();
         for cfg in configured {
             let (schema, table) = match cfg.split_once('.') {
                 Some((s, t)) => (Some(s.to_string()), t.to_string()),
                 None => (None, cfg.clone()),
             };
-            let row: Option<String> = match &schema {
-                Some(s) => conn
+            // RESOLUTION-FIRST, through the SAME decision PostgreSQL uses. An
+            // operator meeting this class on two engines should not have to learn it
+            // twice, and one refusal is one place a mutant can grade.
+            //
+            // The engine difference that stays, because it is real: MySQL's
+            // `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE`
+            // hands over the whole server's binlog — MEASURED, as root the catalog
+            // listed `other_db, rivet` and as the `rivet` user it listed `rivet`
+            // alone, while the export captured other_db's row anyway. So resolution
+            // closes what the catalog CAN see, and `bare_name_spans_databases` stays
+            // as the wire-side backstop for what it cannot. Two guards, two different
+            // sources of truth, deliberately.
+            let matches: Vec<crate::source::cdc::identity::CatalogMatch> = match &schema {
+                // A qualified name names one database; ambiguity cannot apply.
+                Some(sch) => conn
+                    .exec_map(
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                         FROM information_schema.TABLES \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        (sch, &table),
+                        |(schema, table, kind): (String, String, String)| {
+                            // Only a BASE TABLE reaches a binlog TABLE_MAP; a VIEW
+                            // never emits under its own name.
+                            let capturable = kind == "BASE TABLE";
+                            crate::source::cdc::identity::CatalogMatch {
+                                schema,
+                                table,
+                                kind,
+                                capturable,
+                            }
+                        },
+                    )
+                    .unwrap_or_default(),
+                None => conn
+                    .exec_map(
+                        // NO kind filter: a VIEW sharing the name is a CANDIDATE, not
+                        // something to hide. Filtering it out made resolution pick the
+                        // base table silently while classification refused the view —
+                        // two reads of one fact naming two relations.
+                        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                         FROM information_schema.TABLES \
+                         WHERE TABLE_NAME = ? \
+                           AND TABLE_SCHEMA NOT IN \
+                               ('mysql','information_schema','performance_schema','sys')",
+                        (&table,),
+                        |(schema, table, kind): (String, String, String)| {
+                            // Only a BASE TABLE reaches a binlog TABLE_MAP; a VIEW
+                            // never emits under its own name.
+                            let capturable = kind == "BASE TABLE";
+                            crate::source::cdc::identity::CatalogMatch {
+                                schema,
+                                table,
+                                kind,
+                                capturable,
+                            }
+                        },
+                    )
+                    .unwrap_or_default(),
+            };
+            // The resolved relation, and classification asks about THAT — not about a
+            // second lookup of the configured string. The two queries used different
+            // predicates (this one scans every non-system schema; the TABLE_TYPE one
+            // pinned `TABLE_SCHEMA = DATABASE()`), so they could name DIFFERENT
+            // relations. MEASURED: with a VIEW `rivet.vv` and a base table
+            // `other_db.vv`, resolution names `other_db.vv` — unambiguously, since
+            // the identity query filters BASE TABLE — and classification then refused
+            // with "vv is a VIEW", sending the operator to fix a relation resolution
+            // had already ruled out.
+            let resolved = if matches.is_empty() {
+                None
+            } else {
+                // A BARE name means the CONNECTION'S OWN database — the same rule
+                // `bare_name_spans_databases` enforces on the wire, and the one
+                // rivet's routability check has always used. So a candidate outside
+                // it may never be ELECTED as the identity, only reported.
+                //
+                // MEASURED when it could be: with a VIEW `rivet.hunt_v2` and a base
+                // table `hunt_other.hunt_v2`, resolution elected the foreign table —
+                // the only capturable candidate — classification asked IT for a type,
+                // got BASE TABLE, and the run went `status: success, rows: 0` while
+                // the view the operator meant was skipped in silence. Before this it
+                // was a hard refusal naming that exact harm.
+                //
+                // A LIVE foreign twin is still a refusal, because routing would
+                // genuinely capture it — that is the catalog-visible half of the
+                // ambiguity, and the wire guard covers the half the catalog cannot
+                // see (privilege-filtered `information_schema`).
+                let (mine, foreign): (Vec<_>, Vec<_>) = if schema.is_some() {
+                    (matches.clone(), Vec::new())
+                } else {
+                    matches
+                        .iter()
+                        .cloned()
+                        .partition(|m| m.schema == own_db_for_resolution)
+                };
+                let live_foreign: Vec<_> =
+                    foreign.iter().filter(|m| m.capturable).cloned().collect();
+                // Our own database holds the name AND a live twin exists elsewhere:
+                // that is the cross-database ambiguity, refused here rather than left
+                // for the wire — the catalog can see this one, so it should be caught
+                // before the stream opens. Crucially this fires even when OUR
+                // candidate is inert (a view): electing the foreign table instead is
+                // what turned a hard refusal into `success, rows: 0`.
+                if !mine.is_empty() && !live_foreign.is_empty() {
+                    anyhow::bail!(
+                        "mysql cdc: `{cfg}` is unqualified, so it means the connection's \
+                         own database (`{own_db_for_resolution}`) — but `{}` also holds a \
+                         table of that name, and the binlog dump is server-wide, so its \
+                         rows would land in this export under THIS table's names. Qualify \
+                         it (`{own_db_for_resolution}.{cfg}` or `{}.{cfg}`) to say which \
+                         you mean.",
+                        live_foreign[0].schema,
+                        live_foreign[0].schema
+                    );
+                }
+                // Otherwise resolve within the scope the bare name actually names.
+                let for_resolution = if mine.is_empty() {
+                    matches.clone()
+                } else {
+                    mine
+                };
+                let r = crate::source::cdc::identity::resolve_captured_table(cfg, &for_resolution)?;
+                if let Some(note) = &r.note {
+                    log::warn!("mysql cdc: {note}");
+                }
+                Some(r)
+            };
+            let row: Option<String> = match (&resolved, &schema) {
+                // The relation resolution named. One catalog fact, one relation.
+                (Some(r), _) => conn
+                    .exec_first(
+                        "SELECT TABLE_TYPE FROM information_schema.TABLES \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        (&r.schema, &r.table),
+                    )
+                    .unwrap_or(None),
+                // Resolution found nothing — the catalog is privilege-filtered here,
+                // so absence is normal and the old scoped lookups still answer.
+                (None, Some(s)) => conn
                     .exec_first(
                         "SELECT TABLE_TYPE FROM information_schema.TABLES \
                          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                         (s, &table),
                     )
                     .unwrap_or(None),
-                None => conn
+                (None, None) => conn
                     .exec_first(
                         "SELECT TABLE_TYPE FROM information_schema.TABLES \
                          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
@@ -288,6 +590,22 @@ impl MysqlChangeStream {
         let mut conn = connect_conn(url, tls)?;
         // Refuse a compressed binlog rather than read past it in silence.
         refuse_compressed_binlog(&mut conn)?;
+        // Read the connection's own database BEFORE the binlog stream consumes the
+        // connection — it is the meaning of a bare configured name.
+        // `Option<String>`, like the two sibling call sites (`mysql/mod.rs`,
+        // `preflight/mysql.rs`). A db-less URL is a DELIBERATELY supported shape —
+        // `cdc/mod.rs` says so in prose and skips its own query for a qualified name
+        // — and `SELECT DATABASE()` then returns NULL. Deserialising that into
+        // `String` PANICS inside `FromRow`, which `.ok().flatten()` cannot catch:
+        // MEASURED `exit 101`, no run summary, no error path, no ledger finalize.
+        // The value is not even consulted for a qualified name, so the crash was
+        // pure collateral.
+        let own_db: String = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_default();
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
@@ -300,11 +618,19 @@ impl MysqlChangeStream {
             configured_tables,
             tables: HashMap::new(),
             pending: VecDeque::new(),
+            // Overridden by `open_or_resume`, which knows the checkpoint's location.
+            spill_dir: crate::source::cdc::spill_dir_for(None),
+            spill: None,
+            spooled: None,
+            spill_error: None,
             tx: Vec::new(),
             tx_bytes: 0,
             file,
             bound,
             past_bound: false,
+            // The connection's own database — the meaning of a bare configured
+            // name, and the wire-side comparison's fixed reference.
+            own_db,
         })
     }
 
@@ -312,6 +638,40 @@ impl MysqlChangeStream {
     /// MySQL 8.4 REMOVED `SHOW MASTER STATUS` (finding #36, caught by the
     /// version scout); its replacement `SHOW BINARY LOG STATUS` does not exist
     /// before 8.2 — try the new form first, fall back to the old.
+    /// The server's own identity, recorded into every checkpoint rivet writes.
+    ///
+    /// `server_uuid` is present on every MySQL and stable across restarts;
+    /// `gtid_executed` is empty unless `gtid_mode` is ON (which is OFF by default —
+    /// measured, and the reason the uuid is the floor and GTID only ever an extra).
+    fn server_identity(url: &str, tls: Option<&TlsConfig>) -> Result<(String, String)> {
+        use mysql::prelude::Queryable;
+        let mut c = connect_conn(url, tls)?;
+        let uuid: String = c
+            .query_first("SELECT @@server_uuid")?
+            .ok_or_else(|| anyhow::anyhow!("mysql: server reported no @@server_uuid"))?;
+        let gtid: String = c.query_first("SELECT @@gtid_executed")?.unwrap_or_default();
+        Ok((uuid, gtid))
+    }
+
+    /// Ask the SERVER whether the checkpoint's GTID set is still contained in what
+    /// it has executed. `GTID_SUBSET` is the server's own comparison — reimplementing
+    /// set containment over GTID ranges here would be a second definition to drift.
+    fn gtid_is_contained(
+        url: &str,
+        tls: Option<&TlsConfig>,
+        subset: &str,
+        superset: &str,
+    ) -> Option<bool> {
+        use mysql::prelude::Queryable;
+        if subset.is_empty() {
+            return None;
+        }
+        let mut c = connect_conn(url, tls).ok()?;
+        c.exec_first("SELECT GTID_SUBSET(?, ?)", (subset, superset))
+            .ok()
+            .flatten()
+    }
+
     fn current_coordinates(url: &str, tls: Option<&TlsConfig>) -> Result<(String, u64)> {
         let mut c = connect_conn(url, tls)?;
         let row: mysql::Row = match c.query_first("SHOW BINARY LOG STATUS") {
@@ -340,7 +700,11 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
     ) -> Result<()> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        Position(serde_json::json!({ "file": file, "pos": pos })).save(ckpt)
+        let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+        Position(serde_json::json!({
+            "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
+        }))
+        .save(ckpt)
     }
 
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
@@ -373,21 +737,45 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
         configured_tables: Vec<String>,
     ) -> Result<Self> {
+        // Derived here rather than passed in: this is the one constructor the
+        // production path uses, and it already holds the checkpoint whose directory
+        // the spill shares. `open`/`open_from_current` are the anchor and test
+        // helpers and keep the `.rivet/spill` fallback.
+        let spill_dir = crate::source::cdc::spill_dir_for(ckpt);
+        let with_dir = |mut s: Self| {
+            s.spill_dir = spill_dir.clone();
+            s
+        };
         if let Some(path) = ckpt
             && let Some(pos) = Position::load(path)?
+            && let Some((file, p)) =
+                Self::resume_from_checkpoint(Some(&pos), &path.display().to_string())?
         {
-            let file = pos
-                .0
-                .get("file")
-                .and_then(Json::as_str)
-                .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'file'"))?
-                .to_string();
-            let p = pos
-                .0
-                .get("pos")
-                .and_then(Json::as_u64)
-                .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
-            return Self::open(url, server_id, file, p, mode, tls, configured_tables);
+            // The checkpoint's coordinates address a SPECIFIC server's binlog. Verify
+            // it is this one before resuming: `binlog.000042:12345` parses on every
+            // host and means something different on each, so a foreign checkpoint
+            // starts the stream at an arbitrary point — capturing whatever is there
+            // and skipping whatever was between, silently in both directions.
+            let ckpt_uuid = pos.0.get("server_uuid").and_then(Json::as_str);
+            let ckpt_gtid = pos.0.get("gtid_executed").and_then(Json::as_str);
+            let (server_uuid, server_gtid) = Self::server_identity(url, tls)?;
+            let contained = ckpt_gtid
+                .filter(|g| !g.is_empty())
+                .and_then(|g| Self::gtid_is_contained(url, tls, g, &server_gtid));
+            let verdict = Self::checkpoint_identity_verdict(
+                ckpt_uuid,
+                ckpt_gtid,
+                &server_uuid,
+                Some(server_gtid.as_str()),
+                contained,
+            );
+            if let Some(why) = verdict.refusal() {
+                anyhow::bail!("{why}");
+            }
+            if let Some(warn) = verdict.warning() {
+                log::warn!("{warn}");
+            }
+            return Self::open(url, server_id, file, p, mode, tls, configured_tables).map(with_dir);
         }
         // First run (no checkpoint yet): anchor at the current position and persist
         // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
@@ -397,13 +785,95 @@ impl MysqlChangeStream {
         // "current" position, and every change in between would be silently skipped.
         let (file, pos) = Self::current_coordinates(url, tls)?;
         if let Some(path) = ckpt {
-            Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
+            // LOUD, and at `warn` — this branch is reached both on a genuine first
+            // run and when a previously-written checkpoint is simply NOT THERE, and
+            // rivet cannot tell those apart. Round 9 measured the second case end to
+            // end: a relative `checkpoint:` (what `rivet init` scaffolds) is resolved
+            // against the process CWD, so running the same config from a different
+            // working directory found no file, re-anchored HERE at the current
+            // binlog coordinates, and reported `status: success, rows: 0` — three
+            // green runs delivering ids [3] of a source holding [1,2,3], with no line
+            // at any log level. PostgreSQL has said this for its own re-anchor
+            // (`slot_created_warning`) since the equivalent bug there; MySQL's peer
+            // was missing, and MySQL is the engine with NO server-side anchor to fall
+            // back on.
+            log::warn!(
+                "mysql cdc: no checkpoint at `{}` — anchoring at the CURRENT binlog \
+                 position ({file}:{pos}), so anything written before now is NOT \
+                 captured. On a first run that is expected. If this checkpoint existed \
+                 before, it was deleted or the config moved: a RELATIVE \
+                 `cdc.checkpoint:` is resolved against the CONFIG FILE's directory, so \
+                 the path above is where rivet looked — and the changes since it was \
+                 written are gone from this stream. Re-snapshot (`mode: full`) before \
+                 trusting the result.",
+                path.display()
+            );
+            let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+            Position(serde_json::json!({
+                "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
+            }))
+            .save(path)?;
         }
-        Self::open(url, server_id, file, pos, mode, tls, configured_tables)
+        Self::open(url, server_id, file, pos, mode, tls, configured_tables).map(with_dir)
     }
 
-    /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
-    /// ended; `Ok(true)` ⇒ consumed an event.
+    /// Open the spill once the buffered transaction passes the in-memory cap.
+    ///
+    /// With a spill directory NAMED (`RIVET_CDC_SPILL_DIR` — see `spill_dir_for`),
+    /// crossing the cap no longer fails the run: the head stays in memory, the tail
+    /// goes to disk through the general tagged frame, and the transaction is still
+    /// delivered whole and atomically. Without one the cap keeps its original
+    /// meaning and REFUSES — an earlier version of this comment said the directory
+    /// "always resolves", which was true for one day and then reverted, because
+    /// spilling does not bound memory end to end and must not silently replace a
+    /// guard that does refuse.
+    fn open_spill_if_past_cap(&mut self, log_pos: u64) -> Result<()> {
+        if self.spill.is_some() {
+            return Ok(());
+        }
+        let Err(cap_error) =
+            crate::source::cdc::check_tx_buffer_caps("mysql", self.tx.len(), self.tx_bytes)
+        else {
+            return Ok(());
+        };
+        // No spill directory named ⇒ the cap keeps its original meaning: REFUSE.
+        // See `spill_dir_for` — spilling does not bound memory end to end, so it
+        // must not silently replace a guard that does refuse.
+        let Some(dir) = self.spill_dir.clone() else {
+            return Err(cap_error);
+        };
+        log::warn!(
+            "mysql cdc: transaction at {}:{log_pos} passed the in-memory cap at {} \
+             rows / {} bytes — spilling the rest to {} rather than failing the run, \
+             which is what this used to do. The transaction is still delivered whole \
+             and atomically. Note this moves the ADAPTER's copy to disk; the sink \
+             still holds the whole transaction (a part is never split across one), so \
+             peak memory falls only modestly — measured ~11% on a 100k-row \
+             transaction, not to the cap.",
+            self.file,
+            self.tx.len(),
+            self.tx_bytes,
+            dir.display()
+        );
+        self.spill = Some(crate::source::cdc::spill::SpillFile::create(
+            &dir, "mysql-tx",
+        )?);
+        Ok(())
+    }
+
+    /// One row of a spilled tail: decode it through the general frame, stamp it,
+    /// and drop the reader once the last row is out.
+    fn next_spooled(&mut self) -> Result<Option<ChangeEvent>> {
+        let Some(sp) = self.spooled.as_mut() else {
+            return Ok(None);
+        };
+        let out = sp.next_event(crate::source::cdc::spill::decode_event)?;
+        if out.is_none() || sp.remaining() == 0 {
+            self.spooled = None;
+        }
+        Ok(out)
+    }
+
     /// Release the buffered transaction at `log_pos`, or end the stream when the
     /// commit sits past the open-time ceiling.
     ///
@@ -419,21 +889,53 @@ impl MysqlChangeStream {
         if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
             self.tx.clear();
             self.tx_bytes = 0;
+            self.spill = None;
             self.past_bound = true;
             return false;
         }
         let commit = Position(json!({ "file": self.file, "pos": log_pos }));
         let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
         self.tx_bytes = 0;
+        let tail_len = self
+            .spill
+            .as_ref()
+            .map_or(0, crate::source::cdc::spill::SpillFile::len);
         // #158: the shared close — commit position on all, committed on the last
-        // only (the marker frames the whole transaction's boundary).
-        crate::source::cdc::TxnFramer::close_group(&mut tx, &commit);
+        // event of the TRANSACTION (the marker frames the whole boundary). With a
+        // spilled tail that last event is on DISK, which is what `tail_len` says.
+        let head_len = tx.len();
+        crate::source::cdc::TxnFramer::close_head_of_group(&mut tx, &commit, tail_len);
         for ev in tx {
             self.pending.push_back(ev);
+        }
+        if let Some(sp) = self.spill.take() {
+            // `warn`, not `info`: the default level hides info, so an info-level
+            // report of a run's memory behaviour is functionally silent. It fires
+            // only for a transaction that actually spilled.
+            log::warn!(
+                "mysql cdc: transaction at {}:{log_pos} delivered {head_len} rows \
+                 from memory and {} from disk ({} bytes spilled)",
+                self.file,
+                sp.len(),
+                sp.bytes()
+            );
+            let reader = match sp.into_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    // Sealing the log is the one step here that can fail, and a
+                    // silent drop would deliver the head without its tail — a
+                    // half-transaction the sink would flush and checkpoint past.
+                    self.spill_error = Some(e);
+                    return true;
+                }
+            };
+            self.spooled = Some(crate::source::cdc::spill::SpooledTx::new(reader, commit));
         }
         true
     }
 
+    /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
+    /// ended; `Ok(true)` ⇒ consumed an event.
     fn fill(&mut self) -> Result<bool> {
         if self.past_bound {
             return Ok(false); // ended at the open-time ceiling — stay ended
@@ -512,43 +1014,97 @@ impl MysqlChangeStream {
                 };
                 let schema = tme.database_name().to_string();
                 let table = tme.table_name().to_string();
+                // WIRE-side ambiguity check: a bare configured name that has now
+                // matched events from two databases. The catalog cannot see this —
+                // information_schema is privilege-filtered while the binlog dump is
+                // server-wide — so the first event from a second schema is the first
+                // evidence that exists.
+                for cfg in &self.configured_tables {
+                    if cfg.contains('.')
+                        || !crate::source::cdc::sink::table_matches(
+                            crate::source::cdc::CdcEngine::Mysql,
+                            cfg,
+                            &schema,
+                            &table,
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(why) = Self::bare_name_spans_databases(cfg, &self.own_db, &schema) {
+                        anyhow::bail!(why);
+                    }
+                }
                 // Provisional position; rewritten to the commit position at XID.
                 let position = Position(json!({ "file": self.file, "pos": log_pos }));
                 for row in re.rows(&tme) {
                     let (before, after) = row?;
+                    let before = before.map(render_row);
+                    let after = after.map(render_row);
+                    // A cell with no faithful representation is a DEFERRED refusal,
+                    // exactly like PostgreSQL's unrecoverable unchanged-TOAST datum:
+                    // the binlog dump is server-wide, so bailing here would poison
+                    // capture of unrelated tables that merely share the stream. The
+                    // sink raises it only when the event routes to a captured table.
+                    let undecodable: Vec<usize> = before
+                        .iter()
+                        .chain(after.iter())
+                        .flat_map(|(_, bad)| bad.iter().copied())
+                        .collect();
+                    let poison = (!undecodable.is_empty()).then(|| {
+                        let cols: Vec<String> = undecodable
+                            .iter()
+                            .map(|i| {
+                                image_names
+                                    .as_ref()
+                                    .and_then(|n| n.get(*i))
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("column {i}"))
+                            })
+                            .collect();
+                        format!(
+                            "mysql cdc: {schema}.{table}: column(s) [{}] hold a JSON \
+                             document with an OPAQUE leaf — a DECIMAL, DATE, TIME or \
+                             DATETIME that MySQL materialised server-side and wrote to \
+                             the binlog as a type tag plus raw bytes, not as JSON text. \
+                             rivet cannot render those bytes the way the server does, \
+                             and refuses rather than writing NULL (which discards the \
+                             whole document while every count agrees) or the crate's \
+                             `base64:type<N>:…` placeholder (a marker where a number \
+                             belongs). A `mode: full` export of this table renders it \
+                             correctly — the server does the rendering there — so \
+                             snapshot the column, or store it as a JSON string in the \
+                             source so the binlog carries text.",
+                            cols.join(", ")
+                        )
+                    });
                     let ev = ChangeEvent {
                         op,
                         schema: schema.clone(),
                         table: table.clone(),
-                        before: before.map(render_row),
-                        after: after.map(render_row),
+                        before: before.map(|(v, _)| v),
+                        after: after.map(|(v, _)| v),
                         position: position.clone(),
                         committed: false,
                         image_names: image_names.clone(),
                         seq: 0, // stamped by TxnSeq as the stream is consumed
-                        poison: None,
+                        poison,
                     };
+                    if let Some(sp) = self.spill.as_mut() {
+                        // Past the cap: the event goes to disk through the general
+                        // tagged frame and never enters `tx`.
+                        sp.push(&crate::source::cdc::spill::encode_event(&ev))?;
+                        continue;
+                    }
                     self.tx_bytes = self.tx_bytes.saturating_add(ev.estimated_bytes());
                     self.tx.push(ev);
-                }
-                let cap = crate::source::cdc::max_tx_rows();
-                if self.tx.len() > cap {
-                    anyhow::bail!(
-                        "mysql cdc: a single transaction buffered more than {cap} rows \
-                         before its commit — refusing to buffer unbounded (raise the cap only if \
-                         a transaction this large is genuinely expected)"
-                    );
-                }
-                // Round-2 audit #9: byte backstop — a few large-cell rows stay
-                // under the row cap yet exhaust memory (MySQL streams the binlog
-                // event-by-event, so this is the most load-bearing engine).
-                let byte_cap = crate::source::cdc::max_tx_bytes();
-                if self.tx_bytes > byte_cap {
-                    anyhow::bail!(
-                        "mysql cdc: a single transaction buffered more than {byte_cap} bytes \
-                         (large cells) before its commit — refusing to buffer unbounded (raise \
-                         RIVET_CDC_MAX_TX_BYTES only if a transaction this large is expected)"
-                    );
+                    // PER ROW, not per binlog event. One `WriteRows` event carries
+                    // MANY rows, so a check after the loop lets the whole event land
+                    // in memory first — with a transaction written as a single large
+                    // event that is the entire transaction, and the cap bounds
+                    // nothing. (Only rows in LATER events would have spilled, which
+                    // depends on `binlog_row_event_max_size` rather than on the cap
+                    // the operator set.)
+                    self.open_spill_if_past_cap(log_pos)?;
                 }
             }
             // XID = transaction commit. Stamp the commit position on every change
@@ -582,6 +1138,38 @@ impl MysqlChangeStream {
             {
                 let (sc, tb) = truncate_target(&qe.query(), &qe.schema()).expect("just matched");
                 anyhow::bail!(truncate_refusal_message(&sc, &tb));
+            }
+            // `XA PREPARE` arrives as a BINARY `XaPrepareLogEvent` on 5.7.7+, never
+            // as a QueryEvent — so `is_commit_statement`'s "deliberately not XA
+            // PREPARE" arm grades a string this reader cannot receive, and the
+            // prepared rows fell through `_ => {}` and stayed in `self.tx`. The next
+            // UNRELATED transaction's Xid then drained them: `close_transaction_at`
+            // empties the whole buffer, one buffer per stream.
+            //
+            // MEASURED on mysql 8.0.46 — `XA START/INSERT(1)/XA END/XA PREPARE`, then
+            // an ordinary `INSERT(2)` committing, then `XA ROLLBACK`. The source held
+            // {2}; rivet delivered {1, 2}, both stamped `binlog.000011:55090448` (the
+            // SECOND transaction's Xid) at `__seq` 0 and 1 — the rolled-back row
+            // published as committed, and two transactions fused into one group.
+            //
+            // Table-addressed for the reason #281 measured: the dump is server-wide,
+            // so an XA branch on a table nobody captures must not be an outage for
+            // exports that never read it.
+            Some(EventData::XaPrepareLogEvent(_)) => {
+                if let Some(ev) = self.tx.iter().find(|ev| {
+                    undecodable_event_is_ours(
+                        Some((&ev.schema, &ev.table)),
+                        &self.configured_tables,
+                    )
+                }) {
+                    anyhow::bail!(xa_prepare_refusal_message(&ev.schema, &ev.table));
+                }
+                // Nothing of ours in the branch: drop it rather than leave it for the
+                // next commit to stamp and fuse. The sink would route these rows away,
+                // but only after they had already corrupted that transaction's framing.
+                self.tx.clear();
+                self.tx_bytes = 0;
+                self.spill = None;
             }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
@@ -658,9 +1246,14 @@ pub(crate) fn undecodable_event_is_ours(
     }
     match resolved {
         None => true,
-        Some((schema, table)) => configured
-            .iter()
-            .any(|c| crate::source::cdc::sink::table_matches(c, schema, table)),
+        Some((schema, table)) => configured.iter().any(|c| {
+            crate::source::cdc::sink::table_matches(
+                crate::source::cdc::CdcEngine::Mysql,
+                c,
+                schema,
+                table,
+            )
+        }),
     }
 }
 
@@ -912,21 +1505,71 @@ pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, Stri
     // refusal and rows quietly left behind.
     let stripped = strip_sql_comments(sql);
     let t = stripped.trim().trim_end_matches(';').trim();
-    let mut w = t.split_whitespace();
-    if !w.next()?.eq_ignore_ascii_case("truncate") {
+    // Tokenised with BACKTICKS in mind, not by whitespace. A quoted MySQL identifier
+    // may contain a space or a dot — `` `odd name` `` and `` `odd.name` `` are both
+    // legal and both execute — and a whitespace split saw a trailing token and
+    // returned None, so the truncate was not recognised and the rows left the source
+    // with nothing to carry them. Found by writing the unit test the evidence matrix
+    // already claimed existed; a `.split_once('.')` over the raw text had the same
+    // shape, cutting `` `odd.name` `` into a database and a table that do not exist.
+    let rest = {
+        let mut r = t;
+        fn kw<'s>(r: &'s str, w: &str) -> Option<&'s str> {
+            // `get`, never a byte slice. `r[..w.len()]` PANICS when the boundary
+            // falls inside a multi-byte character, and this runs in a match guard
+            // for EVERY QueryEvent in the server-wide binlog — so an unquoted
+            // `TRUNCATE données` on a table nobody captures killed the process:
+            // `byte index 5 is not a char boundary`, exit 101, no run summary, no
+            // journal RunCompleted, no ledger row. The checkpoint stays before the
+            // DDL, so every later run panics at the same event and capture is wedged
+            // until someone hand-edits the file (round-13 bughunt, reproduced twice).
+            // The backticked form happened to be safe, which is why this survived.
+            let head = r.get(..w.len())?;
+            if head.eq_ignore_ascii_case(w) {
+                let after = &r[w.len()..];
+                if after.is_empty() || after.starts_with(char::is_whitespace) {
+                    return Some(after.trim_start());
+                }
+            }
+            None
+        }
+        r = kw(r, "truncate")?;
+        // The TABLE keyword is optional; a table genuinely NAMED `table` would be
+        // backticked, so an unquoted `table` here is always the keyword.
+        if let Some(after) = kw(r, "table") {
+            r = after;
+        }
+        r.trim()
+    };
+
+    // One identifier, optionally qualified. Split on a dot only OUTSIDE backticks.
+    let b = rest.as_bytes();
+    let (mut i, mut in_tick, mut dot) = (0usize, false, None);
+    while i < b.len() {
+        match b[i] {
+            b'`' => {
+                if in_tick && b.get(i + 1) == Some(&b'`') {
+                    i += 2; // doubled backtick — an escaped tick inside the name
+                    continue;
+                }
+                in_tick = !in_tick;
+            }
+            b'.' if !in_tick && dot.is_none() => dot = Some(i),
+            // Anything after the identifier — a second name, a WHERE, a stray word —
+            // is a shape this reader does not claim to understand. Guessing here
+            // refuses the wrong table.
+            c if !in_tick && (c.is_ascii_whitespace() || c == b',') => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_tick || rest.is_empty() {
         return None;
     }
-    let mut name = w.next()?;
-    if name.eq_ignore_ascii_case("table") {
-        name = w.next()?;
-    }
-    if w.next().is_some() {
-        return None; // trailing tokens — not a shape this reader claims to understand
-    }
-    let unq = |s: &str| s.trim_matches('`').to_string();
-    match name.split_once('.') {
-        Some((db, tbl)) => Some((unq(db), unq(tbl))),
-        None => Some((event_db.to_string(), unq(name))),
+    let unq = |s: &str| s.trim_matches('`').replace("``", "`");
+    match dot {
+        Some(at) => Some((unq(&rest[..at]), unq(&rest[at + 1..]))),
+        None => Some((event_db.to_string(), unq(rest))),
     }
 }
 
@@ -946,8 +1589,52 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          change. Skipping it would leave every row the truncate removed sitting in the \
          destination with no DELETE to retract it — the source empty, the destination \
          not, permanently, because those rows left the source without events and no \
-         later capture can reconcile them. Re-snapshot the table (`mode: full`) to \
-         re-establish the baseline, then resume CDC from a fresh checkpoint."
+         later capture can reconcile them. Recover in rivet's OWN order: re-anchor \
+         FIRST (delete the checkpoint so the next run pins a fresh one), THEN \
+         re-snapshot the table (`mode: full`). Snapshotting first leaves everything \
+         changed between the snapshot and the new anchor in neither — a silent gap \
+         as wide as the snapshot takes."
+    )
+}
+
+/// A prepared XA branch this reader cannot frame — and must not let another
+/// transaction publish.
+///
+/// This is a HARD STOP, not a deferral, and the message says so. The TRUNCATE
+/// refusal beside it can promise recovery because re-running re-reads the same
+/// rows; this one cannot. The `XA_prepare_log_event` stays in the binlog forever,
+/// so every re-run from the same checkpoint hits it again — MEASURED: run, refuse,
+/// re-run, refuse. The only way past is a checkpoint on the far side of the branch,
+/// which skips whatever else happened in between, which is why the remedy is the
+/// same re-snapshot TRUNCATE asks for.
+///
+/// It also refuses a branch that goes on to COMMIT, because at `XA PREPARE` there is
+/// nothing to distinguish the two — the outcome is a Query event that has not been
+/// read yet. Over-refusing is the safe direction: the alternative shipped a
+/// rolled-back row as committed.
+pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    format!(
+        "mysql cdc: `{qualified}` was written inside an XA transaction that reached \
+         `XA PREPARE`, and this reader cannot frame a prepared branch. Prepared is not \
+         committed — the branch may still `XA ROLLBACK` — and rivet holds one \
+         transaction buffer per stream, so the NEXT transaction's commit would drain \
+         these rows too and publish them under ITS position: rows that never existed, \
+         stamped with someone else's commit. Fabricating a row is worse than failing, \
+         so the run stops with the checkpoint unmoved.\n\n\
+         This does NOT clear by re-running: the prepare stays in the binlog and every \
+         run from this checkpoint reaches it again. To move past it, recover in \
+         rivet's OWN order — re-anchor FIRST (delete the checkpoint so the next run \
+         pins a fresh one), THEN re-snapshot the table (`mode: full`). Snapshotting \
+         first leaves everything changed between the snapshot and the new anchor in \
+         neither, and re-anchoring alone skips every change since the old position. To avoid it, \
+         do not drive captured tables through an XA transaction manager until rivet \
+         frames XA branches by their xid; those tables can be exported with `mode: \
+         full` meanwhile."
     )
 }
 
@@ -956,8 +1643,22 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
 /// `COMMIT` on its own (the non-transactional-engine and binlog-format path) and
 /// `XA COMMIT <xid>`. Deliberately NOT `XA PREPARE` — prepared is not committed, and
 /// releasing there would publish rows a later `XA ROLLBACK` erases. Not `BEGIN`,
-/// `SAVEPOINT` or `ROLLBACK` either, none of which end a transaction with data to
-/// publish.
+/// `SAVEPOINT` or `ROLLBACK` either.
+///
+/// That last exclusion is MEASURED, so nobody re-derives it: a `ROLLBACK` arm here would be dead code, and
+/// a dangerous one. It was written and then removed after two `SHOW BINLOG EVENTS`
+/// probes on the stand (MySQL 8.0.46, `binlog_format=ROW`):
+///
+/// * a mixed InnoDB+MyISAM transaction rolled back logs ONLY the MyISAM rows — the
+///   InnoDB ones are rolled back UNWRITTEN, so a captured InnoDB table has nothing
+///   buffered when the rollback arrives;
+/// * a pure MyISAM transaction rolled back logs `BEGIN … Write_rows … `**`COMMIT`** —
+///   the rows are permanent, so the server frames them as their own transaction.
+///
+/// So no shape reaches this file with rows buffered AND a `ROLLBACK` marker, and
+/// treating one as "discard the buffer" would DELETE rows that are still in the
+/// source. `roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_
+/// transaction` pins the real contract instead.
 fn is_commit_statement(sql: &str) -> bool {
     let t = sql.trim().trim_end_matches(';').trim();
     if t.eq_ignore_ascii_case("commit") {
@@ -988,23 +1689,57 @@ pub(crate) fn binlog_file_ordinal(name: &str) -> Option<u64> {
 
 /// Decode a binlog row's cells to typed [`RivetValue`]s (structural — no string
 /// reparse of temporals).
-fn render_row(r: mysql::binlog::row::BinlogRow) -> Vec<RivetValue> {
-    r.unwrap().iter().map(binlog_value_to_rivet).collect()
+/// Returns the row's values plus the INDICES of cells that could not be decoded —
+/// a cell that has no faithful representation, never one that is genuinely absent.
+/// The caller turns those indices into a deferred poison naming the columns.
+fn render_row(r: mysql::binlog::row::BinlogRow) -> (Vec<RivetValue>, Vec<usize>) {
+    let mut undecodable = Vec::new();
+    let vals = r
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, bv)| match binlog_value_to_rivet(bv) {
+            Some(v) => v,
+            None => {
+                undecodable.push(i);
+                RivetValue::Null
+            }
+        })
+        .collect();
+    (vals, undecodable)
 }
 
-fn binlog_value_to_rivet(bv: &BinlogValue) -> RivetValue {
+/// `None` ⇒ this cell has no faithful representation — the caller must refuse, not
+/// write the placeholder NULL this returns alongside it.
+fn binlog_value_to_rivet(bv: &BinlogValue) -> Option<RivetValue> {
     match bv {
-        BinlogValue::Value(v) => RivetValue::from_mysql(v),
+        BinlogValue::Value(v) => Some(RivetValue::from_mysql(v)),
         // A JSON column arrives as MySQL's internal JSONB binary — convert it to
         // JSON text in the SAME rendering the server itself produces (", " and
         // ": " separators), so CDC and batch outputs of one value are
         // byte-identical; compact serde output would differ only in whitespace.
+        // A JSONB tree MySQL materialised server-side carries OPAQUE leaves — a
+        // DECIMAL, DATE, TIME or DATETIME stored with a type tag and raw bytes rather
+        // than as JSON text. `serde_json::Value::try_from` errors on the first one and
+        // the object/array arms propagate it, so ONE opaque leaf discarded the WHOLE
+        // document. Measured: `JSON_OBJECT('amt', CAST(1.50 AS DECIMAL(10,2)), 'sku',
+        // 'A1')` and `JSON_OBJECT('created', CAST('2024-01-02' AS DATE))` both came
+        // back `doc: null` under `status: success`, while the plain text literal
+        // beside them was fine — and a `mode: full` export of the SAME table wrote all
+        // three correctly. So a snapshot-plus-CDC pipeline shows the column populated
+        // by the snapshot leg and NULL for every change row that touches it.
+        //
+        // Nulling is not an option and neither is the crate's own fallback, which
+        // renders an opaque leaf as `base64:type<N>:<bytes>` — writing a marker where
+        // a number belongs is the same class as the `unchanged-toast-datum` refusal on
+        // PostgreSQL. rivet cannot render these bytes the way MySQL does, so it says
+        // so and refuses this cell; the caller defers the refusal to routing.
         BinlogValue::Jsonb(j) => match serde_json::Value::try_from(j.clone()) {
-            Ok(json) => RivetValue::Bytes(mysql_style_json(&json).into_bytes()),
-            Err(_) => RivetValue::Null,
+            Ok(json) => Some(RivetValue::Bytes(mysql_style_json(&json).into_bytes())),
+            Err(_) => None,
         },
         // JSONB partial-update diffs (rare) — carry the debug bytes as text.
-        other => RivetValue::Bytes(format!("{other:?}").into_bytes()),
+        other => Some(RivetValue::Bytes(format!("{other:?}").into_bytes())),
     }
 }
 
@@ -1055,8 +1790,21 @@ impl Iterator for MysqlChangeStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if let Some(e) = self.spill_error.take() {
+                return Some(Err(e));
+            }
             if let Some(ev) = self.pending.pop_front() {
                 return Some(Ok(ev));
+            }
+            // A spilled tail outranks another `fill`: its rows belong to a
+            // transaction already framed, and reading more binlog before finishing
+            // it would interleave a later transaction into it.
+            if self.spooled.is_some() {
+                match self.next_spooled() {
+                    Ok(Some(ev)) => return Some(Ok(ev)),
+                    Ok(None) => {}
+                    Err(e) => return Some(Err(e)),
+                }
             }
             match self.fill() {
                 Ok(true) => continue,
@@ -1068,6 +1816,10 @@ impl Iterator for MysqlChangeStream {
 }
 
 impl ChangeStream for MysqlChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Mysql
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         self.next()
     }
@@ -1075,6 +1827,258 @@ impl ChangeStream for MysqlChangeStream {
 
 #[cfg(test)]
 mod tests {
+    /// Every arm of the checkpoint-identity verdict.
+    ///
+    /// This closes a hole rather than tightening one: a MySQL checkpoint is binlog
+    /// COORDINATES, and nothing stopped a checkpoint written by one server from
+    /// being used against another. `binlog.000042:12345` parses on any host and
+    /// addresses a different binlog on each.
+    #[test]
+    fn a_checkpoint_from_another_server_is_refused_and_says_why() {
+        use super::CheckpointIdentity as C;
+        let a = "feada5c8-8818-11f1-a5e3-0242c0a8e406";
+        let b = "00000000-1111-2222-3333-444444444444";
+
+        // SAME server, no GTID in play — the ordinary resume.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(Some(a), None, a, None, None),
+            C::Ok
+        );
+        assert!(C::Ok.refusal().is_none() && C::Ok.warning().is_none());
+
+        // A DIFFERENT server. The whole point.
+        let v = MysqlChangeStream::checkpoint_identity_verdict(Some(a), None, b, None, None);
+        assert_eq!(
+            v,
+            C::ForeignServer {
+                checkpoint: a.into(),
+                server: b.into()
+            }
+        );
+        let msg = v.refusal().expect("a foreign server must REFUSE");
+        assert!(
+            msg.contains(a) && msg.contains(b) && msg.contains("per-server"),
+            "the refusal must name BOTH servers and the reason — an operator whose \
+             failover just happened needs to know which is which: {msg}"
+        );
+        assert!(
+            msg.contains("mode: full"),
+            "and name the recovery, which is a re-snapshot: the old coordinates \
+             cannot be carried to a new server at all"
+        );
+
+        // NO identity: accepted, but SAID. Refusing would strand a checkpoint
+        // written before this existed; saying nothing is the silent half of the bug.
+        let v = MysqlChangeStream::checkpoint_identity_verdict(None, None, a, None, None);
+        assert_eq!(v, C::Unverifiable);
+        assert!(v.refusal().is_none(), "an old checkpoint must still resume");
+        assert!(
+            v.warning()
+                .expect("but it must SAY so")
+                .contains("per-server"),
+            "the warning has to name the hazard, not just admit ignorance"
+        );
+
+        // SAME server, GTID set NO LONGER contained — a `RESET MASTER` keeps the
+        // uuid and empties the history, which the uuid check alone cannot see.
+        let g = "feada5c8-8818-11f1-a5e3-0242c0a8e406:1-100";
+        let v = MysqlChangeStream::checkpoint_identity_verdict(
+            Some(a),
+            Some(g),
+            a,
+            Some(""),
+            Some(false),
+        );
+        assert_eq!(
+            v,
+            C::GtidNotContained {
+                checkpoint: g.into(),
+                server: String::new()
+            }
+        );
+        assert!(v.refusal().expect("must refuse").contains("RESET MASTER"));
+
+        // …and contained is fine.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(
+                Some(a),
+                Some(g),
+                a,
+                Some(g),
+                Some(true)
+            ),
+            C::Ok
+        );
+        // An EMPTY recorded set is not a claim about anything — gtid_mode was off
+        // when it was written, so containment says nothing and must not refuse.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(
+                Some(a),
+                Some(""),
+                a,
+                Some(""),
+                Some(false)
+            ),
+            C::Ok,
+            "an empty GTID set records `gtid_mode was off`, not `no transactions` — \
+             refusing on it would break every non-GTID deployment, which is the \
+             DEFAULT one"
+        );
+        // The server cannot answer (gtid_mode off NOW): the uuid still governs.
+        assert_eq!(
+            MysqlChangeStream::checkpoint_identity_verdict(Some(a), Some(g), a, None, None),
+            C::Ok
+        );
+    }
+
+    /// The rule is DETERMINISTIC — a bare name means the connection's own database,
+    /// and any other schema is the ambiguity.
+    ///
+    /// The first cut compared against the FIRST schema seen in the current run and
+    /// kept that in a per-run map, so a run in which only the foreign database wrote
+    /// recorded IT as "first" and captured its rows in silence. MEASURED: `status:
+    /// success, rows: 1` with an independent read showing `insert | 99 |
+    /// FOREIGN-ROW`. Under `until_current` on a schedule, "only one of the two wrote
+    /// this cycle" is the ORDINARY case.
+    ///
+    /// Checked on the WIRE because no catalog can answer it here: MySQL's
+    /// `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE` hands
+    /// over the whole server's binlog.
+    #[test]
+    fn a_bare_name_means_the_connections_own_database_and_any_other_is_refused() {
+        // The ordinary case: the event is from our own database. Silent — this runs
+        // on EVERY event, so a false positive here is an outage.
+        assert_eq!(
+            MysqlChangeStream::bare_name_spans_databases("orders", "shop", "shop"),
+            None
+        );
+
+        // A QUALIFIED name is never ambiguous: routing compares the whole string.
+        assert_eq!(
+            MysqlChangeStream::bare_name_spans_databases("shop.orders", "shop", "archive"),
+            None,
+            "`database.table` names exactly one relation, whatever else exists"
+        );
+
+        // The defect. Note what makes this stronger than the version it replaces:
+        // there is no "first seen" state, so the verdict does not depend on which
+        // database happened to write first, or on the run boundary.
+        let why = MysqlChangeStream::bare_name_spans_databases("orders", "shop", "archive")
+            .expect("an event from another database is not what a bare name asked for");
+        assert!(
+            why.contains("shop") && why.contains("archive"),
+            "name the database the config MEANT and the one the event came from: {why}"
+        );
+        assert!(
+            why.contains("archive.orders"),
+            "and hand over the fix in the form they must type: {why}"
+        );
+        assert!(
+            why.contains("privilege"),
+            "say WHY no catalog check warned them, or the next reader adds one and it \
+             does not fire either: {why}"
+        );
+    }
+
+    /// MySQL's TRUNCATE parser had ZERO offline coverage while the evidence matrix
+    /// claimed it was graded by `a_mysql_truncate_statement_resolves_the_table_it_names`
+    /// — a test that exists nowhere in the tree. PROVEN by stubbing this function to
+    /// `return None` (the exact pre-fix silent divergence) and watching the whole lib
+    /// suite stay green at 2616 passed. A cited grader nobody resolved against the
+    /// source is a `sound` cell resting on a name.
+    ///
+    /// The shapes that matter are the ones a real server emits: a bare name resolved
+    /// against the EVENT's database, a db-qualified one, backticks, and the comment
+    /// forms every ORM appends.
+    #[test]
+    fn a_mysql_truncate_statement_resolves_the_table_it_names() {
+        let t = |sql: &str| truncate_target(sql, "shop");
+
+        // Bare name ⇒ the event's own database, which is the only place it can come
+        // from: a binlog QUERY event carries the schema separately from the SQL.
+        assert_eq!(t("TRUNCATE orders"), Some(("shop".into(), "orders".into())));
+        assert_eq!(
+            t("TRUNCATE TABLE orders"),
+            Some(("shop".into(), "orders".into())),
+            "the optional TABLE keyword is not part of the name"
+        );
+        assert_eq!(
+            t("truncate table Orders;"),
+            Some(("shop".into(), "Orders".into())),
+            "the keyword is case-insensitive and the trailing semicolon is not a token; \
+             the NAME's case is preserved because MySQL table names can be \
+             case-sensitive depending on lower_case_table_names"
+        );
+
+        // Qualified and quoted — a db-qualified truncate names another schema, and
+        // routing must see that schema, not the event's.
+        assert_eq!(
+            t("TRUNCATE archive.orders"),
+            Some(("archive".into(), "orders".into())),
+            "an explicit database must win over the event's — routing it to `shop` \
+             would refuse the wrong export, or none"
+        );
+        assert_eq!(
+            t("TRUNCATE TABLE `archive`.`odd name`"),
+            Some(("archive".into(), "odd name".into())),
+            "backticks are quoting, not part of the identifier"
+        );
+
+        // Comments: measured NOT to reach this reader on 8.0, handled anyway because
+        // the failure mode is a silent divergence rather than an error.
+        assert_eq!(
+            t("TRUNCATE TABLE orders /* xid=42 */"),
+            Some(("shop".into(), "orders".into()))
+        );
+        assert_eq!(
+            t("/* app='api' */ TRUNCATE TABLE orders"),
+            Some(("shop".into(), "orders".into()))
+        );
+
+        // NOT a truncate, and the boundary matters: claiming one of these would fail
+        // an export over a statement that removes nothing.
+        for not_one in [
+            "DELETE FROM orders",
+            "DROP TABLE orders",
+            "TRUNCATE",
+            "TRUNCATE TABLE",
+            "SELECT 'TRUNCATE orders'",
+            "CREATE TABLE truncate_log(id int)",
+        ] {
+            assert_eq!(t(not_one), None, "{not_one} is not a truncate of a table");
+        }
+
+        // A shape this reader does not claim to understand must be None rather than a
+        // guess — a wrong guess refuses the wrong table.
+        assert_eq!(
+            t("TRUNCATE TABLE a, b"),
+            None,
+            "MySQL does not accept a list here, and inventing an answer for an \
+             unrecognised shape is how a reader refuses an export it should not"
+        );
+
+        // A DOT inside backticks is part of the name, not a qualifier. The old
+        // `split_once('.')` over the raw text cut this into a database and a table
+        // that do not exist, so routing found neither and the truncate was not
+        // refused for the table it actually names.
+        assert_eq!(
+            t("TRUNCATE TABLE `odd.name`"),
+            Some(("shop".into(), "odd.name".into())),
+            "a quoted dot is a character in the identifier"
+        );
+        assert_eq!(
+            t("TRUNCATE TABLE `db.x`.`t.y`"),
+            Some(("db.x".into(), "t.y".into())),
+            "...and the qualifier splits on the dot BETWEEN the quoted parts"
+        );
+        // A doubled backtick is an escaped one inside the name.
+        assert_eq!(
+            t("TRUNCATE TABLE `we``ird`"),
+            Some(("shop".into(), "we`ird".into()))
+        );
+        // An unterminated quote is not a name.
+        assert_eq!(t("TRUNCATE TABLE `unclosed"), None);
+    }
 
     /// The asymmetry with `row_image_verdict` is deliberate and this pins it: a
     /// non-FULL `binlog_row_image` is REFUSED (somebody chose it, the default is
@@ -1260,6 +2264,11 @@ mod tests {
         for no in [
             "BEGIN",
             "XA START 'x1'",
+            // KEEP, but it grades a string this reader does not receive: on 5.7.7+
+            // the prepare is a BINARY `XaPrepareLogEvent`, so the arm that actually
+            // stops it is in `fill`, proven live by
+            // `a_prepared_xa_branch_is_never_published_by_another_transactions_commit`.
+            // Left here for the 5.7.0-5.7.6 spelling and as a second lock.
             "XA PREPARE 'x1'",
             "XA ROLLBACK 'x1'",
             "ROLLBACK",
@@ -1274,6 +2283,7 @@ mod tests {
             );
         }
     }
+
     use super::*;
 
     /// The compression guard's decision, offline. Anything unrecognized — an
@@ -1576,5 +2586,56 @@ mod tests {
                 other => panic!("{bad} must refuse, got {other:?}"),
             }
         }
+    }
+}
+
+/// The outcome of [`MysqlChangeStream::checkpoint_identity_verdict`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointIdentity {
+    /// Same server, and any recorded GTID set is still present.
+    Ok,
+    /// The checkpoint predates identity recording. Accepted, but SAID — an
+    /// unverifiable resume that says nothing is the silent half of the defect.
+    Unverifiable,
+    /// Written by a DIFFERENT server. Its coordinates address another binlog.
+    ForeignServer { checkpoint: String, server: String },
+    /// Same server, but the transactions the checkpoint names are gone —
+    /// `RESET MASTER`, or a rebuild that kept the uuid.
+    GtidNotContained { checkpoint: String, server: String },
+}
+
+impl CheckpointIdentity {
+    /// The refusal text, or `None` when the resume may proceed.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Ok | Self::Unverifiable => None,
+            Self::ForeignServer { checkpoint, server } => Some(format!(
+                "mysql cdc: this checkpoint was written by server `{checkpoint}` and \
+                 the connection is to `{server}`. Binlog coordinates are per-server: \
+                 resuming would start at an arbitrary point in a DIFFERENT binlog, \
+                 capturing whatever is there and skipping whatever was between — \
+                 silently, in both directions. If the source genuinely moved \
+                 (a failover, a restore), re-snapshot (`mode: full`) and start CDC \
+                 from a fresh checkpoint; the old coordinates cannot be carried over."
+            )),
+            Self::GtidNotContained { checkpoint, server } => Some(format!(
+                "mysql cdc: the checkpoint's GTID set `{checkpoint}` is not contained \
+                 in the server's executed set `{server}` — the same server no longer \
+                 has those transactions, which is what a `RESET MASTER` or a rebuild \
+                 leaves behind. The coordinates address a binlog that no longer \
+                 exists. Re-snapshot (`mode: full`) and start from a fresh checkpoint."
+            )),
+        }
+    }
+
+    /// What to WARN about when the resume proceeds but could not be verified.
+    pub(crate) fn warning(&self) -> Option<&'static str> {
+        matches!(self, Self::Unverifiable).then_some(
+            "mysql cdc: this checkpoint carries no server identity, so rivet cannot \
+             confirm it belongs to the server it is resuming against. It was written \
+             before rivet recorded one. Binlog coordinates are per-server — if this \
+             config has ever been pointed at a different host, delete the checkpoint \
+             and re-snapshot rather than trusting the resume.",
+        )
     }
 }

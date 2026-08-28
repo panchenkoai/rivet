@@ -3,7 +3,7 @@
 //!
 //! The point is **structural** typing: temporals are extracted from the driver
 //! value's own components (`mysql::Value::Date(y, m, d, …)`), never re-parsed from
-//! a rendered string — so the naive-timestamp hazard CLAUDE.md forbids never
+//! a rendered string — so the naive-timestamp hazard the process rules forbids never
 //! arises. Decimals are carried as their exact source bytes and converted to
 //! `Decimal128` losslessly at build time.
 //!
@@ -90,7 +90,16 @@ impl RivetValue {
             | RivetValue::TimeMicros(_) => 8,
             RivetValue::DateTime(_) => 12,
             RivetValue::Bytes(b) => b.len(),
-            RivetValue::Array(v) => v.iter().map(RivetValue::estimated_bytes).sum::<usize>() + 16,
+            // The Vec's SLOTS plus the elements — the same accounting
+            // `ChangeEvent::estimated_bytes` gives the top-level image. A flat `+ 16`
+            // charged a 1000-element `integer[]` 8 KB where its slots alone are 32 KB
+            // (`size_of::<RivetValue>()` is 32), so an array-heavy PostgreSQL table
+            // under-counted ~4x — and up to ~32x on an all-NULL array, where the
+            // elements cost 1 byte each and the slots cost everything.
+            RivetValue::Array(v) => {
+                v.capacity() * std::mem::size_of::<RivetValue>()
+                    + v.iter().map(RivetValue::estimated_bytes).sum::<usize>()
+            }
         }
     }
 

@@ -68,7 +68,7 @@ fn probe_failed(e: &anyhow::Error) -> DoctorCheck {
 /// Entry point: every CDC health check for the config, or empty when the
 /// config has no `mode: cdc` exports. A connection failure becomes a single
 /// failed check rather than aborting doctor.
-pub(super) fn collect(config: &Config) -> Vec<DoctorCheck> {
+pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<DoctorCheck> {
     let cdc: Vec<&ExportConfig> = config
         .exports
         .iter()
@@ -84,11 +84,11 @@ pub(super) fn collect(config: &Config) -> Vec<DoctorCheck> {
     let tls = config.source.tls.as_ref();
     let result = match config.source.source_type {
         SourceType::Postgres => pg_checks(&url, tls, &cdc),
-        SourceType::Mysql => mysql_checks(&url, tls, &cdc),
-        SourceType::Mssql => mssql_checks(&url, tls, &cdc),
+        SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir),
+        SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir),
         // Change streams: probe the replica-set requirement + declare the capture
         // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
-        SourceType::Mongo => mongo_checks(&url, tls, &cdc),
+        SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir),
     };
     result.unwrap_or_else(|e| vec![probe_failed(&e)])
 }
@@ -127,27 +127,104 @@ pub(crate) fn pg_retained_wal_warning(
     ))
 }
 
-/// The same question for slots this config does NOT own. These are the dangerous
-/// ones: nobody is draining them, so the WAL they pin is pinned forever — measured
-/// live at 9 abandoned slots holding 1.5 GiB each on a dev stand.
-pub(crate) fn pg_foreign_slots_warning(foreign: &[(String, i64)]) -> Option<String> {
-    let worst = foreign.iter().max_by_key(|(_, b)| *b)?;
+/// The same question for slots the CALLER did not name as its own.
+///
+/// Two callers with different knowledge, so this reports a FACT and leaves the
+/// verdict to them. `doctor` sees the whole config and can name every CDC slot it
+/// owns, so a leftover really is a leftover and it offers the drop command. A
+/// `run` sees ONE export (`CdcCapture` carries a single `cdc_cfg`), so from there a
+/// sibling export's slot — drained by the same `rivet run` a moment later — is
+/// indistinguishable from an abandoned one. Telling that operator "nothing is
+/// draining them, drop it" destroys a live resume anchor, which is why the run
+/// path passes `may_be_owned_elsewhere` and gets wording without a verdict.
+///
+/// `NOT active` is not evidence of abandonment either, and specifically not for
+/// rivet: the PostgreSQL adapter reads through `pg_logical_slot_peek_changes`, so
+/// its own slots sit `active = false` between runs BY CONSTRUCTION. Whatever this
+/// says has to survive that.
+///
+/// The SUM matters as much as the max. The hazard is a filling disk, and a disk is
+/// filled by the total: eight slots at 334 MiB each is 2 GiB of pinned WAL that a
+/// max-only test calls "small". Measured on a dev stand, where exactly that set
+/// reported OK.
+///
+/// `slot_type` rides the listing because a PHYSICAL slot belongs to a standby, not
+/// to a CDC consumer — it pins WAL just the same and is worth reporting, but
+/// dropping one breaks replication, so it must be visibly not a leftover.
+pub(crate) fn pg_foreign_slots_warning(
+    foreign: &[(String, i64, String)],
+    may_be_owned_elsewhere: bool,
+) -> Option<String> {
     let bar = retained_wal_bar();
-    if worst.1 < bar {
+    let total: i64 = foreign.iter().map(|(_, b, _)| *b).sum();
+    // The empty-list early return, said explicitly. It used to ride on the `?` of a
+    // `max_by_key` whose value the guard below then compared — and when that
+    // comparison turned out to be redundant, removing it would have taken the
+    // early return with it silently. A `?` doing two jobs is one job too many.
+    if foreign.is_empty() {
         return None;
     }
-    let listing = foreign
+    // `total < bar` ALONE, and the removed `worst.1 < bar &&` is why: `total` is the
+    // sum and `worst` the max over the same non-negative list, so `total >= worst.1`
+    // always — the first clause can never decide anything the second does not.
+    //
+    // Found by mutation testing rather than by reading: `replace < with <=` on the
+    // first clause survived, and no fixture could kill it. Reaching it needs
+    // `worst.1 == bar` together with `total < bar`, which is arithmetically
+    // impossible here. An unkillable mutant on a redundant clause is the clause
+    // asking to be deleted, not an exclusion to be written into mutants.toml.
+    if total < bar {
+        return None;
+    }
+    // Everything that contributes to a total past the bar is worth naming; a
+    // listing pruned to the offenders is unreadable when the finding IS the count.
+    let mut sorted: Vec<&(String, i64, String)> = foreign.iter().collect();
+    sorted.sort_by_key(|(_, b, _)| -*b);
+    let listing = sorted
         .iter()
-        .filter(|(_, b)| *b >= bar)
-        .map(|(n, b)| format!("{n} ({})", mib(*b)))
+        .take(10)
+        .map(|(n, b, kind)| {
+            if kind == "physical" {
+                format!(
+                    "{n} ({}, PHYSICAL — a standby's, not a CDC leftover)",
+                    mib(*b)
+                )
+            } else {
+                format!("{n} ({})", mib(*b))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    Some(format!(
-        "inactive slot(s) NOT owned by this config are pinning WAL: {listing} — nothing is \
-         draining them, so this WAL is pinned until someone acts. If the consumer is gone \
-         for good: SELECT pg_drop_replication_slot('{}')",
-        worst.0
-    ))
+    let more = foreign.len().saturating_sub(10);
+    let tail = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "inactive slot(s) are pinning WAL: {listing}{tail} — {} across {} slot(s)",
+        mib(total),
+        foreign.len()
+    );
+    Some(if may_be_owned_elsewhere {
+        format!(
+            "{head}. This run drains ONE export's slot and cannot tell whether another \
+             export in your config, or another tool, owns the rest — `rivet doctor -c \
+             <your config>` sees them all and will say which are genuinely unclaimed. \
+             Do NOT drop a slot on this warning alone"
+        )
+    } else {
+        format!(
+            "{head}, and none belongs to this config. If the consumer is gone for good: \
+             SELECT pg_drop_replication_slot('{}') — but never for a slot marked \
+             PHYSICAL, which is a standby's",
+            sorted
+                .iter()
+                .find(|(_, _, k)| k != "physical")
+                .map(|(n, _, _)| n.as_str())
+                .unwrap_or("<slot>")
+        )
+    })
 }
 
 fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorCheck {
@@ -187,37 +264,38 @@ fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorChe
 
 /// Verdict over *other* inactive slots on the instance — not this config's,
 /// but they pin WAL on the same disk (the abandoned-slot foot-gun).
-fn pg_foreign_slots_verdict(foreign: &[(String, i64)]) -> DoctorCheck {
+fn pg_foreign_slots_verdict(foreign: &[(String, i64, String)]) -> DoctorCheck {
     let name = "CDC other inactive slots".to_string();
     if foreign.is_empty() {
         return check(name, true, Some("none".into()), None);
     }
-    let worst = foreign.iter().max_by_key(|(_, b)| *b).expect("non-empty");
-    let listing = foreign
-        .iter()
-        .map(|(n, b)| format!("{n} ({})", mib(*b)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if worst.1 < PG_RETAINED_WAL_FAIL_BYTES {
-        check(
-            name,
-            true,
-            Some(format!("inactive but small: {listing}")),
-            None,
-        )
-    } else {
-        check(
-            name,
-            false,
-            Some(format!(
-                "inactive slot(s) pinning WAL: {listing} — an abandoned slot prevents WAL \
-                 recycling and fills the source disk"
-            )),
-            Some(format!(
-                "if the consumer is gone for good: SELECT pg_drop_replication_slot('{}');",
-                worst.0
-            )),
-        )
+    // `may_be_owned_elsewhere = false`: doctor was handed the whole config and
+    // excluded every CDC slot in it, so what is left really is unclaimed by rivet
+    // and the drop command is safe to offer. The run path cannot say that.
+    match pg_foreign_slots_warning(foreign, false) {
+        None => {
+            // NAMES and the total. The names were here before and an operator wants
+            // them — a lingering slot is worth knowing about while it is still
+            // small. The total is the addition: reporting only the max is what let
+            // 1.96 GiB across eight slots read as "small".
+            let total: i64 = foreign.iter().map(|(_, b, _)| *b).sum();
+            let listing = foreign
+                .iter()
+                .map(|(n, b, _)| format!("{n} ({})", mib(*b)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            check(
+                name,
+                true,
+                Some(format!(
+                    "inactive but small: {listing} — {} across {} slot(s)",
+                    mib(total),
+                    foreign.len()
+                )),
+                None,
+            )
+        }
+        Some(why) => check(name, false, Some(why), None),
     }
 }
 
@@ -248,11 +326,15 @@ fn pg_checks(
         ours.push(slot);
     }
     let rows = client.query(
-        "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+        "SELECT slot_name, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, \
+                slot_type \
          FROM pg_replication_slots WHERE NOT active AND slot_name <> ALL($1)",
         &[&ours],
     )?;
-    let foreign: Vec<(String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let foreign: Vec<(String, i64, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
     checks.push(pg_foreign_slots_verdict(&foreign));
     Ok(checks)
 }
@@ -352,8 +434,9 @@ fn mysql_ckpt_verdict(export: &str, ckpt: MysqlCkpt, logs: &[(String, u64)]) -> 
                          next run fails with ERROR 1236"
                     )),
                     Some(
-                        "re-snapshot the table (mode: full) and restart CDC from a fresh \
-                         checkpoint; size binlog retention above your CDC cadence"
+                        "restart CDC from a fresh checkpoint FIRST, then re-snapshot \
+                         (mode: full) — snapshotting first leaves the changes in between \
+                         in neither; size binlog retention above your CDC cadence"
                             .into(),
                     ),
                 );
@@ -374,6 +457,7 @@ fn mysql_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
 ) -> Result<Vec<DoctorCheck>> {
     use mysql::prelude::Queryable;
     let pool = crate::source::mysql::connect_pool(url, tls)?;
@@ -401,19 +485,46 @@ fn mysql_checks(
     for e in exports {
         let ckpt = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
             None => MysqlCkpt::NoPathConfigured,
-            Some(p) => match crate::source::cdc::Position::load(std::path::Path::new(p))? {
-                None => MysqlCkpt::NotYetWritten,
-                Some(pos) => {
-                    let file = pos
-                        .0
-                        .get("file")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let p = pos.0.get("pos").and_then(|v| v.as_u64()).unwrap_or(0);
-                    MysqlCkpt::Loaded { file, pos: p }
+            Some(raw) => {
+                let p = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+                match crate::source::cdc::Position::load(p)? {
+                    None => MysqlCkpt::NotYetWritten,
+                    // The SAME decoder the run uses. This read `file` with
+                    // `.unwrap_or_default()` and `pos` with `.unwrap_or(0)`, so a
+                    // malformed checkpoint rendered as `Loaded { file: "", pos: 0 }` and
+                    // was graded "below binlog retention (file purged) … ERROR 1236" with
+                    // a RE-SNAPSHOT hint — the wrong cause and a destructive remedy for a
+                    // file the run rejects as `checkpoint missing 'file'`.
+                    Some(pos) => {
+                        match crate::source::mysql::cdc::MysqlChangeStream::resume_from_checkpoint(
+                            Some(&pos),
+                            &p.display().to_string(),
+                        ) {
+                            Ok(Some((file, at))) => MysqlCkpt::Loaded { file, pos: at },
+                            Ok(None) => MysqlCkpt::NotYetWritten,
+                            // The malformed-file FAIL is the whole answer. Falling
+                            // through to `mysql_ckpt_verdict` printed a SECOND check under
+                            // the same name saying "no `cdc.checkpoint` configured" with a
+                            // hint to set one — factually false (a path IS configured) and
+                            // a no-op remedy the operator has already applied. Two
+                            // contradictory verdicts on one file is worse than either.
+                            Err(why) => {
+                                checks.push(check(
+                                    format!("CDC checkpoint (export '{}')", e.name),
+                                    false,
+                                    Some(why.to_string()),
+                                    Some(
+                                        "restore the file, or delete it to accept a fresh \
+                                     anchor at the current binlog position"
+                                            .into(),
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                 }
-            },
+            }
         };
         checks.push(mysql_ckpt_verdict(&e.name, ckpt, &logs));
     }
@@ -506,7 +617,8 @@ fn mssql_verdicts(
                                  cleanup job removed changes past it; the next run fails loudly"
                             )),
                             Some(
-                                "re-snapshot (mode: full) and restart CDC from a fresh checkpoint"
+                                "restart CDC from a fresh checkpoint, THEN re-snapshot (mode: full) — \
+                                 snapshotting first leaves the changes in between in neither"
                                     .into(),
                             ),
                         ));
@@ -551,28 +663,61 @@ fn mssql_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
 ) -> Result<Vec<DoctorCheck>> {
     let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
     let mut checks = Vec::new();
     for e in exports {
         let ci = e.cdc.as_ref().and_then(|c| c.capture_instance.as_deref());
         let health = src.cdc_health(ci)?;
+        // The SAME decision the run makes, not a second copy of it. This used to
+        // reach for `lsn` with `.and_then`, so a checkpoint that exists but carries
+        // no readable position collapsed to `Some(None)` and rendered as a PASSING
+        // "no checkpoint yet — the first run starts at the retained minimum".
+        // MEASURED: `doctor` exit 0 and `check` saying "Looks good" on the exact
+        // file `run` then hard-refuses. Both preflight claims were false — the file
+        // is present, and the run does not start at the minimum.
+        //
+        // `resume_from_checkpoint` is that decision, and it is where the reason
+        // lives; a failure here carries its message verbatim so the operator is
+        // told the same thing twice rather than two different things.
+        let mut ckpt_error: Option<String> = None;
         let ckpt_state = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
             None => None,
-            Some(p) => Some(
-                crate::source::cdc::Position::load(std::path::Path::new(p))?.and_then(|pos| {
-                    pos.0
-                        .get("lsn")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                }),
-            ),
+            Some(raw) => {
+                let p = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+                let pos = crate::source::cdc::Position::load(p)?;
+                match crate::source::mssql::cdc::resume_from_checkpoint(
+                    pos.as_ref(),
+                    &p.display().to_string(),
+                ) {
+                    Ok(r) => Some(r.from_lsn),
+                    Err(e) => {
+                        ckpt_error = Some(e.to_string());
+                        Some(None)
+                    }
+                }
+            }
         };
         let mssql_health = MssqlHealth {
             cdc_enabled: health.cdc_enabled,
             instance_min_lsn: health.instance_min_lsn,
             agent_running: health.agent_running,
         };
+        // A checkpoint the RUN would refuse is a FAIL here, carrying the run's own
+        // message — not a passing "no checkpoint yet".
+        if let Some(why) = ckpt_error {
+            checks.push(check(
+                format!("CDC checkpoint (export '{}')", e.name),
+                false,
+                Some(why),
+                Some(
+                    "restore the file, or delete it to accept a fresh anchor from the \
+                     retained minimum"
+                        .into(),
+                ),
+            ));
+        }
         checks.extend(mssql_verdicts(&e.name, ci, &mssql_health, ckpt_state));
     }
     Ok(checks)
@@ -587,10 +732,57 @@ fn mssql_checks(
 fn mongo_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
-    _exports: &[&ExportConfig],
+    exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
 ) -> Result<Vec<DoctorCheck>> {
     let cap = crate::source::mongo::cdc::probe_capability(url, tls)?;
     let mut checks = Vec::new();
+
+    // The checkpoint, which this took as `_exports` and never read. `create_change_
+    // stream`'s Mongo arm loads it and `Position::load` HARD-FAILS on a corrupt file,
+    // so the exact defect measured on SQL Server today — `doctor` exit 0 and `check`
+    // saying "Looks good" on a file the run then refuses — was live here too, on the
+    // engine whose resume position is a driver token nobody can hand-repair.
+    for e in exports {
+        let Some(raw) = e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) else {
+            continue;
+        };
+        let path = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+        let name = format!("CDC checkpoint (export '{}')", e.name);
+        match crate::source::cdc::Position::load(path) {
+            Ok(None) => checks.push(check(
+                name,
+                true,
+                Some("not written yet — the first run pins its own anchor".into()),
+                None,
+            )),
+            Ok(Some(pos)) => match crate::source::mongo::cdc::decode_resume_token(&pos.0) {
+                Ok(_) => checks.push(check(
+                    name,
+                    true,
+                    Some("resume token readable".into()),
+                    None,
+                )),
+                Err(why) => checks.push(check(
+                    name,
+                    false,
+                    Some(format!("{why} — the run refuses this file")),
+                    Some(
+                        "restore the checkpoint, or delete it to accept a fresh anchor at \
+                         the current cluster time (which SKIPS everything since it was \
+                         written — re-snapshot if that gap matters)"
+                            .into(),
+                    ),
+                )),
+            },
+            Err(why) => checks.push(check(
+                name,
+                false,
+                Some(why.to_string()),
+                Some("restore the file, or delete it to accept a fresh anchor".into()),
+            )),
+        }
+    }
     // Hard requirement: change streams need a replica set.
     checks.push(check(
         "CDC replica set".into(),
@@ -664,12 +856,106 @@ mod tests {
     #[test]
     fn pg_foreign_inactive_slots_fail_only_when_pinning_wal() {
         assert!(pg_foreign_slots_verdict(&[]).ok);
-        let small = pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 1 << 20)]);
+        let small =
+            pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 1 << 20, "logical".into())]);
         assert!(small.ok, "a small inactive slot is a note, not a failure");
-        assert!(small.detail.unwrap().contains("ingestr_leftover"));
-        let big = pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 5 << 30)]);
+        let d = small.detail.unwrap();
+        assert!(
+            d.contains("ingestr_leftover") && d.contains("1 slot(s)"),
+            "the healthy note carries BOTH — the name, because a lingering slot is \
+             worth knowing about while it is still small, and the total, because \
+             reporting only the max is what let 1.96 GiB across eight read as OK: {d}"
+        );
+        let big =
+            pg_foreign_slots_verdict(&[("ingestr_leftover".into(), 5 << 30, "logical".into())]);
         assert!(!big.ok, "an abandoned slot pinning GiBs fails");
-        assert!(big.hint.unwrap().contains("ingestr_leftover"));
+        assert!(big.detail.unwrap().contains("ingestr_leftover"));
+    }
+
+    /// The hazard is a FILLING DISK, and a disk is filled by the total. Measured on
+    /// a dev stand: eight inactive slots at ~334 MiB each — 1.96 GiB pinned — and
+    /// the max-only test called them "inactive but small", OK.
+    #[test]
+    fn a_fleet_of_sub_threshold_slots_still_fills_the_disk() {
+        let third = PG_RETAINED_WAL_FAIL_BYTES / 3;
+        let fleet: Vec<(String, i64, String)> = (0..8)
+            .map(|i| (format!("orphan_{i}"), third, "logical".to_string()))
+            .collect();
+        assert!(
+            fleet
+                .iter()
+                .all(|(_, b, _)| *b < PG_RETAINED_WAL_FAIL_BYTES),
+            "the fixture must be under the bar per-slot or it proves nothing about the sum"
+        );
+        let w = pg_foreign_slots_warning(&fleet, false)
+            .expect("8 slots at a third of the bar is 2.6x the bar in total");
+        assert!(
+            w.contains("8 slot(s)"),
+            "say how many, or an operator cannot tell an aggregate finding from a \
+             single fat slot: {w}"
+        );
+    }
+
+    /// A PHYSICAL slot belongs to a standby. It pins WAL like any other and is worth
+    /// reporting — but `pg_drop_replication_slot` on one breaks replication, so it
+    /// must never be the slot the hint names.
+    #[test]
+    fn a_physical_slot_is_reported_but_never_the_one_the_drop_hint_names() {
+        let w = pg_foreign_slots_warning(
+            &[
+                (
+                    "standby_1".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES * 4,
+                    "physical".into(),
+                ),
+                (
+                    "dead_logical".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES,
+                    "logical".into(),
+                ),
+            ],
+            false,
+        )
+        .expect("both are past the bar");
+        assert!(
+            w.contains("standby_1") && w.contains("PHYSICAL"),
+            "report it — it really is pinning WAL: {w}"
+        );
+        assert!(
+            w.contains("pg_drop_replication_slot('dead_logical')"),
+            "but the ready-to-paste command must name the LOGICAL one, even though the \
+             physical slot is the biggest: {w}"
+        );
+    }
+
+    /// A `run` sees ONE export, so a sibling export's slot is indistinguishable from
+    /// an abandoned one. Telling that operator to drop it destroys a live resume
+    /// anchor — and rivet's own PG slots sit `active = false` between runs by
+    /// construction, because the adapter reads through `pg_logical_slot_peek_changes`.
+    #[test]
+    fn the_run_path_reports_the_wal_but_never_the_verdict() {
+        let one = [(
+            "someone_elses".to_string(),
+            PG_RETAINED_WAL_FAIL_BYTES,
+            "logical".to_string(),
+        )];
+        let from_run = pg_foreign_slots_warning(&one, true).expect("past the bar");
+        assert!(
+            !from_run.contains("pg_drop_replication_slot"),
+            "a run must not hand over a command that can destroy a sibling export's \
+             resume anchor: {from_run}"
+        );
+        assert!(
+            from_run.contains("rivet doctor"),
+            "...it must point at the tool that CAN answer the ownership question: \
+             {from_run}"
+        );
+        let from_doctor = pg_foreign_slots_warning(&one, false).expect("past the bar");
+        assert!(
+            from_doctor.contains("pg_drop_replication_slot"),
+            "doctor was handed the whole config and excluded every slot in it, so it \
+             may say so: {from_doctor}"
+        );
     }
 
     // ── MySQL verdicts ──
@@ -849,10 +1135,10 @@ mod slot_retention_warning_tests {
     /// WAL is pinned until a human acts. Measured live at 9 abandoned slots holding
     /// 1.5 GiB each on a dev stand.
     #[test]
-    fn foreign_slots_warn_only_past_the_bar_and_list_only_the_offenders() {
-        assert_eq!(pg_foreign_slots_warning(&[]), None);
+    fn foreign_slots_warn_past_the_bar_and_report_the_aggregate() {
+        assert_eq!(pg_foreign_slots_warning(&[], false), None);
         assert_eq!(
-            pg_foreign_slots_warning(&[("small".into(), 1024)]),
+            pg_foreign_slots_warning(&[("small".into(), 1024, "logical".into())], false),
             None,
             "an inactive slot holding a KiB is not a hazard; warning about it teaches \
              operators to ignore the message"
@@ -865,42 +1151,128 @@ mod slot_retention_warning_tests {
         // function's boundary and not its twin's is exactly the asymmetry mutation
         // testing exists to find; reading the two tests side by side does not show it.
         assert!(
-            pg_foreign_slots_warning(&[("at_the_bar".into(), PG_RETAINED_WAL_FAIL_BYTES)])
-                .is_some(),
+            pg_foreign_slots_warning(
+                &[(
+                    "at_the_bar".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES,
+                    "logical".into()
+                )],
+                false
+            )
+            .is_some(),
             "a slot sitting exactly ON the bar must be reported — `<=` here would let \
              the single most common boundary value through in silence"
         );
         assert_eq!(
-            pg_foreign_slots_warning(&[("under".into(), PG_RETAINED_WAL_FAIL_BYTES - 1)]),
+            pg_foreign_slots_warning(
+                &[(
+                    "under".into(),
+                    PG_RETAINED_WAL_FAIL_BYTES - 1,
+                    "logical".into()
+                )],
+                false
+            ),
             None,
             "...and one byte under it must not be"
         );
 
+        // The PHYSICAL label, and that it is not applied to a logical slot. Mutating
+        // `kind == "physical"` to `!=` survived: nothing asserted the label appears
+        // on the right one, so the two renderings were interchangeable.
+        let phys = pg_foreign_slots_warning(
+            &[(
+                "standby".into(),
+                PG_RETAINED_WAL_FAIL_BYTES + 1,
+                "physical".into(),
+            )],
+            false,
+        )
+        .expect("past the bar");
+        assert!(
+            phys.contains("PHYSICAL — a standby's"),
+            "a physical slot must be labelled — the drop hint must never name a \
+             standby's slot as a CDC leftover: {phys}"
+        );
+        let logi = pg_foreign_slots_warning(
+            &[(
+                "leftover".into(),
+                PG_RETAINED_WAL_FAIL_BYTES + 1,
+                "logical".into(),
+            )],
+            false,
+        )
+        .expect("past the bar");
+        assert!(
+            !logi.contains("PHYSICAL — a standby's"),
+            "...and a logical one must NOT be. Asserted on the per-slot LABEL, not on \
+             the word: the message's closing caveat says `never for a slot marked \
+             PHYSICAL` regardless, so a bare substring check passes on every input \
+             and grades nothing: {logi}"
+        );
+
+        // The `and N more` tail's boundary. `more > 0` survived three mutants
+        // (`==`, `>=`, `<`) because no fixture ever had exactly ten slots — the
+        // listing takes 10, so ten is the one count at which the tail must be
+        // ABSENT and eleven the one at which it must appear.
+        let many = |n: usize| -> String {
+            let slots: Vec<(String, i64, String)> = (0..n)
+                .map(|i| {
+                    (
+                        format!("s{i}"),
+                        PG_RETAINED_WAL_FAIL_BYTES + 1 + i as i64,
+                        "logical".to_string(),
+                    )
+                })
+                .collect();
+            pg_foreign_slots_warning(&slots, false).expect("past the bar")
+        };
+        assert!(
+            !many(10).contains("more"),
+            "exactly ten slots all fit in the listing — a tail here would claim \
+             something was hidden when nothing was: {}",
+            many(10)
+        );
+        assert!(
+            many(11).contains("and 1 more"),
+            "and the eleventh must be counted, or the operator reads a truncated \
+             listing as the whole set: {}",
+            many(11)
+        );
+
         let big = PG_RETAINED_WAL_FAIL_BYTES + 1;
-        let w = pg_foreign_slots_warning(&[
-            ("small".into(), 4096),
-            ("orphan_a".into(), big),
-            ("orphan_b".into(), big * 2),
-        ])
+        let w = pg_foreign_slots_warning(
+            &[
+                ("small".into(), 4096, "logical".into()),
+                ("orphan_a".into(), big, "logical".into()),
+                ("orphan_b".into(), big * 2, "logical".into()),
+            ],
+            false,
+        )
         .expect("two slots past the bar must be reported");
         assert!(
             w.contains("orphan_a") && w.contains("orphan_b"),
             "list every offender, not just the worst — an operator fixing one and \
              re-running should not have to discover the rest one at a time: {w}"
         );
+        // The listing now INCLUDES sub-bar slots, deliberately: the hazard is a
+        // filling disk and the aggregate is the finding, so hiding the small ones
+        // is what let 1.96 GiB across eight slots read as "inactive but small". It
+        // is capped at ten with a "and N more" tail instead.
         assert!(
-            !w.contains("small"),
-            "and NOT the ones under the bar, or the list is unreadable at the scale \
-             where it matters: {w}"
+            w.contains("small"),
+            "every contributor is listed — the total is what matters: {w}"
         );
         assert!(
             w.contains("pg_drop_replication_slot('orphan_b')"),
             "the ready-to-paste command should name the WORST one: {w}"
         );
+        // The doctor form says none of these belongs to the config — it was handed
+        // the whole config and can. The run form deliberately does not: see
+        // `the_run_path_reports_the_wal_but_never_the_verdict`.
         assert!(
-            w.contains("nothing is draining them"),
-            "say why this differs from our own backlog — that distinction is the \
-             reason there are two warnings: {w}"
+            w.contains("none belongs to this config"),
+            "doctor's form may state ownership, which is what makes its drop hint \
+             safe to offer: {w}"
         );
     }
 }

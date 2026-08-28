@@ -151,18 +151,205 @@ fn unit_overrides(
     crate::types::overrides_for_unit(all, table.or(export.table.as_deref()))
 }
 
+/// What to do when a CDC capture instance cannot be resolved to its relation.
+///
+/// The two callers have different stakes, and one shared decision was wrong for one
+/// of them. `rivet check --type-report` is run BEFORE `sp_cdc_enable_table`, so an
+/// unreadable cdc catalog is its NORMAL state and a report describing the configured
+/// relation is useful. `rivet load` PLANS the warehouse DDL from the same reports —
+/// and `collect_type_reports`' own docstring says a report that cannot be collected
+/// is an ERROR there, because a missing report is a table that silently does not
+/// load. Round-5 made the lookup advisory for both, which turned the load's failure
+/// from missing into WRONG: DDL from one relation, parquet from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUnresolvedCapture {
+    /// Type the configured relation and warn — the preflight's stance.
+    Degrade,
+    /// Refuse: a wrong warehouse schema is worse than no answer.
+    Fail,
+}
+
+/// Where a report is being collected FROM, and on whose behalf.
+///
+/// Grouped rather than passed loose because the last field is a stance, not a
+/// datum: two callers with different stakes must each state it (see
+/// [`OnUnresolvedCapture`]), and a bare trailing bool at a 7-argument call site is
+/// exactly the kind of thing that gets copied wrong.
+pub struct ReportContext<'a> {
+    pub target: Option<ExportTarget>,
+    pub config_dir: &'a std::path::Path,
+    pub params: Option<&'a std::collections::HashMap<String, String>>,
+    pub on_unresolved: OnUnresolvedCapture,
+}
+
+/// Why a capture instance did not resolve — the input to WHICH repair to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unresolved {
+    Resolved,
+    /// The catalog was readable and holds no row for this instance.
+    NoRow,
+    /// The catalog itself could not be read.
+    Unreadable,
+}
+
+/// Can the configured `table:` name its relation WITHOUT the catalog?
+///
+/// A schema-qualified name can: it means one relation on any connection, whatever
+/// the session's default schema. A bare name cannot — that is the whole reason the
+/// capture-instance resolution exists.
+pub(crate) fn degrade_is_unambiguous(configured: Option<&str>) -> bool {
+    configured.is_some_and(|t| t.contains('.'))
+}
+
+/// Must an unresolvable capture instance REFUSE, rather than degrade?
+///
+/// Only when both are true: this caller plans something from the answer
+/// ([`OnUnresolvedCapture::Fail`]), AND the configured name cannot stand in for the
+/// catalog's. Round 6 keyed this off the error variant instead, which left the
+/// `Ok(None)` branch degrading under `Fail` — and refused schema-qualified configs
+/// the catalog was not needed for, killing loads of artifacts already on disk.
+pub(crate) fn unresolved_capture_is_fatal(
+    on_unresolved: OnUnresolvedCapture,
+    configured: Option<&str>,
+) -> bool {
+    on_unresolved == OnUnresolvedCapture::Fail && !degrade_is_unambiguous(configured)
+}
+
 pub fn collect_reports(
     config: &Config,
     export: &ExportConfig,
     column_overrides: &ColumnOverrides,
     policy: &TypePolicy,
-    target: Option<ExportTarget>,
-    config_dir: &std::path::Path,
-    params: Option<&std::collections::HashMap<String, String>>,
+    ctx: ReportContext<'_>,
 ) -> Result<Vec<ExportTypeReport>> {
-    let units = report_units(export, config_dir, params)?;
+    let ReportContext {
+        target,
+        config_dir,
+        params,
+        on_unresolved,
+    } = ctx;
+    let mut units = report_units(export, config_dir, params)?;
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
+
+    // The THIRD reading of one config, and it must agree with the other two.
+    //
+    // On SQL Server a CDC export's `capture_instance:` names its source object in
+    // the catalog, and the configured `table:` may be a bare name that resolves
+    // elsewhere. The extract follows the catalog (`resolved_identity`, and the
+    // snapshot leg's plan-time lookup); this probe was still doing `SELECT * FROM
+    // <configured>` in the connection's default schema. Round-4 MEASURED the split:
+    // `rivet check` reported a decoy's columns and row count with verdict
+    // ACCEPTABLE while the run wrote the captured relation's — and `rivet load`
+    // PLANS the warehouse schema from these very reports, so it would create
+    // `<table>__changes` with one relation's columns and feed it the other's
+    // parquet. Before the resolution landed all three were wrong TOGETHER, which is
+    // consistent and survivable; disagreeing is not.
+    if config.source.source_type == SourceType::Mssql
+        && let Some(cdc) = &export.cdc
+        && let Some(ci) = &cdc.capture_instance
+    {
+        // Which stance applies is decided by ONE question, and round 6 asked the
+        // wrong one: not "did the catalog read fail?" but "can the configured string
+        // name the relation on its own?" Gating on the error VARIANT left the
+        // `Ok(None)` branch — a disabled instance, a typo, CDC not yet enabled —
+        // degrading under `Fail` too, which is exactly the branch where degrading is
+        // wrong. MEASURED: a load then planned `amount` as BIGNUMERIC from a decoy's
+        // DECIMAL(18,4) while the parquet held the captured table's INT; every column
+        // NAME matched, so every row loaded and every count agreed.
+        //
+        // A SCHEMA-QUALIFIED `table:` is unambiguous without the catalog — it names
+        // one relation on any connection, whatever the default schema — so degrading
+        // to it is safe for either caller. A BARE name is not, and that is the only
+        // case where the two callers must part.
+        let resolved = crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls);
+        // WHY it is unresolved decides which repair to name. Round 8: the single
+        // remedy "restore access to the cdc schema" was inert on the no-row branch,
+        // which is reached with cdc access working — the same shape (a remedy correct
+        // on one cause, wrong on the other) that round 6 had just removed.
+        let resolved_kind = match &resolved {
+            Ok(Some(_)) => Unresolved::Resolved,
+            Ok(None) => Unresolved::NoRow,
+            Err(_) => Unresolved::Unreadable,
+        };
+        let why = match &resolved {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(format!(
+                "capture instance '{ci}' is not in cdc.change_tables (CDC not enabled \
+                 yet, disabled since, or a typo)"
+            )),
+            Err(e) => Some(format!(
+                "could not read cdc.change_tables for '{ci}': {e:#}"
+            )),
+        };
+        match (resolved, why) {
+            (Ok(Some((schema, table))), _) => {
+                for (unit, query) in units.iter_mut() {
+                    if unit.is_none() {
+                        *query = format!("SELECT * FROM {schema}.{table}");
+                    }
+                }
+            }
+            (_, Some(why)) => {
+                let configured = export.table.as_deref();
+                if unresolved_capture_is_fatal(on_unresolved, configured) {
+                    // The remedy is branched off the CAUSE, and it leads with the one
+                    // that does not change the export's identity. Round 8 caught both
+                    // halves of the first version: it offered "restore access to the
+                    // cdc schema" on a branch reached WITH cdc access working, and
+                    // prescribed qualifying the name without saying what that does —
+                    // `warehouse_table_name` folds the dot, so `orders` becomes
+                    // `dbo_orders` and the load silently starts filling a NEW, empty
+                    // warehouse table while the old one is left behind, stale and
+                    // still read downstream. The `log::info!` announcing the fold is
+                    // invisible at the default level. A hint that repoints the
+                    // destination is not a fix, it is a second incident.
+                    let remedy = if matches!(resolved_kind, Unresolved::NoRow) {
+                        "Enable capture on the table (`sys.sp_cdc_enable_table`) or \
+                         correct `capture_instance:`"
+                    } else {
+                        "Restore this login's SELECT on the cdc schema"
+                    };
+                    anyhow::bail!(
+                        "mssql: {why}, and `table: {}` is a BARE name — which relation it \
+                         means depends on the connection's default schema, so rivet cannot \
+                         say what these artifacts hold. The warehouse schema is planned \
+                         from this report, so guessing would create the load table with \
+                         one relation's columns and feed it another's parquet, with every \
+                         name matching and every count agreeing. {remedy}. Qualifying \
+                         `table:` as `schema.table` also works, but change it knowingly: \
+                         the warehouse table name is derived from it (a dot folds to an \
+                         underscore), so the load would start writing to a DIFFERENT, \
+                         empty table and leave the current one behind.",
+                        configured.unwrap_or("<none>")
+                    );
+                }
+                log::warn!(
+                    "mssql: {why} — typing `{}` as the connection resolves it. {}",
+                    configured.unwrap_or("the export"),
+                    if degrade_is_unambiguous(configured) {
+                        // Claims unambiguity of the NAME only. The first version said
+                        // "the same relation the catalog would have named", which rivet
+                        // has not established and which round 8 measured FALSE: a
+                        // qualified `table:` pointing at a decoy while
+                        // `capture_instance:` names another relation made `check` print
+                        // ACCEPTABLE / "Looks good." over the decoy's types for a config
+                        // `run` refuses outright.
+                        "The name is schema-qualified, so it means one relation on any \
+                         connection — but rivet could not confirm it is the one the \
+                         capture instance emits; `rivet run` checks that against the \
+                         catalog and will refuse if they disagree."
+                    } else {
+                        "The name is BARE, so this is whatever the connection's default \
+                         schema resolves it to — qualify it as `schema.table` if the \
+                         captured relation lives elsewhere (note that changes the \
+                         warehouse table name, which is derived from it)."
+                    }
+                );
+            }
+            (Err(_), None) | (Ok(None), None) => unreachable!("every non-resolution has a reason"),
+        }
+    }
 
     let mut src: Box<dyn source::Source> = match config.source.source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
@@ -570,6 +757,49 @@ fn rivet_type_label(t: &crate::types::RivetType) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The two callers must DIVERGE, and only where divergence is warranted.
+    ///
+    /// Round 7 found the whole `OnUnresolvedCapture` split ungraded: flipping the
+    /// load's stance to `Degrade` — literally reopening the harm it was added to
+    /// prevent — left lib and offline suites entirely green, because nothing
+    /// anywhere referenced the enum outside the two product files. The split is the
+    /// commit's central behavioural change and had no oracle.
+    ///
+    /// It also found the axis wrong. Keying the refusal off the error VARIANT left
+    /// `Ok(None)` degrading under `Fail` (the branch where degrading is exactly the
+    /// documented harm) while refusing schema-qualified configs that never needed
+    /// the catalog — killing loads of artifacts already complete on disk.
+    #[test]
+    fn only_a_bare_name_makes_an_unresolvable_capture_fatal_and_only_for_the_load() {
+        use super::{
+            OnUnresolvedCapture as On, degrade_is_unambiguous, unresolved_capture_is_fatal,
+        };
+
+        // The load refuses a BARE name: which relation it means depends on the
+        // connection, so planning a warehouse schema from it is a guess whose column
+        // NAMES all match — every row loads, every count agrees, the types are
+        // another relation's.
+        assert!(unresolved_capture_is_fatal(On::Fail, Some("orders")));
+        // ...and accepts a QUALIFIED one, because the catalog was never needed to
+        // read it. This arm is the one that killed a load of finished artifacts
+        // after `sp_cdc_disable_db`.
+        assert!(!unresolved_capture_is_fatal(On::Fail, Some("dbo.orders")));
+
+        // `check` never refuses: it is run BEFORE `sp_cdc_enable_table`, so an
+        // unreadable cdc catalog is its normal state, and a report over the
+        // configured relation is what the operator came for.
+        assert!(!unresolved_capture_is_fatal(On::Degrade, Some("orders")));
+        assert!(!unresolved_capture_is_fatal(
+            On::Degrade,
+            Some("dbo.orders")
+        ));
+
+        // A `query:`-only export has no `table:` at all; there is nothing to stand in
+        // for the catalog, so the load must not plan from a guess either.
+        assert!(unresolved_capture_is_fatal(On::Fail, None));
+        assert!(!degrade_is_unambiguous(None));
+    }
+
     use super::*;
     use crate::types::{RivetType, TypeFidelity};
 
@@ -715,7 +945,7 @@ mod tests {
         // it: an earlier version of this test rsplit the schema off ITSELF and
         // compared two `overrides_for_table` calls, so it stayed green against a
         // product that had stopped narrowing at all (the self-oracle class in
-        // CLAUDE.md). `overrides_for_unit` is the single function every call
+        // the process rules). `overrides_for_unit` is the single function every call
         // site — capture and resolver — now routes through, so mutating it goes
         // RED here.
         let unit = "public.orders";

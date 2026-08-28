@@ -7,7 +7,7 @@
 //! resolver). Borrowed from dlt's `assert_all_data_types_row`: one oracle, keyed
 //! on the destination's declared capabilities, over many destinations.
 //!
-//! What it enforces is the remediation contract recorded in CLAUDE.md: a
+//! What it enforces is the remediation contract recorded in the process rules: a
 //! post-load `cast_sql` exists **only** to bridge an autoload divergence, and
 //! **only** when that bridge is lossless. A lossy divergence (a `UINT64` that has
 //! already overflowed to `INT64` on autoload, a naive timestamp) yields

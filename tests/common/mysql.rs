@@ -121,3 +121,131 @@ pub fn mysql_globals_guard() -> MysqlGlobalsGuard {
     }
     MysqlGlobalsGuard { _file: file }
 }
+
+/// RAII guard for a MySQL GLOBAL variable — restores the PREVIOUS value on scope
+/// exit, not a hard-coded default.
+///
+/// The sibling of [`crate::common::pg::PgSetting`], and the reason it captures the
+/// prior value rather than resetting: `binlog_row_image` and `binlog_row_metadata`
+/// are exactly the settings a stand may already have tuned away from the server
+/// default, and a guard that "restores" a guess leaves the stand drifted in a way
+/// the next test blames on the product.
+///
+/// No restart: every variable this is used for is dynamic.
+pub struct MysqlGlobal {
+    name: String,
+    prev: String,
+}
+
+impl MysqlGlobal {
+    pub fn set(name: &str, value: &str) -> Self {
+        use mysql::prelude::Queryable;
+        let mut c = mysql_connect();
+        let prev: String = c
+            .query_first::<String, _>(format!("SELECT @@GLOBAL.{name}"))
+            .unwrap_or_else(|e| panic!("read @@GLOBAL.{name}: {e}"))
+            .unwrap_or_else(|| panic!("@@GLOBAL.{name} does not exist"));
+        c.query_drop(format!("SET GLOBAL {name} = '{value}'"))
+            .unwrap_or_else(|e| panic!("SET GLOBAL {name} = {value}: {e}"));
+        Self {
+            name: name.to_string(),
+            prev,
+        }
+    }
+
+    /// What the server reports NOW — assert the flip landed before concluding
+    /// anything from a probe that depends on it.
+    pub fn current(name: &str) -> String {
+        use mysql::prelude::Queryable;
+        mysql_connect()
+            .query_first::<String, _>(format!("SELECT @@GLOBAL.{name}"))
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for MysqlGlobal {
+    fn drop(&mut self) {
+        use mysql::prelude::Queryable;
+        if let Ok(mut c) = std::panic::catch_unwind(mysql_connect) {
+            let _ = c.query_drop(format!("SET GLOBAL {} = '{}'", self.name, self.prev));
+        }
+    }
+}
+
+/// Seed ONE transaction spanning `ids` — the fixture an oversized-transaction test
+/// needs, and a scenario rather than a `format!` in a test body.
+///
+/// A single `START TRANSACTION … COMMIT`, because the subject is a transaction
+/// LARGER than the in-memory cap: N separate one-row transactions never reach the
+/// cap however many of them there are.
+///
+/// Shaped for [`crate::common::cdc_id_ops`] and for the DuckDB census — `(id, v)`
+/// integers plus a wide `pad`, so a row cap and a BYTE cap are both reachable, and
+/// the source table's row count equals the delivered change count on an
+/// insert-only fixture.
+pub fn mysql_seed_one_transaction(
+    c: &mut mysql::PooledConn,
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+) {
+    mysql_seed_one_transaction_wide(c, table, ids, 200);
+}
+
+/// [`mysql_seed_one_transaction`] with the `pad` width chosen — the HEAVY-row
+/// fixture, which crosses the BYTE cap where a narrow one only crosses the row cap.
+///
+/// MySQL has no `generate_series`, so the rows are batched into multi-row `INSERT`s
+/// inside ONE explicit transaction: still a single transaction at any size, without
+/// a round trip per row (a million of those measures the driver, not rivet).
+pub fn mysql_seed_one_transaction_wide(
+    c: &mut mysql::PooledConn,
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+    pad: usize,
+) {
+    use mysql::prelude::Queryable;
+    const PER_STATEMENT: usize = 1000;
+    c.query_drop("START TRANSACTION").expect("begin");
+    let mut it = ids.peekable();
+    while it.peek().is_some() {
+        let values: Vec<String> = it
+            .by_ref()
+            .take(PER_STATEMENT)
+            .map(|i| format!("({i}, {i}, REPEAT('x', {pad}))"))
+            .collect();
+        c.query_drop(format!("INSERT INTO {table} VALUES {}", values.join(", ")))
+            .expect("insert");
+    }
+    c.query_drop("COMMIT").expect("commit");
+}
+
+/// Seed a transaction whose rows REACH the binlog and are then closed with
+/// `ROLLBACK` — the shape that leaves a discarded buffer for the next transaction.
+///
+/// MEASURED on the stand, because the obvious fixture does not work: in a mixed
+/// InnoDB+MyISAM transaction MySQL logs ONLY the MyISAM rows and rolls the InnoDB
+/// ones back without writing them, so a captured InnoDB table has nothing in rivet's
+/// buffer when the ROLLBACK arrives and the test passes on the broken code. Probed
+/// with `SHOW BINLOG EVENTS`: the window holds `Table_map(probe_ntx)`,
+/// `Write_rows`, `Query` — no trace of the InnoDB inserts.
+///
+/// So the CAPTURED table must be the non-transactional one. `table` is expected to
+/// be `ENGINE=MyISAM`; its rows cannot be rolled back, so the server keeps them,
+/// logs them, and closes the statement with `ROLLBACK` instead of an `Xid`.
+pub fn mysql_seed_rolled_back_transaction(
+    c: &mut mysql::PooledConn,
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+) {
+    use mysql::prelude::Queryable;
+    c.query_drop("START TRANSACTION").expect("begin");
+    for i in ids {
+        c.query_drop(format!(
+            "INSERT INTO {table} VALUES ({i}, {i}, REPEAT('r', 8))"
+        ))
+        .expect("insert into the captured non-transactional table");
+    }
+    c.query_drop("ROLLBACK").expect("rollback");
+}

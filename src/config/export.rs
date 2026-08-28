@@ -93,6 +93,25 @@ pub struct ExportConfig {
     /// config reference.
     #[serde(skip)]
     pub snapshot_parent: Option<String>,
+
+    /// The CONFIGURED table string this snapshot leg stands for, when it differs
+    /// from the relation the leg READS.
+    ///
+    /// They diverge on SQL Server, where the capture instance names the source
+    /// object in the catalog and the configured `table:` may be a bare name that
+    /// resolves elsewhere. Everything an operator or a later run keys on — the
+    /// destination sub-prefix, the leg's name, the snapshot-done row in the state
+    /// DB — must stay on the LABEL, while only the read follows the catalog.
+    ///
+    /// Round-4 found the fifth consumer of that string the split had missed:
+    /// `mark_snapshot_done` wrote the READ while `snapshot_done` asked for the
+    /// LABEL, so the durable "this table is backfilled" signal could never match
+    /// itself and every scheduled cycle re-snapshotted the whole table (silently,
+    /// `status: success`, one duplicated baseline per cycle appended into
+    /// `<table>__changes`). Carrying the label explicitly is why this field exists
+    /// rather than recovering it by splitting the synthesized name.
+    #[serde(skip)]
+    pub snapshot_label: Option<String>,
     /// Set ONLY on a range sub-export the pool synthesizes under `apply --pool
     /// --split` (#167): a single dominating export is emitted as N units over its
     /// key span, each a first-class scheduler unit the pool places concurrently,
@@ -813,6 +832,10 @@ pub struct CdcExportConfig {
     /// first with `rollover`. Caps the in-memory buffer and the part file size by
     /// bytes instead of a fixed row count — predictable for tables with wide
     /// (large JSON / blob) rows, mirroring the batch path's `batch_size_memory_mb`.
+    /// Defaults to 256 (MiB): the row count alone is a budget for one row width,
+    /// and absence must not mean "no byte budget". The bytes are the buffered
+    /// changes' RESIDENT cost (struct + commit position + values), not the part
+    /// file's size on disk.
     pub rollover_memory_mb: Option<usize>,
     /// MySQL replica server-id for the binlog connection (default 4271; must be
     /// distinct from the source's and any other replica).
@@ -882,6 +905,7 @@ pub enum PartitionGranularity {
 pub(crate) fn sample_export(name: &str) -> ExportConfig {
     ExportConfig {
         snapshot_parent: None,
+        snapshot_label: None,
         split: None,
         name: name.into(),
         target: None,

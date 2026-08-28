@@ -96,9 +96,21 @@ impl StateStore {
         // chunks (a smaller re-run) must not lower it — mirror the
         // cursor_advances guard record_committed_cursor uses (bug hunt
         // 2026-08-09; the incremental path guarded, chunked did not).
+        //
+        // `<`, not `<=`, and the difference is the whole row. `highest_chunk_index`
+        // is RUN-RELATIVE: `chunk_index` restarts at 0 every run, so this is a chunk
+        // COUNT, not a watermark. A stable table with a stable `chunk_size` yields
+        // the SAME number forever — and `<=` discarded every later run whole,
+        // `run_id` and `at` included. After N successful runs the row still named
+        // run 1, so `rivet state progression` answered "when was this last
+        // committed" with the FIRST run's timestamp, permanently, and a clean
+        // `rivet reconcile` never refreshed `last_verified_at`. Silent because the
+        // function returns `Ok(())` and the caller logs only on `Err`: the row looks
+        // fully populated, just from the wrong run. The guard test exercised
+        // 40 → 9 → 55 and never the EQUAL case (round-11 bughunt).
         if let Some(stored) =
             self.chunk_boundary_index(export_name, "last_committed_chunk_index")?
-            && highest_chunk_index <= stored
+            && highest_chunk_index < stored
         {
             return Ok(());
         }
@@ -135,7 +147,7 @@ impl StateStore {
     ) -> Result<()> {
         // Same no-regress guard as record_committed_chunked (bug hunt 2026-08-09).
         if let Some(stored) = self.chunk_boundary_index(export_name, "last_verified_chunk_index")?
-            && highest_chunk_index <= stored
+            && highest_chunk_index < stored
         {
             return Ok(());
         }
@@ -322,6 +334,27 @@ mod tests {
             .chunk_index
             .unwrap();
         assert_eq!(idx2, 55, "a higher index must advance the boundary");
+
+        // The EQUAL case, which this test never had and which is the ORDINARY one:
+        // `highest_chunk_index` is run-relative (`chunk_index` restarts at 0 each
+        // run), so a stable table with a stable `chunk_size` reports the SAME count
+        // forever. Under `<=` every later run was discarded whole — `run_id` and
+        // `at` with it — so the row named the FIRST run permanently and
+        // `rivet state progression` answered "last committed" with its timestamp.
+        s.record_committed_chunked("orders", 55, "runD").unwrap();
+        let c = s.get_progression("orders").unwrap().committed.unwrap();
+        assert_eq!(
+            c.chunk_index.unwrap(),
+            55,
+            "the boundary itself is unchanged — this is not an advance"
+        );
+        assert_eq!(
+            c.run_id.as_deref(),
+            Some("runD"),
+            "...but the run that last committed it MUST refresh, or the answer to \
+             `when was this last committed` freezes at the first run that ever hit \
+             this count"
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //!   (lossy scale reduction). It must be flagged lossy, not 'exact'.
 //! - #33: quality `unique_columns: [nonexistent_col]` is a silent no-op
 //!   (run exits 0, quality: pass) — the gate silently vanishes
-//!   (CLAUDE.md "never a silent no-op").
+//!   (the process rules "never a silent no-op").
 //!
 //! These tests assert the CORRECT behavior and are expected to FAIL against
 //! current code until the validation gap is closed.
@@ -140,7 +140,7 @@ fn audit_run_rejects_quality_on_nonexistent_column() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     let combined = format!("{stdout}{stderr}");
 
-    // CORRECT behavior (CLAUDE.md "never a silent no-op"): a quality gate that
+    // CORRECT behavior (the process rules "never a silent no-op"): a quality gate that
     // names a column the export does not produce must NOT silently pass. Rivet
     // must either fail the run (non-zero exit) or emit an explicit
     // "column not found" diagnostic naming the offending column — never just

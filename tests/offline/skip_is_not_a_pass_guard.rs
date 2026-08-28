@@ -66,7 +66,17 @@ fn no_harness_runner_answers_a_missing_environment_with_an_empty_result() {
         if !body.contains("OracleOutcome") {
             continue;
         }
-        if body.contains("Ok(Vec::new())") {
+        // SHAPE, not one literal spelling. The first cut grepped `Ok(Vec::new())`
+        // and `return Ok(vec![]);` walked straight past it — one word, on any of the
+        // six runners, and the twenty warehouse cells go vacuous again. MEASURED:
+        // that edit left all four guards in this file GREEN.
+        let empty_return = ["Ok(Vec::new())", "Ok(vec![])", "Ok(Default::default())"]
+            .iter()
+            .any(|lit| body.contains(lit));
+        // ...and the positive requirement, which is what the class is actually
+        // about: a runner that can skip must be able to SAY so.
+        let can_say_skipped = body.contains("Skipped");
+        if empty_return || !can_say_skipped {
             offenders.push(name);
         }
     }
@@ -139,7 +149,15 @@ fn every_toxiproxy_fault_injector_asserts_its_own_injection_landed() {
             continue;
         }
         injectors += 1;
-        if !(body.contains("assert") && (body.contains("code") || body.contains("status"))) {
+        // The assertion must reference the STATUS BINDING, not merely sit near the
+        // word `code`. MEASURED: keeping `let (code, body) = toxi_admin(...)`, adding
+        // `let _ = (code, body);` and asserting the toxic NAME is non-empty left this
+        // guard GREEN while the toxic could silently fail to install — the "rivet
+        // survived a fault that never happened" case it exists to prevent.
+        let checks_the_status = ["code == 200", "code != 200", "code == 204", "status == 200"]
+            .iter()
+            .any(|pat| body.contains(pat));
+        if !(body.contains("assert") && checks_the_status) {
             silent.push(name);
         }
     }

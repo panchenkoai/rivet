@@ -89,7 +89,8 @@ impl StateStore {
                      AND NOT EXISTS (
                          SELECT 1 FROM run_status r2
                          WHERE r2.export_name = r.export_name
-                           AND r2.started_at > r.started_at)
+                           AND r2.started_at > r.started_at
+                           AND r2.status <> 'running')
                    LIMIT 1";
         Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
     }
@@ -113,7 +114,8 @@ impl StateStore {
                      AND NOT EXISTS (
                          SELECT 1 FROM run_status r2
                          WHERE r2.export_name = r.export_name
-                           AND r2.started_at > r.started_at)";
+                           AND r2.started_at > r.started_at
+                           AND r2.status <> 'running')";
         Ok(self
             .query(sql, &[prefix.into()], |r| r.text(0))?
             .into_iter()
@@ -170,6 +172,51 @@ mod tests {
     /// one CLOCK-FREE. The gate is otherwise single-process; gc_survival only simulates
     /// a running manifest. Env-gated on RIVET_TEST_STATE_URL; unique names so the shared
     /// public schema never collides with a sibling test.
+    /// Supersession requires a TERMINAL successor — on the default backend, so it
+    /// actually runs.
+    ///
+    /// The rule lived only in the Postgres test above, which early-returns unless
+    /// `RIVET_TEST_STATE_URL` points at one — so on an ordinary `cargo test` it was
+    /// SKIPPED, and mutating the status clause away left everything green. Skip is
+    /// not a pass, and this file had no other home for the rule.
+    ///
+    /// What the clause protects: two concurrently LIVE runs of one export are
+    /// ordinary — a `{date}` prefix straddling UTC midnight while the next
+    /// scheduled cycle starts. Without it the older one reads as INACTIVE, which
+    /// un-gates `gc_orphans` against its prefix and deletes parts a live writer has
+    /// committed but not yet manifested.
+    #[test]
+    fn a_running_successor_does_not_supersede_but_a_finished_one_does() {
+        // `open_in_memory` EXPLICITLY, not `open`. `open` consults the process-global
+        // `RIVET_STATE_URL`, and the Postgres test below SETS that variable mid-run
+        // (`unsafe set_var` … `remove_var`) — so when the dev stand supplies
+        // `RIVET_TEST_STATE_URL` and both tests run in one process, this store
+        // silently opened POSTGRES instead and the first assertion failed. Measured:
+        // green alone, red in the full suite. A test that names its backend cannot
+        // be moved by another test's environment.
+        let st = StateStore::open_in_memory().expect("state");
+        let (pa, pb) = ("gs://b/e/runA/", "gs://b/e/runB/");
+        st.begin_run("r1", "e", pa, "2026-01-01T00:00:01Z").unwrap();
+        assert!(st.has_active_run_on_prefix(pa).unwrap(), "r1 is running");
+
+        // A newer run of the SAME export, itself still running.
+        st.begin_run("r2", "e", pb, "2026-01-01T00:00:02Z").unwrap();
+        assert!(
+            st.has_active_run_on_prefix(pa).unwrap(),
+            "a RUNNING successor has re-done nothing, so r1's prefix must stay \
+             active — releasing it here is what lets the collector delete a live \
+             writer's committed parts"
+        );
+
+        // Terminal successor: now the crashed r1 is releasable, clock-free.
+        st.finish_run("r2", "success", "2026-01-01T00:00:09Z")
+            .unwrap();
+        assert!(
+            !st.has_active_run_on_prefix(pa).unwrap(),
+            "a FINISHED successor supersedes it — no age timer, no second clock"
+        );
+    }
+
     #[test]
     fn pg_shared_state_cross_connection_visibility_and_supersession() {
         let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
@@ -197,12 +244,35 @@ mod tests {
             "conn B must see conn A's active run on the shared Postgres state (multi-process gc signal)"
         );
 
-        // B begins run2 (newer started_at, same export) → supersedes run1 CLOCK-FREE.
+        // B begins run2 (newer started_at, same export). It is still RUNNING, so it
+        // supersedes NOTHING — and this assertion is the correction of a spec the
+        // test itself used to pin.
+        //
+        // Supersession answers "did a later run already re-do this crashed one's
+        // work"; only a run that REACHED a terminal status has. Two concurrently
+        // live runs of one export are ordinary — a `{date}` prefix straddling UTC
+        // midnight while the next scheduled cycle starts — and under the old rule
+        // the older one read as INACTIVE, which un-gates `gc_orphans` against its
+        // prefix and deletes parts a live writer has committed but not yet
+        // manifested. That is precisely the harm the three-way classification
+        // exists to prevent, and the test asserted the bug.
         b.begin_run(&r2, &exp, &pb, "2026-01-01T00:00:02Z").unwrap();
         assert!(
-            !a.has_active_run_on_prefix(&pa).unwrap(),
-            "run1 is superseded by the newer run2 (by started_at, no age timer) → its prefix is no longer active"
+            a.has_active_run_on_prefix(&pa).unwrap(),
+            "run1 is STILL active: a newer run that is itself running has not \
+             re-done anything, so it cannot release run1's prefix to the collector"
         );
+
+        // Once the successor is TERMINAL, supersession applies — still clock-free,
+        // still no age timer.
+        b.finish_run(&r2, "success", "2026-01-01T00:00:09Z")
+            .unwrap();
+        assert!(
+            !a.has_active_run_on_prefix(&pa).unwrap(),
+            "a FINISHED successor supersedes the crashed run1 — that is what makes \
+             a stale `running` row releasable without comparing two clocks"
+        );
+        b.begin_run(&r2, &exp, &pb, "2026-01-01T00:00:02Z").unwrap();
         assert!(
             a.has_active_run_on_prefix(&pb).unwrap(),
             "run2 (newest, same export) is the active run"

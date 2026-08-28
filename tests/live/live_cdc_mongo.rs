@@ -425,7 +425,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     // runs_lose_nothing): run 1 stops at a PREFIX of a live-writer stream, run 2
     // drains the deferred tail, and the distinct-id union re-read from the parquet
     // equals the SOURCE id set. This test completes the per-engine union set the
-    // CLAUDE.md until_current rule names.
+    // the process rules until_current rule names.
     //
     // Two contracts here, with different weights (per that rule):
     //  - TERMINATION is LOAD-BEARING on Mongo: the open-time cluster-time bound
@@ -885,4 +885,315 @@ fn mongo_cdc_crash_after_the_checkpoint_still_delivers_every_change() {
              change whose part was not durable. leg1={leg1_ids:?} resume={resumed:?}"
         );
     }
+}
+
+/// A configured collection that does not exist must SAY so — today it is silence.
+///
+/// MEASURED 2026-08-25: `table: no_such_collection` against a database that holds
+/// `real` ran to `status: success, rows: 0` with no warning of any kind. A typo and
+/// a genuinely quiet window are indistinguishable, and the first is the one an
+/// operator needs to hear about before they conclude "CDC works, there is just no
+/// traffic".
+///
+/// A WARNING and not a refusal, and the asymmetry is the point: on Mongo a
+/// collection is created by its first write, so capturing one that does not exist
+/// YET is a legitimate and common setup — start the stream, then let the app create
+/// it. Refusing would break that. What is not legitimate is saying nothing.
+///
+/// Mongo's stream is scoped to ONE database (`database(&db).watch()`), so the
+/// cross-schema ambiguity the SQL engines refuse cannot arise here — this engine's
+/// share of the resolution contract is the zero-match arm alone.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_warns_when_a_configured_collection_does_not_exist() {
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_ghost");
+    let m = MongoTest::connect(PORT, &db);
+    // A real collection beside it, so the warning can name what IS there — a
+    // "collection not found" that lists nothing is a message an operator cannot act
+    // on when the cause is a typo.
+    m.upsert_set("real", 1, "v", "here");
+
+    let rig = cdc(&db, "no_such_collection");
+    let said = rig.run_ok_capture();
+    assert!(
+        said.contains("no_such_collection"),
+        "the run must name the collection it could not find. Got:\n{said}"
+    );
+    assert!(
+        said.contains("real"),
+        "...and name what the database DOES hold, because the cause is almost always \
+         a typo and the fix is the neighbouring name. Got:\n{said}"
+    );
+
+    // Not too WIDE: a collection that exists must stay silent, or the warning fires
+    // on every correct config and stops being read.
+    let quiet = cdc(&db, "real");
+    let out = quiet.run_ok_capture();
+    assert!(
+        !out.contains("could not find"),
+        "an existing collection is the ordinary case and must not warn. Got:\n{out}"
+    );
+    // The OUTCOME too, and it has to be a real one. The first version of this
+    // assertion read the GHOST rig's destination and demanded a row — which is
+    // wrong twice over: that export captures `no_such_collection`, so zero is the
+    // CORRECT answer, and the `real` write happened before either rig anchored, so
+    // nothing was in bound for the other either. It was written to satisfy the
+    // conformance gate without checking what the fixture does, which is the exact
+    // defect this suite keeps finding in other people's tests.
+    //
+    // The claim being proven is "a missing collection WARNS rather than refusing",
+    // and what makes that claim bite is that capture still WORKS afterwards — so
+    // write AFTER the anchor and read it back.
+    m.upsert_set("real", 2, "v", "after-anchor");
+    quiet.run_ok();
+    let delivered = read_mongo_cdc_changes(&quiet.out_dir()).len();
+    assert_eq!(
+        delivered, 1,
+        "the warning path must not wedge capture — a change written after the anchor \
+         has to arrive, or `warning, not refusal` is an empty claim"
+    );
+}
+
+/// `rivet cdc --output --format csv` on Mongo — the SUBCOMMAND's text writer over
+/// a JSON document column.
+///
+/// The cdc-cli-surface ledger measured the subcommand's coverage as `mysql 11 of
+/// 13 flags · mssql 4 · postgres 3 · mongo 0`, and this is the Mongo cell worth
+/// closing first. Every other engine's CDC row is flat columns the CSV writer has
+/// seen a thousand times; Mongo's payload is one `document` column holding the
+/// whole BSON as JSON — braces, quotes, commas, and whatever the application put
+/// in a string. That is the CSV writer's hostile input, and the two ways it fails
+/// are the two this repo's csv-fidelity ledger already caught elsewhere: a value
+/// silently truncated, or an un-escaped delimiter splitting one row into two.
+///
+/// The oracle is DuckDB's `read_csv_auto` plus hard-coded expected values —
+/// deliberately NOT the `csv` crate, which is what rivet writes with (one library
+/// round-tripping itself grades the pair's agreement, not the file's correctness),
+/// and deliberately not rivet's own read-back.
+///
+/// FIVE flags are graded here, and each one BITES rather than merely appearing on
+/// the command line — the distinction the ledger's `test` state is worth nothing
+/// without:
+///   `--source`      wrong/absent → no connection, no rows
+///   `--table`       ignored → the neighbouring collection's write appears (5 rows)
+///   `--checkpoint`  ignored → run 2 re-anchors to now and captures 0
+///   `--output`      ignored → NDJSON on stdout, no file to read
+///   `--format csv`  ignored → parquet, and the CSV oracle finds nothing to open
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    use mongodb::bson::doc;
+    let db = unique_name("cdc_cli_csv");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("docs");
+    m.drop_collection("other");
+
+    let d = tempfile::tempdir().expect("tempdir");
+    let ckpt = d.path().join("cli.ckpt");
+    let url = MongoTest::url(PORT, &db);
+    // The destination is the SHARED workdir, not the tempdir: the DuckDB oracle
+    // reads from inside a container, and a path it cannot see reads as zero rows —
+    // the harness bug that looks exactly like data loss.
+    let (host, container) = live_shared_workdir(&unique_name("mongo_cli_csv"));
+
+    // Run 1 pins the resume token. Mongo without a checkpoint starts at the
+    // source's CURRENT position, so a bounded run's open-time snapshot IS its
+    // anchor and nothing written afterwards is in bound — without this leg the
+    // test could only ever capture zero, whatever the writer did.
+    let anchor = run_rivet_args_bounded_env(
+        &[
+            "cdc",
+            "--source",
+            &url,
+            "--table",
+            "docs",
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+        ],
+        &[],
+        std::time::Duration::from_secs(60),
+    );
+    assert!(anchor.is_some(), "the anchoring run did not terminate");
+    assert!(ckpt.is_file(), "run 1 wrote no checkpoint to resume from");
+
+    // The hostile payloads, one per CSV failure mode. The newline is the one that
+    // corrupts silently: un-escaped it splits a row in two, and every count still
+    // looks plausible.
+    m.insert_many(
+        "docs",
+        vec![
+            doc! { "_id": 11_i64, "note": "has,comma" },
+            doc! { "_id": 12_i64, "note": "has\"quote" },
+            doc! { "_id": 13_i64, "note": "line\nbreak" },
+            doc! { "_id": 14_i64, "nested": doc! { "a": 1_i64, "b": [1_i64, 2_i64] } },
+        ],
+    );
+    // A write the config did NOT ask for, so `--table` has something to exclude.
+    m.insert_many("other", vec![doc! { "_id": 99_i64, "note": "not mine" }]);
+
+    let out = run_rivet_args_bounded_env(
+        &[
+            "cdc",
+            "--source",
+            &url,
+            "--table",
+            "docs",
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--output",
+            host.to_str().unwrap(),
+            "--format",
+            "csv",
+        ],
+        &[],
+        std::time::Duration::from_secs(90),
+    );
+    assert!(out.is_some(), "the capturing run did not terminate");
+    assert!(
+        !files_with_extension(&host, "csv").is_empty(),
+        "no .csv here — an oracle that shrugged at an empty set would grade nothing. \
+         This one assert catches TWO of the graded flags, MEASURED: `--format \
+         parquet` leaves the directory holding parquet, and dropping `--checkpoint` \
+         re-anchors run 2 at now, so it captures zero events and the sink writes no \
+         file at all"
+    );
+
+    let v = duckdb_run_sql_json(&format!(
+        "SELECT _id, document FROM read_csv_auto('{container}/**/*.csv', header=true) ORDER BY _id"
+    ));
+    let rows = v["rows"].as_array().cloned().unwrap_or_default();
+    let got: std::collections::BTreeMap<i64, serde_json::Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get(0)?.as_str()?.parse::<i64>().ok()?;
+            let doc: serde_json::Value = serde_json::from_str(r.get(1)?.as_str()?).ok()?;
+            Some((id, doc))
+        })
+        .collect();
+
+    assert_eq!(
+        got.keys().copied().collect::<Vec<_>>(),
+        vec![11, 12, 13, 14],
+        "expected exactly the four documents written to the CONFIGURED collection. \
+         Id 99 is the neighbouring collection and means the routing filter let it \
+         through (`--table` cannot simply be dropped here — the subcommand refuses \
+         `--output` without exactly one, MEASURED, so the mutant that grades this \
+         line is pointing it at `other`, which yields [99]); zero means the \
+         checkpoint never resumed; a row lost or gained anywhere else means the CSV \
+         split. Got: {got:#?}"
+    );
+
+    // Hard-coded expectations, not a re-render of what rivet produced.
+    assert_eq!(got[&11]["note"], serde_json::json!("has,comma"));
+    assert_eq!(got[&12]["note"], serde_json::json!("has\"quote"));
+    assert_eq!(got[&13]["note"], serde_json::json!("line\nbreak"));
+    assert_eq!(got[&14]["nested"], serde_json::json!({"a": 1, "b": [1, 2]}));
+
+    m.drop_collection("docs");
+    m.drop_collection("other");
+}
+
+/// A dotted collection name is one collection, not a schema qualifier — and the
+/// sibling it used to also match must stay out.
+///
+/// Round-3B bughunt, two defects meeting in one fixture. The config layer REFUSED
+/// every dotted Mongo collection under `mode: cdc`, on a reason that had stopped
+/// being true: the refusal was written when `table_matches` split the name into a
+/// bogus `schema.table` and routed zero events, the ROUTER was then fixed to try
+/// the full name first, and the guard stayed — refusing a working capture and
+/// telling the operator to rename a production collection.
+///
+/// Underneath it hid the real defect. With the split arm still live for Mongo, a
+/// collection whose first segment equals the DATABASE name matched TWICE: `table:
+/// <db>.orders` took both the collection literally named `<db>.orders` and the
+/// sibling `orders`. Two collections interleaved into one destination, `status:
+/// success`, and no count could show it — each collection's rows are individually
+/// plausible.
+///
+/// Mongo has no schema to qualify with, so the split arm no longer runs there at
+/// all. This test pins both halves at once: the dotted name captures, and only it.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling() {
+    require_alive(LiveService::MongoRs);
+    use mongodb::bson::doc;
+    // The database name is the FIRST SEGMENT of the dotted collection — the exact
+    // shape that used to match twice. A neutral prefix would prove nothing.
+    let db = unique_name("dotted").to_lowercase();
+    let dotted = format!("{db}.orders");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection(&dotted);
+    m.drop_collection("orders");
+
+    // `initial: snapshot` is not incidental: the snapshot leg is the one that goes
+    // through `finalize`, and its manifest is where the engine-blind name split
+    // recorded a different collection's identity. Without it the manifest assertion
+    // below grades nothing — PROVEN by mutating the fix back and watching this test
+    // stay green until the leg was added.
+    let rig = cdc(&db, &dotted).cdc_line("initial: snapshot");
+    rig.run_ok(); // anchor
+    m.insert_many(&dotted, vec![doc! { "_id": 1_i64, "who": "dotted" }]);
+    // The sibling the split arm used to pull in.
+    m.insert_many("orders", vec![doc! { "_id": 2_i64, "who": "sibling" }]);
+    rig.run_ok();
+
+    let who: std::collections::BTreeSet<String> = read_mongo_cdc_changes(&rig.out_dir())
+        .iter()
+        .filter_map(|c| {
+            serde_json::from_str::<serde_json::Value>(&c.document)
+                .ok()?
+                .get("who")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert_eq!(
+        who,
+        ["dotted"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the dotted collection must be captured (a config that no longer even \
+         LOADS would give an empty set) and the sibling `orders` must not be — \
+         `sibling` appearing here is the interleave, which counts cannot see"
+    );
+
+    // Both LEGS must agree about the identity they recorded. `finalize` derived
+    // `schema`/`table` by splitting on the first dot regardless of engine, so the
+    // snapshot leg's manifest named `{schema: "<db>", table: "orders"}` — the
+    // SIBLING collection, which exists and holds different rows — while the drain
+    // recorded the whole string. `identity_source` re-joins with a dot, so both
+    // render the same source id and the single-source guard sees nothing; only a
+    // consumer reading the two fields separately meets the contradiction.
+    {
+        let p = rig.out_dir().join("snapshot").join("manifest.json");
+        assert!(
+            p.is_file(),
+            "the snapshot leg must have produced a manifest — without one this \
+             assertion is vacuous, which is exactly how the defect survived"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).expect("read manifest"))
+                .expect("parse manifest");
+        assert_eq!(
+            doc["source"]["schema"],
+            serde_json::Value::Null,
+            "a MongoDB manifest must carry NO schema — the database is not one, and \
+             recording the first dot-segment as a schema names a different \
+             collection. Got: {}",
+            doc["source"]
+        );
+        assert_eq!(
+            doc["source"]["table"].as_str(),
+            Some(dotted.as_str()),
+            "and the table must be the collection's WHOLE name: {}",
+            doc["source"]
+        );
+    }
+
+    m.drop_collection(&dotted);
+    m.drop_collection("orders");
 }

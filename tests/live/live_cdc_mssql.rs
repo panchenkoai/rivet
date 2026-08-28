@@ -17,35 +17,6 @@ use crate::common::*;
 // nextest one-process-per-test runner (r4 bughunt; same class as r3's
 // COMPRESSION_SERIAL).
 
-/// Enable CDC on the database (idempotent) + the table, creating capture instance
-/// `ci`. The capture job (SQL Server Agent) then populates `cdc.<ci>_CT`.
-fn enable_cdc(table: &str, ci: &str) {
-    mssql_cdc_exec(
-        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
-         EXEC sys.sp_cdc_enable_db;",
-    );
-    mssql_cdc_exec(&format!(
-        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
-         @role_name=NULL, @capture_instance=N'{ci}';"
-    ));
-}
-
-/// Block until the capture job has copied at least `want` rows into the change
-/// table — the job runs asynchronously, so the test must wait for it.
-fn wait_for_capture(ci: &str, want: i64) {
-    // 60s ceiling: the SQL Server Agent capture job is asynchronous and its
-    // scan interval stretches under a loaded E2E runner — a 30s bound flaked
-    // one test at ~456s suite wall-clock (r6 CI). Doubling the ceiling matches
-    // the async reality; it does NOT mask a bug (a real drop still times out).
-    for _ in 0..120 {
-        if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
-}
-
 /// One CDC rig per (table, capture instance, checkpoint, destination). Callers
 /// own ckpt/out so several configs can share one dir across a scenario; the rig
 /// owns everything else (this replaced a yaml round-trip through write_config).
@@ -202,7 +173,7 @@ fn mssql_cdc_sum_reconciles_across_intra_txn_updates() {
     );
 }
 
-// Idle-first-run anchor model (per-engine, see CLAUDE.md): SQL Server has no
+// Idle-first-run anchor model (per-engine, see the anchor-model process rule): SQL Server has no
 // client-side anchor to pin — a run without a checkpoint floors at
 // `fn_cdc_get_min_lsn` (over-reads, never skips). This test pins that property:
 // if a no-checkpoint run ever starts at the *max* LSN instead, a change landing
@@ -1908,5 +1879,795 @@ fn mssql_cdc_checkpoint_without_an_lsn_must_refuse_not_silently_reread_everythin
     assert!(
         !r2.out_dir().join("manifest.json").is_file(),
         "a refused run must deliver nothing"
+    );
+}
+
+/// SQL Server needs no ambiguity resolution — and this pins WHY, so the next
+/// reader does not add a guard that cannot fire.
+///
+/// The other three engines resolve a configured `table:` against a catalog that
+/// may hold the name more than once. SQL Server cannot: the stream is opened on a
+/// CAPTURE INSTANCE, `cdc.change_tables` holds one row per instance, and that row
+/// names exactly one source object. So the relation is resolved before rivet
+/// compares anything, and a bare configured name cannot pull in a second relation
+/// because the stream carries only the one instance's change table.
+///
+/// What remains is the CROSS-CHECK — that the configured string matches the
+/// relation the instance actually emits — and that already refuses, naming the
+/// catalog's own spelling. This test proves both halves: a same-named table in
+/// ANOTHER schema does not disturb a correct config, and a config naming the wrong
+/// schema is refused rather than silently capturing.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_capture_instance_resolves_identity_so_a_same_named_table_cannot_interfere() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let table = unique_name("rivet_cdc_amb");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "IF SCHEMA_ID('other') IS NULL EXEC('CREATE SCHEMA other'); \
+         CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    // The same NAME in another schema — the shape that re-labels rows on the
+    // engines whose stream is server-wide.
+    mssql_cdc_exec(&format!(
+        "IF OBJECT_ID('other.{table}') IS NOT NULL DROP TABLE other.{table}; \
+         CREATE TABLE other.{table}(zzz INT PRIMARY KEY, qqq INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    mssql_cdc_exec(&format!("INSERT INTO other.{table} VALUES (2,20)"));
+    wait_for_capture(&ci, 1);
+
+    // A BARE configured name, the ambiguous shape elsewhere. Here the instance has
+    // already resolved the relation, so it runs clean and captures only dbo's row.
+    let d = tempfile::tempdir().unwrap();
+    let rig = mssql_cdc_rig(&table, &ci, &d.path().join("c.ckpt"), &d.path().join("out"));
+    rig.run_ok();
+    assert_eq!(
+        duckdb_dir_parquet_i64(&rig.out_dir(), "id"),
+        vec![1],
+        "only the capture instance's own relation is streamed — a same-named table \
+         in another schema is not in this change table at all, which is why this \
+         engine has no ambiguity to resolve"
+    );
+
+    // ...and naming the WRONG schema is refused, not silently captured.
+    let wrong = Rig::mssql_cdc(&format!("other.{table}"), &ci)
+        .checkpoint_path(d.path().join("w.ckpt"))
+        .dest_path(d.path().join("w"));
+    let said = wrong.run_expect_fail();
+    assert!(
+        said.contains(&format!("dbo.{table}")),
+        "the refusal must name the relation the INSTANCE emits — that is the whole \
+         remediation, and it is the catalog's spelling rather than the config's. \
+         Got:\n{said}"
+    );
+    mssql_cdc_exec(&format!("DROP TABLE IF EXISTS other.{table}"));
+}
+
+/// The schema probe must read the relation the CAPTURE INSTANCE names — not
+/// whatever the connection's default schema makes of the configured string.
+///
+/// Round-3 bughunt, and SQL Server is the only engine that never calls
+/// `identity::resolve_captured_table`, so it takes the harm the other engines
+/// refuse out loud. Two independent resolutions of one config:
+///
+///   `MssqlChangeStream::open` reads `cdc.change_tables` — the catalog, the truth —
+///   and tags every event `<schema>.<table>`. Its routing check then passes, because
+///   `table_matches` lets a BARE configured name match any schema.
+///
+///   `run_capture` separately hands the CONFIGURED string to `CdcSchemaResolver`,
+///   whose `SELECT * FROM <name>` resolves in the connection's DEFAULT schema — a
+///   different relation, with different columns.
+///
+/// Nothing compares the two. The export is then written with one table's column
+/// names over another table's events: PROVEN before the fix — `status: success`,
+/// exit 0, no warning, and the parquet carried `dbo`'s columns while `note`, the
+/// captured table's only data column, was absent from the output entirely and the
+/// columns that were present were all NULL.
+///
+/// This is precisely what PostgreSQL refuses in words — "a foreign row is written
+/// under THIS table's names … or as an all-NULL row … Neither is recoverable from
+/// the output" — and SQL Server was doing it.
+///
+/// The fix is resolution, not refusal: a capture instance names its source object
+/// in the catalog unambiguously, so there is nothing here for an operator to
+/// disambiguate. Carry the pair the stream already resolved.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_sch");
+    let ci = format!("rvsales_{table}");
+    // A same-named DECOY in the default schema, with DIFFERENT columns. Without
+    // one the two resolutions agree by accident and the test proves nothing — the
+    // fixture has to cross the mechanism's activation threshold.
+    mssql_cdc_exec("IF SCHEMA_ID('rvsales') IS NULL EXEC('CREATE SCHEMA rvsales');");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT, dbo_only INT); \
+         INSERT INTO dbo.{table} VALUES (900, 42, 7);"
+    ));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE rvsales.{table}(id INT PRIMARY KEY, note NVARCHAR(50))"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable::in_schema("rvsales", &table, &ci);
+    let _decoy = DboDecoy(table.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!(
+        "INSERT INTO rvsales.{table} VALUES (1, N'real-note-one'), (2, N'real-note-two')"
+    ));
+    wait_for_capture(&ci, 2);
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // The config an operator writes: the bare table name plus the capture instance
+    // that says, unambiguously, which relation it means.
+    mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
+
+    let batches = read_all_parts(&out);
+    let cols: std::collections::BTreeSet<String> = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        cols.contains("note"),
+        "the captured table's own column must be in the output. Its absence is the \
+         defect in its purest form: the probe read dbo's columns, so the only data \
+         column of the relation actually being captured never reached the \
+         destination. Got: {cols:?}"
+    );
+    assert!(
+        !cols.contains("dbo_only"),
+        "and the DECOY's columns must not be — a column that exists in neither the \
+         captured table nor its events can only arrive all-NULL, which reads as \
+         'the source had no data' rather than as a mis-resolved config: {cols:?}"
+    );
+
+    // `rivet check` is the THIRD reading of this config, and the operator's last
+    // chance to notice. Round-4 measured it reporting the DECOY's columns and row
+    // count with verdict ACCEPTABLE while the run wrote the captured relation's —
+    // and `rivet load` plans the warehouse schema from these same reports, so it
+    // would create `<table>__changes` with one relation's columns and feed it the
+    // other's parquet.
+    let checked = run_rivet(&[
+        "check",
+        "--config",
+        mssql_cdc_rig(&table, &ci, &ckpt, &out)
+            .config_path()
+            .to_str()
+            .unwrap(),
+        "--json",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(
+        said.contains("note"),
+        "preflight must probe the relation the capture instance names — it reported \
+         the decoy's columns while the run wrote the captured table's, and the two \
+         disagreeing is worse than both being wrong together. Got:\n{said}"
+    );
+    assert!(
+        !said.contains("dbo_only"),
+        "and it must not report the decoy's columns at all:\n{said}"
+    );
+
+    // Values, not just names: a schema that is right while every cell is NULL is
+    // the same silent loss one layer down.
+    let notes: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&out, "note");
+    assert_eq!(
+        notes,
+        ["real-note-one", "real-note-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the captured rows' real values must reach the destination"
+    );
+}
+
+/// Drops the `dbo` decoy the schema-probe test plants. The shared
+/// [`MssqlCdcTable`] guard owns the CAPTURED table (it must disable CDC first);
+/// this one owns the un-captured twin, which is an ordinary table.
+struct DboDecoy(String);
+impl Drop for DboDecoy {
+    fn drop(&mut self) {
+        let t = self.0.clone();
+        let _ = std::panic::catch_unwind(move || {
+            mssql_cdc_drop_table(&format!("dbo.{t}"));
+        });
+    }
+}
+
+/// The SNAPSHOT leg must read the same relation the drain captures.
+///
+/// The other half of the schema-probe defect, and the worse half: the drain wrote
+/// the wrong COLUMNS, this writes rows that never existed in the captured table at
+/// all. `initial: snapshot` plans its baseline BEFORE any stream opens, from
+/// `export.table` — the configured string — so `SELECT … FROM <name>` resolves in
+/// the connection's default schema and the baseline is a different table's
+/// contents, deposited in the captured table's own prefix.
+///
+/// MEASURED before the fix on the mssql CDC stand: `status: success`, exit 0, and
+/// `snapshot/…parquet` held exactly `{"id":900,"amount":42,"dbo_only":7}` — the
+/// decoy's row — while the captured table's two rows appeared nowhere. A
+/// downstream loader folds that baseline into the current-state view as fact.
+///
+/// The label and the READ have to part ways here: the sub-prefix and the leg's
+/// name stay the configured string (both legs share one prefix, and the snapshot
+/// marker is keyed by it, so changing them would strand every existing resume), while
+/// the relation read follows the catalog.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_snp");
+    let ci = format!("rvsales_{table}");
+    mssql_cdc_exec("IF SCHEMA_ID('rvsales') IS NULL EXEC('CREATE SCHEMA rvsales');");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT, dbo_only INT); \
+         INSERT INTO dbo.{table} VALUES (900, 42, 7);"
+    ));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE rvsales.{table}(id INT PRIMARY KEY, note NVARCHAR(50)); \
+         INSERT INTO rvsales.{table} VALUES (1, N'base-one'), (2, N'base-two');"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable::in_schema("rvsales", &table, &ci);
+    let _decoy = DboDecoy(table.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    mssql_cdc_rig(&table, &ci, &ckpt, &out)
+        .cdc_line("initial: snapshot")
+        .run_ok();
+
+    let snap = out.join("snapshot");
+    assert!(
+        snap.is_dir(),
+        "the snapshot leg must have run at all — without it this test grades nothing"
+    );
+    let notes: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&snap, "note");
+    assert_eq!(
+        notes,
+        ["base-one", "base-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the baseline must be the CAPTURED table's rows. Before the fix this \
+         directory held the decoy's row (id 900) — data that never existed in the \
+         relation being captured, written into its prefix under a green run"
+    );
+
+    // The other half of the LABEL/READ split, and the half round-5 caught: the leg
+    // READS the catalog's relation but must RECORD the configured one. Both legs of
+    // one export write into one prefix, and `ensure_single_export` refuses a prefix
+    // whose manifests name two sources — so a leg recording `dbo.<table>` against a
+    // drain recording `<table>` breaks `rivet load` on artifacts that are already
+    // durable, with a message blaming the operator's prefix layout.
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(snap.join("manifest.json")).expect("read the leg's manifest"),
+    )
+    .expect("parse the leg's manifest");
+    assert_eq!(
+        doc["source"]["table"].as_str(),
+        Some(table.as_str()),
+        "the leg must record the CONFIGURED name, which is what the drain records \
+         (`schema: None, table: <configured>`). Got: {}",
+        doc["source"]
+    );
+    assert_eq!(
+        doc["source"]["schema"],
+        serde_json::Value::Null,
+        "and no schema, for the same reason — the drain writes none, and an identity \
+         the two legs spell differently is a refused load: {}",
+        doc["source"]
+    );
+}
+
+/// A capture instance the catalog does not know must be refused BEFORE the
+/// snapshot leg makes a fabricated baseline permanent.
+///
+/// Round-4 bughunt, and the finding is about ORDER, not about detection: `open`
+/// already bails on an unknown capture instance, but the snapshot leg runs, writes
+/// and MARKS ITSELF DONE first. So a typo'd `capture_instance:` produced a baseline
+/// read from whatever the configured name resolves to in the default schema, the
+/// drain then failed, and the operator's fix was worthless — MEASURED: run 2 with
+/// the name corrected reported `status: success`, exit 0, and never backfilled the
+/// real rows, because the snapshot was already done. One fabricated row, two real
+/// rows missing, permanently.
+///
+/// The plan-time lookup that made the fix possible had swallowed the distinction:
+/// a missing instance, a permission error and a network blip all became `Ok(None)`
+/// and fell back to the configured string — silently restoring the pre-fix
+/// behaviour for exactly the config most likely to be wrong.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_refuses_an_unknown_capture_instance_before_the_snapshot_is_durable() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_ghost");
+    let ci = format!("rvsales_{table}");
+    mssql_cdc_exec("IF SCHEMA_ID('rvsales') IS NULL EXEC('CREATE SCHEMA rvsales');");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT); \
+         INSERT INTO dbo.{table} VALUES (900, 42);"
+    ));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE rvsales.{table}(id INT PRIMARY KEY, note NVARCHAR(50)); \
+         INSERT INTO rvsales.{table} VALUES (1, N'real-one'), (2, N'real-two');"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'rvsales', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable::in_schema("rvsales", &table, &ci);
+    let _decoy = DboDecoy(table.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // The typo: a capture instance that does not exist.
+    let typo = format!("{ci}_typo");
+    let rig = mssql_cdc_rig(&table, &typo, &ckpt, &out).cdc_line("initial: snapshot");
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains(&typo),
+        "the refusal must name the instance it could not find — an operator cannot \
+         fix a name they were not shown. Got:\n{said}"
+    );
+    assert!(
+        !out.join("snapshot").exists()
+            || files_with_extension(&out.join("snapshot"), "parquet").is_empty(),
+        "and it must refuse BEFORE the snapshot writes. A baseline on disk here is \
+         the whole defect: it is also marked done, so correcting the typo never \
+         backfills the rows it skipped"
+    );
+
+    // With the name corrected the run works, and the baseline is the real table's.
+    let ok_rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot");
+    ok_rig.run_ok();
+    let notes: std::collections::BTreeSet<String> =
+        duckdb_dir_parquet_distinct_strings(&out.join("snapshot"), "note");
+    assert_eq!(
+        notes,
+        ["real-one", "real-two"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the corrected run must produce the CAPTURED table's baseline — this is the \
+         assertion that failed before the fix, because the typo'd run had already \
+         marked the snapshot done"
+    );
+}
+
+/// The snapshot-done row must be keyed by the LABEL both times, or the durable
+/// signal cannot match itself and every cycle re-snapshots the whole table.
+///
+/// Round-4 bughunt, and a regression introduced by the round-3B fix beside it: once
+/// the snapshot leg learned to READ the catalog's relation, `mark_snapshot_done`
+/// started writing that string while `snapshot_plan` kept asking with the CONFIGURED
+/// one. The key is byte-exact, so on SQL Server — the only engine where the two
+/// differ — the row written as `dbo.orders` could never answer a question about
+/// `orders`.
+///
+/// The oracle is the behaviour, not the row: the state DB exists precisely so that
+/// `cleanup_source: true` may wipe the destination without the next run
+/// re-snapshotting (its own docstring says so), so deleting the snapshot directory
+/// and running again asks exactly the question the store was built to answer. A
+/// mismatched key means a full table re-read plus a duplicated baseline appended
+/// into `<table>__changes` on every scheduled cycle, forever, under `status:
+/// success`.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_a_completed_snapshot_is_not_redone_after_the_destination_is_wiped() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_once");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT); \
+         INSERT INTO dbo.{table} VALUES (1,10),(2,20);"
+    ));
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // ONE rig, run twice — the state DB lives in the rig's workdir, so two rigs
+    // would be two databases and the second run could never see the first's row.
+    // (That mistake made the first draft of this test fail for a harness reason
+    // while it looked like the product defect.)
+    let rig = mssql_cdc_rig(&table, &ci, &ckpt, &out).cdc_line("initial: snapshot");
+    rig.run_ok();
+    let snap = out.join("snapshot");
+    assert!(
+        !files_with_extension(&snap, "parquet").is_empty(),
+        "run 1 must actually produce a baseline — without one this test grades nothing"
+    );
+
+    // What `cleanup_source: true` does: the destination goes, the state row stays.
+    std::fs::remove_dir_all(&snap).expect("wipe the snapshot prefix");
+    rig.run_ok();
+    // The outcome, not only the absence: run 1's baseline must still be READABLE
+    // after run 2 — "no new parts" and "nothing survives" look identical otherwise.
+    assert_eq!(
+        read_all_parts(&out)
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>(),
+        0,
+        "the drain captured no changes here, so the export prefix holds none — the \
+         baseline lives under snapshot/ and is asserted below"
+    );
+    assert!(
+        files_with_extension(&snap, "parquet").is_empty(),
+        "run 2 must NOT re-snapshot: the state DB already records this table as \
+         backfilled, and that record is the ONLY thing standing between a wiped \
+         destination and a full re-read plus a duplicated baseline on every \
+         scheduled cycle"
+    );
+}
+
+/// `rivet check --type-report` must still type the export when the cdc catalog is
+/// unreadable — that is the moment an operator runs it.
+///
+/// Round-5 bughunt, a regression from round 4's own fix. Teaching preflight to
+/// resolve the capture instance made the lookup FATAL: on a database where CDC has
+/// never been enabled (`Invalid object name 'cdc.change_tables'`, error 208) or a
+/// login without SELECT on the cdc schema, the error escaped `collect_reports`,
+/// `preflight::check` swallowed it into one `log::warn!`, and the command printed
+/// its verdict, `Looks good.` and exit 0 — with no column table at all. MEASURED
+/// RED/GREEN on a fresh CDC-less database.
+///
+/// A resolution that cannot run must degrade to the configured relation — the same
+/// relation every non-CDC export reads — and say so.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_check_still_types_the_export_when_the_cdc_catalog_is_unreadable() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_chk_nocdc").to_lowercase();
+    // A DATABASE where CDC was never enabled, so `cdc.change_tables` does not exist
+    // at all (error 208) — not merely a table with no capture instance. The
+    // distinction is the whole test: a missing ROW is `Ok(None)` and always
+    // degraded gracefully; a missing CATALOG is the `Err` arm, and that is the one
+    // that made the column table vanish. Measured: with the fixture on the shared
+    // `rivet` database (CDC enabled by every other test here) the mutant sails
+    // through, because the query succeeds and simply returns nothing.
+    let db = format!("nocdc_{table}");
+    mssql_cdc_exec(&format!(
+        "IF DB_ID(N'{db}') IS NOT NULL DROP DATABASE [{db}]; CREATE DATABASE [{db}];"
+    ));
+    let _db_guard = NoCdcDb(db.clone());
+    mssql_cdc_exec(&format!(
+        "USE [{db}]; CREATE TABLE dbo.{table}(id INT PRIMARY KEY, amount INT); \
+         INSERT INTO dbo.{table} VALUES (1, 10);"
+    ));
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = mssql_cdc_rig(&table, &format!("dbo_{table}"), &ckpt, &out)
+        .source_url(&MSSQL_CDC_URL.replace("/rivet", &format!("/{db}")));
+    let checked = run_rivet(&[
+        "check",
+        "--config",
+        rig.config_path().to_str().unwrap(),
+        "--type-report",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    // No capture happens in this test: `rivet check` writes no data, so there is no
+    // delivered outcome to assert — the type REPORT is the outcome, and its absence
+    // is exactly the defect. Said here because the conformance gate reads these
+    // bodies for a delivery assertion and would otherwise be right to ask.
+    assert!(
+        said.contains("amount"),
+        "the column report must still be produced — an unreadable cdc catalog is \
+         the NORMAL state before `sp_cdc_enable_table` runs, and a check that \
+         silently types nothing while printing a verdict is worse than one that \
+         refuses. Got:\n{said}"
+    );
+}
+
+/// Drops the CDC-less database the check test stands up.
+struct NoCdcDb(String);
+impl Drop for NoCdcDb {
+    fn drop(&mut self) {
+        let db = self.0.clone();
+        let _ = std::panic::catch_unwind(move || {
+            mssql_cdc_exec(&format!(
+                "IF DB_ID(N'{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER \
+                 WITH ROLLBACK IMMEDIATE; DROP DATABASE [{db}]; END"
+            ));
+        });
+    }
+}
+
+/// A SQL Server poll batch past the memory cap spills, and every transaction in it
+/// is still delivered whole — confirmed by an oracle that shares no code with rivet.
+///
+/// SQL Server's buffer is the shape neither other engine has: it holds SEVERAL
+/// transactions, runs of rows sharing a `__$start_lsn`, and the boundaries are only
+/// visible by comparing neighbours. So its spilled tail reads one record AHEAD —
+/// a row cannot be handed out until the row after it is known, because that is what
+/// says whether it closes its transaction. Getting that wrong is invisible in the
+/// delivered rows: fusing two transactions or splitting one ships exactly the same
+/// data, and only changes when the sink rolls, checkpoints and acks.
+///
+/// TWO transactions on purpose, the second small: with one, a tail that closes
+/// only at its very end and a tail that closes per group are indistinguishable.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_a_batch_past_the_memory_cap_spills_rather_than_failing() {
+    const ROWS: usize = 400;
+    const CAP: usize = 50;
+    const TAIL_TX: usize = 3;
+
+    let _serial = cross_process_serial("mssql_cdc");
+    let table = unique_name("cdc_spill_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} {ONE_TRANSACTION_DDL}"));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // `census_oracle()` owns the workdir, the destination AND the config placement:
+    // the state DB lives beside the config and the DuckDB reader works from inside a
+    // container, so hand-building those paths is the smell the rig removes.
+    let rig = Rig::mssql_cdc(&table, &ci).census_oracle();
+
+    // Two transactions — each one statement, so each is one `__$start_lsn` group.
+    mssql_seed_one_transaction(&table, 1..=ROWS);
+    mssql_seed_one_transaction(&table, ROWS + 1..=ROWS + TAIL_TX);
+    wait_for_capture(&ci, (ROWS + TAIL_TX) as i64);
+
+    // Spilling is OPT-IN (`spill_dir_for`): with no directory named, the cap keeps
+    // its original meaning and REFUSES the transaction. Without this the test would
+    // exercise the refusal path and read it as a spill that produced no rows.
+    let out = rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", &CAP.to_string()),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+    ]);
+    assert!(
+        out.status.success(),
+        "a batch past the cap must SPILL, not fail the run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // The fixture is not inert, and memory really was bounded. Rows alone cannot see
+    // this: a spill that quietly keeps buffering delivers identical rows.
+    let split = log
+        .split("delivered ")
+        .filter_map(|s| s.split_once(" rows from memory and "))
+        .find_map(|(head, rest)| {
+            let tail = rest.split_once(" from disk")?.0;
+            Some((
+                head.trim().parse::<usize>().ok()?,
+                tail.trim().parse::<usize>().ok()?,
+            ))
+        });
+    let (from_memory, from_disk) =
+        split.unwrap_or_else(|| panic!("the run must report the split. stderr: {log}"));
+    assert!(
+        from_disk > 0,
+        "rows must actually reach DISK — a cap that was noticed and never acted on \\
+         reads the same in the parquet. stderr: {log}"
+    );
+    // CAP + 1: the cap is checked after the row is pushed, so the head holds one
+    // row more than the cap before the spill opens.
+    assert_eq!(
+        from_memory,
+        CAP + 1,
+        "memory must stop at the cap — that is the point of spilling, and a head \\
+         larger than the cap means the ceiling is not enforced. stderr: {log}"
+    );
+
+    // THE INDEPENDENT ORACLE — the SOURCE table, the delivered parquet, and rivet's
+    // two ledgers, from one DuckDB session that shares no code with rivet.
+    let census = rig.row_census();
+    assert_eq!(
+        census.source,
+        (ROWS + TAIL_TX) as i64,
+        "the fixture itself must hold what the test thinks it does, or every \\
+         comparison below is against the wrong number: {census:?}"
+    );
+    assert!(
+        census.agrees(),
+        "source, delivered parquet, export_metrics and file_log must all agree — a \\
+         spilled tail that never reached the destination, or reached it without \\
+         being counted, shows up here and nowhere else: {census:?}"
+    );
+
+    // Exactly once, and the SECOND transaction still arrives after the first.
+    let changes = cdc_id_ops(&rig.out_dir());
+    let mut ids: Vec<i64> = changes.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        ROWS + TAIL_TX,
+        "every id exactly once across the memory head and the disk tail"
+    );
+    assert_eq!(
+        changes.last().map(|(id, _)| *id),
+        Some((ROWS + TAIL_TX) as i64),
+        "the transaction after the spilled one must still arrive, and arrive last"
+    );
+}
+
+/// A crash while a SPILLED tail is being handed out must lose nothing on resume.
+///
+/// SQL Server is the one engine where this window exists at all: its spilled tail
+/// holds SEVERAL transactions (`SpooledGroups`), each group's last row is a real
+/// commit boundary, so the sink can roll + checkpoint + ack MID-tail — between two
+/// spilled groups — and crash before the rest is delivered. PostgreSQL and MySQL
+/// spill exactly one transaction, whose only commit is the tail's last row, so
+/// their sink cannot act until the tail is fully drained and no such window opens.
+///
+/// The crash tests that exist never set `RIVET_CDC_SPILL_DIR`, so until this test
+/// no crash had ever fired with a spill file on disk — the spilled path did not
+/// inherit the atomicity proof, it merely sat beside it.
+///
+/// Three transactions of 5 over a cap of 4 and rollover of 5: every transaction
+/// crosses the cap (its tail spills), and each group's commit lets the sink roll.
+/// The crash lands at `cdc_after_checkpoint_before_ack` — the checkpoint has
+/// advanced past the delivered groups, the rest of the tail is undelivered, and the
+/// reader (with the spill file) dies with the process. Resume must re-read from the
+/// checkpoint and deliver the remainder: the union of both runs holds every row
+/// exactly, or the tail died with the crashed process.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn roast_mssql_cdc_a_crash_mid_spilled_tail_loses_no_group_on_resume() {
+    const TXS: usize = 3;
+    /// SEVEN on purpose — not five, and the difference is the whole test. With
+    /// `PER_TX` equal to the rollover, every possible roll lands exactly on a group
+    /// boundary, so even a mutant that closes the tail's every row "commits" only
+    /// at points where the checkpoint is accidentally legal — measured, two such
+    /// mutants stayed green. At 7 over a rollover of 5, an early close rolls MID-
+    /// group: the checkpoint advances past a commit whose last two rows are still
+    /// in the dying process's spill, and the resume skips them — 19 of 21.
+    const PER_TX: usize = 7;
+
+    let _serial = cross_process_serial("mssql_cdc");
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("cdc_spillcrash_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} {ONE_TRANSACTION_DDL}"));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // THREE transactions — one statement each, so one `__$start_lsn` group each.
+    for t in 0..TXS {
+        mssql_seed_one_transaction(&table, t * PER_TX + 1..=(t + 1) * PER_TX);
+    }
+    wait_for_capture(&ci, (TXS * PER_TX) as i64);
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mssql_cdc(&table, &ci)
+        .cdc("rollover: 5")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+
+    // Run 1: the cap forces every transaction's tail onto disk, and the crash fires
+    // at the first roll — after the checkpoint, before the ack — with the rest of
+    // the spilled tail still undelivered in the dying process.
+    let crashed = rig.run_with_envs(&[
+        ("RIVET_CDC_MAX_TX_ROWS", "4"),
+        ("RIVET_CDC_SPILL_DIR", "1"),
+        ("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack"),
+    ]);
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+    let log1 = String::from_utf8_lossy(&crashed.stderr).to_string();
+    assert!(
+        log1.contains("passed the in-memory cap"),
+        "the fixture is inert unless run 1 actually SPILLED before crashing — \
+         without this line the crash fired on the unspilled path and the test \
+         proves nothing about it. stderr: {log1}"
+    );
+
+    // Run 2: same checkpoint, same destination — the scheduler's own resume shape.
+    // The spill is re-created from the re-read, so the env var stays set.
+    let out2 = rig.run_with_envs(&[("RIVET_CDC_MAX_TX_ROWS", "4"), ("RIVET_CDC_SPILL_DIR", "1")]);
+    assert!(
+        out2.status.success(),
+        "the resume run must succeed: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (1..=(TXS * PER_TX) as i64).collect();
+    assert_eq!(
+        got, want,
+        "every row of every spilled group must survive the mid-tail crash — a \
+         missing group means the checkpoint advanced past a commit whose rows died \
+         with the crashed process's spill file"
+    );
+
+    // And the crashed process's spill file must not still be on disk after the
+    // resume: its writer is dead, the sweep runs at the next spill, and one leaked
+    // multi-GB file per crash fills a disk on a scheduler.
+    let leaked: Vec<String> = std::fs::read_dir(ckpt.parent().unwrap().join(".rivet-spill"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path().display().to_string())
+                .filter(|p| p.contains("rivet-spill-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leaked.is_empty(),
+        "the crashed run's spill must be collected by the resume's sweep: {leaked:?}"
     );
 }

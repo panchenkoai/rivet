@@ -435,7 +435,7 @@ mod tests {
 
     /// Overflow edge cases: a value beyond `i128` range must return `None`,
     /// never panic or wrap. Guards the `checked_mul`/`checked_add` + parse
-    /// paths. See CLAUDE.md "Remediation hints must recover from the degraded
+    /// paths. See the process rules "Remediation hints must recover from the degraded
     /// state" — a wrapped decimal is exactly the silent corruption we forbid.
     #[test]
     fn value_beyond_i128_returns_none_not_panic() {

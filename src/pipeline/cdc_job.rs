@@ -7,14 +7,25 @@
 //! — `(Result<()>, RunSummary)`, metric recorded internally — so the orchestrator
 //! treats a CDC export like any other.
 
-use std::path::PathBuf;
-
 use super::finalize::finalize_run_report;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
 use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, DrainMode, run_capture};
 use crate::state::StateStore;
+
+/// Default memory budget for one CDC part — the byte half of `rollover`.
+///
+/// 256 MiB is chosen to be INERT on the common shape and binding on the pathological
+/// one: the default `rollover: 100_000` narrow events costs ~77 MB (measured 772
+/// B/event), so this never fires there, while a wide-row table that would otherwise
+/// buffer gigabytes now rolls a part instead. Raising it is a config line; the
+/// absence of any default was a memory ceiling that only existed for narrow rows.
+///
+/// It bounds the ORDINARY path. A single transaction larger than the budget still
+/// buffers whole — the sink may not roll mid-transaction — which is the separate
+/// problem `RIVET_CDC_MAX_TX_BYTES` refuses and the soak stand measures.
+pub(crate) const DEFAULT_CDC_ROLLOVER_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
 /// export. The metric row is written here (as `run_export_job` does); the
@@ -118,7 +129,10 @@ pub(super) fn run_cdc_export(
     // while leaving the hole open.
 
     let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes);
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes, config_dir);
     let duration_ms = started.elapsed().as_millis() as i64;
 
     // The manifests describe what was made DURABLE; `outcome` says whether the
@@ -206,6 +220,7 @@ pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
+    config_dir: &std::path::Path,
 ) -> Result<Vec<ExportConfig>> {
     let cdc = export.cdc.clone().unwrap_or_default();
     // `snapshot` is the only OSS `initial:` mode; absence means "capture changes
@@ -231,6 +246,58 @@ pub(super) fn initial_snapshot_pending(
         (None, Some(t)) => (vec![t.clone()], false),
         (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
     };
+    // The relation the SNAPSHOT must read, when the engine can name it from a
+    // catalog rather than from the configured string. On SQL Server the capture
+    // instance settles it outright, and the two readings disagreed in silence: the
+    // baseline was `SELECT … FROM <configured>` resolved in the connection's DEFAULT
+    // schema, so a same-named decoy's rows were deposited in the captured table's
+    // own prefix (MEASURED: `{"id":900,"amount":42,"dbo_only":7}` for a relation
+    // holding neither that id nor those columns, `status: success`). The LABEL stays
+    // the configured string — both legs share one prefix and the snapshot marker is
+    // keyed by it — while the READ follows the catalog.
+    let catalog_read: Option<String> = match (CdcEngine::from_url(&url)?, &cdc.capture_instance) {
+        (CdcEngine::Mssql, Some(ci)) => {
+            let Some((schema, table)) =
+                crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls)?
+            else {
+                // The catalog has no such capture instance. `open` bails on this
+                // too — but the SNAPSHOT leg runs, writes, and MARKS ITSELF DONE
+                // before `open` is ever called, so deferring to it means a typo'd
+                // instance deposits a baseline read from whatever the configured
+                // name resolves to and then never re-reads (round-4, DEMONSTRATED:
+                // correcting the typo left the fabricated row in place and the real
+                // rows never backfilled). Refuse where it is still cheap.
+                anyhow::bail!(
+                    "sqlserver cdc: export '{}' names capture instance '{ci}', which \
+                     `cdc.change_tables` does not know. Enable CDC on the table \
+                     (`sys.sp_cdc_enable_table`) or fix the name — continuing would \
+                     snapshot whatever `{}` resolves to in the connection's default \
+                     schema and record that as this table's baseline.",
+                    export.name,
+                    tables.first().map(String::as_str).unwrap_or("the table"),
+                );
+            };
+            // And the configured name must AGREE with the catalog, by the same
+            // predicate the sink routes by. `open` checks this; the snapshot leg had
+            // no routing check at all, so a `table:` contradicting its capture
+            // instance backfilled one relation into the other's prefix and only then
+            // failed the drain.
+            for t in &tables {
+                if !crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
+                    anyhow::bail!(
+                        "sqlserver cdc: export '{}' configures `table: {t}` while capture \
+                         instance '{ci}' emits changes for `{schema}.{table}` — the two \
+                         name different relations, so the snapshot would back up one and \
+                         the drain capture the other. Set `table:` to `{schema}.{table}`, \
+                         or point `capture_instance:` at the table you meant.",
+                        export.name,
+                    );
+                }
+            }
+            Some(format!("{schema}.{table}"))
+        }
+        _ => None,
+    };
     let mut table_dests = Vec::with_capacity(tables.len());
     let mut done_flags = Vec::with_capacity(tables.len());
     for t in &tables {
@@ -245,7 +312,11 @@ pub(super) fn initial_snapshot_pending(
         // bucket); the GCS `snapshot/_SUCCESS` marker stays a legacy co-signal so
         // pre-v14 runs and setups without state still skip correctly.
         let done = state.snapshot_done(&export.name, t)? || dest.head("_SUCCESS")?.is_some();
-        table_dests.push((t.clone(), snap_dcfg));
+        table_dests.push((
+            t.clone(),
+            catalog_read.clone().unwrap_or_else(|| t.clone()),
+            snap_dcfg,
+        ));
         done_flags.push(done);
     }
 
@@ -255,7 +326,11 @@ pub(super) fn initial_snapshot_pending(
     // by `.ok()` into "no checkpoint" — that let PG CDC treat a run as a fresh
     // first anchor and re-create a dropped slot at 'current', permanently skipping
     // every change since the loss (the anti-gap guard never fired).
-    let ckpt_resume = match cdc.checkpoint.as_deref().map(std::path::Path::new) {
+    let ckpt_path = cdc
+        .checkpoint
+        .as_deref()
+        .map(|raw| crate::source::cdc::resolve_checkpoint(raw, config_dir));
+    let ckpt_resume = match ckpt_path.as_deref() {
         Some(p) => crate::source::cdc::Position::load(p)?.is_some(),
         None => false,
     };
@@ -266,15 +341,15 @@ pub(super) fn initial_snapshot_pending(
     CdcEngine::from_url(&url)?.ensure_anchor(
         &url,
         &slot,
-        cdc.checkpoint.as_deref().map(std::path::Path::new),
+        ckpt_path.as_deref(),
         tls,
         resume_expected,
     )?;
 
     let mut pending = Vec::new();
     for idx in pending_idx {
-        let (t, snap_dcfg) = &table_dests[idx];
-        pending.push(synth_snapshot_export(export, t, snap_dcfg));
+        let (label, read, snap_dcfg) = &table_dests[idx];
+        pending.push(synth_snapshot_export(export, label, read, snap_dcfg));
     }
     Ok(pending)
 }
@@ -287,26 +362,44 @@ pub(super) fn initial_snapshot_pending(
 /// hand-typing the expected family — the fixture bypass that made the earlier
 /// version of that test green against a product which still mis-folded.
 #[cfg(test)]
-pub(crate) fn synth_snapshot_export_for_test(export: &ExportConfig, table: &str) -> ExportConfig {
-    synth_snapshot_export(export, table, &export.destination)
+/// Test door onto [`synth_snapshot_export`], taking BOTH strings.
+///
+/// It took only the one until round-4, and passed it twice — so no unit test could
+/// express LABEL ≠ READ, which is the entire distinction the SQL Server catalog
+/// resolution introduced. That is how a broken snapshot-done key shipped: the
+/// mechanism's activation threshold is two DIFFERENT strings, and every fixture had
+/// one.
+pub(crate) fn synth_snapshot_export_for_test(
+    export: &ExportConfig,
+    table: &str,
+    read: &str,
+) -> ExportConfig {
+    synth_snapshot_export(export, table, read, &export.destination)
 }
 
 fn synth_snapshot_export(
     export: &ExportConfig,
     table: &str,
+    read: &str,
     snap_dcfg: &crate::config::DestinationConfig,
 ) -> ExportConfig {
     let mut synth = export.clone();
     // The leg's family is the PARENT export, recorded here — the one place that
     // knows, because it is building the name from it.
     synth.snapshot_parent = Some(export.name.clone());
+    // The label travels WITH the leg, so every consumer that must agree with the
+    // configured string can ask for it instead of re-deriving it.
+    synth.snapshot_label = Some(table.to_string());
     synth.name = format!(
         "{}{}{table}",
         export.name,
         crate::manifest::SNAPSHOT_LEG_INFIX
     );
     synth.mode = crate::config::ExportMode::Full;
-    synth.table = Some(table.to_string());
+    // The LABEL names the leg (and through it the prefix and the snapshot marker);
+    // the READ names the relation. They differ only where a catalog knows better
+    // than the configured string.
+    synth.table = Some(read.to_string());
     synth.tables = None;
     synth.cdc = None;
     synth.destination = snap_dcfg.clone();
@@ -404,12 +497,14 @@ pub(crate) fn dest_for_table(
 /// the metric + journal.
 /// Returns what the drain made DURABLE paired with its outcome — never one
 /// without the other. See `sink::run_to_files`.
+#[allow(clippy::too_many_arguments)]
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
     state: &StateStore,
     read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    config_dir: &std::path::Path,
 ) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = match config.source.resolve_url() {
         Ok(u) => u,
@@ -518,7 +613,10 @@ fn run_cdc_inner(
             export_name: export.name.clone(),
             cdc_cfg: CdcConfig {
                 url,
-                checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
+                checkpoint: cdc
+                    .checkpoint
+                    .as_deref()
+                    .map(|raw| crate::source::cdc::resolve_checkpoint(raw, config_dir)),
                 drain: DrainMode::from_until_current(cdc.until_current),
                 tls: config.source.tls.clone(),
                 engine: match config.source.source_type {
@@ -546,6 +644,7 @@ fn run_cdc_inner(
                         canonical: config.source.mongo.as_ref().is_some_and(|m| {
                             matches!(m.json, crate::config::MongoJsonMode::Canonical)
                         }),
+                        configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                     },
                 },
             },
@@ -553,7 +652,19 @@ fn run_cdc_inner(
             format: export.format,
             max_events: cdc.max_events,
             rollover: cdc.rollover.unwrap_or(100_000),
-            rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
+            // `.or(...)`, never an unconditional assign: an ABSENT `rollover_memory_mb`
+            // must get the protective default, not be read as "no budget" — the
+            // config-clobber shape that once turned a profile's memory cap into
+            // `None` and tripled RSS.
+            //
+            // A DEFAULT at all, because `rollover` alone bounds ROWS and memory is
+            // what runs out: 100_000 narrow events is ~77 MB and 100_000 wide ones is
+            // unbounded, so the row count is a budget only for one row width. Whichever
+            // limit is reached first rolls the part.
+            rollover_memory_bytes: cdc
+                .rollover_memory_mb
+                .map(|mb| mb * 1024 * 1024)
+                .or(Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES)),
             run_id: run_id.to_string(),
             started_at: now,
             state: Some(state),
@@ -655,6 +766,66 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
 
 #[cfg(test)]
 mod tests {
+
+    /// `resolve_checkpoint`'s three cases, each named by a mutant that survived.
+    ///
+    /// The function is pure apart from two `exists()` probes, and it had only LIVE
+    /// coverage — so `replace -> PathBuf with Default::default()`, `delete !` and
+    /// `&& -> ||` all sailed through the offline gate. It decides where a resume
+    /// looks for its position, so a wrong answer re-anchors the stream at NOW.
+    #[test]
+    fn resolve_checkpoint_prefers_the_config_dir_and_keeps_an_existing_cwd_file() {
+        let cfg_dir = tempfile::tempdir().expect("config dir");
+        let cwd_dir = tempfile::tempdir().expect("cwd");
+        let _guard = std::env::set_current_dir(cwd_dir.path());
+
+        // ABSOLUTE: used verbatim, and never empty — the `-> Default::default()`
+        // mutant returns an empty path, which `Position::load` reads as "no
+        // checkpoint" and re-anchors.
+        let abs = cfg_dir.path().join("abs.ckpt");
+        assert_eq!(
+            crate::source::cdc::resolve_checkpoint(abs.to_str().unwrap(), cfg_dir.path()),
+            abs
+        );
+
+        // A scaffolded `./x` renders WITHOUT the dot component: `rivet init` writes
+        // `./cdc/<table>.ckpt` into every config, so `/etc/rivet/./cdc/t.ckpt` is what
+        // the re-anchor warning would name — the same file, and unreadable next to an
+        // `ls`. Same components, so this is rendering and not resolution.
+        assert_eq!(
+            crate::source::cdc::resolve_checkpoint("./cdc/t.ckpt", cfg_dir.path()),
+            cfg_dir.path().join("cdc").join("t.ckpt"),
+            "a `.` component must not survive into the path rivet reports"
+        );
+
+        // RELATIVE with nothing anywhere: the CONFIG's directory, not the CWD.
+        assert_eq!(
+            crate::source::cdc::resolve_checkpoint("rel.ckpt", cfg_dir.path()),
+            cfg_dir.path().join("rel.ckpt"),
+            "a relative path follows the config — resolving it against the process \
+             working directory is what made one config look in two places"
+        );
+
+        // RELATIVE with a file ALREADY at the CWD-relative location and none at the
+        // config one: the existing file wins, or upgrading strands it and the next
+        // run re-anchors past everything since.
+        std::fs::write(cwd_dir.path().join("legacy.ckpt"), b"{}").expect("seed legacy");
+        assert_eq!(
+            crate::source::cdc::resolve_checkpoint("legacy.ckpt", cfg_dir.path()),
+            std::path::Path::new("legacy.ckpt"),
+            "an existing CWD-relative checkpoint is kept — `&&` becoming `||`, or the \
+             `!` disappearing, both break this compatibility arm"
+        );
+
+        // ...but once the config-relative one exists, it wins even though the CWD
+        // one still does — that is the pair the `&&` guards.
+        std::fs::write(cfg_dir.path().join("legacy.ckpt"), b"{}").expect("seed config-side");
+        assert_eq!(
+            crate::source::cdc::resolve_checkpoint("legacy.ckpt", cfg_dir.path()),
+            cfg_dir.path().join("legacy.ckpt")
+        );
+    }
+
     use super::*;
     use crate::config::{DestinationConfig, DestinationType};
 
@@ -752,7 +923,7 @@ mod tests {
             path: Some("/tmp/snap".into()),
             ..Default::default()
         };
-        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        let synth = synth_snapshot_export(&e, "orders", "orders", &dcfg);
         assert!(
             !synth.meta_columns.exported_at,
             "a per-run stamp must not ride along onto the snapshot leg"
@@ -820,6 +991,43 @@ mod tests {
     // the legs; BOTH legs produce `_rivet_row_hash`, so dropping it on the
     // snapshot is what would desynchronize them — leaving every backfilled
     // row's hash NULL and the audit's cheap path unusable.
+    /// LABEL and READ are different strings, and each consumer must get the right
+    /// one.
+    ///
+    /// Round-4: once the snapshot leg learned to READ the relation SQL Server's
+    /// capture instance names, `synth.table` stopped being the configured string —
+    /// and `mark_snapshot_done` kept writing `synth.table` while `snapshot_plan`
+    /// asked with the configured one. The key is byte-exact, so the row could never
+    /// answer its own question and every scheduled cycle re-snapshotted the whole
+    /// table under a green run.
+    ///
+    /// The fixture needs TWO DIFFERENT strings; the test door passed one twice
+    /// until now, which is why nothing here could see it.
+    #[test]
+    fn the_snapshot_leg_carries_the_label_and_reads_the_catalog_relation() {
+        let e = crate::config::sample_export("orders");
+        let synth = synth_snapshot_export_for_test(&e, "orders", "sales.orders");
+        assert_eq!(
+            synth.table.as_deref(),
+            Some("sales.orders"),
+            "the relation READ follows the catalog — that is the whole point of the \
+             resolution"
+        );
+        assert_eq!(
+            synth.snapshot_label.as_deref(),
+            Some("orders"),
+            "and the LABEL travels with the leg, because everything a later run keys \
+             on — the snapshot-done row above all — asks with the configured string"
+        );
+        assert!(
+            synth.name.contains("orders") && !synth.name.contains("sales.orders"),
+            "the leg's NAME is built from the label too, so the destination \
+             sub-prefix and the manifest identity do not move when a catalog \
+             resolution changes: {}",
+            synth.name
+        );
+    }
+
     #[test]
     fn snapshot_leg_inherits_the_row_hash() {
         let mut e = crate::config::sample_export("orders");
@@ -831,7 +1039,7 @@ mod tests {
             path: Some("/tmp/snap".into()),
             ..Default::default()
         };
-        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        let synth = synth_snapshot_export(&e, "orders", "orders", &dcfg);
         assert_eq!(
             synth.meta_columns.row_hash, e.meta_columns.row_hash,
             "the snapshot leg must emit the SAME hash column the drain does"

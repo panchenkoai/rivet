@@ -310,10 +310,25 @@ exports:
 }
 
 #[test]
-fn roast_mongo_cdc_rejects_dotted_collection_name() {
-    // A dotted collection name does not route through the change-stream capture —
-    // its events are silently dropped (0-row success forever). Refuse at load
-    // (bug-hunt find); batch handles dotted names, so this is CDC-only.
+fn mongo_cdc_accepts_a_dotted_collection_name_because_the_router_addresses_it() {
+    // This test asserted the OPPOSITE until round-3B, and the reversal is the
+    // finding: the refusal was written when a dotted name really was dropped —
+    // `table_matches` split it into a bogus `schema.table` and routed zero events
+    // forever — and the ROUTER was fixed (`cfg == table` is tried first, with a
+    // unit test named for exactly this shape) while the config guard that existed
+    // because of the bug stayed. Its stated reason, "the change-stream router
+    // cannot address it", became false the day the router learned to.
+    //
+    // DEMONSTRATED live on the mongo-rs stand before removal: `rivet cdc --table
+    // events.v2` emitted exactly the dotted collection's inserts and filtered the
+    // rest; a full `mode: cdc` config routed 2 rows to `events.v2/` and 3 to
+    // `orders/`. So the guard refused a capture that works, and told the operator
+    // to rename a production collection.
+    //
+    // The genuinely ambiguous case it hid — a collection whose first dot-segment
+    // equals the DATABASE name — is fixed where it lives, in the router: Mongo has
+    // no schema to qualify with, so the split arm does not run there at all
+    // (`a_mongo_dotted_name_never_splits_into_a_schema_qualifier`).
     let yaml = r#"
 source:
   type: mongo
@@ -326,9 +341,58 @@ exports:
     cdc: { checkpoint: "/tmp/ck", until_current: true }
     destination: { type: local, path: "/tmp/x" }
 "#;
-    let err = parse_err(yaml);
     assert!(
-        err.contains("dot"),
-        "dotted collection in mongo CDC must be rejected naming the dot; got: {err}"
+        rivet::config::Config::from_yaml(yaml).is_ok(),
+        "a dotted collection name is an ordinary MongoDB collection and the \
+         change-stream router addresses it by full name — refusing it wedges a \
+         capture that works"
+    );
+}
+
+/// Two `tables:` entries that can name ONE relation must be refused at load.
+///
+/// Round-3B bughunt. The sink routes each event to the FIRST configured name that
+/// matches, and a BARE name matches any schema — so `["bh_orders",
+/// "public.bh_orders"]` gives one sink every event and leaves the other publishing
+/// a `_SUCCESS` and a `row_count: 0` manifest on every run. DEMONSTRATED live on
+/// PostgreSQL: three inserts, `status: success, rows: 3`, all three under
+/// `bh_orders/`, while `public.bh_orders/` published emptiness that a downstream
+/// loader reads as a healthy, complete, empty export.
+///
+/// The pre-existing duplicate check compares STRINGS, and these two differ.
+#[test]
+fn tables_that_can_name_one_relation_are_refused_not_silently_merged() {
+    let cfg = |tables: &str| {
+        format!(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://u:p@localhost:5432/db"
+exports:
+  - name: t
+    tables: {tables}
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: "s", checkpoint: "/tmp/ck", until_current: true }}
+    destination: {{ type: local, path: "/tmp/x" }}
+"#
+        )
+    };
+    let err = parse_err(&cfg(r#"["bh_orders", "public.bh_orders"]"#));
+    assert!(
+        err.contains("bh_orders") && err.contains("public.bh_orders"),
+        "the refusal must name BOTH spellings — the operator has to know which two \
+         collided to pick one; got: {err}"
+    );
+
+    // Two genuinely different relations must still load: a guard that refused this
+    // would break every multi-schema capture, which is the whole point of `tables:`.
+    assert!(
+        rivet::config::Config::from_yaml(&cfg(r#"["sales.orders", "audit.orders"]"#)).is_ok(),
+        "two qualified names in DIFFERENT schemas are two relations, not a collision"
+    );
+    assert!(
+        rivet::config::Config::from_yaml(&cfg(r#"["orders", "customers"]"#)).is_ok(),
+        "two bare names of different tables are not a collision either"
     );
 }

@@ -272,7 +272,12 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
                 configured_tables: a.table.clone(),
                 capture_instance: a.capture_instance,
             },
-            CdcEngine::Mongo => CdcEngineOpts::Mongo { canonical: false },
+            // Same contract as the SQL arms above: a bare `rivet cdc` with no
+            // `--table` names nothing, so there is nothing to cross-check.
+            CdcEngine::Mongo => CdcEngineOpts::Mongo {
+                canonical: false,
+                configured_tables: a.table.clone(),
+            },
         },
     };
     let Some(dir) = a.output else {

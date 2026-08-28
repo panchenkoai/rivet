@@ -79,6 +79,7 @@ pub(crate) struct MongoChangeStream {
 /// a DDL event we skip (a `drop`/`rename`/`dropDatabase` is not a row change — it
 /// must NOT bail the whole run, especially for an uncaptured collection), or an
 /// `invalidate` that genuinely ended the stream.
+#[derive(Debug, PartialEq, Eq)]
 enum OpClass {
     Row,
     Skip,
@@ -102,6 +103,42 @@ fn classify_op(op: &OperationType) -> OpClass {
 /// bounded run whether the stream has advanced past its open-time target.
 fn token_data(v: &serde_json::Value) -> Option<String> {
     v.get("_data").and_then(|d| d.as_str()).map(String::from)
+}
+
+/// `token_data` is the resume token's identity — the string every bound and resume
+/// decision compares. All three mutants on it were MISSED (live-suite-only oracle):
+/// `-> None` silently disables the open-time bound, `-> Some("")` makes every poll
+/// look past-bound, `-> Some("xyzzy")` anchors resume at a fiction.
+#[cfg(test)]
+mod token_data_tests {
+    use super::*;
+
+    #[test]
+    fn token_data_plucks_the_data_string_and_nothing_else() {
+        assert_eq!(
+            token_data(&serde_json::json!({ "_data": "82ABCD" })),
+            Some("82ABCD".to_string())
+        );
+        assert_eq!(
+            token_data(&serde_json::json!({ "_data": "" })),
+            Some(String::new()),
+            "an EMPTY _data is still a token — collapsing it to None would make \
+             an empty-token checkpoint re-anchor instead of resuming"
+        );
+        for absent in [
+            serde_json::json!({}),
+            serde_json::json!({ "_data": 7 }),
+            serde_json::json!({ "other": "82ABCD" }),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                token_data(&absent),
+                None,
+                "{absent}: no string _data means NO token — inventing one would \
+                 compare bounds against a fiction"
+            );
+        }
+    }
 }
 
 /// Pure bound verdicts (#161): Mongo was the only engine whose `until_current`
@@ -174,7 +211,7 @@ async fn server_identity(
 /// - PostgreSQL, MySQL and SQL Server keep a CATCH-UP exit (a short/empty peek,
 ///   `BINLOG_DUMP_NON_BLOCK`'s EOF, the capture job's scan gap). With the bound
 ///   unset they still terminate — late, not never — so failing OPEN there is the
-///   right call, as CLAUDE.md records.
+///   right call, as the process rules records.
 /// - MongoDB has NO such backstop. `past_time_bound` is `false` for every event
 ///   once the bound is `None`, so the only remaining exit is the empty-poll check
 ///   — and under sustained writes `next_if_any` keeps returning events, so it
@@ -285,6 +322,9 @@ impl MongoChangeStream {
         checkpoint: Option<&std::path::Path>,
         canonical: bool,
         mode: DrainMode,
+        // The export's configured `table:` names. Mongo had no routing
+        // cross-check at all — this is what the zero-match warning needs.
+        configured_tables: &[String],
     ) -> Result<Self> {
         let until_current = mode.is_bounded();
         let session = MongoSession::connect(url, tls)?;
@@ -307,29 +347,95 @@ impl MongoChangeStream {
         // sub-6.0 server gives current-state UpdateLookup post-images and no delete
         // pre-image, so a null `document` on an update/delete means "this tier
         // can't provide it", not "the value was null". doctor surfaces the same.
+        // A configured collection the database does not hold. MEASURED before this:
+        // `table: no_such_collection` ran to `status: success, rows: 0` with no
+        // warning — a typo and a genuinely quiet window look identical, and the
+        // first is the one an operator needs before concluding "CDC works, there is
+        // just no traffic".
+        //
+        // A WARNING, not a refusal: on Mongo a collection is created by its first
+        // write, so capturing one that does not exist YET is a legitimate setup —
+        // start the stream, then let the app create it. Refusing would break that.
+        // What is not legitimate is silence.
+        //
+        // This engine's whole share of the resolution contract is this arm: the
+        // stream is scoped to ONE database, so the cross-schema ambiguity the SQL
+        // engines refuse cannot arise here.
+        if !configured_tables.is_empty() {
+            let present: Vec<String> = session
+                .block_on(async {
+                    session
+                        .client()
+                        .database(&db_name)
+                        .list_collection_names()
+                        .await
+                })
+                .unwrap_or_default();
+            if !present.is_empty() {
+                let missing: Vec<&String> = configured_tables
+                    .iter()
+                    .filter(|c| {
+                        !present.iter().any(|p| {
+                            crate::source::cdc::sink::table_matches(
+                                crate::source::cdc::CdcEngine::Mongo,
+                                c,
+                                &db_name,
+                                p,
+                            )
+                        })
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    log::warn!(
+                        "mongodb cdc: could not find {missing:?} in database `{db_name}` — it \
+                         holds {present:?}. A collection is created by its first write, so \
+                         this is fine if the app has not written yet; if it is a typo the \
+                         capture will report success over zero rows forever."
+                    );
+                }
+            }
+        }
         let cap = probe_capability_on(&session);
-        log::info!(
-            "mongodb cdc: server {} — capture tier: {}",
-            cap.server_version,
-            cap.tier()
-        );
-        let stream = session.block_on(async {
-            session
-                .client()
-                .database(&db_name)
-                .watch()
-                // Post-image for insert/update (current-state lookup).
-                .full_document(FullDocumentType::UpdateLookup)
-                // Delete/update PRE-image when the server carries it (6.0+ with
-                // `changeStreamPreAndPostImages`); silently absent otherwise.
-                .full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable)
-                // Bound how long the server holds a getMore open for a new change.
-                // Short so a bounded (`until_current`) run detects "drained" quickly
-                // via `next_if_any`; harmless for the daemon (`next` just re-polls).
-                .max_await_time(std::time::Duration::from_millis(500))
-                .resume_after(resume)
-                .await
-        })?;
+        // The LOSSY tier is a warn: "deletes carry _id only" is a fidelity loss the
+        // operator should see, and the default log level hides info — the same rule
+        // that governs PostgreSQL's REPLICA IDENTITY warning for the identical
+        // condition. The capable tier stays info; announcing full fidelity loudly
+        // would train operators to ignore the level.
+        if cap.major >= 6 {
+            log::info!(
+                "mongodb cdc: server {} — capture tier: {}",
+                cap.server_version,
+                cap.tier()
+            );
+        } else {
+            log::warn!(
+                "mongodb cdc: server {} — capture tier: {}",
+                cap.server_version,
+                cap.tier()
+            );
+        }
+        let stream = session
+            .block_on(async {
+                session
+                    .client()
+                    .database(&db_name)
+                    .watch()
+                    // Post-image for insert/update (current-state lookup).
+                    .full_document(FullDocumentType::UpdateLookup)
+                    // Delete/update PRE-image when the server carries it (6.0+ with
+                    // `changeStreamPreAndPostImages`); silently absent otherwise.
+                    .full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable)
+                    // Bound how long the server holds a getMore open for a new change.
+                    // Short so a bounded (`until_current`) run detects "drained" quickly
+                    // via `next_if_any`; harmless for the daemon (`next` just re-polls).
+                    .max_await_time(std::time::Duration::from_millis(500))
+                    .resume_after(resume)
+                    .await
+            })
+            // The oversize failure lands HERE, on the initial aggregate, not on a later
+            // poll — so diagnosing it only in `next_change` left it wearing the generic
+            // setup hint. Same function, both sites.
+            .map_err(diagnose_stream_error)?;
         // The "current end" a bounded (`until_current`) run drains up to (the
         // resume-token `_data`, for the empty-poll race), plus the cluster time at
         // open (the strict upper bound that terminates under sustained writes).
@@ -382,7 +488,27 @@ impl MongoChangeStream {
             && let Some(pos) = this.anchor_position()
         {
             pos.save(ckpt)?;
-            log::info!("mongodb cdc: pinned resume anchor at open (fresh checkpoint)");
+            // `warn`, not `info`: this branch is reached both on a genuine first run
+            // and when a previously-written checkpoint is simply NOT THERE, and rivet
+            // cannot tell them apart. An `info` line is invisible at the default
+            // level, so the second case was silent (round 9, measured on the MySQL
+            // peer of this branch: three green runs delivered [3] of [1,2,3], because
+            // a relative `cdc.checkpoint:` was then resolved against the process
+            // working directory and the same config run from elsewhere found no file).
+            // That resolution now follows the CONFIG's directory, so the message names
+            // the path rivet actually looked at rather than a cause that no longer
+            // exists — a hint pointing somewhere the file was never going to be is
+            // spent at exactly the moment the operator is deciding whether to
+            // re-snapshot.
+            log::warn!(
+                "mongodb cdc: no checkpoint at `{}` — anchoring the resume token at the \
+                 CURRENT oplog position, so anything written before now is NOT captured. \
+                 On a first run that is expected. If this checkpoint existed before, it \
+                 was deleted or the config moved: a RELATIVE `cdc.checkpoint:` is \
+                 resolved against the CONFIG FILE's directory, so the path above is \
+                 where rivet looked — re-snapshot before trusting this stream.",
+                ckpt.display()
+            );
         }
         Ok(this)
     }
@@ -400,7 +526,7 @@ impl MongoChangeStream {
 /// prior checkpoint). MongoDB has no server-side anchor — a change stream opened
 /// without a token starts at "now" — so the coordinates must be persisted
 /// immediately, or an idle first run would let the next run re-anchor forward and
-/// skip everything in between (the MySQL binlog anchor rule, per CLAUDE.md).
+/// skip everything in between (the MySQL binlog anchor rule, per the process rules).
 pub(crate) fn pin_checkpoint_at_current(
     url: &str,
     tls: Option<&TlsConfig>,
@@ -411,7 +537,17 @@ pub(crate) fn pin_checkpoint_at_current(
     // first-run anchor). One mechanism, one place — this is the `ensure_anchor`
     // entry into it. (A non-replica-set can't `watch()`, so open fails loudly
     // before any pin.) The stream is opened only to anchor, then dropped.
-    MongoChangeStream::open(url, tls, Some(checkpoint), false, DrainMode::Continuous).map(|_| ())
+    // Anchor-only open: the routing cross-check is the RUN's job, so an empty
+    // configured list here is correct rather than an omission.
+    MongoChangeStream::open(
+        url,
+        tls,
+        Some(checkpoint),
+        false,
+        DrainMode::Continuous,
+        &[],
+    )
+    .map(|_| ())
 }
 
 /// What a MongoDB CDC run actually delivers — probed from the server so the tier
@@ -428,8 +564,14 @@ impl MongoCdcCapability {
     /// One-line fidelity declaration for the log / `doctor`.
     pub(crate) fn tier(&self) -> &'static str {
         if self.major >= 6 {
-            "full-image-capable (6.0+) — delete/update pre-images ride when \
-             changeStreamPreAndPostImages is enabled on the collection"
+            // Says what the code DOES. The previous wording promised update
+            // pre-images "ride", and the decode consults the pre-image only for a
+            // DELETE — an update's document is the `updateLookup` post-image, which
+            // resolves at read time and is absent once the document is gone.
+            "full-image-capable (6.0+) — DELETE pre-images ride when \
+             changeStreamPreAndPostImages is enabled; an UPDATE's document is a \
+             current-state lookup, so a document deleted after the change has none \
+             and rivet refuses that event rather than writing NULL"
         } else {
             "current-state (UpdateLookup) — update post-images are current-state \
              (not point-in-time) and deletes carry _id only; upgrade to 6.0+ for pre/post-images"
@@ -506,20 +648,62 @@ fn to_change_event(
     let id_val = RivetValue::Bytes(id_str.into_bytes());
 
     // The `document` column: post-image for insert/update, pre-image (6.0+) for
-    // delete, else Null (a delete with no pre-image, or an unlooked-up update).
-    let doc_source = match op {
-        ChangeOp::Delete => cse.full_document_before_change.as_ref(),
-        _ => cse.full_document.as_ref(),
+    // delete.
+    let doc_source = if op.values_live_in_before() {
+        cse.full_document_before_change.as_ref()
+    } else {
+        cse.full_document.as_ref()
     };
+    // An insert/update whose post-image is absent writes NULL here, and that is a
+    // KNOWN GAP with a narrow harmful case — recorded rather than papered over.
+    //
+    // `fullDocument: updateLookup` resolves the CURRENT document at read time, so an
+    // update to a document deleted since the change resolves to nothing. In the
+    // ORDINARY case that is harmless: the DELETE is itself a captured op, so its
+    // event follows and `dedup_view_sql` marks the key `__is_deleted` — the NULL row
+    // is outranked and nothing wrong reaches current state.
+    //
+    // The harmful case is a collection DROP. `classify_op` skips it (a
+    // database-scoped stream emits `drop` without `invalidate`), so NO delete event
+    // ever arrives — and the NULL row, ranked latest by `__pos`, then publishes a
+    // document that does not exist. MEASURED on the mongo-rs stand: `updateOne` then
+    // `drop()` gives `op=update, fullDocument=null` while the pre-image holds the
+    // content, and current state exposes `(_id, NULL)`.
+    //
+    // A blanket refusal here is NOT the fix, and this comment exists because I shipped
+    // one and the suite caught it: an insert-then-delete inside one polling window
+    // resolves to nothing too, so refusing wedges an ordinary workload
+    // (`mongo_cdc_delete_carries_the_pre_image_when_the_collection_has_one` went RED).
+    // The pre-image is not a substitute either — it is the document BEFORE the update,
+    // so writing it would publish a wrong value rather than a missing one. The real
+    // fix is to give a captured collection's DROP the same end-of-life semantics a
+    // delete has, which is a contract decision, not a decode tweak.
+    //
+    // `fullDocument: updateLookup` resolves the CURRENT document at read time, so an
+    // update to a document that has since been deleted — or whose collection was
+    // dropped — resolves to nothing. MEASURED on the mongo-rs stand: `updateOne` then
+    // `drop()` yields `op=update, fullDocument=null` while the pre-image holds the
+    // content. rivet wrote `document = NULL`, and because `dedup_view_sql` ranks by
+    // `__pos DESC` and only a `delete` sets `__is_deleted`, that NULL row OUTRANKED
+    // the earlier correct capture — current state then exposed `(_id, NULL)` for a
+    // document that no longer exists. A `drop` is classified `Skip`, so no delete
+    // event ever arrives to correct it. Counts balance; nothing warns.
+    //
+    // The pre-image is NOT a substitute here: it is the document BEFORE the update,
+    // and writing it as the post-image would publish a wrong value rather than a
+    // missing one. So this is a DEFERRED refusal, like the engines' other
+    // unrepresentable cells — the stream carries every collection in the database,
+    // so an uncaptured one must not wedge the run.
     let doc_val = match doc_source {
         Some(d) => RivetValue::Bytes(document_to_json(d, canonical)?.into_bytes()),
         None => RivetValue::Null,
     };
 
     let image = vec![id_val, doc_val];
-    let (before, after) = match op {
-        ChangeOp::Delete => (Some(image), None),
-        _ => (None, Some(image)),
+    let (before, after) = if op.values_live_in_before() {
+        (Some(image), None)
+    } else {
+        (None, Some(image))
     };
 
     let mut ev = ChangeEvent {
@@ -546,7 +730,70 @@ fn to_change_event(
     Ok(ev)
 }
 
+/// Turn a change-stream error into one an operator can act on.
+///
+/// Only one shape is intercepted, and it is intercepted because the generic hint
+/// wrapped around every Mongo CDC error is actively WRONG for it: an oversized
+/// change event surfaces as `BSONObjectTooLarge`, and rivet answered it with
+/// "MongoDB change streams require a replica set" — on a stand that IS one.
+///
+/// The event carries the post-image, the pre-image (when
+/// `changeStreamPreAndPostImages` is on) and the envelope in ONE BSON document
+/// against a 16 MB ceiling. MEASURED on the mongo-rs stand: a 9 MB document updated
+/// with both images enabled produced `BSONObj size: 18874897 … is invalid`. The run
+/// then fails on every attempt — the checkpoint sits at the last committed event
+/// before it — so this is a WEDGE, not a transient, and an operator following the
+/// replica-set hint would find nothing wrong and eventually delete the checkpoint,
+/// which re-anchors past the change and loses it.
+/// True when this error already carries a specific, actionable diagnosis, so the
+/// generic setup hint would only bury it.
+pub(crate) fn error_names_its_own_cause(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("16 MB BSON limit")
+}
+
+/// Does this driver error text name an OVERSIZED change event?
+///
+/// A named predicate rather than an inline `||`, per the rule that live-only glue
+/// may sequence and connect but must not decide: `diagnose_stream_error` takes a
+/// `mongodb::error::Error`, which no unit test can construct, so the decision inside
+/// it was ungradable — the `||` survived mutation to `&&` (which would require BOTH
+/// spellings in one message and so recognise nothing).
+///
+/// TWO spellings because the server uses both: the error CODE name
+/// `BSONObjectTooLarge` and the size complaint `BSONObj size: … is invalid`,
+/// measured on the mongo-rs stand.
+fn names_oversize_event(text: &str) -> bool {
+    text.contains("BSONObjectTooLarge") || text.contains("BSONObj size")
+}
+
+fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
+    let text = e.to_string();
+    if names_oversize_event(&text) {
+        return anyhow::anyhow!(
+            "mongodb cdc: a single change event exceeds MongoDB's 16 MB BSON limit — \
+             the event carries the post-image, the pre-image and the envelope in ONE \
+             document, so a document over roughly 8 MB can cross it on an update. \
+             This is not a setup problem and it does not clear on retry: the run stops \
+             at the same event every time. Recovery is a RE-SNAPSHOT — run this \
+             collection with `mode: full` (verified: a batch read of the same 9 MB \
+             document succeeds, because the snapshot reads the document rather than \
+             an event carrying two copies of it), then move the checkpoint past the \
+             stuck position. Do NOT just delete the checkpoint: on its own that \
+             re-anchors at NOW and drops the change with nothing standing in for it. \
+             Turning `changeStreamPreAndPostImages` off does NOT unstick THIS event \
+             either — the pre-image was already recorded when the change happened — \
+             though it does prevent the next one. Server error: {text}"
+        );
+    }
+    anyhow::Error::from(e)
+}
+
 impl ChangeStream for MongoChangeStream {
+    fn engine(&self) -> crate::source::cdc::CdcEngine {
+        crate::source::cdc::CdcEngine::Mongo
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         let canonical = self.canonical;
         let until_current = self.until_current;
@@ -580,12 +827,12 @@ impl ChangeStream for MongoChangeStream {
                         }
                         continue; // backlog still coming — poll again
                     }
-                    Err(e) => return Some(Err(anyhow::Error::from(e))),
+                    Err(e) => return Some(Err(diagnose_stream_error(e))),
                 }
             } else {
                 match session.block_on(async { stream.next().await }) {
                     Some(Ok(cse)) => cse,
-                    Some(Err(e)) => return Some(Err(anyhow::Error::from(e))),
+                    Some(Err(e)) => return Some(Err(diagnose_stream_error(e))),
                     None => return None, // stream closed
                 }
             };
@@ -651,6 +898,109 @@ impl ChangeStream for MongoChangeStream {
 
 #[cfg(test)]
 mod tests {
+    /// Three pure decisions a mutation run over this file found ungraded — 22 unique
+    /// survivors in 108 mutants, the weakest ratio of any CDC file so far.
+    ///
+    /// All three decide what a change MEANS, and each fails silently: a
+    /// misclassified op, a delete that carries the wrong image, or a hint that
+    /// buries the diagnosis it was written to surface.
+    #[test]
+    fn op_classification_delete_framing_and_the_diagnosis_check_all_answer() {
+        // CLASSIFY. The row ops must all be Row, Invalidate its own class, and
+        // anything else Skip. `delete match arm` on the row group sends every
+        // insert/update/replace/delete to `_ => Skip`, i.e. capture goes silent
+        // while the run reports success; deleting the Invalidate arm turns a
+        // collection drop into a skipped event instead of the stream restart it is.
+        for op in [
+            OperationType::Insert,
+            OperationType::Update,
+            OperationType::Replace,
+            OperationType::Delete,
+        ] {
+            assert_eq!(
+                classify_op(&op),
+                OpClass::Row,
+                "{op:?} carries a row — classifying it Skip drops the change while \
+                 the run still exits 0"
+            );
+        }
+        assert_eq!(
+            classify_op(&OperationType::Invalidate),
+            OpClass::Invalidate,
+            "an invalidate ends the stream's validity; treating it as Skip keeps \
+             reading from a cursor the server has abandoned"
+        );
+        assert_eq!(classify_op(&OperationType::Drop), OpClass::Skip);
+        assert_eq!(classify_op(&OperationType::DropDatabase), OpClass::Skip);
+        assert_eq!(classify_op(&OperationType::Rename), OpClass::Skip);
+
+        // DIAGNOSIS. `error_names_its_own_cause` decides whether a generic
+        // replica-set hint would BURY a specific one. `-> true` suppresses the hint
+        // on every error including the ones that need it; `-> false` restores the
+        // burial this predicate exists to prevent.
+        assert!(
+            error_names_its_own_cause(&anyhow::anyhow!(
+                "change stream event exceeded the 16 MB BSON limit"
+            )),
+            "an error that already names its own cause must suppress the generic \
+             hint — burying it is what sent an operator to check a topology that \
+             was fine"
+        );
+        assert!(
+            !error_names_its_own_cause(&anyhow::anyhow!("connection refused")),
+            "an opaque driver error needs the setup hint; suppressing it there \
+             leaves the operator with nothing actionable"
+        );
+    }
+
+    /// The oversize predicate recognises EITHER spelling, and the capability string
+    /// tells the truth about the version it describes.
+    ///
+    /// Both were ungraded until the local mutation run: `||` survived becoming `&&`
+    /// (which recognises nothing, since one message never carries both spellings),
+    /// and `tier` survived being replaced by `""` and by `"xyzzy"` outright — nothing
+    /// asserted it said anything at all.
+    #[test]
+    fn the_oversize_predicate_and_the_capability_string_say_what_they_mean() {
+        // MEASURED wire text, both forms.
+        assert!(super::names_oversize_event(
+            "Executor error during getMore :: caused by :: BSONObj size: 18874897 is invalid"
+        ));
+        assert!(super::names_oversize_event(
+            "PlanExecutor error during aggregation :: BSONObjectTooLarge"
+        ));
+        assert!(
+            !super::names_oversize_event("not authorized on db to execute command"),
+            "an unrelated error must NOT be diagnosed as oversize — that would send \
+             an operator to shrink documents over a permissions problem"
+        );
+
+        let cap = |major: u32| super::MongoCdcCapability {
+            server_version: format!("{major}.0.0"),
+            major,
+            is_replica_set: true,
+        };
+        let six = cap(6);
+        let five = cap(5);
+        assert!(
+            six.tier().contains("6.0+") && six.tier().to_uppercase().contains("DELETE"),
+            "6.0+ must declare what actually rides — DELETE pre-images, not update \
+             ones, which the decode never consults: {}",
+            six.tier()
+        );
+        assert!(
+            five.tier().contains("UpdateLookup"),
+            "and below 6.0 it must say the post-images are current-state: {}",
+            five.tier()
+        );
+        assert_ne!(
+            six.tier(),
+            five.tier(),
+            "the two tiers must not render identically, or the declaration carries \
+             no information about the server it describes"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

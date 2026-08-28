@@ -286,17 +286,17 @@ def summary_line(doc: dict) -> str:
 # move out from under it and every "no offenders" assertion below stays green.
 _SUBJECT_PATH = re.compile(
     r'"(?:\./)?(?:src|docs|tests|dev|examples|benches|\.github|\.cargo|\.githooks)/[^"]*"'
-    r'|"(?:Cargo\.toml|Cargo\.lock|Makefile|CLAUDE\.md|README\.md)"'
+    r'|"(?:Cargo\.toml|Cargo\.lock|Makefile|README\.md)"'
 )
 # Slice 1's shared rule. A guard that routes its subject through it FAILS on a
 # missing subject instead of grading the empty set — which is precisely the
 # property this census exists to trend.
 _NONVACUITY = re.compile(r"nonvacuity::(?:subject_text|require_enumerated|require_needle)")
 _TEST_ATTR = re.compile(r"#\[(?:tokio::)?test\]")
-# CLAUDE.md: "A name must not promise what the body cannot check" — a test that
+# Process rule: "A name must not promise what the body cannot check" — a test that
 # documents rather than verifies is named `..._documents_...` and says so.
 _DOCUMENTS_ONLY = re.compile(r"\bfn\s+\w*_documents_\w*\s*\(")
-# CLAUDE.md: "A test you cannot make RED should say so where a reader will see
+# Process rule: "A test you cannot make RED should say so where a reader will see
 # it." These are the phrasings the repo actually uses for that declaration.
 _BLIND_SPOT = re.compile(r"CANNOT SEE|cannot be made RED|cannot go RED|CANNOT be made RED")
 

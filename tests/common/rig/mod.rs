@@ -61,6 +61,11 @@ pub struct Rig {
     extra_exports: Vec<SecondaryExport>,
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
     oracle_container_dir: Option<String>,
+    /// Where `config_path()` materialises, when it must be somewhere the oracle
+    /// container can see — see [`Rig::census_oracle`]. `None` keeps the rig's own
+    /// tempdir, which is right for every test that does not read the state DB from
+    /// inside a container.
+    config_dir_override: Option<PathBuf>,
     ckpt_override: Option<PathBuf>,
     /// Cloud destination override when the exports write to a bucket/container
     /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
@@ -121,6 +126,7 @@ impl Rig {
             url_env: None,
             extra_exports: Vec::new(),
             oracle_container_dir: None,
+            config_dir_override: None,
             ckpt_override: None,
             dest_stdout: false,
             cloud_dest: None,
@@ -430,6 +436,25 @@ impl Rig {
     /// Override the checkpoint path (resume/crash suites share one
     /// checkpoint across several configs — the rig renders, the test owns
     /// the file's lifetime).
+    /// Render `cdc.checkpoint:` as the given RELATIVE path, verbatim.
+    ///
+    /// Every other constructor hands the rig an ABSOLUTE tempdir path, which is
+    /// precisely why nothing caught the working-directory bug: a relative
+    /// `checkpoint:` — what `rivet init` scaffolds — was resolved against the
+    /// process CWD, so the same config run from another directory found no file and
+    /// re-anchored at the current log position, silently. A test for that class
+    /// cannot use the absolute default, and this is the seam rather than a
+    /// hand-written `cdc_line`, which collides with the `__CKPT__` marker the
+    /// constructors already seed.
+    pub fn relative_checkpoint(mut self, rel: &str) -> Self {
+        for l in self.cdc_lines.iter_mut() {
+            if l == "__CKPT__" {
+                *l = format!("checkpoint: \"{rel}\"");
+            }
+        }
+        self
+    }
+
     pub fn checkpoint_path(mut self, path: PathBuf) -> Self {
         self.ckpt_override = Some(path);
         // The checkpoint only reaches the config if the cdc block renders it.
@@ -589,17 +614,47 @@ pub struct MssqlCdcTable {
     pub table: String,
     pub ci: String,
 }
+
+impl MssqlCdcTable {
+    /// A captured table outside `dbo`. The schema is taken at CONSTRUCTION because
+    /// the catalog cannot supply it at teardown: `OBJECT_SCHEMA_NAME(source_object_id)`
+    /// resolves the SOURCE OBJECT, so once the table is dropped it returns NULL even
+    /// though the `cdc.change_tables` row is still there (MEASURED on the stand).
+    /// A teardown that derives the schema from a possibly-gone object then skips the
+    /// disable AND drops the wrong name — leaking a non-`dbo` table.
+    pub fn in_schema(schema: &str, table: &str, ci: &str) -> Self {
+        Self {
+            table: format!("{schema}.{table}"),
+            ci: ci.to_string(),
+        }
+    }
+}
 impl Drop for MssqlCdcTable {
     fn drop(&mut self) {
-        let (table, ci) = (self.table.clone(), self.ci.clone());
+        // `table` may be `schema.table` (see `in_schema`) or a bare name in `dbo`.
+        let (schema, leaf) = match self.table.split_once('.') {
+            Some((s, t)) => (s.to_string(), t.to_string()),
+            None => ("dbo".to_string(), self.table.clone()),
+        };
+        let ci = self.ci.clone();
         let _ = std::panic::catch_unwind(move || {
+            // The SCHEMA comes from the catalog, never from an assumption. Two
+            // reasons, both already paid for in this repo: a fixture may put the
+            // captured table outside `dbo` (the schema-probe bughunt needs exactly
+            // that), and the recorded MSSQL lesson is that a guard joining
+            // `cdc.change_tables` to `sys.tables` goes blind the moment the table is
+            // dropped first — leaving the capture instance behind, so the next
+            // `sp_cdc_enable_table` fails 22926 and the suite alternates pass/fail.
+            // `capture_instance` survives the drop; join on that.
             super::mssql::mssql_cdc_exec(&format!(
-                "IF EXISTS(SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t \
-                   ON ct.source_object_id=t.object_id WHERE t.name='{table}') \
-                 EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', \
-                 @source_name=N'{table}', @capture_instance=N'{ci}';"
+                "DECLARE @s sysname = N'{schema}', @t sysname = N'{leaf}'; \
+                 IF EXISTS(SELECT 1 FROM cdc.change_tables WHERE capture_instance = N'{ci}') \
+                   EXEC sys.sp_cdc_disable_table @source_schema=@s, \
+                     @source_name=@t, @capture_instance=N'{ci}'; \
+                 DECLARE @d nvarchar(max) = N'DROP TABLE IF EXISTS ' \
+                   + QUOTENAME(@s) + N'.' + QUOTENAME(@t); \
+                 EXEC sp_executesql @d;"
             ));
-            super::mssql::mssql_cdc_drop_table(&format!("dbo.{table}"));
         });
     }
 }

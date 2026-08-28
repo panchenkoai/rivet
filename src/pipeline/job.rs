@@ -578,6 +578,25 @@ fn resolve_final_result(
     if failed {
         return run_result;
     }
+    // NOT gated on `validated` — and that is a DECISION, not an oversight.
+    //
+    // `rivet run --config … --validate` prints `validated: FAIL` and still exits 0,
+    // while the standalone `rivet validate` exits 3 on the same destination state.
+    // That asymmetry hid the round-11 leading-slash bug: a CI gate keyed on the run's
+    // exit code learned nothing while the report said FAIL.
+    //
+    // I made it fatal and reverted, because
+    // `roast_metric_validated_matches_final_summary_verdict` asserts exit 0 verbatim,
+    // citing ADR-0001 §I7. Read strictly, I7 is about manifest WRITE failures ("a
+    // SQLite INSERT failed") and says nothing about a verification VERDICT — so the
+    // citation is a stretch and the contract is arguably unsettled. But it is a
+    // user-visible exit-code contract with a test standing on it, and changing it is
+    // the maintainer's call, not something to slip in beside a bug fix.
+    //
+    // Whoever settles it: the question is whether `--validate` is an observability
+    // aid (I7's spirit — never abort a successful export over a check) or a GATE (the
+    // reason the flag exists on `run` at all). Today it is documented as the first
+    // and used as the second.
     // The manifest gap outranks the reconcile verdict. Reconcile answers "is the
     // data right?"; this answers "is the data REACHABLE?" — and an unreachable
     // prefix makes the first question moot. Ordered before so the exit code names
@@ -1303,13 +1322,17 @@ pub(super) fn run_export_job(
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails
         // the export — the anchor stays, so the retry resumes gap-free.
-        let pending = match super::cdc_job::initial_snapshot_pending(config, export, state) {
-            Ok(p) => p,
-            Err(e) => {
-                let summary = synthetic_failed_summary(&export.name, &e);
-                return (Err(e), summary);
-            }
-        };
+        let cdc_config_dir = std::path::Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let pending =
+            match super::cdc_job::initial_snapshot_pending(config, export, state, cdc_config_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    let summary = synthetic_failed_summary(&export.name, &e);
+                    return (Err(e), summary);
+                }
+            };
         for synth in &pending {
             let (res, summary) =
                 run_export_job(config_path, config, synth, state, config_dir, opts);
@@ -1327,7 +1350,13 @@ pub(super) fn run_export_job(
             // wasteful (a fresh full re-read + re-load), NOT data loss: the
             // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
             // anchor and no changes are skipped.
-            if let Some(table) = synth.table.as_deref()
+            // The LABEL, never the relation read. `snapshot_plan` asks this store
+            // with the configured string, and on SQL Server `synth.table` is the
+            // catalog's pair — so writing that made the key unable to match itself
+            // and every cycle re-snapshotted the whole table under a green run
+            // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
+            // the two are the same string anyway.
+            if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
                 && let Err(e) =
                     state.mark_snapshot_done(&export.name, table, &summary.journal.run_id)
             {

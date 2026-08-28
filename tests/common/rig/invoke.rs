@@ -31,7 +31,7 @@ impl Rig {
 
     /// The single `Command` builder behind every runner wrapper.
     fn invoke_command(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Command {
-        let mut cmd = std::process::Command::new(crate::common::runner::RIVET_BIN);
+        let mut cmd = std::process::Command::new(crate::common::runner::rivet_bin());
         cmd.args(argv);
         for (k, v) in envs {
             cmd.env(k, v);
@@ -144,6 +144,47 @@ impl Rig {
     /// `run_args_env` with no env — a plain run with extra flags.
     pub fn run_args(&self, extra: &[&str]) -> std::process::Output {
         self.run_args_env(extra, &[])
+    }
+
+    /// Run with the child's WORKING DIRECTORY set — the seam for path-resolution
+    /// contracts.
+    ///
+    /// A relative path in a config is resolved by SOMETHING, and which something is
+    /// a contract worth testing: `cdc.checkpoint: ./x.ckpt` was resolved against the
+    /// process CWD until round 9 measured the cost (the same config run from a cron
+    /// entry and from a shell looked in two places, found nothing the second time,
+    /// and re-anchored at the current log position — three green runs delivered
+    /// `[3]` of `[1,2,3]`). Every other rig entry point inherits the test harness's
+    /// own directory, so nothing could express the case; two hand-rolled
+    /// `Command::new(RIVET_BIN)` sites did, and the rig-adoption guard rightly
+    /// refused them.
+    pub fn run_in_dir(&self, dir: &std::path::Path) -> std::process::Output {
+        let out = self
+            .invoke_command(&self.run_argv(&[]), &[])
+            .current_dir(dir)
+            .output()
+            .expect("spawn rivet binary");
+        self.absorb_product_config_writes();
+        out
+    }
+
+    /// [`Rig::run_in_dir`] for any OTHER subcommand — `doctor`, `check`, `validate`.
+    ///
+    /// A diagnostic must answer about the file the RUN will open. `rivet doctor`
+    /// resolved `cdc.checkpoint:` against the process working directory while the
+    /// run resolved it against the config's, so the same config graded green from
+    /// one shell and described a different file from another — and the ABSENT
+    /// answer is this check's green one ("no checkpoint yet — the first run pins
+    /// the open position"). `run_in_dir` could express the run half of that pair
+    /// and nothing could express the diagnostic half.
+    pub fn cli_in_dir(&self, args: &[&str], dir: &std::path::Path) -> std::process::Output {
+        let out = self
+            .invoke_command(&self.cli_argv(args), &[])
+            .current_dir(dir)
+            .output()
+            .expect("spawn rivet binary");
+        self.absorb_product_config_writes();
+        out
     }
 
     /// Run with an extra environment variable (fault injection); returns the

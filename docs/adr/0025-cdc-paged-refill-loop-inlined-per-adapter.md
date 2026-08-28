@@ -95,3 +95,48 @@ forward. The decision this ADR records — no shared refill driver, the loop
 inlined per adapter — still stands; the re-drain loop lives in the shared sink,
 above the adapters, and non-PG engines (whose read cursor advances on its own)
 fall straight through it.
+
+## Amendment 2026-08-27: the bounded drain's boundary is approximate, and PostgreSQL can make it exact
+
+`PeekBound` encodes the one thing this ADR found worth encoding — a peek that
+undershoots the rollover starves. The bound that ends a `until_current` run is a
+separate quantity and it is weaker than it reads.
+
+On PostgreSQL the open-time snapshot is `pg_current_wal_lsn()`: the WAL head of
+the whole database, which is not a position in this slot's decoded stream. So
+the boundary is approximate on both sides. It can sit past the last commit this
+slot will ever decode — the run then waits for traffic that never routes to it,
+which is the starvation class the sink's re-drain loop had to be built for — and
+it can be reached by WAL this slot never sees. Every fix so far made the drain
+more persistent; none made the boundary exact.
+
+**Decision (proposed).** Where the engine can write an ordered marker INTO the
+log the reader is already decoding, end the stream on that marker rather than on
+a head snapshot: write a run-unique nonce at open, stop when the nonce is
+decoded. The boundary then comes from the same ordering as the data instead of
+from a different counter. Where an engine has no such primitive, the open-time
+snapshot stays.
+
+The per-engine honesty rule this ADR's neighbours already carry applies without
+softening: each engine's bound is probed by DISABLING it and observing whether
+termination actually depends on it, and one engine's result is never generalized
+to another. That mistake has been made twice on this exact question.
+
+**Primary prior art.** `pg_logical_emit_message(transactional, prefix, content)`
+is a documented PostgreSQL function (9.6+) whose stated purpose is to place an
+application-defined record into the WAL for logical-decoding consumers; a
+non-transactional message is decoded in WAL order, which is the property the
+bound needs. The general shape — write a marker, then use its position in the
+log as the boundary — is the watermark technique from Netflix's DBLog paper.
+
+**Sequencing.** This lands AFTER the `pgoutput` migration (ADR-0031), not
+before: the marker is decoded by the same reader that migration replaces, and
+building it twice is the avoidable cost.
+
+**RED-proof before Accepted.** A paced writer whose traffic does not route to
+the captured table, running throughout the bounded run: the run terminates at
+its marker rather than chasing the head. The mutant is the marker check replaced
+by the head snapshot — the termination test goes RED while the two-run union
+test (`..._until_current_open_bound_two_runs_lose_nothing`) stays green, since
+the old behaviour deferred rather than dropped. A test that cannot tell those
+two apart is measuring persistence, not the bound.

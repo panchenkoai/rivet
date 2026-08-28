@@ -283,7 +283,7 @@ def main() -> int:
         # MySQL has NO server-side anchor — its checkpoint is a file, written by
         # the first run. So MySQL gets an anchoring run before the scenario, which
         # is the same guarantee reached by the other of the two documented anchor
-        # models (see CLAUDE.md on per-engine anchors).
+        # models (see the process rules on per-engine anchors).
         if a.engine == "postgres":
             psql(f"CREATE TABLE {t} (id int PRIMARY KEY, v text)")
             psql(f"CREATE PUBLICATION {pub} FOR TABLE {t}")
@@ -296,7 +296,7 @@ def main() -> int:
         elif a.engine == "mssql":
             # CDC must be enabled on the DB and the table, and the capture job needs
             # to have populated fn_cdc_get_min_lsn before either tool can read —
-            # "enabled" is not "ready", the trap CLAUDE.md records for this engine.
+            # "enabled" is not "ready", the trap the process rules records for this engine.
             mssql("IF (SELECT is_cdc_enabled FROM sys.databases WHERE name='rivet') = 0 "
                   "EXEC sys.sp_cdc_enable_db")
             mssql(f"CREATE TABLE dbo.{t} (id int PRIMARY KEY, v varchar(50))")

@@ -1032,7 +1032,7 @@ mod tests {
 
     // ── mutation-W4 boundary rows ────────────────────────────────────────────
     // Every surviving mutant sat ON a threshold the tests jumped over. This is
-    // the CLAUDE.md sparse-key WARN rule's own guard: a `<` -> `<=` here
+    // the the process rules sparse-key WARN rule's own guard: a `<` -> `<=` here
     // silences the warning at exactly the documented floor.
     #[test]
     fn sparse_thresholds_are_exact() {

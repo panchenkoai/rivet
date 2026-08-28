@@ -99,7 +99,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // ── the export RUNNERS ───────────────────────────────────────────────
     // The three big-table runners each own their execution loop, and each loop
     // is dense with pagination/plan arithmetic. These are the ceilings most
-    // worth spending: the runner-bypass class in CLAUDE.md is precisely a
+    // worth spending: the runner-bypass class in the process rules is precisely a
     // per-runner decision that no offline test grades.
     ("src/pipeline/keyset.rs::run_keyset", 5, 1, 3, 2),
     ("src/pipeline/keyset.rs::run_keyset_parallel", 8, 0, 4, 4),
@@ -171,7 +171,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
 ///
 /// DERIVED from `.cargo/mutants.toml`, never typed in: the enumerated dimension
 /// here is "which functions the gate excludes wholesale", and a hand-written
-/// copy of it grades only what its author already knew (CLAUDE.md, "derive the
+/// copy of it grades only what its author already knew (the process rules, "derive the
 /// enumerated dimension"). A new live-only exclusion therefore enters this
 /// gate's subject the moment it is added to the config — which is exactly the
 /// moment someone is deciding whether the body it hides is glue or logic.

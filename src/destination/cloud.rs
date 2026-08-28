@@ -165,6 +165,28 @@ pub(crate) trait CloudBackend {
     /// [`RetryLayer`] is applied by [`CloudDestination::new`], so backends
     /// must return the operator *without* their own retry layer.
     fn build_operator(config: &DestinationConfig) -> Result<Operator>;
+
+    /// Is the `content_md5` a LISTING reports actually the object's MD5?
+    ///
+    /// `false` on S3, and the write path already knew why: opendal's S3 lister
+    /// ALIASES the ETag into `content_md5` (`set_etag(etag);
+    /// set_content_md5(etag.trim_matches('"'))`), while its S3 writer does not. The
+    /// comment beside the single-PUT upload spells the consequence out — "for an
+    /// SSE-KMS / SSE-C object the ETag is NOT the object's MD5" — and that reasoning
+    /// was applied to `write` and never to `list_prefix`.
+    ///
+    /// The cost of the omission is not cosmetic: the manifest side is a locally
+    /// computed MD5, `md5_digest_bytes` parses both encodings, so on an unencrypted
+    /// single-part object they match by luck — and on a bucket with default
+    /// encryption `aws:kms` they cannot. Every part then yields `ChecksumMismatch`:
+    /// validate hard-fails on correct data, and the M8 resume quarantines each
+    /// object out of the delivered prefix and re-exports it. Multipart composite
+    /// ETags (`<hash>-<N>`) already degrade to size-only correctly; it is the
+    /// single-part shape, still 32 hex characters, that lies convincingly.
+    ///
+    /// Round-11 bughunt, read-only (no KMS bucket here) — but the aliasing, the
+    /// write-path refusal and the comparison were each read at their sites.
+    const LIST_MD5_IS_TRUSTWORTHY: bool = true;
 }
 
 /// OpenDAL-backed object-store destination, generic over the backend `B`.
@@ -192,6 +214,17 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 /// `/` and lists an empty `exports/mydata/` -> a false PART_MISSING on present data
 /// (dogfood). Empty (bucket root) and already-slashed prefixes are unchanged.
 fn normalize_prefix(p: String) -> String {
+    // A LEADING slash is stripped too, and the trailing-slash comment above is the
+    // reason to expect its sibling: opendal normalizes `/lead/x/` away on the wire,
+    // so the data lands correctly at `lead/x/…` — but `self.prefix` keeps the slash,
+    // and `list_prefix`'s `strip_prefix(self.prefix)` then FAILS and falls through to
+    // the bucket-absolute key. MEASURED on MinIO with `prefix: "/lead/x/"`: `rivet
+    // validate` reported the SAME object as `PART_MISSING` and as an
+    // `UNTRACKED_OBJECT` in one run, on 100%-correct data. Every listing consumer
+    // shares this — validate, the M8 resume decisions (every part → Rewrite, every
+    // real object → Quarantine), split-unit manifest reads, the CDC validator and
+    // the value-checksum re-read.
+    let p = p.trim_start_matches('/').to_string();
     if p.is_empty() || p.ends_with('/') {
         p
     } else {
@@ -365,7 +398,15 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             out.push(super::ObjectMeta {
                 key: rel,
                 size_bytes: entry.metadata().content_length(),
-                content_md5: entry.metadata().content_md5().map(str::to_string),
+                // Dropped for a backend whose listing aliases something else into
+                // this field — see `LIST_MD5_IS_TRUSTWORTHY`. Size-only is the
+                // honest degrade; a wrong digest is worse than no digest, because
+                // the consumers treat a mismatch as corruption.
+                content_md5: if B::LIST_MD5_IS_TRUSTWORTHY {
+                    entry.metadata().content_md5().map(str::to_string)
+                } else {
+                    None
+                },
             });
         }
         Ok(out)
@@ -426,6 +467,18 @@ mod tests {
         );
         assert_eq!(normalize_prefix(String::new()), ""); // bucket root
         assert_eq!(normalize_prefix("a".into()), "a/");
+        // The LEADING slash, whose absence made `list_prefix` return
+        // bucket-absolute keys: `strip_prefix("/lead/x/")` cannot match a key
+        // opendal already normalized to `lead/x/…`, and the `unwrap_or` swallows
+        // that. MEASURED on MinIO — the same object reported PART_MISSING and
+        // UNTRACKED_OBJECT in one `rivet validate`, on correct data.
+        assert_eq!(normalize_prefix("/lead/x/".into()), "lead/x/");
+        assert_eq!(normalize_prefix("/lead/x".into()), "lead/x/");
+        assert_eq!(
+            normalize_prefix("/".into()),
+            "",
+            "a lone slash is the bucket ROOT, not a directory named empty"
+        );
     }
 
     // L20 (cloud-fastfail): the no-retry probe seam must construct. A GCS

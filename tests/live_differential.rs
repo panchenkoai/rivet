@@ -222,6 +222,39 @@ exports:
         src.distinct_text, N,
         "c_text is unique per row by construction"
     );
+
+    // ...and the same comparison at TUPLE granularity, which the fingerprint above
+    // cannot make. Every field it compares is a per-column AGGREGATE, so SWAPPING
+    // one column's values between two rows leaves all seven identical — MEASURED on
+    // 1000 rows: `count, sum(id), sum(n), sum(big), sum(length(text)),
+    // count(DISTINCT id), count(DISTINCT text)` every one equal, while a row-level
+    // EXCEPT finds the two rows in 4 ms. Row misassociation, a cross-row shuffle and
+    // a swap between two same-profile columns are invisible above and visible here.
+    //
+    // The source is ATTACHed into the SAME DuckDB session, so neither side is read
+    // by rivet's own code: the reader decodes the Parquet and pulls the source
+    // through its own scanner. `EXCEPT ALL`, not `EXCEPT` — set semantics would hide
+    // a duplicated row, which is half of what "at-least-once went wrong" looks like.
+    let diff = duckdb_row_diff_vs_source(
+        &host_dir,
+        "host=postgres port=5432 user=rivet password=rivet dbname=rivet",
+        "postgres",
+        &format!(
+            "SELECT id::VARCHAR AS a, n::VARCHAR AS b, big::VARCHAR AS c, c_text AS d \
+             FROM src.public.{table}"
+        ),
+        "SELECT id::VARCHAR AS a, n::VARCHAR AS b, big::VARCHAR AS c, c_text AS d \
+         FROM read_parquet('__STAGED__/*.parquet')",
+    );
+    assert!(
+        diff.is_empty(),
+        "ROW-LEVEL MISMATCH the fingerprint cannot see: {} row(s) in the source and not \
+         at the destination, {} the other way.\n  missing: {:?}\n  extra: {:?}",
+        diff.missing.len(),
+        diff.extra.len(),
+        &diff.missing[..diff.missing.len().min(3)],
+        &diff.extra[..diff.extra.len().min(3)]
+    );
 }
 
 /// Differential correctness AFTER A CRASH, via the independent reader.

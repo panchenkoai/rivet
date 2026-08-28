@@ -3,7 +3,7 @@
 # AUTOLOAD". Columns are the four ExportTarget variants (src/types/target.rs), not
 # source engines. Cell = { test } | { gap } | { na }.
 #
-# The bug class this guards (CLAUDE.md "Remediation hints must recover from the
+# The bug class this guards (the process rules "Remediation hints must recover from the
 # degraded state" + its native/autoload-truth extension): the resolver must never
 # claim a native type the warehouse cannot hold, autoload_type must be the EMPIRICAL
 # autoload, and any lossy divergence gets cast_sql only where recovery is real. This

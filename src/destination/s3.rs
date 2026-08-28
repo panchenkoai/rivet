@@ -27,6 +27,10 @@ fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing
 
 impl CloudBackend for S3Backend {
     const RUNTIME_LABEL: &'static str = "S3";
+    // opendal's S3 lister puts the ETag in `content_md5`; its writer does not. On an
+    // SSE-KMS / SSE-C object the ETag is not the MD5, so trusting it turns every
+    // part into a ChecksumMismatch on correct data. See `LIST_MD5_IS_TRUSTWORTHY`.
+    const LIST_MD5_IS_TRUSTWORTHY: bool = false;
     const SCHEME: &'static str = "s3";
 
     fn build_operator(config: &DestinationConfig) -> Result<Operator> {

@@ -80,7 +80,22 @@ fn parse_pos(s: &str) -> Option<PosKey> {
     if let Some((hi, lo)) = lsn.split_once('/') {
         let hi = u64::from_str_radix(hi, 16).ok()?;
         let lo = u64::from_str_radix(lo, 16).ok()?;
-        return Some(PosKey::PgLsn((hi << 32) | lo));
+        // A PostgreSQL LSN's low half is 32 bits. A wider one is malformed, and
+        // folding it in anyway makes a WRONG comparable key out of nonsense — the
+        // ordering check would then compare positions that mean nothing and report
+        // either a phantom backwards jump or a false clean. `None` routes it to the
+        // `unparseable __pos` violation instead, which is what the caller already
+        // knows how to say.
+        //
+        if lo >> 32 != 0 {
+            return None;
+        }
+        // `+`, not `|`. With the guard above the halves are provably disjoint, so
+        // the two produce the same number — but `|` vs `^` is then EQUIVALENT and
+        // unkillable, while `+` vs `*` is not (`0/FFFFFFFF` and `1/0` both collapse
+        // to 0 under `*`, so the ordering assertions catch it). Same value, a graded
+        // operator instead of an unkillable one.
+        return Some(PosKey::PgLsn((hi << 32) + lo));
     }
     Some(PosKey::Lsn(lsn.to_string()))
 }
@@ -128,18 +143,63 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
     // run-unique copies (manifest-<run_id>.json) — the same set `load` reconciles
     // — so validate actually checks the parts that are physically present. Only
     // an empty result when there is NO manifest of any kind.
-    let manifests: Vec<RunManifest> = if dest.head(&manifest_key)?.is_some() {
-        vec![serde_json::from_slice(&dest.read(&manifest_key)?)?]
-    } else {
-        let mut copies = Vec::new();
-        for m in dest.list_prefix(prefix)? {
-            let base = m.key.rsplit('/').next().unwrap_or("");
-            if crate::manifest::is_run_unique_manifest_name(base) {
-                copies.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
-            }
+    // The run-unique COPIES first, and the canonical only when there are none.
+    //
+    // The canonical `manifest.json` is a LATEST-RUN POINTER, and an `until_current`
+    // cycle that finds no changes legitimately declares zero parts — which is the
+    // steady state for a scheduled capture, and for most tables of a `tables:`
+    // multiplex most of the time. Reading it alone therefore answered "what did the
+    // last run deliver", while every field printed said "the prefix". MEASURED: a
+    // run captured 3 changes and `validate --depth full` verified 1 part; ONE idle
+    // cycle later the canonical read `parts: []` and the same command reported
+    // `PASSED, 0 parts verified` — then still PASSED after the parquet was
+    // overwritten with junk, and again after it was DELETED, with the copy declaring
+    // it sitting unread beside it.
+    //
+    // The copies are the set `load` reconciles, so validate now asks the same
+    // question the loader does. They do not overlap (one per run) and the canonical
+    // duplicates one of them, so preferring the copies also avoids double-counting.
+    // The canonical stays the fallback for prefixes written before copies existed.
+    let mut manifests: Vec<RunManifest> = Vec::new();
+    for m in dest.list_prefix(prefix)? {
+        // THIS prefix's own copies, not a nested leg's. The listing recurses on both
+        // the local and the cloud destination, so an `initial: snapshot` export's
+        // `<prefix>/snapshot/manifest-<run_id>.json` was swept up here — and its
+        // `parts[].path` is relative to `snapshot/`, so validate looked for those
+        // parts at the CDC root and reported `cdc __pos check could not complete: No
+        // such file or directory`, exit 1, on a correct export. MEASURED: the
+        // documented production shape (`cdc: { initial: snapshot }`) failed
+        // `rivet validate --depth full` outright, and moving that one file aside made
+        // the same command exit 0. It broke every `rivet validate && deploy` gate.
+        //
+        // A separator in the key RELATIVE TO THIS PREFIX means a nested leg; the
+        // copies this prefix owns sit directly under it.
+        //
+        // Relative, because `list_prefix` returns FULL keys — `cdc/manifest-r1.json`,
+        // not `manifest-r1.json`. The first cut of this guard tested the whole key,
+        // so it skipped EVERY copy including this prefix's own, and `check_positions`
+        // fell through to the canonical `manifest.json`. On the prefix that has none
+        // — a daemon or crashed CDC run, where only the run-unique copies exist —
+        // that is a false-clean `PASSED, 0 parts verified`, which is exactly the
+        // #173 defect this fallback was written to remove. Nothing caught it: the
+        // broken guard survived the lib suite AND all 106 live CDC tests, because
+        // every one of them leaves a canonical manifest behind.
+        let rel = m
+            .key
+            .strip_prefix(prefix)
+            .unwrap_or(&m.key)
+            .trim_start_matches('/');
+        if rel.contains('/') {
+            continue;
         }
-        copies
-    };
+        let base = rel;
+        if crate::manifest::is_run_unique_manifest_name(base) {
+            manifests.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
+        }
+    }
+    if manifests.is_empty() && dest.head(&manifest_key)?.is_some() {
+        manifests.push(serde_json::from_slice(&dest.read(&manifest_key)?)?);
+    }
     if manifests.is_empty() {
         return Ok(PositionCheck::default());
     }
@@ -234,6 +294,172 @@ mod v016_checkpoint_compat {
         Position::load(&path)
             .unwrap_or_else(|e| panic!("{name}: a v0.16 checkpoint must still load: {e:#}"))
             .unwrap_or_else(|| panic!("{name}: loader reported the fixture as ABSENT"))
+    }
+
+    /// The five decisions a mutation run over this PURE file found ungraded.
+    ///
+    /// `validate.rs` does no I/O of its own beyond a `Destination` trait a test can
+    /// supply, so every mutant in it is offline-reachable and a survivor is a plain
+    /// gap — no live-only argument available. 92 mutants, 80 caught, 5 missed.
+    #[test]
+    fn the_position_verdict_the_order_check_and_the_lsn_key_all_answer_for_themselves() {
+        use super::{PositionCheck, check_order, parse_pos};
+
+        // THE VERDICT. `is_ok -> true` makes every `rivet validate` pass whatever it
+        // found; `-> false` makes every one fail. Nothing graded the accessor that
+        // turns the whole check into a yes or no.
+        assert!(
+            PositionCheck::default().is_ok(),
+            "a check with no violations is OK — `-> false` fails every correct export"
+        );
+        assert!(
+            !PositionCheck {
+                violations: vec!["part 0: __pos went backwards".into()],
+                ..Default::default()
+            }
+            .is_ok(),
+            "a violation means NOT ok — `-> true` reports every backwards jump as a \
+             clean run, which is the only thing this check produces"
+        );
+
+        // THE ORDER CHECK. `<` -> `<=` flags EQUAL positions as backwards, and equal
+        // is the normal case: every row of one transaction shares its commit
+        // position and is disambiguated by `__seq`. That mutant turns each
+        // multi-row transaction into a violation.
+        let pos = |lsn: &str| format!(r#"{{"lsn":"{lsn}"}}"#);
+        let (_, _, v) = check_order(&[(0, pos("0/10")), (0, pos("0/10")), (0, pos("0/20"))]);
+        assert!(
+            v.is_empty(),
+            "two rows at the SAME position are one transaction, not a backwards \
+             jump: {v:?}"
+        );
+        let (first, last, v) = check_order(&[(0, pos("0/20")), (0, pos("0/10"))]);
+        assert_eq!(v.len(), 1, "a strictly backwards position IS a violation");
+        assert!(v[0].contains("went backwards"));
+        assert_eq!(first.as_deref(), Some(pos("0/20").as_str()));
+        assert_eq!(last.as_deref(), Some(pos("0/10").as_str()));
+
+        // An unparseable value is reported, not skipped — a run whose every position
+        // is junk must not read as clean.
+        let (_, _, v) = check_order(&[(7, "not json".into())]);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("part 7") && v[0].contains("unparseable"));
+
+        // THE LSN KEY. The halves must not bleed into each other: `1/0` is one full
+        // 32-bit step above `0/FFFFFFFF`, and `(hi << 32) ^ lo` only differs from
+        // `|` when the low half overflows 32 bits — which is malformed input, now
+        // refused rather than folded into a meaningless key.
+        assert!(parse_pos(&pos("0/FFFFFFFF")) < parse_pos(&pos("1/0")));
+        assert!(parse_pos(&pos("0/2")) > parse_pos(&pos("0/1")));
+        assert_eq!(
+            parse_pos(&pos("1/1FFFFFFFFF")),
+            None,
+            "a low half wider than 32 bits is not a PostgreSQL LSN; folding it in \
+             silently produces an ordering key that means nothing"
+        );
+    }
+
+    /// The nested-leg skip must actually skip — measured ungraded by BOTH suites.
+    ///
+    /// `check_positions` lists the prefix RECURSIVELY, so an `initial: snapshot`
+    /// export's `<prefix>/snapshot/manifest-<run_id>.json` was swept up with the CDC
+    /// leg's own copies. Its `parts[].path` is relative to `snapshot/`, so validate
+    /// looked for those parts at the CDC root and reported `could not complete: No
+    /// such file or directory`, exit 1, on a correct export — breaking every
+    /// `rivet validate && deploy` gate on the documented production shape.
+    ///
+    /// The guard was added earlier this session and shipped with nothing grading it:
+    /// deleting it survives the lib suite AND all 106 live CDC tests (both measured
+    /// 2026-08-27). A guard nothing can fail is a guard nobody can trust to still be
+    /// there — which is the whole point of this file's mutation pass.
+    #[test]
+    fn a_nested_snapshot_legs_manifest_is_not_read_as_this_prefixs_own() {
+        use std::sync::Arc;
+
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("dest root");
+        let root = dir.path().join("cdc");
+        std::fs::create_dir_all(root.join("snapshot")).expect("nested leg");
+
+        // One parquet with a monotonic `__pos`, at the CDC root.
+        let write_part = |at: &std::path::Path, vals: &[&str]| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "__pos",
+                DataType::Utf8,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vals.to_vec()))],
+            )
+            .expect("batch");
+            let f = std::fs::File::create(at).expect("part file");
+            let mut w = ArrowWriter::try_new(f, schema, None).expect("writer");
+            w.write(&batch).expect("write");
+            w.close().expect("close");
+        };
+        write_part(
+            &root.join("cdc-000000.parquet"),
+            &[r#"{"lsn":"0/10"}"#, r#"{"lsn":"0/20"}"#],
+        );
+
+        // Built from the type via `RunManifest::for_test`, not hand-written JSON.
+        // The first draft WAS hand-written and took six rounds of `missing field`
+        // before it deserialized; a fixture that drifts from the struct fails on
+        // parse rather than on the property it guards.
+        let manifest = |part: &str| {
+            serde_json::to_string(&crate::manifest::RunManifest::for_test("r1", &[(part, 2)]))
+                .expect("serialize the manifest")
+        };
+
+        std::fs::write(
+            root.join("manifest-r1.json"),
+            manifest("cdc-000000.parquet"),
+        )
+        .expect("this leg's own copy");
+        // The nested leg's copy — its part path is relative to `snapshot/`, so a
+        // reader that adopts it looks for `<cdc-root>/snap-000000.parquet`, which
+        // does not exist. That is the exit-1 the guard exists to prevent.
+        std::fs::write(
+            root.join("snapshot").join("manifest-r9.json"),
+            manifest("snap-000000.parquet"),
+        )
+        .expect("nested leg's copy");
+
+        // A CANONICAL manifest beside the run-unique copy. The fallback reads
+        // `manifests.is_empty() && canonical exists`; with `&&` -> `||` the canonical
+        // is adopted TOO and the same run's parts are counted twice. Without this
+        // file present both operators agree and the mutant survives — measured.
+        std::fs::write(
+            root.join(crate::manifest::MANIFEST_FILENAME),
+            manifest("cdc-000000.parquet"),
+        )
+        .expect("canonical manifest");
+
+        let dest =
+            crate::destination::local::LocalDestination::new(&crate::config::DestinationConfig {
+                destination_type: crate::config::DestinationType::Local,
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .expect("local destination");
+        let got = super::check_positions(&dest, "cdc")
+            .expect("a correct export must not fail validation because a nested leg exists");
+        assert_eq!(
+            got.parts, 1,
+            "only THIS prefix's manifest may be adopted; counting the nested leg's \
+             makes validate read parts that were never written here"
+        );
+        assert_eq!(got.rows, 2);
+        assert!(
+            got.violations.is_empty(),
+            "a monotonic single run has no backwards jump: {:?}",
+            got.violations
+        );
     }
 
     #[test]

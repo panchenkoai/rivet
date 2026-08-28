@@ -348,3 +348,61 @@ fn norm_decimal(s: &str) -> String {
         s.to_string()
     }
 }
+
+/// The independent oracle reaches EVERY source engine, and rivet's own state DB,
+/// from one DuckDB session.
+///
+/// Before this, `duckdb_row_diff_vs_source` covered PostgreSQL and MySQL and its
+/// docstring said DuckDB "ships no SQL Server or MongoDB scanner" — which was wrong
+/// and I had written it. Both exist as COMMUNITY extensions (`mssql`, `mongo`); they
+/// simply publish no build below DuckDB 1.5.0, and the stand pinned 1.4.1. Measured:
+/// 404 for every version through 1.4.1, 200 from 1.5.0, on both linux_amd64 and
+/// osx_arm64. The pin moved; these are the two arms it unlocked.
+///
+/// MongoDB has no `ATTACH` even so — its extension exposes `mongo_scan(uri, db,
+/// collection)` — which is why `source_sql` returns the read expression alongside
+/// the attach statement instead of assuming every engine attaches.
+#[test]
+#[ignore = "live: requires docker compose mssql-cdc, mongo-rs and duckdb"]
+fn the_duckdb_oracle_reaches_sql_server_and_mongodb_too() {
+    require_alive(LiveService::DuckDb);
+    let tbl = unique_name("orc_reach").to_lowercase();
+
+    // SQL Server: three rows, read through the community `mssql` ATTACH.
+    mssql_cdc_exec(&format!(
+        "DROP TABLE IF EXISTS dbo.{tbl}; CREATE TABLE dbo.{tbl}(id INT PRIMARY KEY); \
+         INSERT INTO dbo.{tbl} VALUES (1),(2),(3);"
+    ));
+    let (attach, from) = OracleEngine::MssqlCdc.source_sql("rivet", &tbl);
+    let v = duckdb_run_sql_json(&format!(
+        "{} {attach} SELECT count(*) FROM {from}",
+        OracleEngine::MssqlCdc.load_sql()
+    ));
+    assert_eq!(
+        v["rows"][0][0].as_str(),
+        Some("3"),
+        "the mssql extension must read the live stand — a zero here is the harness \
+         failing to connect, which reads exactly like an empty table: {v}"
+    );
+    mssql_cdc_exec(&format!("DROP TABLE IF EXISTS dbo.{tbl}"));
+
+    // MongoDB: two documents, read through `mongo_scan`.
+    let db = unique_name("orc_mg").to_lowercase();
+    let m = MongoTest::connect(27018, &db);
+    m.seed_int_id("t", 2);
+    let (attach, from) = OracleEngine::MongoRs.source_sql(&db, "t");
+    assert!(
+        attach.is_empty(),
+        "Mongo has no ATTACH — the seam must not pretend otherwise"
+    );
+    let v = duckdb_run_sql_json(&format!(
+        "{} SELECT count(*) FROM {from}",
+        OracleEngine::MongoRs.load_sql()
+    ));
+    assert_eq!(
+        v["rows"][0][0].as_str(),
+        Some("2"),
+        "the mongo extension must read the live replica set: {v}"
+    );
+    m.drop_collection("t");
+}

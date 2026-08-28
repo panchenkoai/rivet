@@ -621,6 +621,34 @@ fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) 
             }
         }
     }
+    // A canonical declaring ZERO parts supersedes NOTHING, so the supersession
+    // argument above does not apply to it and its same-family copies must be folded.
+    //
+    // This is the CDC steady state, not an edge: an `until_current` cycle that finds
+    // no changes writes a `Success` manifest with `parts: []` over the canonical
+    // pointer — and for most tables of a `tables:` multiplex that is most cycles.
+    // MEASURED: a run captured 3 changes and `validate --depth full` verified 1
+    // part; ONE idle cycle later the same command reported `PASSED, 0 parts
+    // verified`, then still PASSED after the parquet was overwritten with junk, and
+    // again after it was DELETED — with the copy declaring it sitting unread beside
+    // it. Every field printed was internally consistent; nothing said that "0 parts
+    // verified" was a statement about the manifest rather than about the prefix.
+    //
+    // Deliberately NOT widened to a non-empty canonical: there a plain export's
+    // historical copies really are superseded snapshots, and presence-checking a
+    // legitimately cleaned old part would false-fail.
+    if merged.parts.is_empty() && !canonical.export_family.is_empty() {
+        for run in census.runs() {
+            if run.family() != canonical.export_family {
+                continue;
+            }
+            for p in &run.manifest.parts {
+                if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
+                    merged.parts.push(p.clone());
+                }
+            }
+        }
+    }
     merged
 }
 
@@ -1037,6 +1065,66 @@ mod tests {
     /// historical run or a foreign export sharing the prefix. WHICH copies are units is the
     /// census's classification (`ManifestCensus::split_units`); this pins how validate turns
     /// that answer into the presence-check target.
+    /// The ZERO-PARTS fold, and each condition that gates it.
+    ///
+    /// A canonical declaring no parts supersedes nothing, so its same-family copies
+    /// ARE the prefix's description — this is the CDC steady state (an idle
+    /// `until_current` cycle writes `parts: []` over the pointer). Four mutants
+    /// survived here until now: dropping the `!` on the family check, flipping the
+    /// family comparison, flipping the `Committed` status test, and turning its `&&`
+    /// into `||`. Each is asserted below by the case that distinguishes it.
+    #[test]
+    fn a_zero_part_canonical_folds_its_family_and_nothing_else() {
+        let unit = |name: &str, path: &str, fam: &str, st: PartStatus| {
+            let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+            m.export_family = fam.into();
+            m.export_name = name.into();
+            m.parts[0].path = path.into();
+            m.parts[0].status = st;
+            sib_keyed(m)
+        };
+        let mut canonical = build_manifest(vec![], ManifestStatus::Success);
+        canonical.export_family = "daily".into();
+        canonical.export_name = "daily".into();
+
+        let siblings = vec![
+            unit("daily", "mine_ok.parquet", "daily", PartStatus::Committed),
+            // Same family, NOT committed — a part in flight is not delivered data.
+            unit(
+                "daily",
+                "mine_pending.parquet",
+                "daily",
+                PartStatus::Quarantined,
+            ),
+            // Foreign family — never claimed, or one export's prefix would answer
+            // for another's.
+            unit("other", "foreign.parquet", "other", PartStatus::Committed),
+        ];
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let paths: std::collections::BTreeSet<&str> =
+            merged.parts.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["mine_ok.parquet"].into_iter().collect(),
+            "only the same-family COMMITTED part. A foreign one means the family \
+             check inverted; a quarantined one means the status test did; nothing at \
+             all means the zero-parts fold never ran: {paths:?}"
+        );
+
+        // A canonical with NO family must not fold anything — there is nothing to
+        // match on, and matching everything would let a foreign export's parts
+        // describe this prefix.
+        let mut familyless = canonical.clone();
+        familyless.export_family = String::new();
+        assert!(
+            merge_split_unit_parts(&familyless, &ManifestCensus::new(&siblings))
+                .parts
+                .is_empty(),
+            "a family-less canonical folds nothing — dropping the `!` here would \
+             invert exactly that"
+        );
+    }
+
     #[test]
     fn merge_split_unit_parts_folds_split_siblings_only() {
         let unit = |name: &str, path: &str, fam: &str, split: bool| {

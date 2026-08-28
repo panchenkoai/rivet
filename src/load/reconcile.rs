@@ -948,7 +948,8 @@ mod tests {
     #[test]
     fn the_synthesized_snapshot_leg_takes_its_parents_family() {
         let export = crate::config::sample_export("orders_cdc");
-        let leg = crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders");
+        let leg =
+            crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders", "orders");
         assert_eq!(
             leg.snapshot_parent.as_deref(),
             Some("orders_cdc"),

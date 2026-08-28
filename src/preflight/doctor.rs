@@ -245,7 +245,15 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     // CDC health — only when the config has `mode: cdc` exports. Automates the
     // slot / binlog-retention / capture-job monitoring the CDC reference asks
     // operators to do by hand.
-    for c in super::cdc_health::collect(&config) {
+    // The SAME directory the run resolves `cdc.checkpoint:` against. Passing
+    // nothing here meant the preflight read the raw path against the process
+    // working directory, so `rivet doctor -c /etc/rivet/app.yaml` run from
+    // anywhere but /etc/rivet graded a file that was not there — and absent is
+    // this check's GREEN answer.
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    for c in super::cdc_health::collect(&config, config_dir) {
         if !c.ok {
             all_ok = false;
             // #15 bughunt: a transient CDC-health failure should also drive

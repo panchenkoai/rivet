@@ -1372,3 +1372,103 @@ src/pipeline/summary.rs:998:48: replace + with * in format_block
 src/pipeline/summary.rs:998:48: replace + with - in format_block
 src/pipeline/summary.rs:998:53: replace + with * in format_block
 src/pipeline/summary.rs:998:53: replace + with - in format_block
+
+# ── 2026-08-28 adjudication: mongo/cdc.rs (full run, 130 mutants) and
+# mssql/cdc.rs (full run, 280: 90 caught, 52 unviable, 138 missed = 69 unique).
+# An earlier version of this comment said the mssql run was "cut off at 138 of
+# 280" — wrong, and worth recording HOW: 138 was the MISSED count read as a
+# progress count, because the driver's log carries only missed/timeout lines and
+# the summary line had scrolled past. A re-run of the full file produced the
+# identical missed set, which is what settled it. Everything below is LIVE-GUARDED: `open`/`fill`/`next_change`/
+# `connect` and the probe helpers are driver-bound glue whose oracles are the live
+# suites (`live_cdc_mongo.rs`, `live_cdc_mssql.rs` — resume, until_current,
+# type-matrix, crash/atomicity, and the spilled-tail crash test), plus the
+# Debezium differential and the DuckDB census. Decisions extracted from these
+# bodies are graded offline instead: `map_op` and `token_data` got unit oracles in
+# this pass (their six survivors are NOT below — they are killed), `closes_group`
+# / `head_group_continues_on_disk` / the bound verdicts already had them.
+# `cell_to_rivet` stays glue: it takes the driver's `&Row`, unconstructible
+# offline; its oracle is the mssql type matrix + the DuckDB literal cross-check.
+# `next_spooled`'s `||`→`&&` and `==`→`!=` are NEAR-EQUIVALENT (out.is_none() ⇔
+# remaining()==0 at the drop site — the mutant costs one extra no-op call), kept
+# here rather than excluded because the equivalence is argued, not proven with a
+# witness.
+src/source/mongo/cdc.rs:156:5: replace server_identity -> std::result::Result<mongodb::bson::Document, mongodb::error::Error> with Ok(Default::default())
+src/source/mongo/cdc.rs:328:12: delete ! in MongoChangeStream::open
+src/source/mongo/cdc.rs:338:16: delete ! in MongoChangeStream::open
+src/source/mongo/cdc.rs:342:25: delete ! in MongoChangeStream::open
+src/source/mongo/cdc.rs:352:20: delete ! in MongoChangeStream::open
+src/source/mongo/cdc.rs:368:22: replace >= with < in MongoChangeStream::open
+src/source/mongo/cdc.rs:483:9: replace MongoChangeStream::anchor_position -> Option<Position> with None
+src/source/mongo/cdc.rs:506:5: replace pin_checkpoint_at_current -> Result<()> with Ok(())
+src/source/mongo/cdc.rs:762:9: replace <impl ChangeStream for MongoChangeStream>::next_change -> Option<Result<ChangeEvent>> with None
+src/source/mongo/cdc.rs:824:24: delete ! in <impl ChangeStream for MongoChangeStream>::next_change
+src/source/mongo/cdc.rs:831:29: delete match arm None in <impl ChangeStream for MongoChangeStream>::next_change
+src/source/mongo/cdc.rs:832:44: replace match guard first != b with false in <impl ChangeStream for MongoChangeStream>::next_change
+src/source/mongo/cdc.rs:832:44: replace match guard first != b with true in <impl ChangeStream for MongoChangeStream>::next_change
+src/source/mongo/cdc.rs:832:50: replace != with == in <impl ChangeStream for MongoChangeStream>::next_change
+src/source/mssql/cdc.rs:1013:9: replace MssqlChangeStream::next_spooled -> Result<Option<ChangeEvent>> with Ok(None)
+src/source/mssql/cdc.rs:1017:26: replace || with && in MssqlChangeStream::next_spooled
+src/source/mssql/cdc.rs:1017:44: replace == with != in MssqlChangeStream::next_spooled
+src/source/mssql/cdc.rs:1036:9: replace <impl ChangeStream for MssqlChangeStream>::resolved_identity -> Option<(String, String)> with None
+src/source/mssql/cdc.rs:1036:9: replace <impl ChangeStream for MssqlChangeStream>::resolved_identity -> Option<(String, String)> with Some(("xyzzy".into(), "xyzzy".into()))
+src/source/mssql/cdc.rs:1036:9: replace <impl ChangeStream for MssqlChangeStream>::resolved_identity -> Option<(String, String)> with Some(("xyzzy".into(), String::new()))
+src/source/mssql/cdc.rs:1036:9: replace <impl ChangeStream for MssqlChangeStream>::resolved_identity -> Option<(String, String)> with Some((String::new(), "xyzzy".into()))
+src/source/mssql/cdc.rs:1036:9: replace <impl ChangeStream for MssqlChangeStream>::resolved_identity -> Option<(String, String)> with Some((String::new(), String::new()))
+src/source/mssql/cdc.rs:1048:39: replace && with || in <impl ChangeStream for MssqlChangeStream>::next_change
+src/source/mssql/cdc.rs:1048:65: replace && with || in <impl ChangeStream for MssqlChangeStream>::next_change
+src/source/mssql/cdc.rs:1048:68: delete ! in <impl ChangeStream for MssqlChangeStream>::next_change
+src/source/mssql/cdc.rs:1048:9: replace <impl ChangeStream for MssqlChangeStream>::next_change -> Option<Result<ChangeEvent>> with None
+src/source/mssql/cdc.rs:1154:9: delete match arm ColumnData::DateTimeOffset(_) in cell_to_rivet
+src/source/mssql/cdc.rs:1159:9: delete match arm ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) in cell_to_rivet
+src/source/mssql/cdc.rs:1164:9: delete match arm ColumnData::Date(_) in cell_to_rivet
+src/source/mssql/cdc.rs:1170:9: delete match arm ColumnData::Time(_) in cell_to_rivet
+src/source/mssql/cdc.rs:1200:5: replace hex -> String with "xyzzy".into()
+src/source/mssql/cdc.rs:1200:5: replace hex -> String with String::new()
+src/source/mssql/cdc.rs:1218:20: replace match guard crate::source::mssql::mssql_trusts_cert_without_verify(c) with false in connect
+src/source/mssql/cdc.rs:1218:20: replace match guard crate::source::mssql::mssql_trusts_cert_without_verify(c) with true in connect
+src/source/mssql/cdc.rs:1240:5: replace pin_checkpoint_at_max_lsn -> Result<()> with Ok(())
+src/source/mssql/cdc.rs:1264:5: replace probe_max_lsn -> Option<String> with None
+src/source/mssql/cdc.rs:1264:5: replace probe_max_lsn -> Option<String> with Some("xyzzy".into())
+src/source/mssql/cdc.rs:1264:5: replace probe_max_lsn -> Option<String> with Some(String::new())
+src/source/mssql/cdc.rs:1264:8: delete ! in probe_max_lsn
+src/source/mssql/cdc.rs:419:5: replace source_object_of_capture_instance -> Result<Option<(String, String)>> with Ok(None)
+src/source/mssql/cdc.rs:419:5: replace source_object_of_capture_instance -> Result<Option<(String, String)>> with Ok(Some(("xyzzy".into(), "xyzzy".into())))
+src/source/mssql/cdc.rs:419:5: replace source_object_of_capture_instance -> Result<Option<(String, String)>> with Ok(Some(("xyzzy".into(), String::new())))
+src/source/mssql/cdc.rs:419:5: replace source_object_of_capture_instance -> Result<Option<(String, String)>> with Ok(Some((String::new(), "xyzzy".into())))
+src/source/mssql/cdc.rs:419:5: replace source_object_of_capture_instance -> Result<Option<(String, String)>> with Ok(Some((String::new(), String::new())))
+src/source/mssql/cdc.rs:598:12: delete ! in MssqlChangeStream::open
+src/source/mssql/cdc.rs:601:48: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:601:53: replace == with != in MssqlChangeStream::open
+src/source/mssql/cdc.rs:611:32: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:611:45: replace % with + in MssqlChangeStream::open
+src/source/mssql/cdc.rs:611:45: replace % with / in MssqlChangeStream::open
+src/source/mssql/cdc.rs:611:49: replace != with == in MssqlChangeStream::open
+src/source/mssql/cdc.rs:611:54: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:611:57: delete ! in MssqlChangeStream::open
+src/source/mssql/cdc.rs:669:12: delete ! in MssqlChangeStream::open
+src/source/mssql/cdc.rs:670:13: replace && with || in MssqlChangeStream::open
+src/source/mssql/cdc.rs:670:16: delete ! in MssqlChangeStream::open
+src/source/mssql/cdc.rs:716:21: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:716:34: replace % with + in MssqlChangeStream::open
+src/source/mssql/cdc.rs:716:34: replace % with / in MssqlChangeStream::open
+src/source/mssql/cdc.rs:716:38: replace != with == in MssqlChangeStream::open
+src/source/mssql/cdc.rs:717:21: replace || with && in MssqlChangeStream::open
+src/source/mssql/cdc.rs:717:24: delete ! in MssqlChangeStream::open
+src/source/mssql/cdc.rs:798:9: replace MssqlChangeStream::fill -> Result<()> with Ok(())
+src/source/mssql/cdc.rs:863:26: replace match guard n.starts_with("__$") with false in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:863:26: replace match guard n.starts_with("__$") with true in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:870:16: delete ! in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:976:21: replace < with <= in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:976:21: replace < with == in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:976:21: replace < with > in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:977:33: replace + with * in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:977:33: replace + with - in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:978:23: replace < with <= in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:978:23: replace < with == in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:978:23: replace < with > in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:978:35: replace && with || in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:978:48: replace == with != in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:979:21: replace += with *= in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:979:21: replace += with -= in MssqlChangeStream::fill
+src/source/mssql/cdc.rs:986:21: replace == with != in MssqlChangeStream::fill

@@ -243,3 +243,54 @@ These items were open in the first draft of this ADR; they are now decided.
 | M9 | ✅ best-effort quarantine move wired | `quarantine_move` → `Destination::move` for divergent manifest parts (size/fingerprint) and untracked surplus objects; never fatal, never deletes on partial failure; counted on `M8ResumeStats.{quarantined_moved, quarantine_move_failures}` (`pipeline/chunked/resume_m8.rs`) |
 
 Each invariant lands with at least one unit test (local FS, fast) and one integration test (S3-compat via MinIO or GCS-compat; nightly).
+
+---
+
+## Amendment 2026-08-27: the CDC cursor belongs in this contract, fenced (M10, proposed)
+
+M1–M9 govern what a run records ABOUT its data in the destination. The CDC
+cursor — the position a next run resumes from — is not in that record. It is a
+JSON file on the local filesystem (`src/source/cdc/mod.rs:98-139`: temp file,
+fsync, rename; a corrupt or truncated file is refused rather than silently
+re-anchored). There is no fence and no owner on it.
+
+That split has two silent failures, and neither is a bug in the code above:
+
+1. **The two live in different durability domains.** The data lands in object
+   storage; the cursor lands on a container's disk. A run in a fresh container
+   finds no cursor and re-anchors — the "enable CDC during a quiet period" shape
+   the process rules already records for MySQL, one layer up from the engine.
+2. **Nothing arbitrates two writers.** PostgreSQL refuses a second consumer of a
+   replication slot, so that engine is protected by the server. MySQL, MongoDB
+   and SQL Server are not: two processes on one checkpoint path both advance it
+   and both report success. `has_active_run_on_prefix` answers a different
+   question (orphan GC) and is not an owner check.
+
+**Proposed M10 — Cursor With The Data, Fenced.** The durable CDC cursor is
+recorded in the destination, in the same write path as the manifest, and carries
+a monotonic generation plus the owning run id. A run re-reads that fence
+immediately before every advance and refuses (or invalidates its own generation)
+when it no longer owns it. The local file is demoted to a cache: it may make a
+resume faster, it may never be the sole source of truth. The durability ORDER is
+unchanged (flush → record → ack, per M1/M2 and ADR-0017); what changes is where
+the record lives and that it is fenced.
+
+**Primary prior art.** The fencing token — a monotonically increasing generation
+the resource itself checks on every write, so a stalled or superseded owner
+cannot resume — is Kleppmann, *Designing Data-Intensive Applications*, ch. 8
+("The Truth Is Defined by the Majority" → fencing tokens). rivet already applies
+the shape once, in `gc_orphans`, where a superseded `running` row loses to a
+newer run by `started_at` rather than to a clock; M10 is the same discipline
+applied to the cursor.
+
+**RED-proof before this leaves Proposed.** Two runs of one export against one
+destination, overlapping in time: the second is refused or invalidates the
+first's generation, and the union of delivered rows equals the source. The
+mutant is the fence read removed from the advance path — that test must go RED.
+Plus the ephemeral half: delete the local cursor file between two runs and
+assert the second resumes rather than re-anchors, which is RED today.
+
+Sequencing note: M10 touches the manifest write path, the state store, and every
+engine's ack path. It is the largest of the four CDC amendments dated 2026-08-27
+(the others are in ADR-0023 and ADR-0025) and the one most likely to need its own
+ADR before code.

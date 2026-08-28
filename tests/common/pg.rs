@@ -142,3 +142,239 @@ impl Drop for Slot {
         }
     }
 }
+
+/// RAII guard for a SERVER-LEVEL PostgreSQL setting — reverts it on scope exit.
+///
+/// The STATE axis is the most productive one this repo has (the `timestamptz`
+/// rendering corruption, `datestyle='German, DMY'` nulling every timestamp,
+/// `bytea_output='escape'` corrupting every bytea, and PostgreSQL's two-phase
+/// immunity were all settled by flipping one server setting), and until now it was
+/// also the most expensive: every probe hand-rolled `ALTER SYSTEM SET`, a container
+/// restart, the probe, and a revert — with the revert conditional on the test
+/// actually reaching the end.
+///
+/// That conditional revert is the real hazard, not the typing. A hand-drifted
+/// container is how this repo produced two false "verified" claims in one day, so
+/// the revert belongs in `Drop` where a panic cannot skip it.
+///
+/// Two flavours because PostgreSQL has two kinds of setting: most are reloadable
+/// (`pg_reload_conf`), while `PGC_POSTMASTER` ones — `max_prepared_transactions`,
+/// `wal_level`, `max_replication_slots` — need the server restarted.
+pub struct PgSetting {
+    name: String,
+    container: Option<&'static str>,
+}
+
+impl PgSetting {
+    /// A reloadable setting: `ALTER SYSTEM SET` + `pg_reload_conf()`.
+    pub fn set(name: &str, value: &str) -> Self {
+        Self::apply(name, value);
+        reload();
+        Self {
+            name: name.to_string(),
+            container: None,
+        }
+    }
+
+    /// A `PGC_POSTMASTER` setting: `ALTER SYSTEM SET` + a container restart, then
+    /// waits for the server to accept connections again. `container` is the docker
+    /// name (`rivet-postgres-cdc-1`).
+    ///
+    /// EXCLUSIVE. The restart kills every open connection to that stand, and
+    /// `cargo test` runs tests in parallel — MEASURED: one restart-using test took
+    /// an unrelated bounded-drain test down with it, which reads as a product
+    /// failure and is a fixture breaking its neighbours. A caller must gate itself
+    /// (an env var plus `--test-threads=1`) or not use this variant. `set` is free
+    /// of the problem entirely, so prefer it whenever the setting is reloadable.
+    pub fn set_with_restart(name: &str, value: &str, container: &'static str) -> Self {
+        Self::apply(name, value);
+        restart(container);
+        Self {
+            name: name.to_string(),
+            container: Some(container),
+        }
+    }
+
+    /// What the server reports for this setting RIGHT NOW — so a test can assert
+    /// the flip took effect before drawing any conclusion from it. A probe that
+    /// silently ran at the default is the "absence is not success" shape.
+    pub fn current(name: &str) -> String {
+        let mut c = connect();
+        c.query_one(&format!("SHOW {name}"), &[])
+            .map(|r| r.get::<_, String>(0))
+            .unwrap_or_default()
+    }
+
+    fn apply(name: &str, value: &str) {
+        let mut c = connect();
+        c.batch_execute(&format!("ALTER SYSTEM SET {name} = '{value}'"))
+            .unwrap_or_else(|e| panic!("ALTER SYSTEM SET {name}: {e}"));
+    }
+}
+
+impl Drop for PgSetting {
+    fn drop(&mut self) {
+        if let Ok(mut c) = postgres::Client::connect(&url(), postgres::NoTls) {
+            let _ = c.batch_execute(&format!("ALTER SYSTEM RESET {}", self.name));
+        }
+        match self.container {
+            Some(name) => restart(name),
+            None => reload(),
+        }
+    }
+}
+
+fn url() -> String {
+    std::env::var("POSTGRES_CDC_URL")
+        .unwrap_or_else(|_| "postgresql://rivet:rivet@127.0.0.1:5434/rivet".to_string())
+}
+
+fn connect() -> postgres::Client {
+    postgres::Client::connect(&url(), postgres::NoTls).expect("connect postgres-cdc")
+}
+
+fn reload() {
+    if let Ok(mut c) = postgres::Client::connect(&url(), postgres::NoTls) {
+        let _ = c.batch_execute("SELECT pg_reload_conf()");
+    }
+}
+
+/// Restart the container and WAIT for the server to answer — returning before it
+/// is up turns every later step into a connection error that reads like a product
+/// failure.
+fn restart(container: &str) {
+    let _ = std::process::Command::new("docker")
+        .args(["restart", container])
+        .output();
+    for _ in 0..60 {
+        if postgres::Client::connect(&url(), postgres::NoTls).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("postgres container `{container}` did not accept connections after a restart");
+}
+
+// ─── CDC fixture SCENARIOS ────────────────────────────────────────────────────
+//
+// These live here, not in whatever script needed them first, for the reason the
+// rig exists at all: each encodes a THRESHOLD that a naive fixture does not cross,
+// and every one of them was rediscovered the hard way before it was written down.
+// A scenario in a scratch script is a threshold the next person pays for again.
+
+/// A value PostgreSQL must store OUT OF LINE, so a TOASTed column really is one.
+///
+/// THE THRESHOLD: `repeat('y', 9000)` does NOT work. PGLZ compresses it to almost
+/// nothing, the value stays inline, and an UPDATE that leaves it alone emits no
+/// unchanged-TOAST marker at all — MEASURED, and it nearly produced the conclusion
+/// that `pgoutput` does not send the marker. Concatenated md5s are incompressible.
+///
+/// Returns the SQL expression, not a literal: 12 KB of hex in a test body is noise,
+/// and the server generating it is also what makes it genuinely random.
+pub fn incompressible_text_sql(groups: usize) -> String {
+    format!(
+        "(SELECT string_agg(md5(g::text||random()::text),'') \
+         FROM generate_series(1,{groups}) g)"
+    )
+}
+
+/// The column types that broke the TEXT reader, in one table.
+///
+/// Not an arbitrary selection — each one is a defect this repository measured:
+/// quoted/comma text (parser boundaries), an array (142 lines of literal parsing,
+/// and an inner NULL indistinguishable from the word), a non-UTC `timestamptz`
+/// (rendered in the reader's session zone), `uuid` (36-char text nulled by a
+/// 16-byte guard), `bytea` (`bytea_output` sensitive), `numeric` (exactness),
+/// `jsonb`, and an out-of-line TOAST column.
+pub fn pg_hard_types_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table}(\
+           id BIGINT PRIMARY KEY, txt TEXT, arr INT[], ts TIMESTAMPTZ, u UUID, \
+           b BYTEA, n NUMERIC(20,4), f DOUBLE PRECISION, ok BOOLEAN, d DATE, \
+           j JSONB, big TEXT)"
+    )
+}
+
+/// One row of [`pg_hard_types_ddl`] with every column populated.
+pub fn pg_hard_types_row(table: &str, id: i64) -> String {
+    format!(
+        "INSERT INTO {table} VALUES ({id}, 'a,b \"q\"', ARRAY[1,NULL,3], \
+         '2026-03-01 12:00:00+05', '11111111-2222-3333-4444-555555555555', \
+         '\\x00ff', '-12345.6789', 2.5, true, '2026-03-02', '{{\"k\":[1,2]}}', {})",
+        incompressible_text_sql(400)
+    )
+}
+
+/// The same table with every nullable column NULL.
+///
+/// THE THRESHOLD: a NULL *inside* an array value is NOT a NULL cell on the wire.
+/// A fixture carrying only `ARRAY[1,NULL,3]` never produces the `n` tag, and
+/// `Cell::Null -> Cell::Text` SURVIVED it — measured. A row of column-level NULLs
+/// is what grades the tag.
+pub fn pg_all_null_row(table: &str, id: i64) -> String {
+    format!(
+        "INSERT INTO {table} VALUES ({id},NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"
+    )
+}
+
+/// Wrap statements in ONE transaction.
+///
+/// THE THRESHOLD, and the one that has now cost six re-captures across this
+/// codebase: with a SINGLE row per transaction, `committed on the last event`,
+/// `committed on every event` and `committed on the first` are the same answer, so
+/// every one of those mutants survives. Three rows separate all three.
+pub fn in_one_transaction(statements: &[String]) -> String {
+    format!("BEGIN;\n{};\nCOMMIT;", statements.join(";\n"))
+}
+
+/// ONE transaction holding `rows` inserts — the fixture an oversized-transaction
+/// test needs.
+///
+/// A single `BEGIN … COMMIT`, because the subject is a transaction LARGER than the
+/// in-memory cap: N separate one-row transactions never reach the cap however many
+/// of them there are. The threshold this fixture has to cross is per-transaction,
+/// which is exactly the kind a row-count fixture misses.
+///
+/// Shaped for [`crate::common::cdc_id_ops`]: `(id INT, v INT, pad TEXT)`, so the
+/// canonical CDC read-back applies without a bespoke reader. The `pad` is
+/// deliberately not tiny — a spill is measured in rows AND bytes, and a two-integer
+/// table can cross a row cap while a byte cap never notices it.
+pub const ONE_TRANSACTION_DDL: &str = "(id INT PRIMARY KEY, v INT, pad TEXT)";
+
+pub fn one_transaction_of(table: &str, rows: usize) -> String {
+    transaction_over(table, 1..=rows)
+}
+
+/// One transaction over an explicit id range — for a fixture that needs a SECOND
+/// transaction after the big one.
+///
+/// A mechanism that ends the read window early (to hand out a spilled tail in
+/// order) is only observable when something follows it in the same window: with a
+/// single transaction, ending the window early and draining it normally look
+/// identical. Measured — the `stopped_to_spool` guard could be inverted with a
+/// one-transaction fixture still green.
+pub fn transaction_over(table: &str, ids: std::ops::RangeInclusive<usize>) -> String {
+    transaction_over_wide(table, ids, 200)
+}
+
+/// [`transaction_over`] with the `pad` width chosen — for a HEAVY-row fixture.
+///
+/// The row cap and the BYTE cap are different activation thresholds: a narrow row
+/// crosses `RIVET_CDC_MAX_TX_ROWS` while `RIVET_CDC_MAX_TX_BYTES` never fires, and
+/// a wide one (a `content_items`-shaped table: long text, JSON, markup) does the
+/// opposite. A fixture that only ever crosses the row cap tests half the guard.
+///
+/// ONE set-based statement, so it is one transaction at any size — the per-row
+/// `INSERT` form builds a multi-megabyte SQL string at a million rows and measures
+/// the seeding rather than rivet.
+pub fn transaction_over_wide(
+    table: &str,
+    ids: std::ops::RangeInclusive<usize>,
+    pad: usize,
+) -> String {
+    let (lo, hi) = (*ids.start(), *ids.end());
+    format!(
+        "INSERT INTO {table} SELECT g, g, repeat('x', {pad}) FROM \
+         generate_series({lo}, {hi}) g"
+    )
+}

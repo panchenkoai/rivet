@@ -149,7 +149,7 @@ scenarios:
     mongo:    { na: "a MongoDB secondary serves change streams fine (they read the oplog); reading CDC from a secondary is a supported topology, not a fail-loud case" }
 
   - id: cdc_oversized_transaction_bails_loud
-    what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer at max_tx_rows() (default 5M, RIVET_CDC_MAX_TX_ROWS overrides for the test) and BAILS LOUDLY naming the cap, never a silent OOM or partial capture. One shared helper but THREE call sites — each adapter's own guard is RED-proven, not just the helper"
+    what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer (max_tx_rows(), default 5M, and max_tx_bytes(), default 2 GiB of RESIDENT cost — at resident rates the byte cap fires first on any realistic row) and BY DEFAULT bails loudly naming the cap, never a silent OOM or partial capture. With RIVET_CDC_SPILL_DIR set the same threshold spills the tail to disk instead and the run proceeds — the *_past_the_memory_cap_* tests cover that branch; these three cover the refusal, which is why they must run WITHOUT the env var. One shared helper but THREE call sites — each adapter's own guard is RED-proven, not just the helper"
     postgres: { test: roast_pg_cdc_oversized_transaction_bails_loud_not_oom }
     mysql:    { test: roast_mysql_cdc_oversized_transaction_bails_loud_not_oom }
     mssql:    { test: roast_mssql_cdc_oversized_transaction_bails_loud_not_oom }

@@ -653,7 +653,7 @@ impl BatchSink for ExportSink {
                 );
             }
         }
-        // Warn loud (#6/#29, CLAUDE.md "never a silent no-op"): `max_file_size`
+        // Warn loud (#6/#29, the process rules "never a silent no-op"): `max_file_size`
         // is enforced by `maybe_split` comparing the writer's FLUSHED bytes
         // against the cap. parquet-rs only flushes on row-group close, so with
         // the library-default (~1M-row) row group an export below one group
@@ -687,7 +687,7 @@ impl BatchSink for ExportSink {
         self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
         // Build quality field index cache from dest_schema (after stripping internal cols).
         if let Some(qc) = &self.quality_columns {
-            // Fail loud (#33, CLAUDE.md "never a silent no-op"): a quality rule
+            // Fail loud (#33, the process rules "never a silent no-op"): a quality rule
             // naming a column the export does not produce would otherwise be
             // dropped by the `contains`/`index_of` filters below and report
             // `quality: pass` over a gate that never ran. Validate names against

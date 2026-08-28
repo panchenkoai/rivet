@@ -86,6 +86,19 @@ from .core import (Ledger, cell_gate, cell_parallel, container_for_port, docker_
                    have, port_of, run, rivet)
 from . import scenarios
 
+# The gate's own bucket — the SAME derivation blessed_flow uses, because this
+# module had the same defect blessed_flow's comment records having fixed: a
+# private name (`rivet-blessed`) is a bucket the bring-up never creates, so every
+# gcs cell died at `doctor` with "bucket not found" — 39 cells across four
+# engines, and the one-line ledger detail (doctor's generic epilogue) said
+# nothing. Two modules, one lesson, applied once: the second copy drifted, which
+# is the "one oracle, or two that disagree" rule arriving in the gate itself.
+def _bucket(store: str) -> str:
+    return scenarios.cfg("store", store, "bucket") or "rivet-oracle"
+
+
+# Kept for the one non-store use (BigQuery names its own bucket) — every store
+# call goes through `_bucket` now.
 BUCKET = "rivet-blessed"
 
 # The dev stand, by engine. `_matrix_cfg("url", engine)` owns the TEMPLATE; the
@@ -429,7 +442,7 @@ def sc_blessed_path(
         # back-to-back pass: `source=150000 duckdb=300000 manifest=150000`, with
         # the manifest correctly reporting 150000 the whole time. Same token the
         # CDC leg and blessed_flow already carry.
-        raw = scenarios.store_dest(store, BUCKET, cloud_prefix(engine, tag, table, scenario))
+        raw = scenarios.store_dest(store, _bucket(store), cloud_prefix(engine, tag, table, scenario))
         if not raw:
             led.skipped(engine, tag, "blessed:init", store, f"{store} — no destination block")
             _downstream_unreached(led, engine, tag, store, "init")
@@ -604,10 +617,10 @@ def sc_blessed_path(
             duck_rows, duck_files = _parquet_rows_and_files(dest_dir)
         else:
             pfx = cloud_prefix(engine, tag, table, scenario)
-            got = scenarios.store_readback(store, BUCKET, pfx, work)
+            got = scenarios.store_readback(store, _bucket(store), pfx, work)
             duck_rows = int(got.splitlines()[0]) if got.strip().isdigit() else -1
             duck_files = -1  # the readback helper reports rows only
-            man = _cloud_manifest(BUCKET, pfx) or man
+            man = _cloud_manifest(_bucket(store), pfx) or man
         man_rows = int(man.get("row_count", -1)) if man else -1
         man_files = int(man.get("part_count", -1)) if man else -1
 
@@ -636,7 +649,7 @@ def sc_blessed_path(
                 # store_readback) — the GCS store is exactly where the documented
                 # uuid→null incident happened, so the profile must run here too.
                 pfx = cloud_prefix(engine, tag, table, scenario)
-                n_null, n_cols = scenarios.duckdb_allnull_cloud(store, BUCKET, pfx, work)
+                n_null, n_cols = scenarios.duckdb_allnull_cloud(store, _bucket(store), pfx, work)
             cols_ok = n_null <= 0
             _stage(
                 led, engine, tag, store, "oracle", agree and files_agree and cols_ok,
