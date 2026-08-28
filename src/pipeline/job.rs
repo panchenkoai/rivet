@@ -1240,7 +1240,10 @@ fn execute_resolved_plan(
     let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
     if let Some(why) = &manifest_gap {
         summary.status = "failed".into();
-        summary.error_message = Some(why.clone());
+        // redact-at-assignment (round-8): this string reaches summary.json AND
+        // the Slack payload verbatim — the main failure path redacts, this one
+        // skipped it.
+        summary.error_message = Some(crate::redact::redact_secrets(why));
         ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     }
     // Round-2 audit #12: advance the incremental cursor now that the destination

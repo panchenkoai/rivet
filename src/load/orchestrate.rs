@@ -125,7 +125,14 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         if let Err(e) = outcome {
             // Name the table on the way out: the aggregate must say WHICH load
             // failed, or an operator reading a mixed batch cannot act on it.
-            eprintln!("  LOAD FAILED [{}]: {e:#}", plan.table);
+            // Through redact (round-8): a raw eprintln bypasses both the log
+            // sink and main's top-level redactor — a future URL-bearing load
+            // error would print credentials unredacted.
+            eprintln!(
+                "  LOAD FAILED [{}]: {}",
+                plan.table,
+                crate::redact::redact_secrets(&format!("{e:#}"))
+            );
             failures.push(e.context(format!("load '{}'", plan.table)));
             continue;
         }
@@ -744,7 +751,10 @@ impl LoadCtx<'_> {
             finished_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Err(e) = s.store_load(&rec) {
-            eprintln!("  warning: load ledger write failed (load itself proceeded): {e:#}");
+            eprintln!(
+                "  warning: load ledger write failed (load itself proceeded): {}",
+                crate::redact::redact_secrets(&format!("{e:#}"))
+            );
         }
     }
     /// Nothing new to load — the ledger already covers every run.
@@ -907,6 +917,31 @@ fn rebaseline_shape(uris: &[String], plan_prefix: &str) -> bool {
     })
 }
 
+/// What the re-baseline guard does, given the two signals it can read.
+///
+/// Round-8 lifecycle HIGH: a STATELESS load re-selects EVERY Success run each
+/// cycle by design (at-least-once, absorbed by the view) — so its uris carry
+/// the snapshot leg forever, and the warehouse probe is true from cycle 2 on:
+/// the refusal wedged a HEALTHY pipeline into a routine-TRUNCATE loop (an
+/// operator truncating a serving table every cycle). Only a LEDGERED load can
+/// distinguish "genuine re-snapshot after a gap" (snapshot run NOT consumed)
+/// from "routine re-selection" (it was) — so the refusal requires the ledger,
+/// and stateless degrades to a note.
+#[derive(Debug, PartialEq, Eq)]
+enum RebaselineAction {
+    Proceed,
+    WarnStateless,
+    Refuse,
+}
+
+fn rebaseline_action(warehouse_has_changes: bool, ledgered: bool) -> RebaselineAction {
+    match (warehouse_has_changes, ledgered) {
+        (false, _) => RebaselineAction::Proceed, // empty/truncated log: the recovery load
+        (true, true) => RebaselineAction::Refuse,
+        (true, false) => RebaselineAction::WarnStateless,
+    }
+}
+
 /// The RE-baseline REFUSAL (round-7 refuter, HIGH): the first cut was a warn
 /// printed while the load PROCEEDED — so the runs got consumed, and the
 /// prescribed "truncate + re-run" then selected nothing: the operator who
@@ -916,14 +951,24 @@ fn rebaseline_shape(uris: &[String], plan_prefix: &str) -> bool {
 /// prescribed truncate the recovery re-run probes an empty log and sails
 /// through, while ledger rows (which survive a truncate) would have deadlocked
 /// it forever.
-fn rebaseline_refusal(target_fqtn: &str) -> String {
+fn rebaseline_refusal(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse) -> String {
+    // The remedy must PARSE where the operator pastes it (round-8): backticks
+    // are BigQuery-only; Snowflake takes the bare fqtn.
+    let quoted = match warehouse {
+        crate::load::cdc::Warehouse::BigQuery => format!("`{target_fqtn}__changes`"),
+        crate::load::cdc::Warehouse::Snowflake => format!("{target_fqtn}__changes"),
+    };
+    rebaseline_refusal_text(&quoted)
+}
+
+fn rebaseline_refusal_text(quoted_changes: &str) -> String {
     format!(
         "refusing to append a RE-baseline: this load carries snapshot parquet, but \
-         `{target_fqtn}__changes` already holds real change rows — a re-snapshot row \
+         {quoted_changes} already holds real change rows — a re-snapshot row \
          carries NULL `__pos` and LOSES the dedup to every prior change, so the \
          current-state view would keep serving PRE-GAP values for exactly the rows \
          this re-snapshot fixed. Nothing was consumed by this refusal. Recovery: \
-         1) TRUNCATE TABLE `{target_fqtn}__changes`; 2) re-run this same `rivet load` \
+         1) TRUNCATE TABLE {quoted_changes}; 2) re-run this same `rivet load` \
          — it will then append the baseline into the empty log and proceed \
          (cdc-failure-modes.md)."
     )
@@ -966,8 +1011,20 @@ fn load_one_cdc(
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             if shape {
                 let prior = loader.changes_has_prior_changes(&plan.table)?;
-                if prior {
-                    anyhow::bail!("{}", rebaseline_refusal(&loader.fqtn(&plan.table)));
+                match rebaseline_action(prior, state.is_some()) {
+                    RebaselineAction::Refuse => {
+                        anyhow::bail!(
+                            "{}",
+                            rebaseline_refusal(&loader.fqtn(&plan.table), loader.warehouse())
+                        );
+                    }
+                    RebaselineAction::WarnStateless => eprintln!(
+                        "  note: this STATELESS load re-selects the snapshot leg every \
+                         cycle (at-least-once, absorbed by the dedup view) — the \
+                         re-baseline refusal needs the ledger to tell a genuine \
+                         re-snapshot from a routine re-load, so it does not apply here.",
+                    ),
+                    RebaselineAction::Proceed => {}
                 }
             }
             // The driver gates the appended delta against the manifests' summed
@@ -1213,8 +1270,21 @@ mod load_ledger_tests {
             &["gs://b/exports/base/snapshot/cdc-000000.parquet".into()],
             "gs://b/exports/base/snapshot"
         ));
-        let msg = rebaseline_refusal("p.d.t");
+        // The action table (round-8): refusal requires BOTH a non-empty log and
+        // a ledger; stateless notes, an empty log always proceeds (the recovery
+        // load). RED against collapsing the ledgered arm.
+        use RebaselineAction::*;
+        assert_eq!(rebaseline_action(true, true), Refuse);
+        assert_eq!(rebaseline_action(true, false), WarnStateless);
+        assert_eq!(rebaseline_action(false, true), Proceed);
+        assert_eq!(rebaseline_action(false, false), Proceed);
+        let msg = rebaseline_refusal("p.d.t", crate::load::cdc::Warehouse::BigQuery);
         assert!(msg.contains("TRUNCATE TABLE `p.d.t__changes`"));
+        let sf = rebaseline_refusal("d.s.t", crate::load::cdc::Warehouse::Snowflake);
+        assert!(
+            sf.contains("TRUNCATE TABLE d.s.t__changes;") && !sf.contains("TRUNCATE TABLE `"),
+            "the pasted remedy must parse on Snowflake (bare fqtn in the STATEMENT): {sf}"
+        );
         assert!(msg.contains("re-run this same"));
         assert!(msg.contains("Nothing was consumed"));
     }

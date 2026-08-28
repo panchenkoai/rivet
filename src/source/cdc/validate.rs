@@ -194,7 +194,13 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
         }
         let base = rel;
         if crate::manifest::is_run_unique_manifest_name(base) {
-            manifests.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
+            let m: RunManifest = serde_json::from_slice(&dest.read(&m.key)?)?;
+            // Success-only (round-8): a Failed copy's spared parts are terminal
+            // debris gc legitimately deletes after supersession — reading them
+            // here resurrected the false exit-3 the fold's filter closed.
+            if m.status == crate::manifest::ManifestStatus::Success {
+                manifests.push(m);
+            }
         }
     }
     if manifests.is_empty() && dest.head(&manifest_key)?.is_some() {
@@ -224,14 +230,21 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
             // deleted part as retryable exit 1 while the headline said PASSED.
             let body = match dest.read(&join_key(prefix, &part.path)) {
                 Ok(b) => b,
-                Err(e) => {
+                // NOT-FOUND is verified-wrong (the manifest promises, the
+                // destination refutes); any OTHER read error — auth, outage
+                // past the retry budget — is could-not-verify and must stay
+                // exit 1, not page data-integrity (round-8 split).
+                Err(e)
+                    if format!("{e:#}").contains("NotFound")
+                        || format!("{e:#}").contains("No such file") =>
+                {
                     violations.push(format!(
-                        "declared part '{}' (run {}) is missing or unreadable at the \
-                         destination: {e:#}",
+                        "declared part '{}' (run {}) is MISSING at the destination: {e:#}",
                         part.path, manifest.run_id
                     ));
                     continue;
                 }
+                Err(e) => return Err(e),
             };
             match read_pos_column(body) {
                 Ok(ps) => items.extend(ps.into_iter().map(|p| (part.part_id, p))),

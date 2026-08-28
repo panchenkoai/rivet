@@ -197,7 +197,10 @@ fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
         Some((store, prefix)) => match delete_under(store, prefix) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("warning: source cleanup failed (data is safely loaded): {e:#}");
+                eprintln!(
+                    "warning: source cleanup failed (data is safely loaded): {}",
+                    crate::redact::redact_secrets(&format!("{e:#}"))
+                );
                 false
             }
         },

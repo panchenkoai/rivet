@@ -203,8 +203,13 @@ mod run_summary_redaction {
 mod validate_redaction {
     use super::*;
 
+    /// HONESTY (round-8): this is the redactor PRIMITIVE on a validate-shaped
+    /// string, not validate's wiring — validate has no URL-bearing hard-fail
+    /// path today, so no wiring test can go RED. Renamed from
+    /// `validate_hard_failure_message_redacts_embedded_userinfo`, which claimed
+    /// coverage the body never had.
     #[test]
-    fn validate_hard_failure_message_redacts_embedded_userinfo() {
+    fn documents_redactor_primitive_on_a_validate_shaped_string() {
         // The shape we're exercising is the redactor itself when fed a
         // message containing a destination URL.  Validate's hard-fail
         // branch wraps the underlying anyhow chain via the central

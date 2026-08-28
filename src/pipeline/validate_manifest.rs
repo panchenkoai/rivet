@@ -610,7 +610,11 @@ fn read_sibling_manifests(
 /// snapshots, and presence-checking a legitimately cleaned old part would false-fail. The
 /// canonical's own copy is among them, so seeding `seen` with the canonical's parts keeps it
 /// from being added twice. Only `parts` differ from `canonical`.
-fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) -> RunManifest {
+fn merge_split_unit_parts(
+    canonical: &RunManifest,
+    census: &ManifestCensus<'_>,
+    manifest_dir: &str,
+) -> RunManifest {
     let mut merged = canonical.clone();
     let mut seen: std::collections::BTreeSet<String> =
         merged.parts.iter().map(|p| p.path.clone()).collect();
@@ -662,6 +666,24 @@ fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) 
                 continue;
             }
             if run.manifest.status != crate::manifest::ManifestStatus::Success {
+                continue;
+            }
+            // A copy living in a SUB-directory (`snapshot/manifest-*.json`) is a
+            // separately-certified sub-dataset whose parts[].path are relative
+            // to ITS OWN directory — folding them here resolved
+            // `snapshot/x.parquet` at the TABLE root and false-failed every
+            // intact `initial: snapshot` prefix with PART_MISSING exit 3
+            // (round-8 lifecycle, reproduced). The sibling consumer
+            // check_positions carries the same exclusion, INCLUDING its
+            // whole-key trap: `list_prefix` returns FULL keys, so the test
+            // must be RELATIVE to this prefix or it skips every copy and the
+            // fold silently dies.
+            let rel = run
+                .key
+                .strip_prefix(manifest_dir)
+                .unwrap_or(run.key)
+                .trim_start_matches('/');
+            if rel.contains('/') {
                 continue;
             }
             for p in &run.manifest.parts {
@@ -807,7 +829,7 @@ pub fn verify_at_destination(
                     read_sibling_manifests(dest, &listing)
                 };
                 let census = ManifestCensus::new(&siblings);
-                let target = merge_split_unit_parts(&manifest, &census);
+                let target = merge_split_unit_parts(&manifest, &census, manifest_dir);
                 let mut rec = reconcile_manifest_against_listing(&target, &listing, manifest_dir);
                 // Same-family sibling parts — the folded split units AND a plain export's
                 // SUPERSEDED historical / CDC-soak copies (no split_window, so NOT folded
@@ -1122,7 +1144,7 @@ mod tests {
             // for another's.
             unit("other", "foreign.parquet", "other", PartStatus::Committed),
         ];
-        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings), "");
         let paths: std::collections::BTreeSet<&str> =
             merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
@@ -1139,7 +1161,7 @@ mod tests {
         let mut familyless = canonical.clone();
         familyless.export_family = String::new();
         assert!(
-            merge_split_unit_parts(&familyless, &ManifestCensus::new(&siblings))
+            merge_split_unit_parts(&familyless, &ManifestCensus::new(&siblings), "")
                 .parts
                 .is_empty(),
             "a family-less canonical folds nothing — dropping the `!` here would \
@@ -1165,7 +1187,7 @@ mod tests {
             unit("daily", "daily_old.parquet", "daily", false),  // SAME family, PLAIN (superseded)
             unit("other#0", "other_p.parquet", "other", true),   // FOREIGN family
         ];
-        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings), "");
         let paths: std::collections::BTreeSet<&str> =
             merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
@@ -1209,7 +1231,7 @@ mod tests {
         sib.split_window = Some(split_win());
 
         let siblings = vec![sib_keyed(sib)];
-        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings), "");
         let paths: Vec<&str> = merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
             paths,

@@ -90,7 +90,13 @@ pub fn maybe_send(config: Option<&NotificationsConfig>, summary: &RunSummary) {
             log::warn!("slack notification failed: HTTP {}", resp.status());
         }
         Err(e) => {
-            log::warn!("slack notification failed: {}", e);
+            // WITHOUT the URL (round-8): reqwest's Display appends
+            // ` for url (...)` on connect/DNS/timeout errors, and a Slack
+            // webhook keeps its SECRET in the URL *path* — which
+            // redact_url_passwords (userinfo-only) cannot touch. Printing `e`
+            // raw shipped the posting credential to stderr/log aggregators on
+            // every delivery failure.
+            log::warn!("slack notification failed: {}", e.without_url());
         }
     }
 }

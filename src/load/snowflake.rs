@@ -231,7 +231,13 @@ impl TargetLoader for SnowflakeLoader {
              WHERE __pos IS NOT NULL LIMIT 1);"
         );
         match self.run_snow(&sql) {
-            Ok(v) => Ok(extract_named(&v, "PROBE_").unwrap_or(0) > 0),
+            // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read
+            // as "first cycle" and silently disarm the refusal — the exact
+            // direction this guard exists for. BigQuery's scalar path already
+            // errors; parity.
+            Ok(v) => extract_named(&v, "PROBE_")
+                .map(|n| n > 0)
+                .context("re-baseline probe ran but PROBE_ was not in snow's output"),
             // A missing __changes table is the FIRST cycle, not an error.
             Err(e) if format!("{e:#}").contains("does not exist") => Ok(false),
             Err(e) => Err(e),

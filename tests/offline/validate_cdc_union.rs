@@ -85,6 +85,29 @@ fn a_prior_cdc_cycles_deleted_part_fails_validate_at_sample_depth() {
             .unwrap()
     };
 
+    // Round-8: an `initial: snapshot` SUB-dataset beside the cycles — its copy's
+    // parts[].path are relative to snapshot/, and the round-7 fold's first cut
+    // resolved them at the TABLE root, false-failing every intact snapshot
+    // prefix with PART_MISSING exit 3. The intact assertion below now guards
+    // that shape too (RED against un-rel-ing the fold's nested-copy skip).
+    let snap = out.join("snapshot");
+    std::fs::create_dir_all(&snap).unwrap();
+    write_pq(
+        &snap.join("snap-000.parquet"),
+        r#"{"file":"binlog.000001","pos":1}"#,
+    );
+    std::fs::write(
+        snap.join("manifest-rs.json"),
+        manifest_json(
+            "rs",
+            "snap-000.parquet",
+            std::fs::metadata(snap.join("snap-000.parquet"))
+                .unwrap()
+                .len(),
+        ),
+    )
+    .unwrap();
+
     // Positive control: the intact prefix validates clean at both depths.
     let ok = run(&["validate", "-c", cfg.to_str().unwrap(), "--depth", "sample"]);
     assert!(

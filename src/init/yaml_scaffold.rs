@@ -491,9 +491,32 @@ fn export_block_lines(
     // from the relation, which a curated `query:` hides (`plan::build` bails
     // "needs the table: shortcut"). So a keyset export must emit `table:`, not
     // `SELECT … FROM`, on every engine.
-    let is_keyset = mode == "chunked" && info.single_pk_column().is_some();
-    if is_simple_pg_ident(&qualified_table)
+    // Which names may become an UNQUOTED `table:` per engine (round-8): PG
+    // case-folds unquoted idents, so only a name that IS its own fold is safe
+    // there; MySQL/MSSQL do not fold (case-sensitive FS / case-insensitive
+    // collation — either way the name addresses the right relation); Mongo's
+    // `table:` is a ROUTING string, not SQL — always exact, and the ONLY form
+    // Mongo accepts (round-7's lowercase-strict gate wrongly routed camelCase
+    // collections into a `query:` Mongo refuses: a DOA scaffold, live-proven).
+    let table_form_safe = match source_type {
+        "postgres" => is_simple_pg_ident(&qualified_table),
+        "mongo" => true,
+        _ => {
+            // MySQL/MSSQL: no folding, but the config-side shortcut gate still
+            // wants a plain ident shape (no spaces/quotes/etc.).
+            qualified_table.split('.').all(|p| {
+                !p.is_empty()
+                    && p.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        }
+    };
+    let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
+    if table_form_safe
         && (is_keyset || (mode == "full" && (source_type == "postgres" || source_type == "mongo")))
+        || source_type == "mongo"
     {
         // MongoDB has no SQL: the `table:` shortcut (→ collection scan) is the
         // ONLY export form it accepts, and it is schemaless so there is no
@@ -522,7 +545,7 @@ fn export_block_lines(
     match mode {
         "chunked" => {
             let chunk_size = info.suggest_chunk_size();
-            if let Some(pk) = info.keysettable_pk_column() {
+            if let Some(pk) = info.keysettable_pk_column().filter(|_| is_keyset) {
                 // Single-column PK of a KEYSET-usable type (integer / uuid / string
                 // / timestamp / date — NOT decimal, which the planner refuses) →
                 // keyset (seek) pagination: `WHERE pk > last ORDER BY pk LIMIT n`

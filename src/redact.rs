@@ -153,7 +153,42 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 /// driver/library error (or any operator-untrusted string) into a
 /// persisted or emitted artifact.
 pub fn redact_secrets(s: &str) -> String {
-    redact_url_passwords(s)
+    redact_query_secrets(&redact_url_passwords(s))
+}
+
+/// Redact SECRET-BEARING QUERY PARAMETERS: `?token=…`, `&password=…`,
+/// `sig=…` (SAS), `api_key=…`, `secret=…`, `sas=…`, `sv=…` values become
+/// `***`. Round-8 made this boundary load-bearing, not hypothetical: a Slack
+/// webhook keeps its credential in the URL *path*, and reqwest's error
+/// Display prints the URL — userinfo-only redaction shipped the token to
+/// every log aggregator on a delivery failure. Path secrets have no
+/// recognizable shape (handled at the notify site via `without_url`); query
+/// keys DO, so they are scrubbed here for every error path.
+fn redact_query_secrets(s: &str) -> String {
+    const KEYS: [&str; 7] = ["token", "password", "api_key", "secret", "sig", "sas", "sv"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    'outer: while let Some(q) = rest.find(['?', '&']) {
+        out.push_str(&rest[..=q]);
+        rest = &rest[q + 1..];
+        for key in KEYS {
+            if rest.len() > key.len()
+                && rest.as_bytes()[key.len()] == b'='
+                && rest[..key.len()].eq_ignore_ascii_case(key)
+            {
+                out.push_str(key);
+                out.push_str("=***");
+                let val_end = rest[key.len() + 1..]
+                    .find(|c: char| c == '&' || c.is_whitespace() || c == '\'' || c == '"')
+                    .map(|i| key.len() + 1 + i)
+                    .unwrap_or(rest.len());
+                rest = &rest[val_end..];
+                continue 'outer;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Convenience: format an `anyhow::Error` with `{:#}` and redact the
@@ -181,6 +216,31 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
 
 #[cfg(test)]
 mod tests {
+    /// Round-8: query-param secrets are scrubbed (the Slack-path find made
+    /// this boundary load-bearing). Values after token/password/api_key/
+    /// secret/sig/sas/sv become ***; foreign keys and non-URLs untouched.
+    #[test]
+    fn query_param_secrets_are_scrubbed() {
+        assert_eq!(
+            redact_secrets("GET https://h/hook?token=top-secret failed"),
+            "GET https://h/hook?token=*** failed"
+        );
+        assert_eq!(
+            redact_secrets("postgres://h/db?password=hunter2&sslmode=require"),
+            "postgres://h/db?password=***&sslmode=require"
+        );
+        assert_eq!(
+            redact_secrets("https://acc.blob/x?sv=2020&sig=abc%2F=="),
+            "https://acc.blob/x?sv=***&sig=***"
+        );
+        // A non-secret key and plain text stay byte-identical.
+        assert_eq!(
+            redact_secrets("https://h/x?page=2&limit=10"),
+            "https://h/x?page=2&limit=10"
+        );
+        assert_eq!(redact_secrets("no urls here"), "no urls here");
+    }
+
     use super::*;
 
     // ── URL-safety matrix: the recurring credential-leak class, at the infra
