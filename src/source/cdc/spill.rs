@@ -1580,6 +1580,24 @@ mod spill_cost {
     use super::*;
     use serde_json::json;
 
+    /// Measurements must be ASKED for, not swept up. CI's offline job runs
+    /// `cargo test -- --ignored`, which selects every `#[ignore]`d test at default
+    /// parallelism — and `ru_maxrss` is a process-wide monotonic peak, so these
+    /// arms racing each other (or any sibling) corrupt every delta and the budget
+    /// assertion grades noise. Measured: 1497 B/event reported where a clean
+    /// sequential run reports 772. The env var is the same opt-in shape as the
+    /// fixture regenerator: a run that did not ask must not produce a verdict.
+    fn measuring() -> bool {
+        if std::env::var("RIVET_MEASURE").is_ok() {
+            return true;
+        }
+        eprintln!(
+            "SKIP: set RIVET_MEASURE=1 and run with --test-threads=1 — this is a \
+             measurement, and swept up in a parallel --ignored pass it grades noise"
+        );
+        false
+    }
+
     /// A row shaped like a real captured one: a key, some text, a timestamp, a
     /// decimal carried as bytes, a flag, and a wide column. A one-integer fixture
     /// would report a bytes-per-row that no real table produces.
@@ -1620,6 +1638,9 @@ mod spill_cost {
     #[test]
     #[ignore = "measurement: run with --release --nocapture"]
     fn how_much_disk_does_a_spilled_row_take() {
+        if !measuring() {
+            return;
+        }
         const N: u64 = 100_000;
         let d = tempfile::tempdir().expect("dir");
         let mut f = SpillFile::create(d.path(), "cost").expect("create");
@@ -1646,6 +1667,9 @@ mod spill_cost {
     #[test]
     #[ignore = "measurement: run with --release --nocapture"]
     fn how_fast_is_a_spilled_transaction_written_and_parsed() {
+        if !measuring() {
+            return;
+        }
         const N: u64 = 100_000;
         let d = tempfile::tempdir().expect("dir");
         let events: Vec<ChangeEvent> = (0..N).map(realistic).collect();
@@ -1688,6 +1712,9 @@ mod spill_cost {
     #[test]
     #[ignore = "measurement: run with --release --nocapture"]
     fn how_much_does_a_raw_wire_row_cost() {
+        if !measuring() {
+            return;
+        }
         const N: u64 = 100_000;
         let d = tempfile::tempdir().expect("dir");
         let line = |i: u64| {
@@ -1743,6 +1770,24 @@ mod event_cost {
     use super::*;
     use serde_json::json;
 
+    /// Measurements must be ASKED for, not swept up. CI's offline job runs
+    /// `cargo test -- --ignored`, which selects every `#[ignore]`d test at default
+    /// parallelism — and `ru_maxrss` is a process-wide monotonic peak, so these
+    /// arms racing each other (or any sibling) corrupt every delta and the budget
+    /// assertion grades noise. Measured: 1497 B/event reported where a clean
+    /// sequential run reports 772. The env var is the same opt-in shape as the
+    /// fixture regenerator: a run that did not ask must not produce a verdict.
+    fn measuring() -> bool {
+        if std::env::var("RIVET_MEASURE").is_ok() {
+            return true;
+        }
+        eprintln!(
+            "SKIP: set RIVET_MEASURE=1 and run with --test-threads=1 — this is a \
+             measurement, and swept up in a parallel --ignored pass it grades noise"
+        );
+        false
+    }
+
     #[cfg(target_os = "macos")]
     fn rss_bytes() -> u64 {
         // `ru_maxrss` is BYTES on macOS, KILOBYTES on Linux — one field, two
@@ -1790,6 +1835,9 @@ mod event_cost {
     #[test]
     #[ignore = "measurement: run with --release --nocapture"]
     fn what_does_one_buffered_change_actually_cost() {
+        if !measuring() {
+            return;
+        }
         const N: u64 = 1_000_000;
         let names: std::sync::Arc<[String]> =
             std::sync::Arc::from(["id", "v", "pad"].map(String::from).to_vec());
