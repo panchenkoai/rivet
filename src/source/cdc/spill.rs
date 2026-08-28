@@ -244,10 +244,20 @@ impl SpillFile {
     #[cfg(test)]
     pub(crate) fn drain(self) -> Result<Vec<Vec<u8>>> {
         let mut r = self.into_reader()?;
-        let mut out = Vec::new();
-        while let Some(rec) = r.next_record() {
-            out.push(rec?);
+        // Exactly `len()` pulls, then assert DONE — never `while let Some(..)`.
+        // The unbounded loop turned a "reader always answers Some" mutant into an
+        // infinite hang: twelve mutants survived as TIMEOUTs, a CI stall where an
+        // assertion should be. The count is the writer's own, so a reader that
+        // disagrees with it in either direction fails here, loudly.
+        let mut out = Vec::with_capacity(r.len());
+        for _ in 0..r.len() {
+            out.push(r.next_record().expect("len() promises this record")?);
         }
+        assert!(
+            r.next_record().is_none(),
+            "the reader must be DONE after len() records — more means the count \
+             and the file disagree"
+        );
         Ok(out)
     }
 }
@@ -1470,6 +1480,11 @@ mod frame_tests {
         assert_eq!(sp.remaining(), N, "all rows still on disk before the drain");
         let mut flags = Vec::new();
         while let Some(e) = sp.next_event(decode_event).expect("decode") {
+            assert!(
+                flags.len() < N,
+                "the tail answered a {}th event though it holds {N}",
+                flags.len() + 1
+            );
             assert_eq!(
                 sp.remaining(),
                 N - flags.len() - 1,
@@ -1529,6 +1544,12 @@ mod frame_tests {
 
         let mut got = Vec::new();
         while let Some(e) = sp.next_event(decode_event).expect("decode") {
+            assert!(
+                got.len() < lsns.len(),
+                "the tail answered a {}th event though it holds {}",
+                got.len() + 1,
+                lsns.len()
+            );
             got.push((
                 e.position.0["lsn"].as_str().expect("lsn").to_string(),
                 e.committed,
