@@ -534,3 +534,15 @@ shapes:
         ({dotted, sibling} vs {dotted}), and with finalize's engine-blind split
         restored the snapshot leg's manifest records {schema: <db>, table: orders} —
         a different, existing collection. The database is not a schema."
+
+  - id: spill_crash_mid_tail_atomicity
+    what: "with RIVET_CDC_SPILL_DIR set, a transaction past the memory cap keeps its head in memory and its tail on disk — and a CRASH while that tail is being handed out must lose nothing on resume. The framing decides this: only the tail's true last row (per transaction) may carry `committed`, or the sink rolls + checkpoints past a commit whose remaining rows die with the crashed process's spill file"
+    mutant: "spill.rs::closes_group -> true (every spilled row closes its group): the sink rolls mid-group, the checkpoint advances past the group's commit, and the resume skips the rows still in the dead process's spill"
+    postgres:
+      na: "the crash window cannot OPEN here: PostgreSQL spills exactly one transaction, whose only `committed` row is the tail's very end (`close_head_of_group` marks nothing while `tail_len > 0`, `close_tail_event` only `at+1 == len`) — so `should_roll` first fires when the tail is fully drained and the sink cannot act mid-tail. The framing itself is graded offline (`a_split_transaction_closes_on_its_true_last_row`, spill.rs) and the delivery end-to-end by pg_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing (live_cdc.rs)."
+    mysql:
+      na: "same structural closure as postgres — one transaction per spill, its single commit at the tail's end, so no sink action is possible mid-tail. The seal-failure ordering (`spill_error` checked before `pending` is popped) keeps a half-transaction from shipping when sealing itself fails; delivery end-to-end by mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing (live_cdc.rs)."
+    mssql:
+      sound: "roast_mssql_cdc_a_crash_mid_spilled_tail_loses_no_group_on_resume (live_cdc_mssql.rs) — the ONE engine where the window exists: its tail holds SEVERAL `__$start_lsn` groups, each group's last row a real commit, so the sink can roll + checkpoint + ack between spilled groups and crash before the rest. PER_TX=7 over rollover 5, because at 5 every roll lands on a group boundary and the early-close mutant 'commits' only where the checkpoint is accidentally legal (measured: two mutants green at PER_TX=5). RED: 19 of 21 rows, the checkpoint past a commit whose last two rows died with the process."
+    mongo:
+      na: "no transaction buffer exists to spill: every change-stream event is its own commit (`single_event_commit`), the sink may roll after any event, and the soak stand asserts the no-spill property as its CONTROL (`assert_cycle_spilled`, soak_spill.rs) — if Mongo ever grows a buffer, that assertion says the control stopped being one."
