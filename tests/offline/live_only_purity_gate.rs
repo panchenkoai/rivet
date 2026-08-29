@@ -110,7 +110,10 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
         1,
         1,
     ),
-    ("src/pipeline/single.rs::run_with_reconnect", 0, 0, 0, 1),
+    // `run_with_reconnect`'s row is GONE: its whole-function exclusion was lifted
+    // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
+    // inline decisions are graded per-diff by cargo-mutants now — a stronger
+    // contract than this ceiling, which existed because they could not be.
     // run_pool is the bounded work-stealing executor. Its two headline
     // decisions (next_eligible, advise_split) are ALREADY extracted and
     // unit-tested — mutants.toml says so — and what remains is the HeavyGuard
@@ -127,10 +130,17 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
         3,
     ),
     // ── the orchestration scripts ────────────────────────────────────────
-    // execute_resolved_plan is where the six hand-extractions came FROM, so its
-    // row is the direct measure of how much of that pass is left.
-    ("src/pipeline/job.rs::execute_resolved_plan", 2, 0, 0, 1),
-    ("src/pipeline/plan_cmd.rs::run_plan_command", 1, 0, 3, 1),
+    // execute_resolved_plan's row is GONE because its whole-function exclusion
+    // was LIFTED (2026-08-29): a critic measured 66% of that body executing
+    // under the offline battery, so "no offline test reaches it" was false and
+    // the exclusion was hiding gradable mutants. Its remaining decisions are
+    // now graded directly by cargo-mutants instead of being held to a
+    // glue-only ceiling here — the stronger of the two contracts. The six
+    // hand-extractions it produced keep their own unit tests.
+    // `run_plan_command`'s row is GONE: its whole-function exclusion was lifted
+    // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
+    // inline decisions are graded per-diff by cargo-mutants now — a stronger
+    // contract than this ceiling, which existed because they could not be.
     // The `rivet load` orchestrator (src/load/orchestrate.rs). Six bodies are
     // excluded there and FIVE are listed nowhere here, because they are clean:
     // every decision the in-diff gate reported alive in them was extracted into
@@ -148,9 +158,13 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // uncaught. The comparison they guard IS extracted and unit-tested
     // (conflicting_source_ident). Widening the scanner to skip let-chains would
     // be a loosening; a row that says why is the reviewed alternative.
-    ("src/load/orchestrate.rs::prepare_load", 2, 0, 0, 0),
+    // prepare_load's row is suspended while its exclusion is under measurement
+    // (2026-08-29); restored together with the exclusion if the stub survives.
     // ── source/introspection glue ────────────────────────────────────────
-    ("src/init/mod.rs::introspect_all", 2, 0, 3, 1),
+    // `introspect_all`'s row is GONE: its whole-function exclusion was lifted
+    // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
+    // inline decisions are graded per-diff by cargo-mutants now — a stronger
+    // contract than this ceiling, which existed because they could not be.
     ("src/init/mysql.rs::density_probe", 1, 0, 1, 2),
     ("src/init/postgres.rs::density_probe", 0, 0, 1, 0),
     ("src/source/postgres/mod.rs::pg_run_export", 2, 0, 2, 4),

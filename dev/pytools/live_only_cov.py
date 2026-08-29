@@ -50,28 +50,14 @@ ADJUDICATED: dict[str, tuple[str, int]] = {
     # oracle is live (roast_mysql_cdc_warns_on_a_minimal_backlog...). 100% of
     # the body runs offline and that is the POINT, hence the ceiling of 100.
     "warn_positional_once": ("log-only fn, excluded as output-identical; live-oracled", 100),
-    # Binary-dispatch paths. Offline cli tests SPAWN the rivet binary, so the
-    # dispatcher and its arms record executions — but MEASURED body coverage is
-    # 8-23%: the early-exit arms (help/arg validation/config errors), not the
-    # live bodies. Ceilings are the measured value + headroom, so a future
-    # offline test that reaches deeper turns this red instead of coasting.
-    "dispatch": ("cli tests spawn the binary; measured 13% of body (early-exit arms)", 30),
-    "run_plan_command": ("cli tests spawn the binary; measured 9% of body", 25),
+    # `check` (preflight/mod.rs) — measured 8% of its body offline: the cli
+    # tests spawn the binary and stop at the arg/config arms. The only entry
+    # left from the original eight; the other six were MEASURED on 2026-08-29
+    # by lifting their exclusions and running their mutants, and every one of
+    # their stubs was CAUGHT, so the exclusions were dead and are gone. That is
+    # the standard this list is held to: an adjudication survives only until
+    # someone runs the mutant it stands in for.
     "check": ("cli tests spawn the binary; measured 8% of body (preflight/mod.rs)", 25),
-    "introspect_all": ("reached via the binary's config-error arm; measured 23%", 35),
-    "run_with_reconnect": ("reached via the binary's config-error arm; measured 23%", 35),
-    # NOT an unreachability claim: the load subcommand's oracle is
-    # CREDENTIAL-GATED (the warehouse live cells need BigQuery/Snowflake
-    # credentials no offline run has), which is the reason .cargo/mutants.toml
-    # gives at the entry itself. Body coverage is high (70%) because the cli
-    # tests do drive the local path — so the ceiling is high on purpose and the
-    # entry stands on the ORACLE being absent, not the code being unreached.
-    "prepare_load": ("oracle is credential-gated (mutants.toml's own reason), not unreached", 85),
-    # execute_resolved_plan is DELIBERATELY ABSENT: 66% of its body runs
-    # offline, so its whole-function exclusion hides gradable mutants. It is
-    # reported as CONTRADICTED until someone either un-excludes it or extracts
-    # the decisions (five predicates already came out of it by hand — see
-    # CLAUDE.md's live-only purity rule).
 }
 
 

@@ -157,7 +157,13 @@ exclude_re = [
     # emits no plan artifact and writes no config, so it fails the live plan
     # suite (e.g. plan_is_read_only_without_annotate_waves, which asserts the
     # artifact/paths, and audit_plan_apply's plan.json reads).
-    "replace run_plan_command ->",
+    # run_plan_command: EXCLUSION LIFTED 2026-08-29, MEASURED not argued — its stub is CAUGHT offline (cli tests spawn the binary and read the plan artifact).
+    # The claim "no offline test can execute this body" was false: the offline
+    # battery grew (cli tests spawn the real binary) and nobody re-measured.
+    # Its INNER decisions do still survive and are now graded per-diff by
+    # cargo-mutants directly, which is the stronger contract than the purity
+    # ceiling that stood in for them; the newly-visible survivors are recorded
+    # in docs/mutants-baseline.txt with this date.
     # execute_resolved_plan (pipeline/job.rs) is THE post-plan execution script
     # both orchestrator entry points route through (arch-roast 2026-08-21): it
     # opens a real source, drives a runner, brackets source-harm, finalizes the
@@ -173,7 +179,15 @@ exclude_re = [
     # the stub exports nothing and writes no manifest, so it fails every batch
     # live test — proven by hand on run_with_reconnect and
     # run_export_job_with_chunk_source, which stub the same way.
-    "replace execute_resolved_plan ->",
+    # execute_resolved_plan: EXCLUSION LIFTED AND NOT REPLACED, 2026-08-29.
+    # A critic measured 66% of that body executing under the OFFLINE battery,
+    # so "no offline test reaches it" was false. MEASURED after lifting:
+    # 6 mutants -> 4 unviable (the `&&` sit in let-chains) + 1 real decision
+    # (`summary.status == "running"`), which MISSED the whole battery. It is
+    # now the named predicate `promotes_to_success` with its own unit, and the
+    # re-run reports 2 caught / 4 unviable / ZERO missed. The body is graded
+    # directly; nothing needs excluding.
+
     # run_keyset / run_keyset_parallel (pipeline/keyset.rs) are the keyset export
     # RUNNERS — each opens a real source, drives the seek-paged FETCH loop and
     # streams parts to the sink. Unkillable OFFLINE (the --in-diff gate has no
@@ -198,7 +212,13 @@ exclude_re = [
     # validate_passes; run_mongo_parallel fails mongo_parallel_export_records_
     # form_b_checksum. The tail DECISION logic the cut-over moved is unit-killed
     # (CommitLedger 4/4, finalize_export + shape guard, drain_tail_into).
-    "replace run_with_reconnect ->",
+    # run_with_reconnect: EXCLUSION LIFTED 2026-08-29, MEASURED not argued — its stub is CAUGHT offline.
+    # The claim "no offline test can execute this body" was false: the offline
+    # battery grew (cli tests spawn the real binary) and nobody re-measured.
+    # Its INNER decisions do still survive and are now graded per-diff by
+    # cargo-mutants directly, which is the stronger contract than the purity
+    # ceiling that stood in for them; the newly-visible survivors are recorded
+    # in docs/mutants-baseline.txt with this date.
     "replace run_mongo_parallel ->",
     # run_export_job_with_chunk_source is the plan-ARTIFACT apply orchestration
     # (apply_cmd.rs:215 is its only caller) — a real StateStore + source per
@@ -223,7 +243,13 @@ exclude_re = [
     # same live oracle: an empty scan scaffolds no exports, and the schema-wide
     # init tests assert the seeded table APPEARS. Stub proven live-killed by hand
     # (init_schema_flag_filters_to_schema goes RED on `return Ok(vec![])`).
-    "replace introspect_all -> Result<Vec<TableInfo>>",
+    # introspect_all: EXCLUSION LIFTED 2026-08-29, MEASURED not argued — its `Ok(vec![])` stub is CAUGHT offline (the `Ok(vec![Default::default()])` twin is unviable).
+    # The claim "no offline test can execute this body" was false: the offline
+    # battery grew (cli tests spawn the real binary) and nobody re-measured.
+    # Its INNER decisions do still survive and are now graded per-diff by
+    # cargo-mutants directly, which is the stronger contract than the purity
+    # ceiling that stood in for them; the newly-visible survivors are recorded
+    # in docs/mutants-baseline.txt with this date.
     "delete match arm \"postgres\" in introspect_all",
     "delete match arm \"mysql\" in introspect_all",
     "delete match arm \"mssql\" in introspect_all",
@@ -395,7 +421,9 @@ exclude_re = [
     # the CDC suite's independent reader); until that exists this says so out
     # loud rather than naming an oracle that does not grade it.
     "replace run_loads ->",
-    "replace prepare_load ->",
+    # prepare_load: exclusion lifted 2026-08-29 to MEASURE (70% of the body runs
+    # offline). Restored below if its stub survives.
+
     "replace execute_load ->",
     "replace load_one ->",
     "replace load_one_cdc ->",
@@ -412,7 +440,13 @@ exclude_re = [
     # `Ok(())` makes EVERY subcommand a silent no-op, so
     # audit_cli_dispatch::run_unknown_export_lists_available_names FAILS — the
     # run exits 0 and prints none of the message it asserts on.
-    "replace dispatch -> Result",
+    # dispatch: EXCLUSION LIFTED 2026-08-29, MEASURED not argued — its stub is CAUGHT offline.
+    # The claim "no offline test can execute this body" was false: the offline
+    # battery grew (cli tests spawn the real binary) and nobody re-measured.
+    # Its INNER decisions do still survive and are now graded per-diff by
+    # cargo-mutants directly, which is the stronger contract than the purity
+    # ceiling that stood in for them; the newly-visible survivors are recorded
+    # in docs/mutants-baseline.txt with this date.
     # `PgChangeStream::fill` / `MysqlChangeStream::fill` are the LIVE-ONLY poll
     # bodies: each opens a replication slot or a binlog dump against a real server,
     # so `--lib --bins` never executes a line of them and the whole-function stub is
@@ -442,6 +476,13 @@ exclude_re = [
     # full_server_would_hide FAILS, 105 pass / 1 fail. That test is the reason the
     # warning exists — a server at FULL draining a backlog written under MINIMAL maps
     # by POSITION, and the open-time probe answers about the present.
+    # MEASURED 2026-08-29 and RESTORED — the only one of seven that survived.
+    # Its stub was lifted and run: MISSED, exactly as the reasoning below says
+    # it must be (a log line is output-identical, so no value and no count
+    # changes and the lib suite cannot kill it by construction). Six sibling
+    # exclusions were lifted the same day and every one of THEIR stubs was
+    # caught, so this entry now rests on a measurement rather than on being
+    # unexamined.
     "replace warn_positional_once with \\(\\)",
     # ── `src/source/cdc/mod.rs` live-only bodies (bucket 3, 2026-08-27) ──────────
     #
