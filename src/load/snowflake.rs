@@ -239,6 +239,11 @@ impl TargetLoader for SnowflakeLoader {
                 .map(|n| n > 0)
                 .context("re-baseline probe ran but PROBE_ was not in snow's output"),
             // A missing __changes table is the FIRST cycle, not an error.
+            // Snowflake merges "does not exist" with "not authorized" in ONE
+            // message, so a SELECT-denied role reads first-cycle here — the
+            // residual is SELF-LIMITING (round-9): append_changelog's own
+            // BEFORE_/AFTER_ COUNT gates need SELECT, so that role fails the
+            // load loudly one statement later, never a silent doomed append.
             Err(e) if format!("{e:#}").contains("does not exist") => Ok(false),
             Err(e) => Err(e),
         }

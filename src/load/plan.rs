@@ -473,12 +473,12 @@ fn build_plans(
         // so refuse anything else loudly at plan time.
         if dest.destination_type != crate::config::DestinationType::Gcs {
             anyhow::bail!(
-                "export `{}` has `load:` but its destination is `type: {:?}` — the load \
+                "export `{}` has `load:` but its destination is `type: {}` — the load \
                  layer reads GCS only (Snowflake via storage integration, BigQuery via \
                  LOAD DATA). Stage the export to a gcs destination, or drop the load \
                  block.",
                 export.name,
-                dest.destination_type
+                dest.destination_type.label()
             );
         }
         let bucket = dest.bucket.as_deref().with_context(|| {
@@ -845,7 +845,7 @@ load:
             .expect_err("s3 + load: must refuse at plan time")
             .to_string();
         assert!(
-            err.contains("S3") && err.contains("load"),
+            err.contains("type: s3") && err.contains("load"),
             "must name the mismatch and the block: {err}"
         );
     }

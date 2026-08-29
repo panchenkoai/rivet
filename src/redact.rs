@@ -165,7 +165,18 @@ pub fn redact_secrets(s: &str) -> String {
 /// recognizable shape (handled at the notify site via `without_url`); query
 /// keys DO, so they are scrubbed here for every error path.
 fn redact_query_secrets(s: &str) -> String {
-    const KEYS: [&str; 7] = ["token", "password", "api_key", "secret", "sig", "sas", "sv"];
+    const KEYS: [&str; 10] = [
+        "token",
+        "access_token",
+        "password",
+        "api_key",
+        "secret",
+        "sig",
+        "sas",
+        "sv",
+        "x-amz-signature",
+        "x-amz-security-token",
+    ];
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     'outer: while let Some(q) = rest.find(['?', '&']) {

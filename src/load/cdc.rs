@@ -207,7 +207,8 @@ pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
 /// for exactly the PKs the re-snapshot exists to fix (two snapshots for one PK
 /// even tie nondeterministically). The recovery bail and cdc-failure-modes.md
 /// therefore prescribe truncating `__changes` before the post-recovery load,
-/// and `run_load_cdc` warns when it detects the shape. The structural fix —
+/// and the CDC load driver REFUSES when it detects the shape on a ledgered
+/// load (rebaseline_action in orchestrate.rs; stateless degrades to a note). The structural fix —
 /// the snapshot leg stamping its anchor position instead of NULL — is tracked.
 ///
 /// The subquery + `__rn` structure (rather than a `QUALIFY`) is deliberate: the

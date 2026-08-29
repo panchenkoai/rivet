@@ -390,15 +390,20 @@ fn is_decimal_type(data_type: &str) -> bool {
 /// so the generated SQL addresses the catalog-exact relation — never its
 /// lowercase fold (round-7: `FROM CaseTwin` read `casetwin`'s rows with every
 /// check green). Embedded quote characters are doubled per each dialect.
-fn quote_relation(qualified: &str, source_type: &str) -> String {
-    let quote = |part: &str| match source_type {
+/// Quote ONE identifier with the engine's quotes (the single-part twin of
+/// [`quote_relation`] — columns never carry a qualifying dot).
+fn quote_ident(part: &str, source_type: &str) -> String {
+    match source_type {
         "mysql" => format!("`{}`", part.replace('`', "``")),
         "mssql" => format!("[{}]", part.replace(']', "]]")),
         _ => format!("\"{}\"", part.replace('"', "\"\"")),
-    };
+    }
+}
+
+fn quote_relation(qualified: &str, source_type: &str) -> String {
     qualified
         .split('.')
-        .map(quote)
+        .map(|p| quote_ident(p, source_type))
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -460,7 +465,16 @@ fn export_block_lines(
 ) -> Vec<String> {
     let mode = mode_override.unwrap_or_else(|| info.suggest_mode());
     let columns: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
-    let col_list = columns.join(", ");
+    // Columns QUOTED per engine, same rule as the relation (round-9,
+    // live-proven): a table with the twin columns `Val` and `val` had its
+    // unquoted `SELECT id, Val` silently resolve to the OTHER column `val` —
+    // wrong data, every check green. The earlier justification ("a camel-case
+    // column fails loudly as unknown") is false exactly in the twin shape.
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(c, source_type))
+        .collect::<Vec<_>>()
+        .join(", ");
     let qualified_table =
         if info.schema == "public" || source_type == "mysql" || source_type == "mongo" {
             // Mongo: `info.schema` is the database and the export targets the bare
@@ -523,12 +537,10 @@ fn export_block_lines(
         // column list to spell out. Always emit `table:` for a Mongo source.
         lines.push(format!("    table: {qualified_table}"));
     } else {
-        // QUOTED relation (round-7): the catalog name is case-exact and may
-        // carry any character; interpolating it raw either case-folds to a
-        // DIFFERENT table (silent wrong rows) or dies on the first reserved
-        // word. Column list stays as the catalog gave it — quoting each column
-        // too would be noise for the common case; a camel-case COLUMN still
-        // folds, which the operator sees loudly at check (unknown column).
+        // QUOTED relation (round-7) AND quoted columns (round-9): the catalog
+        // names are case-exact; interpolating either raw case-folds to a
+        // DIFFERENT relation/column when a lowercase twin exists — silent
+        // wrong rows with every check green (both live-proven on the stand).
         lines.push("    query: >".to_string());
         lines.push(format!("      SELECT {col_list}"));
         lines.push(format!(

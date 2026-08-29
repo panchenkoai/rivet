@@ -1007,7 +1007,7 @@ fn load_one_cdc(
         },
         |loader, store, inputs| {
             // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
-            // into a __changes prior cycles already fed (see rebaseline_warning).
+            // into a __changes prior cycles already fed (see rebaseline_shape/rebaseline_action).
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             if shape {
                 let prior = loader.changes_has_prior_changes(&plan.table)?;
