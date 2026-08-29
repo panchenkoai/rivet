@@ -234,6 +234,13 @@ infra:
       The standby half: verify_cdc_standby probes :5436 ITSELF (the live test self-skips as
       PASSED when the port is down — the vacuous-skip class) and drives
       roast_pg_cdc_bounded_on_a_standby_fails_loud when the `cdc-standby` profile is up"
+  - id: live_only_coverage
+    status: test
+    note: "verify_live_only_coverage runs the offline battery under cargo-llvm-cov and
+      dev/pytools/live_only_cov.py classifies every mutants.toml whole-function exclusion:
+      confirmed zero-coverage / adjudicated (reason pinned in the tool; deleting an entry
+      turns the leg red) / CONTRADICTED (fails the gate). Measured 2026-08-29:
+      17 confirmed, 8 adjudicated, 1 no-symbol, 0 contradicted. SKIPs without cargo-llvm-cov."
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"

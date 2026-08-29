@@ -341,6 +341,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_tls_required(led)
     scenarios.verify_auth(led)
     scenarios.verify_cdc_standby(led)
+    scenarios.verify_live_only_coverage(led)
     scenarios.verify_inflight_run_stays_loadable(led)
     scenarios.verify_coverage_matrices(led)
     # Cheap and container-free: the flag surface is read from `rivet --help`,

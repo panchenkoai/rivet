@@ -3171,6 +3171,48 @@ mod run_tail_tests {
     };
     use crate::config::ExportConfig;
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        /// TOTALITY over any composition: the fold errs IFF the batch holds a
+        /// failure, and when a DataIntegrityError is anywhere in the mix the
+        /// representative marker survives the context chain (exit 3, never 1)
+        /// no matter where it sits or how much noise surrounds it. The unit
+        /// below pins three hand shapes; this walks the composition space —
+        /// the survived whole-body stub Ok(()) dies on the first clause, a
+        /// pick-the-first representative dies on the second.
+        #[test]
+        fn fold_failures_errs_iff_nonempty_and_integrity_marker_survives_anywhere(
+            plain in 0usize..4,
+            integrity_at in proptest::option::of(0usize..4),
+        ) {
+            let mut failures: Vec<anyhow::Error> =
+                (0..plain).map(|i| anyhow::anyhow!("plain failure {i}")).collect();
+            if let Some(at) = integrity_at {
+                let at = at.min(failures.len());
+                failures.insert(
+                    at,
+                    anyhow::Error::new(crate::error::DataIntegrityError::new(
+                        "checksum mismatch",
+                    )),
+                );
+            }
+            let n = failures.len();
+            let out = fold_failures(failures, "prop batch");
+            proptest::prop_assert_eq!(out.is_err(), n > 0, "err IFF non-empty (n={})", n);
+            if integrity_at.is_some() {
+                let err = out.unwrap_err();
+                proptest::prop_assert!(
+                    err.chain().any(|c| c.downcast_ref::<crate::error::DataIntegrityError>().is_some()),
+                    "the DataIntegrityError marker must survive the fold's context \
+                     chain wherever it sat: {err:#}"
+                );
+            }
+        }
+    }
+
     /// `fold_failures` is the shared representative-failure fold the three
     /// orchestrator tails route through (arch-roast 2026-08-21). Its whole-body
     /// stub `Ok(())` survived the in-diff mutation gate — a run that FAILED

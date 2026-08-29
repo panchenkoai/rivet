@@ -982,6 +982,45 @@ mod tests {
         (0..h.len()).map(|i| h.value(i)).collect()
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        /// INJECTIVITY over a hostile alphabet: rows differ ⇒ hashes differ,
+        /// rows equal ⇒ hashes equal. The alphabet is deliberately tiny and
+        /// stacked with the historical forgery material — the v1 separator
+        /// `\x1f`, the v1 null-marker `\x00`, the container-render chars
+        /// (`,`, `[`, `]`, `"`) and empty strings — so 256 cases hit boundary
+        /// shifts and absence-imitation constantly, where a uniform generator
+        /// would almost never compose them. An xxh3 collision on distinct
+        /// canonical bytes is astronomically unlikely, so a failure here means
+        /// the FRAMING collapsed two different rows (the render-id v1 family).
+        #[test]
+        fn row_hash_is_injective_over_hostile_two_column_rows(
+            a0 in proptest::option::of("[a\x1f\x00,b\"\\[\\]]{0,3}"),
+            b0 in proptest::option::of("[a\x1f\x00,b\"\\[\\]]{0,3}"),
+            a1 in proptest::option::of("[a\x1f\x00,b\"\\[\\]]{0,3}"),
+            b1 in proptest::option::of("[a\x1f\x00,b\"\\[\\]]{0,3}"),
+        ) {
+            let rows_equal = a0 == a1 && b0 == b1;
+            let h = two_column_hashes(
+                vec![a0.as_deref(), a1.as_deref()],
+                vec![b0.as_deref(), b1.as_deref()],
+            );
+            if rows_equal {
+                proptest::prop_assert_eq!(h[0], h[1], "equal rows must hash equal");
+            } else {
+                proptest::prop_assert_ne!(
+                    h[0], h[1],
+                    "DIFFERENT rows hashed equal — the framing let a value forge \
+                     a boundary or imitate absence: ({:?},{:?}) vs ({:?},{:?})",
+                    a0, b0, a1, b1
+                );
+            }
+        }
+    }
+
     /// A value must not be able to forge a field boundary.
     ///
     /// RED against the `\x1f`-separator framing (render id v1), which built

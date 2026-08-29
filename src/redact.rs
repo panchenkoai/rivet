@@ -248,6 +248,65 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
 
 #[cfg(test)]
 mod tests {
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        /// The shipped contract, both directions. POSITIVE: a key that IS a
+        /// family word, `sas`, or a compound joined by `_`/`-` (access_token,
+        /// X-Amz-Signature) is redacted — the secret never survives, non-secret
+        /// pairs do, and a second pass changes nothing (idempotence: a matcher
+        /// re-triggering on its own `***` would corrupt). NEGATIVE: a GLUED
+        /// prefix (`atoken`) is deliberately NOT matched — round-10 chose the
+        /// separator boundary to keep diagnostics like Azure's `sv` readable,
+        /// and this pins that choice so a future "fix" widening the match is a
+        /// conscious contract change, not a drive-by.
+        #[test]
+        fn suffix_family_contract_redacts_compounds_and_spares_glued_keys(
+            family in proptest::sample::select(vec![
+                "token", "password", "apikey", "api_key", "api-key",
+                "secret", "signature", "sig",
+            ]),
+            prefix in "[a-z]{1,8}",
+            sep in proptest::sample::select(vec!["_", "-"]),
+            exact in proptest::prelude::any::<bool>(),
+            use_sas in proptest::prelude::any::<bool>(),
+            secret in "[A-Za-z0-9]{8,24}",
+            tail_sep in proptest::sample::select(vec!["&", ";", "'", "\""]),
+        ) {
+            // POSITIVE: exact family word, exact `sas`, or a separator-joined
+            // compound. All must redact.
+            let key = if exact {
+                if use_sas { "sas".to_string() } else { family.to_string() }
+            } else {
+                format!("{prefix}{sep}{family}")
+            };
+            let text = format!("postgresql://u@h/db?keep=1&{key}={secret}{tail_sep}tail=x");
+            let once = redact_query_secrets(&text);
+            proptest::prop_assert!(
+                !once.contains(&secret),
+                "secret `{}` survived redaction of `{}` -> `{}`", secret, text, once
+            );
+            proptest::prop_assert!(
+                once.contains("keep=1") && once.contains("tail=x"),
+                "non-secret pairs must survive: `{}` -> `{}`", text, once
+            );
+            let twice = redact_query_secrets(&once);
+            proptest::prop_assert_eq!(&once, &twice, "redaction must be idempotent");
+
+            // NEGATIVE: the same family GLUED to the prefix (no separator) is
+            // not a match — the documented FP-avoidance boundary.
+            let glued = format!("postgresql://u@h/db?{prefix}{family}={secret}");
+            proptest::prop_assert_eq!(
+                redact_query_secrets(&glued),
+                glued.clone(),
+                "a glued key must pass through untouched (the separator boundary \
+                 is the contract)"
+            );
+        }
+    }
     /// Round-8: query-param secrets are scrubbed (the Slack-path find made
     /// this boundary load-bearing). Values after token/password/api_key/
     /// secret/sig/sas/sv become ***; foreign keys and non-URLs untouched.

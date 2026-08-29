@@ -78,6 +78,7 @@ __all__ = [
     "verify_tls_required",
     "verify_auth",
     "verify_cdc_standby",
+    "verify_live_only_coverage",
 ]
 
 # The helper scripts and blessed goldens are DATA, shared with the bash gate: the
@@ -1346,6 +1347,57 @@ def verify_cdc_standby(led: Ledger) -> None:
         "cdc_standby.log",
         "CDC standby loud-fail",
     )
+
+
+
+def verify_live_only_coverage(led: Ledger) -> None:
+    """The live-only claim, MEASURED. mutants.toml's whole-function exclusions
+    assert "no offline test reaches this body"; this leg runs the offline
+    battery under cargo-llvm-cov and has dev/pytools/live_only_cov.py classify
+    every exclusion: confirmed (zero coverage), adjudicated (executed offline
+    with the reason pinned in the tool), or CONTRADICTED (executed, no reason
+    — the exclusion hides gradable mutants). Fails on any contradiction.
+    SKIP when cargo-llvm-cov is absent — never a vacuous pass."""
+    if not have("cargo"):
+        _skipped(led, "infra", "live-only", "coverage", "-", "live-only-cov: cargo absent", "no cargo")
+        return
+    probe = run(["cargo", "llvm-cov", "--version"], timeout=60)
+    if not probe.ok:
+        _skipped(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only-cov: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)",
+            "no llvm-cov",
+        )
+        return
+    led.phase("Live-only coverage (mutants.toml exclusions vs measured offline coverage)")
+    lcov = work_dir() / "offline.lcov"
+    build = run(
+        ["cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
+        timeout=NO_TIMEOUT,
+    )
+    (work_dir() / "live_only_cov.log").write_text(build.out)
+    if not build.ok:
+        _failed(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only-cov: the instrumented offline battery FAILED (see live_only_cov.log)",
+            _first_match(build.out, r"FAILED|error"),
+        )
+        return
+    verdict = run(
+        [sys.executable, str(ROOT / "dev/pytools/live_only_cov.py"), str(lcov)],
+        timeout=600,
+    )
+    if verdict.ok:
+        _passed(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only exclusions hold: " + verdict.out.strip().splitlines()[1].strip(),
+        )
+    else:
+        _failed(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only exclusion CONTRADICTED by measured offline coverage:\n" + verdict.out,
+            _first_match(verdict.out, r"CONTRADICTED"),
+        )
 
 
 # ── coverage-ledger drift-guards PREFLIGHT (offline, runs ONCE) ──────────────
