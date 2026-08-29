@@ -676,7 +676,16 @@ pub enum CdcEngine {
 ///
 /// A part listed with a non-`committed` status is skipped — in-flight is not
 /// delivered.
-pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
+/// WHICH manifests count under `dir`: the immutable run-unique copies, and the
+/// canonical `manifest.json` ONLY when no copy exists.
+///
+/// ONE definition, called by everything that needs it. The 2026-08-29 audit
+/// found this rule written out FIVE separate times (two Rust, two python, one
+/// in the differential harness) and fixed four of them for a Success filter
+/// before a critic found the fifth. A sixth copy — in SQL, for the census
+/// below — is exactly the shape that keeps costing; so the census takes the
+/// file list from here instead of re-deriving it.
+pub fn declared_manifests(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut copies: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
@@ -692,6 +701,11 @@ pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
     if copies.is_empty() && dir.join("manifest.json").is_file() {
         copies.push(dir.join("manifest.json"));
     }
+    copies
+}
+
+pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
+    let copies = declared_manifests(dir);
     let mut declared = Vec::new();
     for m in &copies {
         let Ok(text) = std::fs::read_to_string(m) else {

@@ -74,6 +74,8 @@ pub struct Rig {
     /// `destination: { type: stdout }` — for dispatch tests whose subject is
     /// the stdout destination itself. See [`Rig::dest_stdout`].
     dest_stdout: bool,
+    /// Key column for the census DISTINCT legs (see `Rig::census_key`).
+    census_key: Option<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
     /// sanctioned mutation re-renders every one of them (materialize.rs).
     materialized_copies: std::cell::RefCell<Vec<PathBuf>>,
@@ -129,6 +131,7 @@ impl Rig {
             config_dir_override: None,
             ckpt_override: None,
             dest_stdout: false,
+            census_key: None,
             cloud_dest: None,
             materialized_copies: std::cell::RefCell::new(Vec::new()),
             past_renders: std::cell::RefCell::new(Vec::new()),

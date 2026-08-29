@@ -221,6 +221,14 @@ impl Rig {
     /// Requires [`Rig::census_oracle`], which puts the CONFIG in the shared workdir
     /// too: the state DB sits beside the config, and a census that can reach the
     /// parquet but not the ledger is exactly half of the comparison that matters.
+    /// The rig's destination as the DuckDB CONTAINER sees it — for fixtures that
+    /// must rewrite a delivered part through the same session that reads it.
+    pub fn oracle_container_out(&self) -> String {
+        self.oracle_container_dir
+            .clone()
+            .expect("oracle_container_out needs `.census_oracle()`/`.duckdb_oracle()`")
+    }
+
     pub fn row_census(&self) -> super::super::duckdb::RowCensus {
         let container = self.oracle_container_dir.as_ref().expect(
             "row_census needs `.census_oracle()` — the DuckDB container reads \
@@ -239,15 +247,39 @@ impl Rig {
                 self.tables
             )
         };
+        // WHICH manifests count comes from the ONE resolver
+        // (`declared_manifests`), translated to container paths — never
+        // re-derived in SQL. The host dir is the rig's own out dir.
+        let host_dir = self.out_dir();
+        let manifests: Vec<String> = super::super::parquet::declared_manifests(&host_dir)
+            .iter()
+            .filter_map(|m| m.file_name().and_then(|n| n.to_str()))
+            .map(|n| format!("{container}/{n}"))
+            .collect();
+        // The state backend under test: a Postgres URL when the run used one
+        // (the gate's Postgres pass), otherwise the `.rivet_state.db` beside
+        // the CONFIG, one level above the destination.
+        let state = std::env::var("RIVET_STATE_URL")
+            .ok()
+            .filter(|u| u.starts_with("postgres"))
+            .unwrap_or_else(|| format!("{}/.rivet_state.db", container.trim_end_matches("/out")));
         super::super::duckdb::duckdb_row_census(
             engine,
             self.oracle_database(),
             table,
             &format!("{container}/**/*.parquet"),
-            // The ledger sits beside the CONFIG, one level above the destination.
-            &format!("{}/.rivet_state.db", container.trim_end_matches("/out")),
+            &state,
             &self.name,
+            &manifests,
+            self.census_key.as_deref(),
         )
+    }
+
+    /// The key column the census counts DISTINCT on — set it and duplication
+    /// stops hiding behind a matching total.
+    pub fn census_key(mut self, col: &str) -> Self {
+        self.census_key = Some(col.to_string());
+        self
     }
 
     /// Which DuckDB reader reaches this rig's source. Derived, never passed in — a
@@ -268,6 +300,12 @@ impl Rig {
             "mysql" if self.source_url.contains(":3307") => E::MysqlCdc,
             "mssql" if self.source_url.contains(":1434") => E::MssqlCdc,
             "mongo" if self.source_url.contains(":27018") => E::MongoRs,
+            // MAIN stand — wired 2026-08-29 so the batch suites can census at
+            // all; the ports keep the two instances apart (a shared arm would
+            // read the wrong server and an absent table reads as zero rows).
+            "mysql" if self.source_url.contains(":3306") => E::MysqlMain,
+            "mssql" if self.source_url.contains(":1433") => E::MssqlMain,
+            "mongo" if self.source_url.contains(":27017") => E::MongoMain,
             other => panic!(
                 "row_census has no DuckDB reader for this rig (source type `{other}`, \
                  url `{}`): only the CDC-stand instances (pg :5434, mysql :3307, \

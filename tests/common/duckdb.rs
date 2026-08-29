@@ -460,6 +460,14 @@ pub fn duckdb_distinct_i64_set(
 pub enum OracleEngine {
     Postgres,
     PostgresCdc,
+    // MAIN-stand readers. They exist because the census was CDC-only and
+    // `oracle_engine` refused every batch rig outright — so the batch suites,
+    // 390 capture tests, had no four-way oracle available at all while the CDC
+    // side did (measured 2026-08-29: independent-oracle share 23% batch vs 35%
+    // CDC, and the gap is the missing instrument, not missing discipline).
+    MysqlMain,
+    MssqlMain,
+    MongoMain,
     MysqlCdc,
     MssqlCdc,
     MongoRs,
@@ -473,14 +481,17 @@ impl OracleEngine {
     fn extension(self) -> &'static str {
         match self {
             Self::Postgres | Self::PostgresCdc => "postgres",
-            Self::MysqlCdc => "mysql",
-            Self::MssqlCdc => "mssql",
-            Self::MongoRs => "mongo",
+            Self::MysqlCdc | Self::MysqlMain => "mysql",
+            Self::MssqlCdc | Self::MssqlMain => "mssql",
+            Self::MongoRs | Self::MongoMain => "mongo",
         }
     }
 
     fn is_community(self) -> bool {
-        matches!(self, Self::MssqlCdc | Self::MongoRs)
+        matches!(
+            self,
+            Self::MssqlCdc | Self::MongoRs | Self::MssqlMain | Self::MongoMain
+        )
     }
 
     /// The install/load prelude — every query that reads a source must run it.
@@ -536,6 +547,30 @@ impl OracleEngine {
                      '{database}', '{table}')"
                 ),
             ),
+            // The main stand, reached by SERVICE name like every arm above —
+            // the ports differ from the CDC instances (3306/1433/27017 vs
+            // 3307/1434/27018) and the containers are separate, so a shared arm
+            // would read the wrong server, which is the failure that looks
+            // exactly like an empty source.
+            Self::MysqlMain => (
+                format!(
+                    "ATTACH 'host=mysql port=3306 user=root password=rivet \
+                     database={database}' AS src (TYPE mysql, READ_ONLY);"
+                ),
+                format!("src.{table}"),
+            ),
+            Self::MssqlMain => (
+                format!(
+                    "ATTACH 'Server=mssql,1433;Database={database};UID=sa;\
+                     PWD=Rivet_Passw0rd!;TrustServerCertificate=true' \
+                     AS src (TYPE mssql, READ_ONLY);"
+                ),
+                format!("src.dbo.{table}"),
+            ),
+            Self::MongoMain => (
+                String::new(),
+                format!("mongo_scan('mongodb://mongo:27017', '{database}', '{table}')"),
+            ),
         }
     }
 }
@@ -558,17 +593,41 @@ pub struct RowCensus {
     pub delivered: i64,
     pub metrics: i64,
     pub file_log: i64,
+    /// Sum of `row_count` over the SUCCESS manifests the destination declares —
+    /// the number a CONSUMER reads. A run can deliver the right parquet and
+    /// declare a different total; nothing compared those two until now.
+    pub manifest: i64,
+    /// DISTINCT key values on each side, when a key column is given. A bare
+    /// `count(*)` cannot tell LOSS from DUPLICATION — they are different
+    /// failures with the same total when both happen, and the repo has already
+    /// paid for that once (751 rows / 750 distinct on a keyset retry).
+    pub source_distinct: Option<i64>,
+    pub delivered_distinct: Option<i64>,
 }
 
 impl RowCensus {
-    /// True when all four agree — the only shape that means "this run is sound".
+    /// True when every leg agrees — the only shape that means "this run is sound".
+    ///
+    /// Six legs, not four: the manifest (what a consumer will read) and, when a
+    /// key was given, DISTINCT on both sides so duplication cannot hide behind a
+    /// matching total.
     pub fn agrees(&self) -> bool {
-        self.source == self.delivered
+        let counts = self.source == self.delivered
             && self.delivered == self.metrics
             && self.metrics == self.file_log
+            && self.file_log == self.manifest;
+        let no_dupes = match (self.source_distinct, self.delivered_distinct) {
+            (Some(sd), Some(dd)) => sd == self.source && dd == self.delivered && sd == dd,
+            _ => true,
+        };
+        counts && no_dupes
     }
 }
 
+// Eight parameters, and each one is a DIFFERENT place the census reads from —
+// collapsing them into a struct would hide exactly the thing this function is
+// about (six sources of truth, none of them rivet's own word for itself).
+#[allow(clippy::too_many_arguments)]
 pub fn duckdb_row_census(
     engine: OracleEngine,
     database: &str,
@@ -576,23 +635,67 @@ pub fn duckdb_row_census(
     dest_glob: &str,
     state_db: &str,
     export_name: &str,
+    // Manifest files that COUNT, resolved by `declared_manifests` — never
+    // re-derived in SQL. Container paths.
+    manifests: &[String],
+    // Optional key column for the DISTINCT legs; `None` skips them.
+    key: Option<&str>,
 ) -> RowCensus {
     let (attach, from) = engine.source_sql(database, table);
+    // The state backend is whatever the run used: a `.rivet_state.db` file
+    // (SQLite, the default) or a Postgres URL when RIVET_STATE_URL is set. The
+    // census attached sqlite unconditionally, so it simply could not grade the
+    // gate's Postgres pass — the backend under test half the time.
+    let (state_load, state_attach) = if state_db.starts_with("postgres") {
+        (
+            "INSTALL postgres; LOAD postgres;".to_string(),
+            format!("ATTACH '{state_db}' AS st (TYPE postgres, READ_ONLY);"),
+        )
+    } else {
+        (
+            "INSTALL sqlite; LOAD sqlite;".to_string(),
+            format!("ATTACH '{state_db}' AS st (TYPE sqlite, READ_ONLY);"),
+        )
+    };
+    // The manifest leg. SUCCESS only — a failed run's parts are gc candidates,
+    // the rule four resolvers were fixed for on 2026-08-29. `union_by_name`
+    // because manifests grew fields across versions and a fixed-order read
+    // would fail on a mixed directory.
+    let manifest_sql = if manifests.is_empty() {
+        "0".to_string()
+    } else {
+        let list = manifests
+            .iter()
+            .map(|m| format!("'{m}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "(SELECT coalesce(sum(row_count), 0) FROM \
+              read_json_auto([{list}], union_by_name = true) \
+              WHERE lower(coalesce(status, 'success')) = 'success')"
+        )
+    };
+    let (src_distinct, del_distinct) = match key {
+        Some(k) => (
+            format!("(SELECT count(DISTINCT {k}) FROM {from})"),
+            format!("(SELECT count(DISTINCT {k}) FROM read_parquet('{dest_glob}'))"),
+        ),
+        None => ("NULL".to_string(), "NULL".to_string()),
+    };
     let sql = format!(
-        "{load} INSTALL sqlite; LOAD sqlite; {attach} \
-         ATTACH '{state_db}' AS st (TYPE sqlite, READ_ONLY); \
+        "{load} {state_load} {attach} {state_attach} \
          SELECT (SELECT count(*) FROM {from}) AS source, \
                 (SELECT count(*) FROM read_parquet('{dest_glob}')) AS delivered, \
                 (SELECT coalesce(sum(total_rows), 0) FROM st.export_metrics \
                   WHERE export_name = '{export_name}') AS metrics, \
                 (SELECT coalesce(sum(row_count), 0) FROM st.file_log \
-                  WHERE export_name = '{export_name}') AS file_log",
+                  WHERE export_name = '{export_name}') AS file_log, \
+                {manifest_sql} AS manifest, \
+                {src_distinct} AS source_distinct, \
+                {del_distinct} AS delivered_distinct",
         load = engine.load_sql(),
     );
     let v = duckdb_run_sql_json(&sql);
-    // A community extension that will not install is almost always the stand's
-    // duckdb pin, not the query — say so where the reader is, rather than leaving
-    // an HTTP 404 to be decoded.
     assert!(
         !v["rows"].as_array().is_none_or(Vec::is_empty),
         "the census query returned nothing. If the error mentions a 404 for `{}`, \
@@ -605,13 +708,18 @@ pub fn duckdb_row_census(
         v["rows"][0][i]
             .as_str()
             .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(-1)
+            .unwrap_or_else(|| panic!("census column {i} unreadable: {v}"))
     };
+    let opt =
+        |i: usize| -> Option<i64> { v["rows"][0][i].as_str().and_then(|s| s.parse::<i64>().ok()) };
     RowCensus {
         source: n(0),
         delivered: n(1),
         metrics: n(2),
         file_log: n(3),
+        manifest: n(4),
+        source_distinct: opt(5),
+        delivered_distinct: opt(6),
     }
 }
 
