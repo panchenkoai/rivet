@@ -770,6 +770,21 @@ mod tests {
     }
 
     /// Off unix the fallback is the injected pid probe, sparing on doubt.
+    /// Round-10 mutants: `sweep_dead_spills_now` stubbed to () survived — the
+    /// CDC-open sweep (round-5) had wiring but no direct grade. A flock-free
+    /// rivet-shaped file is an orphan and must go; a foreign file stays.
+    #[test]
+    fn sweep_now_reaps_an_unlocked_orphan_and_spares_foreign_files() {
+        let d = dir();
+        let orphan = d.path().join("rivet-spill-pg-tx-0-999999-aa.bin");
+        let foreign = d.path().join("keep.bin");
+        std::fs::write(&orphan, b"x").unwrap();
+        std::fs::write(&foreign, b"y").unwrap();
+        sweep_dead_spills_now(d.path());
+        assert!(!orphan.exists(), "an unlocked orphan must be reaped");
+        assert!(foreign.exists(), "a foreign file is never touched");
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn a_sweep_falls_back_to_the_pid_probe_off_unix() {

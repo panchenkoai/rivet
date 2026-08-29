@@ -680,6 +680,57 @@ mod tests {
     /// fn wrote — proven here end to end: stamp → ledger terminal (live
     /// ordinal untouched, foreign prefix untouched) → sweep retires exactly
     /// the stamped ordinals' markers → both activity signals read idle.
+    /// Round-10 mutants: three operators inside `completed_units_tile`
+    /// survived the franken fixture — the open-ends `||`, the newer-finished
+    /// `>=` pick, and the adjacency chain's `&&`. One fixture per operator.
+    #[test]
+    fn tile_rejects_one_sided_opens_and_prefers_the_newer_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let write = |run: &str, name: &str, lo: Option<&str>, hi: Option<&str>, fin: &str| {
+            let mut m = unit_manifest(run, name, crate::manifest::ManifestStatus::Success);
+            m.finished_at = fin.into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(str::to_string),
+                hi: hi.map(str::to_string),
+            });
+            std::fs::write(
+                dir.path().join(format!("manifest-{run}.json")),
+                serde_json::to_vec(&m).unwrap(),
+            )
+            .unwrap();
+        };
+        // Closed BOTTOM (lo Some on #0): not a partition — kills `||`->`&&`
+        // on the open-ends check.
+        write(
+            "a0",
+            "orders#0",
+            Some("5"),
+            Some("m"),
+            "2026-08-21T00:01:00Z",
+        );
+        write("a1", "orders#1", Some("m"), None, "2026-08-21T00:01:00Z");
+        assert!(!completed_units_tile(&dest, "orders"));
+
+        // Newer Success REPLACES the older per ordinal: the old gen-1 #0 does
+        // not tile with gen-2 #1; the NEW #0 does — kills `>=`->`<`.
+        for f in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            std::fs::remove_file(f.path()).unwrap();
+        }
+        write("old0", "orders#0", None, Some("x"), "2026-08-21T00:00:00Z");
+        write("new0", "orders#0", None, Some("m"), "2026-08-21T00:05:00Z");
+        write("b1", "orders#1", Some("m"), None, "2026-08-21T00:05:00Z");
+        assert!(
+            completed_units_tile(&dest, "orders"),
+            "the NEWER #0 (hi=m) tiles with #1 (lo=m); picking the older breaks it"
+        );
+    }
+
     #[test]
     fn stamp_ceased_units_closes_both_wedge_halves() {
         let dir = tempfile::tempdir().unwrap();

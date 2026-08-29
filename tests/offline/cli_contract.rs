@@ -335,3 +335,25 @@ fn state_runs_lists_a_frozen_row_and_finish_run_releases_it() {
         "the stamped row must stop freezing the prefix: {out}"
     );
 }
+
+/// Round-10 mutants: `require_config_file` stubbed to Ok(()) and the
+/// `last == 0` arm flipped both survived — the e2e used only existing configs
+/// and nonzero limits. A typo'd -c must refuse (a fresh empty DB read as a
+/// false all-clear), and --last 0 must say "by construction", never an
+/// empty-DB verdict.
+#[test]
+fn state_runs_refuses_a_missing_config_and_last_zero_tells_the_truth() {
+    let (code, _out, err) = run(&["state", "runs", "-c", "definitely-missing.yaml"]);
+    assert_ne!(code, 0, "a typo'd -c must refuse");
+    assert!(err.contains("not a file"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("r.yaml");
+    std::fs::write(&cfg, "x: 1\n").unwrap();
+    let (code, out, _err) = run(&["state", "runs", "-c", cfg.to_str().unwrap(), "--last", "0"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("by construction"),
+        "--last 0 must not read as an empty-DB verdict: {out}"
+    );
+}

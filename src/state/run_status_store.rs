@@ -312,6 +312,20 @@ mod tests {
         assert!(s.recent_run_status(10, true).unwrap().is_empty());
     }
 
+    /// Round-10 mutants: `run_status_of` stubbed to Some("xyzzy") survived —
+    /// the gc dead-marker path reads it, and a lying status mis-sweeps.
+    #[test]
+    fn run_status_of_reports_the_row_or_none() {
+        let s = StateStore::open_in_memory().unwrap();
+        assert_eq!(s.run_status_of("nope").unwrap(), None);
+        s.begin_run("r1", "orders", "gs://b/p", "2026-08-21T00:00:00Z")
+            .unwrap();
+        assert_eq!(s.run_status_of("r1").unwrap().as_deref(), Some("running"));
+        s.finish_run("r1", "success", "2026-08-21T01:00:00Z")
+            .unwrap();
+        assert_eq!(s.run_status_of("r1").unwrap().as_deref(), Some("success"));
+    }
+
     /// Round-4 split-wedge closure, ledger half: a reconstruction that kept 5
     /// units stamps `#5..` interrupted; `#0..#4` and a FOREIGN export are
     /// untouched, and the prefix stops reading active. RED against `>` in the

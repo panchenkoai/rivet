@@ -2604,6 +2604,10 @@ exports:
             // field — at runtime it wraps in release, and a wrapped budget of 0 is
             // the same explosion wearing a huge plausible number.
             ("rollover_memory_mb: 999999999999999999", "overflows"),
+            // Round-10 mutants: a value whose MULTIPLY overflows while an ADD
+            // would not — `checked_mul -> checked_add` sailed through the
+            // usize::MAX-ish fixture above (both overflow there).
+            ("rollover_memory_mb: 18014398509481984", "overflows"),
         ] {
             let yaml = base.replace("ROLLOVER_LINE", line);
             let err = Config::from_yaml(&yaml).expect_err(line).to_string();

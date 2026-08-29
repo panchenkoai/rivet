@@ -524,6 +524,10 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
         // version of this needle carried capitals and was dead on arrival
         // (round-4 fuzz sweep), un-fixing the very case its comment describes.
         || msg.contains("cannot open database")
+        // MySQL 1049 renders "Unknown database 'x'" — neither arm above
+        // matched it, so a typo'd MySQL database fell to the generic catch-all
+        // (round-10: the per-arm fixture exposed the missing engine).
+        || msg.contains("unknown database")
     {
         return "unknown database";
     }
@@ -1033,6 +1037,48 @@ exports:
     }
 
     // ── regression coverage for the broadened needles (fixes #1/#2) ──────────
+
+    /// One input per OR-ARM (round-10 mutants: each `||` in the needle chains
+    /// was un-graded — `&&` mutants survived because only one arm per category
+    /// ever had a fixture). And the hint ARMS exist: `delete match arm` on
+    /// "unknown database"/"transient" survived with no assertion on the text.
+    #[test]
+    fn every_needle_arm_has_its_own_fixture_and_a_hint() {
+        for msg in [
+            "FATAL: database \"nope\" does not exist",
+            "Unknown database 'nope'",
+            "Cannot open database \"nope\" requested by the login",
+        ] {
+            assert_eq!(
+                categorize_source_error(&anyhow::anyhow!("{msg}")),
+                "unknown database",
+                "{msg}"
+            );
+        }
+        // NEGATIVE arm for the `&&`: "does not exist" WITHOUT "database" (a
+        // missing ROLE) must never claim the unknown-database hint.
+        assert_ne!(
+            categorize_source_error(&anyhow::anyhow!("FATAL: role \"rivet\" does not exist")),
+            "unknown database"
+        );
+        for msg in [
+            "FATAL: sorry, too many clients already",
+            "FATAL: remaining connection slots are reserved",
+            "the database system is starting up",
+        ] {
+            assert_eq!(
+                categorize_source_error(&anyhow::anyhow!("{msg}")),
+                "transient",
+                "{msg}"
+            );
+        }
+        for cat in ["unknown database", "transient"] {
+            let err = anyhow::anyhow!("probe");
+            let hint = source_error_hint(cat, &err, &crate::config::SourceType::Postgres)
+                .unwrap_or_else(|| panic!("category {cat} must carry a hint"));
+            assert!(hint.len() > 40, "{cat}: a one-word hint helps nobody");
+        }
+    }
 
     /// MSSQL 4060 routes to "unknown database", NOT auth — through the REAL fn,
     /// whose haystack is LOWERCASED: the first needle carried capitals and was

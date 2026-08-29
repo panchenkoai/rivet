@@ -446,6 +446,21 @@ pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Round-10 mutants: the `||` chain of transient needles was un-graded —
+    /// each arm gets its own input so `&&` mutants die per-arm.
+    #[test]
+    fn each_transient_needle_arm_classifies_on_its_own() {
+        for msg in [
+            "FATAL: sorry, too many clients already",
+            "FATAL: remaining connection slots are reserved for roles",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{msg}"));
+            assert!(
+                matches!(c, RetryClass::Transient { .. }),
+                "{msg} must classify transient, got {c:?}"
+            );
+        }
+    }
 
     /// The rule all three runners now share. Before it was one function it
     /// was five hand-written copies, none of them tested.

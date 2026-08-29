@@ -1450,6 +1450,27 @@ mod empty_state_path_guard {
 
 #[cfg(test)]
 mod tests {
+    /// Round-10 mutants: the NOTADB `||` in the migrate-lock error split was
+    /// un-graded — `&&` reverts corrupt-DB reporting to the phantom
+    /// "another process is migrating" message the round-8 fix removed. Both
+    /// SQLite renderings must route to the CORRUPT branch.
+    #[test]
+    fn a_garbage_state_db_reports_corruption_not_a_phantom_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("r.yaml");
+        std::fs::write(&cfg, "x: 1\n").unwrap();
+        std::fs::write(dir.path().join(".rivet_state.db"), b"garbage-not-a-db").unwrap();
+        let err = match StateStore::open(cfg.to_str().unwrap()) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("garbage bytes must refuse"),
+        };
+        assert!(
+            err.contains("CORRUPT"),
+            "the operator must be told the file is corrupt, never to wait on a \
+             phantom migrating process: {err}"
+        );
+        assert!(!err.contains("wait for it to finish"), "{err}");
+    }
 
     /// The two ladders must define the SAME versions.
     ///
