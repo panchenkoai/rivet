@@ -159,6 +159,18 @@ fn cloud_multipart_s3_rotation_distinct_keys_and_all_rows() {
         "s3: total rows across all downloaded objects must equal {N} (a lost/overwritten part \
          would under-count); got {total}"
     );
+
+    // …and the same claim through an INDEPENDENT codec. Everything above
+    // decodes with `parquet_rows_from_bytes` — rivet's own arrow/parquet crate,
+    // which cancels an encode fault the way any self-read does. DuckDB reads
+    // the bucket over s3:// from inside the stand network and shares none of
+    // that code; the batch oracle gate asks for exactly this on a name that
+    // claims "all_rows" (2026-08-29).
+    let store = duckdb_store_census(ObjectStore::Minio, bucket, &prefix, &[]);
+    assert_eq!(
+        store.rows, N,
+        "s3, read by DuckDB: the bucket must hold every row: {store:?}"
+    );
 }
 
 // ── GCS / fake-gcs ─────────────────────────────────────────────────────────

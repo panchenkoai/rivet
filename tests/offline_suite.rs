@@ -27,6 +27,9 @@ mod skip_is_not_a_pass_guard;
 #[path = "offline/validate_cdc_union.rs"]
 mod validate_cdc_union;
 
+#[path = "offline/batch_oracle_gate.rs"]
+mod batch_oracle_gate;
+
 #[path = "offline/cdc_cli_surface_guard.rs"]
 mod cdc_cli_surface_guard;
 
