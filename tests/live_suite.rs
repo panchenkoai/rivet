@@ -218,5 +218,8 @@ mod sec_terminal_inject;
 #[path = "live/sec_tls_defaults.rs"]
 mod sec_tls_defaults;
 
+#[path = "live/oracle_sensitivity.rs"]
+mod oracle_sensitivity;
+
 #[path = "live/soak_spill.rs"]
 mod soak_spill;

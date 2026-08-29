@@ -126,8 +126,20 @@ pub fn fake_gcs_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
         "GET /storage/v1/b/{bucket}/o?prefix={prefix} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     ));
     let list: serde_json::Value = serde_json::from_slice(&list).expect("fake-gcs list JSON");
+    let items = list["items"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    // An empty LISTING is a harness bug (wrong prefix/bucket), never evidence
+    // of zero rows: the GCS all-features test probed a prefix missing its
+    // export-name segment and this helper answered an honest-but-wrong 0
+    // (2026-08-29). Objects exist whenever the capture ran — refuse to grade
+    // a world the prefix cannot see.
+    assert!(
+        !items.is_empty(),
+        "fake_gcs_parquet_total_rows: prefix `{prefix}` in bucket `{bucket}` \
+         matched no objects at all — a wrong prefix reads as an empty export; \
+         fix the probe, don't trust the zero"
+    );
     let mut total = 0usize;
-    for item in list["items"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+    for item in items {
         let name = item["name"].as_str().expect("object name");
         if !name.ends_with(".parquet") {
             continue;

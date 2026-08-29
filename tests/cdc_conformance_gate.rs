@@ -632,6 +632,122 @@ fn derived_capture_markers() -> &'static Vec<String> {
     })
 }
 
+/// ORACLE-CLASS CENSUS — the strength of the CDC suite as ONE pinned number
+/// per class, so an upgrade is BANKED and a downgrade is loud (the same
+/// two-sided discipline as the matrix ratchets).
+///
+/// Every capture test is classified by the STRONGEST oracle marker in its
+/// body:
+///   independent  — a reader that shares nothing with rivet's write path
+///                  (DuckDB, the four-way census, a source re-query, the
+///                  server's own position). The class the 2026-08-29 audit
+///                  measured at ~29% and this pin ratchets upward.
+///   shared_codec — content read back through rivet's own arrow/parquet crate
+///                  (cdc_id_ops, read_all_parts, …): bites on most bugs, but
+///                  an encode fault cancels itself.
+///   self_counter — rivet's own record about itself (manifest_rows, manifest
+///                  copies): a capture that miscounts agrees with itself.
+///   presence     — none of the above: exit status, file existence, listings.
+///
+/// NOTE the deliberate difference from tier 2 below: tier 2 ACCEPTS
+/// `cdc_id_ops` for enforcement (its callers hand-write expectations from the
+/// seed); this census still classifies it `shared_codec`, because that is
+/// what it is. Enforcement is pragmatic; the census is honest.
+///
+/// Adding a capture test moves exactly one bucket — bump the pin in the same
+/// commit, and prefer the bucket on the left.
+#[test]
+fn oracle_class_census_is_pinned() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let independent = [
+        "duckdb_",
+        "row_census(",
+        "assert_complete(",
+        "confirmed_flush_lsn",
+        "query_one(",
+    ];
+    let shared_codec = [
+        "cdc_id_ops(",
+        "read_all_parts(",
+        "read_cdc_changes(",
+        "read_mongo_cdc_changes(",
+        "run_and_read(",
+        "drain_and_read(",
+        "read_declared_parts(",
+        "manifest_driven",
+        "parquet_rows_from_bytes(",
+        "mc_parquet_total_rows(",
+        "fake_gcs_parquet_total_rows(",
+    ];
+    let self_counter = ["manifest_rows(", "dir_manifest_copy_total_rows("];
+    let mut counts = [0usize; 4]; // [independent, shared_codec, self_counter, presence]
+    for entry in fs::read_dir(root.join("tests/live")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.contains("cdc") || !name.ends_with(".rs") {
+            continue;
+        }
+        let src = fs::read_to_string(&path).unwrap();
+        for raw in src.split("#[test]").skip(1) {
+            let chunk = clip_to_first_fn_body(raw);
+            let runs_capture = chunk.contains("run_cdc(")
+                || chunk.contains("Command::new(RIVET_BIN)")
+                || derived_capture_markers()
+                    .iter()
+                    .any(|m| chunk.contains(m.as_str()));
+            if !runs_capture {
+                continue;
+            }
+            let class = if independent.iter().any(|m| chunk.contains(m)) {
+                0
+            } else if shared_codec.iter().any(|m| chunk.contains(m)) {
+                1
+            } else if self_counter.iter().any(|m| chunk.contains(m)) {
+                2
+            } else {
+                3
+            };
+            counts[class] += 1;
+        }
+    }
+    let total: usize = counts.iter().sum();
+    assert!(
+        total > 200,
+        "census walked only {total} capture tests — the discovery collapsed and \
+         the pin below would grade nothing"
+    );
+    // The pin. Two-sided on purpose: DOWN in `independent` (or UP in
+    // `presence`) is a regression someone must argue for; the opposite moves
+    // are upgrades to bank. Counted 2026-08-29, after the audit's 10 oracle
+    // upgrades landed.
+    assert_eq!(
+        counts,
+        [
+            PIN_INDEPENDENT,
+            PIN_SHARED_CODEC,
+            PIN_SELF_COUNTER,
+            PIN_PRESENCE
+        ],
+        "the oracle-class census moved (order: independent, shared_codec, \
+         self_counter, presence). If you ADDED a capture test: classify it and \
+         bump its bucket here in the same commit — and prefer an independent \
+         oracle (duckdb_*/row_census). If you UPGRADED one: move its count left \
+         and bank the win. If `independent` went DOWN or `presence` went UP \
+         without a stated reason, that is the regression this pin exists to \
+         catch."
+    );
+}
+
+// Measured 2026-08-29 (203 capture tests). `presence` is NOT all defects: a
+// refusal/exit-code test's subject IS the refusal (subject-legitimacy), so it
+// needs no data oracle — the pressure is (1) tier 2 below keeps completeness
+// CLAIMS out of that bucket, and (2) new data-truth tests land in the left
+// buckets. `self_counter` at 6 is the audit's residue after the 10 upgrades.
+const PIN_INDEPENDENT: usize = 69;
+const PIN_SHARED_CODEC: usize = 57;
+const PIN_SELF_COUNTER: usize = 6;
+const PIN_PRESENCE: usize = 71;
+
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
 /// "an outcome". The audit found ten `*loses_nothing*`/`*complete*`-named
