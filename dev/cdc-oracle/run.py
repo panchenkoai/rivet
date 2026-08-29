@@ -31,6 +31,56 @@ MYSQL_HOST_IN_NET = os.environ.get("CDC_ORACLE_MYSQL_HOST", "mysql-cdc")
 MYSQL_URL = os.environ.get("MYSQL_CDC_URL", "mysql://rivet:rivet@127.0.0.1:3307/rivet")
 MYSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MYSQL_CONTAINER", "rivet-mysql-cdc-1"),
               "mysql", "-uroot", "-privet", "rivet", "-N", "-e"]
+# The mysql DIFFERENTIAL runs against a FRESH, DEDICATED source by default.
+# Measured 2026-08-29 on the shared mysql-cdc (weeks of accumulated tables,
+# 8MB binlogs): Debezium's attach-to-first-row-delivered warmup ranged from
+# seconds to PAST FIVE MINUTES, so the drain quiesced on schema events alone
+# and reported 4 rivet-only rows — a harness race wearing a rivet finding
+# (three consecutive DISAGREE, then AGREE under a log tail; the liveness
+# probe below refuses instead, and against a fresh server the probe passes in
+# seconds and crud AGREEs 4/4 with values). Opt back into a shared server by
+# setting CDC_ORACLE_MYSQL_HOST — the fresh path only runs on the default.
+MYSQL_FRESH = "CDC_ORACLE_MYSQL_HOST" not in os.environ
+MYSQL_FRESH_NAME = "mysql-diff-oracle"
+MYSQL_FRESH_PORT = 13317
+
+
+def fresh_mysql_source(net: str) -> None:
+    """Stand up the dedicated mysql source and re-point the module handles."""
+    global MYSQL_HOST_IN_NET, MYSQL_URL, MYSQL_EXEC
+    # MULTI-DAEMON HAZARD, observed 2026-08-29 on a dev Mac with THREE docker
+    # CLIs on PATH and TWO live daemons (OrbStack + Docker Desktop): a
+    # `docker run` on one daemon followed by an instant-succeeding exec that
+    # could only have hit an OLD container on the OTHER, then "No such
+    # container" mid-run. If that shape appears, pin the daemon
+    # (`docker context use orbstack` or DOCKER_HOST) before blaming this
+    # function — every docker call here resolves through ambient PATH/context
+    # like the rest of the harness.
+    subprocess.run(["docker", "rm", "-f", MYSQL_FRESH_NAME], capture_output=True)
+    sh("docker", "run", "-d", "--name", MYSQL_FRESH_NAME, "--network", net,
+       "-p", f"{MYSQL_FRESH_PORT}:3306",
+       "-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
+       "-e", "MYSQL_USER=rivet", "-e", "MYSQL_PASSWORD=rivet",
+       "mysql:8.0", "--server-id=7001", "--binlog_format=ROW")
+    probe = ["docker", "exec", MYSQL_FRESH_NAME, "mysql", "-uroot", "-privet", "-N", "-e"]
+    for _ in range(90):
+        if subprocess.run(probe + ["SELECT 1"], capture_output=True).returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        raise SystemExit("fresh mysql source never came up")
+    subprocess.run(
+        probe + ["GRANT ALL ON *.* TO 'rivet'@'%'; "
+                 "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'rivet'@'%'; "
+                 "FLUSH PRIVILEGES"],
+        capture_output=True,
+    )
+    MYSQL_HOST_IN_NET = MYSQL_FRESH_NAME
+    MYSQL_URL = f"mysql://rivet:rivet@127.0.0.1:{MYSQL_FRESH_PORT}/rivet"
+    MYSQL_EXEC = ["docker", "exec", MYSQL_FRESH_NAME,
+                  "mysql", "-uroot", "-privet", "rivet", "-N", "-e"]
+
+
 MSSQL_HOST_IN_NET = os.environ.get("CDC_ORACLE_MSSQL_HOST", "mssql-cdc")
 MSSQL_URL = os.environ.get("MSSQL_CDC_URL", "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet")
 MSSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MSSQL_CONTAINER", "rivet-mssql-cdc-1"),
@@ -270,11 +320,25 @@ def main() -> int:
                       f"EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='{tt}', "
                       f"@capture_instance='dbo_{tt}'")
                 mssql(f"IF OBJECT_ID('dbo.{tt}') IS NOT NULL DROP TABLE dbo.{tt}")
+        elif MYSQL_FRESH:
+            # The whole dedicated server dies with the run — dropping tables
+            # through it first is not just pointless, it EXECS INTO A REMOVED
+            # CONTAINER when ordered wrong (the first cut removed the server
+            # above this drop, and cleanup's own SystemExit then MASKED the
+            # run's real verdict as "No such container").
+            sh("docker", "rm", "-f", MYSQL_FRESH_NAME, check=False)
         else:
             mysql(f"DROP TABLE IF EXISTS {t}, {t}_late")
         subprocess.run(["rm", "-f", ckpt], check=False)
 
     cleanup()
+    # AFTER the stale-state cleanup, never before: cleanup() also removes the
+    # dedicated server (it IS stale state from a prior run), so creating first
+    # meant the start-call silently destroyed the just-created server and the
+    # first mysql() died with "No such container" — masked, on the first cut,
+    # by the finally-cleanup's own crash.
+    if a.engine == "mysql" and MYSQL_FRESH:
+        fresh_mysql_source(net)
     try:
         # 1. fixture, and rivet's cursor, BEFORE any change.
         #
@@ -377,7 +441,7 @@ debezium.source.database.server.id=9911
 debezium.source.topic.prefix=oracle
 debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory
 debezium.source.schema.history.internal.file.filename=/data/schema-history.dat
-debezium.source.table.include.list=rivet.{t}"""
+debezium.source.table.include.list=rivet.{t},rivet.{t}_probe"""
 
         props = f"""debezium.sink.type=http
 debezium.sink.http.url=http://{sink}:8088/events
@@ -449,6 +513,39 @@ quarkus.log.level=WARN
                     break
         else:
             raise SystemExit("Debezium never became active on its slot")
+
+        # 4b. STREAMING liveness, end to end — mysql only. The Binlog Dump
+        # thread proves a dump CONNECTION, not delivery: on the shared
+        # mysql-cdc server the connector intermittently stalls right after
+        # attach (its own log warns "server has purged some binlogs"), the
+        # drain then quiesces on schema events alone, and an empty reference
+        # reads as 4 rivet-only rows — a harness race reported as a finding
+        # (the exact class the mssql fixed-sleep comment below describes;
+        # measured 2026-08-29: 3 consecutive DISAGREE, then AGREE under a log
+        # tail). A probe row through a SEPARATE included table (excluded from
+        # the comparison by compare.py's `%_probe` filter) proves the pipe
+        # delivers DATA before the scenario is allowed to start.
+        if a.engine == "mysql":
+            mysql(f"CREATE TABLE IF NOT EXISTS {t}_probe (id int PRIMARY KEY)")
+            mysql(f"INSERT INTO {t}_probe VALUES (1)")
+            probe_jsonl = os.path.join(work, "debezium.jsonl")
+            # 300s, not 120: measured 2026-08-29 on the shared mysql-cdc
+            # (weeks of accumulated test tables), the connector takes 2-4
+            # MINUTES from Binlog-Dump-attach to actually delivering row
+            # events — a manual insert flowed only ~3.5min after start. The
+            # probe's whole point is to absorb that warmup instead of letting
+            # the 6s drain quiescence grade it as 4 rivet-only rows.
+            for _ in range(150):
+                if os.path.exists(probe_jsonl):
+                    with open(probe_jsonl) as fh:
+                        if any(f'"{t}_probe"' in ln and '"op"' in ln for ln in fh):
+                            break
+                time.sleep(2)
+            else:
+                raise SystemExit(
+                    "Debezium never delivered the mysql liveness probe — the "
+                    "reference pipe is stalled; refusing to run a scenario that "
+                    "would report the stall as a rivet finding")
 
         # 5. the scenario — applied through the engine's own client
         binary = os.environ.get("RIVET_BIN", "./target/debug/rivet")

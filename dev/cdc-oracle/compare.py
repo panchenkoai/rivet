@@ -121,7 +121,11 @@ FROM (SELECT unnest(str_split(trim(content, chr(10)), chr(10))) AS j
 -- engines' schema-change events and on no row event.
 WHERE j <> ''
   AND json_type(j, '$.tableChanges') IS NULL
-  AND jstr(j, '$.ddl') IS NULL;
+  AND jstr(j, '$.ddl') IS NULL
+  -- The mysql liveness probe (run.py 4b) writes into <t>_probe, which is in
+  -- Debezium's include-list ONLY so its delivery proves the pipe is live —
+  -- its events are harness plumbing, not scenario data, on either side.
+  AND NOT ends_with(coalesce(jstr(j, '$.source.table'), ''), '_probe');
 
 CREATE OR REPLACE VIEW riv AS
 SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k __RIV_VALS__
