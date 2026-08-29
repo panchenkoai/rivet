@@ -202,8 +202,11 @@ preflights:
 infra:
   - id: network_faults
     infra: toxiproxy
-    status: gap
-    note: "retry/reconnect (retry.rs, classify_pg_sqlstate) under injected latency/drop/reset is untested end-to-end in the gate"
+    status: test
+    note: "verify_network_faults drives export_survives_transient_latency_added_via_toxiproxy +
+      export_fails_cleanly_when_toxiproxy_is_disabled_before_run +
+      gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers through the release binary;
+      probes toxiproxy :8474 itself and SKIPs loudly when down"
   - id: state_upgrade
     status: test
     note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
@@ -212,16 +215,25 @@ infra:
     status: test
     note: "pg_shared_state_cross_connection_visibility_and_supersession (src/state/run_status_store.rs) — two StateStore connections = two processes on one shared Postgres state: a run begun on A is active-visible to B (the gc_orphans signal), and a newer run supersedes the older clock-free. Run by the state_migrations preflight; RED-proven against a flipped supersession."
   - id: tls_required
-    status: gap
-    note: "TLS-required connections + cert validation (the vendored-openssl / tiberius handshake class); the gate runs mssql on accept_invalid_certs"
+    status: partial
+    note: "POLICY half gated: verify_tls_policy drives sec_remote_plaintext_pg_is_loud +
+      sec_loopback_plaintext_pg_is_allowed + sec_enforced_tls_is_not_overridden_by_url_sslmode_disable.
+      RESIDUAL: a real TLS handshake against a VERIFIED cert (the vendored-openssl / tiberius
+      class) needs a TLS-provisioned service the stand does not have; the gate still runs
+      mssql on accept_invalid_certs"
   - id: auth
     infra: mongo-auth
-    status: gap
-    note: "SCRAM / cert auth paths; the gate uses no-auth Mongo and password-only SQL"
+    status: partial
+    note: "SCRAM half gated: verify_mongo_auth drives mongo_readonly_login_exports_despite_denied_harm_probe
+      (least-privilege export, DuckDB-graded) + mongo_wrong_password_fails_loud_and_writes_nothing
+      (refusal names auth, zero parquet). RESIDUAL: x509 cert auth is a separate provisioning class"
   - id: cdc_standby
     infra: ["pg-cdc-standby"]
-    status: gap
-    note: "the mysql read-REPLICA half of this is now the `replica_read` preflight (verify_replica_read, status:test). The residual: bounded CDC on a PostgreSQL STANDBY must fail LOUD (roast_pg_cdc_bounded_on_a_standby_fails_loud EXISTS but the gate does not drive it — needs the `cdc-standby` compose profile up)."
+    status: test
+    note: "the mysql read-REPLICA half is the `replica_read` preflight (verify_replica_read).
+      The standby half: verify_cdc_standby probes :5436 ITSELF (the live test self-skips as
+      PASSED when the port is down — the vacuous-skip class) and drives
+      roast_pg_cdc_bounded_on_a_standby_fails_loud when the `cdc-standby` profile is up"
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"

@@ -74,6 +74,10 @@ __all__ = [
     "verify_pool_split",
     "verify_replica_read",
     "verify_state_migrations",
+    "verify_network_faults",
+    "verify_tls_required",
+    "verify_auth",
+    "verify_cdc_standby",
 ]
 
 # The helper scripts and blessed goldens are DATA, shared with the bash gate: the
@@ -1197,6 +1201,151 @@ def verify_state_migrations(led: Ledger) -> None:
             f"PG_MIGRATIONS (see {log_path})",
             _first_match(transcript, r"must succeed|cannot convert|FAILED"),
         )
+
+
+
+def _drive_live_tests(
+    led: Ledger, area: str, a: str, b: str, phase: str, tests: list[str],
+    log_name: str, fail_msg: str,
+) -> None:
+    """Run named live_suite tests through the RELEASE binary (RIVET_BIN), the
+    same shape as verify_state_migrations' fresh leg: the test binary is debug
+    and only orchestrates; the rivet it spawns is what ships."""
+    led.phase(phase)
+    log_path = work_dir() / log_name
+    res = run(
+        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
+         "--", "--ignored", "--test-threads=1", *tests],
+        env={"RIVET_BIN": str(rivet_bin())},
+        timeout=NO_TIMEOUT,
+    )
+    log_path.write_text(res.out)
+    # Filters are positional substrings: a typo'd name selects NOTHING and
+    # libtest exits 0 — require the run to have executed at least as many
+    # tests as were named (absence is not success).
+    m = re.search(r"test result: ok\. (\d+) passed", res.out)
+    ran = int(m.group(1)) if m else 0
+    if res.ok and ran >= len(tests):
+        _passed(led, area, a, b, "-", f"{fail_msg}: {ran} test(s) green through the release binary")
+    elif res.ok:
+        _failed(
+            led, area, a, b, "-",
+            f"{fail_msg}: filter matched only {ran} of {len(tests)} named tests — "
+            f"a renamed test silently un-gated this row (see {log_path})",
+            "filter under-matched",
+        )
+    else:
+        _failed(led, area, a, b, "-", f"{fail_msg} FAILED (see {log_path})",
+                _first_match(res.out, r"panicked|FAILED|error"))
+
+
+def verify_network_faults(led: Ledger) -> None:
+    """Release-gate leg for the `network_faults` infra row: retry/reconnect under
+    REAL injected faults (toxiproxy latency / downed proxy / mid-stream cut),
+    end-to-end through the release binary. The three tests are the live suite's
+    RED-proven fault set: batch retry-through-latency, loud-fail on a dead
+    proxy, and the CDC binlog cut that must fail loud then recover without a
+    gap. SKIP (never silent) when toxiproxy's admin port is down."""
+    if not have("cargo"):
+        _skipped(led, "infra", "network", "faults", "-", "network-faults: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 8474):
+        _skipped(
+            led, "infra", "network", "faults", "-",
+            "network-faults: toxiproxy admin :8474 unreachable (docker compose up -d toxiproxy)",
+            "toxiproxy down",
+        )
+        return
+    _drive_live_tests(
+        led, "infra", "network", "faults",
+        "Network faults (toxiproxy: latency retry, dead proxy, CDC mid-stream cut)",
+        [
+            "export_survives_transient_latency_added_via_toxiproxy",
+            "export_fails_cleanly_when_toxiproxy_is_disabled_before_run",
+            "gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers",
+        ],
+        "network_faults.log",
+        "network faults under toxiproxy",
+    )
+
+
+def verify_tls_required(led: Ledger) -> None:
+    """Release-gate leg for the `tls_required` infra row's POLICY half: a remote
+    plaintext DSN is refused loudly, loopback plaintext is allowed, and an
+    enforced-TLS config is not silently overridden by `sslmode=disable` in the
+    URL. The residual (a real TLS handshake against a verified cert) still
+    needs a TLS-provisioned service and stays named in the matrix row."""
+    if not have("cargo"):
+        _skipped(led, "infra", "tls", "policy", "-", "tls-policy: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 5432):
+        _skipped(led, "infra", "tls", "policy", "-",
+                 "tls-policy: source Postgres :5432 down", "no source pg")
+        return
+    _drive_live_tests(
+        led, "infra", "tls", "policy",
+        "TLS policy (remote plaintext loud, loopback allowed, enforced not overridden)",
+        [
+            "sec_remote_plaintext_pg_is_loud",
+            "sec_loopback_plaintext_pg_is_allowed",
+            "sec_enforced_tls_is_not_overridden_by_url_sslmode_disable",
+        ],
+        "tls_policy.log",
+        "TLS policy",
+    )
+
+
+def verify_auth(led: Ledger) -> None:
+    """Release-gate leg for the `auth` infra row's SCRAM half: a least-privilege
+    SCRAM login exports every document (harm probe denial degrades, never
+    fails the run), and a WRONG password fails loud naming authentication with
+    zero parquet written. x509 cert auth stays the named residual."""
+    if not have("cargo"):
+        _skipped(led, "infra", "mongo", "auth", "-", "mongo-auth: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 27020):
+        _skipped(
+            led, "infra", "mongo", "auth", "-",
+            "mongo-auth: :27020 unreachable (docker compose up -d mongo-auth)",
+            "mongo-auth down",
+        )
+        return
+    _drive_live_tests(
+        led, "infra", "mongo", "auth",
+        "Mongo SCRAM auth (least-privilege export + wrong-password loud refusal)",
+        [
+            "mongo_readonly_login_exports_despite_denied_harm_probe",
+            "mongo_wrong_password_fails_loud_and_writes_nothing",
+        ],
+        "mongo_auth.log",
+        "mongo SCRAM auth",
+    )
+
+
+def verify_cdc_standby(led: Ledger) -> None:
+    """Release-gate leg for the `cdc_standby` infra row: bounded CDC against a
+    PostgreSQL STANDBY must fail LOUD with the actionable escape. The live test
+    self-skips (a plain `return`, which libtest counts as PASSED) when :5436 is
+    down — so this leg probes the port ITSELF and reports SKIP rather than
+    running the test and reading its self-skip as green (the vacuous-skip class
+    the state-parity leg documents)."""
+    if not have("cargo"):
+        _skipped(led, "infra", "pg", "cdc-standby", "-", "cdc-standby: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 5436):
+        _skipped(
+            led, "infra", "pg", "cdc-standby", "-",
+            "cdc-standby: :5436 unreachable (python3 -m dev.pytools.cdc_stand standby)",
+            "standby down",
+        )
+        return
+    _drive_live_tests(
+        led, "infra", "pg", "cdc-standby",
+        "CDC on a PostgreSQL standby (bounded run must fail loud, actionable)",
+        ["roast_pg_cdc_bounded_on_a_standby_fails_loud"],
+        "cdc_standby.log",
+        "CDC standby loud-fail",
+    )
 
 
 # ── coverage-ledger drift-guards PREFLIGHT (offline, runs ONCE) ──────────────

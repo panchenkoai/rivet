@@ -334,6 +334,13 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     """Everything that is source-agnostic, in the order the comments above give."""
     release_path.verify_release_build_path(led)
     scenarios.verify_state_migrations(led)
+    # The four infra rows the 2026-08-29 harness round wired: each drives
+    # RED-proven live tests through the release binary, probing its own
+    # infrastructure first (skip loudly, never a vacuous pass).
+    scenarios.verify_network_faults(led)
+    scenarios.verify_tls_required(led)
+    scenarios.verify_auth(led)
+    scenarios.verify_cdc_standby(led)
     scenarios.verify_inflight_run_stays_loadable(led)
     scenarios.verify_coverage_matrices(led)
     # Cheap and container-free: the flag surface is read from `rivet --help`,

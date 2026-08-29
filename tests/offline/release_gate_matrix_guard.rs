@@ -57,9 +57,10 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 // grid version gaps. Shrink-only: LOWER when a gap is filled; never raise.
 // History: 14 -> 13 (pooler_safety) -> 12 (state_upgrade) -> 11 (state_concurrency)
 // -> 10 (scale_memory wired as the verify_scale_memory flat-RSS preflight).
-// Now: infra gap rows(4: network_faults, tls_required, auth, cdc_standby) +
+// Now: infra gap rows(0 — network_faults/cdc_standby flipped to test,
+// tls_required/auth to partial with the residual named, 2026-08-29) +
 // grid version gaps(3+2+1+0=6) = 10.
-const GAP_RATCHET: usize = 10;
+const GAP_RATCHET: usize = 6;
 
 fn load(path: &str) -> Value {
     let s = super::nonvacuity::subject_text(path);
@@ -210,12 +211,36 @@ fn every_gate_function_has_a_ledger_row_and_vice_versa() {
     // exist twice — `gc_survival` runs as a local scenario (`sc_gc_survival`) and
     // again in the BigQuery stage (`verify_gc_survival`) — and which heading its
     // ledger row sits under is a fact about the stage, not about the name.
+    // `infra` rows became drivable on 2026-08-29 (network_faults / tls_required /
+    // auth / cdc_standby each got a verify_ leg), so the row that satisfies a
+    // verify_ function may live under any of the three headings.
+    let infra_ids: std::collections::BTreeSet<String> = seq(&gate, "infra")
+        .iter()
+        .map(|e| scalar(e.get("id").unwrap()))
+        .collect();
     for f in &verify_fns {
         assert!(
-            preflight_ids.contains(f) || scenario_ids.contains(f),
-            "the gate defines verify_{f}() but the gate matrix has no `preflights` \
-             or `scenarios` row `{f}`"
+            preflight_ids.contains(f) || scenario_ids.contains(f) || infra_ids.contains(f),
+            "the gate defines verify_{f}() but the gate matrix has no `preflights`, \
+             `scenarios` or `infra` row `{f}`"
         );
+    }
+    // An infra row promoted to status:test must have its verify_ leg, same as
+    // the preflights rule below — a `test` claim with no driver is decoration.
+    for e in seq(&gate, "infra") {
+        let id = scalar(e.get("id").unwrap());
+        // state_upgrade / state_concurrency are status:test WITHOUT their own
+        // verify_: their notes say (and the call-site guard verifies) they are
+        // driven by the state_migrations preflight's cargo filters.
+        if e.get("status").map(scalar).as_deref() == Some("test")
+            && id != "state_upgrade"
+            && id != "state_concurrency"
+        {
+            assert!(
+                verify_fns.contains(&id),
+                "infra row `{id}` is status:test but the gate modules have no verify_{id}()"
+            );
+        }
     }
     // A preflight marked status:test MUST have its verify_ function; a `gap` preflight
     // (not yet wired) legitimately has none.
