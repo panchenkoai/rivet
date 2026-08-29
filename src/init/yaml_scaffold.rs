@@ -512,22 +512,45 @@ fn export_block_lines(
     // `table:` is a ROUTING string, not SQL — always exact, and the ONLY form
     // Mongo accepts (round-7's lowercase-strict gate wrongly routed camelCase
     // collections into a `query:` Mongo refuses: a DOA scaffold, live-proven).
-    let table_form_safe = match source_type {
-        "postgres" => is_simple_pg_ident(&qualified_table),
-        "mongo" => true,
-        _ => {
-            // MySQL/MSSQL: no folding, but the config-side shortcut gate still
-            // wants a plain ident shape (no spaces/quotes/etc.).
-            qualified_table.split('.').all(|p| {
+    // MIRRORS `validate_table_shortcut_ident` (round-9): the scaffold's rule
+    // diverging from the config gate's produced DOA scaffolds twice — a
+    // >2-segment name the scaffold accepted and the validator refused, and a
+    // hyphenated Mongo collection whose two refusals pointed at each other.
+    let shortcut_shape_ok = {
+        let parts: Vec<&str> = qualified_table.split('.').collect();
+        parts.len() <= 2
+            && parts.iter().all(|p| {
                 !p.is_empty()
                     && p.chars()
                         .next()
                         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                     && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
-        }
+    };
+    let table_form_safe = match source_type {
+        "postgres" => shortcut_shape_ok && is_simple_pg_ident(&qualified_table),
+        // Mongo has ONLY the table: form — a name the gate cannot pass is
+        // unexportable in any form; the caller emits a commented-out block
+        // with the reason instead of a DOA config (round-9: `user-events`'s
+        // two refusals pointed at each other).
+        "mongo" => shortcut_shape_ok,
+        _ => shortcut_shape_ok,
     };
     let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
+    if source_type == "mongo" && !table_form_safe {
+        // Unexportable in ANY form today: `table:` is Mongo's only export form
+        // and the config gate refuses this name (while its "use query:" remedy
+        // is a form Mongo refuses — the circular pair round-9 live-proved).
+        return vec![
+            format!(
+                "  # SKIPPED collection {}: its name cannot pass the `table:`",
+                yaml_quote_if_needed(&info.table)
+            ),
+            "  #   identifier gate (letters/digits/_ segments, at most one dot), and".to_string(),
+            "  #   `table:` is the only export form MongoDB supports — rename the".to_string(),
+            "  #   collection or export it with another tool.".to_string(),
+        ];
+    }
     if table_form_safe
         && (is_keyset || (mode == "full" && (source_type == "postgres" || source_type == "mongo")))
         || source_type == "mongo"

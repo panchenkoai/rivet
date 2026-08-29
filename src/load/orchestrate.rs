@@ -33,14 +33,18 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // truth for what's loaded, so cleanup is safe for every mode and retry is
     // DB-driven (the GCS listing is only a fallback). A state-DB problem must
     // never fail a load — degrade to the stateless path.
-    let state = match StateStore::open(&args.config) {
-        Ok(s) => Some(s),
+    let (state, ledger_errored) = match StateStore::open(&args.config) {
+        Ok(s) => (Some(s), false),
         Err(e) => {
             eprintln!(
                 "  warning: state store unavailable ({e:#}); loading without a ledger \
                  (no incremental skip / audit log)"
             );
-            None
+            // The ERRORED half of the tri-state (round-9): `state=None` alone
+            // conflated a DB blip with absent-by-design, and the re-baseline
+            // guard then note-and-proceeded a doomed post-gap baseline on the
+            // very host whose ledger just blipped.
+            (None, true)
         }
     };
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
@@ -87,6 +91,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                         pk,
                         drift,
                         state.as_ref(),
+                        ledger_errored,
                         &load_id,
                     )? {
                         Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
@@ -934,11 +939,29 @@ enum RebaselineAction {
     Refuse,
 }
 
-fn rebaseline_action(warehouse_has_changes: bool, ledgered: bool) -> RebaselineAction {
-    match (warehouse_has_changes, ledgered) {
+/// `ledger` is a TRI-STATE (round-9): `state.is_some()` alone conflated a DB
+/// BLIP with absent-by-design — the blip arm note-and-proceeded a genuine
+/// post-gap baseline on exactly the co-located host whose ledger just errored
+/// (and cleanup_source then deleted the evidence). An errored ledger fails
+/// SAFE: refuse the snapshot-carrying load (nothing consumed), retry when the
+/// DB is back. Known residual, documented rather than hidden: `StateStore::
+/// open` auto-creates, so an EPHEMERAL-ledger host reads `Available` with an
+/// empty consumed-set and still refuse-loops on `initial: snapshot` streams —
+/// loud and actionable (keep a persistent ledger for CDC loads, or the tracked
+/// anchor-position structural fix), never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerSignal {
+    Available,
+    AbsentByDesign,
+    Errored,
+}
+
+fn rebaseline_action(warehouse_has_changes: bool, ledger: LedgerSignal) -> RebaselineAction {
+    match (warehouse_has_changes, ledger) {
         (false, _) => RebaselineAction::Proceed, // empty/truncated log: the recovery load
-        (true, true) => RebaselineAction::Refuse,
-        (true, false) => RebaselineAction::WarnStateless,
+        (true, LedgerSignal::Available) => RebaselineAction::Refuse,
+        (true, LedgerSignal::Errored) => RebaselineAction::Refuse,
+        (true, LedgerSignal::AbsentByDesign) => RebaselineAction::WarnStateless,
     }
 }
 
@@ -974,6 +997,7 @@ fn rebaseline_refusal_text(quoted_changes: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)] // the tri-state rides beside `state` (round-9)
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -981,6 +1005,7 @@ fn load_one_cdc(
     pk: &[String],
     allow_source_drift: bool,
     state: Option<&StateStore>,
+    ledger_errored: bool,
     load_id: &str,
 ) -> Result<Option<load::CdcLoadReport>> {
     let job = LoadJob {
@@ -1011,7 +1036,14 @@ fn load_one_cdc(
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             if shape {
                 let prior = loader.changes_has_prior_changes(&plan.table)?;
-                match rebaseline_action(prior, state.is_some()) {
+                let ledger = if ledger_errored {
+                    LedgerSignal::Errored
+                } else if state.is_some() {
+                    LedgerSignal::Available
+                } else {
+                    LedgerSignal::AbsentByDesign
+                };
+                match rebaseline_action(prior, ledger) {
                     RebaselineAction::Refuse => {
                         anyhow::bail!(
                             "{}",
@@ -1273,11 +1305,19 @@ mod load_ledger_tests {
         // The action table (round-8): refusal requires BOTH a non-empty log and
         // a ledger; stateless notes, an empty log always proceeds (the recovery
         // load). RED against collapsing the ledgered arm.
+        use LedgerSignal::*;
         use RebaselineAction::*;
-        assert_eq!(rebaseline_action(true, true), Refuse);
-        assert_eq!(rebaseline_action(true, false), WarnStateless);
-        assert_eq!(rebaseline_action(false, true), Proceed);
-        assert_eq!(rebaseline_action(false, false), Proceed);
+        assert_eq!(rebaseline_action(true, Available), Refuse);
+        assert_eq!(
+            rebaseline_action(true, Errored),
+            Refuse,
+            "a ledger BLIP must fail safe — note-and-proceed appended a doomed \
+             baseline and cleanup then deleted the evidence (round-9)"
+        );
+        assert_eq!(rebaseline_action(true, AbsentByDesign), WarnStateless);
+        for l in [Available, Errored, AbsentByDesign] {
+            assert_eq!(rebaseline_action(false, l), Proceed);
+        }
         let msg = rebaseline_refusal("p.d.t", crate::load::cdc::Warehouse::BigQuery);
         assert!(msg.contains("TRUNCATE TABLE `p.d.t__changes`"));
         let sf = rebaseline_refusal("d.s.t", crate::load::cdc::Warehouse::Snowflake);
