@@ -343,3 +343,98 @@ fn batch_row_hash_agrees_with_an_independent_reading_of_the_spec_postgres() {
     let mut c2 = pg_connect();
     let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
 }
+
+/// METABASE COHERENCE: rivet's own records must describe the run that actually
+/// happened — checked against the artifacts, not against each other.
+///
+/// The metabase has 17 tables. A survey on 2026-08-29 found `export_metrics`
+/// and `file_log` read by ~20 test files each, and THREE tables read by nobody:
+/// `export_shape`, `run_aggregate`, `strategy_snapshot`. `export_shape` is the
+/// sharp one — rivet writes a row per column on EVERY ordinary export (present
+/// in every state DB on the stand), the value-growth warning is built on it,
+/// and no test had ever compared it to the data it describes.
+///
+/// Three claims, each against an artifact:
+///   1. `run_status` is TERMINAL for a finished run — a stale `running` freezes
+///      the prefix for the gc's active-run signal.
+///   2. `export_metrics` records exactly ONE row for the run.
+///   3. `export_shape.max_byte_len` per column EQUALS the widest value that
+///      column carries in the delivered parquet, measured by DuckDB.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn batch_metabase_records_cohere_with_the_artifacts_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("bmeta");
+    let mut c = pg_connect();
+    // Widths chosen so each column has a DIFFERENT max: a fixture where every
+    // column is the same width cannot tell a per-column read from a constant.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, short TEXT, wide TEXT);
+         INSERT INTO {table} VALUES
+           (1, 'ab',   'abcdefghij'),
+           (2, 'a',    'abc'),
+           (3, NULL,   'abcdefg');"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_batch(&format!("public.{table}")).census_oracle();
+    rig.run_ok();
+
+    let db = StateDb::next_to_config(&rig.config_path());
+    let run_id = db.latest_run_id(rig.export_name());
+
+    // 1. terminal status
+    assert_eq!(
+        db.run_status_of(&run_id).as_deref(),
+        Some("success"),
+        "a finished run must record a TERMINAL status — a stale `running` row \
+         freezes this prefix for the gc's active-run signal"
+    );
+
+    // 2. exactly one metrics row
+    let m = db.metrics_row(&run_id);
+    assert_eq!(
+        m.total_rows,
+        Some(3),
+        "the run's own metrics row must describe this run: {m:?}"
+    );
+
+    // 3. export_shape vs the delivered parquet, per column, by DuckDB
+    let shape = db.shape_rows(rig.export_name());
+    assert!(
+        !shape.is_empty(),
+        "rivet writes export_shape on every export — an empty read means the \
+         table moved and this check would pass vacuously"
+    );
+    for (col, recorded) in &shape {
+        let actual = duckdb_dir_scalar(
+            &rig.out_dir(),
+            // `strlen` is DuckDB's BYTE length (verified: 'привет' -> 12),
+            // which is what `max_byte_len` names; `length` counts characters.
+            &format!("coalesce(max(strlen(CAST({col} AS VARCHAR))), 0)"),
+            None,
+        );
+        assert_eq!(
+            *recorded, actual,
+            "export_shape says column `{col}` peaked at {recorded} bytes; the \
+             delivered parquet says {actual}. Nothing compared these before — \
+             the value-growth warning is built on the recorded number"
+        );
+    }
+    // …and the per-column maxima must actually DIFFER, or the assertion above
+    // would pass against a constant.
+    let widths: Vec<i64> = shape.iter().map(|(_, w)| *w).collect();
+    assert!(
+        widths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1,
+        "fixture must give the columns different widths, or a per-column read \
+         and a constant are indistinguishable: {shape:?}"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}

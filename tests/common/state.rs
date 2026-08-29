@@ -157,6 +157,43 @@ impl StateDb {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// `export_shape` for one export: `(column, max_byte_len)`, sorted.
+    ///
+    /// The metabase table NOTHING read. Measured 2026-08-29: rivet writes a row
+    /// per column on every ordinary export (present in every state DB on the
+    /// stand), and across ~600 live tests not one read it back — so the value
+    /// the `max_byte_len` growth warning is built on had never been compared
+    /// against the data it describes. It is checkable exactly: the widest value
+    /// a column carries in the delivered parquet.
+    pub fn shape_rows(&self, export: &str) -> Vec<(String, i64)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT column_name, max_byte_len FROM export_shape \
+                 WHERE export_name = ?1 ORDER BY column_name",
+            )
+            .expect("prepare export_shape read");
+        let rows = stmt
+            .query_map([export], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .expect("query export_shape");
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// The recorded status of one run — `running` after a crash, terminal after
+    /// a finish. A run that FINISHED and still reads `running` freezes its
+    /// prefix for the gc's active-run signal.
+    pub fn run_status_of(&self, run_id: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT status FROM run_status WHERE run_id = ?1",
+                [run_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
     /// Every export-run `(name, status, duration_ms, total_rows)`, oldest first.
     ///
     /// Deliberately UNFILTERED by status. The pool's split advisor predicts from
