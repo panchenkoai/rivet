@@ -335,6 +335,41 @@ mod v016_checkpoint_compat {
     /// `validate.rs` does no I/O of its own beyond a `Destination` trait a test can
     /// supply, so every mutant in it is offline-reachable and a survivor is a plain
     /// gap — no live-only argument available. 92 mutants, 80 caught, 5 missed.
+    /// Round-10 STRUCT ordering, executed (the refuter found no test ordered
+    /// the ANCHOR shapes against EVENT shapes anywhere): each engine's
+    /// checkpoint/pin rendering — the exact string the snapshot stamp writes
+    /// into `__pos` — must parse and rank BELOW a later event and ABOVE an
+    /// earlier one. The MySQL pin carries 4 fields (uuid + gtid ride along);
+    /// extras must not break the parse.
+    #[test]
+    fn anchor_shaped_positions_order_against_event_positions() {
+        // MySQL: 4-field pin vs 2-field events.
+        let anchor = r#"{"file":"binlog.000007","pos":500,"server_uuid":"u","gtid_executed":""}"#;
+        let earlier = r#"{"file":"binlog.000007","pos":100}"#;
+        let later = r#"{"file":"binlog.000008","pos":4}"#;
+        assert!(
+            parse_pos(anchor).is_some(),
+            "extras must not break the parse"
+        );
+        assert!(parse_pos(earlier) < parse_pos(anchor));
+        assert!(parse_pos(anchor) < parse_pos(later));
+        // PostgreSQL: slot LSN text vs a later commit LSN.
+        let pos = |lsn: &str| format!(r#"{{"lsn":"{lsn}"}}"#);
+        assert!(parse_pos(&pos("0/16B2D48")) < parse_pos(&pos("0/16B2D50")));
+        // SQL Server: the pinned anchor carries {"lsn","pinned"}; events carry
+        // {"lsn"} — the same JSON family, extras ignored, fixed-width hex
+        // orders lexically == numerically.
+        assert!(
+            parse_pos(r#"{"lsn":"0000002a000001f80003","pinned":true}"#)
+                < parse_pos(r#"{"lsn":"0000002a000002000001"}"#)
+        );
+        // MongoDB: the pin IS a resume token — same keystring family as events.
+        assert!(
+            parse_pos(r#"{"_data":"8264AA00000000000129"}"#)
+                < parse_pos(r#"{"_data":"8264AB00000000000129"}"#)
+        );
+    }
+
     #[test]
     fn the_position_verdict_the_order_check_and_the_lsn_key_all_answer_for_themselves() {
         use super::{PositionCheck, check_order, parse_pos};

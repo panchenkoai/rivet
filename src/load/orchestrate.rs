@@ -965,46 +965,6 @@ fn rebaseline_shape(uris: &[String], plan_prefix: &str) -> bool {
     })
 }
 
-/// Is the staged snapshot leg STAMPED (round-10 STRUCT) — does its parquet
-/// carry the constant `__pos` column? A stamped baseline ORDERS correctly in
-/// the dedup (anchor beats pre-gap changes, loses to post-anchor ones), so
-/// the re-baseline refusal must let it through: the refusal exists for the
-/// legacy NULL-`__pos` shape only. One footer read of the first snapshot uri;
-/// unreadable → false (the refusal stays, fail-safe).
-fn snapshot_leg_is_stamped(store: &crate::destination::gcs::GcsStore, uris: &[String]) -> bool {
-    let Some(uri) = uris.iter().find(|u| u.contains("/snapshot/")) else {
-        return false;
-    };
-    let Ok((_, key)) = crate::load::split_gs_uri(uri) else {
-        return false;
-    };
-    let Ok(body) = store.read(key) else {
-        return false;
-    };
-    // Footer via a temp file — the same shape value_checksum's readers use.
-    let Ok(mut tmp) = tempfile::NamedTempFile::new() else {
-        return false;
-    };
-    use std::io::Write as _;
-    if tmp.write_all(&body).and_then(|_| tmp.flush()).is_err() {
-        return false;
-    }
-    let Ok(file) = tmp.reopen() else {
-        return false;
-    };
-    use parquet::file::reader::{FileReader as _, SerializedFileReader};
-    let Ok(reader) = SerializedFileReader::new(file) else {
-        return false;
-    };
-    reader
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .any(|c| c.name() == "__pos")
-}
-
 /// What the re-baseline guard does, given the two signals it can read.
 ///
 /// Round-8 lifecycle HIGH: a STATELESS load re-selects EVERY Success run each
@@ -1073,7 +1033,9 @@ fn rebaseline_refusal_text(quoted_changes: &str) -> String {
          {quoted_changes} already holds real change rows — a re-snapshot row \
          carries NULL `__pos` and LOSES the dedup to every prior change, so the \
          current-state view would keep serving PRE-GAP values for exactly the rows \
-         this re-snapshot fixed. Nothing was consumed by this refusal. Recovery: \
+         this re-snapshot fixed — and even an anchor-stamped baseline cannot \
+         express a PK DELETED during the gap (no row, no tombstone: its stale \
+         pre-gap rows would win). Nothing was consumed by this refusal. Recovery: \
          1) TRUNCATE TABLE {quoted_changes}; 2) re-run this same `rivet load` \
          — it will then append the baseline into the empty log and proceed \
          (cdc-failure-modes.md)."
@@ -1118,39 +1080,37 @@ fn load_one_cdc(
             // into a __changes prior cycles already fed (see rebaseline_shape/rebaseline_action).
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             if shape {
-                // A STAMPED baseline (round-10) orders correctly by its anchor
-                // `__pos` — nothing to refuse; the guard is for the legacy
-                // NULL-`__pos` shape.
-                if snapshot_leg_is_stamped(store, &inputs.uris) {
-                    eprintln!(
-                        "  note: the staged snapshot carries the anchor __pos stamp — it \
-                         orders correctly in the dedup, so the re-baseline guard does \
-                         not apply."
-                    );
+                // The refusal stands EVEN FOR A STAMPED baseline (round-10
+                // refuter, HIGH): the anchor stamp fixes the ORDERING half
+                // (adds/updates rank correctly), but no snapshot can express a
+                // PK DELETED during the gap — it has no row and no tombstone,
+                // so its pre-gap change rows would win the dedup and the view
+                // would serve the PK live-with-stale-values, silently and
+                // permanently. TRUNCATE remains the only complete remedy when
+                // the log already holds changes; a first cut here bypassed the
+                // guard for stamped legs and reopened exactly that hole.
+                let prior = loader.changes_has_prior_changes(&plan.table)?;
+                let ledger = if ledger_errored {
+                    LedgerSignal::Errored
+                } else if state.is_some() {
+                    LedgerSignal::Available
                 } else {
-                    let prior = loader.changes_has_prior_changes(&plan.table)?;
-                    let ledger = if ledger_errored {
-                        LedgerSignal::Errored
-                    } else if state.is_some() {
-                        LedgerSignal::Available
-                    } else {
-                        LedgerSignal::AbsentByDesign
-                    };
-                    match rebaseline_action(prior, ledger) {
-                        RebaselineAction::Refuse => {
-                            anyhow::bail!(
-                                "{}",
-                                rebaseline_refusal(&loader.fqtn(&plan.table), loader.warehouse())
-                            );
-                        }
-                        RebaselineAction::WarnStateless => eprintln!(
-                            "  note: this STATELESS load re-selects the snapshot leg every \
+                    LedgerSignal::AbsentByDesign
+                };
+                match rebaseline_action(prior, ledger) {
+                    RebaselineAction::Refuse => {
+                        anyhow::bail!(
+                            "{}",
+                            rebaseline_refusal(&loader.fqtn(&plan.table), loader.warehouse())
+                        );
+                    }
+                    RebaselineAction::WarnStateless => eprintln!(
+                        "  note: this STATELESS load re-selects the snapshot leg every \
                          cycle (at-least-once, absorbed by the dedup view) — the \
                          re-baseline refusal needs the ledger to tell a genuine \
                          re-snapshot from a routine re-load, so it does not apply here.",
-                        ),
-                        RebaselineAction::Proceed => {}
-                    }
+                    ),
+                    RebaselineAction::Proceed => {}
                 }
             }
             // The driver gates the appended delta against the manifests' summed
@@ -1710,59 +1670,6 @@ mod live_only_decisions {
             spec_manifest_column_drift(&["id".into()], &[m]).is_empty(),
             "checksum-less manifests carry no column names — nothing to compare"
         );
-    }
-
-    /// Round-10 STRUCT: the stamped-baseline detector reads one snapshot
-    /// footer — a `__pos`-bearing snapshot bypasses the re-baseline refusal
-    /// (it orders correctly), a legacy one keeps it. RED against inverting
-    /// the column check.
-    #[test]
-    fn a_stamped_snapshot_bypasses_and_a_legacy_one_keeps_the_guard() {
-        use std::sync::Arc;
-        let dir = tempfile::tempdir().unwrap();
-        let store = fs_store(&dir);
-        let snap = dir.path().join("base/snapshot");
-        std::fs::create_dir_all(&snap).unwrap();
-        let write_pq = |path: &std::path::Path, with_pos: bool| {
-            let mut fields = vec![arrow::datatypes::Field::new(
-                "id",
-                arrow::datatypes::DataType::Int64,
-                false,
-            )];
-            if with_pos {
-                fields.push(arrow::datatypes::Field::new(
-                    "__pos",
-                    arrow::datatypes::DataType::Utf8,
-                    false,
-                ));
-            }
-            let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-            let mut cols: Vec<arrow::array::ArrayRef> =
-                vec![Arc::new(arrow::array::Int64Array::from(vec![1]))];
-            if with_pos {
-                cols.push(Arc::new(arrow::array::StringArray::from(vec!["{}"])));
-            }
-            let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), cols).unwrap();
-            let f = std::fs::File::create(path).unwrap();
-            let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
-            w.write(&batch).unwrap();
-            w.close().unwrap();
-        };
-        write_pq(&snap.join("stamped.parquet"), true);
-        write_pq(&snap.join("legacy.parquet"), false);
-        assert!(snapshot_leg_is_stamped(
-            &store,
-            &["gs://b/base/snapshot/stamped.parquet".to_string()]
-        ));
-        assert!(!snapshot_leg_is_stamped(
-            &store,
-            &["gs://b/base/snapshot/legacy.parquet".to_string()]
-        ));
-        // No snapshot uri at all → not stamped (the guard question never arises).
-        assert!(!snapshot_leg_is_stamped(
-            &store,
-            &["gs://b/base/cdc-000000.parquet".to_string()]
-        ));
     }
 
     /// THE ROUND-4 TOCTOU, at the boundary and through the real producer: a run

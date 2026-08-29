@@ -368,9 +368,15 @@ pub(super) fn initial_snapshot_pending(
     // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
     // the same `Position.0.to_string()` the drain writes into `__pos`, read
     // from the checkpoint ensure_anchor just persisted. Engines whose anchor
-    // is server-side-only (PG with no checkpoint file) yield None — those
-    // snapshots keep the legacy NULL-`__pos` shape (documented residual; init
-    // always sets `cdc.checkpoint:`, so the configured path is covered).
+    // is server-side-only yield None and keep the legacy NULL-`__pos` shape.
+    // HONESTY (round-10 refuter): on PostgreSQL the RECOVERY flow is exactly
+    // that case — the prescribed recovery deletes the checkpoint file and PG's
+    // ensure_anchor never rewrites one (the slot is the anchor; the sink
+    // recreates the file only at first ack, AFTER the snapshots run) — so a
+    // PG re-baseline is never stamped and stays behind the refusal+truncate
+    // guard. The stamp covers checkpointed non-recovery snapshots (a table
+    // added mid-stream) and the MySQL/MSSQL/Mongo recovery flows, whose
+    // ensure_anchor persists the pin before the snapshots.
     let anchor_pos = ckpt_path
         .as_deref()
         .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())

@@ -179,9 +179,9 @@ fn redact_query_secrets(s: &str) -> String {
         "password",
         "apikey",
         "api_key",
+        "api-key",
         "secret",
         "signature",
-        "credential",
         "sig",
     ];
     fn is_secret_key(key: &str) -> bool {
@@ -210,9 +210,10 @@ fn redact_query_secrets(s: &str) -> String {
             out.push_str("=***");
             let after = &rest[key_end + 1..];
             let val_end = after
-                .find(|c: char| {
-                    matches!(c, '&' | '\'' | '"' | ')' | ':' | ',' | ';') || c.is_whitespace()
-                })
+                // `)` closes reqwest's ` for url (…)`; `:`/`,` deliberately NOT
+                // stops (round-10 refuter: they truncated redaction mid-secret —
+                // `password=abc:def` leaked `:def`).
+                .find(|c: char| matches!(c, '&' | '\'' | '"' | ')' | ';') || c.is_whitespace())
                 .map(|i| key_end + 1 + i)
                 .unwrap_or(rest.len());
             rest = &rest[val_end..];

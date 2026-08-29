@@ -5100,7 +5100,8 @@ fn cdc_cross_database_enum_enriches_from_the_tables_own_schema() {
 /// for the warehouse load: `read_parquet(union_by_name=true)` over BOTH the
 /// `initial: snapshot` leg AND the CDC change leg mimics the loader's
 /// declared-schema LOAD-by-name into one `<table>__changes` table (snapshot rows
-/// get `__op`/`__pos`/`__seq` = NULL). It is the exact `fda1653` class: a
+/// get `__op` = NULL; since round-10 a checkpointed snapshot leg STAMPS
+/// constant `__pos`/`__seq=-1`, legacy legs stay NULL). It is the exact `fda1653` class: a
 /// snapshot leg that KEPT its batch `meta_columns` would leak a column the CDC
 /// stream lacks — silent under count/sum checks, breaks the warehouse load one
 /// layer up. The current-state dedup is then verified against the SOURCE's actual
