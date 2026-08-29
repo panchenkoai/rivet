@@ -48,11 +48,24 @@ fn matrix() -> Value {
 }
 
 fn shapes(m: &Value) -> Vec<&Value> {
-    m.get("shapes")
+    let out: Vec<&Value> = m
+        .get("shapes")
         .and_then(|s| s.as_sequence())
         .expect("`shapes:` sequence")
         .iter()
-        .collect()
+        .collect();
+    // Floor, like `cdc_engines()` above: every per-shape check below iterates
+    // this list, so a truncated `shapes:` (a bad YAML edit, a deleted block)
+    // would pass everything vacuously over the remainder. 12 shapes as of
+    // 2026-08-29 — raise freely when adding one; lowering is a decision to
+    // argue in the commit that deletes a shape.
+    assert!(
+        out.len() >= 12,
+        "cdc-evidence-matrix declares only {} shape(s) — the ledger shrank; a deleted \
+         shape is coverage silently un-asked",
+        out.len()
+    );
+    out
 }
 
 fn shape_id(s: &Value) -> String {

@@ -21,7 +21,7 @@
 # (exit-code classification, ${param} placeholder resolution) and are tracked by
 # their own tests + the `cli_*` rows in docs/fail-loud-matrix.yaml, not here.
 
-engines: [metrics, journal, files, chunks, progression, loads]
+engines: [metrics, journal, files, chunks, progression, loads, runs]
 
 scenarios:
   - id: unknown_export_rejected
@@ -32,6 +32,7 @@ scenarios:
     chunks:      { test: inspect_handlers_reject_an_unknown_export }
     progression: { test: inspect_handlers_reject_an_unknown_export }
     loads:       { na: "state loads has no -e/--export — it scopes by --target, whose empty-vs-filter-miss contract is the zero_row_request_not_empty_state row below." }
+    runs:        { na: "state runs has no -e/--export — it lists run-status rows ACROSS exports (scoped by --running/--last); the escape hatch pairs with finish-run, which takes a run_id, not an export name." }
 
   - id: zero_row_request_not_empty_state
     what: "--last 0 asks for ZERO rows — an empty result is then a zero-row request, NOT an empty ledger, so the 'no <X> recorded yet' text is suppressed (the --json path already returns []). (dogfood LOW: the two were conflated, so a --last 0 on a POPULATED ledger read as empty state.)"
@@ -41,3 +42,4 @@ scenarios:
     chunks:      { na: "state chunks takes no --last — it shows one export's LATEST chunk run, not a bounded list, so there is no zero-row request to conflate." }
     progression: { na: "state progression takes no --last — it lists ALL committed/verified boundaries, not a bounded window." }
     loads:       { test: empty_loads_message_distinguishes_zero_request_and_filter_miss }
+    runs:        { test: state_runs_refuses_a_missing_config_and_last_zero_tells_the_truth }

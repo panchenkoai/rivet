@@ -60,9 +60,9 @@ impl Rig {
     ///
     /// Returns the new directory so a caller can read the two legs separately.
     pub fn resume_into_fresh_dest(&mut self) -> PathBuf {
-        // The leg number is derived from what is on disk rather than carried as
-        // state: two calls in one test must not collide, and a rig that never
-        // resumed must still get `out2`.
+        // Uniqueness comes from `unique_name`'s pid+counter, so two calls in
+        // one test cannot collide. (An older comment here described a
+        // derive-from-disk `out2` scheme that was never implemented.)
         // A shared-workdir pair, not a tempdir path: the DuckDB oracle reads from
         // INSIDE a container, so a resume destination it cannot see would make every
         // assertion downstream read zero — the failure mode that looks like data loss
@@ -88,10 +88,22 @@ impl Rig {
     /// Panics on a missing directory rather than returning `[]`: "no manifest" and "the
     /// run delivered nothing" must not look alike.
     pub fn read_declared_parts(&self) -> Vec<arrow::record_batch::RecordBatch> {
+        // Same refusal `run_and_read` carries: a cloud/stdout rig's LOCAL out
+        // dir exists (dest_precreate) and holds no manifests, so this would
+        // return `[]` — indistinguishable from "zero parts declared", the
+        // exact vacuity the module header promises to refuse (harness audit,
+        // 2026-08-29).
+        assert!(
+            self.cloud_dest.is_none() && !self.dest_stdout,
+            "read_declared_parts reads the rig's LOCAL out dir, but this rig \
+             writes to a cloud/stdout destination — read the destination store \
+             directly (mc/HTTP oracle), or drop the cloud dest"
+        );
         let dir = self.out_dir();
         assert!(
             dir.is_dir(),
-            "read_declared_parts: {} is not a directory — a missing dir is a harness bug,              never zero parts",
+            "read_declared_parts: {} is not a directory — a missing dir is a \
+             harness bug, never zero parts",
             dir.display()
         );
         let mut declared: Vec<PathBuf> = Vec::new();
@@ -111,6 +123,17 @@ impl Rig {
         for m in &copies {
             let text = std::fs::read_to_string(m).expect("read a manifest");
             let doc: serde_json::Value = serde_json::from_str(&text).expect("parse a manifest");
+            // SUCCESS manifests only — same loader rule as
+            // `declared_parquet_parts` (a Failed/Interrupted manifest's parts
+            // are gc candidates, not delivered data; live-proven on the keyset
+            // refused-resume fixture, 2026-08-29).
+            let ok = doc
+                .get("status")
+                .and_then(|s| s.as_str())
+                .is_none_or(|s| s.eq_ignore_ascii_case("success"));
+            if !ok {
+                continue;
+            }
             for part in doc
                 .get("parts")
                 .and_then(|p| p.as_array())
@@ -146,9 +169,12 @@ impl Rig {
                 ));
                 std::fs::create_dir_all(&one).expect("stage a declared part");
                 let link = one.join(p.file_name().expect("part file name"));
-                if !link.exists() {
-                    std::fs::copy(p, &link).expect("stage a declared part");
-                }
+                // Always overwrite: part names key off the stable run_id, so a
+                // resume/retry can CHANGE the bytes under an unchanged name —
+                // an `if !exists` guard would re-read the first call's bytes
+                // (the stale-staging class stage_declared_for_duckdb already
+                // clears first for).
+                std::fs::copy(p, &link).expect("stage a declared part");
                 read_all_parts(&one)
             })
             .collect::<Vec<_>>()
@@ -229,13 +255,27 @@ impl Rig {
     /// wrong one reads zero rows, which looks exactly like an empty source.
     fn oracle_engine(&self) -> super::super::duckdb::OracleEngine {
         use super::super::duckdb::OracleEngine as E;
+        // Port-discriminated for EVERY family, not just postgres: the readers
+        // attach to the CDC-stand containers (mysql-cdc/mssql-cdc/mongo-rs), so
+        // mapping a MAIN-stand rig onto them censuses the WRONG SERVER — SQL
+        // engines fail loudly on the missing table, but a mongo_batch rig scans
+        // an absent collection as EMPTY, the silent source-0 this method's own
+        // doc warns about (harness audit, 2026-08-29). No main-stand reader is
+        // wired yet, so the honest answer for those rigs is a refusal.
         match self.source_type {
             "postgres" if self.source_url.contains(":5434") => E::PostgresCdc,
             "postgres" => E::Postgres,
-            "mysql" => E::MysqlCdc,
-            "mssql" => E::MssqlCdc,
-            "mongo" => E::MongoRs,
-            other => panic!("row_census has no DuckDB reader for source type `{other}`"),
+            "mysql" if self.source_url.contains(":3307") => E::MysqlCdc,
+            "mssql" if self.source_url.contains(":1434") => E::MssqlCdc,
+            "mongo" if self.source_url.contains(":27018") => E::MongoRs,
+            other => panic!(
+                "row_census has no DuckDB reader for this rig (source type `{other}`, \
+                 url `{}`): only the CDC-stand instances (pg :5434, mysql :3307, \
+                 mssql :1434, mongo-rs :27018) and main-stand postgres are wired. \
+                 Censusing a main-stand rig through a CDC-stand reader would grade \
+                 the wrong server — wire the reader before using row_census here.",
+                self.source_url
+            ),
         }
     }
 

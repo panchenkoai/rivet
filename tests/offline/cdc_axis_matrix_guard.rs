@@ -265,11 +265,14 @@ fn uncovered_axes_do_not_grow() {
         "{MATRIX}'s `gap_ratchet` and this test's constant disagree — they are one number in two \
          places and must be moved together."
     );
-    if n > GAP_RATCHET {
-        panic!(
-            "{n} CDC axes are marked `gap`, the ratchet is {GAP_RATCHET}. Leaving an axis \
-             unswept is a decision; make it out loud by raising the ratchet in the commit that \
-             explains why, or cover it and lower the ratchet."
-        );
-    }
+    // TWO-SIDED (matrix audit, 2026-08-29): the one-directional form let a
+    // closed gap keep the old ceiling, so the win was never banked and a later
+    // regression could spend it silently. Down is as loud as up.
+    assert_eq!(
+        n, GAP_RATCHET,
+        "{n} CDC axes are marked `gap`, the ratchet says {GAP_RATCHET}. Up: leaving an axis \
+         unswept is a decision — raise the ratchet in the commit that explains why. Down: a \
+         gap you closed must be banked — lower GAP_RATCHET and `gap_ratchet:` together in \
+         this commit."
+    );
 }

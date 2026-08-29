@@ -191,6 +191,10 @@ def _declared(root):
             art = json.load(open(d))
         except Exception:
             continue
+        # SUCCESS manifests only — the loader's rule, mirroring the Rust
+        # resolvers (a failed/interrupted manifest's parts are gc candidates).
+        if str(art.get("status") or "success").lower() != "success":
+            continue
         for f in art.get("parts") or []:
             if isinstance(f, dict) and f.get("status") not in (None, "committed"):
                 continue

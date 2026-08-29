@@ -57,6 +57,9 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.85.7
+        with:
+          tool: cargo-nextest
 
       - name: Start services
         # `proxysql` lives in the same `pool` docker-compose profile as
@@ -196,11 +199,13 @@ jobs:
         # so all along), so the exclusion has to be written HERE where a reader can
         # see it rather than hidden in the harness.
         run: |
-          cargo test --release -- --ignored \
-            --skip full_content_export_max_pressure \
-            --skip validates --skip edge_cases --skip via_duckdb \
-            --skip mongo \
-            --skip warehouse_cell
+          # nextest, not plain `cargo test`: tests/live_suite.rs's own header
+          # says the per-test process isolation this consolidation relies on is
+          # GONE under the default libtest harness — and getrusage(RUSAGE_
+          # CHILDREN) claims (soak_spill's RSS ceiling) are unattributable when
+          # sibling tests share one process (harness audit, 2026-08-29).
+          cargo nextest run --release --run-ignored ignored-only \
+            -E 'not (test(full_content_export_max_pressure) or test(validates) or test(edge_cases) or test(via_duckdb) or test(mongo) or test(warehouse_cell))'
 
       - name: Dump service logs on failure
         if: failure()
@@ -245,6 +250,9 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.85.7
+        with:
+          tool: cargo-nextest
 
       - name: Start Mongo stack
         # minio + fake-gcs ride along for the engine-agnostic chunking_stand
@@ -271,10 +279,8 @@ jobs:
         # `stand_` would also select the mysql/mssql stand tests, whose engines
         # this slim stack does not run).
         run: |
-          cargo test --release --test live_suite -- --ignored \
-            live_mongo live_cdc_mongo \
-            stand_dest_gcs_mongo stand_dest_s3_mongo \
-            stand_format_csv_mongo stand_compression_codecs_mongo
+          cargo nextest run --release --run-ignored ignored-only \
+            -E 'binary(live_suite) and (test(live_mongo) or test(live_cdc_mongo) or test(stand_dest_gcs_mongo) or test(stand_dest_s3_mongo) or test(stand_format_csv_mongo) or test(stand_compression_codecs_mongo))'
 
       - name: Dump Mongo logs on failure
         if: failure()
@@ -333,6 +339,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.85.7
+        with:
+          tool: cargo-nextest
       - name: Start the CDC stack at the scouted tag
         run: |
           export ${{ matrix.env }}=${{ matrix.tag }}
@@ -344,8 +353,9 @@ jobs:
           else
             FILTER="live_cdc::pg_cdc_"
           fi
-          cargo test --test live_suite -- --ignored "$FILTER" \
-            --skip gcs --skip toxiproxy 2>&1 | tail -20
+          cargo nextest run --run-ignored ignored-only \
+            -E "binary(live_suite) and test($FILTER) and not (test(gcs) or test(toxiproxy))" \
+            2>&1 | tail -20
       - name: Stop services
         if: always()
         run: docker compose down -v
@@ -362,6 +372,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.85.7
+        with:
+          tool: cargo-nextest
       - name: Download the previous release binary
         # Downloaded, never rebuilt: the release profile is fat-LTO, and the
         # published asset is what users actually run.
@@ -414,6 +427,9 @@ jobs:
         if: steps.day.outputs.sunday == 'yes'
       - uses: Swatinem/rust-cache@v2
         if: steps.day.outputs.sunday == 'yes'
+      - uses: taiki-e/install-action@v2.85.7
+        with:
+          tool: cargo-nextest
       - name: Start CDC stack
         if: steps.day.outputs.sunday == 'yes'
         run: docker compose --profile cdc up -d mysql-cdc

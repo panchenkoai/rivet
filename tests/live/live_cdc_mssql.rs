@@ -264,7 +264,13 @@ fn mssql_cdc_mixed_transaction_and_qualified_table_conformance() {
     std::fs::create_dir_all(&out2).unwrap();
     let qualified = format!("dbo.{orders}");
     mssql_cdc_rig(&qualified, &ci_o, &ckpt, &out1).run_ok();
-    assert_eq!(manifest_rows(&out1), 1, "qualified table: must capture");
+    // CONTENT (harness audit): the two tables share id 1, so a mis-route kept
+    // the count at 1 and passed — this file's own doc names the blindness.
+    assert_eq!(
+        cdc_id_ops(&out1),
+        vec![(1, "insert".to_string())],
+        "exactly the ORDERS row"
+    );
 
     // And the checkpoint advanced past the mixed transaction.
     mssql_cdc_rig(&qualified, &ci_o, &ckpt, &out2).run_ok();
@@ -381,10 +387,13 @@ fn gremlin_mssql_capture_job_stall_loses_nothing() {
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
     mssql_cdc_rig(&table, &ci, &ckpt, &out3).run_ok();
+    // CONTENT (harness audit #1): "loses nothing" graded by manifest_rows
+    // alone let a restart that re-read (1,10) and dropped (3,30) pass at
+    // count 2. The ids themselves are the claim.
     assert_eq!(
-        manifest_rows(&out3),
-        2,
-        "changes landed during the stall must appear after the job restarts"
+        cdc_id_ops(&out3),
+        vec![(2, "insert".to_string()), (3, "insert".to_string())],
+        "exactly the two stall-window rows, by id — not any two rows"
     );
 }
 
@@ -616,10 +625,9 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
     std::fs::create_dir_all(&out).unwrap();
     mssql_cdc_rig(&table, &ci, &ckpt, &out).run_ok();
     assert_eq!(
-        manifest_rows(&out),
-        2,
-        "events must be routed by the REAL table name (from cdc.change_tables), \
-         not by parsing the capture-instance name"
+        cdc_id_ops(&out),
+        vec![(1, "insert".to_string()), (2, "insert".to_string())],
+        "both rows ROUTED (the historic 6-of-8 loss was count-invisible)"
     );
 }
 
@@ -875,6 +883,18 @@ fn mssql_cdc_uniqueidentifier_value_is_preserved() {
     assert!(
         parquet_col0_present(&out, "u"),
         "uniqueidentifier must be captured (16 canonical bytes), not dropped to NULL"
+    );
+    // VALUE, not presence (harness audit #10): the test's NAME promises the
+    // value is preserved, and SQL Server's Guid byte order differs from
+    // RFC-4122 — a wrong-endian capture is non-NULL and was passing. DuckDB
+    // renders the canonical text; compare to the literal we inserted.
+    let rendered = duckdb_dir_parquet_distinct_strings(&out, "u");
+    assert_eq!(
+        rendered,
+        ["12345678-1234-1234-1234-123456789012".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the CANONICAL uuid text must round-trip — byte order included"
     );
 }
 
@@ -2745,15 +2765,19 @@ fn mssql_cdc_a_marker_only_snapshot_survives_a_fresh_state_db() {
         "a fresh state DB with the marker intact must NOT re-snapshot — new part \
          names here mean a duplicated baseline appended under status: success"
     );
-    // The outcome, not only the file-set: the original baseline is still the
-    // READABLE 2 rows (a wiped-and-rewritten set of the same names would lie
-    // to the name comparison above).
+    // The outcome through the INDEPENDENT codec (harness audit #9): the
+    // rig's own reader shares rivet's parquet crate, and a count of 2 says
+    // nothing about WHICH rows survived. DuckDB reads the id set + sum.
     assert_eq!(
-        read_all_parts(&snap)
-            .iter()
-            .map(|b| b.num_rows())
-            .sum::<usize>(),
-        2,
-        "run 1's baseline must be byte-for-byte the one still standing"
+        duckdb_dir_parquet_id_set(&snap),
+        [1, 2]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<i64>>(),
+        "run 1's baseline ids must be the ones still standing"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(&snap, "sum(v)", None),
+        30,
+        "and their VALUES, not merely their count"
     );
 }

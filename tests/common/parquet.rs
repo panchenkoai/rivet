@@ -251,6 +251,53 @@ pub fn duckdb_dir_parquet_ids(dir: &Path) -> Vec<i64> {
 }
 
 /// The distinct `id` values under `dir`, read by DuckDB.
+/// [`duckdb_dir_parquet_id_set`], but over the MANIFEST-DECLARED parts only —
+/// the loader's view. A glob counts orphan parts no manifest names; on a crash
+/// suite that difference IS the claim (harness audit: the gremlin final union
+/// rode the glob and its own sibling file documents the glob as MASKING the
+/// ack→manifest window loss).
+pub fn duckdb_declared_dir_id_set(dir: &Path) -> BTreeSet<i64> {
+    let staged = stage_declared_for_duckdb(dir);
+    let sql = format!("SELECT DISTINCT id FROM read_parquet('{staged}/**/*.parquet') ORDER BY id");
+    // `duckdb_run_sql_json` emits {columns:[..], rows:[[..]]} with every cell
+    // STRINGIFIED (same shape `duckdb_dir_scalar` documents). The first cut of
+    // this helper parsed the top level as an array-of-objects and
+    // `unwrap_or_default()`ed the mismatch into an EMPTY SET — a completeness
+    // oracle that silently answers "zero rows" on its own parse bug is the
+    // absence-is-not-success class wearing a DuckDB badge (caught live,
+    // 2026-08-29: arrow saw 30 ids, this saw 0). Parse the real shape; PANIC
+    // on anything else.
+    let v = super::duckdb_run_sql_json(&sql);
+    let rows = v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb returned no rows array for `{sql}`: {v}"));
+    rows.iter()
+        .map(|r| {
+            r.get(0)
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| panic!("unparseable id cell in `{sql}`: {r}"))
+        })
+        .collect()
+}
+
+/// A scalar over the MANIFEST-DECLARED parts only (the loader's view) — the
+/// generic sibling of [`duckdb_declared_dir_id_set`] for tables whose key is
+/// not an `id` int. Same why: a glob counts orphan parts of FAILED attempts
+/// (a refused resume exports ranges before refusing at finalize), and those
+/// are the `gc_orphans` case, not delivered data.
+pub fn duckdb_declared_dir_scalar(dir: &Path, expr: &str) -> i64 {
+    let staged = stage_declared_for_duckdb(dir);
+    let sql = format!("SELECT {expr} FROM read_parquet('{staged}/**/*.parquet')");
+    let v = super::duckdb_run_sql_json(&sql);
+    v["rows"]
+        .get(0)
+        .and_then(|r| r.get(0))
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("duckdb returned no scalar for `{sql}`: {v}"))
+}
+
 pub fn duckdb_dir_parquet_id_set(dir: &Path) -> BTreeSet<i64> {
     duckdb_dir_parquet_ids(dir).into_iter().collect()
 }
@@ -653,6 +700,19 @@ pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
         let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        // SUCCESS manifests only — the loader's rule (a part in a Failed/
+        // Interrupted manifest is a gc DELETE candidate, not delivered data).
+        // Live-proven 2026-08-29: a crashed keyset run leaves a `failed`
+        // manifest copy whose part NAMES a refused resume then re-creates
+        // under the same run stamp, so without this filter the union counted
+        // 500 undelivered rows as declared (2500 vs the true 2000).
+        let ok = doc
+            .get("status")
+            .and_then(|s| s.as_str())
+            .is_none_or(|s| s.eq_ignore_ascii_case("success"));
+        if !ok {
+            continue;
+        }
         for part in doc
             .get("parts")
             .and_then(|p| p.as_array())

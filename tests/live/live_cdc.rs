@@ -291,8 +291,15 @@ fn cdc_throughput_drains_a_large_backlog() {
     run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
     let secs = t.elapsed().as_secs_f64();
 
-    // Correctness at scale: nothing dropped under volume.
+    // Correctness at scale: nothing dropped under volume — graded by DuckDB
+    // (independent codec), not by rivet's own counter (harness audit: the
+    // suite's ONLY at-scale CDC test was manifest_rows-only).
     assert_eq!(manifest_rows(&out), N, "all {N} changes must be captured");
+    assert_eq!(
+        duckdb_dir_scalar(&out, "count(DISTINCT id)", None),
+        N,
+        "the destination must HOLD all {N} ids, not merely count them"
+    );
 
     // Throughput: logged for trend-watching, plus a generous wall-clock ceiling so
     // a catastrophic perf regression fails the test without machine-variance flake.
@@ -1768,7 +1775,13 @@ fn cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     c.query_drop("COMMIT").unwrap();
 
     run_rivet_ok(&cdc_config(&d, &orders, &ckpt, &out1));
-    assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
+    // CONTENT, not count (harness audit): the fixture's two tables share id 1,
+    // so a mis-route of the audit row kept the count at 1 and passed.
+    assert_eq!(
+        cdc_id_ops(&out1),
+        vec![(1, "insert".to_string())],
+        "exactly the ORDERS row — the audit row must not be routed here"
+    );
 
     // Run 3 with NO new changes must capture ZERO — a stalled checkpoint
     // would re-read the same transaction and duplicate the row.
@@ -1818,7 +1831,11 @@ fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &orders, &slot, &out1));
-    assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
+    assert_eq!(
+        cdc_id_ops(&out1),
+        vec![(1, "insert".to_string())],
+        "exactly the ORDERS row — the audit row must not be routed here"
+    );
     run_rivet_ok(&pg_cdc_config(&d, &orders, &slot, &out2));
     assert_eq!(
         manifest_rows(&out2),
@@ -1849,9 +1866,9 @@ fn cdc_schema_qualified_table_config_captures_events() {
         .unwrap();
     run_rivet_ok(&cdc_config(&d, &qualified, &ckpt, &out));
     assert_eq!(
-        manifest_rows(&out),
-        1,
-        "a db-qualified table: must capture, not 0-row-success"
+        cdc_id_ops(&out),
+        vec![(1, "insert".to_string())],
+        "a db-qualified table: the ROW must land, not merely a count of 1"
     );
 }
 
@@ -1885,9 +1902,9 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
     let qualified = format!("public.{tbl}");
     run_rivet_ok(&pg_cdc_config(&d, &qualified, &slot, &out));
     assert_eq!(
-        manifest_rows(&out),
-        1,
-        "a schema-qualified table: must capture, not 0-row-success"
+        cdc_id_ops(&out),
+        vec![(1, "insert".to_string())],
+        "a schema-qualified table: the ROW must land, not merely a count of 1"
     );
 }
 

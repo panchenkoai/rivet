@@ -276,10 +276,14 @@ fn gaps_do_not_exceed_the_ratchet() {
         }
     }
 
-    assert!(
-        gaps <= GAP_RATCHET,
-        "release-gate-matrix has {gaps} gaps > ratchet {GAP_RATCHET} — you cannot ADD a gap; \
-         wire the check (flip gap -> test / gate the version) and LOWER the ratchet"
+    // TWO-SIDED (matrix audit, 2026-08-29): `<=` let a closed gap keep the old
+    // ceiling — the win was never banked, so a later regression could spend it
+    // silently. Down is as loud as up.
+    assert_eq!(
+        gaps, GAP_RATCHET,
+        "release-gate-matrix has {gaps} gaps, the ratchet says {GAP_RATCHET}. Up: you cannot \
+         ADD a gap — wire the check (flip gap -> test / gate the version). Down: a gap you \
+         closed must be banked — LOWER the ratchet in this commit."
     );
 }
 

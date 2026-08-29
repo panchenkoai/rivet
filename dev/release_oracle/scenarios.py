@@ -311,6 +311,11 @@ def _manifest_declared_parts(root: Path) -> list[str]:
             art = json.loads(d.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        # SUCCESS manifests only — the loader's rule (a failed/interrupted
+        # manifest's parts are gc candidates, not delivered data), mirroring
+        # tests/common's Rust + python resolvers (live-proven 2026-08-29).
+        if str(art.get("status") or "success").lower() != "success":
+            continue
         for f in art.get("parts", []) or []:
             if isinstance(f, dict) and f.get("status") not in (None, "committed"):
                 continue

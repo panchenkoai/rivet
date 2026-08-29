@@ -2424,12 +2424,23 @@ fn keyset_resume_refuses_when_a_committed_page_was_deleted_between_attempts() {
         "after the remedy the export must complete; stderr:\n{}",
         String::from_utf8_lossy(&rerun.stderr)
     );
-    let m: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap())
-            .expect("manifest.json after the remedied run");
+    // INDEPENDENT delivery proof (harness audit): manifest.json row_count is
+    // rivet's own counter — a run that miscounts agrees with itself. DuckDB
+    // reads the parquet with a codec rivet does not share — over the
+    // MANIFEST-DECLARED parts, not a glob: the REFUSED resume exported its
+    // missing ranges before refusing at finalize, and those unmanifested
+    // orphans (measured: 499 rows) are the gc_orphans case, not delivered
+    // data. A glob read 2499 here and graded the fixture, not the remedy.
     assert_eq!(
-        m["row_count"].as_i64(),
-        Some(2000),
-        "the remedied run must deliver the whole table"
+        duckdb_declared_dir_scalar(&out, "count(*)"),
+        2000,
+        "the remedied run must deliver the whole table — graded by DuckDB over \
+         the declared parts"
+    );
+    assert_eq!(
+        duckdb_declared_dir_scalar(&out, "count(DISTINCT uid)"),
+        2000,
+        "every key exactly once — loss and duplication are different failures \
+         and a bare count cannot tell them apart"
     );
 }

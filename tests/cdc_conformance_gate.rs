@@ -375,6 +375,11 @@ fn every_cdc_engine_covers_every_conformance_case() {
 #[test]
 fn derived_capture_marker_set_is_pinned() {
     let expected: Vec<&str> = vec![
+        // `Rig::apply_env` — `rivet apply` EXECUTES an export, so it is a
+        // capture; it went ungraded until the 2026-08-29 harness audit (the
+        // derivation matched run*/cli*/spawn*/drain* only, and apply_env also
+        // routed around the invoke seam).
+        "apply_env(",
         "cli(",
         "cli_env(",
         "cli_in_dir(",
@@ -597,7 +602,7 @@ fn derived_capture_markers() -> &'static Vec<String> {
                 let l = line.trim_start();
                 if let Some(rest) = l.strip_prefix("pub fn ")
                     && let Some(name) = rest.split('(').next()
-                    && ["run", "cli", "spawn", "drain"]
+                    && ["run", "cli", "spawn", "drain", "apply"]
                         .iter()
                         .any(|p| name.starts_with(p))
                 {
@@ -625,6 +630,80 @@ fn derived_capture_markers() -> &'static Vec<String> {
         );
         out
     })
+}
+
+/// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
+/// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
+/// "an outcome". The audit found ten `*loses_nothing*`/`*complete*`-named
+/// tests graded by rivet's own counters or its own parquet codec: a capture
+/// that miscounts agrees with itself, and the shared codec cancels encode
+/// faults. Independent = DuckDB (different codec), the four-way row_census,
+/// the server's own position, a source re-query, or the host-CLI oracles.
+///
+/// Tier 1 below stays the floor for every capture; this tier prices the
+/// claim in the NAME. A completeness test that genuinely cannot carry an
+/// independent oracle documents why in its body and renames itself out of
+/// the claim vocabulary — not around this gate.
+#[test]
+fn every_completeness_named_cdc_test_carries_an_independent_oracle() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let claim_words = [
+        "loses_nothing",
+        "lose_no",
+        "loses_no",
+        "without_gap",
+        "no_gap",
+        "captures_only",
+        "is_complete",
+        "complete_destination",
+        "nothing_dropped",
+        "must_appear",
+    ];
+    let independent = [
+        "duckdb_",             // every duckdb_* helper (different codec)
+        "row_census(",         // the four-way census
+        "assert_complete(",    // Rig -> duckdb container
+        "confirmed_flush_lsn", // the server's own position
+        "cdc_id_ops(",         // CONTENT assert (ids+ops): shared codec, but the
+        // strongest claim shape — allowed because every caller hand-writes the
+        // expectation from the SEED, not from rivet's output
+        "query_one(", // a source re-query
+    ];
+    let mut weak = Vec::new();
+    for entry in fs::read_dir(root.join("tests/live")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.contains("cdc") || !name.ends_with(".rs") {
+            continue;
+        }
+        let src = fs::read_to_string(&path).unwrap();
+        for raw in src.split("#[test]").skip(1) {
+            let chunk = clip_to_first_fn_body(raw);
+            let fn_name = chunk
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("fn "))
+                .unwrap_or("?")
+                .split('(')
+                .next()
+                .unwrap_or("?")
+                .to_string();
+            if !claim_words.iter().any(|w| fn_name.contains(w)) {
+                continue;
+            }
+            if independent.iter().any(|m| chunk.contains(m)) {
+                continue;
+            }
+            weak.push(format!("{name}::{fn_name}"));
+        }
+    }
+    assert!(
+        weak.is_empty(),
+        "these tests CLAIM completeness in their names but grade it with \
+         rivet's own counters/codec — a capture that miscounts agrees with \
+         itself. Add a class-(a) oracle (duckdb_*, row_census, assert_complete, \
+         a source re-query) or rename the claim out of the name:\n  {}",
+        weak.join("\n  ")
+    );
 }
 
 #[test]
@@ -716,12 +795,12 @@ fn every_live_cdc_test_asserts_an_outcome() {
             // process exited 0.
             let asserts_outcome = chunk.contains("manifest_rows")
                 // `cdc_id_ops` (-> `read_cdc_changes`, arrow straight off the
-                // parquet) is the STRONGEST marker in this list and was missing
-                // from it: a test asserting only that — i.e. reading the
-                // delivered rows and nothing else — was reported as asserting no
-                // outcome, while `manifest_rows` alone (rivet's own summary of
-                // its own writes) counted. Found when the first test to use the
-                // independent reader ALONE was rejected here (2026-08-17).
+                // parquet) asserts CONTENT (ids+ops), the strongest claim shape
+                // in this list — but its READER shares rivet's own
+                // arrow/parquet crate, so it is NOT an independent oracle
+                // (harness audit corrected an older comment here that called it
+                // one; `duckdb_*`/`row_census` are the independent class). A
+                // test asserting only cdc_id_ops was rejected here (2026-08-17).
                 || chunk.contains("cdc_id_ops")
                 || chunk.contains("assert_cdc_matches_batch")
                 || chunk.contains("read_one_batch")
@@ -770,7 +849,9 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // decoded events (the cdc-cli termination/backlog tests);
                 || chunk.contains("serde_json::from_str::<serde_json::Value>")
                 // Parquet re-read helpers (tests/common/parquet.rs): the seq
-                // helper reads __seq/__pos/counter columns back with DuckDB;
+                // helper reads __seq/__pos/counter columns back via the ARROW
+                // readers (shared codec — the duckdb_dir_* twins are the
+                // independent ones; an older comment here claimed DuckDB);
                 // deduped_current_sum folds a re-read change log. Registered
                 // when the rig migration made two mssql tests VISIBLE to this
                 // gate for the first time — they ran captures via a helper
@@ -790,7 +871,9 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // non-marker; a named-diagnostic assertion does not.
                 || chunk.contains("the stream-time refusal must name")
                 // `rivet validate` re-reads the destination (parts + manifest +
-                // checksums) — an independent read-back, not the capture's exit.
+                // checksums) — independent of the CAPTURE path, but it is
+                // rivet's own verdict: legitimate when the verdict IS the
+                // subject, never an independent oracle for data-truth claims.
                 || chunk.contains("args([\"validate\"")
                 // …and the same command driven through the rig, which supplies
                 // the config flag itself.

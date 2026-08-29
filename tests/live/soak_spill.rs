@@ -216,15 +216,32 @@ fn assert_soak_is_sound(rig: &Rig, engine: &str, expected: usize, rss_before: u6
         peak as f64 / 1e6,
         rss_before as f64 / 1e6,
     );
-    assert!(
-        peak <= rss_ceiling(),
-        "{engine}: a rivet child peaked at {:.1} MB, past the {:.1} MB ceiling. The \
-         spill exists to BOUND memory — growth here with RIVET_SOAK_ROWS is a spill \
-         that is quietly still buffering, which delivers identical rows and no \
-         ceiling at all.",
-        peak as f64 / 1e6,
-        rss_ceiling() as f64 / 1e6,
-    );
+    // The ceiling is attributable ONLY process-per-test: RUSAGE_CHILDREN is a
+    // process-wide high-water mark, so under plain `cargo test` (threads in one
+    // process) a heavier sibling reaped before `rss_before` inflates the
+    // baseline to where this soak's own regression moves the delta by ZERO —
+    // false-green on the one claim this soak exists for (harness audit,
+    // 2026-08-29: nightly ran exactly that shape). nextest sets NEXTEST=1 per
+    // test process; without it, say the measurement is unattributable instead
+    // of asserting a number that grades the wrong test.
+    if std::env::var_os("NEXTEST").is_some() {
+        assert!(
+            peak <= rss_ceiling(),
+            "{engine}: a rivet child peaked at {:.1} MB, past the {:.1} MB ceiling. The \
+             spill exists to BOUND memory — growth here with RIVET_SOAK_ROWS is a spill \
+             that is quietly still buffering, which delivers identical rows and no \
+             ceiling at all.",
+            peak as f64 / 1e6,
+            rss_ceiling() as f64 / 1e6,
+        );
+    } else {
+        eprintln!(
+            "soak/{engine}: RSS ceiling NOT asserted — not under nextest, so \
+             RUSAGE_CHILDREN mixes sibling tests' children and the delta grades \
+             the wrong process. Run under `cargo nextest` (make test-live) for \
+             the memory claim."
+        );
+    }
 
     // BOTH places a spill can land, because `spill_dir_for` picks by whether the
     // config has a checkpoint: beside it (`<ckpt dir>/.rivet-spill`) when there is

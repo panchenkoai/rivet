@@ -174,13 +174,21 @@ fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap() {
             break;
         }
     }
-    let ids = distinct_ids(&out);
+    // FINAL truth over the DECLARED set through the independent codec
+    // (harness audit #8): the glob above is only the loop's fast-path break —
+    // it counts orphan parts no manifest names, which is exactly the
+    // ack→manifest window this suite exists to catch.
+    let ids = duckdb_declared_dir_id_set(&out);
     assert_eq!(
         ids.len(),
         5_000,
-        "union of parts must hold every row (overlap ok, gap never); \
+        "union of DECLARED parts must hold every row (overlap ok, gap never); \
          killed_mid_drain={killed_mid_drain}"
     );
+    // seed_backlog seeds 0..rows — ids are 0-based (the first cut of these
+    // asserts assumed 1..=5000 and failed on the product being right).
+    assert_eq!(ids.iter().min(), Some(&0));
+    assert_eq!(ids.iter().max(), Some(&4_999));
 }
 
 // ── CG2: binlog stream cut after N bytes ─────────────────────────────────────
