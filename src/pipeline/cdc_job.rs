@@ -365,10 +365,22 @@ pub(super) fn initial_snapshot_pending(
         resume_expected,
     )?;
 
+    // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
+    // the same `Position.0.to_string()` the drain writes into `__pos`, read
+    // from the checkpoint ensure_anchor just persisted. Engines whose anchor
+    // is server-side-only (PG with no checkpoint file) yield None — those
+    // snapshots keep the legacy NULL-`__pos` shape (documented residual; init
+    // always sets `cdc.checkpoint:`, so the configured path is covered).
+    let anchor_pos = ckpt_path
+        .as_deref()
+        .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
+        .map(|p| p.0.to_string());
     let mut pending = Vec::new();
     for idx in pending_idx {
         let (label, read, snap_dcfg) = &table_dests[idx];
-        pending.push(synth_snapshot_export(export, label, read, snap_dcfg));
+        let mut synth = synth_snapshot_export(export, label, read, snap_dcfg);
+        synth.meta_columns.cdc_snapshot_pos = anchor_pos.clone();
+        pending.push(synth);
     }
     Ok(pending)
 }

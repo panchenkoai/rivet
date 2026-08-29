@@ -631,15 +631,23 @@ fn part_row_count_mismatch(
         // decode a single value.
         let actual = match SerializedFileReader::new(file) {
             Ok(r) => r.metadata().file_metadata().num_rows(),
-            // A part that will not open is NOT this check's business. Saying
-            // "declared N rows, holds ?" about an unreadable file tells the
-            // operator nothing they can act on, and classifying it here would
-            // widen what `--depth full` fails on for every run that records no
-            // checksums — which is how this landed on two fixtures whose subject
-            // was surplus labelling and which write a placeholder body. Form B
-            // classifies an undecodable part where checksums exist; this check
-            // stays narrow: a MIS-DECLARED count on a readable part.
-            Err(_) => continue,
+            // VERIFIED-WRONG, not skipped (round-10, closing the round-7 find):
+            // the presence reconcile already confirmed this part EXISTS at its
+            // declared size, so a body that will not open as Parquet is
+            // corrupt bytes — and skipping it here meant `--depth full`
+            // printed PASSED over literal garbage whenever the manifest
+            // recorded no checksums (every keyset/chunked/mongo_parallel run
+            // today). The old narrowness was a test-workaround leaked into the
+            // product; the fixtures now carry checksums and fail one gate
+            // earlier either way.
+            Err(e) => {
+                return Ok(Some(format!(
+                    "part '{}' is present at its declared size but does not decode \
+                     as the Parquet the manifest committed ({e}) — the bytes are \
+                     corrupt, not missing",
+                    part.path
+                )));
+            }
         };
         let declared = part.rows;
         if actual != declared {

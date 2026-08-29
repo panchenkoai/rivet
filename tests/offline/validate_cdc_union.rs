@@ -136,3 +136,54 @@ fn a_prior_cdc_cycles_deleted_part_fails_validate_at_sample_depth() {
         "the failure must be the presence class, at SAMPLE depth (no __pos backstop there): {all}"
     );
 }
+
+/// Round-10 (closing round-7 F2): a part PRESENT at its declared size whose
+/// bytes are not Parquet must fail `--depth full` even when the manifest
+/// records NO column_checksums (what every keyset/chunked/mongo_parallel run
+/// records today) — the old `Err(_) => continue` printed PASSED over literal
+/// garbage. RED against re-narrowing part_row_count_mismatch's unopenable arm.
+#[test]
+fn full_depth_fails_a_non_parquet_part_even_without_recorded_checksums() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let body = b"NOTPARQUET";
+    std::fs::write(out.join("part-000001.parquet"), body).unwrap();
+    let m = format!(
+        r#"{{"manifest_version":1,"run_id":"rb1","export_name":"orders","mode":"batch",
+"started_at":"2026-08-29T01:00:00Z","finished_at":"2026-08-29T01:01:00Z","status":"success",
+"source":{{"engine":"postgres","schema":"public","table":"orders","extraction":null}},
+"destination":{{"kind":"local","uri":"file:///x"}},"format":"parquet","compression":"zstd",
+"schema_fingerprint":"xxh3:0123456789abcdef","row_count":500,"part_count":1,
+"parts":[{{"part_id":1,"path":"part-000001.parquet","rows":500,"size_bytes":{},
+"content_fingerprint":"xxh3:1111111111111111","content_md5":"","status":"committed"}}]}}"#,
+        body.len()
+    );
+    std::fs::write(out.join("manifest.json"), m).unwrap();
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "source:\n  type: postgres\n  url: postgresql://nobody@localhost/nope\nexports:\n  - name: orders\n    query: \"SELECT 1\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: \"{}\"\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    let out_cmd = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args(["validate", "-c", cfg.to_str().unwrap(), "--depth", "full"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_cmd.status.code(),
+        Some(3),
+        "garbage bytes at declared size are VERIFIED-WRONG;\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_cmd.stdout),
+        String::from_utf8_lossy(&out_cmd.stderr)
+    );
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_cmd.stdout),
+        String::from_utf8_lossy(&out_cmd.stderr)
+    );
+    assert!(all.contains("does not decode"), "{all}");
+}

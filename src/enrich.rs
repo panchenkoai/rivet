@@ -81,7 +81,7 @@ impl RowHashContract {
 /// Fallible because `row_hash` may name a column this export does not project;
 /// that refusal belongs at schema time, before a single row is read.
 pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef> {
-    if !meta.exported_at && !meta.row_hash.enabled() {
+    if !meta.exported_at && !meta.row_hash.enabled() && meta.cdc_snapshot_pos.is_none() {
         return Ok(schema.clone());
     }
     // Resolved for its refusal, not its result: a name outside the projection
@@ -94,6 +94,12 @@ pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         )));
+    }
+    if meta.cdc_snapshot_pos.is_some() {
+        // The snapshot leg's anchor stamp (round-10): constant per run, typed
+        // exactly as the drain's columns so union_by_name lines them up.
+        fields.push(Arc::new(Field::new("__pos", DataType::Utf8, false)));
+        fields.push(Arc::new(Field::new("__seq", DataType::Int64, false)));
     }
     if meta.row_hash.enabled() {
         fields.push(Arc::new(Field::new(COL_ROW_HASH, DataType::Int64, false)));
@@ -109,7 +115,7 @@ pub fn enrich_batch(
     enriched_schema: &SchemaRef,
     exported_at_us: i64,
 ) -> Result<RecordBatch> {
-    if !meta.exported_at && !meta.row_hash.enabled() {
+    if !meta.exported_at && !meta.row_hash.enabled() && meta.cdc_snapshot_pos.is_none() {
         return Ok(batch.clone());
     }
 
@@ -120,6 +126,15 @@ pub fn enrich_batch(
         let ts_array =
             TimestampMicrosecondArray::from(vec![Some(exported_at_us); n]).with_timezone("UTC");
         columns.push(Arc::new(ts_array));
+    }
+
+    if let Some(pos) = meta.cdc_snapshot_pos.as_deref() {
+        // Order mirrors enrich_schema: __pos, __seq BEFORE row_hash.
+        columns.push(Arc::new(arrow::array::StringArray::from(vec![
+            Some(pos);
+            n
+        ])));
+        columns.push(Arc::new(arrow::array::Int64Array::from(vec![-1i64; n])));
     }
 
     if meta.row_hash.enabled() {
@@ -522,6 +537,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: true,
             row_hash: RowHash::All(true),
+            cdc_snapshot_pos: None,
         };
         let enriched = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(
@@ -547,6 +563,7 @@ mod tests {
             &MetaColumns {
                 exported_at: false,
                 row_hash: RowHash::All(true),
+                cdc_snapshot_pos: None,
             },
             &batch,
         );
@@ -554,6 +571,7 @@ mod tests {
             &MetaColumns {
                 exported_at: true,
                 row_hash: RowHash::All(true),
+                cdc_snapshot_pos: None,
             },
             &batch,
         );
@@ -599,6 +617,48 @@ mod tests {
         MetaColumns {
             exported_at: false,
             row_hash: spec,
+            cdc_snapshot_pos: None,
+        }
+    }
+
+    /// Round-10 STRUCT: the snapshot stamp appends a CONSTANT `__pos` (the
+    /// anchor string) + `__seq = -1` to every row — the columns whose absence
+    /// made a re-baseline lose the warehouse dedup to every pre-gap change.
+    /// RED against dropping either column or the -1.
+    #[test]
+    fn cdc_snapshot_stamp_appends_constant_pos_and_seq() {
+        let (schema, batch) = sample_batch();
+        let meta = MetaColumns {
+            exported_at: false,
+            row_hash: RowHash::All(false),
+            cdc_snapshot_pos: Some(r#"{"file":"binlog.000007","pos":42}"#.into()),
+        };
+        let enriched = enrich_schema(&schema, &meta).unwrap();
+        assert_eq!(
+            enriched.fields().len(),
+            schema.fields().len() + 2,
+            "__pos + __seq"
+        );
+        let out = enrich_batch(&batch, &meta, &enriched, 0).unwrap();
+        let pos = out
+            .column_by_name("__pos")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let seq = out
+            .column_by_name("__seq")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..out.num_rows() {
+            assert_eq!(pos.value(i), r#"{"file":"binlog.000007","pos":42}"#);
+            assert_eq!(
+                seq.value(i),
+                -1,
+                "must LOSE an exact-anchor tie to any change"
+            );
         }
     }
 
@@ -765,6 +825,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: false,
             row_hash: RowHash::All(false),
+            cdc_snapshot_pos: None,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 2);
@@ -778,6 +839,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: true,
             row_hash: RowHash::All(false),
+            cdc_snapshot_pos: None,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 3);
@@ -803,6 +865,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: false,
             row_hash: RowHash::All(true),
+            cdc_snapshot_pos: None,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.field(2).name(), COL_ROW_HASH);
@@ -826,6 +889,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: true,
             row_hash: RowHash::All(true),
+            cdc_snapshot_pos: None,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 4);
@@ -843,6 +907,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: false,
             row_hash: RowHash::All(true),
+            cdc_snapshot_pos: None,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
 
@@ -872,6 +937,7 @@ mod tests {
         let meta = MetaColumns {
             exported_at: false,
             row_hash: RowHash::All(true),
+            cdc_snapshot_pos: None,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();

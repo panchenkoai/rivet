@@ -2152,13 +2152,34 @@ fn rivet_validate_subcommand_drives_existing_m5_semantics_passing_path() {
     // Lay out a clean dataset using the public Destination + write_manifest
     // API — same shape `rivet run` produces.
     let dest_proxy = local_dest(&dest_dir);
-    let parts = vec![
-        part(1, 100, 4096, "xxh3:1111111111111111"),
-        part(2, 200, 8192, "xxh3:2222222222222222"),
+    // REAL parquet since round-10: zero-filled bodies relied on the
+    // `Err(_) => continue` skip that let full depth print PASSED over
+    // garbage; the fixture now writes genuine N-row files and takes the
+    // sizes from disk.
+    let write_pq = |path: &std::path::Path, rows: i64| -> u64 {
+        use std::sync::Arc;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(
+                (0..rows).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        std::fs::metadata(path).unwrap().len()
+    };
+    let mut parts = vec![
+        part(1, 100, 0, "xxh3:1111111111111111"),
+        part(2, 200, 0, "xxh3:2222222222222222"),
     ];
-    for p in &parts {
-        let body = vec![0u8; p.size_bytes as usize];
-        std::fs::write(dest_dir.join(&p.path), body).unwrap();
+    for p in &mut parts {
+        p.size_bytes = write_pq(&dest_dir.join(&p.path), p.rows);
     }
     let m = build_manifest("rivet_validate_e2e", ManifestStatus::Success, parts.clone());
     write_manifest(dest_proxy.as_writer(), &m).unwrap();
