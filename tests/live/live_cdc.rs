@@ -9118,6 +9118,26 @@ fn cdc_drain_row_hash_matches_the_independent_implementation() {
     .unwrap();
     run_rivet_ok(&cfg); // drain leg -> out/cdc-*.parquet
 
+    // ENV PRECHECK (completeness critic: the nightly runner installs neither
+    // host duckdb nor python-xxhash, and a missing dep must read as a SKIP,
+    // never as "the independent implementation DISAGREES"). Loud skip, not
+    // silent: absence-is-not-success.
+    let duck_ok = std::process::Command::new("duckdb")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let xxh_ok = std::process::Command::new("python3")
+        .args(["-c", "import xxhash"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !duck_ok || !xxh_ok {
+        skip_live(&format!(
+            "host oracle deps missing (duckdb CLI: {duck_ok}, python3+xxhash: {xxh_ok}) \
+             — install both to grade the drain leg's hashes"
+        ));
+        return;
+    }
+
     // Leg 1 of the oracle: DuckDB (host CLI) renders the drain parquet.
     let q = format!(
         "SELECT id, a, b, _rivet_row_hash AS h FROM read_parquet('{}/cdc-*.parquet') ORDER BY id",

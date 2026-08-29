@@ -772,7 +772,8 @@ fn dispatch_state(action: StateAction) -> Result<()> {
             config,
             running,
             last,
-        } => show_runs(&config, running, last),
+            json,
+        } => show_runs(&config, running, last, json),
         StateAction::FinishRun { config, run_id } => finish_run_cmd(&config, &run_id),
         StateAction::Loads {
             config,
@@ -799,10 +800,33 @@ fn require_config_file(config: &str) -> Result<()> {
     )
 }
 
-fn show_runs(config: &str, running_only: bool, last: usize) -> Result<()> {
+fn show_runs(config: &str, running_only: bool, last: usize, json: bool) -> Result<()> {
     require_config_file(config)?;
     let store = StateStore::open(config)?;
     let rows = store.recent_run_status(last, running_only)?;
+    if json {
+        // Machine leg (hostile reviewer: the footer drives a scripted flow) —
+        // same shape discipline as the sibling `--json` listings.
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "run_id": r.run_id,
+                    "export_name": r.export_name,
+                    "prefix": r.prefix,
+                    "status": r.status,
+                    "started_at": r.started_at,
+                    "finished_at": if r.finished_at.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(r.finished_at.clone())
+                    },
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         // `--last 0` clips everything: an empty listing then says NOTHING about
         // the DB, and "no running rows" would be an actively false all-clear

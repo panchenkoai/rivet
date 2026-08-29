@@ -297,6 +297,7 @@ Show the run-status ledger (extraction-run lifecycle rows gc/cleanup read)
 * `-l`, `--last <LAST>` — Number of recent rows to show
 
   Default value: `50`
+* `--json` — Emit the rows as a JSON array to stdout instead of the text table. Empty → `[]`
 
 
 

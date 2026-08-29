@@ -521,4 +521,8 @@ exclude_re = [
     # name ending in an escaped quote (`"a"""`) — so this exclusion is scoped to the
     # guard alone and does not blanket the line.
     "replace match guard in_quotes .* in split_top_level_commas",
+    # Bitwise-equivalent (round-10 triage): LOCK_EX and LOCK_NB share no bits,
+    # so `|`→`^` yields the identical value — no witness input exists.
+    "replace \\| with \\^ in spill_is_held",
+    "replace \\| with \\^ in SpillFile::create",
 ]

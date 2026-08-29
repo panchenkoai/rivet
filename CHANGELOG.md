@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- **New: `rivet state runs` and `rivet state finish-run`** — the frozen-prefix
+  escape hatch. `runs` lists the run-status ledger (gc/cleanup's activity
+  signal); `finish-run` terminal-stamps a row you KNOW is dead (hard crash with
+  no successful successor — nothing else can release it now that supersession
+  is success-only). The cleanup refusal names the commands.
+- **CDC re-baseline loads now REFUSE instead of appending silently-wrong
+  data.** A snapshot-carrying `rivet load` into a `<table>__changes` that
+  already holds change rows hard-fails with a per-warehouse `TRUNCATE`
+  prescription: a re-snapshot row cannot win the dedup against already-loaded
+  changes (and no snapshot can express a PK deleted during the gap), so the
+  view would silently keep serving pre-gap values. Stateless loads degrade to
+  a note; an errored state store refuses (fail-safe).
+- **Snapshot legs are anchor-stamped.** On checkpointed MySQL/SQL
+  Server/MongoDB flows the `initial: snapshot` parquet now carries constant
+  `__pos` (the CDC anchor) and `__seq = -1` columns, so a re-baseline orders
+  correctly in the warehouse dedup. PostgreSQL-without-a-checkpoint and
+  pre-existing snapshots keep the legacy NULL shape. Anyone querying
+  `__changes WHERE __pos IS NULL` to find baselines sees the new shape.
+- **`rivet validate` got stricter — previously-green runs can now exit 3.**
+  CDC prefixes presence-check EVERY cycle's committed parts (the dataset is
+  the union of run-unique manifests; deleting a historical part used to
+  validate PASSED), and a declared part that is present at its size but does
+  not decode as Parquet is VERIFIED-WRONG even when the manifest records no
+  checksums. Budget accordingly: `--depth full` on a long CDC stream now
+  honestly re-reads the accumulated history.
+- **Resume verifies the destination.** A chunked resume re-exports committed
+  chunks whose parts were deleted between attempts (destination probe + the
+  M8 rewrite path); a keyset resume REFUSES over a deleted committed page
+  (naming `rivet state reset`) instead of finalizing Success over a hole.
+- **gc/census supersession requires a newer SUCCESS.** A failed or
+  merely-running successor no longer retires a live run's marker; a failed
+  run's parts are spared until a Success supersedes them (checkpoint resumes
+  may still adopt them); dead `running` markers are retired via the
+  terminal-ledger sweep once `finish-run`/the split stamp closes their rows.
+- **New refusals of previously-accepted configs** (each was a silent
+  misbehaviour): `format: csv` under a `load:` block; `load:` on a non-GCS
+  destination (it silently listed a same-named GCS bucket); destination
+  prefixes with a `..` segment or an embedded URI scheme; `--split` with
+  `{date}`/`{run_id}` placeholders; equivalent checkpoint-path spellings; a
+  MySQL CDC open whose server-identity query fails (no more unverifiable
+  anchors); a MongoDB resume token whose `_data` is not a string.
+- **`rivet init` generates case-exact configs.** Mixed-case tables route
+  through a quoted `query:` (a `CaseTwin`/`casetwin` twin used to silently
+  export the WRONG table's rows), SELECT columns are quoted per engine (the
+  same twin bug at column level), Mongo always emits `table:` (hyphenated
+  collections get an honest SKIPPED comment), and `-o` refuses to overwrite
+  an existing file.
+- **CSV: NULL and the empty string are distinct at last.** A present empty
+  string renders as `""`; NULL stays the bare field (the PostgreSQL COPY
+  convention). Existing consumers see different bytes for empty strings;
+  DuckDB readers need `allow_quoted_nulls=false` to recover the distinction.
+- **Secrets scrubbed from more places.** URL query parameters carrying
+  token/password/api-key/signature families are redacted in errors and logs;
+  a Slack webhook delivery failure no longer prints the webhook URL (its
+  path IS the credential); load-path errors route through the redactor.
+- Smaller: BigQuery DDL backticks every column (reserved-word columns
+  survive); a set-but-missing `GOOGLE_APPLICATION_CREDENTIALS` is a loud
+  error naming the path; `RIVET_BQ_ACCESS_TOKEN` now takes precedence over
+  ADC resolution; `rivet check` preflight understands Mongo keyset
+  (`page_size`) and stops sparse-alarming configs that took its own
+  `chunk_count` advice; the doctor recognises MySQL's "Unknown database".
+
 - **CDC memory budgets measure memory now, with an operator-visible surface.**
   `rollover_memory_mb` gained a default (256 MiB) so absence no longer means "no
   byte budget" — wide-row tables roll parts by resident size where they previously

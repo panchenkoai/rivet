@@ -770,6 +770,46 @@ mod tests {
     }
 
     /// Off unix the fallback is the injected pid probe, sparing on doubt.
+    /// Seed generator for `fuzz/seeds/spill_frame_decode/` — gated like the
+    /// fixture regenerator: writes only under RIVET_REGENERATE_FIXTURES=1.
+    /// Seeds are REAL encode_event output, so the fuzzer starts from valid
+    /// frames instead of discovering the format from zero.
+    #[test]
+    fn regenerate_spill_fuzz_seeds() {
+        if std::env::var("RIVET_REGENERATE_FIXTURES").as_deref() != Ok("1") {
+            return;
+        }
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/spill_frame_decode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ev = |vals: Vec<crate::source::cdc::RivetValue>| crate::source::cdc::ChangeEvent {
+            op: crate::source::cdc::ChangeOp::Insert,
+            schema: "public".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vals),
+            position: crate::source::cdc::Position(serde_json::json!({"lsn":"0/1"})),
+            committed: true,
+            image_names: Some(std::sync::Arc::from(
+                vec!["id".to_string(), "v".to_string()].into_boxed_slice(),
+            )),
+            seq: 0,
+            poison: None,
+        };
+        use crate::source::cdc::RivetValue as V;
+        let seeds = [
+            ("scalar.bin", ev(vec![V::Int(1), V::Bytes(b"x".to_vec())])),
+            ("nulls.bin", ev(vec![V::Null, V::Null])),
+            (
+                "array.bin",
+                ev(vec![V::Array(vec![V::Int(1), V::Null]), V::Bool(true)]),
+            ),
+        ];
+        for (name, e) in seeds {
+            std::fs::write(dir.join(name), encode_event(&e)).unwrap();
+        }
+    }
+
     /// Round-10 mutants: `sweep_dead_spills_now` stubbed to () survived — the
     /// CDC-open sweep (round-5) had wiring but no direct grade. A flock-free
     /// rivet-shaped file is an orphan and must go; a foreign file stays.

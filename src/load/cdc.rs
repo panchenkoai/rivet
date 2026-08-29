@@ -208,8 +208,13 @@ pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
 /// even tie nondeterministically). The recovery bail and cdc-failure-modes.md
 /// therefore prescribe truncating `__changes` before the post-recovery load,
 /// and the CDC load driver REFUSES when it detects the shape on a ledgered
-/// load (rebaseline_action in orchestrate.rs; stateless degrades to a note). The structural fix —
-/// the snapshot leg stamping its anchor position instead of NULL — is tracked.
+/// load (rebaseline_action in orchestrate.rs; stateless degrades to a note).
+/// The anchor stamp SHIPPED (round-10: checkpointed MySQL/MSSQL/Mongo flows
+/// stamp constant `__pos`/`__seq=-1`; PG-no-checkpoint and legacy legs stay
+/// NULL) — it fixes the ORDERING half only. TRUNCATE remains the remedy
+/// because no snapshot can express a PK DELETED during the gap (no row, no
+/// tombstone: its pre-gap rows would win), so the refusal stands for stamped
+/// legs too.
 ///
 /// The subquery + `__rn` structure (rather than a `QUALIFY`) is deliberate: the
 /// flag must reflect the *winning* row per PK, computed **after** `ROW_NUMBER`.

@@ -209,7 +209,7 @@ impl TargetLoader for BigQueryLoader {
         let fqtn = self.fqtn(&format!("{table}__changes"));
         // LIMIT 1 inside: existence, not a full count, on an unbounded log.
         let sql = format!(
-            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM `{fqtn}` WHERE __pos IS NOT NULL LIMIT 1)"
+            "SELECT COUNT(*) AS n FROM (SELECT 1 FROM `{fqtn}` WHERE __op IS NOT NULL LIMIT 1)"
         );
         match self
             .api()?

@@ -228,7 +228,7 @@ impl TargetLoader for SnowflakeLoader {
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = 'rivet_probe_{tag}';\n\
              SELECT COUNT(*) AS PROBE_ FROM (SELECT 1 FROM {changes_fqtn} \
-             WHERE __pos IS NOT NULL LIMIT 1);"
+             WHERE __op IS NOT NULL LIMIT 1);"
         );
         match self.run_snow(&sql) {
             // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read

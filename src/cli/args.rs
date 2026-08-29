@@ -526,6 +526,10 @@ pub enum StateAction {
         /// Number of recent rows to show
         #[arg(short, long, default_value = "50")]
         last: usize,
+        /// Emit the rows as a JSON array to stdout instead of the text table.
+        /// Empty → `[]`.
+        #[arg(long)]
+        json: bool,
     },
     /// Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful
     /// successor) — the escape hatch for a prefix frozen by a stale `running` row

@@ -990,13 +990,29 @@ enum RebaselineAction {
 /// DB is back. Known residual, documented rather than hidden: `StateStore::
 /// open` auto-creates, so an EPHEMERAL-ledger host reads `Available` with an
 /// empty consumed-set and still refuse-loops on `initial: snapshot` streams —
-/// loud and actionable (keep a persistent ledger for CDC loads, or the tracked
-/// anchor-position structural fix), never silent.
+/// loud and actionable (keep a persistent ledger for CDC loads), never
+/// silent. The anchor stamp does NOT lift this: a snapshot cannot express a
+/// PK deleted during the gap, so the refusal stands for stamped legs too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LedgerSignal {
     Available,
     AbsentByDesign,
     Errored,
+}
+
+impl LedgerSignal {
+    /// The round-9 tri-state decision, NAMED (arch critic: the inline bool
+    /// ladder in the excluded body had zero counted tokens — invisible to the
+    /// purity gate and to mutants alike).
+    fn classify(errored: bool, present: bool) -> Self {
+        if errored {
+            LedgerSignal::Errored
+        } else if present {
+            LedgerSignal::Available
+        } else {
+            LedgerSignal::AbsentByDesign
+        }
+    }
 }
 
 fn rebaseline_action(warehouse_has_changes: bool, ledger: LedgerSignal) -> RebaselineAction {
@@ -1089,13 +1105,17 @@ fn load_one_cdc(
                 // permanently. TRUNCATE remains the only complete remedy when
                 // the log already holds changes; a first cut here bypassed the
                 // guard for stamped legs and reopened exactly that hole.
-                let prior = loader.changes_has_prior_changes(&plan.table)?;
-                let ledger = if ledger_errored {
-                    LedgerSignal::Errored
-                } else if state.is_some() {
-                    LedgerSignal::Available
-                } else {
-                    LedgerSignal::AbsentByDesign
+                // LEDGER FIRST (hostile-reviewer MUST-2): on the documented
+                // STATELESS deployment the uris carry the snapshot leg every
+                // cycle, and AbsentByDesign can never Refuse — probing there
+                // billed a full __pos column scan (BigQuery) or a warehouse
+                // resume (Snowflake) per table per cycle to choose between a
+                // note and silence. The probe runs only when its answer can
+                // change the decision.
+                let ledger = LedgerSignal::classify(ledger_errored, state.is_some());
+                let prior = match ledger {
+                    LedgerSignal::AbsentByDesign => true, // any value: same arm
+                    _ => loader.changes_has_prior_changes(&plan.table)?,
                 };
                 match rebaseline_action(prior, ledger) {
                     RebaselineAction::Refuse => {
@@ -1361,6 +1381,9 @@ mod load_ledger_tests {
         // load). RED against collapsing the ledgered arm.
         use LedgerSignal::*;
         use RebaselineAction::*;
+        assert_eq!(LedgerSignal::classify(true, true), Errored, "errored wins");
+        assert_eq!(LedgerSignal::classify(false, true), Available);
+        assert_eq!(LedgerSignal::classify(false, false), AbsentByDesign);
         assert_eq!(rebaseline_action(true, Available), Refuse);
         assert_eq!(
             rebaseline_action(true, Errored),
