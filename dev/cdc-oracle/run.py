@@ -61,8 +61,21 @@ def fresh_mysql_source(net: str) -> None:
        "-p", f"{MYSQL_FRESH_PORT}:3306",
        "-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
        "-e", "MYSQL_USER=rivet", "-e", "MYSQL_PASSWORD=rivet",
-       "mysql:8.0", "--server-id=7001", "--binlog_format=ROW")
-    probe = ["docker", "exec", MYSQL_FRESH_NAME, "mysql", "-uroot", "-privet", "-N", "-e"]
+       # binlog-row-metadata=FULL mirrors the stand (docker-compose.yaml pins it
+       # with eight lines of rationale). MySQL's OWN default is MINIMAL, so
+       # WITHOUT this the differential silently graded the POSITIONAL mapping
+       # path while the stand — and rivet's own recommendation — is the
+       # by-NAME path: measured, rivet warned "binlog_row_metadata = MINIMAL …
+       # maps values by POSITION" and the harness swallowed it.
+       "mysql:8.0", "--server-id=7001", "--binlog_format=ROW",
+       "--binlog-row-metadata=FULL")
+    # TCP, not the socket: mysql's entrypoint runs a TEMPORARY init server that
+    # listens on the SOCKET ONLY, so a socket probe reports ready, the init
+    # server then shuts down for the real one, and the next command dies with
+    # "Can't connect … through socket" (measured 2026-08-29). The same
+    # readiness-signal-is-not-the-thing class as Debezium's attach-vs-delivery.
+    probe = ["docker", "exec", MYSQL_FRESH_NAME, "mysql", "-h", "127.0.0.1",
+             "--protocol=tcp", "-uroot", "-privet", "-N", "-e"]
     for _ in range(90):
         if subprocess.run(probe + ["SELECT 1"], capture_output=True).returncode == 0:
             break
@@ -77,8 +90,8 @@ def fresh_mysql_source(net: str) -> None:
     )
     MYSQL_HOST_IN_NET = MYSQL_FRESH_NAME
     MYSQL_URL = f"mysql://rivet:rivet@127.0.0.1:{MYSQL_FRESH_PORT}/rivet"
-    MYSQL_EXEC = ["docker", "exec", MYSQL_FRESH_NAME,
-                  "mysql", "-uroot", "-privet", "rivet", "-N", "-e"]
+    MYSQL_EXEC = ["docker", "exec", MYSQL_FRESH_NAME, "mysql", "-h", "127.0.0.1",
+                  "--protocol=tcp", "-uroot", "-privet", "rivet", "-N", "-e"]
 
 
 MSSQL_HOST_IN_NET = os.environ.get("CDC_ORACLE_MSSQL_HOST", "mssql-cdc")
@@ -328,7 +341,11 @@ def main() -> int:
             # run's real verdict as "No such container").
             sh("docker", "rm", "-f", MYSQL_FRESH_NAME, check=False)
         else:
-            mysql(f"DROP TABLE IF EXISTS {t}, {t}_late")
+            # `_probe` included: without it the liveness probe's table leaked on
+            # the SHARED server and its fixed key made the second run die on a
+            # duplicate — the documented escape hatch was single-use, and the
+            # harness littered the very server whose litter it fled.
+            mysql(f"DROP TABLE IF EXISTS {t}, {t}_late, {t}_probe")
         subprocess.run(["rm", "-f", ckpt], check=False)
 
     cleanup()
@@ -526,8 +543,12 @@ quarkus.log.level=WARN
         # the comparison by compare.py's `%_probe` filter) proves the pipe
         # delivers DATA before the scenario is allowed to start.
         if a.engine == "mysql":
-            mysql(f"CREATE TABLE IF NOT EXISTS {t}_probe (id int PRIMARY KEY)")
-            mysql(f"INSERT INTO {t}_probe VALUES (1)")
+            mysql(f"CREATE TABLE IF NOT EXISTS {t}_probe (id bigint PRIMARY KEY)")
+            # A per-run key, so a leaked probe table from an interrupted run
+            # cannot make the next INSERT a duplicate-key failure (which
+            # mysql() turns into SystemExit -> a SKIPPED gate cell).
+            probe_key = int(time.time() * 1000)
+            mysql(f"INSERT INTO {t}_probe VALUES ({probe_key})")
             probe_jsonl = os.path.join(work, "debezium.jsonl")
             # 300s, not 120: measured 2026-08-29 on the shared mysql-cdc
             # (weeks of accumulated test tables), the connector takes 2-4
@@ -535,17 +556,44 @@ quarkus.log.level=WARN
             # events — a manual insert flowed only ~3.5min after start. The
             # probe's whole point is to absorb that warmup instead of letting
             # the 6s drain quiescence grade it as 4 rivet-only rows.
-            for _ in range(150):
+            # 300s only for a SHARED server (measured warmup there ranged into
+            # minutes); on the dedicated one the probe lands in seconds, and a
+            # long ceiling would just turn a broken stand into a 5-minute hang
+            # inside a 900s gate cell.
+            for _ in range(150 if not MYSQL_FRESH else 30):
                 if os.path.exists(probe_jsonl):
                     with open(probe_jsonl) as fh:
-                        if any(f'"{t}_probe"' in ln and '"op"' in ln for ln in fh):
+                        if any(str(probe_key) in ln and '"op"' in ln for ln in fh):
                             break
                 time.sleep(2)
             else:
+                # FACTS, not just a refusal: which is the ONE line that tells a
+                # harness race from a genuinely broken reference (the original
+                # diagnosis needed "server has purged some binlogs" out of the
+                # container log, read by hand).
+                blob = subprocess.run(["docker", "logs", srv],
+                                      capture_output=True, text=True).stdout + \
+                       subprocess.run(["docker", "logs", srv],
+                                      capture_output=True, text=True).stderr
+                msgs = [m for m in re.findall(r'"message":"(.*?)"', blob)][-6:]
+                delivered = sum(1 for _ in open(probe_jsonl)) if os.path.exists(probe_jsonl) else 0
+                tables = sorted(set(re.findall(r'"table":"([^"]+)"', 
+                    open(probe_jsonl).read() if os.path.exists(probe_jsonl) else "")))
+                # A MARKER on stdout the gate can grade: a bare SystemExit
+                # lands in the gate's catch-all and becomes a non-blocking
+                # SKIP, so the whole differential for an engine could vanish
+                # silently — the same class of loss the harness exists to
+                # catch, one layer up (critic RED-proof, 2026-08-29).
+                print("REFERENCE-STALLED: the reference pipe never delivered "
+                      "the liveness probe", flush=True)
                 raise SystemExit(
                     "Debezium never delivered the mysql liveness probe — the "
                     "reference pipe is stalled; refusing to run a scenario that "
-                    "would report the stall as a rivet finding")
+                    "would report the stall as a rivet finding.\n"
+                    f"  reference lines delivered: {delivered}\n"
+                    f"  source tables seen: {tables or '(none)'}\n"
+                    "  last connector messages:\n    "
+                    + "\n    ".join(dict.fromkeys(m[:200] for m in msgs)))
 
         # 5. the scenario — applied through the engine's own client
         binary = os.environ.get("RIVET_BIN", "./target/debug/rivet")
@@ -607,6 +655,11 @@ quarkus.log.level=WARN
         return subprocess.run([sys.executable, os.path.join(HERE, "compare.py"),
                                "--rivet-dir", out,
                                "--debezium-jsonl", os.path.join(work, "debezium.jsonl"),
+                               # The liveness probe's own table, by EXACT name:
+                               # its events are harness plumbing on the
+                               # reference side and must not read as a finding.
+                               *(["--exclude-table", f"{t}_probe"]
+                                 if a.engine == "mysql" else []),
                                # MongoDB's key is `_id` on both sides — rivet writes
                                # it under that name and Debezium's after-document
                                # carries it likewise.

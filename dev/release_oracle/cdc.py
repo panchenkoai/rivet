@@ -1174,6 +1174,18 @@ def verify_cdc_differential(led: "Ledger") -> None:
                            f"differential[{eng}/{scen}]: rivet delivered NOTHING "
                            f"while the reference captured events — total-loss "
                            f"outcome, not plumbing\n{tail}", "nothing delivered")
+            elif "REFERENCE-STALLED" in ((r.stdout or "") + (r.stderr or "")):
+                # The harness REFUSED because the reference never streamed. That
+                # is a statement about the stand, and it still FAILS: a SKIP here
+                # removes an engine's entire differential from the release with
+                # no ledger row demanding it back, and nothing counts SKIPs. The
+                # refusal carries the connector's own last messages, so the
+                # operator sees whether it is a race or a broken reference.
+                led.failed(eng, "cdc", f"differential:{scen}", "-",
+                           f"differential[{eng}/{scen}]: the REFERENCE never "
+                           f"streamed — no comparison happened, and a silent skip "
+                           f"would drop this engine's differential entirely\n{tail}",
+                           "reference stalled")
             else:
                 # Neither AGREE nor DISAGREE: the harness itself did not complete.
                 # Seven plumbing artefacts in two days say this happens, and a gate

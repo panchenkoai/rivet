@@ -216,7 +216,7 @@ infra:
     note: "pg_shared_state_cross_connection_visibility_and_supersession (src/state/run_status_store.rs) — two StateStore connections = two processes on one shared Postgres state: a run begun on A is active-visible to B (the gc_orphans signal), and a newer run supersedes the older clock-free. Run by the state_migrations preflight; RED-proven against a flipped supersession."
   - id: tls_required
     status: partial
-    note: "POLICY half gated: verify_tls_policy drives sec_remote_plaintext_pg_is_loud +
+    note: "POLICY half gated: verify_tls_required drives sec_remote_plaintext_pg_is_loud +
       sec_loopback_plaintext_pg_is_allowed + sec_enforced_tls_is_not_overridden_by_url_sslmode_disable.
       RESIDUAL: a real TLS handshake against a VERIFIED cert (the vendored-openssl / tiberius
       class) needs a TLS-provisioned service the stand does not have; the gate still runs
@@ -224,7 +224,7 @@ infra:
   - id: auth
     infra: mongo-auth
     status: partial
-    note: "SCRAM half gated: verify_mongo_auth drives mongo_readonly_login_exports_despite_denied_harm_probe
+    note: "SCRAM half gated: verify_auth drives mongo_readonly_login_exports_despite_denied_harm_probe
       (least-privilege export, DuckDB-graded) + mongo_wrong_password_fails_loud_and_writes_nothing
       (refusal names auth, zero parquet). RESIDUAL: x509 cert auth is a separate provisioning class"
   - id: cdc_standby
@@ -243,4 +243,6 @@ infra:
       17 confirmed, 8 adjudicated, 1 no-symbol, 0 contradicted. SKIPs without cargo-llvm-cov."
   - id: warehouse_load
     status: partial
-    note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"
+    note: "BigQuery live golden IS gated — driven by run_bigquery_golden (dev/release_oracle/bigquery.py),
+      which is this row's driver under a different name; Snowflake + ClickHouse are resolver/type-only (no live
+      load-and-readback) — ClickHouse is even a local compose service, cheap to add"

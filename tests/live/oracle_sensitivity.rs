@@ -46,6 +46,42 @@ fn write_ids_parquet(path: &Path, ids: &[i64]) {
     w.close().unwrap();
 }
 
+/// A CDC part carrying every column `read_cdc_changes` reads EXCEPT `__op` —
+/// the world where exactly one column is missing.
+///
+/// The first cut wrote an `id`-only part, which panicked on `v` long before
+/// `__op` was ever looked up; `should_panic(expected = "column present")` is a
+/// SUBSTRING and caught `"v column present"` just as happily. Measured by a
+/// critic: with the `__op` panic replaced by a silent `"MUTANT"` fallback, all
+/// twelve pairs stayed green — the ledger missed an oracle inventing an op for
+/// every row. The fixture must therefore be complete but for the one column
+/// under test, and the expectation must NAME that column.
+fn write_cdc_part_without_op(path: &Path, ids: &[i64]) {
+    let n = ids.len();
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("__seq", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("__pos", arrow::datatypes::DataType::Utf8, false),
+    ]));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(ids.to_vec())),
+            Arc::new(arrow::array::Int64Array::from(vec![7i64; n])),
+            Arc::new(arrow::array::Int64Array::from(
+                (0..n as i64).collect::<Vec<_>>(),
+            )),
+            Arc::new(arrow::array::StringArray::from(vec!["0/1"; n])),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+}
+
 /// Same shape but `id` is TEXT — the type-hostile world for the numeric leg.
 fn write_text_id_parquet(path: &Path, ids: &[&str]) {
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -108,8 +144,11 @@ fn oracle_declared_parts_skips_a_failed_manifests_parts() {
     );
 }
 
-/// PAIR: a part the manifest lists but does not mark committed is in-flight,
-/// not delivered. Mutant: drop the per-part status filter → RED.
+/// PAIR: a part the manifest lists but does not mark committed is not
+/// delivered. The non-committed value is `quarantined` — the ONLY other
+/// `PartStatus` the product has (src/manifest.rs); an earlier cut invented
+/// `"in-flight"`, a string no writer emits, which made the pair grade a
+/// fictional grammar. Mutant: drop the per-part status filter → RED.
 #[test]
 fn oracle_declared_parts_skips_an_uncommitted_part() {
     let d = tempfile::tempdir().unwrap();
@@ -119,7 +158,7 @@ fn oracle_declared_parts_skips_an_uncommitted_part() {
         d.path().join("manifest-run.json"),
         manifest_body(
             "success",
-            &[("pa.parquet", "committed"), ("pb.parquet", "in-flight")],
+            &[("pa.parquet", "committed"), ("pb.parquet", "quarantined")],
         ),
     )
     .unwrap();
@@ -131,8 +170,12 @@ fn oracle_declared_parts_skips_an_uncommitted_part() {
 
 /// PAIR (the gc_orphans class): an on-disk parquet no manifest names is a
 /// retry's abandoned attempt, not delivered data — the glob-vs-declared
-/// difference IS the claim on every crash suite. Mutant: fall back to a
-/// directory glob → RED.
+/// difference IS the claim on every crash suite.
+///
+/// HONEST about its strength: the mutant it names ("fall back to a directory
+/// glob") is a change nobody has made, so today this pair kills nothing — it
+/// is a guard against a FUTURE rewrite of the resolver, not evidence about the
+/// present one. Said here rather than left to read like a proof.
 #[test]
 fn oracle_declared_parts_ignores_an_orphan_part_on_disk() {
     let d = tempfile::tempdir().unwrap();
@@ -208,10 +251,10 @@ fn oracle_declared_parts_prefers_copies_over_the_canonical() {
 /// that silently yields nothing would turn every zero-expectation assert
 /// vacuous. Mutant: replace the column panic with a skip → RED.
 #[test]
-#[should_panic(expected = "column present")]
+#[should_panic(expected = "__op column present")]
 fn oracle_read_cdc_changes_panics_on_a_missing_op_column() {
     let d = tempfile::tempdir().unwrap();
-    write_ids_parquet(&d.path().join("pa.parquet"), &[1]);
+    write_cdc_part_without_op(&d.path().join("pa.parquet"), &[1]);
     std::fs::write(
         d.path().join("manifest-run.json"),
         manifest_body("success", &[("pa.parquet", "committed")]),
@@ -296,7 +339,12 @@ fn oracle_duckdb_declared_id_set_panics_on_a_text_id_column() {
 /// vacuous-[] class one leg over from the cloud refusal.
 #[test]
 #[ignore = "live: requires docker compose duckdb"]
-#[should_panic(expected = "python exec failed")]
+// The expectation names DuckDB's OWN message about the empty glob, not the
+// exec wrapper's "python exec failed": that wrapper string is produced by ANY
+// non-zero docker exec, so a critic proved both this pair and the corrupt-part
+// twin below pass green with the duckdb container ABSENT — the
+// fixture-fails-for-a-second-reason class, inside the ledger built to refuse it.
+#[should_panic(expected = "No files found")]
 fn oracle_duckdb_declared_scalar_panics_on_a_manifestless_dir() {
     let d = tempfile::tempdir().unwrap();
     write_ids_parquet(&d.path().join("orphan.parquet"), &[1]);
@@ -309,7 +357,9 @@ fn oracle_duckdb_declared_scalar_panics_on_a_manifestless_dir() {
 /// the python resolver.
 #[test]
 #[ignore = "live: requires docker compose duckdb"]
-#[should_panic(expected = "python exec failed")]
+// Same reason as the twin above: name the PARQUET decode failure, not the exec
+// wrapper — otherwise "the container is down" grades as "the oracle refused".
+#[should_panic(expected = "Invalid Input Error")]
 fn oracle_duckdb_declared_scalar_errors_loudly_on_a_corrupt_declared_part() {
     let d = tempfile::tempdir().unwrap();
     write_ids_parquet(&d.path().join("pa.parquet"), &[1]);

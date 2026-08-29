@@ -1209,35 +1209,69 @@ def _drive_live_tests(
     led: Ledger, area: str, a: str, b: str, phase: str, tests: list[str],
     log_name: str, fail_msg: str,
 ) -> None:
-    """Run named live_suite tests through the RELEASE binary (RIVET_BIN), the
-    same shape as verify_state_migrations' fresh leg: the test binary is debug
-    and only orchestrates; the rivet it spawns is what ships."""
+    """Run named live_suite tests through the RELEASE binary (RIVET_BIN).
+
+    EXACT names under nextest, for two reasons a critic RED-proved on the first
+    version (2026-08-29):
+
+    1. libtest's positional filters are SUBSTRINGS, and the old guard compared
+       the SUM of `test result: ok. N passed` against the COUNT of names. The
+       three network-fault names expand to six tests (engine siblings), so
+       renaming the one CDC test away still passed with five siblings covering
+       the count — the single binlog-cut test silently left the gate while the
+       docstring claimed "a renamed test cannot un-gate this row". Now every
+       NAMED test must appear as its own `PASS` line.
+    2. `tests/live_suite.rs` states in its own header that running the
+       consolidated suite WITHOUT nextest loses the per-test process isolation
+       these fault-injection tests depend on. The first version did exactly
+       what that header forbids.
+
+    A test that SELF-SKIPS (skip_live) is a vacuous pass — libtest and nextest
+    both count it green. `RIVET_SKIP_LOG` is the harness's own mechanism for
+    that; it was never wired to anything, so this drives it for every leg.
+    """
     led.phase(phase)
     log_path = work_dir() / log_name
+    skip_log = work_dir() / f"{log_name}.skips"
+    skip_log.write_text("")
+    # `test(=X)` matches the FULL nextest name (`<module>::<fn>`), so the bare
+    # fn name never matches; anchor the regex form at the end instead.
+    expr = " or ".join(f"test(/{t}$/)" for t in tests)
     res = run(
-        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
-         "--", "--ignored", "--test-threads=1", *tests],
-        env={"RIVET_BIN": str(rivet_bin())},
-        timeout=NO_TIMEOUT,
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all", "-E", expr],
+        env={"RIVET_BIN": str(rivet_bin()), "RIVET_SKIP_LOG": str(skip_log)},
+        timeout=3600,
     )
     log_path.write_text(res.out)
-    # Filters are positional substrings: a typo'd name selects NOTHING and
-    # libtest exits 0 — require the run to have executed at least as many
-    # tests as were named (absence is not success).
-    m = re.search(r"test result: ok\. (\d+) passed", res.out)
-    ran = int(m.group(1)) if m else 0
-    if res.ok and ran >= len(tests):
-        _passed(led, area, a, b, "-", f"{fail_msg}: {ran} test(s) green through the release binary")
-    elif res.ok:
+    # Each NAMED test must have its own PASS line — not a count that siblings
+    # can satisfy. nextest prints `PASS [   1.234s] (1/6) <binary> <module>::<name>`.
+    passed = {
+        m.group(1) for m in re.finditer(r"PASS \[[^\]]*\] \([^)]*\) \S+ (\S+)", res.out)
+    }
+    missing = [t for t in tests if not any(p.endswith(t) or p == t for p in passed)]
+    skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
+    if missing:
         _failed(
             led, area, a, b, "-",
-            f"{fail_msg}: filter matched only {ran} of {len(tests)} named tests — "
-            f"a renamed test silently un-gated this row (see {log_path})",
-            "filter under-matched",
+            f"{fail_msg}: named test(s) never passed: {', '.join(missing)} — a "
+            f"renamed or filtered-out test silently un-gates this row (see {log_path})",
+            "named test missing",
         )
+    elif skipped:
+        _failed(
+            led, area, a, b, "-",
+            f"{fail_msg}: {len(skipped)} test(s) SELF-SKIPPED, which libtest counts "
+            f"as green: {'; '.join(skipped[:3])} — bring the infrastructure up or "
+            f"the row grades nothing",
+            "vacuous self-skip",
+        )
+    elif res.ok:
+        _passed(led, area, a, b, "-",
+                f"{fail_msg}: {len(tests)} named test(s) green through the release binary")
     else:
         _failed(led, area, a, b, "-", f"{fail_msg} FAILED (see {log_path})",
-                _first_match(res.out, r"panicked|FAILED|error"))
+                _first_match(res.out, r"FAIL |panicked|error"))
 
 
 def verify_network_faults(led: Ledger) -> None:
@@ -1396,7 +1430,9 @@ def verify_live_only_coverage(led: Ledger) -> None:
     if verdict.ok:
         _passed(
             led, "infra", "live-only", "coverage", "-",
-            "live-only exclusions hold: " + verdict.out.strip().splitlines()[1].strip(),
+            "live-only exclusions hold: "
+            + next((ln.strip() for ln in verdict.out.strip().splitlines()
+                    if "confirmed" in ln), verdict.out.strip()[:120]),
         )
     else:
         _failed(

@@ -18,8 +18,13 @@ import argparse, glob, json, os, subprocess, sys, tempfile
 
 
 def declared_parts(root: str) -> list[str]:
-    """The parts the manifest declares as committed — mirrors declared_parquet_parts
-    (tests/common/parquet.rs) and _manifest_declared_parts (dev/release_oracle)."""
+    """The parts a SUCCESS manifest declares as committed — mirrors
+    declared_parquet_parts (tests/common/parquet.rs), DECLARED_PARTS_PY
+    (tests/common/duckdb.rs), Rig::read_declared_parts and
+    _manifest_declared_parts (dev/release_oracle). FIVE resolvers, not four:
+    the 2026-08-29 harness round fixed the other four and missed this one
+    (two independent critics caught it), which is exactly why the rule is to
+    collapse them onto one canonical resolver rather than keep mirroring."""
     copies = sorted(glob.glob(os.path.join(root, "manifest-*.json")))
     if not copies:
         c = os.path.join(root, "manifest.json")
@@ -29,6 +34,13 @@ def declared_parts(root: str) -> list[str]:
         try:
             art = json.load(open(d))
         except (OSError, json.JSONDecodeError):
+            continue
+        # SUCCESS manifests only: a failed/interrupted manifest's parts are gc
+        # candidates, not delivered data. Without this the differential counts
+        # a crashed attempt's parts as rivet output and prints them as
+        # `rivet-only` — the SAME false verdict shape this harness spent a
+        # whole commit diagnosing (2500 vs 2000 on the keyset fixture).
+        if str(art.get("status") or "success").lower() != "success":
             continue
         for p in art.get("parts") or []:
             if isinstance(p, dict) and p.get("status") not in (None, "committed"):
@@ -125,7 +137,7 @@ WHERE j <> ''
   -- The mysql liveness probe (run.py 4b) writes into <t>_probe, which is in
   -- Debezium's include-list ONLY so its delivery proves the pipe is live —
   -- its events are harness plumbing, not scenario data, on either side.
-  AND NOT ends_with(coalesce(jstr(j, '$.source.table'), ''), '_probe');
+  __PROBE_FILTER__;
 
 CREATE OR REPLACE VIEW riv AS
 SELECT __op AS op, CAST(__KEY__ AS VARCHAR) AS k __RIV_VALS__
@@ -136,6 +148,10 @@ FROM read_parquet(__PARTS__);
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rivet-dir", required=True)
+    ap.add_argument("--exclude-table", default="",
+                    help="a source table whose events are harness plumbing "
+                         "(run.py's liveness probe), excluded from the reference "
+                         "side by EXACT name")
     ap.add_argument("--debezium-jsonl", required=True)
     ap.add_argument("--key", required=True, help="the key column, on both sides")
     ap.add_argument("--value", action="append", default=[],
@@ -231,7 +247,16 @@ def main() -> int:
         )
     else:
         riv_vals = "".join(f", CAST({v} AS VARCHAR) AS v_{v}" for v in a.value)
-    sql = (SQL.replace("__DBZ_VALS__", dbz_vals)
+    # The liveness-probe table is excluded BY EXACT NAME, passed in by the
+    # caller — an `ends_with('_probe')` catch-all silently dropped any user
+    # table ending in `_probe` on EVERY engine, including the three that have
+    # no probe at all.
+    probe_filter = (
+        f"AND coalesce(jstr(j, '$.source.table'), '') <> '{a.exclude_table}'"
+        if a.exclude_table else "AND TRUE"
+    )
+    sql = (SQL.replace("__PROBE_FILTER__", probe_filter)
+              .replace("__DBZ_VALS__", dbz_vals)
               .replace("__RIV_VALS__", riv_vals)
               .replace("__DBZ__", a.debezium_jsonl)
               .replace("__KEY__", a.key)
@@ -261,6 +286,39 @@ ORDER BY 2, 3, 1;
     if r.returncode != 0:
         print(r.stderr, file=sys.stderr)
         return 1
+
+    # THE COMPARABLE-EVENT GUARD, on the right unit of measurement.
+    #
+    # The `dbz_lines == 0` guard above counts RAW LINES, and a STALLED reference
+    # is not silent: it emits schema/DDL events, which this comparison correctly
+    # filters out. Measured on real captures (2026-08-29): mysql 6 of 12 events
+    # are non-row, mssql **26 of 30** — so on those engines a reference that
+    # never delivered a single ROW still passes the raw-line guard, the drain
+    # quiesces on the schema traffic, and every rivet row lands as `rivet-only`.
+    # RED-proven by feeding an mssql capture stripped of its 4 row events to
+    # this script: DISAGREE, exactly `4 rivet-only rows` — the harness's own
+    # stall, reported as a rivet finding.
+    #
+    # This is the LOAD-BEARING fix for that class and it covers every engine.
+    # run.py's mysql liveness probe is belt-and-suspenders on top (it fails
+    # EARLY, before a scenario is even applied); postgres/mongo emit no
+    # schema events at all and were protected by the raw-line guard already.
+    comparable = subprocess.run(
+        ["duckdb", "-noheader", "-list", "-c",
+         sql.split("SELECT 'rivet-only'")[0] +
+         "SELECT (SELECT count(*) FROM dbz) || ' ' || (SELECT count(*) FROM riv);"],
+        capture_output=True, text=True)
+    dbz_n, riv_n = (comparable.stdout.strip().split() + ["?", "?"])[:2]
+    if dbz_n == "0" and riv_n not in ("0", "?"):
+        print(f"FAIL: the reference delivered {dbz_lines} event(s) but NONE of them "
+              f"is a comparable row change, while rivet delivered {riv_n}. That is a "
+              f"STALLED reference (its schema/DDL traffic keeps the raw-line guard "
+              f"from firing), not a rivet finding — every rivet row would print as "
+              f"`rivet-only`. Check the connector actually reached streaming; on "
+              f"mysql, run.py's liveness probe refuses earlier for the same reason.",
+              file=sys.stderr)
+        return 1
+
     body = r.stdout.strip()
     # DuckDB prints an empty box when a query returns no rows; agreement is the
     # absence of any differing row.
@@ -287,7 +345,8 @@ ORDER BY 2, 3, 1;
         scope = (f"(op, key, {', '.join(a.value)})" if a.value
                  else "(op, key) — VALUES NOT COMPARED, pass --value to see cell corruption")
         print(f"AGREE: rivet and Debezium produced the same {scope} set "
-              f"[{len(parts)} declared part(s) / {dbz_lines} reference event(s) "
+              f"[{len(parts)} declared part(s) / {dbz_lines} reference event(s), "
+              f"{dbz_n} comparable after the schema/probe filter "
               f"-> {pairs} distinct tuples compared]")
         return 0
     print("DISAGREE — one of the two is wrong, and which is the finding:\n")

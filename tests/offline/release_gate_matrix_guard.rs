@@ -59,7 +59,9 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 // -> 10 (scale_memory wired as the verify_scale_memory flat-RSS preflight).
 // Now: infra gap rows(0 — network_faults/cdc_standby flipped to test,
 // tls_required/auth to partial with the residual named, 2026-08-29) +
-// grid version gaps(3+2+1+0=6) = 10.
+// grid version gaps(3+2+1+0=6) = 6. (The line above summed to the OLD value of
+// 10 until a critic recomputed it — the constant was right, its arithmetic was
+// leftover: the message-truth class, in the comment over a ratchet.)
 const GAP_RATCHET: usize = 6;
 
 fn load(path: &str) -> Value {
@@ -232,13 +234,29 @@ fn every_gate_function_has_a_ledger_row_and_vice_versa() {
         // state_upgrade / state_concurrency are status:test WITHOUT their own
         // verify_: their notes say (and the call-site guard verifies) they are
         // driven by the state_migrations preflight's cargo filters.
-        if e.get("status").map(scalar).as_deref() == Some("test")
-            && id != "state_upgrade"
+        // `partial` counts too: a critic deleted verify_tls_required outright
+        // (fn + __all__ + call site) and every guard stayed green, because
+        // `partial` was the one status that required nothing. Two of the four
+        // infra gaps this branch banked were banked into it, so the structural
+        // guard was off exactly where the claim was newest.
+        if matches!(
+            e.get("status").map(scalar).as_deref(),
+            Some("test") | Some("partial")
+        ) && id != "state_upgrade"
             && id != "state_concurrency"
         {
+            // A row may be driven by a differently-named function (the
+            // warehouse_load half runs through `run_bigquery_golden`), so the
+            // note may carry the driver instead — and the sibling guard below
+            // proves any verify_ name in a note RESOLVES, so this cannot be
+            // satisfied by inventing one.
+            let note = e.get("note").map(scalar).unwrap_or_default();
+            let named_in_note = note.contains("verify_") || note.contains("run_bigquery_golden");
             assert!(
-                verify_fns.contains(&id),
-                "infra row `{id}` is status:test but the gate modules have no verify_{id}()"
+                verify_fns.contains(&id) || named_in_note,
+                "infra row `{id}` is status:{} but nothing drives it: no \
+                 verify_{id}(), and its note names no driver either",
+                e.get("status").map(scalar).unwrap_or_default()
             );
         }
     }
@@ -309,6 +327,61 @@ fn gaps_do_not_exceed_the_ratchet() {
         "release-gate-matrix has {gaps} gaps, the ratchet says {GAP_RATCHET}. Up: you cannot \
          ADD a gap — wire the check (flip gap -> test / gate the version). Down: a gap you \
          closed must be banked — LOWER the ratchet in this commit."
+    );
+}
+
+/// Every `verify_*` token a matrix NOTE mentions must resolve to a real gate
+/// function. Prose is unchecked by construction — the guard binds a row's `id`
+/// to `verify_<id>`, so a note may name anything — and two notes named
+/// `verify_tls_policy` / `verify_mongo_auth`, which exist nowhere (the real
+/// functions are `verify_tls_required` / `verify_auth`). A reader who follows
+/// the note lands on nothing: the message-truth class this repo grades
+/// everywhere else.
+#[test]
+fn every_verify_name_in_a_matrix_note_resolves() {
+    let mut defined: BTreeSet<String> = BTreeSet::new();
+    for path in gate_py() {
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in src.lines() {
+            if let Some(rest) = line.trim().strip_prefix("def verify_") {
+                defined.insert(format!("verify_{}", rest.split('(').next().unwrap().trim()));
+            }
+        }
+    }
+    assert!(
+        defined.len() >= 10,
+        "collected only {} verify_ fns — the sweep broke and this would pass vacuously",
+        defined.len()
+    );
+    let gate = load(GATE_MATRIX);
+    let mut notes = String::new();
+    for section in ["preflights", "infra", "scenarios"] {
+        for e in seq(&gate, section) {
+            if let Some(n) = e.get("note") {
+                notes.push_str(&scalar(n));
+                notes.push('\n');
+            }
+        }
+    }
+    let mut missing: Vec<String> = Vec::new();
+    let mut rest = notes.as_str();
+    while let Some(at) = rest.find("verify_") {
+        rest = &rest[at + "verify_".len()..];
+        let ident: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let full = format!("verify_{ident}");
+        if !ident.is_empty() && !defined.contains(&full) {
+            missing.push(full);
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "matrix notes name gate functions that do not exist: {missing:?} — the \
+         note is what a reader follows, so an unresolvable name is a dead end"
     );
 }
 
