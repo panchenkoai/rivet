@@ -232,6 +232,12 @@ BQ_ORACLE_BUCKET          ?= rivet_data_test
 # single full run while the download step reported success. A baseline the
 # gate needs must live where the gate's own hygiene cannot eat it.
 PREV_RELEASE_DIR          ?= .gate-baseline
+# The field-symptom replay's baseline is NOT the latest release: criterion 1
+# needs the release that CARRIES the governor regression (0.24.4 — see
+# verify_field_symptom_replay's shelf-life doc). Pinned here explicitly so the
+# stage stops going permanently red now that the fix has shipped in 0.24.5+.
+FIELD_REPLAY_CARRIER_TAG  ?= v0.24.4
+FIELD_REPLAY_CARRIER_BIN  ?= $(PREV_RELEASE_DIR)/carrier/rivet-$(FIELD_REPLAY_CARRIER_TAG)-$(shell uname -m | sed 's/arm64/aarch64/')-apple-darwin/rivet
 
 GATE_ENV = \
   RIVET_ORACLE_POSTGRES_URL='$(RIVET_ORACLE_POSTGRES_URL)' \
@@ -246,6 +252,7 @@ GATE_ENV = \
   RIVET_CDC_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_CONC_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_GATE_STATE_URL='$(RIVET_GATE_STATE_URL)' \
+  RIVET_FIELD_REPLAY_BIN='$(FIELD_REPLAY_CARRIER_BIN)' \
   RIVET_TEST_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_SWEEP_STATE_CONTAINER='$(RIVET_SWEEP_STATE_CONTAINER)' \
   RIVET_CONC_SRC_CONTAINER='$(RIVET_CONC_SRC_CONTAINER)' \
@@ -265,6 +272,15 @@ release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regressio
 	 tar -xzf "$(PREV_RELEASE_DIR)/rivet-$$tag-$$triple.tar.gz" -C $(PREV_RELEASE_DIR); \
 	 chmod +x "$(PREV_RELEASE_DIR)/rivet-$$tag-$$triple/rivet"; \
 	 echo "  $$($(PREV_RELEASE_DIR)/rivet-$$tag-$$triple/rivet --version) → $(PREV_RELEASE_DIR)/rivet-$$tag-$$triple/rivet"
+	@# The field-replay CARRIER (0.24.4) — a separate, PINNED download: the
+	@# stage needs the release that still reproduces the symptom, and the
+	@# latest asset above stopped carrying it the day the fix shipped.
+	@if [ ! -x "$(FIELD_REPLAY_CARRIER_BIN)" ]; then \
+	 mkdir -p $(PREV_RELEASE_DIR)/carrier; \
+	 gh release download $(FIELD_REPLAY_CARRIER_TAG) --pattern "*aarch64-apple-darwin*" -D $(PREV_RELEASE_DIR)/carrier --clobber; \
+	 tar xzf $(PREV_RELEASE_DIR)/carrier/rivet-$(FIELD_REPLAY_CARRIER_TAG)-aarch64-apple-darwin.tar.gz -C $(PREV_RELEASE_DIR)/carrier; \
+	 echo "  field-replay carrier: $$($(FIELD_REPLAY_CARRIER_BIN) --version)"; \
+	fi
 
 release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
 	@# The gate grades `target/release/rivet`. A stale one grades yesterday's

@@ -1371,8 +1371,14 @@ def verify_live_only_coverage(led: Ledger) -> None:
         return
     led.phase("Live-only coverage (mutants.toml exclusions vs measured offline coverage)")
     lcov = work_dir() / "offline.lcov"
+    # `env -u`: the gate's Postgres pass exports RIVET_STATE_URL globally, which
+    # rewires the STATE BACKEND under the lib's unit tests — three
+    # pipeline::cli state tests failed against the shared Postgres on the first
+    # gated run (2026-08-29). The coverage question is about the DEFAULT
+    # offline battery, so the state overrides are stripped for this leg only.
     build = run(
-        ["cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
+        ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
+         "cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
         timeout=NO_TIMEOUT,
     )
     (work_dir() / "live_only_cov.log").write_text(build.out)
