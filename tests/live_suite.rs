@@ -221,5 +221,8 @@ mod sec_tls_defaults;
 #[path = "live/oracle_sensitivity.rs"]
 mod oracle_sensitivity;
 
+#[path = "live/live_single_abort.rs"]
+mod live_single_abort;
+
 #[path = "live/soak_spill.rs"]
 mod soak_spill;
