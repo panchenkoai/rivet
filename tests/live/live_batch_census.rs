@@ -278,3 +278,68 @@ fn batch_export_to_minio_agrees_across_store_manifest_and_ledger_postgres() {
     let mut c2 = pg_connect();
     let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
 }
+
+/// The FOURTH comparison point: the row hash, checked against an INDEPENDENT
+/// reading of its spec rather than against rivet recomputing its own.
+///
+/// `rivet validate` re-derives `_rivet_row_hash` with the product's own
+/// `enrich`, which answers "did the data change" and cannot answer "is the
+/// canonical form injective" — both sides share the definition. Render id v1
+/// shipped non-injective twice and lived four months inside exactly that
+/// arrangement.
+///
+/// The fixture is hostile on purpose: values that carry the v1 separator
+/// (`\x1f`), empty strings and NULLs, arranged
+/// so a boundary-forging pair sits in the data — `('a\x1f', 'b')` next to
+/// `('a', '\x1fb')`, which v1 hashed identically. A green result means the
+/// shipped canonical image distinguishes them AND that an independent
+/// implementation of the spec agrees with rivet row for row.
+///
+/// The OTHER half of the v1 family — a value whose rendering IS the null marker
+/// (a lone `\x00`) — cannot be expressed here: PostgreSQL refuses a NUL byte in
+/// `text` outright ("null character not permitted"), which is a real engine
+/// constraint rather than a fixture choice. It is graded offline instead, by
+/// `hash_distinguishes_null_from_a_value_rendering_as_the_null_marker`
+/// (src/enrich.rs), where the batch is built through Arrow directly.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn batch_row_hash_agrees_with_an_independent_reading_of_the_spec_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("bhash");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, a TEXT, b TEXT);
+         INSERT INTO {table} VALUES
+           (1, 'a' || chr(31), 'b'),
+           (2, 'a',            chr(31) || 'b'),
+           (3, NULL,           'x'),
+           (4, '',             'x'),
+           (5, 'plain',        'value');"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .census_oracle()
+        .export_line("meta_columns: { row_hash: true }");
+    rig.run_ok();
+
+    // The values themselves must survive the trip, or the hash comparison is
+    // over data that never carried the hostile bytes.
+    let census = rig.row_census();
+    assert_eq!(
+        census.delivered, 5,
+        "the five hostile rows must land: {census:?}"
+    );
+
+    let checked = row_hash_matches_independent_spec(&rig.out_dir(), &["id", "a", "b"]);
+    assert!(
+        checked,
+        "the independent hasher did not run (no `xxhash` on the host) — this \
+         test grades nothing without it, and falling back on rivet's own \
+         recomputation would be the self-oracle the helper refuses"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}

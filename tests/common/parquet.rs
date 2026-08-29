@@ -1051,3 +1051,130 @@ pub fn duckdb_dir_csv_id_set(dir: &Path) -> BTreeSet<i64> {
         })
         .unwrap_or_default()
 }
+
+/// `_rivet_row_hash`, verified by an implementation that is NOT rivet's.
+///
+/// The one integrity column rivet asks a reader to trust. `rivet validate`
+/// recomputes it with the product's OWN `enrich` — deliberately, and sound for
+/// its purpose (did the DATA change between extract and audit) — but
+/// structurally incapable of catching a defect in the SPEC, because both sides
+/// share it. Render id v1 shipped non-injective in two independent ways and
+/// lived four months behind exactly that arrangement.
+///
+/// So this rebuilds the canonical image from the SPEC in `src/enrich.rs` —
+/// presence tag, u32 little-endian length, rendered bytes — in PYTHON, hashes it
+/// with the `xxhash` package, and compares. Different language, different
+/// library, different reading of the spec. The gate has carried this since
+/// `dev/release_oracle/rowhash.py`; this is the same approach as a rig helper,
+/// so a live test can make the claim too.
+///
+/// SCOPE, stated because it is narrow: the cell text must render identically in
+/// DuckDB and in Arrow's display. That holds for integers, plain strings and
+/// booleans; it does NOT hold for every timestamp/decimal spelling, which is why
+/// the gate uses a controlled probe table. Pass columns of the safe shapes, or
+/// the comparison grades the two renderings rather than the hash.
+///
+/// SKIPS loudly (returns `false`) when the host has no `xxhash` — never a silent
+/// pass, and never a fallback to rivet's own recomputation, which would be the
+/// self-oracle this exists to avoid.
+pub fn row_hash_matches_independent_spec(dir: &Path, cols: &[&str]) -> bool {
+    if std::process::Command::new("python3")
+        .args(["-c", "import xxhash"])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        // Through the ONE marker, so a release lane can count it: a skip is a
+        // pass to libtest, and an un-counted skip is how a lane reports green
+        // over a check that never ran.
+        super::skip_live(
+            "row_hash_matches_independent_spec: the host has no `xxhash` \
+             (pip install xxhash). Refusing to fall back on rivet's own \
+             recomputation — that is the self-oracle this check exists to avoid.",
+        );
+        return false;
+    }
+    let staged = stage_declared_for_duckdb(dir);
+    let sel = cols
+        .iter()
+        .map(|c| format!("CAST({c} AS VARCHAR) AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT {sel}, CAST(_rivet_row_hash AS VARCHAR) AS h \
+         FROM read_parquet('{staged}/**/*.parquet') ORDER BY 1"
+    ));
+    let rows = v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("row-hash read returned no rows array: {v}"));
+    assert!(
+        !rows.is_empty(),
+        "no rows to check — an empty read agrees with every hash, which is the \
+         vacuous shape this helper must never report as success"
+    );
+    let payload = serde_json::json!({
+        "cols": cols.len(),
+        "rows": rows,
+    });
+    let script = r#"
+import json, sys, xxhash
+TAG_NULL, TAG_PRESENT = 0x00, 0x01
+def canon(cells):
+    out = bytearray()
+    for c in cells:
+        if c is None:
+            out.append(TAG_NULL); continue
+        b = c.encode("utf-8")
+        out.append(TAG_PRESENT); out += len(b).to_bytes(4, "little"); out += b
+    return bytes(out)
+def h64(cells):
+    low = xxhash.xxh3_128_intdigest(canon(cells)) & 0xFFFFFFFFFFFFFFFF
+    return low - (1 << 64) if low >= (1 << 63) else low
+doc = json.load(sys.stdin)
+n = doc["cols"]
+bad = 0
+for r in doc["rows"]:
+    want = int(r[n])
+    got = h64(r[:n])
+    if want != got:
+        bad += 1
+        if bad <= 3:
+            print(f"MISMATCH cells={r[:n]} rivet={want} spec={got}", file=sys.stderr)
+print(json.dumps({"checked": len(doc["rows"]), "bad": bad}))
+"#;
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the independent hasher");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("feed the hasher");
+    }
+    let out = child.wait_with_output().expect("independent hasher");
+    let verdict: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        panic!(
+            "the independent hasher produced no verdict.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let checked = verdict["checked"].as_i64().unwrap_or(0);
+    let bad = verdict["bad"].as_i64().unwrap_or(-1);
+    assert!(checked > 0, "the hasher checked nothing: {verdict}");
+    assert_eq!(
+        bad,
+        0,
+        "{bad} of {checked} rows disagree with the SPEC's canonical image — \
+         rivet's hash and an independent reading of src/enrich.rs differ.\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
+}
