@@ -210,3 +210,71 @@ fn batch_census_manifest_leg_catches_a_declared_total_the_parquet_denies_postgre
     let mut c2 = pg_connect();
     let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
 }
+
+/// THE THIRD COMPARISON POINT: what the BUCKET holds, against what the ledger
+/// recorded and the manifest declared.
+///
+/// Every census leg before this one reads the host — the source, the local
+/// parquet, the state DB. A cloud export's artifacts live somewhere no test
+/// asked about: `file_log` said N, the manifest declared N, and whether the
+/// bucket held N was simply never a question. The store readers differ per
+/// emulator (minio and azurite glob natively; fake-gcs is read-only to DuckDB
+/// because its JSON API 404s the HEAD httpfs issues — measured), so the leg
+/// names its store rather than pretending one path fits all.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres minio duckdb"]
+fn batch_export_to_minio_agrees_across_store_manifest_and_ledger_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("bstore");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, v TEXT NOT NULL);
+         INSERT INTO {table} SELECT g, 'v' || g FROM generate_series(1, 300) g;"
+    ))
+    .unwrap();
+
+    let bucket = "rivet-census";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("store_census");
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .census_oracle()
+        .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    // The credentials the rendered config names — the rig writes
+    // `access_key_env: RIVET_TEST_MINIO_AK`, so the run needs them on its env.
+    let out = rig.run_with_envs(&[
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+    ]);
+    assert!(
+        out.status.success(),
+        "the export must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The BUCKET, read by DuckDB from inside the stand network.
+    let store = duckdb_store_census(ObjectStore::Minio, bucket, &prefix, &[]);
+    assert_eq!(
+        store.rows, 300,
+        "the bucket must hold every source row — this is what a cross-boundary \
+         reader will find, and no test asked it before: {store:?}"
+    );
+    assert!(store.files > 0, "fixture is not inert: {store:?}");
+
+    // …against what rivet RECORDED and DECLARED. The state DB sits beside the
+    // config in the shared workdir even for a cloud destination.
+    let db = StateDb::next_to_config(&rig.config_path());
+    let run_id = db.latest_run_id(rig.export_name());
+    let m = db.metrics_row(&run_id);
+    assert_eq!(
+        m.total_rows,
+        Some(store.rows),
+        "the ledger's total and the bucket's contents must be the same number: \
+         ledger {:?} vs store {}",
+        m.total_rows,
+        store.rows
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}

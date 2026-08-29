@@ -763,3 +763,108 @@ pub fn duckdb_s3_parquet_rows(bucket: &str, prefix: &str) -> i64 {
             panic!("duckdb read nothing under s3://{bucket}/{p}/ — a bucket that reads as empty and an export that wrote nothing look identical, so this is never a valid answer")
         })
 }
+
+/// Which object store a census reads, and how DuckDB reaches it from INSIDE the
+/// `rivet-duckdb` container (service names, never host ports).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectStore {
+    Minio,
+    Azurite,
+    /// fake-gcs is READ-ONLY to DuckDB, deliberately: its JSON API answers a GET
+    /// but 404s the HEAD that httpfs issues to size a file, so `glob` and a bare
+    /// URL both fail while `?alt=media` object reads succeed. MEASURED
+    /// 2026-08-29 — urllib saw 3269 objects on the same URL DuckDB 404'd on. So
+    /// the LIST comes from the store's own API and DuckDB reads the objects.
+    FakeGcs,
+}
+
+/// What an object store actually holds under a prefix: parquet FILES and the
+/// ROWS inside them, both read by DuckDB.
+///
+/// The third comparison point. Until now a test could confirm the ledger and the
+/// parquet agreed on the host and never ask the BUCKET anything — and the store
+/// is where a cross-boundary reader looks. Pairing this with `RowCensus.file_log`
+/// and `.manifest` closes "the ledger recorded N, the manifest declared N, and
+/// the bucket holds M".
+#[derive(Debug, PartialEq, Eq)]
+pub struct StoreCensus {
+    pub files: i64,
+    pub rows: i64,
+}
+
+fn store_prelude(store: ObjectStore) -> String {
+    match store {
+        ObjectStore::Minio => duckdb_minio_prelude(),
+        ObjectStore::Azurite => "INSTALL azure; LOAD azure; \
+             CREATE OR REPLACE SECRET az (TYPE azure, CONNECTION_STRING \
+             'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;\
+AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;\
+BlobEndpoint=http://azurite:10000/devstoreaccount1;');"
+            .to_string(),
+        ObjectStore::FakeGcs => "INSTALL httpfs; LOAD httpfs;".to_string(),
+    }
+}
+
+/// Files and rows under `bucket/prefix`, as the STORE holds them.
+///
+/// `gcs_objects` is required for [`ObjectStore::FakeGcs`] and ignored otherwise:
+/// DuckDB cannot list that emulator (see the enum), so the caller supplies the
+/// object names from the store's own API and DuckDB reads each one. An empty
+/// list where objects were expected is refused rather than reported as zero —
+/// "the oracle looked in the wrong place" and "the export wrote nothing" are the
+/// same number otherwise.
+pub fn duckdb_store_census(
+    store: ObjectStore,
+    bucket: &str,
+    prefix: &str,
+    gcs_objects: &[String],
+) -> StoreCensus {
+    let p = prefix.trim_matches('/');
+    let (files_sql, rows_sql) = match store {
+        ObjectStore::Minio => (
+            format!("SELECT count(*) FROM glob('s3://{bucket}/{p}/**/*.parquet')"),
+            format!("SELECT count(*) FROM read_parquet('s3://{bucket}/{p}/**/*.parquet')"),
+        ),
+        ObjectStore::Azurite => (
+            format!("SELECT count(*) FROM glob('azure://{bucket}/{p}/**/*.parquet')"),
+            format!("SELECT count(*) FROM read_parquet('azure://{bucket}/{p}/**/*.parquet')"),
+        ),
+        ObjectStore::FakeGcs => {
+            assert!(
+                !gcs_objects.is_empty(),
+                "duckdb_store_census(FakeGcs) needs the object list from the \
+                 store's own API — DuckDB cannot list this emulator, and an \
+                 empty list would read as 'the export wrote nothing'"
+            );
+            let urls = gcs_objects
+                .iter()
+                .map(|o| {
+                    let enc = o.replace('/', "%2F");
+                    format!("'http://fake-gcs:4443/storage/v1/b/{bucket}/o/{enc}?alt=media'")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                format!("SELECT {}", gcs_objects.len()),
+                format!("SELECT count(*) FROM read_parquet([{urls}])"),
+            )
+        }
+    };
+    let prelude = store_prelude(store);
+    let files = duckdb_run_sql_json(&format!("{prelude} {files_sql}"));
+    let files = files["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("store census: no file count ({files})"));
+    assert!(
+        files > 0,
+        "no parquet under {bucket}/{p} — a prefix that matches nothing reads \
+         exactly like an export that delivered nothing, so this refuses instead"
+    );
+    let rows = duckdb_run_sql_json(&format!("{prelude} {rows_sql}"));
+    let rows = rows["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("store census: no row count ({rows})"));
+    StoreCensus { files, rows }
+}
