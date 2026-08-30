@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.25.0 — 2026-08-30
+
 - **New: `rivet state runs` and `rivet state finish-run`** — the frozen-prefix
   escape hatch. `runs` lists the run-status ledger (gc/cleanup's activity
   signal); `finish-run` terminal-stamps a row you KNOW is dead (hard crash with
