@@ -34,6 +34,21 @@ impl Drop for DropTable {
     }
 }
 
+/// `(rows, distinct keys)` read by DuckDB — an INDEPENDENT codec.
+///
+/// `read_uid_set` below decodes with rivet's own arrow/parquet crate, so an
+/// encode fault cancels itself: the writer and the reader agree because they
+/// are the same code. Six completeness-claiming tests in this file rested on
+/// it alone (the batch oracle gate named them), and each now cross-checks with
+/// this. Manifest-DECLARED parts, so a crashed attempt's orphans cannot inflate
+/// the count — which matters here, since half the callers crash on purpose.
+fn duckdb_uid_counts(dir: &std::path::Path) -> (i64, i64) {
+    (
+        duckdb_declared_dir_scalar(dir, "count(*)"),
+        duckdb_declared_dir_scalar(dir, "count(DISTINCT uid)"),
+    )
+}
+
 fn read_uid_set(dir: &std::path::Path) -> (usize, BTreeSet<String>) {
     let mut count = 0usize;
     let mut keys = BTreeSet::new();
@@ -720,6 +735,17 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
         keys, expected,
         "the union of all parallel workers' keys must equal the source key set"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// PARALLEL keyset on a PostgreSQL native `uuid` PK — the canonical
@@ -887,6 +913,17 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
         keys, expected,
         "the union must equal the full source key set"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// PARALLEL keyset INCREMENTAL (feat/parallel-keyset iteration 3). A parallel run
@@ -970,6 +1007,17 @@ fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
         keys3, expected,
         "the union of all runs must equal the full source key set"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
@@ -1048,6 +1096,17 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
         Some(1000),
         "destination manifest must declare every row (pre-crash page not orphaned); got {}",
         m["row_count"]
+    );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
     );
 }
 
@@ -1296,6 +1355,17 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
         dir_manifest_copy_total_rows(&rig.out_dir()),
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
+    );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
     );
 }
 
@@ -1906,6 +1976,17 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
         dir_manifest_copy_total_rows(&rig.out_dir()),
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
+    );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
     );
 }
 

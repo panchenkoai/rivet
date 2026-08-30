@@ -302,6 +302,16 @@ fn chunked_crash_resume_writes_a_complete_destination_manifest() {
         3,
         "3 physical parquet parts"
     );
+
+    // The manifest DECLARES 150; an independent codec must find them. The
+    // assertion above reads rivet's own sidecar, which is the right subject for
+    // "writes a complete manifest" and cannot answer "…and the parquet holds
+    // them" — a resume that declared 150 over 100 delivered rows passed it.
+    assert_eq!(
+        duckdb_declared_dir_scalar(out.path(), "count(*)"),
+        150,
+        "DuckDB over the manifest-DECLARED parts must find every declared row"
+    );
 }
 
 // ─── C2: crash after chunk 0 file (before commit) → resume re-runs chunk 0 ───

@@ -244,6 +244,17 @@ fn auto_shrink_csv_output_is_complete_and_valid() {
          {delivered} data rows in {} file(s)",
         files.len()
     );
+    // …and by an INDEPENDENT parser. Counting lines is not parsing CSV: a
+    // quoted field carrying a newline splits one row into two lines, so a
+    // line count can DISAGREE with the row count in either direction while
+    // both sides read the same bytes. DuckDB parses the format properly and
+    // shares no code with the `csv` crate rivet writes with — the batch oracle
+    // gate asks for this on a name that claims "is_complete".
+    assert_eq!(
+        duckdb_dir_csv_rows(out.path()),
+        ROWS as i64,
+        "auto_shrink CSV, parsed by DuckDB: every source row must be there"
+    );
     for f in &files {
         let content = std::fs::read_to_string(f).expect("read csv");
         // Header + at least one data row means the file has >= 2 lines.

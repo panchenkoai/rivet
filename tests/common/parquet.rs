@@ -1052,6 +1052,29 @@ pub fn duckdb_dir_csv_id_set(dir: &Path) -> BTreeSet<i64> {
         .unwrap_or_default()
 }
 
+/// Rows across every CSV under `dir`, parsed by DuckDB.
+///
+/// The column-agnostic sibling of [`duckdb_dir_csv_id_set`]: a completeness
+/// claim over a CSV destination whose key column is not named `id` needs the
+/// COUNT, and demanding an `id` there fails on the schema rather than on the
+/// claim. Independent by construction — rivet writes CSV with the `csv` crate
+/// and DuckDB parses it with its own reader.
+pub fn duckdb_dir_csv_rows(dir: &Path) -> i64 {
+    assert!(
+        !files_with_extension(dir, "csv").is_empty(),
+        "duckdb_dir_csv_rows on a directory with no .csv — reading zero as the \
+         answer is how a wrong-format wiring hides"
+    );
+    let c = stage_for_duckdb(dir);
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT count(*) FROM read_csv_auto('{c}/**/*.csv', header=true)"
+    ));
+    v["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("duckdb returned no CSV row count: {v}"))
+}
+
 /// `_rivet_row_hash`, verified by an implementation that is NOT rivet's.
 ///
 /// The one integrity column rivet asks a reader to trust. `rivet validate`

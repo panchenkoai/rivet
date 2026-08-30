@@ -173,6 +173,49 @@ fn outcome_markers() -> BTreeSet<String> {
     out
 }
 
+/// Bodies of the same-file helpers a test calls, one level deep.
+///
+/// One level is deliberate and stated: it covers the delegation shape that
+/// actually occurs here (`fn test() { helper(arg) }`) without pretending to a
+/// call-graph this gate does not have. A helper that hides its oracle two
+/// levels down would read as ungraded — a false ALARM, which is the safe
+/// direction for a gate.
+fn helper_bodies(src: &str, test_body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(at) = rest.find("fn ") {
+        let after = &rest[at + 3..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && test_body.contains(&format!("{name}(")) {
+            // The WHOLE body, by brace counting — a fixed character window is a
+            // magic number that silently truncates: at 6000 it cut
+            // `pool_split_cloud` (185 lines) before its oracle and reported a
+            // DuckDB-graded test as ungraded.
+            let mut depth = 0i32;
+            let mut end = after.len();
+            for (i, c) in after.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(after[..end].to_string());
+        }
+        rest = after;
+    }
+    out
+}
+
 /// Readers a live file defines for ITSELF: any `fn` in this file whose body
 /// reads the delivered artifacts. Returned as call spellings (`name(`).
 fn local_readers(src: &str) -> BTreeSet<String> {
@@ -331,22 +374,34 @@ fn every_completeness_named_batch_test_carries_an_independent_oracle() {
             if !claim.iter().any(|w| name.contains(w)) {
                 continue;
             }
-            if independent.iter().any(|m| body.contains(m)) {
+            // The body, PLUS any helper in this file it calls: a test that
+            // delegates its whole shape to `run_soak_case(fault)` carries its
+            // oracle there, and reading only the test body reports a
+            // DuckDB-graded soak as ungraded. Tier 1 needed the same fix for
+            // the same reason — a reader one call away is still a reader.
+            let via_helper = helper_bodies(&src, &body)
+                .iter()
+                .any(|h| independent.iter().any(|m| h.contains(m)));
+            if independent.iter().any(|m| body.contains(m)) || via_helper {
                 continue;
             }
             weak.push(format!("{file}::{name}"));
         }
     }
-    // SHRINK-ONLY, and the number is the honest count on the day the gate was
-    // written — not zero, because pretending 18 upgrades happened would be the
-    // laundering this whole file exists to refuse. Two came down the same day
-    // (the s3 and azure multipart tests now read their bucket through DuckDB,
-    // which the store census made possible); the rest are named below so the
-    // debt is visible and cannot grow.
+    // ZERO, and it got there by UPGRADES, not by widening the words.
     //
-    // Lower it in the commit that upgrades one. It fails DOWNWARD too, so a
-    // banked win stays banked.
-    const WEAK_RATCHET: usize = 18;
+    // The gate landed at 18 and each one was closed by giving the test an
+    // independent reader — DuckDB over the declared parts, the store census
+    // over a bucket, DuckDB's own CSV parser — every upgrade run live. Two of
+    // the 18 were the gate's own blindness rather than weak tests (a test that
+    // delegates to `run_soak_case` carries its oracle in the helper), and the
+    // fix was to teach the gate to follow one call, not to excuse the test.
+    //
+    // At zero the contract changes shape: a new batch test that claims
+    // completeness in its NAME arrives with an independent oracle or does not
+    // arrive. Raising this number is a decision someone argues for in the
+    // commit that raises it.
+    const WEAK_RATCHET: usize = 0;
     assert_eq!(
         weak.len(),
         WEAK_RATCHET,

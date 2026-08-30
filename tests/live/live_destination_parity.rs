@@ -57,6 +57,14 @@ fn local_destination_produces_one_parquet_with_all_rows() {
     let files = files_with_extension(out_dir.path(), "parquet");
     assert_eq!(files.len(), 1, "local must produce exactly one file");
     assert_eq!(parquet_rows(&files[0]), 25);
+    // …and by an INDEPENDENT codec: `parquet_rows` decodes with rivet's own
+    // arrow/parquet crate, which cancels an encode fault. The batch oracle gate
+    // asks for this on a name that claims "all_rows".
+    assert_eq!(
+        duckdb_total_parquet_rows(out_dir.path()),
+        25,
+        "local: DuckDB must count the same 25 rows"
+    );
 }
 
 #[test]
@@ -112,6 +120,15 @@ fn s3_minio_destination_produces_one_parquet_with_all_rows() {
         25,
         "the downloaded s3 parquet must hold every seeded row"
     );
+
+    // The BUCKET's contents, by an INDEPENDENT codec. Everything above counts
+    // OBJECTS through `mc ls` — presence, not rows — so a run that wrote one
+    // object holding nothing passed a test whose name claims "all_rows".
+    let store = duckdb_store_census(ObjectStore::Minio, bucket, &prefix, &[]);
+    assert_eq!(
+        store.rows, 25,
+        "s3, read by DuckDB: the bucket must hold all 25 rows: {store:?}"
+    );
 }
 
 #[test]
@@ -158,6 +175,24 @@ fn gcs_fake_destination_produces_one_parquet_with_all_rows() {
         fake_gcs_parquet_total_rows(bucket, &prefix),
         25,
         "the downloaded gcs parquet must hold every seeded row"
+    );
+
+    // The BUCKET's contents, by an INDEPENDENT codec. The listing above proves
+    // an object EXISTS; it says nothing about rows. DuckDB cannot list
+    // fake-gcs (its JSON API 404s the HEAD httpfs issues), so the object names
+    // come from the store's own API and DuckDB reads them by URL.
+    let objects: Vec<String> = fake_gcs_object_names(bucket, &prefix)
+        .into_iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .collect();
+    assert!(
+        !objects.is_empty(),
+        "fixture: the bucket must hold a parquet"
+    );
+    let store = duckdb_store_census(ObjectStore::FakeGcs, bucket, &prefix, &objects);
+    assert_eq!(
+        store.rows, 25,
+        "gcs, read by DuckDB: the bucket must hold all 25 rows: {store:?}"
     );
 }
 
