@@ -94,16 +94,84 @@ pub trait TargetLoader {
     fn changes_has_prior_changes(&self, table: &str) -> Result<bool>;
 }
 
-/// A plain SQL identifier the load layer can safely interpolate into DDL/COPY
-/// without quoting: `[A-Za-z_][A-Za-z0-9_]*`. Round-5: column names are
-/// SOURCE-derived and spliced raw into executed warehouse SQL (build_schema,
-/// build_copy_select, …), so a name outside this set is an injection vector.
-fn is_safe_load_ident(s: &str) -> bool {
+/// A plain ASCII identifier: `[A-Za-z_][A-Za-z0-9_]*`. Safe to interpolate
+/// into DDL/COPY with NO quoting at all, which is what the Snowflake driver
+/// does (its columns are created unquoted, so Snowflake upper-cases them and
+/// a quoted `"col"` would then miss them).
+fn is_plain_ascii_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// An identifier the load layer can safely splice into warehouse SQL — either
+/// bare (plain ASCII) or QUOTED by the driver.
+///
+/// Round-5 gated this to ASCII only, because column names are SOURCE-derived
+/// and reach executed SQL (build_schema, build_copy_select, the dedup view's
+/// `PARTITION BY`, …), so an unconstrained name is an injection vector. The
+/// gate held, but it was stricter than the warehouse: a real production table
+/// carried a column named `сomment` — a Cyrillic `с` (U+0441) where the typist
+/// meant ASCII `c`, indistinguishable on screen — and BigQuery accepts that
+/// name perfectly well when it is back-quoted (verified: CREATE/INSERT/SELECT
+/// all succeed). Refusing it made ONE table of a 154-table schema
+/// un-adoptable over a keyboard-layout slip, and the only remedy we could
+/// offer was a production DDL rename.
+///
+/// So the rule is default-deny on what can BREAK OUT of a quoted identifier,
+/// not on what is unfamiliar: letters (any script), digits, `_`, `$`, `-` and
+/// spaces are content; a backtick, quote, backslash, dot, semicolon, control
+/// character or newline is structure and stays refused. Drivers that cannot
+/// quote (Snowflake, see [`is_plain_ascii_ident`]) apply the stricter rule
+/// themselves.
+fn is_safe_load_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 300 // BigQuery caps column names at 300 characters
+        && s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '-' | ' '))
+}
+
+/// Does this name LOOK like ASCII but isn't? A column named with a Cyrillic
+/// `с`/`а`/`е` (or a full-width Latin letter) is legal and now loadable, but
+/// it is far more often a typo than a decision — and it silently breaks every
+/// hand-written query that spells the name in ASCII. Worth one line on stderr,
+/// never a refusal.
+pub(crate) fn homoglyph_hint(name: &str) -> Option<String> {
+    if name.is_ascii() {
+        return None;
+    }
+    let ascii_lookalike: String = name
+        .chars()
+        .map(|c| match c {
+            'с' => 'c',
+            'а' => 'a',
+            'е' => 'e',
+            'о' => 'o',
+            'р' => 'p',
+            'х' => 'x',
+            'у' => 'y',
+            'к' => 'k',
+            'м' => 'm',
+            'т' => 't',
+            'в' => 'b',
+            'н' => 'h',
+            'і' | 'ї' => 'i',
+            'ѕ' => 's',
+            'ԁ' => 'd',
+            other => other,
+        })
+        .collect();
+    (ascii_lookalike != name && ascii_lookalike.is_ascii()).then(|| {
+        format!(
+            "column `{name}` is spelled with non-ASCII letters that LOOK like \
+             `{ascii_lookalike}` (e.g. Cyrillic `с` for ASCII `c`) — loading it \
+             as given. If that is a typo, every query spelling it the ASCII way \
+             will miss the column; rename it at the source to `{ascii_lookalike}`."
+        )
+    })
 }
 
 /// Refuse any Parquet URI that can't be splice-safely single-quoted into the
@@ -152,25 +220,35 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     // Round-6: the target table name is interpolated raw into the fqtn / DDL / dedup
     // view too (a sibling injection surface of the column names). Gate it, tolerating
     // a qualified `dataset.table` — each dot-separated component must be a plain ident.
-    if table.is_empty() || !table.split('.').all(is_safe_load_ident) {
+    // The TABLE name stays on the strict ASCII rule: it is operator-typed (a
+    // config value, not source-derived), every driver splices it, and
+    // Snowflake splices it BARE — so there is nothing to gain and a dialect
+    // of edge cases to lose by widening it.
+    if table.is_empty() || !table.split('.').all(is_plain_ascii_ident) {
         bail!(
             "cannot load: target table `{}` is not a plain (optionally dotted) SQL identifier — \
              the loader splices it into DDL/COPY.",
             table.escape_default()
         );
     }
-    // Round-5: refuse a source-derived column name that isn't a plain identifier —
-    // the warehouse drivers interpolate it into executed DDL/COPY with no quoting,
-    // so a hostile/odd name (`x); DROP TABLE …`, an embedded quote/backtick) must
-    // fail LOUDLY here rather than run as SQL. The one gate covers every load target.
+    // Round-5: refuse a source-derived column name that could BREAK OUT of the
+    // driver's quoting — a hostile name (`x); DROP TABLE …`, an embedded quote
+    // or backtick) must fail LOUDLY here rather than run as SQL. Unfamiliar is
+    // not hostile: a non-ASCII letter is content, and BigQuery back-quotes it
+    // happily (see `is_safe_load_ident`).
     for s in specs {
         if !is_safe_load_ident(&s.column_name) {
             bail!(
-                "cannot load `{table}`: column name `{}` is not a plain SQL identifier \
-                 ([A-Za-z_][A-Za-z0-9_]*) — the warehouse loader splices it into DDL/COPY. \
-                 Rename or alias the column in the export query.",
+                "cannot load `{table}`: column name `{}` cannot be safely spliced into \
+                 warehouse SQL — letters, digits, `_`, `$`, `-` and spaces are accepted \
+                 (any script), but quotes, back-ticks, dots, semicolons and control \
+                 characters are refused because the loader would have to escape them \
+                 into executed DDL/COPY. Rename or alias the column in the export query.",
                 s.column_name.escape_default()
             );
+        }
+        if let Some(hint) = homoglyph_hint(&s.column_name) {
+            eprintln!("  warning: {hint}");
         }
     }
     let failed: Vec<&str> = specs
@@ -648,6 +726,69 @@ mod tests {
             prefix_populated(&store, "innocent-neighbour"),
             "a scoped cleanup spares the sibling"
         );
+    }
+
+    fn named_spec(name: &str) -> Vec<TargetColumnSpec> {
+        vec![TargetColumnSpec {
+            column_name: name.into(),
+            target_type: "STRING".into(),
+            autoload_type: String::new(),
+            status: TargetStatus::Ok,
+            note: None,
+            cast_sql: None,
+        }]
+    }
+
+    /// A real production column named `сomment` — Cyrillic `с` (U+0441) where
+    /// the typist meant ASCII `c` — made ONE table of a 154-table schema
+    /// un-adoptable, and BigQuery accepts that name back-quoted (verified
+    /// live). Unfamiliar is not hostile: letters of any script load.
+    #[test]
+    fn a_non_ascii_letter_is_content_and_loads() {
+        assert!(validate_specs("ds.t", &named_spec("\u{441}omment")).is_ok());
+        assert!(validate_specs("ds.t", &named_spec("ціна")).is_ok());
+        assert!(validate_specs("ds.t", &named_spec("価格")).is_ok());
+        // …and it is NOT a plain ASCII identifier, which is what the
+        // Snowflake leg (bare, upper-casing splices) still requires.
+        assert!(!is_plain_ascii_ident("\u{441}omment"));
+        assert!(is_plain_ascii_ident("comment"));
+    }
+
+    /// What can break OUT of a quoted identifier stays refused — the round-5
+    /// injection gate is intact, only its definition of "safe" widened.
+    #[test]
+    fn structure_characters_are_still_refused() {
+        for hostile in [
+            "x`); DROP TABLE t; --",
+            "a`b",
+            "a\"b",
+            "a'b",
+            "a.b",
+            "a;b",
+            "a\\b",
+            "a\nb",
+            "1leading_digit",
+            "",
+        ] {
+            assert!(
+                validate_specs("ds.t", &named_spec(hostile)).is_err(),
+                "must refuse {hostile:?}"
+            );
+        }
+        // 300 chars is BigQuery's own column-name ceiling.
+        assert!(validate_specs("ds.t", &named_spec(&"a".repeat(301))).is_err());
+    }
+
+    /// The typo hint: a name that LOOKS ASCII but is not is far more often a
+    /// keyboard-layout slip than a decision — say so, never refuse.
+    #[test]
+    fn a_homoglyph_name_is_flagged_as_a_probable_typo() {
+        let hint = homoglyph_hint("\u{441}omment").expect("Cyrillic es must be flagged");
+        assert!(hint.contains("`comment`"), "{hint}");
+        assert!(hint.contains("loading it as given"), "{hint}");
+        // Honest non-ASCII names are not "typos" — nothing to say.
+        assert_eq!(homoglyph_hint("価格"), None);
+        assert_eq!(homoglyph_hint("comment"), None);
     }
 
     fn spec(status: TargetStatus) -> Vec<TargetColumnSpec> {
