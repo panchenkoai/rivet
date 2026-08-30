@@ -471,12 +471,21 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
         # tools18 is the 2022 image's path; the 2019 image ships plain
         # `mssql-tools`. A hardcoded path made the older version unrunnable and
         # the matrix recorded that as a coverage GAP — so the fix is one
-        # fallback, not a permanent hole. `sqlcmd_path` probes both once.
-        "mssql": [[sqlcmd_path(name), "-S", "localhost", "-U", "sa",
+        # fallback, not a permanent hole.
+        #
+        # The path is resolved LAZILY, below: this dict literal is built in
+        # full before `[engine]` selects an arm, so calling `sqlcmd_path(name)`
+        # here ran it against the POSTGRES container and killed the run on the
+        # first postgres version with "no sqlcmd at tools18 or tools". A helper
+        # that is correct for its own engine and fatal for the others is the
+        # same shape as a feature wired into one runner of four.
+        "mssql": [["__SQLCMD__", "-S", "localhost", "-U", "sa",
                    "-P", "Rivet_Passw0rd!", "-C", "-Q", "SELECT 1"]],
         "mongo": [["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
                   ["mongo", "--quiet", "--eval", "db.runCommand({ping:1})"]],
     }[engine]
+    if engine == "mssql":
+        probes = [[sqlcmd_path(name) if a == "__SQLCMD__" else a for a in p] for p in probes]
     from .core import docker_exec, wait_until
 
     # TWO consecutive successes, a second apart — not one.

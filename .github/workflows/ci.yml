@@ -1450,6 +1450,15 @@ jobs:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
 
+      - name: Independent row-hash oracle deps
+        # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
+        # canonical image from the spec in src/enrich.rs and hashes it with a
+        # different library, so rivet is never compared against itself. Without
+        # the package the test REFUSES rather than falling back — which is the
+        # contract, and which turned this job red until the package was
+        # installed here (measured: 699 passed, 1 failed, three runs running).
+        run: python3 -m pip install --break-system-packages xxhash
+
       - name: Start services
         # Include `toxiproxy` so the retry / chaos / crash-recovery live-test
         # binaries have the proxy admin API available on :8474.

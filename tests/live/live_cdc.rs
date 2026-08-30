@@ -8300,12 +8300,24 @@ fn doctor_grades_the_checkpoint_the_run_opens_not_one_relative_to_the_shell() {
         "the control half is broken — doctor run from the config's own directory \
          must read the position the run just wrote, got:\n{from_config}"
     );
+    // Compare the CHECKPOINT IDENTITY, not the whole line.
+    //
+    // The two doctor invocations are seconds apart against a SHARED server, and
+    // the line carries a live-moving estimate: CI caught `backlog ≈ 0.0 MiB`
+    // against `≈ 0.1 MiB` for the same `binlog.000003:2944814` and failed a test
+    // whose subject is WHICH checkpoint was read. A byte-for-byte compare of a
+    // string containing a quantity the server keeps changing grades the
+    // server's traffic, not the product — and it fails INTERMITTENTLY, which is
+    // how a flake teaches people to re-run instead of read.
+    let identity =
+        |line: &str| -> String { line.split(", backlog").next().unwrap_or(line).to_string() };
     assert_eq!(
-        from_config, from_elsewhere,
+        identity(&from_config),
+        identity(&from_elsewhere),
         "doctor described two different checkpoints for one config. The verdict \
          from another working directory is the one deployments actually see, and \
          `no checkpoint yet` is GREEN — so a position below binlog retention grades \
-         [OK] and the run then dies with ERROR 1236."
+         [OK] and the run then dies with ERROR 1236.\n  from config:    {from_config}\n  from elsewhere: {from_elsewhere}"
     );
 }
 
