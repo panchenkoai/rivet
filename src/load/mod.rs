@@ -779,6 +779,21 @@ mod tests {
         assert!(validate_specs("ds.t", &named_spec(&"a".repeat(301))).is_err());
     }
 
+    /// The TABLE gate stays ASCII-strict, and BOTH of its arms matter — a
+    /// surviving `||`→`&&` mutant proved the non-empty-but-invalid arm was
+    /// untested, which is the arm that actually fires in production (an
+    /// empty table name never reaches here from a parsed config).
+    #[test]
+    fn a_non_ascii_or_malformed_table_name_is_still_refused() {
+        assert!(validate_specs("ds.t", &named_spec("id")).is_ok());
+        for bad in ["ds.t!", "ds.\u{441}omment", "ds.t-x", "ds.t x", "1ds.t", ""] {
+            assert!(
+                validate_specs(bad, &named_spec("id")).is_err(),
+                "must refuse table {bad:?}"
+            );
+        }
+    }
+
     /// The typo hint: a name that LOOKS ASCII but is not is far more often a
     /// keyboard-layout slip than a decision — say so, never refuse.
     #[test]
@@ -789,6 +804,11 @@ mod tests {
         // Honest non-ASCII names are not "typos" — nothing to say.
         assert_eq!(homoglyph_hint("価格"), None);
         assert_eq!(homoglyph_hint("comment"), None);
+        // BOTH conditions are load-bearing (a surviving `&&`→`||` mutant
+        // said so): a name that mixes a homoglyph with a genuinely
+        // non-ASCII letter has NO ascii spelling to suggest, so the hint
+        // would name a target that is itself unspellable.
+        assert_eq!(homoglyph_hint("\u{441}omment_価"), None);
     }
 
     fn spec(status: TargetStatus) -> Vec<TargetColumnSpec> {
