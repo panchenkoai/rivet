@@ -20,14 +20,23 @@ mod audit_validate_warning_label;
 mod cargo_manifest_chef;
 #[path = "offline/cdc_axis_matrix_guard.rs"]
 mod cdc_axis_matrix_guard;
+#[path = "offline/memory_throttle_wiring.rs"]
+mod memory_throttle_wiring;
 #[path = "offline/skip_is_not_a_pass_guard.rs"]
 mod skip_is_not_a_pass_guard;
+#[path = "offline/validate_cdc_union.rs"]
+mod validate_cdc_union;
+
+#[path = "offline/batch_oracle_gate.rs"]
+mod batch_oracle_gate;
 
 #[path = "offline/cdc_cli_surface_guard.rs"]
 mod cdc_cli_surface_guard;
 
 #[path = "offline/cdc_evidence_matrix_guard.rs"]
 mod cdc_evidence_matrix_guard;
+#[path = "offline/changelog_guard.rs"]
+mod changelog_guard;
 #[path = "offline/chunking_matrix_guard.rs"]
 mod chunking_matrix_guard;
 #[path = "offline/cli_contract.rs"]

@@ -238,6 +238,10 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let cdc_cfg = crate::source::cdc::CdcConfig {
         url: url.clone(),
         checkpoint: ckpt.clone(),
+        // The CLI has no config file, so the CWD is the honest anchor here: the
+        // operator typed the command in a shell whose directory they chose. The
+        // config-driven path anchors to the config's directory instead.
+        config_dir: std::path::PathBuf::from("."),
         drain: DrainMode::from_until_current(a.until_current),
         // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
@@ -338,7 +342,13 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             format: fmt,
             max_events: a.max_events,
             rollover: a.rollover,
-            rollover_memory_bytes: None,
+            // The SAME protective default the config path applies — absence must not
+            // mean "no byte budget" on the ad-hoc CLI either: `--rollover` bounds ROWS,
+            // and a wide-row table would buffer unbounded to the row cap. The named
+            // runner-bypass shape, at an entry point instead of a runner.
+            // Through the NAMED supplier, so this entry point and the config path
+            // cannot drift into two defaults.
+            rollover_memory_bytes: crate::pipeline::cdc_job::cdc_rollover_memory_bytes(None),
             run_id: now.clone(),
             started_at: now,
             // The ad-hoc `rivet cdc` subcommand runs without a config, and so
@@ -758,11 +768,134 @@ fn dispatch_state(action: StateAction) -> Result<()> {
         StateAction::Progression { config, export } => {
             pipeline::show_progression(&config, export.as_deref())
         }
+        StateAction::Runs {
+            config,
+            running,
+            last,
+            json,
+        } => show_runs(&config, running, last, json),
+        StateAction::FinishRun { config, run_id } => finish_run_cmd(&config, &run_id),
         StateAction::Loads {
             config,
             target,
             last,
         } => show_loads(&config, target.as_deref(), last),
+    }
+}
+
+/// `rivet state runs`: the run-status ledger, newest first — the rows
+/// gc_orphans / cleanup_source / the consumed-exclusion actually read.
+/// The two run-status commands REFUSE a missing config file: `StateStore::open`
+/// derives the DB path from the config's DIRECTORY and would silently create a
+/// fresh empty DB — and these commands' empty output is a VERDICT ("no row is
+/// freezing any prefix"), so a typo'd `-c` mid-incident reads as a false
+/// all-clear (round-5 hostile-input probe, live-verified).
+fn require_config_file(config: &str) -> Result<()> {
+    if std::path::Path::new(config).is_file() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "config '{config}' is not a file — refusing to answer from the state DB its \
+         directory would imply (a fresh empty DB reads as an all-clear verdict)"
+    )
+}
+
+fn show_runs(config: &str, running_only: bool, last: usize, json: bool) -> Result<()> {
+    require_config_file(config)?;
+    let store = StateStore::open(config)?;
+    let rows = store.recent_run_status(last, running_only)?;
+    if json {
+        // Machine leg (hostile reviewer: the footer drives a scripted flow) —
+        // same shape discipline as the sibling `--json` listings.
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "run_id": r.run_id,
+                    "export_name": r.export_name,
+                    "prefix": r.prefix,
+                    "status": r.status,
+                    "started_at": r.started_at,
+                    "finished_at": if r.finished_at.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(r.finished_at.clone())
+                    },
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        // `--last 0` clips everything: an empty listing then says NOTHING about
+        // the DB, and "no running rows" would be an actively false all-clear
+        // (round-5 hostile-input probe).
+        let msg = if last == 0 {
+            "--last 0 shows no rows by construction — raise it to inspect the ledger"
+        } else if running_only {
+            "no running rows — no run-status row is freezing any prefix"
+        } else {
+            "no runs recorded in the state DB yet"
+        };
+        println!("{msg}");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<20} {:<11} {:<25} {:<25} PREFIX",
+        "RUN ID", "EXPORT", "STATUS", "STARTED", "FINISHED"
+    );
+    for r in &rows {
+        let finished = if r.finished_at.is_empty() {
+            "-"
+        } else {
+            r.finished_at.as_str()
+        };
+        println!(
+            "{:<28} {:<20} {:<11} {:<25} {:<25} {}",
+            r.run_id, r.export_name, r.status, r.started_at, finished, r.prefix
+        );
+    }
+    if running_only {
+        println!(
+            "\nA `running` row with NO live extract is a crash remnant: it makes gc spare \
+             the prefix and cleanup refuse, forever (supersession needs a newer SUCCESS). \
+             Close one you KNOW is dead with `rivet state finish-run -c <config> --run-id <id>`."
+        );
+    }
+    Ok(())
+}
+
+/// `rivet state finish-run`: stamp a dead run's row `interrupted`. Refuses
+/// loudly on a typo'd id and no-ops honestly on an already-terminal row —
+/// only a `running` row is ever touched.
+fn finish_run_cmd(config: &str, run_id: &str) -> Result<()> {
+    use crate::state::FinishOutcome;
+    require_config_file(config)?;
+    let store = StateStore::open(config)?;
+    match store.finish_run_checked(run_id, &chrono::Utc::now().to_rfc3339())? {
+        FinishOutcome::Stamped => {
+            println!(
+                "run '{run_id}' stamped `interrupted` — the ledger no longer counts it as \
+                 writing. If the export writes to a CLOUD destination, its crash left a \
+                 `running` marker in the bucket too; the next `rivet load` over this state \
+                 DB retires that marker in its gc pass (a load from another host cannot, \
+                 and keeps sparing conservatively). Only stamp runs you KNOW are dead: a \
+                 LIVE co-located run stamped here loses its ledger-side gc protection."
+            );
+            Ok(())
+        }
+        FinishOutcome::AlreadyTerminal(status) => {
+            println!(
+                "run '{run_id}' is already terminal (`{status}`) — nothing to do; it does \
+                 not freeze any prefix"
+            );
+            Ok(())
+        }
+        FinishOutcome::NotFound => anyhow::bail!(
+            "no run-status row has run_id '{run_id}' — check `rivet state runs -c \
+             <config>`; refusing to report success for a stamp that touched nothing"
+        ),
     }
 }
 

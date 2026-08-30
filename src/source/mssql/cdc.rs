@@ -732,7 +732,8 @@ impl MssqlChangeStream {
             from_is_pin: cfg.from_is_pin,
             pending: VecDeque::new(),
             // Overridden by `from_url`, which knows the checkpoint's location.
-            spill_dir: crate::source::cdc::spill_dir_for(None),
+            // Overridden by `from_url`, the production constructor.
+            spill_dir: None,
             spooled: None,
             batch_limit: peek.rows_capped() as i64,
             exhausted: false,
@@ -756,8 +757,8 @@ impl MssqlChangeStream {
         // Passed through to `open`, which cross-checks it against the catalog.
         configured_tables: &[String],
         // Where an oversized batch's tail spills — the checkpoint's directory. See
-        // `spill_dir_for`; `open` keeps the `.rivet/spill` fallback for the CLI and
-        // test paths that have no checkpoint.
+        // `spill_dir_for`; `open` starts with None — test paths that never cross
+        // the cap need no directory, and one that does must be given one.
         spill_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
@@ -928,7 +929,7 @@ impl MssqlChangeStream {
                      transaction is still delivered whole and atomically. Note this \
                      moves the ADAPTER's copy to disk; the sink still holds a whole \
                      transaction (a part is never split across one), so peak memory \
-                     falls only modestly — measured ~11% on a 100k-row transaction, \
+                     falls only modestly — measured ~11% on PostgreSQL's 100k-row transaction, \
                      not to the cap.",
                     batch.len(),
                     dir.display()

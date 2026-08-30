@@ -120,9 +120,11 @@ impl MysqlChangeStream {
     /// Measured against a real server at `MINIMAL`, three changes to a three-column
     /// table:
     ///
-    ///     insert | 1 | 10.5000 | alpha        <- fine
-    ///     update |   |         |              <- NO KEY, no value: 99.9 is gone
-    ///     delete | 2 |         |              <- key only
+    /// ```text
+    /// insert | 1 | 10.5000 | alpha        <- fine
+    /// update |   |         |              <- NO KEY, no value: 99.9 is gone
+    /// delete | 2 |         |              <- key only
+    /// ```
     ///
     /// and the run printed `status: success`, `rows: 4`, with no warning of any
     /// kind. An UPDATE row with a NULL key cannot even be applied to the right row,
@@ -619,7 +621,8 @@ impl MysqlChangeStream {
             tables: HashMap::new(),
             pending: VecDeque::new(),
             // Overridden by `open_or_resume`, which knows the checkpoint's location.
-            spill_dir: crate::source::cdc::spill_dir_for(None),
+            // Overridden by `open_or_resume`, the one production constructor.
+            spill_dir: None,
             spill: None,
             spooled: None,
             spill_error: None,
@@ -645,6 +648,11 @@ impl MysqlChangeStream {
     /// measured, and the reason the uuid is the floor and GTID only ever an extra).
     fn server_identity(url: &str, tls: Option<&TlsConfig>) -> Result<(String, String)> {
         use mysql::prelude::Queryable;
+        // Fault hook: the identity query's transient failure is the state the
+        // no-swallowing contract exists for, and a healthy stand can never
+        // produce it — without this, the mutant restoring `unwrap_or_default`
+        // is equivalent on every test environment.
+        crate::test_hook::maybe_fail_at("mysql_identity_query")?;
         let mut c = connect_conn(url, tls)?;
         let uuid: String = c
             .query_first("SELECT @@server_uuid")?
@@ -700,7 +708,22 @@ impl MysqlChangeStream {
         tls: Option<&TlsConfig>,
     ) -> Result<()> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+        // `?`, never `unwrap_or_default`: swallowing the error wrote a checkpoint
+        // with an EMPTY uuid — an unverifiable anchor that silently disables the
+        // whole foreign-server refusal this identity exists for, on any transient
+        // blip of the second query (the first, `current_coordinates`, had just
+        // succeeded on the same connection path — measured on a loaded E2E runner,
+        // where the inertness guard in the live test caught the empty uuid). An
+        // anchor rivet cannot later verify must not be created quietly; failing
+        // here is retryable and loud.
+        let (uuid, gtid) = Self::server_identity(url, tls).map_err(|e| {
+            anyhow::anyhow!(
+                "mysql cdc: could not record the server's identity for the new \
+                 checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: a \
+                 checkpoint without a server_uuid cannot be checked against a \
+                 foreign server on resume"
+            )
+        })?;
         Position(serde_json::json!({
             "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
         }))
@@ -736,12 +759,13 @@ impl MysqlChangeStream {
         mode: DrainMode,
         tls: Option<&TlsConfig>,
         configured_tables: Vec<String>,
+        spill_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        // Derived here rather than passed in: this is the one constructor the
-        // production path uses, and it already holds the checkpoint whose directory
-        // the spill shares. `open`/`open_from_current` are the anchor and test
-        // helpers and keep the `.rivet/spill` fallback.
-        let spill_dir = crate::source::cdc::spill_dir_for(ckpt);
+        // PASSED IN, not derived: resolving the directory needs the CONFIG's dir
+        // (the anchor for every relative path this run resolves), which only the
+        // caller holds. An earlier version derived it here from the checkpoint
+        // alone and fell back to a cwd-relative path — the shipped image runs at
+        // `/`, where that is an EACCES at the exact moment the cap is crossed.
         let with_dir = |mut s: Self| {
             s.spill_dir = spill_dir.clone();
             s
@@ -808,7 +832,21 @@ impl MysqlChangeStream {
                  trusting the result.",
                 path.display()
             );
-            let (uuid, gtid) = Self::server_identity(url, tls).unwrap_or_default();
+            // `?`, never `unwrap_or_default` — the SECOND site of the same
+            // swallowing `pin_checkpoint_at_current` had, and the one the config
+            // path actually takes: a transient blip of the identity query wrote a
+            // checkpoint with an EMPTY uuid, an unverifiable anchor that silently
+            // disables the foreign-server refusal (measured on a loaded CI
+            // runner, where the live test's inertness guard caught the empty
+            // uuid). Refusing is retryable and loud; a half-anchor is forever.
+            let (uuid, gtid) = Self::server_identity(url, tls).map_err(|e| {
+                anyhow::anyhow!(
+                    "mysql cdc: could not record the server's identity for the new \
+                     checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: \
+                     a checkpoint without a server_uuid cannot be checked against a \
+                     foreign server on resume"
+                )
+            })?;
             Position(serde_json::json!({
                 "file": file, "pos": pos, "server_uuid": uuid, "gtid_executed": gtid
             }))
@@ -848,7 +886,7 @@ impl MysqlChangeStream {
              which is what this used to do. The transaction is still delivered whole \
              and atomically. Note this moves the ADAPTER's copy to disk; the sink \
              still holds the whole transaction (a part is never split across one), so \
-             peak memory falls only modestly — measured ~11% on a 100k-row \
+             peak memory falls only modestly — measured ~11% on PostgreSQL's 100k-row \
              transaction, not to the cap.",
             self.file,
             self.tx.len(),
@@ -1163,6 +1201,18 @@ impl MysqlChangeStream {
                     )
                 }) {
                     anyhow::bail!(xa_prepare_refusal_message(&ev.schema, &ev.table));
+                }
+                // A SPILLED tail makes the "nothing of ours" verdict below
+                // unreachable honestly: the scan above covers only the in-memory
+                // head, and past the cap every later row went to disk without
+                // entering `tx` — so a branch whose captured rows sit only in the
+                // tail would pass the scan and `self.spill = None` would DELETE
+                // them, permanently and silently. Refuse instead: nothing has been
+                // handed to the sink, so the bail loses nothing (at-least-once
+                // re-reads from the checkpoint), and the message names both facts
+                // the operator needs.
+                if let Some(sp) = &self.spill {
+                    anyhow::bail!("{}", xa_prepare_spilled_tail_refusal_message(sp.len()));
                 }
                 // Nothing of ours in the branch: drop it rather than leave it for the
                 // next commit to stamp and fuse. The sink would route these rows away,
@@ -1611,6 +1661,38 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
 /// It also refuses a branch that goes on to COMMIT, because at `XA PREPARE` there is
 /// nothing to distinguish the two — the outcome is a Query event that has not been
 /// read yet. Over-refusing is the safe direction: the alternative shipped a
+/// The XA+spill refusal — a HARD STOP, and the message says so.
+///
+/// The first version prescribed "commit the XA branch promptly so it frames
+/// normally", which clears the condition in NO world: the refusal fires at the
+/// `XA_prepare_log_event`, the checkpoint has not advanced, and an `XA COMMIT` is
+/// appended AFTER the PREPARE — so every re-run replays the same rows from the
+/// checkpoint, re-crosses the same cap, re-spills, and bails at the SAME immutable
+/// PREPARE before ever reaching the commit. The sibling plain-XA refusal had
+/// already measured exactly this loop ("run, refuse, re-run, refuse") and its
+/// message says "does NOT clear by re-running"; this one said neither. A refusal
+/// that can persist for hours (XA's whole point) must tell the operator the
+/// stream is STOPPED, and name the ladder honestly: raising the caps un-wedges
+/// only a branch that turns out NOT to touch a captured table — if it is ours,
+/// the next rung is the plain refusal, whose escape (re-anchor FIRST, then
+/// re-snapshot) is the one that always works.
+pub(crate) fn xa_prepare_spilled_tail_refusal_message(tail_rows: usize) -> String {
+    format!(
+        "mysql cdc: an XA PREPARE arrived while this transaction's tail \
+         ({tail_rows} row(s)) is spilled to disk, so rivet cannot see whether the \
+         branch touches a captured table — and dropping a branch whose captured \
+         rows sit only in the tail would lose them silently. This is a HARD STOP: \
+         the PREPARE event is permanent in the binlog, so re-running refuses again \
+         at the same event; committing the branch does not clear it (the commit \
+         lands AFTER the PREPARE the re-read stops at). To proceed: raise \
+         RIVET_CDC_MAX_TX_ROWS/_BYTES past this branch's size so the whole branch \
+         is scanned in memory — if the branch does not touch a captured table, \
+         capture then continues; if it does, the plain XA refusal fires next with \
+         its own recovery (re-anchor the checkpoint past the branch FIRST, then \
+         re-snapshot the captured tables)."
+    )
+}
+
 /// rolled-back row as committed.
 pub(crate) fn xa_prepare_refusal_message(schema: &str, table: &str) -> String {
     let qualified = if schema.is_empty() {
@@ -1833,6 +1915,41 @@ mod tests {
     /// COORDINATES, and nothing stopped a checkpoint written by one server from
     /// being used against another. `binlog.000042:12345` parses on any host and
     /// addresses a different binlog on each.
+    /// The XA+spill refusal tells the operator the truth: hard stop, re-running
+    /// refuses again, committing does not clear it, and the ladder out.
+    ///
+    /// The first version said "commit the XA branch promptly so it frames
+    /// normally" — impossible in every world (the commit lands AFTER the PREPARE
+    /// the re-read stops at), on a refusal that can legitimately persist for
+    /// hours. Each pinned phrase below is a CLAIM the code makes true; drift the
+    /// message and this names which promise broke.
+    #[test]
+    fn the_xa_spill_refusal_names_the_stop_the_loop_and_the_ladder() {
+        let msg = xa_prepare_spilled_tail_refusal_message(7);
+        assert!(msg.contains("7 row(s)"), "names the spilled tail size");
+        assert!(msg.contains("HARD STOP"), "says the stream is stopped");
+        assert!(
+            msg.contains("re-running refuses again"),
+            "says the loop out loud — the PREPARE is permanent in the binlog"
+        );
+        assert!(
+            msg.contains("committing the branch does not clear it"),
+            "the first version prescribed exactly this non-remedy"
+        );
+        assert!(
+            msg.contains("RIVET_CDC_MAX_TX_ROWS"),
+            "the one rung that can un-wedge a not-ours branch"
+        );
+        assert!(
+            msg.contains("re-anchor") && msg.contains("re-snapshot"),
+            "the always-working escape, in the load-bearing order"
+        );
+        assert!(
+            !msg.contains("frames normally"),
+            "the retired false promise must not drift back in"
+        );
+    }
+
     #[test]
     fn a_checkpoint_from_another_server_is_refused_and_says_why() {
         use super::CheckpointIdentity as C;
@@ -2467,6 +2584,7 @@ mod tests {
             DrainMode::BoundedAtOpen,
             None,
             Vec::new(),
+            None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
         assert!(
@@ -2494,6 +2612,7 @@ mod tests {
             DrainMode::BoundedAtOpen,
             None,
             Vec::new(),
+            None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
         let got = s2
@@ -2546,6 +2665,7 @@ mod tests {
             DrainMode::Continuous,
             None,
             Vec::new(),
+            None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
         let b = s2

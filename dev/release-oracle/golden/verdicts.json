@@ -44,7 +44,7 @@
     },
     "order_keyed": {
       "strategy": "range",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "orders": {
       "strategy": "keyset",
@@ -56,7 +56,7 @@
     },
     "orders_sparse": {
       "strategy": "full",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "orders_sparse_for_export": {
       "strategy": "full",
@@ -68,7 +68,7 @@
     },
     "ref_id_history": {
       "strategy": "range",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "rivet_type_matrix": {
       "strategy": "full",
@@ -76,7 +76,7 @@
     },
     "row_hash_probe": {
       "strategy": "full",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "sparse_key": {
       "strategy": "keyset",
@@ -92,7 +92,7 @@
     },
     "wide_cols": {
       "strategy": "full",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     }
   },
   "mysql": {
@@ -134,7 +134,7 @@
     },
     "ext_ref_id_history": {
       "strategy": "range",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "ext_sparse_key": {
       "strategy": "keyset",
@@ -212,7 +212,7 @@
     },
     "order_keyed": {
       "strategy": "range",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "orders": {
       "strategy": "keyset",
@@ -236,7 +236,7 @@
     },
     "ref_id_history": {
       "strategy": "range",
-      "verdict": "ACCEPTABLE"
+      "verdict": "DEGRADED"
     },
     "rivet_type_matrix": {
       "strategy": "full",

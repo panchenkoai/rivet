@@ -57,9 +57,19 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 // grid version gaps. Shrink-only: LOWER when a gap is filled; never raise.
 // History: 14 -> 13 (pooler_safety) -> 12 (state_upgrade) -> 11 (state_concurrency)
 // -> 10 (scale_memory wired as the verify_scale_memory flat-RSS preflight).
-// Now: infra gap rows(4: network_faults, tls_required, auth, cdc_standby) +
-// grid version gaps(3+2+1+0=6) = 10.
-const GAP_RATCHET: usize = 10;
+// Now: infra gap rows(0 — network_faults/cdc_standby flipped to test,
+// tls_required/auth to partial with the residual named, 2026-08-29) +
+// grid version gaps(0+1+1+0=2), MEASURED 2026-08-30 rather than argued.
+// Three postgres images needed nothing; the mysql and mssql notes described
+// blockers that had already been removed (a CTE-free seed had shipped; the real
+// mssql blocker was a hardcoded tools18 path in the HARNESS, now probed). The
+// sixth, `mariadb-11`, was not a gap at all — MariaDB is not a SourceType, so
+// the row recorded a debt that could only be "paid" by adding an engine. A
+// coverage ledger that carries an obligation the product never took on reports
+// permanent debt and teaches its readers to discount it. (The line above summed to the OLD value of
+// 10 until a critic recomputed it — the constant was right, its arithmetic was
+// leftover: the message-truth class, in the comment over a ratchet.)
+const GAP_RATCHET: usize = 2;
 
 fn load(path: &str) -> Value {
     let s = super::nonvacuity::subject_text(path);
@@ -210,12 +220,52 @@ fn every_gate_function_has_a_ledger_row_and_vice_versa() {
     // exist twice — `gc_survival` runs as a local scenario (`sc_gc_survival`) and
     // again in the BigQuery stage (`verify_gc_survival`) — and which heading its
     // ledger row sits under is a fact about the stage, not about the name.
+    // `infra` rows became drivable on 2026-08-29 (network_faults / tls_required /
+    // auth / cdc_standby each got a verify_ leg), so the row that satisfies a
+    // verify_ function may live under any of the three headings.
+    let infra_ids: std::collections::BTreeSet<String> = seq(&gate, "infra")
+        .iter()
+        .map(|e| scalar(e.get("id").unwrap()))
+        .collect();
     for f in &verify_fns {
         assert!(
-            preflight_ids.contains(f) || scenario_ids.contains(f),
-            "the gate defines verify_{f}() but the gate matrix has no `preflights` \
-             or `scenarios` row `{f}`"
+            preflight_ids.contains(f) || scenario_ids.contains(f) || infra_ids.contains(f),
+            "the gate defines verify_{f}() but the gate matrix has no `preflights`, \
+             `scenarios` or `infra` row `{f}`"
         );
+    }
+    // An infra row promoted to status:test must have its verify_ leg, same as
+    // the preflights rule below — a `test` claim with no driver is decoration.
+    for e in seq(&gate, "infra") {
+        let id = scalar(e.get("id").unwrap());
+        // state_upgrade / state_concurrency are status:test WITHOUT their own
+        // verify_: their notes say (and the call-site guard verifies) they are
+        // driven by the state_migrations preflight's cargo filters.
+        // `partial` counts too: a critic deleted verify_tls_required outright
+        // (fn + __all__ + call site) and every guard stayed green, because
+        // `partial` was the one status that required nothing. Two of the four
+        // infra gaps this branch banked were banked into it, so the structural
+        // guard was off exactly where the claim was newest.
+        if matches!(
+            e.get("status").map(scalar).as_deref(),
+            Some("test") | Some("partial")
+        ) && id != "state_upgrade"
+            && id != "state_concurrency"
+        {
+            // A row may be driven by a differently-named function (the
+            // warehouse_load half runs through `run_bigquery_golden`), so the
+            // note may carry the driver instead — and the sibling guard below
+            // proves any verify_ name in a note RESOLVES, so this cannot be
+            // satisfied by inventing one.
+            let note = e.get("note").map(scalar).unwrap_or_default();
+            let named_in_note = note.contains("verify_") || note.contains("run_bigquery_golden");
+            assert!(
+                verify_fns.contains(&id) || named_in_note,
+                "infra row `{id}` is status:{} but nothing drives it: no \
+                 verify_{id}(), and its note names no driver either",
+                e.get("status").map(scalar).unwrap_or_default()
+            );
+        }
     }
     // A preflight marked status:test MUST have its verify_ function; a `gap` preflight
     // (not yet wired) legitimately has none.
@@ -276,10 +326,69 @@ fn gaps_do_not_exceed_the_ratchet() {
         }
     }
 
+    // TWO-SIDED (matrix audit, 2026-08-29): `<=` let a closed gap keep the old
+    // ceiling — the win was never banked, so a later regression could spend it
+    // silently. Down is as loud as up.
+    assert_eq!(
+        gaps, GAP_RATCHET,
+        "release-gate-matrix has {gaps} gaps, the ratchet says {GAP_RATCHET}. Up: you cannot \
+         ADD a gap — wire the check (flip gap -> test / gate the version). Down: a gap you \
+         closed must be banked — LOWER the ratchet in this commit."
+    );
+}
+
+/// Every `verify_*` token a matrix NOTE mentions must resolve to a real gate
+/// function. Prose is unchecked by construction — the guard binds a row's `id`
+/// to `verify_<id>`, so a note may name anything — and two notes named
+/// `verify_tls_policy` / `verify_mongo_auth`, which exist nowhere (the real
+/// functions are `verify_tls_required` / `verify_auth`). A reader who follows
+/// the note lands on nothing: the message-truth class this repo grades
+/// everywhere else.
+#[test]
+fn every_verify_name_in_a_matrix_note_resolves() {
+    let mut defined: BTreeSet<String> = BTreeSet::new();
+    for path in gate_py() {
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in src.lines() {
+            if let Some(rest) = line.trim().strip_prefix("def verify_") {
+                defined.insert(format!("verify_{}", rest.split('(').next().unwrap().trim()));
+            }
+        }
+    }
     assert!(
-        gaps <= GAP_RATCHET,
-        "release-gate-matrix has {gaps} gaps > ratchet {GAP_RATCHET} — you cannot ADD a gap; \
-         wire the check (flip gap -> test / gate the version) and LOWER the ratchet"
+        defined.len() >= 10,
+        "collected only {} verify_ fns — the sweep broke and this would pass vacuously",
+        defined.len()
+    );
+    let gate = load(GATE_MATRIX);
+    let mut notes = String::new();
+    for section in ["preflights", "infra", "scenarios"] {
+        for e in seq(&gate, section) {
+            if let Some(n) = e.get("note") {
+                notes.push_str(&scalar(n));
+                notes.push('\n');
+            }
+        }
+    }
+    let mut missing: Vec<String> = Vec::new();
+    let mut rest = notes.as_str();
+    while let Some(at) = rest.find("verify_") {
+        rest = &rest[at + "verify_".len()..];
+        let ident: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let full = format!("verify_{ident}");
+        if !ident.is_empty() && !defined.contains(&full) {
+            missing.push(full);
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "matrix notes name gate functions that do not exist: {missing:?} — the \
+         note is what a reader follows, so an unresolvable name is a dead end"
     );
 }
 

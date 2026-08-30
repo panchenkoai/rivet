@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [config_from_yaml, pg_test_decoding, mongo_resume_token]
+        target: [config_from_yaml, pg_test_decoding, mongo_resume_token, spill_frame_decode]
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly + cargo-fuzz

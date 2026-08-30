@@ -1643,10 +1643,12 @@ pub(crate) fn run_pool(
     // config.exports slot to borrow, and everything downstream (`by_name`,
     // `queue`) borrows from THIS vec.
     //
-    // #167 per-unit resume: with `--split` the prefix-level _SUCCESS is AMBIGUOUS
-    // (a split prefix's _SUCCESS is written per-unit, so it is present the moment
-    // ONE unit finishes) — pre-skipping the giant on it would drop a partially-
-    // complete split. So when `--split` is set the pre-skip is deferred to a
+    // #167 per-unit resume: with `--split` the prefix-level _SUCCESS says the
+    // WHOLE giant completed (units suppress their own marker; the pool writes
+    // the one marker after every unit succeeds) — but a crash can leave a
+    // partially-complete split with NO marker, and pre-skipping the giant on
+    // the marker's absence alone cannot tell "never ran" from "half done". So
+    // when `--split` is set the pre-skip is deferred to a
     // PER-UNIT skip AFTER the split (below); without `--split` the normal
     // prefix-level skip applies here unchanged.
     let mut effective: Vec<ExportConfig> = config
@@ -1728,17 +1730,47 @@ pub(crate) fn run_pool(
                 // yields different boundaries, and the name-based skip below then covers a
                 // different key range than was exported → silent gap). Re-probe only when there
                 // is no prior split in the prefix (a genuine first run).
-                let units_opt = match resume
-                    .then(|| {
-                        super::split::reconstruct_units_from_prefix(
+                // A run-varying placeholder breaks split's stable-prefix identity
+                // (resume + stamp expand `for_today` at their own moments — a
+                // cross-midnight resume reads an EMPTY prefix, silently re-runs
+                // the giant and leaves yesterday's markers wedged). Refuse now,
+                // before any unit exists (round-5).
+                if let Some(token) = super::split::split_unsafe_placeholder(&base.destination) {
+                    anyhow::bail!(
+                        "apply --pool --split: export '{}' writes to a destination with the \
+                         run-varying placeholder {token} — a split resume reconstructs its \
+                         partition FROM the prefix, so the prefix must be one stable location \
+                         across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
+                         which are stable) for the split export.",
+                        base.name
+                    );
+                }
+                let reconstructed = match resume {
+                    true => super::split::reconstruct_units_from_prefix(
+                        &base.destination,
+                        &base.family(),
+                        &base,
+                    )?,
+                    false => None,
+                };
+                let units_opt = match reconstructed {
+                    Some(u) => {
+                        // The reconstruction may have SHRUNK the partition (a
+                        // trailing-adjacent crash: the open tail absorbed the
+                        // crashed units). Stamp the ceased ordinals' ledger rows
+                        // + bucket markers terminal NOW — this is the only
+                        // moment that knows they ceased, and unstamped they
+                        // wedge gc/cleanup on the shared prefix forever
+                        // (round-4; born with the reconstruction in #217).
+                        super::split::stamp_ceased_units(
                             &base.destination,
                             &base.family(),
-                            &base,
-                        )
-                    })
-                    .flatten()
-                {
-                    Some(u) => Some(u),
+                            &base.name,
+                            u.len(),
+                            &state,
+                        );
+                        Some(u)
+                    }
                     None => super::split::probe_and_synthesize(&config, &base, &config_dir, *n)?,
                 };
                 match units_opt {
@@ -1900,6 +1932,14 @@ pub(crate) fn run_pool(
             }
         });
         if effective.is_empty() {
+            // Every split unit is complete — but this return sits ABOVE the
+            // pool's prefix-`_SUCCESS` writer, so a crash in the
+            // [last unit's Success → marker] window would leave the marker
+            // missing FOREVER (this is the only path that ever looks again).
+            // Repair it before declaring "nothing to run" (round-4).
+            if let Some((dest_config, family)) = &split_info {
+                finalize::repair_missing_split_marker(dest_config, family);
+            }
             // This return sits ABOVE the schedule + makespan block, so a run
             // that got here prints neither — and the `--split` notice above
             // points forward at exactly that makespan line. Cancel the pointer
@@ -3130,6 +3170,48 @@ mod run_tail_tests {
         reports_run_aggregate, self_check_throughput_as, snapshot_then_stamp, tail_plan,
     };
     use crate::config::ExportConfig;
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        /// TOTALITY over any composition: the fold errs IFF the batch holds a
+        /// failure, and when a DataIntegrityError is anywhere in the mix the
+        /// representative marker survives the context chain (exit 3, never 1)
+        /// no matter where it sits or how much noise surrounds it. The unit
+        /// below pins three hand shapes; this walks the composition space —
+        /// the survived whole-body stub Ok(()) dies on the first clause, a
+        /// pick-the-first representative dies on the second.
+        #[test]
+        fn fold_failures_errs_iff_nonempty_and_integrity_marker_survives_anywhere(
+            plain in 0usize..4,
+            integrity_at in proptest::option::of(0usize..4),
+        ) {
+            let mut failures: Vec<anyhow::Error> =
+                (0..plain).map(|i| anyhow::anyhow!("plain failure {i}")).collect();
+            if let Some(at) = integrity_at {
+                let at = at.min(failures.len());
+                failures.insert(
+                    at,
+                    anyhow::Error::new(crate::error::DataIntegrityError::new(
+                        "checksum mismatch",
+                    )),
+                );
+            }
+            let n = failures.len();
+            let out = fold_failures(failures, "prop batch");
+            proptest::prop_assert_eq!(out.is_err(), n > 0, "err IFF non-empty (n={})", n);
+            if integrity_at.is_some() {
+                let err = out.unwrap_err();
+                proptest::prop_assert!(
+                    err.chain().any(|c| c.downcast_ref::<crate::error::DataIntegrityError>().is_some()),
+                    "the DataIntegrityError marker must survive the fold's context \
+                     chain wherever it sat: {err:#}"
+                );
+            }
+        }
+    }
 
     /// `fold_failures` is the shared representative-failure fold the three
     /// orchestrator tails route through (arch-roast 2026-08-21). Its whole-body

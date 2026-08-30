@@ -590,6 +590,58 @@ fn matrix_mapped_tests_are_real_test_functions() {
     }
 }
 
+/// Every fuzz-matrix `test:` cell names a target that is wired END TO END:
+/// the `rivet::fuzz` entry fn (src/fuzz.rs), the libFuzzer binary
+/// (fuzz/fuzz_targets/<name>.rs + a `[[bin]]` in fuzz/Cargo.toml), and the
+/// nightly workflow's target list (.github/workflows/fuzz.yml). The sibling
+/// check above stops at the entry fn — which is exactly how
+/// `spill_frame_decode` shipped half-wired (fn + matrix cell present, CI
+/// wiring absent) until a review caught it by eye (2026-08-29). A fuzz target
+/// nothing RUNS is a matrix cell about a binary that never executes.
+#[test]
+fn every_fuzz_matrix_target_is_fully_wired() {
+    let root = repo_root();
+    let fuzz_src = std::fs::read_to_string(root.join("src/fuzz.rs")).expect("read src/fuzz.rs");
+    let cargo =
+        std::fs::read_to_string(root.join("fuzz/Cargo.toml")).expect("read fuzz/Cargo.toml");
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/fuzz.yml")).expect("read fuzz.yml");
+    let matrix = load_matrix("docs/fuzz-matrix.yaml");
+    let mut names = std::collections::BTreeSet::new();
+    for sc in &matrix.scenarios {
+        for (_, cell) in sc.resolved_cells(&matrix.engines, "docs/fuzz-matrix.yaml") {
+            if let Some(name) = &cell.test {
+                names.insert(name.clone());
+            }
+        }
+    }
+    assert!(
+        names.len() >= 4,
+        "fuzz-matrix declares only {} target name(s) — the ledger shrank or the parse broke",
+        names.len()
+    );
+    for name in &names {
+        assert!(
+            fuzz_src.contains(&format!("fn {name}(")),
+            "fuzz target `{name}`: no `fn {name}(` entry in src/fuzz.rs"
+        );
+        assert!(
+            cargo.contains(&format!("name = \"{name}\"")),
+            "fuzz target `{name}`: no [[bin]] in fuzz/Cargo.toml — `cargo fuzz run {name}` \
+             cannot build it"
+        );
+        assert!(
+            root.join(format!("fuzz/fuzz_targets/{name}.rs")).is_file(),
+            "fuzz target `{name}`: fuzz/fuzz_targets/{name}.rs does not exist"
+        );
+        assert!(
+            workflow.contains(name.as_str()),
+            "fuzz target `{name}`: absent from .github/workflows/fuzz.yml's target list — \
+             the binary exists and nothing ever runs it"
+        );
+    }
+}
+
 /// The engine-agnostic `na`-shared-seam scenarios in pool-split-matrix.yaml name their RED-proven
 /// regression test in `what` (not a `test:` cell, so [`matrix_every_mapped_test_exists`] does not
 /// reach them). Those tests ARE the regression barrier — the matrix only maps each split bug this

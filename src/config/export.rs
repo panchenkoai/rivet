@@ -682,6 +682,19 @@ pub struct MetaColumns {
     pub exported_at: bool,
     #[serde(default)]
     pub row_hash: RowHash,
+    /// INTERNAL (never user-config, serde-skipped): the CDC anchor position the
+    /// snapshot leg stamps into every row as a constant `__pos` (+ `__seq=-1`).
+    /// Round-10 STRUCT fix for the re-baseline class: a NULL-`__pos` baseline
+    /// loses the warehouse dedup to EVERY already-loaded change row, so a
+    /// post-gap re-snapshot silently served pre-gap values. Stamped with the
+    /// anchor — rendered by the SAME `Position.0.to_string()` the drain uses —
+    /// a re-baseline row outranks every pre-gap change (anchor > their pos) and
+    /// loses to every post-anchor change (pos > anchor, and `__seq=-1` loses
+    /// the exact-anchor tie deterministically on both warehouses). Old NULL
+    /// baselines keep ranking below everything (`__pos IS NOT NULL DESC`).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub cdc_snapshot_pos: Option<String>,
 }
 
 // `any_enabled()` lived here to answer "does the CDC path need to warn that

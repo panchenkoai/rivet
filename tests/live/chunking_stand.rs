@@ -2772,6 +2772,22 @@ fn pool_split_cloud(crash: Option<(&str, &str)>) {
          copy name leaves 150001 of 300000.)",
         ids.len()
     );
+
+    // …and the same union through an INDEPENDENT codec — at the SAME scope.
+    //
+    // `dir_manifest_copy_id_set` above decodes with rivet's own arrow/parquet
+    // crate, so a fault in that shared path cancels itself. DuckDB shares none
+    // of it. The scope is the load-bearing half: a first cut counted the whole
+    // BUCKET and read 600200 against 300000 — the prefix legitimately holds
+    // ORPHAN parts (written, never manifested), which is precisely the property
+    // the comment above says a prefix-wide count does not have. Declared scope,
+    // different codec.
+    let declared_by_duckdb = duckdb_declared_dir_scalar(pulled.path(), "count(DISTINCT id)");
+    assert_eq!(
+        declared_by_duckdb, ROWS,
+        "every source id must be DECLARED, counted by DuckDB over the same \
+         manifest-declared parts"
+    );
 }
 
 #[test]

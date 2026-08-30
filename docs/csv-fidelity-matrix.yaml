@@ -47,8 +47,8 @@ scenarios:
     no_corruption_on_escape: { na: "a float literal is `[0-9.eE+-]`/`NaN`/`inf` — no CSV metacharacter, nothing to escape" }
 
   - id: null_vs_empty
-    what: "a NULL cell writes the empty field (the CSV convention) — pinned so a future change can't collide NULL with an empty string silently."
-    no_silent_loss:          { test: null_value_writes_empty_string }
+    what: "NULL writes the bare empty field; a PRESENT empty string writes quoted \"\" (the PostgreSQL COPY CSV convention). HONESTY (round-7): until 2026-08-29 BOTH rendered as bare nothing — the collision this row claimed to pin was total, and the one test asserted only the NULL side. Consumers: DuckDB's read_csv default allow_quoted_nulls=true still folds \"\" to NULL — set it false to recover the distinction."
+    no_silent_loss:          { test: an_empty_string_is_quoted_and_distinct_from_null }
     no_corruption_on_escape: { na: "the empty field has no content to escape" }
 
   - id: binary_hex

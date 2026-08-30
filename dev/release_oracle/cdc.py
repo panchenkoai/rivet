@@ -1128,10 +1128,27 @@ def verify_cdc_differential(led: "Ledger") -> None:
     led.phase("CDC differential [rivet vs Debezium] (same window, compared in DuckDB)")
     for eng in ("postgres", "mysql", "mssql", "mongo"):
         for scen in _DIFFERENTIAL_SCENARIOS:
-            r = subprocess.run(
-                [sys.executable, str(runner), "--engine", eng, "--scenario", scen],
-                capture_output=True, text=True, timeout=900,
-            )
+            # The timeout is a GRADED outcome, never an uncaught exception: a hung
+            # harness (rivet run has no inner timeout; a bound regression hangs it)
+            # used to raise TimeoutExpired straight through main's try/finally —
+            # killing the WHOLE gate mid-flight and losing every already-graded
+            # row, the one failure mode with no SKIP path. Directly contradicted
+            # the design statement two branches below.
+            try:
+                r = subprocess.run(
+                    [sys.executable, str(runner), "--engine", eng, "--scenario", scen],
+                    capture_output=True, text=True, timeout=900,
+                )
+            except subprocess.TimeoutExpired as t:
+                led.failed(eng, "cdc", f"differential:{scen}", "-",
+                           f"differential[{eng}/{scen}]: harness HUNG past 900s — a "
+                           f"bound/termination regression is exactly what a hang "
+                           f"means here, so it fails the cell rather than skipping "
+                           f"(and never kills the gate).\n"
+                           + ((t.stdout or b"").decode(errors="replace")[-600:]
+                              if isinstance(t.stdout, bytes) else (t.stdout or "")[-600:]),
+                           "hung")
+                continue
             tail = (r.stdout or "")[-600:] + (r.stderr or "")[-600:]
             if r.returncode == 0 and "AGREE" in (r.stdout or ""):
                 # The message names its own scope. A run that compared only
@@ -1147,6 +1164,28 @@ def verify_cdc_differential(led: "Ledger") -> None:
             elif "DISAGREE" in (r.stdout or ""):
                 led.failed(eng, "cdc", f"differential:{scen}", "-",
                            f"differential[{eng}/{scen}]: DISAGREE\n{tail}", "disagree")
+            elif "that is an outcome" in ((r.stdout or "") + (r.stderr or "")):
+                # compare.py's own words: "no manifest-declared parts … that is an
+                # outcome ('nothing was delivered')". Rivet exiting 0 while the
+                # reference captured events is the ONE regression class this
+                # harness uniquely exists to catch — total silent loss — and the
+                # skip catch-all below was absorbing it into a non-blocking cell.
+                led.failed(eng, "cdc", f"differential:{scen}", "-",
+                           f"differential[{eng}/{scen}]: rivet delivered NOTHING "
+                           f"while the reference captured events — total-loss "
+                           f"outcome, not plumbing\n{tail}", "nothing delivered")
+            elif "REFERENCE-STALLED" in ((r.stdout or "") + (r.stderr or "")):
+                # The harness REFUSED because the reference never streamed. That
+                # is a statement about the stand, and it still FAILS: a SKIP here
+                # removes an engine's entire differential from the release with
+                # no ledger row demanding it back, and nothing counts SKIPs. The
+                # refusal carries the connector's own last messages, so the
+                # operator sees whether it is a race or a broken reference.
+                led.failed(eng, "cdc", f"differential:{scen}", "-",
+                           f"differential[{eng}/{scen}]: the REFERENCE never "
+                           f"streamed — no comparison happened, and a silent skip "
+                           f"would drop this engine's differential entirely\n{tail}",
+                           "reference stalled")
             else:
                 # Neither AGREE nor DISAGREE: the harness itself did not complete.
                 # Seven plumbing artefacts in two days say this happens, and a gate

@@ -291,8 +291,15 @@ fn cdc_throughput_drains_a_large_backlog() {
     run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out));
     let secs = t.elapsed().as_secs_f64();
 
-    // Correctness at scale: nothing dropped under volume.
+    // Correctness at scale: nothing dropped under volume — graded by DuckDB
+    // (independent codec), not by rivet's own counter (harness audit: the
+    // suite's ONLY at-scale CDC test was manifest_rows-only).
     assert_eq!(manifest_rows(&out), N, "all {N} changes must be captured");
+    assert_eq!(
+        duckdb_dir_scalar(&out, "count(DISTINCT id)", None),
+        N,
+        "the destination must HOLD all {N} ids, not merely count them"
+    );
 
     // Throughput: logged for trend-watching, plus a generous wall-clock ceiling so
     // a catastrophic perf regression fails the test without machine-variance flake.
@@ -1768,7 +1775,13 @@ fn cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     c.query_drop("COMMIT").unwrap();
 
     run_rivet_ok(&cdc_config(&d, &orders, &ckpt, &out1));
-    assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
+    // CONTENT, not count (harness audit): the fixture's two tables share id 1,
+    // so a mis-route of the audit row kept the count at 1 and passed.
+    assert_eq!(
+        cdc_id_ops(&out1),
+        vec![(1, "insert".to_string())],
+        "exactly the ORDERS row — the audit row must not be routed here"
+    );
 
     // Run 3 with NO new changes must capture ZERO — a stalled checkpoint
     // would re-read the same transaction and duplicate the row.
@@ -1818,7 +1831,11 @@ fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &orders, &slot, &out1));
-    assert_eq!(manifest_rows(&out1), 1, "the captured row lands");
+    assert_eq!(
+        cdc_id_ops(&out1),
+        vec![(1, "insert".to_string())],
+        "exactly the ORDERS row — the audit row must not be routed here"
+    );
     run_rivet_ok(&pg_cdc_config(&d, &orders, &slot, &out2));
     assert_eq!(
         manifest_rows(&out2),
@@ -1849,9 +1866,9 @@ fn cdc_schema_qualified_table_config_captures_events() {
         .unwrap();
     run_rivet_ok(&cdc_config(&d, &qualified, &ckpt, &out));
     assert_eq!(
-        manifest_rows(&out),
-        1,
-        "a db-qualified table: must capture, not 0-row-success"
+        cdc_id_ops(&out),
+        vec![(1, "insert".to_string())],
+        "a db-qualified table: the ROW must land, not merely a count of 1"
     );
 }
 
@@ -1885,9 +1902,9 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
     let qualified = format!("public.{tbl}");
     run_rivet_ok(&pg_cdc_config(&d, &qualified, &slot, &out));
     assert_eq!(
-        manifest_rows(&out),
-        1,
-        "a schema-qualified table: must capture, not 0-row-success"
+        cdc_id_ops(&out),
+        vec![(1, "insert".to_string())],
+        "a schema-qualified table: the ROW must land, not merely a count of 1"
     );
 }
 
@@ -5100,7 +5117,8 @@ fn cdc_cross_database_enum_enriches_from_the_tables_own_schema() {
 /// for the warehouse load: `read_parquet(union_by_name=true)` over BOTH the
 /// `initial: snapshot` leg AND the CDC change leg mimics the loader's
 /// declared-schema LOAD-by-name into one `<table>__changes` table (snapshot rows
-/// get `__op`/`__pos`/`__seq` = NULL). It is the exact `fda1653` class: a
+/// get `__op` = NULL; since round-10 a checkpointed snapshot leg STAMPS
+/// constant `__pos`/`__seq=-1`, legacy legs stay NULL). It is the exact `fda1653` class: a
 /// snapshot leg that KEPT its batch `meta_columns` would leak a column the CDC
 /// stream lacks — silent under count/sum checks, breaks the warehouse load one
 /// layer up. The current-state dedup is then verified against the SOURCE's actual
@@ -8282,12 +8300,24 @@ fn doctor_grades_the_checkpoint_the_run_opens_not_one_relative_to_the_shell() {
         "the control half is broken — doctor run from the config's own directory \
          must read the position the run just wrote, got:\n{from_config}"
     );
+    // Compare the CHECKPOINT IDENTITY, not the whole line.
+    //
+    // The two doctor invocations are seconds apart against a SHARED server, and
+    // the line carries a live-moving estimate: CI caught `backlog ≈ 0.0 MiB`
+    // against `≈ 0.1 MiB` for the same `binlog.000003:2944814` and failed a test
+    // whose subject is WHICH checkpoint was read. A byte-for-byte compare of a
+    // string containing a quantity the server keeps changing grades the
+    // server's traffic, not the product — and it fails INTERMITTENTLY, which is
+    // how a flake teaches people to re-run instead of read.
+    let identity =
+        |line: &str| -> String { line.split(", backlog").next().unwrap_or(line).to_string() };
     assert_eq!(
-        from_config, from_elsewhere,
+        identity(&from_config),
+        identity(&from_elsewhere),
         "doctor described two different checkpoints for one config. The verdict \
          from another working directory is the one deployments actually see, and \
          `no checkpoint yet` is GREEN — so a position below binlog retention grades \
-         [OK] and the run then dies with ERROR 1236."
+         [OK] and the run then dies with ERROR 1236.\n  from config:    {from_config}\n  from elsewhere: {from_elsewhere}"
     );
 }
 
@@ -8929,6 +8959,45 @@ fn mysql_cdc_a_transaction_past_the_memory_cap_spills_rather_than_failing() {
     );
 }
 
+/// An anchor whose identity query FAILS must refuse to write the checkpoint —
+/// never quietly write an UNVERIFIABLE one.
+///
+/// `unwrap_or_default` here shipped an empty `server_uuid` on any transient blip
+/// of the second query (measured on a loaded CI runner, where the sibling test's
+/// inertness guard caught the empty uuid) — an anchor the foreign-server refusal
+/// can never check. The healthy stand cannot produce the failure, so the fault
+/// hook is the only honest fixture; without it the swallowing mutant is
+/// equivalent on every test environment.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW + REPLICATION grant)"]
+fn mysql_anchor_refuses_to_write_an_unverifiable_checkpoint() {
+    let tbl = unique_name("cdc_anchor_id");
+    let mut c = conn();
+    use mysql::prelude::Queryable;
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl);
+    let out = rig.run_with_envs(&[("RIVET_TEST_ERROR_AT", "mysql_identity_query")]);
+    assert!(
+        !out.status.success(),
+        "an anchor that cannot record the server's identity must FAIL, not write \
+         a checkpoint the resume can never verify"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("UNVERIFIABLE anchor"),
+        "the refusal must say WHY the anchor was not written: {err}"
+    );
+    assert!(
+        !rig.checkpoint().exists(),
+        "no checkpoint may exist — a half-anchor with an empty uuid is exactly \
+         the artifact this refusal exists to prevent"
+    );
+}
+
 /// A rolled-back MyISAM statement is framed as its OWN transaction — it must not be
 /// fused into the next one's commit.
 ///
@@ -9019,5 +9088,139 @@ fn roast_mysql_cdc_a_rolled_back_myisam_statement_is_framed_as_its_own_transacti
          transactions and must carry two commit positions — one shared position \
          means the buffer survived its marker and was published under the next \
          transaction's commit"
+    );
+}
+
+/// Round-5 completeness critic: the DRAIN leg's `_rivet_row_hash` graded by the
+/// INDEPENDENT implementation (`dev/release_oracle/rowhash.py`: DuckDB's own
+/// JSON rendering of the parquet + python xxhash — neither rivet's reader nor
+/// rivet's hasher). Until now every CDC row-hash assertion checked PRESENCE and
+/// schema parity only, while the sink's comment claimed "the same Rust render
+/// as the snapshot" untested — and rounds 2-4 edited the drain's value path.
+/// The corpus carries the injectivity ghosts (NULL, empty string, an embedded
+/// unit separator, a comma-joined value): a render divergence on the drain leg
+/// hashes the same logical row differently, silently defeating the one
+/// cross-leg integrity column. RED against un-framing the canonical image in
+/// `src/enrich.rs` (the v1 bare-separator bug shape).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + host duckdb + python3+xxhash"]
+fn cdc_drain_row_hash_matches_the_independent_implementation() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_rowhash_val");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, a VARCHAR(64) NULL, b VARCHAR(64) NOT NULL)"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mysql_cdc(&tbl)
+        .export_line("meta_columns: { row_hash: true }")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
+    run_rivet_ok(&cfg); // anchor run (captures nothing)
+
+    // The injectivity-ghost corpus: NULL vs empty, an embedded \x1f (the v1
+    // separator), a comma-joined value (the container-display ghost).
+    c.exec_drop(
+        format!("INSERT INTO {tbl} (id, a, b) VALUES (?,?,?),(?,?,?),(?,?,?),(?,?,?)"),
+        (
+            1,
+            Option::<String>::None,
+            "plain",
+            2,
+            Some(String::new()),
+            "x",
+            3,
+            Some("a\u{1f}b".to_string()),
+            "sep",
+            4,
+            Some("a, b".to_string()),
+            "[c]",
+        ),
+    )
+    .unwrap();
+    run_rivet_ok(&cfg); // drain leg -> out/cdc-*.parquet
+
+    // ENV PRECHECK (completeness critic: the nightly runner installs neither
+    // host duckdb nor python-xxhash, and a missing dep must read as a SKIP,
+    // never as "the independent implementation DISAGREES"). Loud skip, not
+    // silent: absence-is-not-success.
+    let duck_ok = std::process::Command::new("duckdb")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let xxh_ok = std::process::Command::new("python3")
+        .args(["-c", "import xxhash"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !duck_ok || !xxh_ok {
+        skip_live(&format!(
+            "host oracle deps missing (duckdb CLI: {duck_ok}, python3+xxhash: {xxh_ok}) \
+             — install both to grade the drain leg's hashes"
+        ));
+        return;
+    }
+
+    // Leg 1 of the oracle: DuckDB (host CLI) renders the drain parquet.
+    let q = format!(
+        "SELECT id, a, b, _rivet_row_hash AS h FROM read_parquet('{}/cdc-*.parquet') ORDER BY id",
+        out.display()
+    );
+    let duck = std::process::Command::new("duckdb")
+        .args(["-json", "-c", &q])
+        .output()
+        .expect("host duckdb CLI (brew install duckdb) — the independent reader");
+    assert!(
+        duck.status.success(),
+        "duckdb read failed: {}",
+        String::from_utf8_lossy(&duck.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&duck.stdout).expect("duckdb -json output");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(
+        rows.len(),
+        4,
+        "fixture: all four corpus rows must be captured"
+    );
+
+    // Leg 2: python + xxhash recompute the canonical image per
+    // dev/release_oracle/rowhash.py — a different hasher AND a different
+    // framing implementation than src/enrich.rs.
+    let py_script = d.path().join("check.py");
+    std::fs::write(
+        &py_script,
+        format!(
+            "import sys, json\nsys.path.insert(0, '{repo}/dev/release_oracle')\nfrom rowhash import row_hash_of\nrows = json.load(sys.stdin)\nfor r in rows:\n    cells = [str(r['id']), r['a'], r['b']]\n    exp = row_hash_of(cells)\n    got = int(r['h'])\n    assert exp == got, f\"row {{r['id']}}: independent={{exp}} rivet={{got}}\"\nprint('OK', len(rows))\n",
+            repo = env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(&py_script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 with xxhash — the independent hasher");
+    use std::io::Write as _;
+    child.stdin.take().unwrap().write_all(&duck.stdout).unwrap();
+    let py_out = child.wait_with_output().unwrap();
+    assert!(
+        py_out.status.success(),
+        "the independent implementation DISAGREES with the drain leg's \
+         _rivet_row_hash:\n{}\n{}",
+        String::from_utf8_lossy(&py_out.stdout),
+        String::from_utf8_lossy(&py_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&py_out.stdout).contains("OK 4"),
+        "positive control: the checker must have graded all four rows"
     );
 }

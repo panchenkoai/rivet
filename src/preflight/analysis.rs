@@ -431,7 +431,11 @@ pub(crate) fn chunk_sparsity_from_counts(
     max_i: i64,
     chunk_size: usize,
 ) -> ChunkSparsityInfo {
-    let range_span = (max_i - min_i).max(1);
+    // CHECKED: a signed key spanning near the full i64 domain (a hash-distributed
+    // bigint) overflows the plain subtraction — debug panics, release wraps to a
+    // garbage span that then feeds the sparsity math. The sibling estimator in
+    // this file (`check_oversized_chunk`) was hardened the same way.
+    let range_span = max_i.checked_sub(min_i).unwrap_or(i64::MAX).max(1);
     let density = row_count as f64 / range_span as f64;
     let logical_windows = if chunk_size == 0 {
         0
@@ -469,6 +473,14 @@ pub(crate) fn check_sparse_range(
     }
     if export.chunk_by_days.is_some() {
         // Date chunks iterate by calendar interval; sparsity concept does not apply.
+        return None;
+    }
+    if export.chunk_count.is_some() {
+        // The RUNTIME sparse warning names `chunk_count: N` as its escape —
+        // and check kept alarming on the config that took it (round-10,
+        // closing the round-7 find): the exemption chain never learned the
+        // knob. With a fixed count the operator CHOSE the window count;
+        // "mostly-empty windows" is no longer a surprise to warn about.
         return None;
     }
     let rows = row_estimate.unwrap_or(0);
@@ -1107,6 +1119,28 @@ pub(crate) fn assemble_diagnostic(
 
 #[cfg(test)]
 mod tests {
+    /// Round-10: the runtime sparse warning names `chunk_count: N` as its
+    /// escape — check must stop alarming on the config that took it. RED
+    /// against removing the chunk_count arm from the exemption chain.
+    #[test]
+    fn a_chunk_count_config_is_exempt_from_the_sparse_alarm() {
+        let mut e = crate::config::sample_export("sparse");
+        e.mode = crate::config::ExportMode::Chunked;
+        e.chunk_column = Some("id".into());
+        e.chunk_size = 100_000;
+        // 1000 rows over a 1e9 span: wildly sparse by the window math.
+        assert!(
+            check_sparse_range(&e, Some(1000), Some("1"), Some("1000000000")).is_some(),
+            "fixture must be sparse without the knob, or this test grades nothing"
+        );
+        e.chunk_count = Some(8);
+        assert_eq!(
+            check_sparse_range(&e, Some(1000), Some("1"), Some("1000000000")),
+            None,
+            "the operator chose the window count — nothing to warn about"
+        );
+    }
+
     use super::*;
     use crate::config::ExportConfig;
 

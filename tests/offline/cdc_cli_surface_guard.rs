@@ -110,7 +110,29 @@ fn every_cdc_cli_flag_has_a_row_and_every_engine_a_cell() {
         .iter()
         .map(|v| v.as_str().unwrap_or("").to_string())
         .collect();
-    assert_eq!(engines.len(), 4, "four CDC engines");
+    // DERIVED, like the flags above and like cdc_evidence's engine columns: every
+    // `src/source/<engine>/cdc.rs` in the tree. `assert_eq!(len, 4)` was a
+    // typed-in count — a fifth CDC engine would have arrived with no column
+    // asking about it (matrix audit, 2026-08-29).
+    let derived_engines: BTreeSet<String> = {
+        let mut out = BTreeSet::new();
+        for entry in std::fs::read_dir(repo_root().join("src/source")).expect("read src/source") {
+            let path = entry.expect("dir entry").path();
+            if path.join("cdc.rs").is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                out.insert(name.to_string());
+            }
+        }
+        out
+    };
+    assert_eq!(
+        engines.iter().cloned().collect::<BTreeSet<_>>(),
+        derived_engines,
+        "the matrix's declared engines disagree with the set DERIVED from \
+         src/source/*/cdc.rs — a ledger whose columns are typed in cannot notice \
+         a new engine"
+    );
     for r in rows(&m) {
         for e in &engines {
             let (state, note) = cell(r, e);
@@ -197,16 +219,30 @@ fn every_test_cell_cites_a_test_that_exists() {
             if state != "test" {
                 continue;
             }
+            let mut resolved_any = false;
             for word in note.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-                if word.len() > 20 && word.matches('_').count() >= 3 && !defined.contains(word) {
-                    panic!(
-                        "flag `{}` / engine `{e}` cites `{word}`, defined nowhere in the tree. \
-                         Either the test was never written — in which case the cell is not \
-                         `test` — or it was renamed and the ledger points at nothing.",
-                        flag_id(r)
-                    );
+                if word.len() > 20 && word.matches('_').count() >= 3 {
+                    if defined.contains(word) {
+                        resolved_any = true;
+                    } else {
+                        panic!(
+                            "flag `{}` / engine `{e}` cites `{word}`, defined nowhere in the tree. \
+                             Either the test was never written — in which case the cell is not \
+                             `test` — or it was renamed and the ledger points at nothing.",
+                            flag_id(r)
+                        );
+                    }
                 }
             }
+            // A `test` cell made of PROSE ("driven in the pg cli tests") named
+            // nothing and passed the per-word check vacuously — the matrix audit
+            // found four such cells. A claim nobody can re-run is not a claim.
+            assert!(
+                resolved_any,
+                "flag `{}` / engine `{e}` is `test` but its note names no resolvable \
+                 test fn: `{note}`. Cite at least one real test name.",
+                flag_id(r)
+            );
         }
     }
 }

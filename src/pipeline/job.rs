@@ -1000,6 +1000,21 @@ fn rerun_warning_applies(resume: bool, force: bool) -> bool {
     !resume && !force
 }
 
+/// May a successful run promote its status to `success`?
+///
+/// Only from the transient `running` the summary is BUILT with. A deeper layer
+/// may already have decided a terminal status — `single` writes `skipped` for
+/// an incremental run with nothing new — and overwriting that would report a
+/// run that moved no rows as a successful export. Pure, because the `==` it
+/// replaces was the one decision left ungraded in `execute_resolved_plan`
+/// after that body's whole-function mutation exclusion was lifted: measured
+/// 2026-08-29, `==`→`!=` MISSED the whole offline battery, and it inverts BOTH
+/// directions (a finished run stays `running` forever; a `skipped` run is
+/// relabelled `success`).
+fn promotes_to_success(current_status: &str) -> bool {
+    current_status == "running"
+}
+
 /// Does this export bypass the batch plan/strategy machinery for the dedicated
 /// CDC runner? Pure so the dispatch condition is graded offline — the `==`
 /// survived as a live-only mutant (flipping it to `!=` sends every BATCH export
@@ -1148,7 +1163,7 @@ fn execute_resolved_plan(
     let failed = result.is_err();
     match &result {
         Ok(()) => {
-            if summary.status == "running" {
+            if promotes_to_success(&summary.status) {
                 summary.status = "success".into();
             }
         }
@@ -1240,7 +1255,10 @@ fn execute_resolved_plan(
     let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
     if let Some(why) = &manifest_gap {
         summary.status = "failed".into();
-        summary.error_message = Some(why.clone());
+        // redact-at-assignment (round-8): this string reaches summary.json AND
+        // the Slack payload verbatim — the main failure path redacts, this one
+        // skipped it.
+        summary.error_message = Some(crate::redact::redact_secrets(why));
         ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     }
     // Round-2 audit #12: advance the incremental cursor now that the destination
@@ -1746,6 +1764,33 @@ mod tests {
             msg.contains("chunk key is nullable") && msg.contains("no primary key"),
             "every rejection reason must reach the operator; got {msg}"
         );
+    }
+
+    /// A successful run promotes ONLY the transient status it was built with.
+    ///
+    /// Both directions matter and the `==`→`!=` mutant inverts both: with `!=`
+    /// a finished run keeps reporting `running` forever, and a run a deeper
+    /// layer already marked `skipped` (an incremental pass with nothing new)
+    /// gets relabelled `success` — an export that moved no rows, reported as
+    /// one that did. This decision lived inside `execute_resolved_plan`, whose
+    /// whole-function mutation exclusion was lifted on 2026-08-29 after a
+    /// critic measured 66% of that body running offline; the mutant then
+    /// MISSED the entire battery, which is what this unit closes.
+    #[test]
+    fn only_a_still_running_status_is_promoted_to_success() {
+        use super::promotes_to_success;
+        assert!(
+            promotes_to_success("running"),
+            "the transient status promotes"
+        );
+        // Every terminal status a deeper layer can already have decided must
+        // survive: overwriting them is the harm, not merely a mislabel.
+        for terminal in ["skipped", "failed", "success", "interrupted", ""] {
+            assert!(
+                !promotes_to_success(terminal),
+                "`{terminal}` is a decided status and must not be overwritten"
+            );
+        }
     }
 
     /// The resume/force policy as ONE truth table: the refuse-gate and the

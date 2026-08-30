@@ -1316,11 +1316,11 @@ def verify_field_symptom_replay(led: Ledger) -> None:
     pinned = os.environ.get("RIVET_FIELD_REPLAY_BIN", "").strip()
     if pinned:
         prev = Path(pinned)
-        if not prev.is_file():
+        if not prev.is_file() or not os.access(prev, os.X_OK):
             led.failed(_R_ENGINE, _FR_VERSION, "replay", _FR_STORE,
-                       f"field replay: RIVET_FIELD_REPLAY_BIN={pinned} is not a file — "
+                       f"field replay: RIVET_FIELD_REPLAY_BIN={pinned} is not an executable file — "
                        "a typo here would silently grade the wrong binary",
-                       "pinned replay binary missing")
+                       "pinned replay binary missing or not executable")
             return
     else:
         prev = _require_prev_binary(

@@ -81,7 +81,9 @@ impl RivetValue {
 
     /// Rough in-memory footprint of this cell — drives the sink's memory-budget
     /// rollover. Heap length for `Bytes`; the scalar width otherwise.
-    pub(crate) fn estimated_bytes(&self) -> usize {
+    /// DECODED payload size — the value's own bytes, no allocator overhead.
+    /// See `ChangeEvent::payload_bytes` for why this is not `estimated_bytes`.
+    pub(crate) fn payload_bytes(&self) -> usize {
         match self {
             RivetValue::Null | RivetValue::Bool(_) => 1,
             RivetValue::Int(_)
@@ -90,6 +92,26 @@ impl RivetValue {
             | RivetValue::TimeMicros(_) => 8,
             RivetValue::DateTime(_) => 12,
             RivetValue::Bytes(b) => b.len(),
+            RivetValue::Array(v) => v.iter().map(RivetValue::payload_bytes).sum::<usize>(),
+        }
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        match self {
+            RivetValue::Null | RivetValue::Bool(_) => 1,
+            RivetValue::Int(_)
+            | RivetValue::UInt(_)
+            | RivetValue::Float(_)
+            | RivetValue::TimeMicros(_) => 8,
+            RivetValue::DateTime(_) => 12,
+            // CAPACITY, not len — the model's contract is RESIDENT cost, and the
+            // one producer whose Bytes carry real slack is Mongo: its document
+            // cell comes through `serde_json::to_string`, whose doubling growth
+            // leaves capacity/len in (1, 2]. Charging len under-counted a
+            // large-document stream up to 2x — outside the calibration contract
+            // that already caught a 12.7x under and a 1.8x over. A no-op for the
+            // exact-capacity engines (PG's to_vec, MySQL's clone).
+            RivetValue::Bytes(b) => b.capacity(),
             // The Vec's SLOTS plus the elements — the same accounting
             // `ChangeEvent::estimated_bytes` gives the top-level image. A flat `+ 16`
             // charged a 1000-element `integer[]` 8 KB where its slots alone are 32 KB

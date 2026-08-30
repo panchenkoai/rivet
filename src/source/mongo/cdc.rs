@@ -268,6 +268,19 @@ fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Re
     doc.to_writer(&mut buf)?;
     let hex = super::bytes_to_hex(&buf);
     let data = doc.get_str("_data").ok();
+    // Round-6: a token whose `_data` is NOT a string (BinData-era, MongoDB
+    // 3.6-4.0 shapes) would flow through as `"_data": null` — and a NULL parse
+    // key INSIDE the non-NULL-__pos group ranks differently per warehouse
+    // (Snowflake NULLS FIRST would crown it newest). Unreachable on supported
+    // servers; refuse rather than mis-order silently if it ever appears.
+    if data.is_none() && doc.get("_data").is_some() {
+        anyhow::bail!(
+            "mongodb cdc: resume token `_data` is not a string (a pre-4.2 BinData \
+             token?) — refusing to emit an unorderable __pos; every token from \
+             this server has the same shape, so the remedy is upgrading the \
+             server (support floor is MongoDB 4.4)"
+        );
+    }
     // `_data` FIRST so the `__pos` column string-sorts in oplog order: `_data` is
     // the order-preserving resume keystring, whereas `rt` is the full token (with
     // `_typeBits`) whose hex is NOT length-stable across events, so a `rt`-first

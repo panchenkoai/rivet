@@ -43,6 +43,19 @@ fn high_latency_does_not_cause_false_positive_transient_classification() {
         out_run.status.success(),
         "200ms latency must not be classified as transient failure"
     );
+    // …and the export must have DELIVERED. Exit 0 alone was the whole oracle
+    // here until the batch gate asked (2026-08-29): a run that classified the
+    // latency correctly and then shipped nothing exits 0 too, so the test
+    // could not tell "tolerated the slow network" from "tolerated it and
+    // delivered an empty file". Three seeded rows, read back off the parquet.
+    let rows = read_all_parts(&rig.out_dir())
+        .iter()
+        .map(|b| b.num_rows())
+        .sum::<usize>();
+    assert_eq!(
+        rows, 3,
+        "the slow-but-successful run must still deliver every seeded row"
+    );
 }
 
 #[test]

@@ -34,6 +34,21 @@ impl Drop for DropTable {
     }
 }
 
+/// `(rows, distinct keys)` read by DuckDB — an INDEPENDENT codec.
+///
+/// `read_uid_set` below decodes with rivet's own arrow/parquet crate, so an
+/// encode fault cancels itself: the writer and the reader agree because they
+/// are the same code. Six completeness-claiming tests in this file rested on
+/// it alone (the batch oracle gate named them), and each now cross-checks with
+/// this. Manifest-DECLARED parts, so a crashed attempt's orphans cannot inflate
+/// the count — which matters here, since half the callers crash on purpose.
+fn duckdb_uid_counts(dir: &std::path::Path) -> (i64, i64) {
+    (
+        duckdb_declared_dir_scalar(dir, "count(*)"),
+        duckdb_declared_dir_scalar(dir, "count(DISTINCT uid)"),
+    )
+}
+
 fn read_uid_set(dir: &std::path::Path) -> (usize, BTreeSet<String>) {
     let mut count = 0usize;
     let mut keys = BTreeSet::new();
@@ -720,6 +735,17 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
         keys, expected,
         "the union of all parallel workers' keys must equal the source key set"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// PARALLEL keyset on a PostgreSQL native `uuid` PK — the canonical
@@ -887,6 +913,17 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
         keys, expected,
         "the union must equal the full source key set"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// PARALLEL keyset INCREMENTAL (feat/parallel-keyset iteration 3). A parallel run
@@ -970,6 +1007,17 @@ fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
         keys3, expected,
         "the union of all runs must equal the full source key set"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
@@ -1048,6 +1096,17 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
         Some(1000),
         "destination manifest must declare every row (pre-crash page not orphaned); got {}",
         m["row_count"]
+    );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
     );
 }
 
@@ -1296,6 +1355,17 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
         dir_manifest_copy_total_rows(&rig.out_dir()),
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
+    );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
     );
 }
 
@@ -1907,6 +1977,17 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
     );
+
+    // The same completeness claim through an INDEPENDENT codec: `read_uid_set`
+    // above decodes with rivet's own arrow/parquet crate, so an encode fault
+    // cancels itself. DuckDB shares none of it, and reads the manifest-DECLARED
+    // parts so a crashed attempt's orphans cannot inflate the count.
+    let (dk_rows, dk_keys) = duckdb_uid_counts(&rig.out_dir());
+    assert_eq!(
+        dk_rows, dk_keys,
+        "every key exactly once, by DuckDB: {dk_rows} rows over {dk_keys} distinct \
+         keys — loss and duplication share a total when both happen"
+    );
 }
 
 /// Companion to `snapshot_pg_uuid_pk_roundtrips_full_uuid_set` for the
@@ -2310,4 +2391,137 @@ fn keyset_part_names_do_not_double_the_export_name() {
             "part name must still lead with the export name once: {name}"
         );
     }
+}
+
+/// Round-5 lifecycle HIGH, keyset flavor: a committed page part deleted from
+/// the destination BETWEEN attempts (a gc pass after `state finish-run`, a
+/// foreign-host gc) must make the resume REFUSE — keyset has no per-part
+/// re-export (the cursor has moved past the page), so the pre-fix behavior
+/// re-declared the deleted file sight-unseen: Success + `_SUCCESS` naming
+/// parquet that does not exist, the page's rows silently absent. The refusal
+/// names the remedy (`state reset-chunks` / fresh prefix). RED against
+/// disabling the destination probe in `rehydrate_keyset_pages_probed`.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_resume_refuses_when_a_committed_page_was_deleted_between_attempts() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_gone_page");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 2000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_gone_exp");
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 200");
+    let cfg = rig.config_path();
+
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")],
+    );
+    assert!(!crash.status.success());
+    assert!(
+        String::from_utf8_lossy(&crash.stderr).contains("keyset_parallel_range_committed"),
+        "the crash must be OUR injected panic; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    // The between-attempts gc: every durable parquet vanishes — including the
+    // done range's committed pages, the ones the resume would re-declare.
+    let out = rig.out_dir();
+    let mut deleted = 0;
+    for e in std::fs::read_dir(&out).unwrap().flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "parquet") {
+            std::fs::remove_file(&path).unwrap();
+            deleted += 1;
+        }
+    }
+    assert!(
+        deleted > 0,
+        "fixture: the crash must have left durable parquet"
+    );
+
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        !resume.status.success(),
+        "resume must REFUSE to declare deleted pages, not finalize Success over a hole"
+    );
+    let err = String::from_utf8_lossy(&resume.stderr);
+    assert!(
+        err.contains("GONE from the destination"),
+        "the refusal must name the cause; stderr:\n{err}"
+    );
+    assert!(
+        err.contains("state reset") && !err.contains("reset-chunks"),
+        "the refusal must name the WORKING remedy — round-6 live-proved \
+         reset-chunks clears tables keyset never writes, stranding the operator \
+         in a refusal loop; stderr:\n{err}"
+    );
+    assert!(
+        !out.join("_SUCCESS").is_file(),
+        "no completion marker may exist after the refusal"
+    );
+
+    // THE REMEDY MUST WORK from the refused state (a hint is a testable claim):
+    // follow it verbatim, then the next run must do a fresh full pass.
+    let reset = std::process::Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "state",
+            "reset",
+            "-c",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reset.status.success(),
+        "the named remedy must run clean; stderr:\n{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let rerun = run_rivet_export(&cfg, &export);
+    assert!(
+        rerun.status.success(),
+        "after the remedy the export must complete; stderr:\n{}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    // INDEPENDENT delivery proof (harness audit): manifest.json row_count is
+    // rivet's own counter — a run that miscounts agrees with itself. DuckDB
+    // reads the parquet with a codec rivet does not share — over the
+    // MANIFEST-DECLARED parts, not a glob: the REFUSED resume exported its
+    // missing ranges before refusing at finalize, and those unmanifested
+    // orphans (measured: 499 rows) are the gc_orphans case, not delivered
+    // data. A glob read 2499 here and graded the fixture, not the remedy.
+    assert_eq!(
+        duckdb_declared_dir_scalar(&out, "count(*)"),
+        2000,
+        "the remedied run must deliver the whole table — graded by DuckDB over \
+         the declared parts"
+    );
+    assert_eq!(
+        duckdb_declared_dir_scalar(&out, "count(DISTINCT uid)"),
+        2000,
+        "every key exactly once — loss and duplication are different failures \
+         and a bare count cannot tell them apart"
+    );
 }

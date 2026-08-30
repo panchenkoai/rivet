@@ -154,6 +154,30 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
     run_id: &str,
     summary: &mut RunSummary,
 ) -> Result<usize> {
+    Ok(rehydrate_manifest_parts_probed(state, run_id, summary, None)?.0)
+}
+
+/// [`rehydrate_manifest_parts_from_file_log`] with a DESTINATION PRESENCE probe.
+///
+/// `present` = the basenames actually at the destination (from one
+/// `list_prefix`). A file_log part MISSING from it is NOT declared — it is
+/// returned in the second slot instead, with its chunk index when the name
+/// carries one. Round-5 lifecycle HIGH: state-DB completion was trusted
+/// against a destination gc has since edited (a between-attempts gc after
+/// `state finish-run`, or a foreign-host pass), so the resume re-declared
+/// deleted parquet sight-unseen — Success + `_SUCCESS` naming files that do
+/// not exist, rows silently absent. `None` = no probe (the caller could not
+/// list; legacy behavior, caller says why).
+/// One part the probe found MISSING at the destination: its chunk index (when
+/// the name carries one — re-exportable) and the file name.
+pub(crate) type MissingPart = (Option<u32>, String);
+
+pub(crate) fn rehydrate_manifest_parts_probed(
+    state: &StateStore,
+    run_id: &str,
+    summary: &mut RunSummary,
+    present: Option<&std::collections::HashSet<String>>,
+) -> Result<(usize, Vec<MissingPart>)> {
     // Reconstruct from file_log, NOT chunk_task: file_log records EVERY committed
     // part — including every max_file_size rotation sibling — with its real byte
     // size, whereas chunk_task stores only the FIRST sibling's file_name and the
@@ -216,6 +240,7 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
     let mut rehydrated = 0usize;
     let mut rehydrated_rows = 0i64;
     let mut rehydrated_bytes = 0u64;
+    let mut missing: Vec<MissingPart> = Vec::new();
     for f in files {
         // Don't duplicate a part a fresh record_part already added this run.
         if summary.manifest_parts.iter().any(|p| p.path == f.file_name) {
@@ -230,6 +255,14 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
             match surviving.get(idx) {
                 Some(key) if attempt_key(&f.file_name) == *key => {}
                 _ => continue,
+            }
+        }
+        if let Some(present) = present {
+            let base = f.file_name.rsplit('/').next().unwrap_or(&f.file_name);
+            if !present.contains(base) {
+                let idx = super::chunk_index_of(&f.file_name).and_then(|i| i.parse::<u32>().ok());
+                missing.push((idx, f.file_name.clone()));
+                continue;
             }
         }
         next_id += 1;
@@ -272,7 +305,7 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
              committed part, rotation siblings included"
         );
     }
-    Ok(rehydrated)
+    Ok((rehydrated, missing))
 }
 
 pub(crate) fn apply_m8_resume_decisions(
@@ -329,8 +362,58 @@ pub(crate) fn apply_m8_resume_decisions(
             // the pre-crash chunks' durable parts from the manifest-authoritative
             // loader (silent row loss). A "fresh prefix" (no completed chunks) rehydr-
             // ates nothing, so this is safe for the legacy/fresh case too.
-            rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
-            return Ok(M8Stats::default());
+            //
+            // Round-5: PROBED against the destination. State-DB completion can lie
+            // about a destination gc has since edited (a between-attempts gc after
+            // `state finish-run` deleted committed no-manifest parts) — declaring
+            // them sight-unseen shipped Success + `_SUCCESS` naming deleted files.
+            // A part missing at the destination gets its CHUNK reset to pending
+            // (the M8 Rewrite semantics): this same run re-exports it.
+            let mut stats = M8Stats::default();
+            match dest.list_prefix("") {
+                Ok(listing) => {
+                    let present: std::collections::HashSet<String> = listing
+                        .iter()
+                        .map(|m| m.key.rsplit('/').next().unwrap_or(&m.key).to_string())
+                        .collect();
+                    let (_, missing) =
+                        rehydrate_manifest_parts_probed(state, run_id, summary, Some(&present))?;
+                    for (idx, name) in missing {
+                        let Some(idx) = idx else {
+                            anyhow::bail!(
+                                "resume: committed part '{name}' is GONE from the \
+                                 destination and carries no chunk index to re-export — \
+                                 refusing to finalize a manifest naming a deleted file. \
+                                 Re-run without the checkpoint (`rivet state reset-chunks`) \
+                                 or into a fresh prefix."
+                            );
+                        };
+                        let n = state.reset_chunk_task_for_re_export(
+                            run_id,
+                            idx as i64,
+                            "M8 reset: committed part missing at destination (no-manifest probe)",
+                        )?;
+                        if n > 0 {
+                            stats.reset_for_rewrite += 1;
+                            log::warn!(
+                                "resume: committed part '{name}' is gone from the \
+                                 destination — its chunk is re-exported this run"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Cannot probe → legacy declare-from-state (the pre-round-5
+                    // behavior), said out loud: refusing every resume on a listing
+                    // blip would be worse than the narrow gc-between-attempts race.
+                    log::warn!(
+                        "resume: cannot list the destination to verify committed parts \
+                         ({e:#}) — declaring from the state DB unverified"
+                    );
+                    rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
+                }
+            }
+            return Ok(stats);
         }
         Err(e) => {
             log::warn!(

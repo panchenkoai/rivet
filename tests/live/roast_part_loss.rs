@@ -99,6 +99,17 @@ fn roast_chunked_split_parts_all_rows_reach_destination() {
          chunked runner uploaded only sink.tmp (the last partial part) and the rotated parts \
          were deleted with the sink"
     );
+
+    // The same "all rows reach the destination" claim through an INDEPENDENT
+    // codec: the reader above is this file's own, decoding with rivet's crates.
+    // DuckDB parses the CSV itself and shares none of that code — which is
+    // what the batch oracle gate asks of a name that claims completeness.
+    assert_eq!(
+        duckdb_dir_csv_rows(out.path()),
+        ROWS,
+        "DATA LOSS by an independent reader: DuckDB counts a different number \
+         of rows at the destination than the seeded {ROWS}"
+    );
 }
 
 // ─── keyset (keyset.rs) — rotated parts must reach the destination ───────────
@@ -165,6 +176,17 @@ fn roast_keyset_split_parts_all_rows_reach_destination() {
          files {per_file:?} — maybe_split rotated parts into sink.completed_parts, but the \
          keyset runner uploaded only sink.tmp (the last partial part) and the rotated parts \
          were deleted with the sink"
+    );
+
+    // The same "all rows reach the destination" claim through an INDEPENDENT
+    // codec: the reader above is this file's own, decoding with rivet's crates.
+    // DuckDB parses the CSV itself and shares none of that code — which is
+    // what the batch oracle gate asks of a name that claims completeness.
+    assert_eq!(
+        duckdb_dir_csv_rows(out.path()) as usize,
+        N,
+        "DATA LOSS by an independent reader: DuckDB counts a different number \
+         of rows at the destination than the seeded {N}"
     );
 }
 
@@ -239,5 +261,16 @@ fn roast_keyset_split_parts_parquet_all_rows_reach_destination() {
         "rotation must have produced >=2 parquet parts (proves max_file_size engaged with \
          row_group_rows=100); got {}: {per_file:?}",
         per_file.len()
+    );
+
+    // The same "all rows reach the destination" claim through an INDEPENDENT
+    // codec: the reader above is this file's own, decoding with rivet's crates.
+    // DuckDB parses the parquet itself and shares none of that code — which is
+    // what the batch oracle gate asks of a name that claims completeness.
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()),
+        N,
+        "DATA LOSS by an independent reader: DuckDB counts a different number \
+         of rows at the destination than the seeded {N}"
     );
 }

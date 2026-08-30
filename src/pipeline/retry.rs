@@ -251,6 +251,12 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
 
     // Capacity errors -- retry with longer delay
     if msg.contains("too many connections")
+        // 53300's OTHER renderings — the max_connections cap says "sorry, too
+        // many clients already" / "remaining connection slots are reserved";
+        // "too many connections" is only the per-role/per-DB CONNECTION LIMIT
+        // arm. Same gap, same fix as the doctor's categorizer.
+        || msg.contains("too many clients")
+        || msg.contains("connection slots are reserved")
         || msg.contains("the database system is starting up")
         || msg.contains("the database system is shutting down")
     {
@@ -440,6 +446,21 @@ pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Round-10 mutants: the `||` chain of transient needles was un-graded —
+    /// each arm gets its own input so `&&` mutants die per-arm.
+    #[test]
+    fn each_transient_needle_arm_classifies_on_its_own() {
+        for msg in [
+            "FATAL: sorry, too many clients already",
+            "FATAL: remaining connection slots are reserved for roles",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{msg}"));
+            assert!(
+                matches!(c, RetryClass::Transient { .. }),
+                "{msg} must classify transient, got {c:?}"
+            );
+        }
+    }
 
     /// The rule all three runners now share. Before it was one function it
     /// was five hand-written copies, none of them tested.

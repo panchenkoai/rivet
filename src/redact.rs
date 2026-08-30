@@ -153,7 +153,74 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
 /// driver/library error (or any operator-untrusted string) into a
 /// persisted or emitted artifact.
 pub fn redact_secrets(s: &str) -> String {
-    redact_url_passwords(s)
+    redact_query_secrets(&redact_url_passwords(s))
+}
+
+/// Redact SECRET-BEARING QUERY PARAMETERS: `?token=…`, `&password=…`,
+/// `sig=…` (SAS), `api_key=…`, `secret=…`, `sas=…`, `sv=…` values become
+/// `***`. Round-8 made this boundary load-bearing, not hypothetical: a Slack
+/// webhook keeps its credential in the URL *path*, and reqwest's error
+/// Display prints the URL — userinfo-only redaction shipped the token to
+/// every log aggregator on a delivery failure. Path secrets have no
+/// recognizable shape (handled at the notify site via `without_url`); query
+/// keys DO, so they are scrubbed here for every error path.
+fn redact_query_secrets(s: &str) -> String {
+    // SUFFIX-FAMILY matching (round-10, rebuilt from the start-anchored key
+    // list): real secret params are compounds ENDING in the secret word —
+    // access_token, sas_token, client_secret, X-Amz-Signature — so `token=`
+    // covered while `*_token=` leaked, systematically. A param whose lowercased
+    // name ends in one of these families is redacted; `sv` left the list (it is
+    // Azure's service VERSION — redacting it destroyed the one field that
+    // diagnoses version-mismatch errors). The matched key keeps its ORIGINAL
+    // spelling, and the value stop-set includes the `)`/`:`/`,`/`;` that
+    // reqwest's ` for url (…)` rendering puts right after the URL.
+    const FAMILIES: [&str; 8] = [
+        "token",
+        "password",
+        "apikey",
+        "api_key",
+        "api-key",
+        "secret",
+        "signature",
+        "sig",
+    ];
+    fn is_secret_key(key: &str) -> bool {
+        if key.is_empty() || key.len() > 64 {
+            return false;
+        }
+        let lower = key.to_ascii_lowercase();
+        FAMILIES.iter().any(|f| {
+            lower == *f
+                || (lower.ends_with(f) && lower[..lower.len() - f.len()].ends_with(['_', '-']))
+        }) || lower == "sas"
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(q) = rest.find(['?', '&']) {
+        out.push_str(&rest[..=q]);
+        rest = &rest[q + 1..];
+        let key_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(rest.len());
+        if key_end < rest.len()
+            && rest.as_bytes()[key_end] == b'='
+            && is_secret_key(&rest[..key_end])
+        {
+            out.push_str(&rest[..key_end]);
+            out.push_str("=***");
+            let after = &rest[key_end + 1..];
+            let val_end = after
+                // `)` closes reqwest's ` for url (…)`; `:`/`,` deliberately NOT
+                // stops (round-10 refuter: they truncated redaction mid-secret —
+                // `password=abc:def` leaked `:def`).
+                .find(|c: char| matches!(c, '&' | '\'' | '"' | ')' | ';') || c.is_whitespace())
+                .map(|i| key_end + 1 + i)
+                .unwrap_or(rest.len());
+            rest = &rest[val_end..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Convenience: format an `anyhow::Error` with `{:#}` and redact the
@@ -181,6 +248,111 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
 
 #[cfg(test)]
 mod tests {
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        /// The shipped contract, both directions. POSITIVE: a key that IS a
+        /// family word, `sas`, or a compound joined by `_`/`-` (access_token,
+        /// X-Amz-Signature) is redacted — the secret never survives, non-secret
+        /// pairs do, and a second pass changes nothing (idempotence: a matcher
+        /// re-triggering on its own `***` would corrupt). NEGATIVE: a GLUED
+        /// prefix (`atoken`) is deliberately NOT matched — round-10 chose the
+        /// separator boundary to keep diagnostics like Azure's `sv` readable,
+        /// and this pins that choice so a future "fix" widening the match is a
+        /// conscious contract change, not a drive-by.
+        #[test]
+        fn suffix_family_contract_redacts_compounds_and_spares_glued_keys(
+            family in proptest::sample::select(vec![
+                "token", "password", "apikey", "api_key", "api-key",
+                "secret", "signature", "sig",
+            ]),
+            prefix in "[a-z]{1,8}",
+            sep in proptest::sample::select(vec!["_", "-"]),
+            exact in proptest::prelude::any::<bool>(),
+            use_sas in proptest::prelude::any::<bool>(),
+            secret in "[A-Za-z0-9]{8,24}",
+            tail_sep in proptest::sample::select(vec!["&", ";", "'", "\""]),
+        ) {
+            // POSITIVE: exact family word, exact `sas`, or a separator-joined
+            // compound. All must redact.
+            let key = if exact {
+                if use_sas { "sas".to_string() } else { family.to_string() }
+            } else {
+                format!("{prefix}{sep}{family}")
+            };
+            let text = format!("postgresql://u@h/db?keep=1&{key}={secret}{tail_sep}tail=x");
+            let once = redact_query_secrets(&text);
+            proptest::prop_assert!(
+                !once.contains(&secret),
+                "secret `{}` survived redaction of `{}` -> `{}`", secret, text, once
+            );
+            proptest::prop_assert!(
+                once.contains("keep=1") && once.contains("tail=x"),
+                "non-secret pairs must survive: `{}` -> `{}`", text, once
+            );
+            let twice = redact_query_secrets(&once);
+            proptest::prop_assert_eq!(&once, &twice, "redaction must be idempotent");
+
+            // NEGATIVE: the same family GLUED to the prefix (no separator) is
+            // not a match — the documented FP-avoidance boundary.
+            let glued = format!("postgresql://u@h/db?{prefix}{family}={secret}");
+            proptest::prop_assert_eq!(
+                redact_query_secrets(&glued),
+                glued.clone(),
+                "a glued key must pass through untouched (the separator boundary \
+                 is the contract)"
+            );
+        }
+    }
+    /// Round-8: query-param secrets are scrubbed (the Slack-path find made
+    /// this boundary load-bearing). Values after token/password/api_key/
+    /// secret/sig/sas/sv become ***; foreign keys and non-URLs untouched.
+    #[test]
+    fn query_param_secrets_are_scrubbed() {
+        assert_eq!(
+            redact_secrets("GET https://h/hook?token=top-secret failed"),
+            "GET https://h/hook?token=*** failed"
+        );
+        assert_eq!(
+            redact_secrets("postgres://h/db?password=hunter2&sslmode=require"),
+            "postgres://h/db?password=***&sslmode=require"
+        );
+        // `sv` deliberately NOT redacted since round-10 (service VERSION);
+        // `sig` — the actual SAS credential — is.
+        assert_eq!(
+            redact_secrets("https://acc.blob/x?sv=2020&sig=abc%2F=="),
+            "https://acc.blob/x?sv=2020&sig=***"
+        );
+        // Compound families (round-10): the dominant real-world shapes.
+        for (input, want) in [
+            ("?access_token=abc&x=1", "?access_token=***&x=1"),
+            (
+                "?X-Amz-Signature=deadbeef&X-Amz-Date=2026",
+                "?X-Amz-Signature=***&X-Amz-Date=2026",
+            ),
+            ("&client_secret=s3cr3t ", "&client_secret=*** "),
+            ("&sas_token=tok\"", "&sas_token=***\""),
+            // reqwest's rendering: the paren must survive OUTSIDE the span.
+            (
+                "(https://h/hook?token=abc): connect error",
+                "(https://h/hook?token=***): connect error",
+            ),
+            // Azure's service VERSION is diagnostic, not a secret.
+            ("?sv=2020-08-04&sig=abc", "?sv=2020-08-04&sig=***"),
+        ] {
+            assert_eq!(redact_secrets(input), want, "{input}");
+        }
+        // A non-secret key and plain text stay byte-identical.
+        assert_eq!(
+            redact_secrets("https://h/x?page=2&limit=10"),
+            "https://h/x?page=2&limit=10"
+        );
+        assert_eq!(redact_secrets("no urls here"), "no urls here");
+    }
+
     use super::*;
 
     // ── URL-safety matrix: the recurring credential-leak class, at the infra

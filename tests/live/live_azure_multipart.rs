@@ -122,4 +122,14 @@ fn cloud_multipart_azure_rotation_distinct_keys_and_all_rows() {
         "azure: total rows across all downloaded blobs must equal {N} (a lost/overwritten part \
          under-counts); got {total}"
     );
+
+    // The same claim through an INDEPENDENT codec: DuckDB reads the container
+    // over azure:// and shares none of the arrow/parquet code the byte-level
+    // downloads above decode with. Capability verified live before relying on
+    // it (glob + read_parquet against azurite: 70 files, 4.2M rows).
+    let store = duckdb_store_census(ObjectStore::Azurite, &container, &prefix, &[]);
+    assert_eq!(
+        store.rows, N,
+        "azure, read by DuckDB: the container must hold every row: {store:?}"
+    );
 }

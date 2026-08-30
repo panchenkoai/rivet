@@ -112,6 +112,20 @@ pub(crate) fn maybe_pause_at(point: &str) {
     }
 }
 
+/// Return an `Err` if `RIVET_TEST_ERROR_AT` names exactly `point` — the
+/// index-less sibling of [`maybe_error_at_index`], for fault points that are not
+/// per-worker (a one-shot query whose TRANSIENT failure is the state a
+/// no-swallowing contract exists for, and which a healthy stand can never
+/// produce).
+pub(crate) fn maybe_fail_at(point: &str) -> crate::error::Result<()> {
+    if let Ok(p) = std::env::var("RIVET_TEST_ERROR_AT")
+        && p == point
+    {
+        anyhow::bail!("rivet test-hook: injected error at '{point}' (RIVET_TEST_ERROR_AT)");
+    }
+    Ok(())
+}
+
 /// Return an `Err` if `RIVET_TEST_ERROR_AT` matches `"{point}:{index}"` — simulates a
 /// per-worker SQL error (connection drop / statement timeout) MID-RANGE, distinct from
 /// the hard-exit crash: the worker RETURNS an error (not process death), the parallel

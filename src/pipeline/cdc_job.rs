@@ -14,6 +14,25 @@ use crate::error::Result;
 use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, DrainMode, run_capture};
 use crate::state::StateStore;
 
+/// The byte-rollover budget one export runs under — the NAMED supplier of the
+/// sink's `rollover_memory_bytes`, extracted so the offline gate can grade it.
+///
+/// Inline, this decision was ungraded BY CONSTRUCTION: the default is chosen to
+/// be inert on narrow rows (no live fixture trips it), the sink's byte-cap test
+/// sets the field directly (bypassing this supplier — the fabricated-input
+/// seam), and the expression sat inside live-only glue. A regression to
+/// `.map(..)` alone would ship green everywhere and silently remove the memory
+/// ceiling for wide-row streams.
+///
+/// `.or(..)`, never an unconditional assign: an ABSENT `rollover_memory_mb`
+/// gets the protective default rather than reading as "no budget" — the
+/// config-clobber shape. The multiply cannot overflow here: validation refuses
+/// any `mb` whose byte count would (`validate_cdc_resource_conflicts`).
+pub(crate) fn cdc_rollover_memory_bytes(mb: Option<usize>) -> Option<usize> {
+    mb.map(|mb| mb * 1024 * 1024)
+        .or(Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES))
+}
+
 /// Default memory budget for one CDC part — the byte half of `rollover`.
 ///
 /// 256 MiB is chosen to be INERT on the common shape and binding on the pathological
@@ -346,10 +365,28 @@ pub(super) fn initial_snapshot_pending(
         resume_expected,
     )?;
 
+    // The anchor STRING for the snapshot stamp (round-10 STRUCT): rendered by
+    // the same `Position.0.to_string()` the drain writes into `__pos`, read
+    // from the checkpoint ensure_anchor just persisted. Engines whose anchor
+    // is server-side-only yield None and keep the legacy NULL-`__pos` shape.
+    // HONESTY (round-10 refuter): on PostgreSQL the RECOVERY flow is exactly
+    // that case — the prescribed recovery deletes the checkpoint file and PG's
+    // ensure_anchor never rewrites one (the slot is the anchor; the sink
+    // recreates the file only at first ack, AFTER the snapshots run) — so a
+    // PG re-baseline is never stamped and stays behind the refusal+truncate
+    // guard. The stamp covers checkpointed non-recovery snapshots (a table
+    // added mid-stream) and the MySQL/MSSQL/Mongo recovery flows, whose
+    // ensure_anchor persists the pin before the snapshots.
+    let anchor_pos = ckpt_path
+        .as_deref()
+        .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
+        .map(|p| p.0.to_string());
     let mut pending = Vec::new();
     for idx in pending_idx {
         let (label, read, snap_dcfg) = &table_dests[idx];
-        pending.push(synth_snapshot_export(export, label, read, snap_dcfg));
+        let mut synth = synth_snapshot_export(export, label, read, snap_dcfg);
+        synth.meta_columns.cdc_snapshot_pos = anchor_pos.clone();
+        pending.push(synth);
     }
     Ok(pending)
 }
@@ -612,6 +649,7 @@ fn run_cdc_inner(
         CdcCapture {
             export_name: export.name.clone(),
             cdc_cfg: CdcConfig {
+                config_dir: config_dir.to_path_buf(),
                 url,
                 checkpoint: cdc
                     .checkpoint
@@ -661,10 +699,7 @@ fn run_cdc_inner(
             // what runs out: 100_000 narrow events is ~77 MB and 100_000 wide ones is
             // unbounded, so the row count is a budget only for one row width. Whichever
             // limit is reached first rolls the part.
-            rollover_memory_bytes: cdc
-                .rollover_memory_mb
-                .map(|mb| mb * 1024 * 1024)
-                .or(Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES)),
+            rollover_memory_bytes: cdc_rollover_memory_bytes(cdc.rollover_memory_mb),
             run_id: run_id.to_string(),
             started_at: now,
             state: Some(state),
@@ -777,7 +812,19 @@ mod tests {
     fn resolve_checkpoint_prefers_the_config_dir_and_keeps_an_existing_cwd_file() {
         let cfg_dir = tempfile::tempdir().expect("config dir");
         let cwd_dir = tempfile::tempdir().expect("cwd");
-        let _guard = std::env::set_current_dir(cwd_dir.path());
+        // A REAL guard. The first version bound `set_current_dir`'s io::Result to
+        // `_guard`, which restores nothing — the whole lib-test process then
+        // finished its life inside a DELETED tempdir, and every concurrently
+        // scheduled test shared the hijacked cwd. Process-global state needs a
+        // restore in Drop, like the repo's EnvGuard.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _guard = CwdGuard(std::env::current_dir().expect("cwd"));
+        std::env::set_current_dir(cwd_dir.path()).expect("enter the temp cwd");
 
         // ABSOLUTE: used verbatim, and never empty — the `-> Default::default()`
         // mutant returns an empty path, which `Position::load` reads as "no
@@ -1144,5 +1191,22 @@ mod tests {
         // Nothing done, no checkpoint → snapshot, and no evidence means the
         // anchor is a legitimate first anchor, not a loud failure.
         assert_eq!(snapshot_plan(&[false], false), (vec![0], false));
+    }
+
+    /// Both arms of the byte-budget supplier — the decision the sink's own test
+    /// bypasses by setting the field directly.
+    #[test]
+    fn the_byte_budget_defaults_on_absence_and_converts_on_presence() {
+        assert_eq!(
+            cdc_rollover_memory_bytes(None),
+            Some(DEFAULT_CDC_ROLLOVER_MEMORY_BYTES),
+            "absence must get the PROTECTIVE default, never read as 'no budget' \
+             — losing this arm silently removes the wide-row memory ceiling"
+        );
+        assert_eq!(
+            cdc_rollover_memory_bytes(Some(32)),
+            Some(32 * 1024 * 1024),
+            "a configured value is megabytes, converted — not passed through raw"
+        );
     }
 }

@@ -37,3 +37,10 @@ path = "fuzz_targets/mongo_resume_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "spill_frame_decode"
+path = "fuzz_targets/spill_frame_decode.rs"
+test = false
+doc = false
+bench = false

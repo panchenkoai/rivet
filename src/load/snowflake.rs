@@ -222,6 +222,33 @@ impl TargetLoader for SnowflakeLoader {
         Ok(after.saturating_sub(before))
     }
 
+    fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
+        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
+        let tag = sanitize_tag(table);
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = 'rivet_probe_{tag}';\n\
+             SELECT COUNT(*) AS PROBE_ FROM (SELECT 1 FROM {changes_fqtn} \
+             WHERE __op IS NOT NULL LIMIT 1);"
+        );
+        match self.run_snow(&sql) {
+            // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read
+            // as "first cycle" and silently disarm the refusal — the exact
+            // direction this guard exists for. BigQuery's scalar path already
+            // errors; parity.
+            Ok(v) => extract_named(&v, "PROBE_")
+                .map(|n| n > 0)
+                .context("re-baseline probe ran but PROBE_ was not in snow's output"),
+            // A missing __changes table is the FIRST cycle, not an error.
+            // Snowflake merges "does not exist" with "not authorized" in ONE
+            // message, so a SELECT-denied role reads first-cycle here — the
+            // residual is SELF-LIMITING (round-9): append_changelog's own
+            // BEFORE_/AFTER_ COUNT gates need SELECT, so that role fails the
+            // load loudly one statement later, never a silent doomed append.
+            Err(e) if format!("{e:#}").contains("does not exist") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn warehouse(&self) -> crate::load::cdc::Warehouse {
         crate::load::cdc::Warehouse::Snowflake
     }

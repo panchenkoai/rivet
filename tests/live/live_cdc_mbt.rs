@@ -456,6 +456,19 @@ fn cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read() {
         "every acked row must be reachable via a Success manifest (not just a parquet \
          glob) — the ack advanced past parts the manifest must still declare (#11)"
     );
+    // Same claim through an INDEPENDENT codec: manifest-declared parts staged for
+    // DuckDB. `manifest_driven_int_ids` reads with rivet's own arrow/parquet crate,
+    // which cancels an encode fault; a capture that miscounts agrees with itself.
+    let declared = duckdb_declared_dir_id_set(&out);
+    assert_eq!(
+        declared.len(),
+        30,
+        "DuckDB over the manifest-declared parts must see all 30 acked rows"
+    );
+    assert!(
+        declared.contains(&1) && declared.contains(&30),
+        "the declared id set must span the full seeded range, got {declared:?}"
+    );
 }
 
 /// Distinct `id`s reachable the way `rivet load` reads: ONLY parts declared by a
@@ -734,8 +747,11 @@ fn run_ok(cfg: &std::path::Path) {
 // Finding #38 — Form B was a silent no-op for CDC: the manifest recorded
 // `column_checksums: None`, so `rivet validate` skipped the value leg on CDC
 // prefixes while looking green. The sink already computed the arrow-side sum
-// per column per part (Form A); it now XOR-accumulates them into the
-// manifest, and validate's re-read must agree — or name the column.
+// per column per part (Form A); it SUM-accumulates them into the manifest
+// (`wrapping_add` — an earlier comment here said "XOR-accumulates", naming
+// exactly the operator the code refuses: under `^` two parts with equal
+// column sums cancel to zero), and validate's re-read must agree — or name
+// the column.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
@@ -890,6 +906,25 @@ fn cdc_all_features_combined_on_gcs() {
         "run 2 must not re-snapshot (markers stable)"
     );
     let _ = markers_before;
+
+    // CONTENT, not just object names (harness audit: this was the last
+    // presence-only offender). Pull every parquet under each table's prefix
+    // straight off fake-gcs (raw HTTP, independent of rivet's writer) and
+    // count rows: ta = its 1 snapshot row untouched; tb = 1 snapshot row +
+    // the 1 streamed change. A capture that wrote empty/wrong parts under
+    // correct names passed the listing asserts above for months.
+    // Layout: {prefix}/<export name>/<table>/… — the export segment is part of
+    // the path (first cut probed {prefix}/{table} and read a honest-but-wrong 0).
+    assert_eq!(
+        fake_gcs_parquet_total_rows(bucket, &format!("{prefix}/all_features/{ta}")),
+        1,
+        "table {ta}: snapshot content on GCS must hold its 1 row"
+    );
+    assert_eq!(
+        fake_gcs_parquet_total_rows(bucket, &format!("{prefix}/all_features/{tb}")),
+        2,
+        "table {tb}: snapshot (1) + streamed change (1) must be readable off GCS"
+    );
 }
 
 // Negative family #5 — corrupt CHECKPOINT files. The probe found the code

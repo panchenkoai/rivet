@@ -194,7 +194,13 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
         }
         let base = rel;
         if crate::manifest::is_run_unique_manifest_name(base) {
-            manifests.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
+            let m: RunManifest = serde_json::from_slice(&dest.read(&m.key)?)?;
+            // Success-only (round-8): a Failed copy's spared parts are terminal
+            // debris gc legitimately deletes after supersession — reading them
+            // here resurrected the false exit-3 the fold's filter closed.
+            if m.status == crate::manifest::ManifestStatus::Success {
+                manifests.push(m);
+            }
         }
     }
     if manifests.is_empty() && dest.head(&manifest_key)?.is_some() {
@@ -214,12 +220,40 @@ pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<Po
     for manifest in &manifests {
         let mut items: Vec<(u32, String)> = Vec::new();
         for part in &manifest.parts {
-            let body = dest.read(&join_key(prefix, &part.path))?;
-            items.extend(
-                read_pos_column(body)?
-                    .into_iter()
-                    .map(|p| (part.part_id, p)),
-            );
+            if part.status != crate::manifest::PartStatus::Committed {
+                continue;
+            }
+            // A DECLARED part that is missing or undecodable is VERIFIED-WRONG
+            // (a violation in the verdict), not could-not-verify: the manifest
+            // promises the part and the destination refutes the promise —
+            // round-7 measured the old `?` propagation grading a permanently
+            // deleted part as retryable exit 1 while the headline said PASSED.
+            let body = match dest.read(&join_key(prefix, &part.path)) {
+                Ok(b) => b,
+                // NOT-FOUND is verified-wrong (the manifest promises, the
+                // destination refutes); any OTHER read error — auth, outage
+                // past the retry budget — is could-not-verify and must stay
+                // exit 1, not page data-integrity (round-8 split).
+                Err(e)
+                    if format!("{e:#}").contains("NotFound")
+                        || format!("{e:#}").contains("No such file") =>
+                {
+                    violations.push(format!(
+                        "declared part '{}' (run {}) is MISSING at the destination: {e:#}",
+                        part.path, manifest.run_id
+                    ));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match read_pos_column(body) {
+                Ok(ps) => items.extend(ps.into_iter().map(|p| (part.part_id, p))),
+                Err(e) => violations.push(format!(
+                    "declared part '{}' (run {}) does not decode as the Parquet the \
+                     manifest committed: {e:#}",
+                    part.path, manifest.run_id
+                )),
+            }
         }
         let (f, l, v) = check_order(&items);
         parts += manifest.parts.len();
@@ -301,6 +335,41 @@ mod v016_checkpoint_compat {
     /// `validate.rs` does no I/O of its own beyond a `Destination` trait a test can
     /// supply, so every mutant in it is offline-reachable and a survivor is a plain
     /// gap — no live-only argument available. 92 mutants, 80 caught, 5 missed.
+    /// Round-10 STRUCT ordering, executed (the refuter found no test ordered
+    /// the ANCHOR shapes against EVENT shapes anywhere): each engine's
+    /// checkpoint/pin rendering — the exact string the snapshot stamp writes
+    /// into `__pos` — must parse and rank BELOW a later event and ABOVE an
+    /// earlier one. The MySQL pin carries 4 fields (uuid + gtid ride along);
+    /// extras must not break the parse.
+    #[test]
+    fn anchor_shaped_positions_order_against_event_positions() {
+        // MySQL: 4-field pin vs 2-field events.
+        let anchor = r#"{"file":"binlog.000007","pos":500,"server_uuid":"u","gtid_executed":""}"#;
+        let earlier = r#"{"file":"binlog.000007","pos":100}"#;
+        let later = r#"{"file":"binlog.000008","pos":4}"#;
+        assert!(
+            parse_pos(anchor).is_some(),
+            "extras must not break the parse"
+        );
+        assert!(parse_pos(earlier) < parse_pos(anchor));
+        assert!(parse_pos(anchor) < parse_pos(later));
+        // PostgreSQL: slot LSN text vs a later commit LSN.
+        let pos = |lsn: &str| format!(r#"{{"lsn":"{lsn}"}}"#);
+        assert!(parse_pos(&pos("0/16B2D48")) < parse_pos(&pos("0/16B2D50")));
+        // SQL Server: the pinned anchor carries {"lsn","pinned"}; events carry
+        // {"lsn"} — the same JSON family, extras ignored, fixed-width hex
+        // orders lexically == numerically.
+        assert!(
+            parse_pos(r#"{"lsn":"0000002a000001f80003","pinned":true}"#)
+                < parse_pos(r#"{"lsn":"0000002a000002000001"}"#)
+        );
+        // MongoDB: the pin IS a resume token — same keystring family as events.
+        assert!(
+            parse_pos(r#"{"_data":"8264AA00000000000129"}"#)
+                < parse_pos(r#"{"_data":"8264AB00000000000129"}"#)
+        );
+    }
+
     #[test]
     fn the_position_verdict_the_order_check_and_the_lsn_key_all_answer_for_themselves() {
         use super::{PositionCheck, check_order, parse_pos};

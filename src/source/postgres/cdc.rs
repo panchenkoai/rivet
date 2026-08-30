@@ -319,9 +319,11 @@ impl PgChangeStream {
     /// changed it — it carries the primary key and nothing else. Measured on a real
     /// server at DEFAULT:
     ///
-    ///     insert | 1 | 10.5000 | alpha
-    ///     update | 1 | 99.9000 | alpha        <- the AFTER image is complete
-    ///     delete | 2 |         |              <- key only
+    /// ```text
+    /// insert | 1 | 10.5000 | alpha
+    /// update | 1 | 99.9000 | alpha        <- the AFTER image is complete
+    /// delete | 2 |         |              <- key only
+    /// ```
     ///
     /// Not corruption and not a reason to refuse: a delete event's job is to say
     /// which key is gone, and `test_decoding` still renders the whole NEW tuple, so
@@ -1197,7 +1199,9 @@ fn run_nonce() -> String {
 ///
 /// The line the server renders, measured on the stand:
 ///
-///     message: transactional: 0 prefix: rivet, sz: 20 content:rivet-barrier-abc123
+/// ```text
+/// message: transactional: 0 prefix: rivet, sz: 20 content:rivet-barrier-abc123
+/// ```
 ///
 /// Both halves of the match are load-bearing. The PREFIX stops another tool's
 /// logical message ending a rivet drain — a slot decodes the WHOLE database, so a

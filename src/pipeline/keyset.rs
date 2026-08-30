@@ -28,6 +28,68 @@ use crate::source::{self, Source};
 use crate::state::StateStore;
 use crate::types::CursorState;
 
+/// Rehydrate a keyset resume's prior committed pages WITH a destination probe —
+/// and REFUSE to finalize over a hole. Round-5 lifecycle HIGH: keyset has no M8
+/// (no per-part Rewrite machinery), so a committed page deleted from the
+/// destination between attempts (a gc pass after `state finish-run`, a
+/// foreign-host gc) was re-declared sight-unseen — Success + `_SUCCESS` naming
+/// deleted parquet, the page's rows silently absent. Chunked re-exports the
+/// missing chunk; keyset cannot re-read one page (the cursor has moved), so the
+/// honest outcome is a LOUD bail naming the remedy. A listing failure degrades
+/// to the unverified declare, said out loud (a resume must not die on a blip).
+fn rehydrate_keyset_pages_probed(
+    st: &crate::state::StateStore,
+    run_id: &str,
+    plan: &ResolvedRunPlan,
+    summary: &mut crate::pipeline::RunSummary,
+) -> anyhow::Result<()> {
+    let probe: Option<std::collections::HashSet<String>> =
+        match crate::destination::create_destination(&plan.destination) {
+            Ok(dest) if dest.capabilities().commit_protocol.leaves_objects_at_rest() => {
+                match dest.list_prefix("") {
+                    Ok(listing) => Some(
+                        listing
+                            .iter()
+                            .map(|m| m.key.rsplit('/').next().unwrap_or(&m.key).to_string())
+                            .collect(),
+                    ),
+                    Err(e) => {
+                        log::warn!(
+                            "keyset resume: cannot list the destination to verify prior \
+                             pages ({e:#}) — declaring from the state DB unverified"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None, // streaming destination, or unopenable: nothing to probe
+        };
+    let (_, missing) =
+        super::chunked::rehydrate_manifest_parts_probed(st, run_id, summary, probe.as_ref())?;
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().map(|(_, n)| n.as_str()).collect();
+        // The remedy is `state reset`, NOT `state reset-chunks`: keyset resume
+        // keys on `export_state.resume_run_id` + `keyset_range`, which
+        // reset-chunks does not touch (it clears chunk_task/chunk_run — tables
+        // keyset never writes). Round-6 live-proved the wrong hint strands the
+        // operator in a refusal loop; `state reset` drops the export_state row
+        // (cursor included, which incremental-keyset needs cleared too) and the
+        // next run does a fresh full pass.
+        anyhow::bail!(
+            "keyset resume: {} committed page part(s) are GONE from the destination \
+             ({}) — a gc/cleanup pass deleted them between attempts. Refusing to \
+             finalize a Success manifest naming deleted files (their rows would be \
+             silently absent). Reset this export's keyset state (`rivet state \
+             reset -c <config> --export {}`) so the whole range is re-read, \
+             or point the export at a fresh prefix.",
+            names.len(),
+            names.join(", "),
+            plan.export_name
+        );
+    }
+    Ok(())
+}
+
 fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
     match &plan.strategy {
         ExtractionStrategy::Keyset(kp) => kp,
@@ -869,7 +931,7 @@ fn run_keyset_parallel(
     if let Some(st) = state
         && checkpoint
     {
-        super::chunked::rehydrate_manifest_parts_from_file_log(st, &run_id, summary)?;
+        rehydrate_keyset_pages_probed(st, &run_id, plan, summary)?;
     }
     // ADR-0028/0029: feed every committed range's Form-B checksums to the ledger
     // under the SAME `UnitId::Range` its parts were recorded with (commit-gated —
@@ -1025,7 +1087,7 @@ pub(crate) fn run_keyset(
         match &resume_run_id {
             Some(rid) => {
                 summary.run_id = rid.clone();
-                super::chunked::rehydrate_manifest_parts_from_file_log(st, rid, summary)?;
+                rehydrate_keyset_pages_probed(st, rid, plan, summary)?;
                 // v25 cursor-atomic reconcile: the export_state cursor can LAG the committed parts
                 // — a crash in the after_manifest_update window advanced file_log (with the page's
                 // cursor_high) but NOT the export_state cursor, so resuming from the latter

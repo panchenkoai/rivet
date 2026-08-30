@@ -422,6 +422,16 @@ pub(super) fn run_single_export(
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
 
     for (part_idx, part) in sink.completed_parts.iter().enumerate() {
+        // Test-only: a RETURNED error mid-commit-loop (not a crash — a panic
+        // never reaches the retry decider at all). Proves the boundary the
+        // runner-coverage matrix argues "by construction": an error at part N
+        // leaves files_committed = N for decide_export_retry's duplicate
+        // guard, because parts 0..N-1 already went through record_part.
+        if let Err(e) =
+            crate::test_hook::maybe_error_at_index("single_part_commit", part_idx as i64)
+        {
+            anyhow::bail!("part {part_idx}: {e}");
+        }
         if plan.validate {
             validate_output(part.tmp.path(), plan.format, part.rows)?;
             summary.validated = Some(true);

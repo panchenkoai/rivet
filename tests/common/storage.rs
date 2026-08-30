@@ -108,6 +108,45 @@ pub fn minio_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
 
 /// Same independent oracle for fake-gcs: list the objects via the JSON API,
 /// then `GET ?alt=media` each `.parquet` and sum the row counts.
+/// Object NAMES under a fake-gcs prefix, from the store's own JSON API.
+///
+/// Extracted because DuckDB cannot list this emulator — its JSON API answers a
+/// GET but 404s the HEAD `httpfs` issues to size a file (measured) — so the
+/// store census takes the names from here and reads the objects itself. One
+/// lister, used by both, rather than a second HTTP block that drifts.
+pub fn fake_gcs_object_names(bucket: &str, prefix: &str) -> Vec<String> {
+    let list = fake_gcs_list_json(bucket, prefix);
+    let items = list["items"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    assert!(
+        !items.is_empty(),
+        "fake_gcs_object_names: prefix `{prefix}` in bucket `{bucket}` matched \
+         no objects — a wrong prefix reads exactly like an empty export"
+    );
+    items
+        .iter()
+        .filter_map(|i| i["name"].as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+fn fake_gcs_list_json(bucket: &str, prefix: &str) -> serde_json::Value {
+    use std::io::{Read, Write};
+    let http = |req: String| -> Vec<u8> {
+        let mut s = TcpStream::connect("127.0.0.1:4443").expect("connect fake-gcs");
+        s.write_all(req.as_bytes()).expect("write fake-gcs req");
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        let sep = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http header separator");
+        buf.split_off(sep + 4)
+    };
+    let list = http(format!(
+        "GET /storage/v1/b/{bucket}/o?prefix={prefix} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    ));
+    serde_json::from_slice(&list).expect("fake-gcs list JSON")
+}
+
 pub fn fake_gcs_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
     use std::io::{Read, Write};
     let http = |req: String| -> Vec<u8> {
@@ -126,8 +165,20 @@ pub fn fake_gcs_parquet_total_rows(bucket: &str, prefix: &str) -> usize {
         "GET /storage/v1/b/{bucket}/o?prefix={prefix} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     ));
     let list: serde_json::Value = serde_json::from_slice(&list).expect("fake-gcs list JSON");
+    let items = list["items"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    // An empty LISTING is a harness bug (wrong prefix/bucket), never evidence
+    // of zero rows: the GCS all-features test probed a prefix missing its
+    // export-name segment and this helper answered an honest-but-wrong 0
+    // (2026-08-29). Objects exist whenever the capture ran — refuse to grade
+    // a world the prefix cannot see.
+    assert!(
+        !items.is_empty(),
+        "fake_gcs_parquet_total_rows: prefix `{prefix}` in bucket `{bucket}` \
+         matched no objects at all — a wrong prefix reads as an empty export; \
+         fix the probe, don't trust the zero"
+    );
     let mut total = 0usize;
-    for item in list["items"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+    for item in items {
         let name = item["name"].as_str().expect("object name");
         if !name.ends_with(".parquet") {
             continue;

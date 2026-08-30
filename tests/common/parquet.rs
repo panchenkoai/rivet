@@ -251,6 +251,53 @@ pub fn duckdb_dir_parquet_ids(dir: &Path) -> Vec<i64> {
 }
 
 /// The distinct `id` values under `dir`, read by DuckDB.
+/// [`duckdb_dir_parquet_id_set`], but over the MANIFEST-DECLARED parts only —
+/// the loader's view. A glob counts orphan parts no manifest names; on a crash
+/// suite that difference IS the claim (harness audit: the gremlin final union
+/// rode the glob and its own sibling file documents the glob as MASKING the
+/// ack→manifest window loss).
+pub fn duckdb_declared_dir_id_set(dir: &Path) -> BTreeSet<i64> {
+    let staged = stage_declared_for_duckdb(dir);
+    let sql = format!("SELECT DISTINCT id FROM read_parquet('{staged}/**/*.parquet') ORDER BY id");
+    // `duckdb_run_sql_json` emits {columns:[..], rows:[[..]]} with every cell
+    // STRINGIFIED (same shape `duckdb_dir_scalar` documents). The first cut of
+    // this helper parsed the top level as an array-of-objects and
+    // `unwrap_or_default()`ed the mismatch into an EMPTY SET — a completeness
+    // oracle that silently answers "zero rows" on its own parse bug is the
+    // absence-is-not-success class wearing a DuckDB badge (caught live,
+    // 2026-08-29: arrow saw 30 ids, this saw 0). Parse the real shape; PANIC
+    // on anything else.
+    let v = super::duckdb_run_sql_json(&sql);
+    let rows = v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb returned no rows array for `{sql}`: {v}"));
+    rows.iter()
+        .map(|r| {
+            r.get(0)
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or_else(|| panic!("unparseable id cell in `{sql}`: {r}"))
+        })
+        .collect()
+}
+
+/// A scalar over the MANIFEST-DECLARED parts only (the loader's view) — the
+/// generic sibling of [`duckdb_declared_dir_id_set`] for tables whose key is
+/// not an `id` int. Same why: a glob counts orphan parts of FAILED attempts
+/// (a refused resume exports ranges before refusing at finalize), and those
+/// are the `gc_orphans` case, not delivered data.
+pub fn duckdb_declared_dir_scalar(dir: &Path, expr: &str) -> i64 {
+    let staged = stage_declared_for_duckdb(dir);
+    let sql = format!("SELECT {expr} FROM read_parquet('{staged}/**/*.parquet')");
+    let v = super::duckdb_run_sql_json(&sql);
+    v["rows"]
+        .get(0)
+        .and_then(|r| r.get(0))
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("duckdb returned no scalar for `{sql}`: {v}"))
+}
+
 pub fn duckdb_dir_parquet_id_set(dir: &Path) -> BTreeSet<i64> {
     duckdb_dir_parquet_ids(dir).into_iter().collect()
 }
@@ -629,7 +676,16 @@ pub enum CdcEngine {
 ///
 /// A part listed with a non-`committed` status is skipped — in-flight is not
 /// delivered.
-pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
+/// WHICH manifests count under `dir`: the immutable run-unique copies, and the
+/// canonical `manifest.json` ONLY when no copy exists.
+///
+/// ONE definition, called by everything that needs it. The 2026-08-29 audit
+/// found this rule written out FIVE separate times (two Rust, two python, one
+/// in the differential harness) and fixed four of them for a Success filter
+/// before a critic found the fifth. A sixth copy — in SQL, for the census
+/// below — is exactly the shape that keeps costing; so the census takes the
+/// file list from here instead of re-deriving it.
+pub fn declared_manifests(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut copies: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
@@ -645,6 +701,11 @@ pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
     if copies.is_empty() && dir.join("manifest.json").is_file() {
         copies.push(dir.join("manifest.json"));
     }
+    copies
+}
+
+pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
+    let copies = declared_manifests(dir);
     let mut declared = Vec::new();
     for m in &copies {
         let Ok(text) = std::fs::read_to_string(m) else {
@@ -653,6 +714,19 @@ pub fn declared_parquet_parts(dir: &Path) -> Vec<std::path::PathBuf> {
         let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        // SUCCESS manifests only — the loader's rule (a part in a Failed/
+        // Interrupted manifest is a gc DELETE candidate, not delivered data).
+        // Live-proven 2026-08-29: a crashed keyset run leaves a `failed`
+        // manifest copy whose part NAMES a refused resume then re-creates
+        // under the same run stamp, so without this filter the union counted
+        // 500 undelivered rows as declared (2500 vs the true 2000).
+        let ok = doc
+            .get("status")
+            .and_then(|s| s.as_str())
+            .is_none_or(|s| s.eq_ignore_ascii_case("success"));
+        if !ok {
+            continue;
+        }
         for part in doc
             .get("parts")
             .and_then(|p| p.as_array())
@@ -976,4 +1050,154 @@ pub fn duckdb_dir_csv_id_set(dir: &Path) -> BTreeSet<i64> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Rows across every CSV under `dir`, parsed by DuckDB.
+///
+/// The column-agnostic sibling of [`duckdb_dir_csv_id_set`]: a completeness
+/// claim over a CSV destination whose key column is not named `id` needs the
+/// COUNT, and demanding an `id` there fails on the schema rather than on the
+/// claim. Independent by construction — rivet writes CSV with the `csv` crate
+/// and DuckDB parses it with its own reader.
+pub fn duckdb_dir_csv_rows(dir: &Path) -> i64 {
+    assert!(
+        !files_with_extension(dir, "csv").is_empty(),
+        "duckdb_dir_csv_rows on a directory with no .csv — reading zero as the \
+         answer is how a wrong-format wiring hides"
+    );
+    let c = stage_for_duckdb(dir);
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT count(*) FROM read_csv_auto('{c}/**/*.csv', header=true)"
+    ));
+    v["rows"][0][0]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("duckdb returned no CSV row count: {v}"))
+}
+
+/// `_rivet_row_hash`, verified by an implementation that is NOT rivet's.
+///
+/// The one integrity column rivet asks a reader to trust. `rivet validate`
+/// recomputes it with the product's OWN `enrich` — deliberately, and sound for
+/// its purpose (did the DATA change between extract and audit) — but
+/// structurally incapable of catching a defect in the SPEC, because both sides
+/// share it. Render id v1 shipped non-injective in two independent ways and
+/// lived four months behind exactly that arrangement.
+///
+/// So this rebuilds the canonical image from the SPEC in `src/enrich.rs` —
+/// presence tag, u32 little-endian length, rendered bytes — in PYTHON, hashes it
+/// with the `xxhash` package, and compares. Different language, different
+/// library, different reading of the spec. The gate has carried this since
+/// `dev/release_oracle/rowhash.py`; this is the same approach as a rig helper,
+/// so a live test can make the claim too.
+///
+/// SCOPE, stated because it is narrow: the cell text must render identically in
+/// DuckDB and in Arrow's display. That holds for integers, plain strings and
+/// booleans; it does NOT hold for every timestamp/decimal spelling, which is why
+/// the gate uses a controlled probe table. Pass columns of the safe shapes, or
+/// the comparison grades the two renderings rather than the hash.
+///
+/// SKIPS loudly (returns `false`) when the host has no `xxhash` — never a silent
+/// pass, and never a fallback to rivet's own recomputation, which would be the
+/// self-oracle this exists to avoid.
+pub fn row_hash_matches_independent_spec(dir: &Path, cols: &[&str]) -> bool {
+    if std::process::Command::new("python3")
+        .args(["-c", "import xxhash"])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        // Through the ONE marker, so a release lane can count it: a skip is a
+        // pass to libtest, and an un-counted skip is how a lane reports green
+        // over a check that never ran.
+        super::skip_live(
+            "row_hash_matches_independent_spec: the host has no `xxhash` \
+             (pip install xxhash). Refusing to fall back on rivet's own \
+             recomputation — that is the self-oracle this check exists to avoid.",
+        );
+        return false;
+    }
+    let staged = stage_declared_for_duckdb(dir);
+    let sel = cols
+        .iter()
+        .map(|c| format!("CAST({c} AS VARCHAR) AS {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT {sel}, CAST(_rivet_row_hash AS VARCHAR) AS h \
+         FROM read_parquet('{staged}/**/*.parquet') ORDER BY 1"
+    ));
+    let rows = v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("row-hash read returned no rows array: {v}"));
+    assert!(
+        !rows.is_empty(),
+        "no rows to check — an empty read agrees with every hash, which is the \
+         vacuous shape this helper must never report as success"
+    );
+    let payload = serde_json::json!({
+        "cols": cols.len(),
+        "rows": rows,
+    });
+    let script = r#"
+import json, sys, xxhash
+TAG_NULL, TAG_PRESENT = 0x00, 0x01
+def canon(cells):
+    out = bytearray()
+    for c in cells:
+        if c is None:
+            out.append(TAG_NULL); continue
+        b = c.encode("utf-8")
+        out.append(TAG_PRESENT); out += len(b).to_bytes(4, "little"); out += b
+    return bytes(out)
+def h64(cells):
+    low = xxhash.xxh3_128_intdigest(canon(cells)) & 0xFFFFFFFFFFFFFFFF
+    return low - (1 << 64) if low >= (1 << 63) else low
+doc = json.load(sys.stdin)
+n = doc["cols"]
+bad = 0
+for r in doc["rows"]:
+    want = int(r[n])
+    got = h64(r[:n])
+    if want != got:
+        bad += 1
+        if bad <= 3:
+            print(f"MISMATCH cells={r[:n]} rivet={want} spec={got}", file=sys.stderr)
+print(json.dumps({"checked": len(doc["rows"]), "bad": bad}))
+"#;
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the independent hasher");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("feed the hasher");
+    }
+    let out = child.wait_with_output().expect("independent hasher");
+    let verdict: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        panic!(
+            "the independent hasher produced no verdict.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let checked = verdict["checked"].as_i64().unwrap_or(0);
+    let bad = verdict["bad"].as_i64().unwrap_or(-1);
+    assert!(checked > 0, "the hasher checked nothing: {verdict}");
+    assert_eq!(
+        bad,
+        0,
+        "{bad} of {checked} rows disagree with the SPEC's canonical image — \
+         rivet's hash and an independent reading of src/enrich.rs differ.\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
 }

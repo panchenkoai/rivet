@@ -23,14 +23,35 @@
 #             are not yet gated — each is a real coverage hole, ratcheted.
 grid:
   postgres:
-    gated: [13, 14, 16, 18]          # 14/18 verified green on the devbox against the blessed goldens
-    gaps:  [12, 15, 17]              # 12/15 are compose services; 17 is a public image
+    gated: [12, 13, 14, 15, 16, 17, 18]   # 12/15/17 added 2026-08-30 — public images, no seed blocker existed
+    gaps:  []
   mysql:
     gated: ["8.0", "8.4"]
-    gaps:  ["5.7", "mariadb-11"]     # 5.7 = huge install base, needs a CTE-free seed; MariaDB needs a compose service + driver check
+    gaps:  ["5.7"]                   # MEASURED 2026-08-30, not argued: the seed dies with
+                                     # `ERROR 1064 at line 111 … near '(ORDER BY id) AS chunk_rownum'`
+                                     # — a WINDOW FUNCTION (dev/mysql/init.sql), which is 8.0+.
+                                     # The old note blamed a recursive CTE: right family, wrong
+                                     # construct, and the CTE had already been removed. Closing this
+                                     # means emulating ROW_NUMBER with a session variable in a seed
+                                     # every other version shares — a change with its own blast
+                                     # radius, deliberately not made on the way to a release.
+    # `mariadb-11` was listed as a gap and REMOVED 2026-08-30: MariaDB is not a
+    # source engine at all. `SourceType` is Postgres | Mysql | Mssql | Mongo, and
+    # the only MariaDB-shaped things in the tree are MaxScale PROXY detection
+    # (a front-end for MySQL, src/source/mysql/proxy.rs) and a changelog note
+    # that MariaDB spells `max_statement_time` differently. There is no compose
+    # service, no doc, no README claim and no test — so the row was a debt that
+    # could never be paid, only pretended at: closing it would mean ADDING an
+    # engine, which is a product decision and not a coverage gap.
   mssql:
     gated: ["2022"]
-    gaps:  ["2019"]                  # 2019 ships mssql-tools (not tools18) — needs an sqlcmd-path fallback in bring_up/seed
+    gaps:  ["2019"]                  # MEASURED 2026-08-30. The tools18-path blocker WAS real and is
+                                     # fixed (sqlcmd is probed per container now, and 2019 brings up
+                                     # and connects). The seed then fails with `Msg 208` (invalid
+                                     # object) + two `Msg 195` (not a recognized built-in function) —
+                                     # a 2022-only function in the seed, not a harness limit. The
+                                     # exact function is one `sqlcmd` away; closing it is a seed
+                                     # change, tracked here rather than bundled into a release.
   mongo:
     gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
     gaps:  []
@@ -202,8 +223,11 @@ preflights:
 infra:
   - id: network_faults
     infra: toxiproxy
-    status: gap
-    note: "retry/reconnect (retry.rs, classify_pg_sqlstate) under injected latency/drop/reset is untested end-to-end in the gate"
+    status: test
+    note: "verify_network_faults drives export_survives_transient_latency_added_via_toxiproxy +
+      export_fails_cleanly_when_toxiproxy_is_disabled_before_run +
+      gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers through the release binary;
+      probes toxiproxy :8474 itself and SKIPs loudly when down"
   - id: state_upgrade
     status: test
     note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
@@ -212,16 +236,34 @@ infra:
     status: test
     note: "pg_shared_state_cross_connection_visibility_and_supersession (src/state/run_status_store.rs) — two StateStore connections = two processes on one shared Postgres state: a run begun on A is active-visible to B (the gc_orphans signal), and a newer run supersedes the older clock-free. Run by the state_migrations preflight; RED-proven against a flipped supersession."
   - id: tls_required
-    status: gap
-    note: "TLS-required connections + cert validation (the vendored-openssl / tiberius handshake class); the gate runs mssql on accept_invalid_certs"
+    status: partial
+    note: "POLICY half gated: verify_tls_required drives sec_remote_plaintext_pg_is_loud +
+      sec_loopback_plaintext_pg_is_allowed + sec_enforced_tls_is_not_overridden_by_url_sslmode_disable.
+      RESIDUAL: a real TLS handshake against a VERIFIED cert (the vendored-openssl / tiberius
+      class) needs a TLS-provisioned service the stand does not have; the gate still runs
+      mssql on accept_invalid_certs"
   - id: auth
     infra: mongo-auth
-    status: gap
-    note: "SCRAM / cert auth paths; the gate uses no-auth Mongo and password-only SQL"
+    status: partial
+    note: "SCRAM half gated: verify_auth drives mongo_readonly_login_exports_despite_denied_harm_probe
+      (least-privilege export, DuckDB-graded) + mongo_wrong_password_fails_loud_and_writes_nothing
+      (refusal names auth, zero parquet). RESIDUAL: x509 cert auth is a separate provisioning class"
   - id: cdc_standby
     infra: ["pg-cdc-standby"]
-    status: gap
-    note: "the mysql read-REPLICA half of this is now the `replica_read` preflight (verify_replica_read, status:test). The residual: bounded CDC on a PostgreSQL STANDBY must fail LOUD (roast_pg_cdc_bounded_on_a_standby_fails_loud EXISTS but the gate does not drive it — needs the `cdc-standby` compose profile up)."
+    status: test
+    note: "the mysql read-REPLICA half is the `replica_read` preflight (verify_replica_read).
+      The standby half: verify_cdc_standby probes :5436 ITSELF (the live test self-skips as
+      PASSED when the port is down — the vacuous-skip class) and drives
+      roast_pg_cdc_bounded_on_a_standby_fails_loud when the `cdc-standby` profile is up"
+  - id: live_only_coverage
+    status: test
+    note: "verify_live_only_coverage runs the offline battery under cargo-llvm-cov and
+      dev/pytools/live_only_cov.py classifies every mutants.toml whole-function exclusion:
+      confirmed zero-coverage / adjudicated (reason pinned in the tool; deleting an entry
+      turns the leg red) / CONTRADICTED (fails the gate). Measured 2026-08-29:
+      17 confirmed, 8 adjudicated, 1 no-symbol, 0 contradicted. SKIPs without cargo-llvm-cov."
   - id: warehouse_load
     status: partial
-    note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"
+    note: "BigQuery live golden IS gated — driven by run_bigquery_golden (dev/release_oracle/bigquery.py),
+      which is this row's driver under a different name; Snowflake + ClickHouse are resolver/type-only (no live
+      load-and-readback) — ClickHouse is even a local compose service, cheap to add"

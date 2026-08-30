@@ -18,8 +18,9 @@ pub(super) fn check_mongo(
     url: &str,
     tls: Option<&TlsConfig>,
     exports: &[&ExportConfig],
+    mongo: Option<&crate::config::MongoConfig>,
 ) -> Result<Vec<ExportDiagnostic>> {
-    super::collect_diagnostics(exports, |export| diagnose_mongo(url, tls, export))
+    super::collect_diagnostics(exports, |export| diagnose_mongo(url, tls, export, mongo))
 }
 
 /// Diagnose a single export without printing — used by `rivet plan`.
@@ -27,14 +28,16 @@ pub(super) fn diagnose_export_mongo(
     url: &str,
     tls: Option<&TlsConfig>,
     export: &ExportConfig,
+    mongo: Option<&crate::config::MongoConfig>,
 ) -> Result<ExportDiagnostic> {
-    diagnose_mongo(url, tls, export)
+    diagnose_mongo(url, tls, export, mongo)
 }
 
 fn diagnose_mongo(
     url: &str,
     tls: Option<&TlsConfig>,
     export: &ExportConfig,
+    mongo: Option<&crate::config::MongoConfig>,
 ) -> Result<ExportDiagnostic> {
     // Scan-free row estimate via `estimatedDocumentCount` (collection metadata,
     // never a scan) — the Mongo analogue of PG `reltuples`. Resolved from the
@@ -45,9 +48,22 @@ fn diagnose_mongo(
         .as_deref()
         .and_then(|coll| crate::source::mongo::estimated_count(url, tls, coll));
 
-    // A full collection scan uses no index and has no cursor.
-    let uses_index = false;
-    let strategy = derive_strategy(export);
+    // The diagnostic-bypass class (round-10, closing the round-7 find):
+    // `source.mongo.page_size` routes `mode: full` to the KEYSET `_id`-range
+    // reader — an indexed seek that `parallel: N` fans out — but this
+    // diagnostic never received the source config and hardcoded
+    // "collection scan / no index / UNSAFE" for the correctly-configured
+    // path. Four false claims on one line of check output.
+    let keyset = mongo.is_some_and(|m| m.page_size.is_some());
+    let uses_index = keyset; // `_id` seek rides the mandatory _id index
+    let strategy = if keyset {
+        format!(
+            "keyset(_id, page_size={})",
+            mongo.and_then(|m| m.page_size).unwrap_or(0)
+        )
+    } else {
+        derive_strategy(export)
+    };
     let verdict = compute_verdict(row_estimate, uses_index, false, None, export.parallel);
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);

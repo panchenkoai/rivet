@@ -1472,3 +1472,65 @@ src/source/mssql/cdc.rs:978:48: replace == with != in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:979:21: replace += with *= in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:979:21: replace += with -= in MssqlChangeStream::fill
 src/source/mssql/cdc.rs:986:21: replace == with != in MssqlChangeStream::fill
+
+# ── 2026-08-28 adjudication: src/source/cdc/sink.rs (full run, 188: 134 caught,
+# 46 unviable, 6 timeouts — the timeouts were the drain_is_complete never-stop
+# mutants hanging the FakeStream loop, now a loud fuse panic instead). ONE
+# survivor, LIVE-GUARDED: `yielded_this_pass += → *=` freezes the counter at 0,
+# which is indistinguishable on a single-pass FakeStream (the drive loop ends
+# after pass one either way, correctly) and only observable on a RE-DRAINING
+# reader — PostgreSQL's non-consuming peek, whose re-drain loop is exactly what
+# the counter exists for. Oracles: roast_pg_cdc_reaches_open_bound_past_a_large_
+# uncaptured_transaction + roast_pg_cdc_empty_transaction_churn_must_not_pin_the_
+# slot (tests/live/live_cdc.rs) — both starve if a zero-yield pass reads as
+# complete while in-bound data remains.
+src/source/cdc/sink.rs:454:35: replace += with *= in run_to_files
+
+# ── 2026-08-29: newly VISIBLE survivors after six whole-function exclusions
+# were lifted (execute_resolved_plan, prepare_load, dispatch, run_plan_command,
+# introspect_all, run_with_reconnect). Each exclusion claimed "no offline test
+# reaches this body"; every one of their STUBS is caught offline, so the claim
+# was false. The inner decisions below DO survive — they were never covered by
+# the wholesale entries (which name only the stub) and were simply unmeasured.
+# They are graded per-diff by cargo-mutants now: touch one of these lines and
+# the in-diff gate asks for a test.
+src/cli/dispatch.rs:195:5: replace dispatch_schema -> Result<()> with Ok(())
+src/cli/dispatch.rs:235:5: replace dispatch_cdc -> Result<()> with Ok(())
+src/cli/dispatch.rs:305:9: delete match arm [t] in dispatch_cdc
+src/cli/dispatch.rs:316:9: delete field destination_type from struct crate::config::DestinationConfig expression in dispatch_cdc
+src/cli/dispatch.rs:317:9: delete field path from struct crate::config::DestinationConfig expression in dispatch_cdc
+src/cli/dispatch.rs:432:21: replace || with && in dispatch_check
+src/cli/dispatch.rs:432:29: replace || with && in dispatch_check
+src/cli/dispatch.rs:432:39: replace || with && in dispatch_check
+src/cli/dispatch.rs:445:19: replace && with || in dispatch_check
+src/cli/dispatch.rs:445:22: delete ! in dispatch_check
+src/cli/dispatch.rs:464:5: replace check_plan_compatibility -> Result<()> with Ok(())
+src/cli/dispatch.rs:472:63: replace == with != in check_plan_compatibility
+src/cli/dispatch.rs:47:5: replace check_export_selection -> Result<()> with Ok(())
+src/cli/dispatch.rs:480:28: replace != with == in check_plan_compatibility
+src/cli/dispatch.rs:544:12: delete ! in dispatch_init
+src/cli/dispatch.rs:631:5: replace dispatch_plan -> Result<()> with Ok(())
+src/cli/dispatch.rs:699:5: replace dispatch_reconcile -> Result<()> with Ok(())
+src/cli/dispatch.rs:713:5: replace dispatch_repair -> Result<()> with Ok(())
+src/cli/dispatch.rs:920:5: replace show_loads -> Result<()> with Ok(())
+src/init/mod.rs:1013:29: delete ! in introspect_all
+src/init/mod.rs:1039:54: delete ! in introspect_all
+src/init/mod.rs:1041:27: replace != with == in introspect_all
+src/init/mod.rs:1068:29: delete ! in introspect_all
+src/init/mod.rs:1083:9: delete match arm "mongo" in introspect_all
+src/pipeline/plan_cmd.rs:101:39: replace > with < in run_plan_command
+src/pipeline/plan_cmd.rs:101:39: replace > with == in run_plan_command
+src/pipeline/plan_cmd.rs:101:39: replace > with >= in run_plan_command
+src/pipeline/plan_cmd.rs:117:36: replace > with < in run_plan_command
+src/pipeline/plan_cmd.rs:117:36: replace > with == in run_plan_command
+src/pipeline/plan_cmd.rs:117:36: replace > with >= in run_plan_command
+src/pipeline/plan_cmd.rs:125:41: replace == with != in run_plan_command
+src/pipeline/plan_cmd.rs:157:36: replace == with != in run_plan_command
+src/pipeline/plan_cmd.rs:157:67: replace && with || in run_plan_command
+src/pipeline/plan_cmd.rs:157:70: delete ! in run_plan_command
+src/pipeline/plan_cmd.rs:231:60: delete ! in run_plan_command
+src/pipeline/plan_cmd.rs:232:8: delete ! in run_plan_command
+src/pipeline/plan_cmd.rs:78:30: replace == with != in run_plan_command
+src/pipeline/single.rs:39:20: replace > with < in run_with_reconnect
+src/pipeline/single.rs:39:20: replace > with == in run_with_reconnect
+src/pipeline/single.rs:39:20: replace > with >= in run_with_reconnect

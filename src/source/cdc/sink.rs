@@ -478,9 +478,16 @@ pub(crate) fn run_to_files(
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
-                    let eb = ev.estimated_bytes();
-                    total_bytes += eb;
-                    read_bytes.fetch_add(eb as u64, std::sync::atomic::Ordering::Relaxed);
+                    // TWO units on purpose: the rollover budget wants RESIDENT
+                    // cost (what the buffer actually holds), the bytes-read metric
+                    // wants DECODED payload (comparable with the batch path's
+                    // figure). One `eb` feeding both silently inflated the metric
+                    // ~4-13x when the estimate was re-based to resident.
+                    total_bytes += ev.estimated_bytes();
+                    read_bytes.fetch_add(
+                        ev.payload_bytes() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     sink.buf.push(ev);
                     total_rows += 1;
                     emitted += 1;
@@ -1201,6 +1208,21 @@ mod tests {
 
     /// A fake stream that yields a fixed list of changes and records every `ack`,
     /// so the test can assert the durable sequence ran once per committed part.
+    /// The runaway fuse every test stream's `next_change` calls FIRST: a drive
+    /// loop that stops terminating (a `drain_is_complete` mutant) must fail as a
+    /// loud panic in milliseconds, not a per-mutant 33-second harness timeout —
+    /// six mutants survived that way, each a stalled CI job wearing a verdict.
+    /// One counter across all streams: the budget is per test PROCESS, which is
+    /// exactly the resource a hang consumes.
+    fn runaway_fuse() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        assert!(
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100_000,
+            "a test stream was polled 100_000 times — the drive loop is not \
+             terminating (drain_is_complete never fired)"
+        );
+    }
+
     struct FakeStream {
         events: VecDeque<ChangeEvent>,
         acked: Vec<Position>,
@@ -1212,6 +1234,20 @@ mod tests {
         }
 
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            runaway_fuse();
+            // A RUNAWAY FUSE, panicking loudly instead of hanging. The drive
+            // loop re-drains until `drain_is_complete` says stop; a mutant that
+            // never says stop (`-> false`, `|| -> &&`) spun this stream's empty
+            // tail forever and survived as a 33-second TIMEOUT per mutant — a
+            // stalled CI job where an assertion should be, the same class the
+            // spill's drain loops had. 10_000 calls is three orders past any
+            // fixture here.
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            assert!(
+                CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10_000,
+                "FakeStream polled 10_000 times — the drive loop is not \
+                 terminating (drain_is_complete never fired)"
+            );
             self.events.pop_front().map(Ok)
         }
         fn ack(&mut self, position: &Position) -> Result<()> {
@@ -1495,6 +1531,7 @@ mod tests {
         }
 
         fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            runaway_fuse();
             self.events.pop_front().map(Ok)
         }
         fn ack(&mut self, _position: &Position) -> Result<()> {
@@ -1585,6 +1622,7 @@ mod tests {
             }
 
             fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+                runaway_fuse();
                 match self.events.pop_front() {
                     Some(e) => Some(Ok(e)),
                     // Exhausted -> the read itself fails, mid-drain.
@@ -2618,6 +2656,174 @@ mod tests {
         }
     }
 
+    /// A destination that delegates to the real local one but FAILS exactly the
+    /// terminal writes (`manifest*` / `_SUCCESS`) — the one failure shape
+    /// `FailingDestination` (which fails EVERYTHING) can never reach: with it the
+    /// drain dies at the first flush and the `(Ok(()), Some(e))` arm plus the
+    /// sibling-gating never run.
+    struct ManifestFailingDest {
+        inner: Box<dyn crate::destination::Destination>,
+    }
+    impl crate::destination::Destination for ManifestFailingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            let name = key.rsplit('/').next().unwrap_or(key);
+            if name.starts_with("manifest") || name == "_SUCCESS" {
+                anyhow::bail!("injected: terminal write of '{key}' refused");
+            }
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A failed TERMINAL manifest write is the run's OUTCOME — never a success
+    /// with a stale manifest.
+    ///
+    /// This arm had never executed in any test: the only injector failed every
+    /// write, so the drain died first and `(Ok(()), Some(e))` was dead weight a
+    /// mutant could flip to `(manifests, Ok(()))` — a run whose `_SUCCESS` never
+    /// landed reporting success in metrics and journal while the prefix carries
+    /// no completion marker and a stale canonical manifest.
+    #[test]
+    fn a_failed_terminal_manifest_write_fails_the_run_and_writes_no_success() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = ManifestFailingDest {
+            inner: local_dest(&d),
+        };
+        let cols = int_col();
+        let mut e1 = insert(1);
+        e1.committed = true;
+        let mut stream = FakeStream {
+            events: vec![e1].into(),
+            acked: Vec::new(),
+        };
+        let (m, r) = run_to_files(&mut stream, cfg(&dest, &cols, FormatType::Parquet, 100));
+        assert!(
+            r.is_err(),
+            "the terminal write failed — reporting Ok would let metrics and the \
+             journal record a success no completion marker supports"
+        );
+        assert!(
+            !m.is_empty(),
+            "the manifests are still RETURNED — discarding them on a write error \
+             would throw away the record of what IS durable"
+        );
+        assert!(
+            !d.path().join("_SUCCESS").exists(),
+            "no _SUCCESS may exist for a run whose terminal write failed"
+        );
+        // The data part itself is durable — only the terminal records failed.
+        let parts: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+            .collect();
+        assert_eq!(parts.len(), 1, "the flushed part must survive");
+    }
+
+    /// The cross-part checksum fold is SUM, recorded with the Sum render stamp —
+    /// graded on TWO parts with EQUAL sums, the one fixture where every wrong
+    /// fold shows its face.
+    ///
+    /// On one part `0.wrapping_add(s) == 0 ^ s == s`: every operator agrees, so
+    /// the only pre-existing coverage (a one-part live cell) could not fail
+    /// against `^=` — under which two equal parts cancel to ZERO, "a checksum
+    /// that verified anything" (the production comment's own words) — nor
+    /// against dropping the render stamp, which sends validate's re-read to the
+    /// v1 XOR fold and false-reports healthy multi-part prefixes corrupt.
+    #[test]
+    fn the_cross_part_checksum_fold_survives_two_equal_parts() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        // TWO transactions with IDENTICAL values — equal per-part column sums,
+        // the XOR-annihilation witness — at rollover 1, so each rolls its own part.
+        let mut e1 = insert(7);
+        e1.committed = true;
+        let mut e2 = insert(7);
+        e2.committed = true;
+        let mut stream = FakeStream {
+            events: vec![e1, e2].into(),
+            acked: Vec::new(),
+        };
+        let (m, r) = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 1),
+        );
+        r.unwrap();
+        let manifest = m.into_iter().next().expect("one table");
+        assert!(
+            manifest.parts.len() >= 2,
+            "the fixture is inert below TWO parts — every fold operator is \
+             identical on one"
+        );
+        let sums = manifest
+            .column_checksums
+            .as_ref()
+            .expect("the sink records Form B checksums");
+        let v: u64 = sums
+            .iter()
+            .find(|c| c.name == "v")
+            .map(|c| c.checksum.parse().expect("a numeric checksum"))
+            .expect("the data column is summed");
+        assert_ne!(
+            v, 0,
+            "two equal parts must NOT cancel — zero here is the annihilating XOR \
+             fold back from the dead"
+        );
+        assert_eq!(
+            manifest.checksum_render.as_deref(),
+            Some(crate::source::value_checksum::CHECKSUM_RENDER_ID),
+            "without the render stamp, validate's re-read falls back to the v1 \
+             XOR fold and false-reports healthy multi-part prefixes corrupt"
+        );
+    }
+
+    /// `read_bytes` counts PAYLOAD, produced by the real producer — not resident.
+    ///
+    /// The boundary test the regression demanded: a unit on `payload_bytes` alone
+    /// could not catch the sink feeding the metric from `estimated_bytes` (the
+    /// mutant survived it — the decider was right and the SUPPLIER was wrong). So
+    /// this drives the real drive loop and reads the counter at the boundary: the
+    /// total must equal the events' payload sum exactly, and the resident sum —
+    /// which exceeds it by the cloned position + struct overhead — must NOT fit.
+    /// One `eb` feeding both consumers inflated the metric ~13x on narrow rows and
+    /// broke comparability with the batch path's figure.
+    #[test]
+    fn read_bytes_counts_payload_not_resident() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let events: Vec<ChangeEvent> = (1..=4).map(insert).collect();
+        let payload: u64 = events.iter().map(|e| e.payload_bytes() as u64).sum();
+        let resident: u64 = events.iter().map(|e| e.estimated_bytes() as u64).sum();
+        assert!(
+            resident > payload * 2,
+            "the fixture is inert unless the two units DIFFER visibly — if they \
+             converge, this test can no longer tell which one the sink counted"
+        );
+
+        let mut stream = FakeStream {
+            events: events.into(),
+            acked: Vec::new(),
+        };
+        let config = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        let counter = std::sync::Arc::clone(&config.read_bytes);
+        let (_m, r) = run_to_files(&mut stream, config);
+        r.unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            payload,
+            "bytes_read must be the DECODED payload — the number comparable with \
+             the batch path — never the resident bookkeeping cost"
+        );
+    }
+
     /// `max_events` must be a SOFT cap that lands on a commit boundary — the same
     /// treatment `should_roll` gives every other budget. The hard break sat inside
     /// the per-event loop with no boundary condition, so a transaction larger than
@@ -2970,6 +3176,14 @@ mod tests {
 
         assert_eq!(manifests.len(), 2, "one manifest per table");
         assert_eq!(manifests[0].export_name, "a");
+        // The FAMILY is the parent export on BOTH tables — the field exists so
+        // the load guard can group the drain with its snapshot leg, and a flip
+        // to `out.table` here would make `identity_family` see two families in
+        // one prefix and refuse rivet's own output at the first name≠table load.
+        // This fixture already crosses the threshold (export "t", tables a/b);
+        // it just never asserted the field.
+        assert_eq!(manifests[0].export_family, "t");
+        assert_eq!(manifests[1].export_family, "t");
         assert_eq!(manifests[0].row_count, 2);
         assert_eq!(manifests[1].export_name, "b");
         assert_eq!(manifests[1].row_count, 1);

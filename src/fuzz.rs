@@ -38,3 +38,13 @@ pub fn mongo_resume_token(data: &[u8]) {
         let _ = crate::source::mongo::cdc::decode_resume_token(&v);
     }
 }
+
+/// CDC spill tagged-frame decoder — the length-prefixed record log a crashed
+/// run leaves on DISK, i.e. a persisted, corruptible input (same standing as
+/// the checkpoint row in the fuzz matrix). Round-4 found two crash-classes by
+/// hand — an ARRAY nesting bomb (stack overflow, uncatchable) and a lying
+/// length prefix (up to 4 GiB pre-committed) — both now refused; this target
+/// holds the whole frame surface to "Err, never panic".
+pub fn spill_frame_decode(data: &[u8]) {
+    let _ = crate::source::cdc::spill::decode_event(data);
+}

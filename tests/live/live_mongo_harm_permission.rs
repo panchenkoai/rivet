@@ -26,3 +26,29 @@ fn mongo_readonly_login_exports_despite_denied_harm_probe() {
         "the read-only export must still read every document"
     );
 }
+
+/// The refusal half of the auth row: WRONG credentials must fail LOUD naming
+/// authentication — never a hung run, a silent empty export, or a partial one.
+/// The oracle names the ONE thing that can produce the failure (the exit-status
+/// rule): stderr must say auth, and the out dir must hold zero parquet.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-auth"]
+fn mongo_wrong_password_fails_loud_and_writes_nothing() {
+    require_alive(LiveService::MongoAuth);
+    let bad =
+        "mongodb://reader:WRONGPASS@127.0.0.1:27020/harmdb?authSource=harmdb&directConnection=true";
+    let rig = Rig::mongo_batch("t").source_url(bad);
+    let err = rig.run_expect_fail().to_lowercase();
+    assert!(
+        err.contains("auth") || err.contains("scram") || err.contains("unauthorized"),
+        "the failure must NAME authentication, not a generic timeout: {err}"
+    );
+    let parts = std::fs::read_dir(rig.out_dir())
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(parts, 0, "nothing may be exported off a refused login");
+}

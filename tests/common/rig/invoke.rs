@@ -124,9 +124,19 @@ impl Rig {
         extra: &[&str],
         envs: &[(&str, &str)],
     ) -> std::process::Output {
-        let mut args: Vec<&str> = vec!["apply", plan.to_str().expect("plan path must be utf-8")];
-        args.extend_from_slice(extra);
-        crate::common::runner::run_rivet_env(&args, envs)
+        let mut argv: Vec<String> = vec![
+            "apply".into(),
+            plan.to_str().expect("plan path must be utf-8").into(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        // Through `invoke`, like every other runner: the harness audit found this
+        // method routed around invoke_command (via runner::run_rivet_env), which
+        // both falsified the module header's "every method bottoms out in invoke"
+        // claim and skipped absorb_product_config_writes — an apply that touched
+        // the config would false-trip the hand-edit guard at the next
+        // materialization. `apply` EXECUTES an export, so it is a capture; the
+        // conformance gate's derivation now includes the `apply*` prefix.
+        self.invoke(&argv, envs)
     }
 
     /// Run `rivet run --config <rig cfg>` plus `extra` args, with `envs` set.
@@ -239,6 +249,10 @@ impl Rig {
             if start.elapsed() >= timeout {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Absorb on the KILL path too: a product config write that
+                // landed before the timeout would otherwise false-trip the
+                // hand-edit guard at the next materialization.
+                self.absorb_product_config_writes();
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));

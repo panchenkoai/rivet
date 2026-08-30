@@ -67,10 +67,37 @@ fn one_part_manifest() -> RunManifest {
     }
 }
 
+fn write_real_parquet_one_row(path: &Path) -> u64 {
+    use std::sync::Arc;
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    std::fs::metadata(path).unwrap().len()
+}
+
 /// Land manifest.json + _SUCCESS + the declared part at `prefix`.
+///
+/// REAL parquet since round-10: the placeholder b"AAAA" body relied on the
+/// old `Err(_) => continue` skip in part_row_count_mismatch — the very
+/// test-workaround-in-the-product that let `--depth full` print PASSED over
+/// garbage. The subject here is labels, so the fixture pays for real bytes.
 fn stage_dataset(prefix: &Path, m: &RunManifest) {
     std::fs::create_dir_all(prefix).unwrap();
-    std::fs::write(prefix.join("part-000001.parquet"), b"AAAA").unwrap();
+    let size = write_real_parquet_one_row(&prefix.join("part-000001.parquet"));
+    let mut m2 = m.clone();
+    for p in &mut m2.parts {
+        p.size_bytes = size;
+    }
+    let m = &m2;
     let dest = rivet::destination_for_tests::create_destination(&DestinationConfig {
         destination_type: DestinationType::Local,
         path: Some(prefix.to_string_lossy().into_owned()),

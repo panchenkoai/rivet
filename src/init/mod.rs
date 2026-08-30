@@ -671,6 +671,15 @@ fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
 /// bare `std::fs::write` error ("No such file or directory (os error 2)") named
 /// neither the path nor the operation (dogfood LOW).
 fn write_config_output(path: &str, text: &str) -> Result<()> {
+    // REFUSE to clobber (round-7): a re-run of init after the operator tuned
+    // the config silently destroyed their work — a bare fs::write with no
+    // exists-check. Scaffolding is regenerable; hand edits are not.
+    if std::path::Path::new(path).exists() {
+        anyhow::bail!(
+            "init: '{path}' already exists — refusing to overwrite a config that may \
+             carry hand edits. Move it aside, or write elsewhere with `-o <new-path>`."
+        );
+    }
     std::fs::write(path, text).map_err(|e| {
         anyhow::anyhow!(
             "init: could not write config to '{path}': {e} \

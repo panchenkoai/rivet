@@ -74,6 +74,11 @@ __all__ = [
     "verify_pool_split",
     "verify_replica_read",
     "verify_state_migrations",
+    "verify_network_faults",
+    "verify_tls_required",
+    "verify_auth",
+    "verify_cdc_standby",
+    "verify_live_only_coverage",
 ]
 
 # The helper scripts and blessed goldens are DATA, shared with the bash gate: the
@@ -310,6 +315,11 @@ def _manifest_declared_parts(root: Path) -> list[str]:
         try:
             art = json.loads(d.read_text())
         except (OSError, json.JSONDecodeError):
+            continue
+        # SUCCESS manifests only — the loader's rule (a failed/interrupted
+        # manifest's parts are gc candidates, not delivered data), mirroring
+        # tests/common's Rust + python resolvers (live-proven 2026-08-29).
+        if str(art.get("status") or "success").lower() != "success":
             continue
         for f in art.get("parts", []) or []:
             if isinstance(f, dict) and f.get("status") not in (None, "committed"):
@@ -1191,6 +1201,244 @@ def verify_state_migrations(led: Ledger) -> None:
             "state-migration parity FAILED — a schema drift between MIGRATIONS and "
             f"PG_MIGRATIONS (see {log_path})",
             _first_match(transcript, r"must succeed|cannot convert|FAILED"),
+        )
+
+
+
+def _drive_live_tests(
+    led: Ledger, area: str, a: str, b: str, phase: str, tests: list[str],
+    log_name: str, fail_msg: str,
+) -> None:
+    """Run named live_suite tests through the RELEASE binary (RIVET_BIN).
+
+    EXACT names under nextest, for two reasons a critic RED-proved on the first
+    version (2026-08-29):
+
+    1. libtest's positional filters are SUBSTRINGS, and the old guard compared
+       the SUM of `test result: ok. N passed` against the COUNT of names. The
+       three network-fault names expand to six tests (engine siblings), so
+       renaming the one CDC test away still passed with five siblings covering
+       the count — the single binlog-cut test silently left the gate while the
+       docstring claimed "a renamed test cannot un-gate this row". Now every
+       NAMED test must appear as its own `PASS` line.
+    2. `tests/live_suite.rs` states in its own header that running the
+       consolidated suite WITHOUT nextest loses the per-test process isolation
+       these fault-injection tests depend on. The first version did exactly
+       what that header forbids.
+
+    A test that SELF-SKIPS (skip_live) is a vacuous pass — libtest and nextest
+    both count it green. `RIVET_SKIP_LOG` is the harness's own mechanism for
+    that; it was never wired to anything, so this drives it for every leg.
+    """
+    led.phase(phase)
+    log_path = work_dir() / log_name
+    skip_log = work_dir() / f"{log_name}.skips"
+    skip_log.write_text("")
+    # `test(=X)` matches the FULL nextest name (`<module>::<fn>`), so the bare
+    # fn name never matches; anchor the regex form at the end instead.
+    expr = " or ".join(f"test(/{t}$/)" for t in tests)
+    res = run(
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all", "-E", expr],
+        env={"RIVET_BIN": str(rivet_bin()), "RIVET_SKIP_LOG": str(skip_log)},
+        timeout=3600,
+    )
+    log_path.write_text(res.out)
+    # Each NAMED test must have its own PASS line — not a count that siblings
+    # can satisfy. nextest prints `PASS [   1.234s] (1/6) <binary> <module>::<name>`.
+    passed = {
+        m.group(1) for m in re.finditer(r"PASS \[[^\]]*\] \([^)]*\) \S+ (\S+)", res.out)
+    }
+    missing = [t for t in tests if not any(p.endswith(t) or p == t for p in passed)]
+    skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
+    if missing:
+        _failed(
+            led, area, a, b, "-",
+            f"{fail_msg}: named test(s) never passed: {', '.join(missing)} — a "
+            f"renamed or filtered-out test silently un-gates this row (see {log_path})",
+            "named test missing",
+        )
+    elif skipped:
+        _failed(
+            led, area, a, b, "-",
+            f"{fail_msg}: {len(skipped)} test(s) SELF-SKIPPED, which libtest counts "
+            f"as green: {'; '.join(skipped[:3])} — bring the infrastructure up or "
+            f"the row grades nothing",
+            "vacuous self-skip",
+        )
+    elif res.ok:
+        _passed(led, area, a, b, "-",
+                f"{fail_msg}: {len(tests)} named test(s) green through the release binary")
+    else:
+        _failed(led, area, a, b, "-", f"{fail_msg} FAILED (see {log_path})",
+                _first_match(res.out, r"FAIL |panicked|error"))
+
+
+def verify_network_faults(led: Ledger) -> None:
+    """Release-gate leg for the `network_faults` infra row: retry/reconnect under
+    REAL injected faults (toxiproxy latency / downed proxy / mid-stream cut),
+    end-to-end through the release binary. The three tests are the live suite's
+    RED-proven fault set: batch retry-through-latency, loud-fail on a dead
+    proxy, and the CDC binlog cut that must fail loud then recover without a
+    gap. SKIP (never silent) when toxiproxy's admin port is down."""
+    if not have("cargo"):
+        _skipped(led, "infra", "network", "faults", "-", "network-faults: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 8474):
+        _skipped(
+            led, "infra", "network", "faults", "-",
+            "network-faults: toxiproxy admin :8474 unreachable (docker compose up -d toxiproxy)",
+            "toxiproxy down",
+        )
+        return
+    _drive_live_tests(
+        led, "infra", "network", "faults",
+        "Network faults (toxiproxy: latency retry, dead proxy, CDC mid-stream cut)",
+        [
+            "export_survives_transient_latency_added_via_toxiproxy",
+            "export_fails_cleanly_when_toxiproxy_is_disabled_before_run",
+            "gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers",
+        ],
+        "network_faults.log",
+        "network faults under toxiproxy",
+    )
+
+
+def verify_tls_required(led: Ledger) -> None:
+    """Release-gate leg for the `tls_required` infra row's POLICY half: a remote
+    plaintext DSN is refused loudly, loopback plaintext is allowed, and an
+    enforced-TLS config is not silently overridden by `sslmode=disable` in the
+    URL. The residual (a real TLS handshake against a verified cert) still
+    needs a TLS-provisioned service and stays named in the matrix row."""
+    if not have("cargo"):
+        _skipped(led, "infra", "tls", "policy", "-", "tls-policy: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 5432):
+        _skipped(led, "infra", "tls", "policy", "-",
+                 "tls-policy: source Postgres :5432 down", "no source pg")
+        return
+    _drive_live_tests(
+        led, "infra", "tls", "policy",
+        "TLS policy (remote plaintext loud, loopback allowed, enforced not overridden)",
+        [
+            "sec_remote_plaintext_pg_is_loud",
+            "sec_loopback_plaintext_pg_is_allowed",
+            "sec_enforced_tls_is_not_overridden_by_url_sslmode_disable",
+        ],
+        "tls_policy.log",
+        "TLS policy",
+    )
+
+
+def verify_auth(led: Ledger) -> None:
+    """Release-gate leg for the `auth` infra row's SCRAM half: a least-privilege
+    SCRAM login exports every document (harm probe denial degrades, never
+    fails the run), and a WRONG password fails loud naming authentication with
+    zero parquet written. x509 cert auth stays the named residual."""
+    if not have("cargo"):
+        _skipped(led, "infra", "mongo", "auth", "-", "mongo-auth: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 27020):
+        _skipped(
+            led, "infra", "mongo", "auth", "-",
+            "mongo-auth: :27020 unreachable (docker compose up -d mongo-auth)",
+            "mongo-auth down",
+        )
+        return
+    _drive_live_tests(
+        led, "infra", "mongo", "auth",
+        "Mongo SCRAM auth (least-privilege export + wrong-password loud refusal)",
+        [
+            "mongo_readonly_login_exports_despite_denied_harm_probe",
+            "mongo_wrong_password_fails_loud_and_writes_nothing",
+        ],
+        "mongo_auth.log",
+        "mongo SCRAM auth",
+    )
+
+
+def verify_cdc_standby(led: Ledger) -> None:
+    """Release-gate leg for the `cdc_standby` infra row: bounded CDC against a
+    PostgreSQL STANDBY must fail LOUD with the actionable escape. The live test
+    self-skips (a plain `return`, which libtest counts as PASSED) when :5436 is
+    down — so this leg probes the port ITSELF and reports SKIP rather than
+    running the test and reading its self-skip as green (the vacuous-skip class
+    the state-parity leg documents)."""
+    if not have("cargo"):
+        _skipped(led, "infra", "pg", "cdc-standby", "-", "cdc-standby: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 5436):
+        _skipped(
+            led, "infra", "pg", "cdc-standby", "-",
+            "cdc-standby: :5436 unreachable (python3 -m dev.pytools.cdc_stand standby)",
+            "standby down",
+        )
+        return
+    _drive_live_tests(
+        led, "infra", "pg", "cdc-standby",
+        "CDC on a PostgreSQL standby (bounded run must fail loud, actionable)",
+        ["roast_pg_cdc_bounded_on_a_standby_fails_loud"],
+        "cdc_standby.log",
+        "CDC standby loud-fail",
+    )
+
+
+
+def verify_live_only_coverage(led: Ledger) -> None:
+    """The live-only claim, MEASURED. mutants.toml's whole-function exclusions
+    assert "no offline test reaches this body"; this leg runs the offline
+    battery under cargo-llvm-cov and has dev/pytools/live_only_cov.py classify
+    every exclusion: confirmed (zero coverage), adjudicated (executed offline
+    with the reason pinned in the tool), or CONTRADICTED (executed, no reason
+    — the exclusion hides gradable mutants). Fails on any contradiction.
+    SKIP when cargo-llvm-cov is absent — never a vacuous pass."""
+    if not have("cargo"):
+        _skipped(led, "infra", "live-only", "coverage", "-", "live-only-cov: cargo absent", "no cargo")
+        return
+    probe = run(["cargo", "llvm-cov", "--version"], timeout=60)
+    if not probe.ok:
+        _skipped(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only-cov: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)",
+            "no llvm-cov",
+        )
+        return
+    led.phase("Live-only coverage (mutants.toml exclusions vs measured offline coverage)")
+    lcov = work_dir() / "offline.lcov"
+    # `env -u`: the gate's Postgres pass exports RIVET_STATE_URL globally, which
+    # rewires the STATE BACKEND under the lib's unit tests — three
+    # pipeline::cli state tests failed against the shared Postgres on the first
+    # gated run (2026-08-29). The coverage question is about the DEFAULT
+    # offline battery, so the state overrides are stripped for this leg only.
+    build = run(
+        ["env", "-u", "RIVET_STATE_URL", "-u", "RIVET_TEST_STATE_URL",
+         "cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
+        timeout=NO_TIMEOUT,
+    )
+    (work_dir() / "live_only_cov.log").write_text(build.out)
+    if not build.ok:
+        _failed(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only-cov: the instrumented offline battery FAILED (see live_only_cov.log)",
+            _first_match(build.out, r"FAILED|error"),
+        )
+        return
+    verdict = run(
+        [sys.executable, str(ROOT / "dev/pytools/live_only_cov.py"), str(lcov)],
+        timeout=600,
+    )
+    if verdict.ok:
+        _passed(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only exclusions hold: "
+            + next((ln.strip() for ln in verdict.out.strip().splitlines()
+                    if "confirmed" in ln), verdict.out.strip()[:120]),
+        )
+    else:
+        _failed(
+            led, "infra", "live-only", "coverage", "-",
+            "live-only exclusion CONTRADICTED by measured offline coverage:\n" + verdict.out,
+            _first_match(verdict.out, r"CONTRADICTED"),
         )
 
 

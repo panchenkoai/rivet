@@ -43,8 +43,9 @@ flags:
     mongo:    { gap: "same" }
 
   - id: "--table"
-    postgres: { test: "driven in the pg cli tests" }
-    mysql:    { test: "driven in six mysql cli tests" }
+    postgres: { test: "roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog drives it" }
+    mysql:    { test: "roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpoint
+                and five siblings" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
     mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column — RED-proven by pointing
                 --table at the neighbouring collection (captures [99] instead of [11,12,13,14]).
@@ -53,7 +54,7 @@ flags:
                 this cell is a WRONG selection, not an absent flag" }
 
   - id: "--slot"
-    postgres: { test: "driven in the pg cli tests" }
+    postgres: { test: "roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog passes it" }
     mysql:    { na: "PostgreSQL-only: a logical replication slot is that engine's anchor, and
                 the flag is rejected for any other source" }
     mssql:    { na: "PostgreSQL-only: SQL Server anchors on a from-LSN in the checkpoint, and
@@ -80,7 +81,8 @@ flags:
   - id: "--checkpoint"
     postgres: { gap: "PG's anchor is the SLOT and the checkpoint file is only a boolean, so the
                 subcommand path deserves its own cell rather than inheriting mysql's" }
-    mysql:    { test: "five mysql cli tests drive resume through it" }
+    mysql:    { test: "roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clobber
+                and four siblings drive resume through it" }
     mssql:    { test: "mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events" }
     mongo:    { test: "mongo_cdc_cli_writes_a_faithful_csv_of_the_document_column — RED-proven: with
                 --checkpoint dropped, run 2 re-anchors at the source's current position,

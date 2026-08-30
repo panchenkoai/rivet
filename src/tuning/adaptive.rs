@@ -24,7 +24,13 @@ pub const ADAPTIVE_MIN_BATCH: usize = 500;
 
 /// Decide the next adaptive fetch size from current pressure state.
 ///
-/// - Under pressure: shrink to 75 %, but never below [`ADAPTIVE_MIN_BATCH`].
+/// - Under pressure: shrink to 75 %, but never below [`ADAPTIVE_MIN_BATCH`] —
+///   and NEVER above `current`. The floor is a brake on shrinking, not a target:
+///   below 500 the bare `.max(floor)` turned "shrink under pressure" into "grow
+///   under pressure", overriding both a user `batch_size < 500` and PG's
+///   work_mem safety cap (`.max(100)` puts wide-row exports at 100–400, so the
+///   first pressure sample GREW the fetch up to 5× past the cap it exists to
+///   respect — cursor spill to pgsql_tmp on a source already under write load).
 /// - Otherwise: grow to 125 %, but never above the schema-chosen `base` ceiling
 ///   (so we recover toward the initial fetch size without overshooting it).
 ///
@@ -32,7 +38,7 @@ pub const ADAPTIVE_MIN_BATCH: usize = 500;
 /// a live database.
 pub fn next_adaptive_batch_size(current: usize, base: usize, under_pressure: bool) -> usize {
     if under_pressure {
-        (current * 3 / 4).max(ADAPTIVE_MIN_BATCH)
+        (current * 3 / 4).max(ADAPTIVE_MIN_BATCH).min(current)
     } else {
         (current * 5 / 4).min(base)
     }
@@ -524,6 +530,18 @@ fn sample_interval_ms_from_env() -> u64 {
 /// `RIVET_GOVERNOR_INTERVAL_MS=0` is exactly what an operator types meaning
 /// "off", so it must read as "unset", never as "unbounded".
 fn sample_interval_ms(raw: Option<String>) -> u64 {
+    if let Some(v) = &raw {
+        let rejected = v.parse::<u64>().map(|n| n == 0).unwrap_or(true);
+        if rejected {
+            // Say so, or the operator believes the cadence changed: "2s",
+            // "1500ms", a trailing space and "0" all silently reverted to the
+            // default before this line existed (round-4).
+            log::warn!(
+                "RIVET_GOVERNOR_INTERVAL_MS={v:?} is not a positive integer of \
+                 milliseconds — using the default {GOVERNOR_SAMPLE_INTERVAL_MS} ms"
+            );
+        }
+    }
     raw.and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(GOVERNOR_SAMPLE_INTERVAL_MS)
@@ -551,6 +569,26 @@ mod tests {
         assert_eq!(next_adaptive_batch_size(9_000, 10_000, false), 10_000);
         // Already at base: stays there.
         assert_eq!(next_adaptive_batch_size(10_000, 10_000, false), 10_000);
+    }
+
+    /// BELOW the floor — the only region where `.max(floor)` inverts the
+    /// operator. A work_mem-capped PG export enters at 100; a user batch_size
+    /// can legitimately sit at 40 for huge rows. Pressure must never GROW the
+    /// batch: growing past the work_mem cap spills the cursor to pgsql_tmp on a
+    /// source already under write pressure — the exact harm the cap prevents.
+    /// RED against the pre-fix bare `.max(ADAPTIVE_MIN_BATCH)`.
+    #[test]
+    fn pressure_never_grows_a_batch_already_below_the_floor() {
+        for current in [1, 40, 100, 400, 499] {
+            let next = next_adaptive_batch_size(current, 10_000, true);
+            assert!(
+                next <= current,
+                "under pressure {current} must not grow, got {next}"
+            );
+        }
+        // At/above the floor the brake still floors the shrink.
+        assert_eq!(next_adaptive_batch_size(500, 10_000, true), 500);
+        assert_eq!(next_adaptive_batch_size(1000, 10_000, true), 750);
     }
 
     #[test]

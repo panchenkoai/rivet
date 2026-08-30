@@ -273,3 +273,87 @@ fn json_errors_makes_stderr_machine_readable_and_is_off_by_default() {
         "the `error` field must carry the reason, not an empty string; got:\n{raw}"
     );
 }
+
+// ─── state runs / finish-run: the frozen-prefix escape hatch ─────────────
+
+/// The round-4 escape hatch end to end through the REAL binary: a stale
+/// `running` row (hard crash, no successful successor — nothing else can ever
+/// release it since supersession went success-only) is listed by
+/// `state runs --running`, closed by `state finish-run`, and gone from the
+/// next listing. A typo'd id exits non-zero — a stamp that touched nothing
+/// must never read as success.
+#[test]
+fn state_runs_lists_a_frozen_row_and_finish_run_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("r.yaml");
+    std::fs::write(
+        &cfg,
+        "source:\n  type: postgres\n  url: postgres://x/x\ndestination:\n  type: local\n  path: ./out\nexports:\n  - name: orders\n    query: SELECT 1\n",
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    // Seed the stale row through the product's own store (begin with no finish
+    // = the hard-crash shape).
+    {
+        let store = rivet::state::StateStore::open(cfg).unwrap();
+        store
+            .begin_run(
+                "r-dead",
+                "orders",
+                "file:///tmp/out",
+                "2026-08-27T00:00:00Z",
+            )
+            .unwrap();
+    }
+
+    let (code, out, err) = run(&["state", "runs", "-c", cfg, "--running"]);
+    assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+    assert!(
+        out.contains("r-dead") && out.contains("running"),
+        "the frozen row must be listed: {out}"
+    );
+    assert!(
+        out.contains("finish-run"),
+        "the listing must point at the escape hatch: {out}"
+    );
+
+    let (code, _out, err) = run(&["state", "finish-run", "-c", cfg, "--run-id", "nope"]);
+    assert_ne!(
+        code, 0,
+        "a typo'd id must refuse loudly, not report success"
+    );
+    assert!(err.contains("nope"), "the refusal names the id: {err}");
+
+    let (code, out, _err) = run(&["state", "finish-run", "-c", cfg, "--run-id", "r-dead"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("interrupted"), "{out}");
+
+    let (code, out, _err) = run(&["state", "runs", "-c", cfg, "--running"]);
+    assert_eq!(code, 0);
+    assert!(
+        !out.contains("r-dead"),
+        "the stamped row must stop freezing the prefix: {out}"
+    );
+}
+
+/// Round-10 mutants: `require_config_file` stubbed to Ok(()) and the
+/// `last == 0` arm flipped both survived — the e2e used only existing configs
+/// and nonzero limits. A typo'd -c must refuse (a fresh empty DB read as a
+/// false all-clear), and --last 0 must say "by construction", never an
+/// empty-DB verdict.
+#[test]
+fn state_runs_refuses_a_missing_config_and_last_zero_tells_the_truth() {
+    let (code, _out, err) = run(&["state", "runs", "-c", "definitely-missing.yaml"]);
+    assert_ne!(code, 0, "a typo'd -c must refuse");
+    assert!(err.contains("not a file"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("r.yaml");
+    std::fs::write(&cfg, "x: 1\n").unwrap();
+    let (code, out, _err) = run(&["state", "runs", "-c", cfg.to_str().unwrap(), "--last", "0"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("by construction"),
+        "--last 0 must not read as an empty-DB verdict: {out}"
+    );
+}

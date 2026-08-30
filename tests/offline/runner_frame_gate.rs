@@ -41,6 +41,12 @@ fn batch_writers_obtain_destinations_only_through_the_frame() {
             "M8 rehydration LISTS durable parts of a prior run; it writes nothing",
         ),
         (
+            "keyset.rs",
+            "round-5 resume probe: rehydrate_keyset_pages_probed LISTS the destination \
+             to verify prior committed pages still exist before re-declaring them — a \
+             reader; a missing page REFUSES the resume, writes nothing",
+        ),
+        (
             "split.rs",
             "#167 --split resume: completed_units_in_prefix READS sibling units' \
              manifest copies to decide per-unit skip — a reader, no parts written",

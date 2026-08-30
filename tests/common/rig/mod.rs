@@ -74,6 +74,8 @@ pub struct Rig {
     /// `destination: { type: stdout }` — for dispatch tests whose subject is
     /// the stdout destination itself. See [`Rig::dest_stdout`].
     dest_stdout: bool,
+    /// Key column for the census DISTINCT legs (see `Rig::census_key`).
+    census_key: Option<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
     /// sanctioned mutation re-renders every one of them (materialize.rs).
     materialized_copies: std::cell::RefCell<Vec<PathBuf>>,
@@ -129,6 +131,7 @@ impl Rig {
             config_dir_override: None,
             ckpt_override: None,
             dest_stdout: false,
+            census_key: None,
             cloud_dest: None,
             materialized_copies: std::cell::RefCell::new(Vec::new()),
             past_renders: std::cell::RefCell::new(Vec::new()),
@@ -447,6 +450,14 @@ impl Rig {
     /// hand-written `cdc_line`, which collides with the `__CKPT__` marker the
     /// constructors already seed.
     pub fn relative_checkpoint(mut self, rel: &str) -> Self {
+        // Seed the marker when the constructor didn't (pg_cdc is slot-anchored
+        // and seeds none) — otherwise this method silently NO-OPS and the test
+        // runs checkpoint-less while its fixture claims otherwise. Same guard
+        // `checkpoint_path` carries below, for the same prior bite; the harness
+        // audit caught the pg barrier test riding the no-op (2026-08-29).
+        if self.mode == "cdc" && !self.cdc_lines.iter().any(|l| l == "__CKPT__") {
+            self.cdc_lines.push("__CKPT__".to_string());
+        }
         for l in self.cdc_lines.iter_mut() {
             if l == "__CKPT__" {
                 *l = format!("checkpoint: \"{rel}\"");
@@ -855,7 +866,7 @@ mod rig_render_goldens {
     /// before any live suite meets it.
     #[test]
     fn every_engine_constructor_renders_the_pinned_shape() {
-        let cases: [(&str, Rig, &str); 5] = [
+        let cases: [(&str, Rig, &str); 6] = [
             (
                 "mysql_batch",
                 Rig::mysql_batch("t").dest_path("/tmp/o".into()),
@@ -882,6 +893,17 @@ mod rig_render_goldens {
                 "pg_cdc",
                 Rig::pg_cdc("t", "s1").dest_path("/tmp/o".into()),
                 "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5434/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, slot: s1 }\n    destination: { type: local, path: \"/tmp/o\" }\n",
+            ),
+            // relative_checkpoint on a marker-less constructor must SEED the
+            // marker, not no-op: pg_cdc renders no __CKPT__, and before the
+            // 2026-08-29 fix this combination silently dropped `checkpoint:`
+            // from the config — the barrier test's premise without its fixture.
+            (
+                "pg_cdc_relative_checkpoint",
+                Rig::pg_cdc("t", "s1")
+                    .relative_checkpoint("./b.ckpt")
+                    .dest_path("/tmp/o".into()),
+                "source: { type: postgres, url: \"postgresql://rivet:rivet@127.0.0.1:5434/rivet\" }\nexports:\n  - name: t\n    table: t\n    mode: cdc\n    format: parquet\n    cdc: { until_current: true, slot: s1, checkpoint: \"./b.ckpt\" }\n    destination: { type: local, path: \"/tmp/o\" }\n",
             ),
         ];
         for (name, rig, want) in cases {
@@ -980,6 +1002,18 @@ fn run_and_read_refuses_a_cloud_rig() {
         .export_named("e")
         .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443");
     let _ = rig.run_and_read();
+}
+
+/// Twin of the run_and_read refusal for the declared-parts oracle: the local
+/// dir EXISTS even for cloud rigs (dest_precreate), so without the refusal a
+/// cloud rig reads `[]` silently — the vacuity class, one method over.
+#[test]
+#[should_panic(expected = "LOCAL out dir")]
+fn read_declared_parts_refuses_a_cloud_rig() {
+    let rig = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443");
+    let _ = rig.read_declared_parts();
 }
 
 /// DOCUMENTS the absorb contract (r3 bughunt): a product write into the

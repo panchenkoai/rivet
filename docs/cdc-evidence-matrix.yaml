@@ -237,7 +237,7 @@ shapes:
       Feed the boundary its unknown value and assert a warning/error is produced. A silent
       arm passes today because nothing observes the degradation.
     postgres:
-      sound: "TRUNCATE — the one that mattered — now bails: truncate_target +
+      sound: "TRUNCATE — the one that mattered — now bails: truncate_targets +
         truncate_is_ours + truncate_refusal_message (src/source/postgres/cdc.rs),
         graded offline by a_truncate_is_recognised_across_a_relation_list_and_refused_only_for_ours
         and live by roast_pg_cdc_refuses_a_truncate_instead_of_silently_diverging.

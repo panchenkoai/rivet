@@ -232,6 +232,15 @@ next resume and the orphan eventually gets moved.
 - **Object lifecycle policies** — Rivet does not configure
   retention, lifecycle transitions, encryption-at-rest, or replication
   rules on the destination.  Manage those out-of-band (Terraform, console).
+- **Incomplete multipart uploads are not aborted on failure** — when a
+  streamed (large-part) upload fails mid-transfer, the multipart upload is
+  left open: its already-uploaded parts are billed but invisible to
+  listings, and Rivet currently has no abort call on that error path (a
+  crash could never run one anyway). **Configure an
+  abort-incomplete-multipart-upload lifecycle rule on every destination
+  bucket** (S3: `AbortIncompleteMultipartUpload`, e.g. 7 days; GCS/Azure:
+  the equivalent incomplete-upload cleanup) — this is load-bearing
+  hygiene, not an optimization.
 - **Azure SAS expiry** — SAS tokens are short-lived by design.  Rivet
   reads the env var once at process start; a long-running export whose
   token expires mid-flight will fail at the next write.  Pair short SAS

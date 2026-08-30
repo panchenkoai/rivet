@@ -610,11 +610,24 @@ fn read_sibling_manifests(
 /// snapshots, and presence-checking a legitimately cleaned old part would false-fail. The
 /// canonical's own copy is among them, so seeding `seen` with the canonical's parts keeps it
 /// from being added twice. Only `parts` differ from `canonical`.
-fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) -> RunManifest {
+fn merge_split_unit_parts(
+    canonical: &RunManifest,
+    census: &ManifestCensus<'_>,
+    manifest_dir: &str,
+) -> RunManifest {
     let mut merged = canonical.clone();
     let mut seen: std::collections::BTreeSet<String> =
         merged.parts.iter().map(|p| p.path.clone()).collect();
     for unit in census.split_units(&canonical.export_family) {
+        // Success-only (round-7): a crashed unit's Failed/Interrupted copy
+        // declares parts gc legitimately deletes as terminal debris — folding
+        // them into the presence target armed a false PartMissing
+        // stop-the-line after a documented gc pass. The filter lives HERE, in
+        // the fold, because `split_units` is the family's identity (markers
+        // included) for every other consumer.
+        if unit.manifest.status != crate::manifest::ManifestStatus::Success {
+            continue;
+        }
         for p in &unit.manifest.parts {
             if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
                 merged.parts.push(p.clone());
@@ -634,12 +647,43 @@ fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) 
     // it. Every field printed was internally consistent; nothing said that "0 parts
     // verified" was a statement about the manifest rather than about the prefix.
     //
-    // Deliberately NOT widened to a non-empty canonical: there a plain export's
-    // historical copies really are superseded snapshots, and presence-checking a
-    // legitimately cleaned old part would false-fail.
-    if merged.parts.is_empty() && !canonical.export_family.is_empty() {
+    // Widened to CDC canonicals whatever their part count (round-7 HIGH,
+    // measured): a CDC prefix ACCUMULATES — the dataset consumers read is the
+    // UNION of the run-unique copies, so with a non-empty canonical every
+    // HISTORICAL cycle's parts were absent from the presence check (and
+    // census-subtracted from the untracked sweep): deleting a prior cycle's
+    // part validated `PASSED, exit 0`. The batch rationale (historical copies
+    // are superseded snapshots; presence-checking a cleaned old part would
+    // false-fail) is exactly why this stays NARROW: `mode == "cdc"` or an
+    // empty canonical, never a plain export's history.
+    //
+    // Success-only (round-7 sibling find): a Failed/Interrupted copy's parts
+    // are terminal debris `gc_orphans` legitimately deletes — folding them
+    // armed a false PartMissing stop-the-line after a documented gc pass.
+    if (merged.parts.is_empty() || canonical.mode == "cdc") && !canonical.export_family.is_empty() {
         for run in census.runs() {
             if run.family() != canonical.export_family {
+                continue;
+            }
+            if run.manifest.status != crate::manifest::ManifestStatus::Success {
+                continue;
+            }
+            // A copy living in a SUB-directory (`snapshot/manifest-*.json`) is a
+            // separately-certified sub-dataset whose parts[].path are relative
+            // to ITS OWN directory — folding them here resolved
+            // `snapshot/x.parquet` at the TABLE root and false-failed every
+            // intact `initial: snapshot` prefix with PART_MISSING exit 3
+            // (round-8 lifecycle, reproduced). The sibling consumer
+            // check_positions carries the same exclusion, INCLUDING its
+            // whole-key trap: `list_prefix` returns FULL keys, so the test
+            // must be RELATIVE to this prefix or it skips every copy and the
+            // fold silently dies.
+            let rel = run
+                .key
+                .strip_prefix(manifest_dir)
+                .unwrap_or(run.key)
+                .trim_start_matches('/');
+            if rel.contains('/') {
                 continue;
             }
             for p in &run.manifest.parts {
@@ -785,7 +829,7 @@ pub fn verify_at_destination(
                     read_sibling_manifests(dest, &listing)
                 };
                 let census = ManifestCensus::new(&siblings);
-                let target = merge_split_unit_parts(&manifest, &census);
+                let target = merge_split_unit_parts(&manifest, &census, manifest_dir);
                 let mut rec = reconcile_manifest_against_listing(&target, &listing, manifest_dir);
                 // Same-family sibling parts — the folded split units AND a plain export's
                 // SUPERSEDED historical / CDC-soak copies (no split_window, so NOT folded
@@ -1100,7 +1144,7 @@ mod tests {
             // for another's.
             unit("other", "foreign.parquet", "other", PartStatus::Committed),
         ];
-        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings), "");
         let paths: std::collections::BTreeSet<&str> =
             merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
@@ -1117,7 +1161,7 @@ mod tests {
         let mut familyless = canonical.clone();
         familyless.export_family = String::new();
         assert!(
-            merge_split_unit_parts(&familyless, &ManifestCensus::new(&siblings))
+            merge_split_unit_parts(&familyless, &ManifestCensus::new(&siblings), "")
                 .parts
                 .is_empty(),
             "a family-less canonical folds nothing — dropping the `!` here would \
@@ -1143,7 +1187,7 @@ mod tests {
             unit("daily", "daily_old.parquet", "daily", false),  // SAME family, PLAIN (superseded)
             unit("other#0", "other_p.parquet", "other", true),   // FOREIGN family
         ];
-        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings), "");
         let paths: std::collections::BTreeSet<&str> =
             merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
@@ -1187,7 +1231,7 @@ mod tests {
         sib.split_window = Some(split_win());
 
         let siblings = vec![sib_keyed(sib)];
-        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings), "");
         let paths: Vec<&str> = merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
             paths,

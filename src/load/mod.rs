@@ -84,6 +84,14 @@ pub trait TargetLoader {
     /// [`cdc::inc_dedup_view_sql`] for incremental). The adapter only executes it
     /// its way (e.g. Snowflake prefixes a `QUERY_TAG`).
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()>;
+
+    /// Does `<table>__changes` already hold REAL change rows (`__pos IS NOT
+    /// NULL`)? The RE-baseline refusal's condition (round-7): the truth about
+    /// whether a snapshot append would lose the dedup lives in the WAREHOUSE,
+    /// never in rivet's ledger — after the prescribed TRUNCATE the recovery
+    /// load must sail through, and ledger rows survive a truncate. A missing
+    /// `__changes` table reads `false` (the first cycle).
+    fn changes_has_prior_changes(&self, table: &str) -> Result<bool>;
 }
 
 /// A plain SQL identifier the load layer can safely interpolate into DDL/COPY
@@ -114,9 +122,13 @@ fn is_safe_load_ident(s: &str) -> bool {
 /// it — default-deny, fail loud rather than escape-and-hope.
 fn ensure_safe_load_uris(uris: &[String]) -> Result<()> {
     for u in uris {
+        // `*` is in the deny set because BigQuery expands ONE wildcard per
+        // `uris=[...]` entry — a planted object name containing `*` would widen
+        // the load past the manifest-declared file set (round-6; Snowflake's
+        // FILES= is literal, but one deny set guards both).
         if let Some(bad) = u
             .chars()
-            .find(|&c| c == '\'' || c == '\\' || c.is_control())
+            .find(|&c| c == '\'' || c == '\\' || c == '*' || c.is_control())
         {
             bail!(
                 "refusing to load: Parquet URI `{}` contains {:?}, which is unsafe to splice \
@@ -185,7 +197,10 @@ fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
         Some((store, prefix)) => match delete_under(store, prefix) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("warning: source cleanup failed (data is safely loaded): {e:#}");
+                eprintln!(
+                    "warning: source cleanup failed (data is safely loaded): {}",
+                    crate::redact::redact_secrets(&format!("{e:#}"))
+                );
                 false
             }
         },
@@ -265,7 +280,10 @@ fn append_and_view(
     }
     ensure_safe_load_uris(uris)?;
     if pk.is_empty() {
-        bail!("{label} load of `{table}` needs a primary key for the dedup view (pass --pk)");
+        bail!(
+            "{label} load of `{table}` needs a primary key for the dedup view — add \
+             `pk: [<column>]` under the export's `load:` block (no --pk flag exists)"
+        );
     }
     // Gate the PK columns at the SHARED seam: both the CDC and the INCREMENTAL
     // driver splice them into the dedup view's `PARTITION BY` via quote_ident
@@ -545,6 +563,10 @@ mod tests {
         fn fqtn(&self, table: &str) -> String {
             format!("db.{table}")
         }
+
+        fn changes_has_prior_changes(&self, _table: &str) -> Result<bool> {
+            Ok(false)
+        }
         fn materialize(&self, table: &str, _: &[TargetColumnSpec], _: &[String]) -> Result<u64> {
             self.materialized.borrow_mut().push(table.into());
             Ok(self.rows)
@@ -605,7 +627,7 @@ mod tests {
             "cleanup_source must REFUSE a bucket-root prefix, not remove_all(\"\")"
         );
         assert!(
-            reconcile::gc_orphans(&store, "gs://bucket/", &[], false).is_err(),
+            reconcile::gc_orphans(&store, "gs://bucket/", &[], false, &Default::default()).is_err(),
             "gc_orphans must REFUSE a bucket-root prefix, not list+delete the whole bucket"
         );
         // Nothing was deleted — both independent exports survive intact.

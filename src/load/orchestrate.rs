@@ -33,14 +33,18 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // truth for what's loaded, so cleanup is safe for every mode and retry is
     // DB-driven (the GCS listing is only a fallback). A state-DB problem must
     // never fail a load — degrade to the stateless path.
-    let state = match StateStore::open(&args.config) {
-        Ok(s) => Some(s),
+    let (state, ledger_errored) = match StateStore::open(&args.config) {
+        Ok(s) => (Some(s), false),
         Err(e) => {
             eprintln!(
                 "  warning: state store unavailable ({e:#}); loading without a ledger \
                  (no incremental skip / audit log)"
             );
-            None
+            // The ERRORED half of the tri-state (round-9): `state=None` alone
+            // conflated a DB blip with absent-by-design, and the re-baseline
+            // guard then note-and-proceeded a doomed post-gap baseline on the
+            // very host whose ledger just blipped.
+            (None, true)
         }
     };
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
@@ -87,6 +91,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                         pk,
                         drift,
                         state.as_ref(),
+                        ledger_errored,
                         &load_id,
                     )? {
                         Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
@@ -125,7 +130,14 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         if let Err(e) = outcome {
             // Name the table on the way out: the aggregate must say WHICH load
             // failed, or an operator reading a mixed batch cannot act on it.
-            eprintln!("  LOAD FAILED [{}]: {e:#}", plan.table);
+            // Through redact (round-8): a raw eprintln bypasses both the log
+            // sink and main's top-level redactor — a future URL-bearing load
+            // error would print credentials unredacted.
+            eprintln!(
+                "  LOAD FAILED [{}]: {}",
+                plan.table,
+                crate::redact::redact_secrets(&format!("{e:#}"))
+            );
             failures.push(e.context(format!("load '{}'", plan.table)));
             continue;
         }
@@ -336,7 +348,10 @@ fn cleanup_target<'a>(
                 "  cleanup [{}]: SKIPPED — a run is writing into {} right now. Deleting the \
                  prefix would remove parts that run has already committed, and on a \
                  CDC/incremental export the source position has advanced past them. Re-run the \
-                 load once the extract has finished.",
+                 load once the extract has finished — or, if this is a DEAD crash remnant \
+                 (no extract is actually running), inspect it with `rivet state runs -c \
+                 <config> --running` and close it with `rivet state finish-run -c <config> \
+                 --run-id <id>`.",
                 plan.table, plan.gcs_prefix
             );
             None
@@ -377,7 +392,31 @@ fn maybe_gc_orphans(
         ledger_active,
         load::reconcile::has_active_running_manifest(&keyed),
     );
-    match load::reconcile::gc_orphans(store, &plan.gcs_prefix, &keyed, active) {
+    // Which `running` MARKERS the ledger already knows are dead (`state
+    // finish-run`, the split ceased-ordinal stamp): their run_id has a
+    // TERMINAL row, so the sweep may retire the marker even though no Success
+    // ever superseded it. Stateless → empty → conservative sweep only.
+    let dead_marker_run_ids: std::collections::HashSet<String> = match state {
+        Some(s) => keyed
+            .iter()
+            .filter(|(_, m)| m.status == crate::manifest::ManifestStatus::Running)
+            .filter(|(_, m)| {
+                matches!(
+                    s.run_status_of(&m.run_id),
+                    Ok(Some(status)) if status != "running"
+                )
+            })
+            .map(|(_, m)| m.run_id.clone())
+            .collect(),
+        None => Default::default(),
+    };
+    match load::reconcile::gc_orphans(
+        store,
+        &plan.gcs_prefix,
+        &keyed,
+        active,
+        &dead_marker_run_ids,
+    ) {
         Ok((0, _)) => {}
         Ok((n, bytes)) => {
             println!(
@@ -403,6 +442,15 @@ struct LoadInputs {
     /// LATER load of the same warehouse table from a DIFFERENT database can be
     /// refused instead of silently replacing these rows.
     source_ident: String,
+    /// Which runs were still WRITING at the moment the manifests were FETCHED —
+    /// sampled BEFORE the fetch, in [`prepare_load`]. `record` unions this with
+    /// its own record-time sample: a run that finishes DURING the warehouse copy
+    /// is active in neither sample alone taken at record time, yet the manifest
+    /// this load consumed was its mid-flight snapshot — recording it consumed
+    /// would strand every part it flushed after the fetch, permanently
+    /// (round-4 TOCTOU). `None` = the sample could not be taken (stateless, or
+    /// the query failed): record then consumes NOTHING this cycle.
+    active_at_fetch: Option<std::collections::HashSet<String>>,
 }
 
 /// The prior source identity that CONFLICTS with the one this load carries, or
@@ -443,7 +491,37 @@ fn prepare_load(
     target_fqtn: &str,
     allow_source_drift: bool,
 ) -> Result<Option<LoadInputs>> {
+    // Sampled BEFORE the manifests are read, deliberately: a run that finishes
+    // between this sample and the fetch stays in the set and is merely
+    // re-appended next cycle (at-least-once, absorbed by the current-state
+    // view). The reverse order — sample after fetch — reopens the TOCTOU this
+    // exists to close: finish-then-fetch would read the run as consumable
+    // against a manifest snapshot older than its last parts.
+    let active_at_fetch = state.and_then(|s| match s.active_run_ids_on_prefix(&plan.gcs_prefix) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            log::warn!(
+                "load: cannot tell which runs are writing into {} at fetch time ({e:#}) — \
+                 this cycle will not record any run as consumed, so nothing they write \
+                 later is stranded",
+                plan.gcs_prefix
+            );
+            None
+        }
+    });
     let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    // Round-6: "up to date — every extraction run already loaded" was printed
+    // for BOTH "all runs consumed" and "this prefix holds NOTHING" — and the
+    // second is what a typo'd/mis-encoded prefix produces, forever, exit 0.
+    // Say the empty-prefix truth before the optimistic line.
+    if keyed.is_empty() {
+        eprintln!(
+            "  load [{}]: found NO manifests under {} — nothing was ever staged \
+             here. If an export should have landed, check the prefix for typos \
+             (a wrong prefix reads as permanently 'up to date').",
+            plan.table, plan.gcs_prefix
+        );
+    }
     // Refuse a prefix shared by two exports BEFORE selecting/summing/cleaning:
     // the load sums every manifest here and cleanup wipes the prefix recursively,
     // so a shared base prefix would cross-contaminate the count and delete a
@@ -490,6 +568,12 @@ fn prepare_load(
         return Ok(None);
     }
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
+    // Best-effort column-drift check (only manifests with Form B record
+    // column names — a checksum-less prefix yields no notes, silently-honest).
+    let spec_names: Vec<String> = plan.specs.iter().map(|s| s.column_name.clone()).collect();
+    for note in spec_manifest_column_drift(&spec_names, &manifests) {
+        eprintln!("{note}");
+    }
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
     let source_run_ids: Vec<String> = new.iter().map(|(_, m)| m.run_id.clone()).collect();
@@ -525,6 +609,7 @@ fn prepare_load(
         uris,
         source_run_ids,
         source_ident,
+        active_at_fetch,
     }))
 }
 
@@ -557,6 +642,10 @@ struct LoadCtx<'a> {
     /// Set once the manifests are known (after `prepare_load`), so the ledger row
     /// records WHERE the rows came from and not merely that they arrived.
     source_ident: String,
+    /// [`LoadInputs::active_at_fetch`], copied beside `source_ident` — `record`
+    /// unions it with its own record-time sample so a run that finished DURING
+    /// the copy is still excluded from the consumed set.
+    active_at_fetch: Option<std::collections::HashSet<String>>,
 }
 
 /// The source runs this load may record as CONSUMED: everything it read, MINUS
@@ -624,7 +713,7 @@ impl LoadCtx<'_> {
         // forever — the harm the comment above describes. Treating the answer as
         // "assume they are all active" records none of them, and the next cycle
         // re-evaluates: at-least-once, which the current-state view absorbs.
-        let active = match s.active_run_ids_on_prefix(self.source_prefix) {
+        let mut active = match s.active_run_ids_on_prefix(self.source_prefix) {
             Ok(a) => a,
             Err(e) => {
                 log::warn!(
@@ -636,8 +725,27 @@ impl LoadCtx<'_> {
                 source_run_ids.iter().cloned().collect()
             }
         };
+        // UNION with the fetch-time sample: this method runs AFTER the warehouse
+        // copy, so a run that finished (or was resumed and finished) during the
+        // copy is absent from the record-time set — but the manifest this load
+        // consumed was fetched while it was still writing, i.e. a mid-flight
+        // snapshot. Consuming it would strand its post-fetch parts forever.
+        // No fetch-time sample at all (the query failed) → consume nothing;
+        // the next cycle re-evaluates, which the dedup view absorbs.
+        let fetch_sample_missing = self.active_at_fetch.is_none();
+        match &self.active_at_fetch {
+            Some(at_fetch) => active.extend(at_fetch.iter().cloned()),
+            None => active.extend(source_run_ids.iter().cloned()),
+        }
         let source_run_ids = consumable_run_ids(source_run_ids, &active);
-        if let Some(note) = active_run_note(active.len(), self.source_prefix) {
+        // The "still writing" note is for runs OBSERVED active. When the
+        // fetch-time sample is missing, `active` was padded with every run as
+        // a consume-nothing fail-safe — printing "N runs still writing" about
+        // runs that are merely unverifiable is false (round-5); the fetch-time
+        // warn already told the operator nothing will be recorded this cycle.
+        if !fetch_sample_missing
+            && let Some(note) = active_run_note(active.len(), self.source_prefix)
+        {
             eprintln!("{note}");
         }
         let source_run_ids = &source_run_ids[..];
@@ -654,7 +762,10 @@ impl LoadCtx<'_> {
             finished_at: chrono::Utc::now().to_rfc3339(),
         };
         if let Err(e) = s.store_load(&rec) {
-            eprintln!("  warning: load ledger write failed (load itself proceeded): {e:#}");
+            eprintln!(
+                "  warning: load ledger write failed (load itself proceeded): {}",
+                crate::redact::redact_secrets(&format!("{e:#}"))
+            );
         }
     }
     /// Nothing new to load — the ledger already covers every run.
@@ -711,6 +822,7 @@ fn execute_load<R>(
         mode: job.mode,
         source_prefix: job.plan.gcs_prefix.as_str(),
         source_ident: String::new(),
+        active_at_fetch: None,
     };
     let inputs = match prepare_load(
         &store,
@@ -721,6 +833,7 @@ fn execute_load<R>(
     )? {
         Some(i) => {
             ctx.source_ident = i.source_ident.clone();
+            ctx.active_at_fetch = i.active_at_fetch.clone();
             i
         }
         None => {
@@ -794,6 +907,158 @@ fn full_done_line(inputs: &LoadInputs, report: &load::LoadReport) -> String {
 /// dedup view over it. The manifests' summed `row_count` gates the rows *this*
 /// load appends (before/after the append) — the file→warehouse leg for an
 /// accumulating, at-least-once log.
+/// The RE-baseline warning, or `None`. Round-6 (proven on the verbatim view
+/// SQL): a re-snapshot row carries NULL `__pos` and LOSES the dedup to every
+/// already-loaded change row — so appending a snapshot leg into a `__changes`
+/// that prior cycles already fed serves pre-gap values silently for exactly
+/// the PKs the re-snapshot fixed. The shape is detectable co-located: snapshot
+/// URIs in THIS load + a non-empty loaded-ledger for the target. First-cycle
+/// snapshot+changes (no prior loads) is the normal shape — no warning.
+/// Is this load's URI set a RE-baseline shape — a snapshot leg under THIS
+/// plan's own prefix? Prefix-anchored (round-7 refuter): a bare
+/// `contains("/snapshot/")` false-fired forever on an operator prefix with a
+/// `snapshot` segment and on a multiplex TABLE literally named `snapshot`,
+/// prescribing a destructive truncate every cycle.
+/// Column drift between the LIVE source (the specs resolve from it at load
+/// time) and the STAGED parquet (its manifests record the columns when Form B
+/// is on). Round-10, closing the round-6 find: a column dropped from the
+/// source AFTER the extract is silently never loaded — Snowflake's COPY
+/// projects only spec columns, so the staged data vanishes with every count
+/// gate green (rows agree; columns were never compared). Detection is
+/// best-effort by construction: manifests without checksums record no column
+/// names, and this then returns empty — said in the caller's comment, not
+/// silently.
+fn spec_manifest_column_drift(
+    spec_columns: &[String],
+    manifests: &[crate::manifest::RunManifest],
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let specs: BTreeSet<&str> = spec_columns.iter().map(|s| s.as_str()).collect();
+    let mut notes = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for m in manifests {
+        let Some(cols) = m.column_checksums.as_deref() else {
+            continue;
+        };
+        for c in cols {
+            if !specs.contains(c.name.as_str()) && seen.insert(c.name.clone()) {
+                notes.push(format!(
+                    "  WARNING: staged parquet carries column `{}` (recorded by run {}), \
+                     but the LIVE source no longer has it — the load projects only \
+                     live-source columns, so this column's data will be SILENTLY \
+                     omitted from the warehouse. Re-extract after aligning the schema, \
+                     or add the column back.",
+                    c.name, m.run_id
+                ));
+            }
+        }
+    }
+    notes
+}
+
+fn rebaseline_shape(uris: &[String], plan_prefix: &str) -> bool {
+    let base = plan_prefix.trim_end_matches('/');
+    uris.iter().any(|u| {
+        u.strip_prefix(base)
+            .map(|rest| rest.trim_start_matches('/'))
+            .is_some_and(|rest| rest.starts_with("snapshot/"))
+    })
+}
+
+/// What the re-baseline guard does, given the two signals it can read.
+///
+/// Round-8 lifecycle HIGH: a STATELESS load re-selects EVERY Success run each
+/// cycle by design (at-least-once, absorbed by the view) — so its uris carry
+/// the snapshot leg forever, and the warehouse probe is true from cycle 2 on:
+/// the refusal wedged a HEALTHY pipeline into a routine-TRUNCATE loop (an
+/// operator truncating a serving table every cycle). Only a LEDGERED load can
+/// distinguish "genuine re-snapshot after a gap" (snapshot run NOT consumed)
+/// from "routine re-selection" (it was) — so the refusal requires the ledger,
+/// and stateless degrades to a note.
+#[derive(Debug, PartialEq, Eq)]
+enum RebaselineAction {
+    Proceed,
+    WarnStateless,
+    Refuse,
+}
+
+/// `ledger` is a TRI-STATE (round-9): `state.is_some()` alone conflated a DB
+/// BLIP with absent-by-design — the blip arm note-and-proceeded a genuine
+/// post-gap baseline on exactly the co-located host whose ledger just errored
+/// (and cleanup_source then deleted the evidence). An errored ledger fails
+/// SAFE: refuse the snapshot-carrying load (nothing consumed), retry when the
+/// DB is back. Known residual, documented rather than hidden: `StateStore::
+/// open` auto-creates, so an EPHEMERAL-ledger host reads `Available` with an
+/// empty consumed-set and still refuse-loops on `initial: snapshot` streams —
+/// loud and actionable (keep a persistent ledger for CDC loads), never
+/// silent. The anchor stamp does NOT lift this: a snapshot cannot express a
+/// PK deleted during the gap, so the refusal stands for stamped legs too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerSignal {
+    Available,
+    AbsentByDesign,
+    Errored,
+}
+
+impl LedgerSignal {
+    /// The round-9 tri-state decision, NAMED (arch critic: the inline bool
+    /// ladder in the excluded body had zero counted tokens — invisible to the
+    /// purity gate and to mutants alike).
+    fn classify(errored: bool, present: bool) -> Self {
+        if errored {
+            LedgerSignal::Errored
+        } else if present {
+            LedgerSignal::Available
+        } else {
+            LedgerSignal::AbsentByDesign
+        }
+    }
+}
+
+fn rebaseline_action(warehouse_has_changes: bool, ledger: LedgerSignal) -> RebaselineAction {
+    match (warehouse_has_changes, ledger) {
+        (false, _) => RebaselineAction::Proceed, // empty/truncated log: the recovery load
+        (true, LedgerSignal::Available) => RebaselineAction::Refuse,
+        (true, LedgerSignal::Errored) => RebaselineAction::Refuse,
+        (true, LedgerSignal::AbsentByDesign) => RebaselineAction::WarnStateless,
+    }
+}
+
+/// The RE-baseline REFUSAL (round-7 refuter, HIGH): the first cut was a warn
+/// printed while the load PROCEEDED — so the runs got consumed, and the
+/// prescribed "truncate + re-run" then selected nothing: the operator who
+/// obeyed verbatim emptied the warehouse table with exit 0. Now the load
+/// REFUSES BEFORE appending (nothing consumed), and the condition comes from
+/// the WAREHOUSE (`changes_has_prior_changes`), never the ledger — after the
+/// prescribed truncate the recovery re-run probes an empty log and sails
+/// through, while ledger rows (which survive a truncate) would have deadlocked
+/// it forever.
+fn rebaseline_refusal(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse) -> String {
+    // The remedy must PARSE where the operator pastes it (round-8): backticks
+    // are BigQuery-only; Snowflake takes the bare fqtn.
+    let quoted = match warehouse {
+        crate::load::cdc::Warehouse::BigQuery => format!("`{target_fqtn}__changes`"),
+        crate::load::cdc::Warehouse::Snowflake => format!("{target_fqtn}__changes"),
+    };
+    rebaseline_refusal_text(&quoted)
+}
+
+fn rebaseline_refusal_text(quoted_changes: &str) -> String {
+    format!(
+        "refusing to append a RE-baseline: this load carries snapshot parquet, but \
+         {quoted_changes} already holds real change rows — a re-snapshot row \
+         carries NULL `__pos` and LOSES the dedup to every prior change, so the \
+         current-state view would keep serving PRE-GAP values for exactly the rows \
+         this re-snapshot fixed — and even an anchor-stamped baseline cannot \
+         express a PK DELETED during the gap (no row, no tombstone: its stale \
+         pre-gap rows would win). Nothing was consumed by this refusal. Recovery: \
+         1) TRUNCATE TABLE {quoted_changes}; 2) re-run this same `rivet load` \
+         — it will then append the baseline into the empty log and proceed \
+         (cdc-failure-modes.md)."
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // the tri-state rides beside `state` (round-9)
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -801,6 +1066,7 @@ fn load_one_cdc(
     pk: &[String],
     allow_source_drift: bool,
     state: Option<&StateStore>,
+    ledger_errored: bool,
     load_id: &str,
 ) -> Result<Option<load::CdcLoadReport>> {
     let job = LoadJob {
@@ -826,6 +1092,47 @@ fn load_one_cdc(
             );
         },
         |loader, store, inputs| {
+            // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
+            // into a __changes prior cycles already fed (see rebaseline_shape/rebaseline_action).
+            let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
+            if shape {
+                // The refusal stands EVEN FOR A STAMPED baseline (round-10
+                // refuter, HIGH): the anchor stamp fixes the ORDERING half
+                // (adds/updates rank correctly), but no snapshot can express a
+                // PK DELETED during the gap — it has no row and no tombstone,
+                // so its pre-gap change rows would win the dedup and the view
+                // would serve the PK live-with-stale-values, silently and
+                // permanently. TRUNCATE remains the only complete remedy when
+                // the log already holds changes; a first cut here bypassed the
+                // guard for stamped legs and reopened exactly that hole.
+                // LEDGER FIRST (hostile-reviewer MUST-2): on the documented
+                // STATELESS deployment the uris carry the snapshot leg every
+                // cycle, and AbsentByDesign can never Refuse — probing there
+                // billed a full __pos column scan (BigQuery) or a warehouse
+                // resume (Snowflake) per table per cycle to choose between a
+                // note and silence. The probe runs only when its answer can
+                // change the decision.
+                let ledger = LedgerSignal::classify(ledger_errored, state.is_some());
+                let prior = match ledger {
+                    LedgerSignal::AbsentByDesign => true, // any value: same arm
+                    _ => loader.changes_has_prior_changes(&plan.table)?,
+                };
+                match rebaseline_action(prior, ledger) {
+                    RebaselineAction::Refuse => {
+                        anyhow::bail!(
+                            "{}",
+                            rebaseline_refusal(&loader.fqtn(&plan.table), loader.warehouse())
+                        );
+                    }
+                    RebaselineAction::WarnStateless => eprintln!(
+                        "  note: this STATELESS load re-selects the snapshot leg every \
+                         cycle (at-least-once, absorbed by the dedup view) — the \
+                         re-baseline refusal needs the ledger to tell a genuine \
+                         re-snapshot from a routine re-load, so it does not apply here.",
+                    ),
+                    RebaselineAction::Proceed => {}
+                }
+            }
             // The driver gates the appended delta against the manifests' summed
             // `row_count` and cleans up (only) after the gate passes.
             let cleanup = cleanup_target(plan, store, state);
@@ -1038,11 +1345,73 @@ mod load_ledger_tests {
         );
     }
 
+    /// Round-7 rebuild of the round-6 guard: the SHAPE is prefix-anchored (a
+    /// `snapshot` segment in the operator's own prefix, or a multiplex table
+    /// named `snapshot`, must not read as a re-baseline), and the REFUSAL
+    /// message prescribes the truncate-then-rerun sequence that the
+    /// warehouse-probed condition makes safe. RED against un-anchoring the
+    /// shape (bare contains) and against dropping either message half.
+    #[test]
+    fn rebaseline_shape_is_prefix_anchored_and_the_refusal_names_the_sequence() {
+        let plan_prefix = "gs://b/exports/orders";
+        // The real snapshot leg under THIS plan's prefix.
+        assert!(rebaseline_shape(
+            &["gs://b/exports/orders/snapshot/part-0.parquet".into()],
+            plan_prefix
+        ));
+        // A cdc-only cycle is not a baseline.
+        assert!(!rebaseline_shape(
+            &["gs://b/exports/orders/cdc-000000.parquet".into()],
+            plan_prefix
+        ));
+        // An operator prefix CONTAINING a snapshot segment is not a baseline
+        // (the round-6 substring bug fired forever here).
+        assert!(!rebaseline_shape(
+            &["gs://b/analytics/snapshot/orders/cdc-000000.parquet".into()],
+            "gs://b/analytics/snapshot/orders"
+        ));
+        // A multiplex TABLE named `snapshot`: its sub-prefix is the PLAN prefix
+        // for its own load, so its cdc parts do not read as a baseline either.
+        assert!(!rebaseline_shape(
+            &["gs://b/exports/base/snapshot/cdc-000000.parquet".into()],
+            "gs://b/exports/base/snapshot"
+        ));
+        // The action table (round-8): refusal requires BOTH a non-empty log and
+        // a ledger; stateless notes, an empty log always proceeds (the recovery
+        // load). RED against collapsing the ledgered arm.
+        use LedgerSignal::*;
+        use RebaselineAction::*;
+        assert_eq!(LedgerSignal::classify(true, true), Errored, "errored wins");
+        assert_eq!(LedgerSignal::classify(false, true), Available);
+        assert_eq!(LedgerSignal::classify(false, false), AbsentByDesign);
+        assert_eq!(rebaseline_action(true, Available), Refuse);
+        assert_eq!(
+            rebaseline_action(true, Errored),
+            Refuse,
+            "a ledger BLIP must fail safe — note-and-proceed appended a doomed \
+             baseline and cleanup then deleted the evidence (round-9)"
+        );
+        assert_eq!(rebaseline_action(true, AbsentByDesign), WarnStateless);
+        for l in [Available, Errored, AbsentByDesign] {
+            assert_eq!(rebaseline_action(false, l), Proceed);
+        }
+        let msg = rebaseline_refusal("p.d.t", crate::load::cdc::Warehouse::BigQuery);
+        assert!(msg.contains("TRUNCATE TABLE `p.d.t__changes`"));
+        let sf = rebaseline_refusal("d.s.t", crate::load::cdc::Warehouse::Snowflake);
+        assert!(
+            sf.contains("TRUNCATE TABLE d.s.t__changes;") && !sf.contains("TRUNCATE TABLE `"),
+            "the pasted remedy must parse on Snowflake (bare fqtn in the STATEMENT): {sf}"
+        );
+        assert!(msg.contains("re-run this same"));
+        assert!(msg.contains("Nothing was consumed"));
+    }
+
     const TARGET: &str = "proj.ds.orders";
 
     fn ctx<'a>(state: &'a StateStore, load_id: &'a str) -> LoadCtx<'a> {
         LoadCtx {
             source_ident: String::new(),
+            active_at_fetch: Some(Default::default()),
             source_prefix: "gs://b/p/",
             state: Some(state),
             load_id,
@@ -1179,6 +1548,7 @@ mod load_ledger_tests {
         // Stateless load (state=None): recording must not panic and writes nothing.
         let c = LoadCtx {
             source_ident: String::new(),
+            active_at_fetch: None,
             state: None,
             load_id: "L1",
             export_name: "orders",
@@ -1250,6 +1620,152 @@ mod live_only_decisions {
         let p = dir.path().join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    /// A minimal Success manifest whose one part exists in the store — enough for
+    /// `prepare_load` to fetch, select and integrity-check it.
+    fn success_manifest(run: &str, part: &str) -> crate::manifest::RunManifest {
+        use crate::manifest::*;
+        RunManifest {
+            manifest_version: MANIFEST_VERSION,
+            run_id: run.into(),
+            export_name: "orders".into(),
+            export_family: "orders".into(),
+            mode: "cdc".into(),
+            started_at: "2026-08-21T00:00:00Z".into(),
+            finished_at: "2026-08-21T00:01:00Z".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: Some("public".into()),
+                table: Some("orders".into()),
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "gcs".into(),
+                uri: "gs://b/base".into(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: "xxh3:0123456789abcdef".into(),
+            row_count: 1,
+            part_count: 1,
+            parts: vec![ManifestPart {
+                part_id: 0,
+                path: part.into(),
+                rows: 1,
+                size_bytes: 1,
+                content_fingerprint: "xxh3:0123456789abcdef".into(),
+                content_md5: String::new(),
+                status: PartStatus::Committed,
+            }],
+            column_checksums: None,
+            checksum_render: None,
+            checksum_key_column: None,
+            row_hash: None,
+            split_window: None,
+        }
+    }
+
+    /// Round-10: a column the staged parquet records but the live source lost
+    /// must WARN (Snowflake silently omits it; counts stay green). Additive
+    /// columns and checksum-less manifests stay silent. RED against dropping
+    /// the contains-check.
+    #[test]
+    fn a_dropped_source_column_warns_and_an_added_one_does_not() {
+        use crate::manifest::ColumnChecksum;
+        let mut m = success_manifest("r1", "p.parquet");
+        m.column_checksums = Some(vec![
+            ColumnChecksum {
+                name: "id".into(),
+                checksum: "0".into(),
+            },
+            ColumnChecksum {
+                name: "legacy_col".into(),
+                checksum: "0".into(),
+            },
+        ]);
+        let notes = spec_manifest_column_drift(&["id".into(), "brand_new".into()], &[m.clone()]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("legacy_col") && notes[0].contains("SILENTLY"));
+        m.column_checksums = None;
+        assert!(
+            spec_manifest_column_drift(&["id".into()], &[m]).is_empty(),
+            "checksum-less manifests carry no column names — nothing to compare"
+        );
+    }
+
+    /// THE ROUND-4 TOCTOU, at the boundary and through the real producer: a run
+    /// LIVE when `prepare_load` fetched the manifests finishes DURING the
+    /// warehouse copy — by record time it is active in neither a record-time
+    /// sample nor the ledger, yet the manifest this load consumed was its
+    /// mid-flight snapshot. Recording it consumed strands every part it flushed
+    /// after the fetch, permanently (`select_runs` skips consumed run_ids).
+    ///
+    /// `active_at_fetch` is produced by the REAL `prepare_load` over a real fs
+    /// store + state DB (not fabricated — the fabricated-input class is exactly
+    /// how this went unobserved), then `finish_run` lands between prepare and
+    /// record, as the copy window does. RED against dropping the fetch-time
+    /// union in `record` (the pre-fix record-time-only sampling).
+    #[test]
+    fn a_run_finishing_during_the_copy_is_not_recorded_as_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        for (run, part) in [("run-live", "live-0.parquet"), ("r-done", "done-0.parquet")] {
+            write_at(&dir, &format!("base/{part}"), b"x");
+            let m = success_manifest(run, part);
+            write_at(
+                &dir,
+                &format!("base/manifest-{run}.json"),
+                &serde_json::to_vec(&m).unwrap(),
+            );
+        }
+        let state = state_with_active_run(prefix); // r-live is WRITING at fetch time
+        // …under the run_id the manifests carry:
+        let plan = plan_at(LoadMode::Cdc, prefix);
+        let inputs = prepare_load(&store, &plan, Some(&state), "p.d.orders", false)
+            .unwrap()
+            .expect("two unloaded Success runs must select");
+        // Not inert: the fetch-time sample really names the live run.
+        assert_eq!(
+            inputs
+                .active_at_fetch
+                .as_ref()
+                .map(|a| a.contains("run-live")),
+            Some(true),
+            "the fixture must catch the run mid-write, or this test grades nothing"
+        );
+        assert_eq!(inputs.source_run_ids.len(), 2);
+
+        // The copy window: the run finishes AFTER the fetch, BEFORE record.
+        state
+            .finish_run("run-live", "success", "2026-08-21T00:02:00Z")
+            .unwrap();
+
+        let ctx = LoadCtx {
+            state: Some(&state),
+            load_id: "load-1",
+            export_name: "orders",
+            target_fqtn: "proj.ds.orders",
+            warehouse: "bigquery",
+            mode: LoadMode::Cdc,
+            source_prefix: prefix,
+            source_ident: inputs.source_ident.clone(),
+            active_at_fetch: inputs.active_at_fetch.clone(), // execute_load's copy
+        };
+        ctx.record_success(&inputs.source_run_ids, 2);
+
+        let loaded = state.loaded_source_run_ids("proj.ds.orders").unwrap();
+        assert!(
+            loaded.contains("r-done"),
+            "positive control: the run terminal at FETCH time is consumed, got {loaded:?}"
+        );
+        assert!(
+            !loaded.contains("run-live") && !loaded.contains("r-live"),
+            "a run live at fetch time finished during the copy — consuming it strands its \
+             post-fetch parts: {loaded:?}"
+        );
     }
 
     /// A state store with `run` recorded `running` on `prefix` — the ledger's
@@ -1524,6 +2040,7 @@ mod live_only_decisions {
             uris: vec!["gs://b/base/part-000000.parquet".into()],
             source_run_ids: vec!["r1".into()],
             source_ident: "postgres:public.orders".into(),
+            active_at_fetch: Some(Default::default()),
         };
 
         let appended = load::CdcLoadReport {

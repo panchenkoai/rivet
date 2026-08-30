@@ -206,6 +206,17 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .downcast_ref::<StringArray>()
                 .expect("DataType/Array mismatch");
             let val = arr.value(idx);
+            // A PRESENT empty string renders as `""` (round-7): bare-nothing is
+            // this writer's NULL rendering, so an unquoted empty cell collided
+            // NULL with `""` byte-identically — a distinction rivet's own
+            // row_hash treats as load-bearing. PostgreSQL's COPY CSV convention
+            // is the same (`""` = empty, bare = NULL). Consumers note: DuckDB's
+            // read_csv default `allow_quoted_nulls=true` still folds `""` to
+            // NULL — set it false to recover the distinction.
+            if val.is_empty() {
+                writer.write_all(b"\"\"")?;
+                return Ok(());
+            }
             // RFC 4180: quote on delimiter, quote, LF — and CR, which readers
             // in universal-newline mode treat as a record terminator. One pass
             // instead of four `contains` scans per cell.
@@ -485,6 +496,22 @@ mod tests {
         assert_eq!(null_cell(DataType::Int64), "");
         assert_eq!(null_cell(DataType::Utf8), "");
         assert_eq!(null_cell(DataType::Boolean), "");
+    }
+
+    /// The OTHER side of null_vs_empty (round-7: for months both rendered as
+    /// bare nothing, byte-identical — the collision the matrix row claimed to
+    /// pin). A PRESENT empty string is `""`; NULL stays bare. PostgreSQL's
+    /// COPY CSV convention, and the distinction rivet's own row_hash keeps.
+    /// RED against removing the is_empty() branch.
+    #[test]
+    fn an_empty_string_is_quoted_and_distinct_from_null() {
+        assert_eq!(cell(StringArray::from(vec![Some("")]), 0), "\"\"");
+        assert_eq!(null_cell(DataType::Utf8), "");
+        assert_ne!(
+            cell(StringArray::from(vec![Some("")]), 0),
+            null_cell(DataType::Utf8),
+            "NULL and empty string must not collide byte-identically"
+        );
     }
 
     // ── scalars ─────────────────────────────────────────────────────────────

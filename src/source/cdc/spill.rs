@@ -19,11 +19,16 @@
 //! This is the container, not the encoding. Two encodings ride on it and the choice
 //! is per adapter:
 //!
-//! * **raw wire bytes** where the engine gives them — PostgreSQL's `pgoutput`
-//!   messages arrive as bytes and Mongo's events as BSON, so there is nothing to
-//!   encode and the existing decoder reads them back. SQL Server has no wire to
-//!   keep (its "stream" is a query result set) and MySQL's crate hands over parsed
-//!   events, so neither can use this path;
+//! * **raw wire bytes** where the engine gives them — PostgreSQL only: its
+//!   `test_decoding` rows arrive as text, so there is nothing to encode and the
+//!   same parser reads them back. (NOT `pgoutput` — that module is staged, unused
+//!   here — and NOT MongoDB, which spills nothing by construction: it has no
+//!   transaction buffer, every event is its own commit, and it serves as the soak
+//!   stand's control. An earlier header listed both wrongly; the mid-file
+//!   encoding note already told the true story while this summary contradicted
+//!   it, which is exactly how a contributor gets sent the wrong way.) SQL Server
+//!   has no wire to keep (its "stream" is a query result set) and MySQL's crate
+//!   hands over parsed events, so neither can use this path;
 //! * **Arrow IPC** as the general fallback — rivet already converts events to Arrow
 //!   to write Parquet, so this reuses machinery that exists and is tested, in a
 //!   self-describing format with a stable reader.
@@ -47,6 +52,7 @@ use crate::source::cdc::{ChangeEvent, ChangeOp, Position};
 /// file rather than reading what it can: a truncated spill is a torn transaction,
 /// and half of one is worse than none. That is the same rule the sink applies to a
 /// torn part.
+#[derive(Debug)]
 pub(crate) struct SpillFile {
     /// `None` once [`SpillFile::into_reader`] has handed the file over — the
     /// reader owns the cleanup from that point, and a `Drop` that deleted it
@@ -58,17 +64,43 @@ pub(crate) struct SpillFile {
     bytes: u64,
 }
 
+/// This process's spill identity: `{pid}-{startup-hex}`.
+///
+/// The pid ALONE was the identity, and two container generations are both pid 1 —
+/// so a name could collide across namespaces (`create` then truncated a live
+/// neighbour's inode through the shared volume) and the sweep's pid probe read a
+/// foreign namespace's live writer as dead-or-self. The startup stamp makes the
+/// name unique per PROCESS INSTANCE, not per pid number; the pid stays in front
+/// for traceability.
+fn process_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 20))
+            .unwrap_or(0);
+        format!("{}-{nanos:x}", std::process::id())
+    })
+}
+
 /// The pid a spill file's name carries, if it is one of ours.
 ///
 /// The label can itself hold dashes (`pg-tx`, `mssql-batch`), so the pid is the
 /// segment between the LAST dash and the extension — not the third field.
 pub(crate) fn spill_file_pid(name: &str) -> Option<u32> {
-    name.strip_prefix("rivet-spill-")?
-        .strip_suffix(".bin")?
-        .rsplit_once('-')?
-        .1
-        .parse()
-        .ok()
+    let core = name.strip_prefix("rivet-spill-")?.strip_suffix(".bin")?;
+    // `{label}-{seq}-{pid}-{startup}`: the pid is SECOND from the end — the
+    // startup token took the last slot when pid alone stopped being an identity
+    // (two containers on one volume are both pid 1). A name without the token
+    // (the short-lived pre-token shape) still parses via the fallback, so a
+    // dev-machine orphan from that window is recognised rather than immortal.
+    let (rest, last) = core.rsplit_once('-')?;
+    if let Some((_, pid)) = rest.rsplit_once('-')
+        && let Ok(p) = pid.parse()
+    {
+        return Some(p);
+    }
+    last.parse().ok()
 }
 
 /// Remove spill files left behind by a process that is no longer running.
@@ -84,6 +116,16 @@ pub(crate) fn spill_file_pid(name: &str) -> Option<u32> {
 /// Deleting a file a LIVE writer is still appending to would tear a transaction in
 /// half. Same rule as the orphan GC: gate the ambiguous case on a lifecycle signal,
 /// and where it is unclear, spare.
+/// Sweep with the PRODUCTION liveness probe — the CDC open calls this once per
+/// run so an orphan does not wait for the NEXT spill to be born in the same
+/// dir (round-5 lifecycle: the likeliest spill producer is a one-off giant
+/// backfill transaction that also crashed the run — its multi-GB file leaked
+/// until another transaction crossed the cap in the same directory, possibly
+/// never).
+pub(crate) fn sweep_dead_spills_now(dir: &std::path::Path) {
+    sweep_dead_spills(dir, pid_is_alive);
+}
+
 pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) -> bool) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return; // no directory yet is not an error — there is nothing to sweep
@@ -97,7 +139,15 @@ pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) ->
         else {
             continue; // not ours; never touch a file we did not name
         };
-        if is_alive(pid) {
+        let _ = pid; // recognised as OURS by the name shape; liveness comes below
+        // The discriminator is the WRITER-HELD FLOCK, not pid liveness. Pid
+        // numbers do not survive namespaces (two containers on one volume are
+        // both pid 1 — the old probe read a live neighbour as "self", i.e. an
+        // orphan, and deleted its in-flight spill) and are recycled within one.
+        // The lock is a true lifecycle record: held while any writer or reader
+        // owns the fd, released by the kernel on any death including SIGKILL.
+        // `is_alive` remains the fallback where flock does not exist.
+        if spill_is_held(&path, &is_alive, pid) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -106,6 +156,36 @@ pub(crate) fn sweep_dead_spills(dir: &std::path::Path, is_alive: impl Fn(u32) ->
             // outage, and a file it could not remove costs disk, not correctness.
             Err(err) => log::debug!("cdc spill: could not remove {}: {err}", path.display()),
         }
+    }
+}
+
+/// Is this spill file still OWNED — i.e. does a live writer/reader hold its lock?
+///
+/// `flock` where it exists (unix): try to take the lock; failure means a live
+/// owner in ANY pid namespace, success means the kernel already released it —
+/// the owner is dead, whatever its pid number said. Elsewhere, fall back to the
+/// pid probe, sparing on doubt.
+fn spill_is_held(path: &std::path::Path, is_alive: &impl Fn(u32) -> bool, pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        match std::fs::OpenOptions::new().read(true).open(path) {
+            Ok(f) => {
+                let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                // rc == 0: we got the lock — nobody held it — the file is an
+                // orphan (the lock dies with `f` at the end of this scope).
+                rc != 0
+            }
+            // Unreadable: cannot prove it is dead — spare, the safe direction.
+            Err(_) => {
+                let _ = (is_alive, pid);
+                true
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        is_alive(pid)
     }
 }
 
@@ -143,34 +223,73 @@ impl SpillFile {
     /// is sized for the data.
     pub(crate) fn create(dir: &std::path::Path, label: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        // Once per process, at the first spill: a hard-killed predecessor cannot
-        // have cleaned up after itself, and nothing else ever will.
-        static SWEPT: std::sync::Once = std::sync::Once::new();
-        SWEPT.call_once(|| sweep_dead_spills(dir, pid_is_alive));
-        // `{label}-{seq}-{pid}`: the pid stays LAST so the sweep's parse is a
-        // single `rsplit_once`, and the counter makes the name unique WITHIN a
-        // process. Today one process drives one CDC stream, so label+pid would not
-        // collide — but that is an invariant nothing enforces, and the failure mode
-        // if it ever breaks is silent: `create` truncates, so a second stream would
-        // destroy the first's spilled transaction while its reader held the file
-        // open. Cheaper to remove the class than to document the assumption.
+        // Per DIRECTORY, not per process: a run with two CDC exports whose
+        // checkpoints live in different directories spills into both, and a
+        // process-wide `Once` (the first version) swept only whichever came
+        // first — the second directory's orphans lived forever. A readdir per
+        // spill-open is cheap next to the spill itself.
+        {
+            static SWEPT: std::sync::Mutex<Option<std::collections::BTreeSet<PathBuf>>> =
+                std::sync::Mutex::new(None);
+            let mut seen = SWEPT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seen
+                .get_or_insert_with(Default::default)
+                .insert(dir.to_path_buf())
+            {
+                sweep_dead_spills(dir, pid_is_alive);
+            }
+        }
+        // `{label}-{seq}-{pid}-{startup}`: the counter makes the name unique
+        // WITHIN a process, the token across PROCESS INSTANCES — two containers
+        // sharing a checkpoint volume are both pid 1, so a pid-only name collided
+        // across namespaces and `truncate` then destroyed a live neighbour's
+        // spilled transaction through the shared inode.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = dir.join(format!(
-            "rivet-spill-{label}-{seq}-{}.bin",
-            std::process::id()
-        ));
+        let path = dir.join(format!("rivet-spill-{label}-{seq}-{}.bin", process_token()));
         // read+write, not `File::create`: `drain` rewinds and reads the same
         // handle back, and a write-only descriptor fails there with `Bad file
         // descriptor` — which reads as a TRUNCATED log, i.e. the one error this
-        // type raises to mean "your transaction is torn". A wrong open mode
-        // masquerading as data loss is worth the explicit options.
+        // type raises to mean "your transaction is torn". And `create_new`, never
+        // `truncate`: a name collision must be an ERROR, not a silent truncation
+        // of whoever owns the existing inode. With the startup token in the name
+        // a collision means a bug, and a bug must be loud.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)?;
+        // The WRITER-HELD LOCK is the liveness signal the sweep reads. Pid
+        // liveness cannot cross a pid namespace (two containers on one volume are
+        // both pid 1: a live neighbour probed as "self" or as "dead"), and the
+        // GC rule is that ambiguity gates on a LIFECYCLE signal, never a clock —
+        // flock IS that signal: held for the file's whole life (the fd passes
+        // into the reader), released by the kernel on ANY death including
+        // SIGKILL, and visible through shared volumes.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                // This branch runs on a file `create_new` JUST made — no other
+                // writer can hold it. A failing flock here means the FILESYSTEM
+                // refused the lock (NFS without lockd → ENOLCK, some FUSE/SMB →
+                // EOPNOTSUPP) — and flock is the sweep's liveness signal, so
+                // continuing would leave a spill the sweep could later mistake
+                // for an orphan mid-write. (Round-5: the old text asserted an
+                // impossible live neighbour, for a case that cannot reach here.)
+                anyhow::bail!(
+                    "cdc spill: this filesystem refused flock on {} ({}) — the lock is \
+                     the crash-liveness signal spills depend on. Point RIVET_CDC_SPILL_DIR \
+                     at a local filesystem (flock-capable), or raise the rollover memory \
+                     cap so this transaction stays in memory.",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
         Ok(Self {
             path: Some(path),
             writer: Some(BufWriter::new(file)),
@@ -311,14 +430,27 @@ impl SpillReader {
             )
         })?;
         let len = u32::from_be_bytes(len) as usize;
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact(&mut buf).map_err(|e| {
-            anyhow::anyhow!(
+        // Bounded pre-allocation: one corrupt length prefix can declare up to
+        // 4 GiB, and `vec![0u8; len]` commits that much memory BEFORE
+        // `read_exact` refuses (round-4 fuzz sweep). Grow through a capped
+        // `take`-reader instead, so a lying prefix costs at most one chunk.
+        let mut buf = Vec::with_capacity(len.min(1 << 20));
+        let got = std::io::Read::take(&mut self.reader, len as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cdc spill: record {i} of {} declares {len} bytes the log does not \
+                     hold — truncated: {e}",
+                    self.total
+                )
+            })?;
+        if got != len {
+            anyhow::bail!(
                 "cdc spill: record {i} of {} declares {len} bytes the log does not \
-                 hold — truncated: {e}",
+                 hold — truncated at {got}",
                 self.total
-            )
-        })?;
+            );
+        }
         Ok(buf)
     }
 }
@@ -533,51 +665,251 @@ mod tests {
         );
     }
 
-    /// A dead writer's spill is collected; a LIVE one's is spared; anything rivet
-    /// did not name is untouched.
+    /// `create` REFUSES an existing path — it must never truncate whoever owns
+    /// the inode. The pre-token behaviour (`truncate(true)`) destroyed a live
+    /// neighbour's spilled transaction through a shared volume when two pid-1
+    /// containers collided on `{label}-{seq}-{pid}`.
     ///
-    /// The liveness probe arrives as a parameter so all three arms are reachable
-    /// offline — a test using the real `kill(pid, 0)` could assert the live arm (its
-    /// own pid) and would have to GUESS a dead one, which is exactly the pid reuse
-    /// this is careful about.
+    /// The SEQ is process-global and every parallel test advances it, so the
+    /// "plant the next name" fixture retries until its prediction lands — a
+    /// missed prediction is a sibling test racing, not a failure.
     #[test]
-    fn a_sweep_collects_dead_spills_and_spares_live_ones() {
+    fn create_refuses_an_existing_path_rather_than_truncating_it() {
         let d = dir();
-        let live = d.path().join("rivet-spill-pg-tx-111.bin");
-        let dead = d.path().join("rivet-spill-mssql-batch-222.bin");
+        for _ in 0..50 {
+            // Probe the counter: this create's name carries the CURRENT seq.
+            let probe = SpillFile::create(d.path(), "collide").expect("probe");
+            let probe_name = probe
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .expect("named")
+                .to_string();
+            let (head, tail) = probe_name.split_once("collide-").expect("label");
+            let (seq, rest) = tail.split_once('-').expect("seq");
+            let next: u64 = seq.parse::<u64>().expect("numeric") + 1;
+            let victim = d.path().join(format!("{head}collide-{next}-{rest}"));
+            std::fs::write(&victim, b"someone else's bytes").expect("plant");
+
+            match SpillFile::create(d.path(), "collide") {
+                Err(err) => {
+                    assert!(
+                        err.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists),
+                        "the refusal must be the collision, got: {err:#}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&victim).expect("re-read"),
+                        b"someone else's bytes",
+                        "the existing inode must be untouched — truncating it was \
+                         the loss"
+                    );
+                    return;
+                }
+                Ok(second) => {
+                    // A sibling test consumed our predicted seq — clean up, retry.
+                    drop(second);
+                    let _ = std::fs::remove_file(&victim);
+                }
+            }
+        }
+        panic!("50 predictions raced away — the fixture never landed");
+    }
+
+    /// An UNLOCKED spill is collected; a LOCKED one is spared; a foreign file is
+    /// untouched.
+    ///
+    /// The discriminator is the writer-held flock, because pid liveness cannot
+    /// cross a pid namespace: two containers sharing a checkpoint volume are both
+    /// pid 1, and the pid probe read a live neighbour as "self" — an orphan — and
+    /// deleted its in-flight spill. The lock is a true lifecycle record: held
+    /// while any writer/reader owns the fd, released by the kernel on any death
+    /// including SIGKILL, visible through shared volumes.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_collects_unlocked_spills_and_spares_locked_ones() {
+        use std::os::fd::AsRawFd as _;
+        let d = dir();
+        let token = "9999-cafef00d"; // a foreign process instance's token
+        let live = d.path().join(format!("rivet-spill-pg-tx-0-{token}.bin"));
+        let dead = d
+            .path()
+            .join(format!("rivet-spill-mssql-batch-1-{token}.bin"));
         let foreign = d.path().join("some-other-tool.bin");
         for f in [&live, &dead, &foreign] {
             std::fs::write(f, b"x").expect("stage");
         }
-        sweep_dead_spills(d.path(), |pid| pid == 111);
+        // The "live" file's owner: a held flock, exactly what a writer holds.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&live)
+            .expect("open the live file");
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the fixture must actually HOLD the lock, or the spare arm is vacuous"
+        );
+
+        sweep_dead_spills(d.path(), |_| false);
         assert!(
             live.exists(),
-            "a spill whose writer is still running must be SPARED — deleting one \
-             mid-append tears the transaction it holds"
+            "a spill whose lock is HELD has a live owner in some pid namespace — \
+             deleting it mid-append tears the transaction it holds"
         );
         assert!(
             !dead.exists(),
-            "a spill whose writer is gone is an orphan: Drop cannot run on SIGKILL, \
-             so nothing else will ever remove it"
+            "a spill nobody holds is an orphan: the kernel released its lock at \
+             the owner's death, whatever pid number the name carries"
         );
         assert!(
             foreign.exists(),
             "a file rivet did not name is not rivet's to delete"
         );
+        drop(holder);
     }
 
-    /// The pid comes from the LAST dash, because labels hold dashes too.
+    /// Off unix the fallback is the injected pid probe, sparing on doubt.
+    /// Seed generator for `fuzz/seeds/spill_frame_decode/` — gated like the
+    /// fixture regenerator: writes only under RIVET_REGENERATE_FIXTURES=1.
+    /// Seeds are REAL encode_event output, so the fuzzer starts from valid
+    /// frames instead of discovering the format from zero.
+    #[test]
+    fn regenerate_spill_fuzz_seeds() {
+        if std::env::var("RIVET_REGENERATE_FIXTURES").as_deref() != Ok("1") {
+            return;
+        }
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/spill_frame_decode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ev = |vals: Vec<crate::source::cdc::RivetValue>| crate::source::cdc::ChangeEvent {
+            op: crate::source::cdc::ChangeOp::Insert,
+            schema: "public".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vals),
+            position: crate::source::cdc::Position(serde_json::json!({"lsn":"0/1"})),
+            committed: true,
+            image_names: Some(std::sync::Arc::from(
+                vec!["id".to_string(), "v".to_string()].into_boxed_slice(),
+            )),
+            seq: 0,
+            poison: None,
+        };
+        use crate::source::cdc::RivetValue as V;
+        let seeds = [
+            ("scalar.bin", ev(vec![V::Int(1), V::Bytes(b"x".to_vec())])),
+            ("nulls.bin", ev(vec![V::Null, V::Null])),
+            (
+                "array.bin",
+                ev(vec![V::Array(vec![V::Int(1), V::Null]), V::Bool(true)]),
+            ),
+        ];
+        for (name, e) in seeds {
+            std::fs::write(dir.join(name), encode_event(&e)).unwrap();
+        }
+    }
+
+    /// Round-10 mutants: `sweep_dead_spills_now` stubbed to () survived — the
+    /// CDC-open sweep (round-5) had wiring but no direct grade. A flock-free
+    /// rivet-shaped file is an orphan and must go; a foreign file stays.
+    #[test]
+    fn sweep_now_reaps_an_unlocked_orphan_and_spares_foreign_files() {
+        let d = dir();
+        let orphan = d.path().join("rivet-spill-pg-tx-0-999999-aa.bin");
+        let foreign = d.path().join("keep.bin");
+        std::fs::write(&orphan, b"x").unwrap();
+        std::fs::write(&foreign, b"y").unwrap();
+        sweep_dead_spills_now(d.path());
+        assert!(!orphan.exists(), "an unlocked orphan must be reaped");
+        assert!(foreign.exists(), "a foreign file is never touched");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_sweep_falls_back_to_the_pid_probe_off_unix() {
+        let d = dir();
+        let live = d.path().join("rivet-spill-pg-tx-0-111-aa.bin");
+        let dead = d.path().join("rivet-spill-pg-tx-1-222-bb.bin");
+        for f in [&live, &dead] {
+            std::fs::write(f, b"x").expect("stage");
+        }
+        sweep_dead_spills(d.path(), |pid| pid == 111);
+        assert!(live.exists() && !dead.exists());
+    }
+
+    /// The pid still parses out of the token-bearing name — second from the end —
+    /// and the pre-token shape stays recognisable so its orphans are not immortal.
     #[test]
     fn a_spill_name_yields_the_writer_pid() {
-        assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.bin"), Some(4242));
         assert_eq!(
-            spill_file_pid("rivet-spill-mssql-batch-7.bin"),
-            Some(7),
-            "the label itself holds dashes, so the pid is not the third field"
+            spill_file_pid("rivet-spill-pg-tx-0-4242-1a2b3c.bin"),
+            Some(4242),
+            "the startup token holds the LAST slot; the pid is second from the end"
         );
+        assert_eq!(
+            spill_file_pid("rivet-spill-mssql-batch-7-9-deadbeef.bin"),
+            Some(9)
+        );
+        // The `{label}-{pid}` fallback shape. HONESTY (round-4): the REAL
+        // pre-token production name was `{label}-{seq}-{pid}.bin`, for which the
+        // primary branch fires and returns the SEQ — usually 0 — as the "pid".
+        // Harmless today: on unix flock decides and the pid only feeds a log
+        // line; off unix the probe never deletes. What matters is the Some/None
+        // SHAPE (a rivet spill is recognised, a foreign file is not); do NOT
+        // wire the VALUE into any decision without fixing the parse first.
+        assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.bin"), Some(4242));
         assert_eq!(spill_file_pid("some-other-tool-9.bin"), None);
-        assert_eq!(spill_file_pid("rivet-spill-pg-tx-.bin"), None);
         assert_eq!(spill_file_pid("rivet-spill-pg-tx-4242.txt"), None);
+    }
+
+    /// A corrupt frame of nested `ARRAY(len=1)` units must come back as an
+    /// `Err`, never a stack overflow: each 9-byte unit used to cost one stack
+    /// frame, so a few MB of corruption was a SIGSEGV no caller could catch
+    /// (round-4 fuzz sweep). RED against removing the depth cap — with it gone
+    /// this test dies by signal rather than failing an assert.
+    #[test]
+    fn a_nesting_bomb_is_refused_not_a_stack_overflow() {
+        // 200_000 levels of ARRAY(1) — far past the cap, far below what would
+        // fit legitimate data.
+        let mut frame = Vec::new();
+        for _ in 0..200_000 {
+            frame.push(tag::ARRAY);
+            frame.extend_from_slice(&1u64.to_be_bytes());
+        }
+        frame.push(tag::NULL);
+        let mut c = Cur { b: &frame, at: 0 };
+        let err = get_value(&mut c).expect_err("a nesting bomb must be refused");
+        assert!(
+            err.to_string().contains("nesting"),
+            "the refusal must name the cause: {err:#}"
+        );
+    }
+
+    /// A record whose length prefix LIES (declares 4 GiB the file does not hold)
+    /// must refuse after reading what is actually there — never pre-commit the
+    /// declared allocation (round-4: `vec![0u8; len]` committed up to 4 GiB from
+    /// one corrupt u32 before `read_exact` could refuse).
+    #[test]
+    fn a_lying_length_prefix_refuses_without_committing_the_declared_bytes() {
+        let d = dir();
+        let mut s = SpillFile::create(d.path(), "liar").expect("create");
+        s.push(b"real record").expect("push");
+        // Seal first (flushes + rewinds), THEN corrupt the bytes on disk: the
+        // reader's first pull sees the rewritten inode.
+        let mut r = s.into_reader().expect("seal");
+        let path = r.path.clone().expect("reader owns the path");
+        let mut bytes = std::fs::read(&path).expect("read spill");
+        bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("rewrite");
+        let err = r
+            .next_record()
+            .expect("one record")
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("truncated"),
+            "the refusal must name truncation: {err:#}"
+        );
     }
 
     /// The PRODUCTION probe, all three arms: alive, dead, and exists-but-foreign.
@@ -851,11 +1183,16 @@ impl SpooledGroups {
 
 // ─── the general fallback encoding ───────────────────────────────────────────
 //
-// PostgreSQL and MongoDB spill the RAW WIRE bytes: the row arrived as text or BSON
-// and the decoder that reads it back is the one the in-memory path uses, so a
-// spilled row and a buffered one cannot decode differently. MySQL's crate hands
-// over PARSED events and SQL Server's "stream" is a query result set — neither has
-// a wire to keep, so their events need an encoding of their own.
+// PostgreSQL spills the RAW WIRE bytes: the row arrived as text and the decoder
+// that reads it back is the one the in-memory path uses, so a spilled row and a
+// buffered one cannot decode differently. MySQL's crate hands over PARSED events
+// and SQL Server's "stream" is a query result set — neither has a wire to keep, so
+// their events need an encoding of their own. MongoDB spills NOTHING, by
+// construction rather than omission: it has no transaction buffer at all (every
+// change-stream event is its own commit), which is why it serves as the soak
+// stand's CONTROL — an earlier version of this comment listed it beside
+// PostgreSQL as a raw-BSON spiller, and a contributor adding Mongo buffering
+// would have believed the encoding decision already covered it.
 //
 // ARROW IPC was the plan here, on the argument that rivet already turns events into
 // Arrow to write Parquet, so the machinery exists and is tested. Checking that
@@ -999,6 +1336,25 @@ fn put_value(out: &mut Vec<u8>, v: &RivetValue) {
 }
 
 fn get_value(c: &mut Cur<'_>) -> Result<RivetValue> {
+    get_value_at(c, 0)
+}
+
+/// Nesting ceiling for ARRAY frames. No engine produces depth past LOW single
+/// digits (only PostgreSQL builds `RivetValue::Array` at all, and PG spills raw
+/// wire bytes — this frame never carries its arrays), so the cap only ever
+/// fires on CORRUPTION: a repeated 9-byte `ARRAY(len=1)` unit recurses once per
+/// nesting level, and a few MB of it is hundreds of thousands of stack frames —
+/// a SIGSEGV, not an `Err`, which no caller can catch (round-4 fuzz sweep).
+const MAX_VALUE_DEPTH: u32 = 128;
+
+fn get_value_at(c: &mut Cur<'_>, depth: u32) -> Result<RivetValue> {
+    if depth > MAX_VALUE_DEPTH {
+        // Refuse, never recurse on: past the cap this is a corrupt frame, and a
+        // stack overflow is a crash no `Result` can report.
+        anyhow::bail!(
+            "cdc spill: value nesting deeper than {MAX_VALUE_DEPTH} — the frame is corrupt"
+        );
+    }
     let t = c.u8()?;
     Ok(match t {
         tag::NULL => RivetValue::Null,
@@ -1025,7 +1381,7 @@ fn get_value(c: &mut Cur<'_>) -> Result<RivetValue> {
             let n = c.len()?;
             let mut items = Vec::with_capacity(n.min(4096));
             for _ in 0..n {
-                items.push(get_value(c)?);
+                items.push(get_value_at(c, depth + 1)?);
             }
             RivetValue::Array(items)
         }

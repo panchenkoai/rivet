@@ -34,6 +34,7 @@ pub use metrics::MetricRow;
 pub use progression::{Boundary, ExportProgression};
 #[allow(unused_imports)]
 pub use run_aggregate::{RunAggregate, RunAggregateEntry};
+pub use run_status_store::FinishOutcome;
 #[allow(unused_imports)]
 pub use schema::{SchemaChange, SchemaColumn, arrow_schema_to_columns, schema_fingerprint};
 #[allow(unused_imports)]
@@ -983,12 +984,27 @@ fn migrate(conn: &Connection) -> Result<()> {
     // but the operator is then handed "no such table: file_manifest" instead of
     // the truth, which names neither the cause nor the remedy.
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
-        anyhow::anyhow!(
-            "state: could not acquire the migration lock within the busy timeout ({e}). \
-             Another rivet process is migrating this state database; wait for it to finish \
-             and retry. Running the migration ladder without the lock is what produces \
-             'no such table' / 'duplicate column' failures on a shared backend."
-        )
+        // NOTADB is a DIFFERENT disease than BUSY: garbage bytes in the file
+        // are not another process's lock, and telling the operator to "wait
+        // for it to finish" strands them waiting on a phantom (round-5 — the
+        // corrupt-DB probe surfaced this wrong-cause-first headline through
+        // the new `state` CLI).
+        let msg = e.to_string();
+        if msg.contains("file is not a database") || msg.contains("database disk image") {
+            anyhow::anyhow!(
+                "state: {msg} — the state DB file is CORRUPT (or not a SQLite file at \
+                 all), not locked. Move it aside and re-run (rivet rebuilds state; \
+                 incremental cursors and skip-ledgers start fresh), or restore it from \
+                 a backup."
+            )
+        } else {
+            anyhow::anyhow!(
+                "state: could not acquire the migration lock within the busy timeout ({e}). \
+                 Another rivet process is migrating this state database; wait for it to \
+                 finish and retry. Running the migration ladder without the lock is what \
+                 produces 'no such table' / 'duplicate column' failures on a shared backend."
+            )
+        }
     })?;
     let out = migrate_locked(conn);
     let _ = conn.execute_batch(if out.is_ok() { "COMMIT;" } else { "ROLLBACK;" });
@@ -1434,6 +1450,27 @@ mod empty_state_path_guard {
 
 #[cfg(test)]
 mod tests {
+    /// Round-10 mutants: the NOTADB `||` in the migrate-lock error split was
+    /// un-graded — `&&` reverts corrupt-DB reporting to the phantom
+    /// "another process is migrating" message the round-8 fix removed. Both
+    /// SQLite renderings must route to the CORRUPT branch.
+    #[test]
+    fn a_garbage_state_db_reports_corruption_not_a_phantom_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("r.yaml");
+        std::fs::write(&cfg, "x: 1\n").unwrap();
+        std::fs::write(dir.path().join(".rivet_state.db"), b"garbage-not-a-db").unwrap();
+        let err = match StateStore::open(cfg.to_str().unwrap()) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("garbage bytes must refuse"),
+        };
+        assert!(
+            err.contains("CORRUPT"),
+            "the operator must be told the file is corrupt, never to wait on a \
+             phantom migrating process: {err}"
+        );
+        assert!(!err.contains("wait for it to finish"), "{err}");
+    }
 
     /// The two ladders must define the SAME versions.
     ///

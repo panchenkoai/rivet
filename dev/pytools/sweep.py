@@ -444,8 +444,45 @@ def test_cruft() -> int:
     else:
         print("  mysql: not up — skipped")
 
+    _sweep_live_tmp()
+
     print("sweep-test-cruft: done")
     return 0
+
+
+def _sweep_live_tmp(max_age_days: float = 2.0) -> None:
+    """Prune old entries under `tests/.live-tmp`, the shared bind-mount workdir.
+
+    Every `duckdb_oracle()` / `census_oracle()` / `resume_into_fresh_dest()`
+    leaks its labeled dir forever: `live_shared_workdir` clears contents only on
+    a label collision (pid+counter — near-never), the Rig's TempDir cleanup does
+    not cover the shared mount, and nothing else sweeps it. Measured at the
+    2026-08-29 harness audit: 3,715 dirs / 592 MB on one dev machine, including
+    fossils from a pre-fix census. Age-gated so anything a LIVE run could still
+    be using (hours old at most) is never touched; entries are removed whole.
+    Two days, not seven: a workdir entry is only ever read by the test that
+    created it, so anything past its own run is dead weight.
+    """
+    import time
+
+    root = Path("tests/.live-tmp")
+    if not root.is_dir():
+        return
+    cutoff = time.time() - max_age_days * 86400.0
+    removed = 0
+    for entry in root.iterdir():
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed += 1
+        except OSError as e:
+            print(f"  live-tmp: could not remove {entry.name}: {e}")
+    if removed:
+        print(f"  live-tmp: pruned {removed} entries older than {max_age_days:g} days")
 
 
 # ══ CLI ════════════════════════════════════════════════════════════════════════

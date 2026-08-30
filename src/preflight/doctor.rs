@@ -512,6 +512,38 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     // would get the useless generic "error" bucket. The alternate form joins
     // the chain so the auth/connectivity needles below match the true cause.
     let msg = format!("{err:#}").to_lowercase();
+    // Connect-time server errors that are NOT auth, peeled off before the
+    // `db error` catch-all below claims them (each verified against the server's
+    // actual rendering: 3D000 / 53300 / 57P03).
+    if (msg.contains("does not exist") && msg.contains("database"))
+        // SQL Server's 4060 says "Cannot open database … requested by the login.
+        // The login failed." — the trailing sentence matched the `login failed`
+        // needle and answered a wrong DATABASE NAME with a credentials hint. The
+        // opening phrase is the discriminating one, so it is checked first.
+        // lowercase: the haystack is lowercased at the top of this fn — the first
+        // version of this needle carried capitals and was dead on arrival
+        // (round-4 fuzz sweep), un-fixing the very case its comment describes.
+        || msg.contains("cannot open database")
+        // MySQL 1049 renders "Unknown database 'x'" — neither arm above
+        // matched it, so a typo'd MySQL database fell to the generic catch-all
+        // (round-10: the per-arm fixture exposed the missing engine).
+        || msg.contains("unknown database")
+    {
+        return "unknown database";
+    }
+    // ALL of 53300's renderings, measured against the stand's own PostgreSQL:
+    // the max_connections cap says "sorry, too many clients already" or
+    // "remaining connection slots are reserved" — NEITHER contains "too many
+    // connections", which only the per-role/per-DB CONNECTION LIMIT arm renders.
+    // The first cut matched the one phrasing and sent the other two to the auth
+    // catch-all: "verify the user/password" for a full server.
+    if msg.contains("too many connections")
+        || msg.contains("too many clients")
+        || msg.contains("connection slots are reserved")
+        || msg.contains("starting up")
+    {
+        return "transient";
+    }
     if msg.contains("password")
         || msg.contains("authentication")
         || msg.contains("access denied")
@@ -519,8 +551,12 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
         || msg.contains("login failed")
         // Postgres top-level Display when the real cause (auth) is nested and
         // `{:#}` still collapses to the bare wrapper — a server-side `DbError`
-        // is never a connectivity failure (those say "connect"/"refused"), so
-        // mapping it to auth is the actionable bucket, not a misroute.
+        // is never a connectivity failure (those say "connect"/"refused"). But
+        // "never connectivity" is not "always auth": three ordinary connect-time
+        // DbErrors are neither, and the three arms ABOVE this catch-all peel
+        // them off so a wrong-database-name typo stops being answered with
+        // "verify the user/password" — a hint that sends the operator to fix
+        // credentials they never had a problem with.
         || msg.contains("db error")
     {
         "auth error"
@@ -646,6 +682,20 @@ pub(crate) fn source_error_hint(
     }
 
     match category {
+        // The two connect-time DbError shapes peeled off before the auth
+        // catch-all — each hint names the actual fix, where "verify the
+        // user/password" sent the operator to credentials they never had a
+        // problem with.
+        "unknown database" => Some(
+            "The database named in the URL does not exist on this server. Check \
+             the path segment of the connection URL — credentials are fine (the \
+             server authenticated you far enough to say so).",
+        ),
+        "transient" => Some(
+            "The server refused the connection for a TRANSIENT reason (connection \
+             cap reached, or still starting up). Retry shortly; if it persists, \
+             check max_connections / the pooler, not the credentials.",
+        ),
         "auth error" => Some(match source_type {
             SourceType::Postgres => {
                 "Verify the user/password and that pg_hba.conf permits your client IP. The user also needs SELECT on the target tables and USAGE on the schema."
@@ -987,6 +1037,62 @@ exports:
     }
 
     // ── regression coverage for the broadened needles (fixes #1/#2) ──────────
+
+    /// One input per OR-ARM (round-10 mutants: each `||` in the needle chains
+    /// was un-graded — `&&` mutants survived because only one arm per category
+    /// ever had a fixture). And the hint ARMS exist: `delete match arm` on
+    /// "unknown database"/"transient" survived with no assertion on the text.
+    #[test]
+    fn every_needle_arm_has_its_own_fixture_and_a_hint() {
+        for msg in [
+            "FATAL: database \"nope\" does not exist",
+            "Unknown database 'nope'",
+            "Cannot open database \"nope\" requested by the login",
+        ] {
+            assert_eq!(
+                categorize_source_error(&anyhow::anyhow!("{msg}")),
+                "unknown database",
+                "{msg}"
+            );
+        }
+        // NEGATIVE arm for the `&&`: "does not exist" WITHOUT "database" (a
+        // missing ROLE) must never claim the unknown-database hint.
+        assert_ne!(
+            categorize_source_error(&anyhow::anyhow!("FATAL: role \"rivet\" does not exist")),
+            "unknown database"
+        );
+        for msg in [
+            "FATAL: sorry, too many clients already",
+            "FATAL: remaining connection slots are reserved",
+            "the database system is starting up",
+        ] {
+            assert_eq!(
+                categorize_source_error(&anyhow::anyhow!("{msg}")),
+                "transient",
+                "{msg}"
+            );
+        }
+        for cat in ["unknown database", "transient"] {
+            let err = anyhow::anyhow!("probe");
+            let hint = source_error_hint(cat, &err, &crate::config::SourceType::Postgres)
+                .unwrap_or_else(|| panic!("category {cat} must carry a hint"));
+            assert!(hint.len() > 40, "{cat}: a one-word hint helps nobody");
+        }
+    }
+
+    /// MSSQL 4060 routes to "unknown database", NOT auth — through the REAL fn,
+    /// whose haystack is LOWERCASED: the first needle carried capitals and was
+    /// dead on arrival, so this exact input fell through to the trailing
+    /// "login failed" sentence and got the credentials hint its own comment
+    /// claimed to have fixed. RED against re-capitalizing the needle.
+    #[test]
+    fn mssql_wrong_database_is_not_an_auth_error() {
+        let err = anyhow::anyhow!(
+            "Cannot open database \"prod_reporting\" requested by the login. \
+             The login failed. Login failed for user 'rivet'."
+        );
+        assert_eq!(categorize_source_error(&err), "unknown database");
+    }
 
     // The pg auth reason is nested in `.source()`; only `{:#}` surfaces it.
     // This proves the categorizer reads the alternate form, not just the bare
