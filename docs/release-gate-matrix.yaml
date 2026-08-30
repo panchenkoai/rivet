@@ -26,8 +26,15 @@ grid:
     gated: [12, 13, 14, 15, 16, 17, 18]   # 12/15/17 added 2026-08-30 — public images, no seed blocker existed
     gaps:  []
   mysql:
-    gated: ["5.7", "8.0", "8.4"]     # 5.7 added 2026-08-30: the "needs a CTE-free seed" note was stale —
-    gaps:  []                        # the seed already says "no CTEs / window functions".
+    gated: ["8.0", "8.4"]
+    gaps:  ["5.7"]                   # MEASURED 2026-08-30, not argued: the seed dies with
+                                     # `ERROR 1064 at line 111 … near '(ORDER BY id) AS chunk_rownum'`
+                                     # — a WINDOW FUNCTION (dev/mysql/init.sql), which is 8.0+.
+                                     # The old note blamed a recursive CTE: right family, wrong
+                                     # construct, and the CTE had already been removed. Closing this
+                                     # means emulating ROW_NUMBER with a session variable in a seed
+                                     # every other version shares — a change with its own blast
+                                     # radius, deliberately not made on the way to a release.
     # `mariadb-11` was listed as a gap and REMOVED 2026-08-30: MariaDB is not a
     # source engine at all. `SourceType` is Postgres | Mysql | Mssql | Mongo, and
     # the only MariaDB-shaped things in the tree are MaxScale PROXY detection
@@ -37,8 +44,14 @@ grid:
     # could never be paid, only pretended at: closing it would mean ADDING an
     # engine, which is a product decision and not a coverage gap.
   mssql:
-    gated: ["2019", "2022"]          # 2019 added 2026-08-30: the blocker was a hardcoded /opt/mssql-tools18
-    gaps:  []                        # path in the harness (2019 ships plain mssql-tools), now probed per container
+    gated: ["2022"]
+    gaps:  ["2019"]                  # MEASURED 2026-08-30. The tools18-path blocker WAS real and is
+                                     # fixed (sqlcmd is probed per container now, and 2019 brings up
+                                     # and connects). The seed then fails with `Msg 208` (invalid
+                                     # object) + two `Msg 195` (not a recognized built-in function) —
+                                     # a 2022-only function in the seed, not a harness limit. The
+                                     # exact function is one `sqlcmd` away; closing it is a seed
+                                     # change, tracked here rather than bundled into a release.
   mongo:
     gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
     gaps:  []

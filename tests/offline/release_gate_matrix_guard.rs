@@ -59,7 +59,7 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 // -> 10 (scale_memory wired as the verify_scale_memory flat-RSS preflight).
 // Now: infra gap rows(0 — network_faults/cdc_standby flipped to test,
 // tls_required/auth to partial with the residual named, 2026-08-29) +
-// grid version gaps(0) = 0, reached 2026-08-30 by MEASURING instead of arguing.
+// grid version gaps(0+1+1+0=2), MEASURED 2026-08-30 rather than argued.
 // Three postgres images needed nothing; the mysql and mssql notes described
 // blockers that had already been removed (a CTE-free seed had shipped; the real
 // mssql blocker was a hardcoded tools18 path in the HARNESS, now probed). The
@@ -69,7 +69,7 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 // permanent debt and teaches its readers to discount it. (The line above summed to the OLD value of
 // 10 until a critic recomputed it — the constant was right, its arithmetic was
 // leftover: the message-truth class, in the comment over a ratchet.)
-const GAP_RATCHET: usize = 0;
+const GAP_RATCHET: usize = 2;
 
 fn load(path: &str) -> Value {
     let s = super::nonvacuity::subject_text(path);
