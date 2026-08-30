@@ -20,27 +20,36 @@ engines:
     url: "postgresql://rivet:rivet@127.0.0.1:%PORT%/rivet"
     seed: seeds/common/postgres.sql
     versions:
+      - { tag: "12", image: "postgres:12", port: 55012 }
       - { tag: "13", image: "postgres:13", port: 55013 }
       - { tag: "14", image: "postgres:14", port: 55014 }
+      - { tag: "15", image: "postgres:15", port: 55015 }
       - { tag: "16", image: "postgres:16", port: 55016 }
+      - { tag: "17", image: "postgres:17", port: 55017 }
       - { tag: "18", image: "postgres:18", port: 55018 }
   mysql:
-    # The canonical seed uses a recursive CTE (deterministic fast fill) → MySQL 8.0+
-    # ONLY. Pre-8.0 (5.7) would need a non-recursive compat seed; out of matrix.
+    # 5.7 is IN as of 2026-08-30. The note here used to say the seed needed a
+    # recursive CTE and so was 8.0+ only — stale: seeds/common/mysql.sql says in
+    # its own header "no CTEs / window functions; numbers come from a digits
+    # cross-join". The blocker had been removed and the gap outlived it.
     driver: mysql
     url: "mysql://rivet:rivet@127.0.0.1:%PORT%/rivet"
     seed: seeds/common/mysql.sql
     versions:
+      - { tag: "5.7", image: "mysql:5.7", port: 55057 }
       - { tag: "8.0", image: "mysql:8.0", port: 55080 }
       - { tag: "8.4", image: "mysql:8.4", port: 55084 }
   mssql:
-    # The canonical seed uses GENERATE_SERIES → SQL Server 2022+ ONLY. Pre-2022
-    # (2019) would need a numbers-table compat seed; out of matrix.
+    # 2019 is IN as of 2026-08-30. The note here used to blame GENERATE_SERIES —
+    # stale: the seed fills through `ROW_NUMBER() OVER`, which SQL Server has had
+    # since 2005. The real blocker was a hardcoded `/opt/mssql-tools18` path in
+    # the harness (2019 ships plain `mssql-tools`), now probed per container.
     driver: mssql
     url: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:%PORT%/rivet"
     tls: accept_invalid_certs
     seed: seeds/common/mssql.sql
     versions:
+      - { tag: "2019", image: "mcr.microsoft.com/mssql/server:2019-latest", port: 55019 }
       - { tag: "2022", image: "mcr.microsoft.com/mssql/server:2022-latest", port: 55022 }
   mongo:
     driver: mongo

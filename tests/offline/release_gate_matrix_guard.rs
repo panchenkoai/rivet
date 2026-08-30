@@ -59,10 +59,17 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 // -> 10 (scale_memory wired as the verify_scale_memory flat-RSS preflight).
 // Now: infra gap rows(0 — network_faults/cdc_standby flipped to test,
 // tls_required/auth to partial with the residual named, 2026-08-29) +
-// grid version gaps(3+2+1+0=6) = 6. (The line above summed to the OLD value of
+// grid version gaps(0) = 0, reached 2026-08-30 by MEASURING instead of arguing.
+// Three postgres images needed nothing; the mysql and mssql notes described
+// blockers that had already been removed (a CTE-free seed had shipped; the real
+// mssql blocker was a hardcoded tools18 path in the HARNESS, now probed). The
+// sixth, `mariadb-11`, was not a gap at all — MariaDB is not a SourceType, so
+// the row recorded a debt that could only be "paid" by adding an engine. A
+// coverage ledger that carries an obligation the product never took on reports
+// permanent debt and teaches its readers to discount it. (The line above summed to the OLD value of
 // 10 until a critic recomputed it — the constant was right, its arithmetic was
 // leftover: the message-truth class, in the comment over a ratchet.)
-const GAP_RATCHET: usize = 6;
+const GAP_RATCHET: usize = 0;
 
 fn load(path: &str) -> Value {
     let s = super::nonvacuity::subject_text(path);

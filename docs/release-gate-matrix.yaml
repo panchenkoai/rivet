@@ -23,14 +23,22 @@
 #             are not yet gated — each is a real coverage hole, ratcheted.
 grid:
   postgres:
-    gated: [13, 14, 16, 18]          # 14/18 verified green on the devbox against the blessed goldens
-    gaps:  [12, 15, 17]              # 12/15 are compose services; 17 is a public image
+    gated: [12, 13, 14, 15, 16, 17, 18]   # 12/15/17 added 2026-08-30 — public images, no seed blocker existed
+    gaps:  []
   mysql:
-    gated: ["8.0", "8.4"]
-    gaps:  ["5.7", "mariadb-11"]     # 5.7 = huge install base, needs a CTE-free seed; MariaDB needs a compose service + driver check
+    gated: ["5.7", "8.0", "8.4"]     # 5.7 added 2026-08-30: the "needs a CTE-free seed" note was stale —
+    gaps:  []                        # the seed already says "no CTEs / window functions".
+    # `mariadb-11` was listed as a gap and REMOVED 2026-08-30: MariaDB is not a
+    # source engine at all. `SourceType` is Postgres | Mysql | Mssql | Mongo, and
+    # the only MariaDB-shaped things in the tree are MaxScale PROXY detection
+    # (a front-end for MySQL, src/source/mysql/proxy.rs) and a changelog note
+    # that MariaDB spells `max_statement_time` differently. There is no compose
+    # service, no doc, no README claim and no test — so the row was a debt that
+    # could never be paid, only pretended at: closing it would mean ADDING an
+    # engine, which is a product decision and not a coverage gap.
   mssql:
-    gated: ["2022"]
-    gaps:  ["2019"]                  # 2019 ships mssql-tools (not tools18) — needs an sqlcmd-path fallback in bring_up/seed
+    gated: ["2019", "2022"]          # 2019 added 2026-08-30: the blocker was a hardcoded /opt/mssql-tools18
+    gaps:  []                        # path in the harness (2019 ships plain mssql-tools), now probed per container
   mongo:
     gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
     gaps:  []

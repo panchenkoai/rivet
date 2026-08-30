@@ -468,7 +468,11 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     probes: list[list[str]] = {
         "postgres": [["psql", "-U", "rivet", "-d", "rivet", "-tAc", "select 1"]],
         "mysql": [["mysql", "-urivet", "-privet", "rivet", "-e", "select 1"]],
-        "mssql": [["/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
+        # tools18 is the 2022 image's path; the 2019 image ships plain
+        # `mssql-tools`. A hardcoded path made the older version unrunnable and
+        # the matrix recorded that as a coverage GAP — so the fix is one
+        # fallback, not a permanent hole. `sqlcmd_path` probes both once.
+        "mssql": [[sqlcmd_path(name), "-S", "localhost", "-U", "sa",
                    "-P", "Rivet_Passw0rd!", "-C", "-Q", "SELECT 1"]],
         "mongo": [["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
                   ["mongo", "--quiet", "--eval", "db.runCommand({ping:1})"]],
@@ -504,7 +508,7 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
         return None
 
     if engine == "mssql":
-        docker_exec(name, "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
+        docker_exec(name, sqlcmd_path(name), "-S", "localhost", "-U", "sa",
                     "-P", "Rivet_Passw0rd!", "-C", "-Q",
                     "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet")
 
@@ -531,7 +535,7 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
         p = docker_exec(name, "mysql", "-urivet", "-privet", "rivet", stdin=body, timeout=900)
     elif engine == "mssql":
         docker("cp", str(seed), f"{name}:/tmp/s.sql")
-        p = docker_exec(name, "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
+        p = docker_exec(name, sqlcmd_path(name), "-S", "localhost", "-U", "sa",
                         "-P", "Rivet_Passw0rd!", "-d", "rivet", "-C", "-i", "/tmp/s.sql", timeout=900)
     else:  # mongo — from the host
         p = run(["python3", str(seed)], timeout=1800,
@@ -545,6 +549,29 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
     if p.ok and not hits:
         return ""
     return "; ".join(hits) or f"exit {p.returncode}"
+
+
+def sqlcmd_path(container: str) -> str:
+    """Where THIS SQL Server image keeps sqlcmd.
+
+    The 2022 image ships `/opt/mssql-tools18`; 2019 ships `/opt/mssql-tools`.
+    A hardcoded tools18 path is why "mssql 2019" sat in the gate matrix as a
+    coverage gap — a harness limitation recorded as a product-coverage hole.
+    Probed per container, cheap, and it fails LOUD rather than silently picking
+    a path that does not exist.
+    """
+    # Through the module's own `docker_exec`, not a bare subprocess: this file
+    # imports no subprocess at all (the first cut of this helper crashed the
+    # whole run with a NameError on the very first mssql version).
+    from .core import docker_exec
+
+    for path in ("/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd"):
+        if docker_exec(container, "test", "-x", path, timeout=20).ok:
+            return path
+    raise SystemExit(
+        f"{container}: no sqlcmd at tools18 or tools — the image changed its "
+        f"layout and every seed/probe below would fail with a confusing exec error"
+    )
 
 
 def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:

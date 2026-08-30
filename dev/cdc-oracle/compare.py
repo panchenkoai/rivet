@@ -137,6 +137,19 @@ WHERE j <> ''
   -- The mysql liveness probe (run.py 4b) writes into <t>_probe, which is in
   -- Debezium's include-list ONLY so its delivery proves the pipe is live —
   -- its events are harness plumbing, not scenario data, on either side.
+  -- rivet's OWN CYCLE BARRIER, excluded by SHAPE like the schema events above.
+  --
+  -- A bounded PostgreSQL run writes a marker into the WAL with
+  -- `pg_logical_emit_message` (src/source/postgres/cdc.rs), and Debezium
+  -- faithfully reports it as `op: "m"` with `message.prefix = "rivet"`. It is
+  -- not a row change on either side, so leaving it to the UNKNOWN arm turned a
+  -- correct reference into a DISAGREE — INTERMITTENTLY, because whether the
+  -- barrier lands before the drain quiesces is a race: ten cells agreed in one
+  -- gate run and two of three disagreed in the next (measured 2026-08-30).
+  -- Matched on the op AND the prefix, so a genuinely unrecognised event still
+  -- reaches UNKNOWN, which is the arm that must stay armed.
+  AND NOT (coalesce(jstr(j, '$.op'), '') = 'm'
+           AND coalesce(jstr(j, '$.message.prefix'), '') = 'rivet')
   __PROBE_FILTER__;
 
 CREATE OR REPLACE VIEW riv AS
