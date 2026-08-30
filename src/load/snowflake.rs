@@ -164,6 +164,24 @@ impl TargetLoader for SnowflakeLoader {
     }
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
+        // The shared gate accepts any-script letters because BigQuery
+        // back-quotes column names. THIS driver splices them BARE (see `fqtn`
+        // and `build_schema_ddl`), and Snowflake upper-cases what it parses
+        // unquoted — so a non-ASCII name would be created as one object and
+        // referenced as another. Refuse it here, narrowly, naming the remedy,
+        // rather than widen the shared gate into a promise this leg cannot keep.
+        for s in specs {
+            if !crate::load::is_plain_ascii_ident(&s.column_name) {
+                anyhow::bail!(
+                    "Snowflake load `{table}`: column `{}` is not a plain ASCII identifier. \
+                     This driver splices column names UNQUOTED (quoting a lowercase name \
+                     would miss the unquoted-created, upper-cased object), so it cannot \
+                     carry that name — the BigQuery leg can. Alias the column in the export \
+                     query, or rename it at the source.",
+                    s.column_name.escape_default()
+                );
+            }
+        }
         let fqtn = self.fqtn(table);
         let ddl = Self::build_schema_ddl(specs);
         let select = Self::build_copy_select(specs);
