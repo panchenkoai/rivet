@@ -344,7 +344,7 @@ jobs:
       # the first grading of a change.
       - name: Restore mutation outcomes
         if: steps.scope.outputs.code == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .mutants-cache
           key: mutants-outcomes-v1-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
@@ -662,7 +662,7 @@ jobs:
         # that measurement is exactly what a re-run of the same commit should
         # not have to pay for again.
         if: always() && steps.scope.outputs.code == 'true' && hashFiles('.mutants-cache/outcomes.json') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .mutants-cache
           key: mutants-outcomes-v1-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
@@ -1690,7 +1690,7 @@ jobs:
       # MSSQL driver's unavoidable tiberius→rustls-0.21 advisories failed the
       # gate; documenting + tracking them in one place keeps the gate green
       # while still catching every *fixable* future advisory.
-      - uses: taiki-e/install-action@v2.85.7
+      - uses: taiki-e/install-action@v2.86.2
         with:
           tool: cargo-audit
       - run: cargo audit
