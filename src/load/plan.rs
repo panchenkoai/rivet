@@ -126,6 +126,18 @@ pub enum LoadTarget {
         schema: String,
         storage_integration: String,
     },
+    Clickhouse {
+        /// ClickHouse HTTP endpoint — `http://localhost:8123` for the native
+        /// HTTP port, `https://host:8443` for the secure one.
+        url: String,
+        /// Database to load into. The loader never creates databases — it must
+        /// exist (the loader is run as a single SQL user, not an admin).
+        database: String,
+        /// HTTP basic-auth user (ClickHouse's default superuser is `default`).
+        user: String,
+        /// Name of an env var holding the password — secrets stay out of config.
+        password_env: String,
+    },
 }
 
 impl LoadTarget {
@@ -135,6 +147,7 @@ impl LoadTarget {
         match self {
             LoadTarget::Bigquery { .. } => "bigquery",
             LoadTarget::Snowflake { .. } => "snowflake",
+            LoadTarget::Clickhouse { .. } => "clickhouse",
         }
     }
 }
@@ -240,7 +253,7 @@ const LOAD_KEYS: &[&str] = &[
     "allow_source_drift",
     "gc_orphans",
     "cluster_by",
-    // LoadTarget::{Bigquery, Snowflake} variant fields (flattened in).
+    // LoadTarget::{Bigquery, Snowflake, Clickhouse} variant fields (flattened in).
     "project",
     "dataset",
     "connection",
@@ -248,6 +261,9 @@ const LOAD_KEYS: &[&str] = &[
     "database",
     "schema",
     "storage_integration",
+    "url",
+    "user",
+    "password_env",
 ];
 
 /// Reject any key in a `load:` block that isn't in [`LOAD_KEYS`] — turns a
@@ -266,34 +282,53 @@ fn check_load_keys(value: &serde_json::Value, whose: &str) -> Result<()> {
     Ok(())
 }
 
-/// Warehouse fields that belong to exactly ONE target.
-const BIGQUERY_ONLY: &[&str] = &["project", "dataset"];
-const SNOWFLAKE_ONLY: &[&str] = &[
-    "connection",
-    "warehouse",
-    "database",
-    "schema",
-    "storage_integration",
-];
-
 /// Reject fields that belong to a DIFFERENT warehouse than the resolved
 /// `target`. `#[serde(flatten)]` on the target enum can't `deny_unknown_fields`,
 /// so `LOAD_KEYS` (the union of all warehouses' fields) let a `target: snowflake`
 /// block silently carry — and ignore — BigQuery's `project:`/`dataset:` (and
 /// vice versa) (dogfood LOW). Name the offending key and its warehouse.
+///
+/// `database` is notably shared by Snowflake and ClickHouse, so it is never
+/// foreign between the two — only to BigQuery.
 fn reject_foreign_target_fields(
     value: &serde_json::Value,
     target: &str,
     whose: &str,
 ) -> Result<()> {
-    let (foreign, other) = match target {
-        "bigquery" => (SNOWFLAKE_ONLY, "snowflake"),
-        "snowflake" => (BIGQUERY_ONLY, "bigquery"),
+    // (foreign field, the warehouse it belongs to) — the field list per target
+    // is every OTHER warehouse's exclusive fields, with `database` excluded from
+    // the ClickHouse foreign set because Snowflake and ClickHouse share it.
+    let foreign: &[(&str, &str)] = match target {
+        "bigquery" => &[
+            ("connection", "snowflake"),
+            ("warehouse", "snowflake"),
+            ("database", "snowflake"),
+            ("schema", "snowflake"),
+            ("storage_integration", "snowflake"),
+            ("url", "clickhouse"),
+            ("user", "clickhouse"),
+            ("password_env", "clickhouse"),
+        ],
+        "snowflake" => &[
+            ("project", "bigquery"),
+            ("dataset", "bigquery"),
+            ("url", "clickhouse"),
+            ("user", "clickhouse"),
+            ("password_env", "clickhouse"),
+        ],
+        "clickhouse" => &[
+            ("project", "bigquery"),
+            ("dataset", "bigquery"),
+            ("connection", "snowflake"),
+            ("warehouse", "snowflake"),
+            ("schema", "snowflake"),
+            ("storage_integration", "snowflake"),
+        ],
         _ => return Ok(()),
     };
     if let Some(obj) = value.as_object() {
         for k in obj.keys() {
-            if foreign.contains(&k.as_str()) {
+            if let Some((_, other)) = foreign.iter().find(|(f, _)| f == k) {
                 bail!(
                     "the {whose} `load:` block targets `{target}` but carries `{k}`, a `{other}` \
                      field — remove it (it would be silently ignored, masking a mis-configured load)"

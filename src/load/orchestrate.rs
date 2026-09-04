@@ -811,7 +811,11 @@ fn execute_load<R>(
     done: impl FnOnce(&LoadInputs, &R),
 ) -> Result<Option<R>> {
     let store = load::open_store(&job.plan.destination)?;
-    let loader = load::build_loader(job.plan, job.run_id);
+    // `&store`: the ClickHouse loader reads the export parquet from the export
+    // store (INSERT … FORMAT Parquet), so the loader seam takes it. This call
+    // site moved here from cli/dispatch.rs after #145 was cut; the change is
+    // that PR's, relocated rather than merged textually.
+    let loader = load::build_loader(job.plan, job.run_id, &store);
     let target_fqtn = loader.fqtn(&job.plan.table);
     let mut ctx = LoadCtx {
         state: job.state,

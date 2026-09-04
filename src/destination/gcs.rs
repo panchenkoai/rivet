@@ -33,6 +33,11 @@ fn dir_boundary(path: &str) -> String {
 /// (source cleanup). Mirrors [`CloudDestination`]'s runtime + blocking wrap,
 /// but exposes the read/list/delete surface the streaming `Destination` trait
 /// does not. Holds the runtime the blocking operator drives.
+///
+/// `Clone` (a cheap Arc/operator clone) so a load can hand the same store to
+/// its reconcile, its cleanup, and a download-ing adapter (ClickHouse) without
+/// each building its own opendal client.
+#[derive(Debug, Clone)]
 pub(crate) struct GcsStore {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: opendal::blocking::Operator,
