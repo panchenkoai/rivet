@@ -65,6 +65,8 @@ mod mutation_gate_config;
 mod mutation_gate_priority_guard;
 #[path = "offline/mysql_wire_type_fixture_guard.rs"]
 mod mysql_wire_type_fixture_guard;
+#[path = "offline/oneshot_budget.rs"]
+mod oneshot_budget;
 // Not a test module: the shared non-vacuity rule the grep-shaped guards call so
 // a moved subject fails LOUDLY instead of grading the empty set.
 #[path = "offline/nonvacuity.rs"]
