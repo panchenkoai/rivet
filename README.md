@@ -29,7 +29,7 @@ rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
 rivet run -c rivet.yaml
 ```
 
-Output: Parquet files in `./output/`. Full walkthrough: [docs/getting-started.md](docs/getting-started.md). Want to try without your own DB? `docs/pilot/demo-quickstart.md` runs the whole flow against a pre-seeded 14-table fixture in ~10 min.
+Output: Parquet files in `./output/`. Full walkthrough: [docs/getting-started.md](docs/getting-started.md). Other engine or a cloud bucket? The [quickstart builder](https://panchenkoai.github.io/rivet/recipes/quickstart-builder.html) fills this block in for MySQL / SQL Server / MongoDB → GCS / S3 / Azure ([source](docs/recipes/quickstart-builder.md)). Want to try without your own DB? `docs/pilot/demo-quickstart.md` runs the whole flow against a pre-seeded 14-table fixture in ~10 min.
 
 ---
 

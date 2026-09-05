@@ -35,6 +35,7 @@ Pick one — they're ordered shortest to deepest. Read top-to-bottom, then come 
 | Guide | What it gives you | Time |
 |-------|-------|------|
 | [Who is Rivet for?](who-is-this-for.md) | Yes / no fit-check with named alternatives (Debezium / Airbyte / Fivetran / dbt / DuckDB) | ~1 min |
+| [Quickstart builder](recipes/quickstart-builder.md) | Pick engine + destination, fill in credentials, copy one shell block: `init` → `doctor` → `check` → `run` | ~2 min |
 | [Getting Started](getting-started.md) | Install + your first export from a real table | ~3 min read · ~5 min hands-on |
 | [Concepts glossary](concepts.md) | One-page orientation: `run_id`, `cursor`, `chunk`, `manifest`, `journal`, `progression` | ~3 min |
 | [Pilot guide](pilot/) | Operator runbook — full flow on your own database, production-ready guardrails | 1–2 sessions |

@@ -76,6 +76,8 @@
 
 # Recipes
 
+- [Quickstart builder](recipes/quickstart-builder.md)
+- [MySQL (Cloud SQL) → GCS, end to end](recipes/quickstart-mysql-gcs.md)
 - [Verify your export](recipes/verify-your-export.md)
 - [Recover an interrupted run](recipes/recover-interrupted-run.md)
 - [Idempotent warehouse load](recipes/idempotent-warehouse-load.md)

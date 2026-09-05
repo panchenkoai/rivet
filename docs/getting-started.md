@@ -14,6 +14,8 @@ rivet run -c rivet.yaml --validate
 
 That's the whole flow. The four steps below explain each command, expected output, and where to go from each. Read time: ~3 minutes.
 
+> **Not PostgreSQL, or not local?** The [quickstart builder](recipes/quickstart-builder.md) writes this block for MySQL / SQL Server / MongoDB, remote hosts (TLS), and GCS / S3 / Azure destinations — fill in the fields, copy, paste. A worked example with expected output: [MySQL (Cloud SQL) → GCS](recipes/quickstart-mysql-gcs.md).
+
 > **Already running it locally?** Jump to [§3 Preflight & run](#3--preflight--run). If you're evaluating it for production, finish this page first, then continue with [docs/pilot/](pilot/).
 
 ---
