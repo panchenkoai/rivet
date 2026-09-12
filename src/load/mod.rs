@@ -134,6 +134,131 @@ pub trait TargetLoader {
     fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// How `<table>__changes` differs from what the load DECLARES, or `None` when it
+    /// matches, is absent, nothing is declared, or the warehouse cannot tell.
+    fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
+        Ok(None)
+    }
+
+    /// Re-cluster `<table>__changes` in place to the load's `cluster_by`.
+    fn recluster_changelog(&self, _table: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Rebuild `<table>__changes` with the load's partition — a billed copy of every
+    /// row — and swap it in.
+    fn rebuild_changelog(&self, table: &str) -> Result<()> {
+        bail!(
+            "rebuilding `{}` is not supported on this warehouse",
+            self.fqtn(&format!("{table}__changes"))
+        )
+    }
+
+    /// Objects an interrupted rebuild of `<table>__changes` left behind.
+    fn rebuild_leftovers(&self, _table: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+/// How an existing change log differs from what the load declares (ADR-0034 D5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangelogDrift {
+    /// A different partition: only a rebuild (a billed copy of `bytes`) can change it.
+    Partition {
+        existing: String,
+        declared: String,
+        bytes: Option<u64>,
+    },
+    /// A different clustering: applied to the table's metadata in place.
+    Cluster {
+        existing: Vec<String>,
+        declared: Vec<String>,
+    },
+}
+
+/// Bring `<table>__changes` to the shape the load declares: re-cluster in place; rebuild
+/// a changed partition only when asked for, else refuse naming the cost.
+fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool) -> Result<()> {
+    let changes = loader.fqtn(&format!("{table}__changes"));
+    match loader.changelog_drift(table)? {
+        None => Ok(()),
+        Some(ChangelogDrift::Cluster { existing, declared }) => {
+            loader.recluster_changelog(table)?;
+            eprintln!(
+                "  note: `{changes}` now clusters on {}, was {} — new rows land clustered and \
+                 the warehouse re-clusters the rest in the background",
+                column_list(&declared),
+                column_list(&existing)
+            );
+            Ok(())
+        }
+        Some(ChangelogDrift::Partition {
+            existing,
+            declared,
+            bytes,
+        }) => {
+            if !rebuild {
+                bail!("{}", rebuild_refusal(&changes, &existing, &declared, bytes));
+            }
+            loader.rebuild_changelog(table)?;
+            eprintln!("  note: `{changes}` rebuilt: partitioned by {declared}, was {existing}");
+            Ok(())
+        }
+    }
+}
+
+/// Why a changed partition of the change log is refused: the rebuild, and what it reads.
+fn rebuild_refusal(changes: &str, existing: &str, declared: &str, bytes: Option<u64>) -> String {
+    let reads = bytes.map_or_else(
+        || "every row".to_string(),
+        |b| format!("every row ({})", human_size(b)),
+    );
+    format!(
+        "`{changes}` is partitioned by {existing}, the load declares {declared}; a table cannot \
+         be re-partitioned in place. `rivet load --rebuild-changelog` rebuilds it with a billed \
+         query reading {reads} and swaps it in — nothing was changed"
+    )
+}
+
+/// Why a load stops at the remains of an interrupted rebuild.
+fn leftovers_refusal(changes: &str, leftovers: &[String]) -> String {
+    format!(
+        "a rebuild of `{changes}` was interrupted and left {}: keep the one holding every row \
+         under the name `{changes}`, drop the other, then re-run",
+        leftovers
+            .iter()
+            .map(|l| format!("`{l}`"))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    )
+}
+
+/// `` `a`, `b` `` or `nothing`.
+fn column_list(cols: &[String]) -> String {
+    if cols.is_empty() {
+        return "nothing".to_string();
+    }
+    cols.iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `1.5 GiB` for a byte count.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 /// Whether an existing warehouse table is one rivet loaded, per the load ledger.
@@ -374,6 +499,7 @@ fn append_and_view(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
     ownership: Ownership,
+    rebuild_changelog: bool,
     label: &str,
     build_view: impl FnOnce(&dyn TargetLoader) -> Result<()>,
 ) -> Result<CdcLoadReport> {
@@ -405,6 +531,13 @@ fn append_and_view(
         }
     }
     validate_specs(&format!("{table}__changes"), specs)?;
+    let leftovers = loader.rebuild_leftovers(table)?;
+    if !leftovers.is_empty() {
+        bail!(
+            "{}",
+            leftovers_refusal(&loader.fqtn(&format!("{table}__changes")), &leftovers)
+        );
+    }
 
     if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership)? {
         eprintln!(
@@ -414,6 +547,7 @@ fn append_and_view(
             loader.fqtn(&format!("{table}__changes"))
         );
     }
+    settle_changelog_shape(loader, table, rebuild_changelog)?;
 
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
 
@@ -506,6 +640,7 @@ pub fn run_load_cdc(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
     ownership: Ownership,
+    rebuild_changelog: bool,
 ) -> Result<CdcLoadReport> {
     // PK-injection gating lives in the SHARED seam `append_and_view` (below), which
     // covers both the CDC and incremental drivers — no per-driver copy (the old
@@ -519,6 +654,7 @@ pub fn run_load_cdc(
         expected_delta,
         cleanup,
         ownership,
+        rebuild_changelog,
         "CDC",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
@@ -553,6 +689,7 @@ pub fn run_load_incremental(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
     ownership: Ownership,
+    rebuild_changelog: bool,
 ) -> Result<CdcLoadReport> {
     // uris + pk are checked by `append_and_view`; the cursor guards are incremental-only.
     if cursor_column.is_empty() {
@@ -585,6 +722,7 @@ pub fn run_load_incremental(
         expected_delta,
         cleanup,
         ownership,
+        rebuild_changelog,
         "incremental",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
@@ -659,13 +797,16 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
-        LoadTarget::Bigquery { project, dataset } => Box::new(build_bigquery_loader(
-            project,
-            dataset,
-            plan.partition.as_ref(),
-            &plan.cluster_by,
-            run_id,
-        )),
+        LoadTarget::Bigquery { project, dataset } => Box::new(
+            build_bigquery_loader(
+                project,
+                dataset,
+                plan.partition.as_ref(),
+                &plan.cluster_by,
+                run_id,
+            )
+            .cluster_declared(plan.cluster_declared),
+        ),
         LoadTarget::Snowflake {
             connection,
             warehouse,
@@ -730,6 +871,8 @@ mod tests {
         overlap: Option<(u64, u64)>,
         prior_changes: bool,
         shape_conflict: Option<String>,
+        drift: RefCell<Option<ChangelogDrift>>,
+        leftovers: Vec<String>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -770,6 +913,22 @@ mod tests {
         fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
             Ok(self.shape_conflict.clone())
         }
+        fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
+            Ok(self.drift.borrow().clone())
+        }
+        fn recluster_changelog(&self, table: &str) -> Result<()> {
+            self.calls.borrow_mut().push(format!("recluster {table}"));
+            *self.drift.borrow_mut() = None;
+            Ok(())
+        }
+        fn rebuild_changelog(&self, table: &str) -> Result<()> {
+            self.calls.borrow_mut().push(format!("rebuild {table}"));
+            *self.drift.borrow_mut() = None;
+            Ok(())
+        }
+        fn rebuild_leftovers(&self, _table: &str) -> Result<Vec<String>> {
+            Ok(self.leftovers.clone())
+        }
         fn materialize(&self, table: &str, _: &[TargetColumnSpec], _: &[String]) -> Result<u64> {
             self.materialized.borrow_mut().push(table.into());
             Ok(self.rows)
@@ -809,6 +968,14 @@ mod tests {
     }
 
     fn load_incremental_as(f: &FakeLoader, ownership: Ownership) -> Result<CdcLoadReport> {
+        load_incremental_with(f, ownership, false)
+    }
+
+    fn load_incremental_with(
+        f: &FakeLoader,
+        ownership: Ownership,
+        rebuild: bool,
+    ) -> Result<CdcLoadReport> {
         run_load_incremental(
             f,
             "t",
@@ -819,11 +986,78 @@ mod tests {
             Some(3),
             None,
             ownership,
+            rebuild,
         )
     }
 
     fn calls(f: &FakeLoader) -> Vec<String> {
         f.calls.borrow().clone()
+    }
+
+    fn changelog_with(drift: ChangelogDrift) -> FakeLoader {
+        let f = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        f.kinds
+            .borrow_mut()
+            .insert("t__changes".into(), ObjectKind::Table);
+        *f.drift.borrow_mut() = Some(drift);
+        f
+    }
+
+    #[test]
+    fn a_changed_clustering_of_the_changelog_is_applied_before_the_append() {
+        let f = changelog_with(ChangelogDrift::Cluster {
+            existing: vec!["id".into()],
+            declared: vec!["v".into()],
+        });
+        load_incremental(&f).unwrap();
+        assert_eq!(calls(&f), ["recluster t", "append t"]);
+    }
+
+    #[test]
+    fn a_changed_partition_of_the_changelog_is_refused_until_a_rebuild_is_asked_for() {
+        let drift = || ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: Some(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+        };
+        let f = changelog_with(drift());
+        let err = format!("{:#}", load_incremental(&f).unwrap_err());
+        assert!(
+            err.contains(
+                "`db.t__changes` is partitioned by `ts` by day, the load declares `ts` by month"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("--rebuild-changelog") && err.contains("3.5 GiB"),
+            "{err}"
+        );
+        assert!(calls(&f).is_empty(), "nothing appended: {:?}", calls(&f));
+
+        let f = changelog_with(drift());
+        load_incremental_with(&f, Ownership::Own, true).unwrap();
+        assert_eq!(calls(&f), ["rebuild t", "append t"]);
+    }
+
+    #[test]
+    fn an_interrupted_rebuild_is_refused_before_anything_else() {
+        let f = FakeLoader {
+            rows: 3,
+            leftovers: vec!["db.t__changes__old".into()],
+            ..Default::default()
+        };
+        let err = format!("{:#}", load_incremental(&f).unwrap_err());
+        assert!(
+            err.contains("interrupted") && err.contains("`db.t__changes__old`"),
+            "{err}"
+        );
+        assert!(calls(&f).is_empty());
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
     }
 
     #[test]
@@ -921,6 +1155,7 @@ mod tests {
             Some(3),
             None,
             Ownership::Own,
+            false,
         )
         .unwrap();
         assert_eq!(calls(&f), ["adopt t", "append t"]);
@@ -1265,6 +1500,7 @@ mod tests {
             Some(5),
             Some((&store, PREFIX)),
             Ownership::Own,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -1297,6 +1533,7 @@ mod tests {
             Some(5),
             Some((&store, PREFIX)),
             Ownership::Own,
+            false,
         )
         .unwrap();
         assert_eq!(r.rows_appended, 5);
@@ -1400,7 +1637,8 @@ mod tests {
                 cdc::SourceEngine::MySql,
                 None,
                 None,
-                Ownership::Own
+                Ownership::Own,
+                false,
             )
             .is_err()
         );
@@ -1452,6 +1690,7 @@ mod tests {
                     Some(1),
                     None,
                     Ownership::Own,
+                    false,
                 )
                 .is_err(),
                 "run_load_cdc must reject the injection URI {bad:?}"
@@ -1482,6 +1721,7 @@ mod tests {
             None,
             None,
             Ownership::Own,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -1513,6 +1753,7 @@ mod tests {
             None,
             None,
             Ownership::Own,
+            false,
         )
         .unwrap_err()
         .to_string();

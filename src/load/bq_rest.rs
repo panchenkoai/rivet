@@ -154,6 +154,21 @@ impl BigQueryApi {
             .filter(|meta| meta.get("type").and_then(Value::as_str) == Some("TABLE")))
     }
 
+    /// `tables.patch` on `dataset.table` with `body` — the metadata-only changes
+    /// (clustering) no DDL statement can make.
+    pub(crate) fn patch_table(&self, dataset: &str, table: &str, body: &Value) -> Result<Value> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
+            self.endpoint, self.project
+        );
+        let resp = self
+            .authorized(self.http.patch(&url))?
+            .json(body)
+            .send()
+            .context("BigQuery tables.patch request failed")?;
+        self.read_json(resp, "tables.patch")
+    }
+
     /// `numRows` of `dataset.table` from `tables.get`: table metadata, no query job, so
     /// it needs no partition filter on a table that requires one. `None` for anything
     /// but a table — a view reports a meaningless zero.

@@ -21,6 +21,17 @@
   (`range` / `ingestion` / the options are refused). The per-job Hive batching of the old
   export-`partition_by` loader path — unreachable since `partition_by` and `load:` exclude
   each other — is gone.
+- **A change log follows a written `partition:` / `cluster_by:`; `rivet load
+  --rebuild-changelog` re-partitions it.** With the defaults (`partition` absent,
+  `cluster_by: auto`) `<table>__changes` keeps whatever shape it has. Once the config writes
+  `cluster_by`, a log clustered otherwise is re-clustered in place (new rows land clustered,
+  BigQuery re-clusters the rest in the background). Once it writes `partition`, a log
+  partitioned otherwise refuses the load naming both keys and the bytes a rebuild reads;
+  `rivet load --rebuild-changelog` copies the log in the declared shape with a billed query,
+  checks the row count and swaps it in — never as a side effect of a scheduled load. A load
+  that finds the remains of an interrupted swap (`<table>__changes__old` / `__rebuild`) stops
+  before touching anything and says which to keep. A changed `expiration_days` is altered in
+  place on the log as on the table.
 - **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
   text ("failed to lookup address information…", or MongoDB's whole topology dump); a
   connection that fails before the server answers now says `cannot resolve host <host> —

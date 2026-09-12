@@ -663,3 +663,79 @@ fn bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load() {
     );
     assert_eq!(bq.read_bq_table_type(&table), None, "no job ran");
 }
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild() {
+    let Some(bq) = BqLive::from_env("bq_part_drift") else {
+        return;
+    };
+    let (table, _guard) = temporal_pg_table("bq_part_drift", 30);
+    let changes = format!("{table}__changes");
+    let (old, rebuild) = (format!("{changes}__old"), format!("{changes}__rebuild"));
+    let _cleanup = bq.cleanup(&[&table, &changes, &old, &rebuild]);
+    let daily = Some(("DAY".to_string(), Some("ts".to_string())));
+    let rig = SqlEngine::Pg
+        .rig(&table)
+        .restage("incremental", &["cursor_column: id"])
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&partition_line(&bq, "{ column: ts, granularity: day }"));
+    rig.run_ok();
+    load_ok(&rig);
+    add_temporal_rows(&table, 31, 35);
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_clustering(&changes), ["id"]);
+    assert_eq!(bq.read_bq_time_partitioning(&changes), daily);
+
+    add_temporal_rows(&table, 36, 40);
+    let rig = rig
+        .clear_top_lines()
+        .top_line(&bq.load_line(", cluster_by: [v], partition: { column: ts, granularity: day }"));
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(
+        bq.read_bq_clustering(&changes),
+        ["v"],
+        "a written cluster_by re-clusters the log in place"
+    );
+    assert_eq!(bq.read_bq_count(&changes), "40");
+
+    add_temporal_rows(&table, 41, 45);
+    let rig = rig.clear_top_lines().top_line(
+        &bq.load_line(", cluster_by: [v], partition: { column: ts, granularity: month }"),
+    );
+    rig.run_ok();
+    let said = load_fails(&rig);
+    assert!(
+        said.contains("partitioned by `ts` by day, the load declares `ts` by month")
+            && said.contains("--rebuild-changelog"),
+        "the refusal names both keys and the way out:\n{said}"
+    );
+    assert_eq!(bq.read_bq_time_partitioning(&changes), daily, "untouched");
+    assert_eq!(bq.read_bq_count(&changes), "40", "untouched");
+
+    let out = rig.cli(&["load", "--rebuild-changelog"]);
+    assert!(
+        out.status.success(),
+        "rivet load --rebuild-changelog failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        bq.read_bq_time_partitioning(&changes),
+        Some(("MONTH".to_string(), Some("ts".to_string())))
+    );
+    assert_eq!(bq.read_bq_clustering(&changes), ["v"]);
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "45",
+        "the rebuilt log plus the delta"
+    );
+    assert_eq!(distinct_ids(&bq, &table), "45");
+    assert_eq!(
+        bq.read_bq_table_type(&old),
+        None,
+        "the swap left nothing behind"
+    );
+    assert_eq!(bq.read_bq_table_type(&rebuild), None);
+}

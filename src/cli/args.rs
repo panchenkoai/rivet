@@ -203,6 +203,12 @@ pub enum Commands {
         /// per run as well as per table. Defaults to a generated id.
         #[arg(long, env = "RIVET_RUN_ID")]
         run_id: Option<String>,
+        /// Rebuild a `<table>__changes` whose partitioning differs from the config's
+        /// `load.partition` — a billed query copying every row — and swap it in.
+        /// Without this flag such a load is refused naming the difference; a
+        /// rebuild is never a side effect of a scheduled load.
+        #[arg(long)]
+        rebuild_changelog: bool,
     },
     /// Manage export state
     State {

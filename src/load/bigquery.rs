@@ -106,6 +106,10 @@ pub struct BigQueryLoader {
     pub partition: Option<TablePartition>,
     /// Up to 4 clustering columns. Applied only when the table is created.
     pub cluster_by: Vec<String>,
+    /// Whether the config declared `cluster_by` (a list or `none`) rather than leaving
+    /// it at `auto`: a declared clustering is applied to an existing change log; an
+    /// `auto` one leaves the log's own.
+    pub cluster_declared: bool,
     /// Load-run correlation id, emitted as the automatic `rivet_run:<id>` job
     /// label so every job of one `rivet load` invocation shares a run key —
     /// cost slices per run (across tables) as well as per table. `None` omits
@@ -126,9 +130,16 @@ impl BigQueryLoader {
             dataset: dataset.into(),
             partition: None,
             cluster_by: Vec::new(),
+            cluster_declared: false,
             run_id: None,
             api: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Whether the config wrote `cluster_by` (see the field).
+    pub fn cluster_declared(mut self, declared: bool) -> Self {
+        self.cluster_declared = declared;
+        self
     }
 
     /// Partition the table the load creates.
@@ -292,10 +303,10 @@ impl TargetLoader for BigQueryLoader {
                  would drop rows that never changed from the current-state view"
             );
         }
-        if !same_columns(&shape.cluster, &self.cluster_by) {
+        if keeps_own_clustering(&shape, &self.cluster_by, self.cluster_declared) {
             eprintln!(
-                "  note: `{changes}` keeps the clustering `{src}` had ({}); `cluster_by` applies \
-                 to a change log rivet creates",
+                "  note: `{changes}` keeps the clustering `{src}` had ({}); a written `cluster_by` \
+                 would re-cluster it",
                 shape.cluster.join(", ")
             );
         }
@@ -307,6 +318,71 @@ impl TargetLoader for BigQueryLoader {
         Ok(self
             .existing_shape(table)?
             .and_then(|shape| shape_conflict(&shape, want, &self.cluster_by)))
+    }
+
+    fn changelog_drift(&self, table: &str) -> Result<Option<super::ChangelogDrift>> {
+        let changes = format!("{table}__changes");
+        let declared_cluster = self.cluster_declared.then_some(self.cluster_by.as_slice());
+        Ok(self.existing_shape(&changes)?.and_then(|shape| {
+            classify_drift(
+                &shape,
+                self.partition.as_ref().map(|p| &p.key),
+                declared_cluster,
+            )
+        }))
+    }
+
+    fn recluster_changelog(&self, table: &str) -> Result<()> {
+        let changes = format!("{table}__changes");
+        self.api()?
+            .patch_table(&self.dataset, &changes, &clustering_patch(&self.cluster_by))?;
+        Ok(())
+    }
+
+    fn rebuild_changelog(&self, table: &str) -> Result<()> {
+        let changes = format!("{table}__changes");
+        let rebuild = format!("{changes}__rebuild");
+        let old = format!("{changes}__old");
+        let before = self.count_rows(&changes)?;
+        let copy = build_rebuild_copy_sql(
+            &self.fqtn(&rebuild),
+            &self.fqtn(&changes),
+            self.partition.as_ref(),
+            &self.cluster_by,
+        );
+        self.run_sql(&copy, "rebuild", table)?;
+        let after = self.count_rows(&rebuild)?;
+        if after != before {
+            bail!(
+                "`{}` holds {after} rows but `{}` holds {before} — the copy is left for \
+                 inspection, nothing was swapped",
+                self.fqtn(&rebuild),
+                self.fqtn(&changes)
+            );
+        }
+        for sql in build_rebuild_swap_sql(
+            &self.fqtn(&changes),
+            &self.fqtn(&rebuild),
+            &self.fqtn(&old),
+            &changes,
+            &old,
+        ) {
+            self.run_sql(&sql, "rebuild", table)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_leftovers(&self, table: &str) -> Result<Vec<String>> {
+        let changes = format!("{table}__changes");
+        let names = [format!("{changes}__rebuild"), format!("{changes}__old")];
+        let sql = build_leftovers_sql(&self.project, &self.dataset, &names);
+        let code = self
+            .api()?
+            .run_query_scalar(&sql, &self.labels("probe", table))?;
+        Ok(leftover_names(code, &names)
+            .iter()
+            .map(|n| self.fqtn(n))
+            .collect())
     }
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
@@ -379,6 +455,16 @@ impl TargetLoader for BigQueryLoader {
         if let Some(alter) = build_alter_add_columns_sql(&changes_fqtn, &full) {
             self.run_sql(&alter, "alter", &changes)?;
         }
+        // …and its partition options, as the log takes them (no filter, no load-date expiry).
+        let log_partition = self.partition.as_ref().map(changelog_partition);
+        if let Some(alter) = options_drift(
+            &changes_fqtn,
+            self.existing_shape(&changes)?.as_ref(),
+            log_partition.as_ref(),
+        ) {
+            self.run_sql(&alter, "alter", &changes)?;
+            eprintln!("  note: `{changes_fqtn}` partition options changed: {alter}");
+        }
 
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
@@ -441,6 +527,120 @@ struct TableShape {
     cluster: Vec<String>,
     require_partition_filter: bool,
     expiration_ms: Option<u64>,
+    /// `numBytes` — what a rebuild would read.
+    bytes: Option<u64>,
+}
+
+/// Whether an adopted log keeps the clustering its table had: `cluster_by` differs but was
+/// not written in the config.
+fn keeps_own_clustering(shape: &TableShape, cluster_by: &[String], declared: bool) -> bool {
+    !declared && !same_columns(&shape.cluster, cluster_by)
+}
+
+/// Drift of an existing change log from what the load DECLARES: a declared partition that
+/// differs comes first (only a rebuild fixes it), then a declared clustering that differs
+/// (patched in place). Nothing declared → no drift; the log keeps its own shape.
+fn classify_drift(
+    shape: &TableShape,
+    partition: Option<&PartitionKey>,
+    cluster_by: Option<&[String]>,
+) -> Option<super::ChangelogDrift> {
+    if let Some(want) = partition
+        && !same_partition(shape.partition.as_ref(), Some(want))
+    {
+        return Some(super::ChangelogDrift::Partition {
+            existing: shape
+                .partition
+                .as_ref()
+                .map_or_else(|| "nothing".to_string(), PartitionKey::describe),
+            declared: want.describe(),
+            bytes: shape.bytes,
+        });
+    }
+    if let Some(want) = cluster_by
+        && !same_columns(&shape.cluster, want)
+    {
+        return Some(super::ChangelogDrift::Cluster {
+            existing: shape.cluster.clone(),
+            declared: want.to_vec(),
+        });
+    }
+    None
+}
+
+/// The `tables.patch` body setting — or, for no columns, clearing — a table's clustering.
+fn clustering_patch(cluster_by: &[String]) -> serde_json::Value {
+    if cluster_by.is_empty() {
+        serde_json::json!({ "clustering": null })
+    } else {
+        serde_json::json!({ "clustering": { "fields": cluster_by } })
+    }
+}
+
+/// The billed copy of the change log into `rebuild_fqtn`, shaped as the load declares.
+fn build_rebuild_copy_sql(
+    rebuild_fqtn: &str,
+    changes_fqtn: &str,
+    partition: Option<&TablePartition>,
+    cluster_by: &[String],
+) -> String {
+    let options = partition.and_then(changelog_options_sql);
+    format!(
+        "CREATE TABLE `{rebuild_fqtn}`{}\nAS SELECT * FROM `{changes_fqtn}`;",
+        table_shape_clauses(
+            partition.map(|p| p.expr.as_str()),
+            cluster_by,
+            options.as_deref()
+        )
+    )
+}
+
+/// Swap the rebuilt log in: the old one steps aside, the copy takes the name, the old one
+/// is dropped. An interruption leaves `<name>__old` / `<name>__rebuild`, which the next
+/// load refuses to proceed past (`rebuild_leftovers`).
+fn build_rebuild_swap_sql(
+    changes_fqtn: &str,
+    rebuild_fqtn: &str,
+    old_fqtn: &str,
+    changes_name: &str,
+    old_name: &str,
+) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE `{changes_fqtn}` RENAME TO {old_name};"),
+        format!("ALTER TABLE `{rebuild_fqtn}` RENAME TO {changes_name};"),
+        format!("DROP TABLE `{old_fqtn}`;"),
+    ]
+}
+
+/// Probe whose scalar has bit `i` set when `names[i]` exists in the dataset.
+fn build_leftovers_sql(project: &str, dataset: &str, names: &[String]) -> String {
+    let terms = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("{} * COUNTIF(table_name = '{n}')", 1u64 << i))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    format!("SELECT {terms} AS n FROM `{project}.{dataset}`.INFORMATION_SCHEMA.TABLES")
+}
+
+/// The names whose bit is set in the leftovers probe's scalar.
+fn leftover_names(code: u64, names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| code & (1 << i) != 0)
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+/// The partition as the change log takes it: never a filter requirement, and an expiry
+/// only on a column or range key (load-date partitions of a log do not expire).
+fn changelog_partition(p: &TablePartition) -> TablePartition {
+    TablePartition {
+        expiration_days: p.key.column().and(p.expiration_days),
+        require_filter: false,
+        ..p.clone()
+    }
 }
 
 impl TableShape {
@@ -494,6 +694,7 @@ fn parse_table_shape(meta: &serde_json::Value) -> TableShape {
     if let Some(required) = meta.get("requirePartitionFilter").and_then(Value::as_bool) {
         shape.require_partition_filter |= required;
     }
+    shape.bytes = text(meta, "numBytes").and_then(|s| s.parse().ok());
     shape.cluster = meta
         .pointer("/clustering/fields")
         .and_then(Value::as_array)
@@ -908,6 +1109,125 @@ mod tests {
         }
     }
 
+    #[test]
+    fn changelog_drift_follows_only_a_declared_partition_or_clustering() {
+        use super::super::ChangelogDrift;
+        let shape = TableShape {
+            partition: Some(time_key(Some("ts"), Granularity::Day)),
+            cluster: vec!["id".into()],
+            require_partition_filter: false,
+            expiration_ms: None,
+            bytes: Some(42),
+        };
+        let monthly = time_key(Some("ts"), Granularity::Month);
+        let daily = time_key(Some("ts"), Granularity::Day);
+        let v = vec!["v".to_string()];
+        assert_eq!(
+            classify_drift(&shape, Some(&monthly), Some(&v)),
+            Some(ChangelogDrift::Partition {
+                existing: "`ts` by day".into(),
+                declared: "`ts` by month".into(),
+                bytes: Some(42),
+            }),
+            "a partition difference comes first"
+        );
+        assert_eq!(
+            classify_drift(&shape, Some(&daily), Some(&v)),
+            Some(ChangelogDrift::Cluster {
+                existing: vec!["id".into()],
+                declared: v.clone(),
+            })
+        );
+        assert_eq!(classify_drift(&shape, None, None), None, "nothing declared");
+        assert_eq!(classify_drift(&shape, Some(&daily), None), None);
+        assert_eq!(
+            classify_drift(&shape, Some(&daily), Some(&["ID".to_string()])),
+            None,
+            "the same clustering, compared without case"
+        );
+        assert!(keeps_own_clustering(&shape, &v, false));
+        assert!(!keeps_own_clustering(&shape, &v, true));
+        assert!(!keeps_own_clustering(&shape, &["id".to_string()], false));
+    }
+
+    #[test]
+    fn a_recluster_patches_the_fields_or_clears_them() {
+        assert_eq!(
+            clustering_patch(&["a".into(), "b".into()]),
+            serde_json::json!({ "clustering": { "fields": ["a", "b"] } })
+        );
+        assert_eq!(
+            clustering_patch(&[]),
+            serde_json::json!({ "clustering": null })
+        );
+    }
+
+    #[test]
+    fn a_rebuild_copies_the_log_in_the_declared_shape_then_swaps_it_in() {
+        let p = partition_at(time_key(Some("ts"), Granularity::Month), Some(30), true);
+        let copy = build_rebuild_copy_sql(
+            "p.d.t__changes__rebuild",
+            "p.d.t__changes",
+            Some(&p),
+            &["id".into()],
+        );
+        assert_eq!(
+            copy,
+            "CREATE TABLE `p.d.t__changes__rebuild`\nPARTITION BY TIMESTAMP_TRUNC(ts, DAY)\n\
+             CLUSTER BY `id`\nOPTIONS(partition_expiration_days = 30)\nAS SELECT * FROM `p.d.t__changes`;"
+        );
+        assert!(!copy.contains("require_partition_filter"));
+        let swap = build_rebuild_swap_sql(
+            "p.d.t__changes",
+            "p.d.t__changes__rebuild",
+            "p.d.t__changes__old",
+            "t__changes",
+            "t__changes__old",
+        );
+        assert_eq!(
+            swap,
+            [
+                "ALTER TABLE `p.d.t__changes` RENAME TO t__changes__old;",
+                "ALTER TABLE `p.d.t__changes__rebuild` RENAME TO t__changes;",
+                "DROP TABLE `p.d.t__changes__old`;",
+            ]
+        );
+        let flat = build_rebuild_copy_sql("r", "c", None, &[]);
+        assert_eq!(flat, "CREATE TABLE `r`\nAS SELECT * FROM `c`;");
+    }
+
+    #[test]
+    fn the_leftovers_probe_names_what_an_interrupted_rebuild_left() {
+        let names = [
+            "t__changes__rebuild".to_string(),
+            "t__changes__old".to_string(),
+        ];
+        let sql = build_leftovers_sql("p", "d", &names);
+        assert_eq!(
+            sql,
+            "SELECT 1 * COUNTIF(table_name = 't__changes__rebuild') + 2 * COUNTIF(table_name = \
+             't__changes__old') AS n FROM `p.d`.INFORMATION_SCHEMA.TABLES"
+        );
+        assert!(leftover_names(0, &names).is_empty());
+        assert_eq!(leftover_names(1, &names), ["t__changes__rebuild"]);
+        assert_eq!(leftover_names(2, &names), ["t__changes__old"]);
+        assert_eq!(leftover_names(3, &names), names);
+    }
+
+    #[test]
+    fn the_log_takes_a_partition_without_a_filter_or_a_load_date_expiry() {
+        let column = partition_at(time_key(Some("ts"), Granularity::Day), Some(400), true);
+        let log = changelog_partition(&column);
+        assert_eq!(
+            (log.expiration_days, log.require_filter),
+            (Some(400), false)
+        );
+        assert_eq!(log.key, column.key);
+        let ingestion = partition_at(time_key(None, Granularity::Day), Some(3), true);
+        let log = changelog_partition(&ingestion);
+        assert_eq!((log.expiration_days, log.require_filter), (None, false));
+    }
+
     /// A `tables.get` resource with the given partitioning, clustering and options.
     fn meta(
         partition: serde_json::Value,
@@ -992,6 +1312,7 @@ mod tests {
                 cluster: vec!["v".into(), "order".into()],
                 require_partition_filter: true,
                 expiration_ms: Some(DAY_MS),
+                bytes: None,
             }
         );
         let range = parse_table_shape(&meta(
@@ -1060,6 +1381,7 @@ mod tests {
             cluster: vec![],
             require_partition_filter: true,
             expiration_ms: Some(400 * DAY_MS),
+            bytes: None,
         };
         let same = partition_at(time_key(Some("ts"), Granularity::Day), Some(400), true);
         assert_eq!(options_drift("p.d.t", Some(&shape), Some(&same)), None);
@@ -1171,6 +1493,7 @@ mod tests {
             cluster: vec!["v".into()],
             require_partition_filter: false,
             expiration_ms: None,
+            bytes: None,
         };
         let id = vec!["id".to_string()];
         let diff = shape_conflict(&existing, None, &id).expect("differs");
@@ -1198,6 +1521,7 @@ mod tests {
         let with_options = TableShape {
             require_partition_filter: true,
             expiration_ms: Some(DAY_MS),
+            bytes: None,
             ..existing.clone()
         };
         assert_eq!(
@@ -1637,6 +1961,7 @@ mod tests {
             None,
             None,
             crate::load::Ownership::Own,
+            false,
         )
         .expect("first CDC append + view build should succeed");
         let second = crate::load::run_load_cdc(
@@ -1649,6 +1974,7 @@ mod tests {
             None,
             None,
             crate::load::Ownership::Own,
+            false,
         )
         .expect("second CDC append (at-least-once) should succeed");
         assert!(second.rows_appended > 0, "second append added rows");

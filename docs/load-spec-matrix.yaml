@@ -195,6 +195,34 @@ scenarios:
     duckdb:     { na: "not a load target" }
     clickhouse: { na: "not a load target" }
 
+  - id: changelog_keeps_its_shape_under_the_defaults
+    what: "with `partition` absent and `cluster_by: auto` an existing change log keeps the shape it has (D2: the log follows the table it grew from) — no drift is ever reported"
+    bigquery:   { test: changelog_drift_follows_only_a_declared_partition_or_clustering }
+    snowflake:  { na: "no change-log shape probe (changelog_drift defaults to none)" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: changelog_reclustered_in_place
+    what: "a written `cluster_by` that differs from the log's is patched in place (tables.patch clustering, set or cleared) before the append"
+    bigquery:   { test: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild }
+    snowflake:  { na: "no change-log shape probe; Snowflake could ALTER TABLE … CLUSTER BY in place — not wired, not live-run" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: changelog_partition_change_refused_until_rebuild
+    what: "a written `partition` that differs from the log's refuses the load naming both keys and the bytes a rebuild reads; nothing is touched"
+    bigquery:   { test: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild }
+    snowflake:  { na: "no change-log shape probe" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: rebuild_changelog_swaps_a_repartitioned_copy_in
+    what: "`rivet load --rebuild-changelog` copies the log in the declared shape (billed CTAS), checks the row count, renames the old aside, the copy in, drops the old; an interrupted swap's leftovers stop the next load"
+    bigquery:   { test: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild }
+    snowflake:  { na: "rebuild_changelog is refused as unsupported on Snowflake" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
   - id: span_over_the_job_cap_refused
     what: "a load whose Parquet spans more than 4,000 partitions is refused from the footer statistics before any job, naming the granularity that fits (D4)"
     bigquery:   { test: bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load }

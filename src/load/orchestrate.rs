@@ -20,6 +20,8 @@ use anyhow::Context as _;
 pub struct LoadArgs {
     pub config: String,
     pub run_id: Option<String>,
+    /// Rebuild a change log whose partition differs from the config (ADR-0034 D5).
+    pub rebuild_changelog: bool,
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
@@ -91,6 +93,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                         engine.expect("engine resolved above for a cdc plan"),
                         pk,
                         drift,
+                        args.rebuild_changelog,
                         state.as_ref(),
                         ledger_errored,
                         &load_id,
@@ -102,8 +105,15 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                 // Incremental: APPEND the delta + a cursor-ordered current-state view.
                 load::plan::LoadMode::Incremental => {
                     let pk = require_pk(plan, "incremental")?;
-                    match load_one_incremental(plan, &run_id, pk, drift, state.as_ref(), &load_id)?
-                    {
+                    match load_one_incremental(
+                        plan,
+                        &run_id,
+                        pk,
+                        drift,
+                        args.rebuild_changelog,
+                        state.as_ref(),
+                        &load_id,
+                    )? {
                         Some(report) => {
                             println!("INCREMENTAL LOAD OK [{}]: {}", plan.table, report.summary())
                         }
@@ -1114,6 +1124,7 @@ fn load_one_cdc(
     engine: load::cdc::SourceEngine,
     pk: &[String],
     allow_source_drift: bool,
+    rebuild_changelog: bool,
     state: Option<&StateStore>,
     ledger_errored: bool,
     load_id: &str,
@@ -1204,6 +1215,7 @@ fn load_one_cdc(
                 Some(inputs.integrity.file_rows),
                 cleanup,
                 inputs.ownership,
+                rebuild_changelog,
             )?;
             Ok((report.rows_appended, report))
         },
@@ -1297,6 +1309,7 @@ fn load_one_incremental(
     run_id: &str,
     pk: &[String],
     allow_source_drift: bool,
+    rebuild_changelog: bool,
     state: Option<&StateStore>,
     load_id: &str,
 ) -> Result<Option<IncrementalReport>> {
@@ -1395,6 +1408,7 @@ fn load_one_incremental(
                     Some(integrity.file_rows),
                     cleanup,
                     ownership,
+                    rebuild_changelog,
                 )?;
                 eprintln!("{}", append_done_line(&integrity, &r));
                 rows += r.rows_appended;
@@ -1536,6 +1550,7 @@ mod load_ledger_tests {
             cursor_column: None,
             pk: vec![],
             cluster_by: vec![],
+            cluster_declared: false,
         };
         let err = require_pk(&plan, "cdc").unwrap_err().to_string();
         assert!(err.contains("export `c1`"), "must name the export: {err}");
@@ -1809,6 +1824,7 @@ mod live_only_decisions {
             cursor_column: None,
             pk: vec!["id".into()],
             cluster_by: vec![],
+            cluster_declared: false,
         }
     }
 

@@ -173,6 +173,7 @@ The native column schema, target table, partition, and source URIs are all deriv
 
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
+* `--rebuild-changelog` — Rebuild a `<table>__changes` whose partitioning differs from the config's `load.partition` — a billed query copying every row — and swap it in. Without this flag such a load is refused naming the difference; a rebuild is never a side effect of a scheduled load
 
 
 

@@ -570,6 +570,9 @@ pub struct LoadPlan {
     pub pk: Vec<String>,
     /// The resolved clustering columns of the table the load writes.
     pub cluster_by: Vec<String>,
+    /// Whether `cluster_by` was written in the config (a list or `none`) rather than
+    /// left at `auto` — a change log follows a declared clustering, keeps its own otherwise.
+    pub cluster_declared: bool,
 }
 
 /// Resolve a rivet config into **one [`LoadPlan`] per export** — the shared
@@ -968,6 +971,7 @@ fn build_plans_keyed(
             &specs,
         )?;
         let partition = resolve_partition(&export.name, &eff_load, mode, &specs)?;
+        let cluster_declared = !matches!(eff_load.cluster_by, KeyColumns::Auto);
         plans.push(LoadPlan {
             export_name: export.name.clone(),
             table,
@@ -980,6 +984,7 @@ fn build_plans_keyed(
             cursor_column: export.cursor_column.clone(),
             pk,
             cluster_by,
+            cluster_declared,
         });
     }
     reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;
