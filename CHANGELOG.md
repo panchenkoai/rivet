@@ -32,6 +32,10 @@
   that finds the remains of an interrupted swap (`<table>__changes__old` / `__rebuild`) stops
   before touching anything and says which to keep. A changed `expiration_days` is altered in
   place on the log as on the table.
+- **BigQuery load jobs are inserted under a client job id.** A `jobs.insert` that times
+  out or is refused transiently is sent again with the same id, so the statement never runs
+  twice: a repeat of an insert that did land answers `409 Already Exists`, and the job is
+  fetched and polled instead. Previously such a timeout failed the load outright.
 - **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
   text ("failed to lookup address information…", or MongoDB's whole topology dump); a
   connection that fails before the server answers now says `cannot resolve host <host> —

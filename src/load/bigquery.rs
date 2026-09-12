@@ -1634,6 +1634,7 @@ mod tests {
             &l.labels("load", "Orders"),
             "p",
             None,
+            "rivet_job",
         );
         assert_eq!(body["configuration"]["labels"]["managed_by"], "rivet");
         assert_eq!(body["configuration"]["labels"]["rivet_op"], "load");
