@@ -1324,7 +1324,31 @@ fn execute_resolved_plan(
     (final_result, summary)
 }
 
+/// Run one export and, when it succeeds, record the load spec `rivet load` plans from.
 pub(super) fn run_export_job(
+    config_path: &str,
+    config: &Config,
+    export: &ExportConfig,
+    state: &StateStore,
+    config_dir: &Path,
+    opts: &RunOptions<'_>,
+) -> (Result<()>, RunSummary) {
+    let (result, summary) =
+        run_export_job_inner(config_path, config, export, state, config_dir, opts);
+    if result.is_ok() {
+        super::load_spec::record_after_run(
+            config,
+            export,
+            state,
+            config_dir,
+            opts.params,
+            &summary.run_id,
+        );
+    }
+    (result, summary)
+}
+
+fn run_export_job_inner(
     config_path: &str,
     config: &Config,
     export: &ExportConfig,

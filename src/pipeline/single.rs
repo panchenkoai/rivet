@@ -248,7 +248,11 @@ pub(crate) fn run_export(
 
     // All non-chunked strategies: ask the strategy for its query and cursor needs.
     let cursor_state = if plan.strategy.needs_cursor_state() {
-        Some(state.get(&plan.export_name)?)
+        let identity = plan
+            .strategy
+            .cursor_identity()
+            .expect("a strategy that needs cursor state has a cursor identity");
+        Some(state.get_owned(&plan.export_name, &identity)?)
     } else {
         None
     };

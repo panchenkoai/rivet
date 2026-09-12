@@ -104,7 +104,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     match load_one_incremental(plan, &run_id, pk, drift, state.as_ref(), &load_id)?
                     {
                         Some(report) => {
-                            println!("INCREMENTAL LOAD OK [{}]: {report:#?}", plan.table)
+                            println!("INCREMENTAL LOAD OK [{}]: {}", plan.table, report.summary())
                         }
                         None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
                     }
@@ -207,17 +207,18 @@ pub(crate) fn aggregate_load_failures(mut failures: Vec<anyhow::Error>) -> Optio
     )))
 }
 
-/// The dedup view's primary key for an append mode (`cdc` / `incremental`), read
-/// from the export's `load:` block. Bails with a config-fix hint when absent.
+/// The resolved dedup key for an append mode (`cdc` / `incremental`); bails with a
+/// config-fix hint when neither the config nor the recorded source key gives one.
 fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
-    if plan.load.pk.is_empty() {
+    if plan.pk.is_empty() {
         anyhow::bail!(
-            "export `{}` is mode: {mode} but its `load:` block has no `pk:` — the current-state \
-             dedup view needs a primary key (e.g. `pk: [id]`)",
+            "export `{}` is mode: {mode} but has no primary key for the current-state dedup \
+             view — `rivet run` recorded none (a `query:` export, or a table without one), so \
+             declare it in the export's `load:` block (e.g. `pk: [id]`)",
             plan.export_name
         );
     }
-    Ok(&plan.load.pk)
+    Ok(&plan.pk)
 }
 
 /// What the run-status LEDGER says about a prefix, folded from the three answers
@@ -451,6 +452,10 @@ struct LoadInputs {
     /// (round-4 TOCTOU). `None` = the sample could not be taken (stateless, or
     /// the query failed): record then consumes NOTHING this cycle.
     active_at_fetch: Option<std::collections::HashSet<String>>,
+    /// The selected run manifests, keyed by their bucket path.
+    runs: Vec<(String, crate::manifest::RunManifest)>,
+    /// Whether the target table, if it exists, is one rivet loaded (per the ledger).
+    ownership: load::Ownership,
 }
 
 /// The prior source identity that CONFLICTS with the one this load carries, or
@@ -604,12 +609,22 @@ fn prepare_load(
         .first()
         .map(|(_, m)| crate::manifest::identity_source(m))
         .unwrap_or_default();
+    let ownership = match state {
+        Some(s) => match s.has_load_attempt(target_fqtn) {
+            Ok(true) => load::Ownership::Own,
+            Ok(false) => load::Ownership::Foreign,
+            Err(_) => load::Ownership::Unknown,
+        },
+        None => load::Ownership::Unknown,
+    };
     Ok(Some(LoadInputs {
         integrity,
         uris,
         source_run_ids,
         source_ident,
         active_at_fetch,
+        runs: new,
+        ownership,
     }))
 }
 
@@ -878,10 +893,13 @@ fn cleaned_suffix(source_cleaned: bool) -> &'static str {
 /// to be an `eprintln!`-only `fn`, and its whole-function `-> ()` stub was one of
 /// the in-diff gate's misses: stubbed, every append load goes quiet about what it
 /// appended and where, and nothing fails.
-fn append_done_line(inputs: &LoadInputs, report: &load::CdcLoadReport) -> String {
+fn append_done_line(
+    integrity: &load::reconcile::LoadIntegrity,
+    report: &load::CdcLoadReport,
+) -> String {
     format!(
         "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
-        inputs.integrity.chain_prefix(),
+        integrity.chain_prefix(),
         report.rows_appended,
         report.changes_table,
         report.view,
@@ -892,10 +910,10 @@ fn append_done_line(inputs: &LoadInputs, report: &load::CdcLoadReport) -> String
 /// The full-load sibling of [`append_done_line`] — the whole chain, now that the
 /// warehouse leg is known. The loader already proved `warehouse == file` (its
 /// count gate) before returning, so this is an all-green trace, not an assertion.
-fn full_done_line(inputs: &LoadInputs, report: &load::LoadReport) -> String {
+fn full_done_line(integrity: &load::reconcile::LoadIntegrity, report: &load::LoadReport) -> String {
     format!(
         "  integrity ✓ {} → warehouse {} rows in {}{}",
-        inputs.integrity.chain_prefix(),
+        integrity.chain_prefix(),
         report.rows_loaded,
         report.target_table,
         cleaned_suffix(report.source_cleaned),
@@ -954,6 +972,11 @@ fn spec_manifest_column_drift(
         }
     }
     notes
+}
+
+/// A CDC load carrying a snapshot leg over a `<table>` an earlier full load left: two baselines.
+fn snapshot_over_full_table(snapshot_leg: bool, table: load::ObjectKind) -> bool {
+    snapshot_leg && table == load::ObjectKind::Table
 }
 
 fn rebaseline_shape(uris: &[String], plan_prefix: &str) -> bool {
@@ -1095,6 +1118,15 @@ fn load_one_cdc(
             // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
             // into a __changes prior cycles already fed (see rebaseline_shape/rebaseline_action).
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
+            if snapshot_over_full_table(shape, loader.object_kind(&plan.table)?) {
+                anyhow::bail!(
+                    "`{}` is a table from an earlier full load, and this CDC load carries an \
+                     initial snapshot of the same table — the snapshot is a new baseline, so \
+                     keep one: drop the table (the snapshot replaces it), or run the stream \
+                     without `initial: snapshot` to keep the table's rows as the baseline",
+                    loader.fqtn(&plan.table)
+                );
+            }
             if shape {
                 // The refusal stands EVEN FOR A STAMPED baseline (round-10
                 // refuter, HIGH): the anchor stamp fixes the ORDERING half
@@ -1145,18 +1177,95 @@ fn load_one_cdc(
                 engine,
                 Some(inputs.integrity.file_rows),
                 cleanup,
+                inputs.ownership,
             )?;
             Ok((report.rows_appended, report))
         },
-        |inputs, report| eprintln!("{}", append_done_line(inputs, report)),
+        |inputs, report| eprintln!("{}", append_done_line(&inputs.integrity, report)),
     )
 }
 
-/// Load a single export's INCREMENTAL delta: APPEND the delta Parquet into
-/// `<table>__changes` and (re)build a current-state view deduped to the latest
-/// row per PK by the export's `cursor_column`. Ledger-driven exactly like CDC —
-/// only the not-yet-loaded runs are appended, so re-loads don't double and
-/// `cleanup_source` is safe.
+/// What an incremental load did: landed a whole-table run as `<table>`, or appended
+/// deltas to `<table>__changes` behind the view.
+#[derive(Debug)]
+pub enum IncrementalReport {
+    Table(load::LoadReport),
+    Changelog(load::CdcLoadReport),
+}
+
+impl IncrementalReport {
+    /// One line saying what landed where.
+    pub fn summary(&self) -> String {
+        match self {
+            IncrementalReport::Table(r) => format!(
+                "{} rows landed as table {}{}",
+                r.rows_loaded,
+                r.target_table,
+                cleaned_suffix(r.source_cleaned)
+            ),
+            IncrementalReport::Changelog(r) => format!(
+                "{} rows appended to {} | current-state view {}{}",
+                r.rows_appended,
+                r.changes_table,
+                r.view,
+                cleaned_suffix(r.source_cleaned)
+            ),
+        }
+    }
+}
+
+/// Whether an incremental run's manifest says it re-read the whole table: a cursor
+/// column, but no cursor value it resumed from.
+fn is_first_pass(m: &crate::manifest::RunManifest) -> bool {
+    m.source
+        .extraction
+        .as_ref()
+        .is_some_and(|e| e.cursor_column.is_some() && e.cursor_low.is_none())
+}
+
+/// The pending incremental runs, split: the latest whole-table run (if any) lands as the
+/// table, runs started after it are deltas, and runs it supersedes are only recorded.
+struct SplitRuns {
+    first_pass: Option<(String, crate::manifest::RunManifest)>,
+    deltas: Vec<(String, crate::manifest::RunManifest)>,
+    superseded: Vec<String>,
+}
+
+impl SplitRuns {
+    fn has_deltas(&self) -> bool {
+        !self.deltas.is_empty()
+    }
+}
+
+fn split_runs(runs: &[(String, crate::manifest::RunManifest)]) -> SplitRuns {
+    let first_pass = runs
+        .iter()
+        .filter(|(_, m)| is_first_pass(m))
+        .max_by(|a, b| a.1.started_at.cmp(&b.1.started_at))
+        .cloned();
+    let mut out = SplitRuns {
+        deltas: Vec::new(),
+        superseded: Vec::new(),
+        first_pass,
+    };
+    for (key, m) in runs {
+        match &out.first_pass {
+            Some((_, f)) if f.run_id == m.run_id => {}
+            Some((_, f)) if m.started_at <= f.started_at => out.superseded.push(m.run_id.clone()),
+            _ => out.deltas.push((key.clone(), m.clone())),
+        }
+    }
+    out.deltas
+        .sort_by(|a, b| a.1.started_at.cmp(&b.1.started_at));
+    out
+}
+
+/// Load a single export's INCREMENTAL runs. A run that re-read the whole table (the
+/// first run, or one after `state reset`) lands as `<table>` exactly like a full load;
+/// a delta APPENDs into `<table>__changes` — turning a `<table>` table into the log
+/// first — behind a current-state view deduped to the latest row per PK by the
+/// export's `cursor_column`. Ledger-driven exactly like CDC — only the not-yet-loaded
+/// runs are loaded, so re-loads don't double and `cleanup_source` is safe.
 fn load_one_incremental(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -1164,7 +1273,7 @@ fn load_one_incremental(
     allow_source_drift: bool,
     state: Option<&StateStore>,
     load_id: &str,
-) -> Result<Option<load::CdcLoadReport>> {
+) -> Result<Option<IncrementalReport>> {
     let cursor = plan.cursor_column.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "incremental load of `{}` needs the export's `cursor_column:` — the current-state \
@@ -1195,20 +1304,81 @@ fn load_one_incremental(
             );
         },
         |loader, store, inputs| {
-            let cleanup = cleanup_target(plan, store, state);
-            let report = load::run_load_incremental(
-                loader,
-                &plan.table,
-                &plan.specs,
-                &inputs.uris,
-                pk,
-                &cursor,
-                Some(inputs.integrity.file_rows),
-                cleanup,
-            )?;
-            Ok((report.rows_appended, report))
+            let split = split_runs(&inputs.runs);
+            for id in &split.superseded {
+                eprintln!(
+                    "  note: run {id} started before the latest whole-table run and is superseded \
+                     by it — recorded as loaded, its files are not read"
+                );
+            }
+            let mut rows = 0u64;
+            let mut report = None;
+            let landed_table = split.first_pass.is_some();
+            let has_deltas = split.has_deltas();
+            if let Some(first) = split.first_pass {
+                let uris = load::reconcile::select_load_uris(
+                    store,
+                    &plan.gcs_prefix,
+                    std::slice::from_ref(&first),
+                )?;
+                let integrity =
+                    load::reconcile::reconcile(std::slice::from_ref(&first.1), allow_source_drift)?;
+                eprintln!(
+                    "  incremental load {}: run {} holds the whole table (no cursor to resume \
+                     from) — landing it as `{}`",
+                    plan.table,
+                    first.1.run_id,
+                    loader.fqtn(&plan.table)
+                );
+                let cleanup = if has_deltas {
+                    None
+                } else {
+                    cleanup_target(plan, store, state)
+                };
+                let r = load::run_load(
+                    loader,
+                    &plan.table,
+                    &plan.specs,
+                    &uris,
+                    Some(integrity.file_rows),
+                    cleanup,
+                    inputs.ownership,
+                )?;
+                eprintln!("{}", full_done_line(&integrity, &r));
+                rows += r.rows_loaded;
+                report = Some(IncrementalReport::Table(r));
+            }
+            if has_deltas {
+                let uris =
+                    load::reconcile::select_load_uris(store, &plan.gcs_prefix, &split.deltas)?;
+                let manifests: Vec<_> = split.deltas.iter().map(|(_, m)| m.clone()).collect();
+                let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+                let ownership = if landed_table {
+                    load::Ownership::Own
+                } else {
+                    inputs.ownership
+                };
+                let cleanup = cleanup_target(plan, store, state);
+                let r = load::run_load_incremental(
+                    loader,
+                    &plan.table,
+                    &plan.specs,
+                    &uris,
+                    pk,
+                    &cursor,
+                    Some(integrity.file_rows),
+                    cleanup,
+                    ownership,
+                )?;
+                eprintln!("{}", append_done_line(&integrity, &r));
+                rows += r.rows_appended;
+                report = Some(IncrementalReport::Changelog(r));
+            }
+            let report = report
+                .ok_or_else(|| anyhow::anyhow!("no loadable run among the selected manifests"))?;
+            Ok((rows, report))
         },
-        |inputs, report| eprintln!("{}", append_done_line(inputs, report)),
+        |_, _| {},
     )
 }
 
@@ -1261,10 +1431,11 @@ fn load_one(
                 &inputs.uris,
                 Some(inputs.integrity.file_rows),
                 cleanup,
+                inputs.ownership,
             )?;
             Ok((report.rows_loaded, report))
         },
-        |inputs, report| eprintln!("{}", full_done_line(inputs, report)),
+        |inputs, report| eprintln!("{}", full_done_line(&inputs.integrity, report)),
     )
 }
 
@@ -1329,13 +1500,15 @@ mod load_ledger_tests {
                     dataset: "d".into(),
                 },
                 cleanup_source: false,
-                pk: vec![], // empty → require_pk bails
+                pk: load::plan::KeyColumns::Auto,
                 allow_source_drift: false,
                 gc_orphans: false,
-                cluster_by: vec![],
+                cluster_by: load::plan::KeyColumns::Auto,
             },
             mode: LoadMode::Cdc,
             cursor_column: None,
+            pk: vec![],
+            cluster_by: vec![],
         };
         let err = require_pk(&plan, "cdc").unwrap_err().to_string();
         assert!(err.contains("export `c1`"), "must name the export: {err}");
@@ -1599,13 +1772,15 @@ mod live_only_decisions {
                     dataset: "d".into(),
                 },
                 cleanup_source: false,
-                pk: vec!["id".into()],
+                pk: load::plan::KeyColumns::Columns(vec!["id".into()]),
                 allow_source_drift: false,
                 gc_orphans: false,
-                cluster_by: vec![],
+                cluster_by: load::plan::KeyColumns::None,
             },
             mode,
             cursor_column: None,
+            pk: vec!["id".into()],
+            cluster_by: vec![],
         }
     }
 
@@ -1620,6 +1795,94 @@ mod live_only_decisions {
         let p = dir.path().join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    /// An incremental run's manifest: `cursor_low` is the value it resumed from, `None` on a whole-table pass.
+    fn incremental_manifest(
+        run: &str,
+        started_at: &str,
+        cursor_low: Option<&str>,
+    ) -> (String, crate::manifest::RunManifest) {
+        let mut m = success_manifest(run, "part.parquet");
+        m.mode = "incremental".into();
+        m.started_at = started_at.into();
+        m.source.extraction = Some(
+            serde_json::from_value(serde_json::json!({
+                "strategy": "incremental",
+                "cursor_column": "id",
+                "cursor_low": cursor_low,
+                "cursor_high": "9",
+            }))
+            .unwrap(),
+        );
+        (format!("base/{run}/manifest.json"), m)
+    }
+
+    fn ids(runs: &[(String, crate::manifest::RunManifest)]) -> Vec<String> {
+        runs.iter().map(|(_, m)| m.run_id.clone()).collect()
+    }
+
+    #[test]
+    fn the_latest_whole_table_run_lands_first_and_only_later_deltas_follow() {
+        let split = split_runs(&[
+            incremental_manifest("d0", "2026-09-01T00:00:00Z", Some("5")),
+            incremental_manifest("f1", "2026-09-02T00:00:00Z", None),
+            incremental_manifest("d3", "2026-09-04T00:00:00Z", Some("9")),
+            incremental_manifest("d2", "2026-09-03T00:00:00Z", Some("7")),
+        ]);
+        assert_eq!(
+            split.first_pass.map(|(_, m)| m.run_id).as_deref(),
+            Some("f1")
+        );
+        assert_eq!(ids(&split.deltas), ["d2", "d3"], "deltas in start order");
+        assert_eq!(split.superseded, ["d0"]);
+    }
+
+    #[test]
+    fn two_whole_table_runs_keep_only_the_latest() {
+        let split = split_runs(&[
+            incremental_manifest("f1", "2026-09-01T00:00:00Z", None),
+            incremental_manifest("d2", "2026-09-02T00:00:00Z", Some("3")),
+            incremental_manifest("f3", "2026-09-03T00:00:00Z", None),
+        ]);
+        assert_eq!(
+            split.first_pass.map(|(_, m)| m.run_id).as_deref(),
+            Some("f3")
+        );
+        assert!(split.deltas.is_empty());
+        assert_eq!(split.superseded, ["f1", "d2"]);
+    }
+
+    #[test]
+    fn deltas_and_manifests_without_cursor_data_never_land_as_a_table() {
+        let mut legacy = success_manifest("old", "part.parquet");
+        legacy.started_at = "2026-08-01T00:00:00Z".into();
+        let split = split_runs(&[
+            incremental_manifest("d2", "2026-09-02T00:00:00Z", Some("3")),
+            ("base/old/manifest.json".to_string(), legacy),
+            incremental_manifest("d1", "2026-09-01T00:00:00Z", Some("1")),
+        ]);
+        assert!(split.first_pass.is_none());
+        assert_eq!(ids(&split.deltas), ["old", "d1", "d2"]);
+        assert!(split.superseded.is_empty());
+    }
+
+    #[test]
+    fn has_deltas_reads_the_split() {
+        let delta = incremental_manifest("d1", "2026-09-02T00:00:00Z", Some("1"));
+        let first = incremental_manifest("f1", "2026-09-01T00:00:00Z", None);
+        assert!(split_runs(std::slice::from_ref(&delta)).has_deltas());
+        assert!(!split_runs(std::slice::from_ref(&first)).has_deltas());
+        assert!(split_runs(&[first, delta]).has_deltas());
+    }
+
+    #[test]
+    fn a_snapshot_leg_conflicts_only_with_a_full_load_table() {
+        use load::ObjectKind::*;
+        assert!(snapshot_over_full_table(true, Table));
+        assert!(!snapshot_over_full_table(false, Table));
+        assert!(!snapshot_over_full_table(true, View));
+        assert!(!snapshot_over_full_table(true, Absent));
     }
 
     /// A minimal Success manifest whose one part exists in the store — enough for
@@ -2041,6 +2304,8 @@ mod live_only_decisions {
             source_run_ids: vec!["r1".into()],
             source_ident: "postgres:public.orders".into(),
             active_at_fetch: Some(Default::default()),
+            runs: Vec::new(),
+            ownership: load::Ownership::Own,
         };
 
         let appended = load::CdcLoadReport {
@@ -2050,7 +2315,7 @@ mod live_only_decisions {
             source_cleaned: false,
         };
         assert_eq!(
-            append_done_line(&inputs, &appended),
+            append_done_line(&inputs.integrity, &appended),
             "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
              current-state view p.d.orders"
         );
@@ -2060,7 +2325,7 @@ mod live_only_decisions {
             ..appended
         };
         assert_eq!(
-            append_done_line(&inputs, &cleaned),
+            append_done_line(&inputs.integrity, &cleaned),
             "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
              current-state view p.d.orders (source cleaned)",
             "a load that deleted the staged Parquet must SAY so — the prefix is empty now"
@@ -2072,12 +2337,12 @@ mod live_only_decisions {
             source_cleaned: false,
         };
         assert_eq!(
-            full_done_line(&inputs, &full),
+            full_done_line(&inputs.integrity, &full),
             "  integrity ✓ source 100 → files 100 → warehouse 100 rows in p.d.orders"
         );
         assert_eq!(
             full_done_line(
-                &inputs,
+                &inputs.integrity,
                 &load::LoadReport {
                     source_cleaned: true,
                     ..full

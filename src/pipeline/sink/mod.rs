@@ -47,6 +47,8 @@ pub(crate) struct ExportSink {
     /// When `Some`, `on_batch` extracts the last cursor value inline so we never
     /// hold a full batch in memory just for post-run cursor commit.
     pub(in crate::pipeline) cursor_column: Option<String>,
+    /// Columns the settle window compares; must be date/timestamp.
+    pub(in crate::pipeline) settle_columns: Vec<String>,
     /// Last extracted cursor value — set by `on_batch`, consumed by `run_single_export`.
     pub(in crate::pipeline) last_cursor_value: Option<String>,
     /// First observed cursor value of the RUN (first non-null of the first
@@ -180,6 +182,11 @@ impl ExportSink {
             bytes_read: std::sync::Arc::clone(&plan.bytes_read),
             part_rows: 0,
             cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
+            settle_columns: plan
+                .strategy
+                .incremental_plan()
+                .map(|p| p.settle_columns())
+                .unwrap_or_default(),
             last_cursor_value: None,
             first_cursor_value: None,
             source_cursor: None,
@@ -641,6 +648,23 @@ impl BatchSink for ExportSink {
             }
             _ => schema.clone(),
         };
+        for name in &self.settle_columns {
+            if let Ok(field) = schema.field_with_name(name)
+                && !matches!(
+                    field.data_type(),
+                    arrow::datatypes::DataType::Date32
+                        | arrow::datatypes::DataType::Date64
+                        | arrow::datatypes::DataType::Timestamp(_, _)
+                )
+            {
+                anyhow::bail!(
+                    "settle column `{name}` is {}, not a date/timestamp — the settle window \
+                     compares it against the source clock. Point `settle.column` at the row's \
+                     insert/update time (the cursor is used when `settle.column` is omitted).",
+                    field.data_type()
+                );
+            }
+        }
         let enriched = enrich::enrich_schema(&dest_schema, &self.meta)?;
         // Compute row group rows from the actual schema now that it's available.
         if let Some(pc) = &self.parquet_config {

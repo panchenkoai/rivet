@@ -388,6 +388,22 @@ pub trait Source: Send {
     fn server_context(&mut self) -> Option<String> {
         None
     }
+
+    /// The primary key columns of `table` in key order; `None` when it has none
+    /// or the engine cannot tell.
+    fn primary_key(&mut self, _table: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+}
+
+/// Split a catalog's unit-separator-joined key list; an empty list is no key.
+pub(crate) fn split_key_list(joined: Option<String>) -> Option<Vec<String>> {
+    let cols: Vec<String> = joined?
+        .split('\u{1f}')
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!cols.is_empty()).then_some(cols)
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
@@ -448,6 +464,25 @@ pub(crate) fn value_within_ceiling(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod key_list_tests {
+    use super::split_key_list;
+
+    #[test]
+    fn a_joined_key_splits_in_key_order_and_an_empty_one_is_no_key() {
+        assert_eq!(
+            split_key_list(Some("tenant\u{1f}id".into())),
+            Some(vec!["tenant".to_string(), "id".to_string()])
+        );
+        assert_eq!(
+            split_key_list(Some("a,b".into())),
+            Some(vec!["a,b".to_string()])
+        );
+        assert_eq!(split_key_list(Some(String::new())), None);
+        assert_eq!(split_key_list(None), None);
+    }
 }
 
 #[cfg(test)]

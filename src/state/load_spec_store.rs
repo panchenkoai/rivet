@@ -1,0 +1,293 @@
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+
+use crate::error::Result;
+use crate::types::{RivetType, TypeFidelity, TypeMapping, rivet_type_to_arrow};
+
+use super::StateStore;
+
+/// One column of a recorded load spec: the type the extractor resolved and wrote.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoadSpecColumn {
+    pub name: String,
+    pub source_type: String,
+    pub rivet_type: RivetType,
+    pub fidelity: TypeFidelity,
+    pub nullable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl LoadSpecColumn {
+    /// The recorded form of a resolved mapping.
+    pub fn from_mapping(m: &TypeMapping) -> Self {
+        Self {
+            name: m.column_name.clone(),
+            source_type: m.source_native_type.clone(),
+            rivet_type: m.rivet_type.clone(),
+            fidelity: m.fidelity,
+            nullable: m.nullable,
+            warnings: m.warnings.clone(),
+        }
+    }
+
+    /// The mapping this column stands for, its Arrow type re-derived from the Rivet type.
+    pub fn to_mapping(&self) -> TypeMapping {
+        TypeMapping {
+            column_name: self.name.clone(),
+            source_native_type: self.source_type.clone(),
+            rivet_type: self.rivet_type.clone(),
+            arrow_type: rivet_type_to_arrow(&self.rivet_type),
+            fidelity: self.fidelity,
+            nullable: self.nullable,
+            warnings: self.warnings.clone(),
+        }
+    }
+}
+
+/// What the load needs about one unit of an export, as recorded in the state DB.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadSpec {
+    pub export_name: String,
+    pub unit: Option<String>,
+    pub columns: Vec<LoadSpecColumn>,
+    pub primary_key: Option<Vec<String>>,
+    pub run_id: Option<String>,
+    pub origin: String,
+    pub captured_at: String,
+}
+
+impl StateStore {
+    /// Upsert the columns and primary key a successful run captured for one unit;
+    /// a capture that found no key keeps the key recorded before it.
+    pub fn record_load_spec(
+        &self,
+        export_name: &str,
+        unit: Option<&str>,
+        columns: &[LoadSpecColumn],
+        primary_key: Option<&[String]>,
+        run_id: &str,
+    ) -> Result<()> {
+        let columns_json = serde_json::to_string(columns)?;
+        let primary_key_json = primary_key.map(serde_json::to_string).transpose()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        self.execute(
+            "INSERT INTO export_load_spec
+                 (export_name, unit, columns_json, primary_key_json, run_id, origin, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'run', ?6)
+             ON CONFLICT (export_name, unit) DO UPDATE SET
+                 columns_json     = excluded.columns_json,
+                 primary_key_json = COALESCE(excluded.primary_key_json,
+                                             export_load_spec.primary_key_json),
+                 run_id           = excluded.run_id,
+                 origin           = excluded.origin,
+                 captured_at      = excluded.captured_at",
+            &[
+                export_name.into(),
+                unit.unwrap_or("").into(),
+                columns_json.into(),
+                primary_key_json.into(),
+                run_id.into(),
+                now.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record the source primary key `rivet init` read for an export it scaffolded,
+    /// leaving any columns a run recorded in place.
+    pub fn record_primary_key(
+        &self,
+        export_name: &str,
+        unit: Option<&str>,
+        primary_key: &[String],
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.execute(
+            "INSERT INTO export_load_spec
+                 (export_name, unit, columns_json, primary_key_json, run_id, origin, captured_at)
+             VALUES (?1, ?2, NULL, ?3, NULL, 'init', ?4)
+             ON CONFLICT (export_name, unit) DO UPDATE SET
+                 primary_key_json = excluded.primary_key_json",
+            &[
+                export_name.into(),
+                unit.unwrap_or("").into(),
+                serde_json::to_string(primary_key)?.into(),
+                now.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded spec for one unit of `export_name`, or `None` when nothing recorded one.
+    pub fn load_spec(&self, export_name: &str, unit: Option<&str>) -> Result<Option<LoadSpec>> {
+        let row = self.query_opt(
+            "SELECT columns_json, primary_key_json, run_id, origin, captured_at
+             FROM export_load_spec WHERE export_name = ?1 AND unit = ?2",
+            &[export_name.into(), unit.unwrap_or("").into()],
+            |r| {
+                (
+                    r.opt_text(0),
+                    r.opt_text(1),
+                    r.opt_text(2),
+                    r.text(3),
+                    r.text(4),
+                )
+            },
+        )?;
+        let Some((columns_json, primary_key_json, run_id, origin, captured_at)) = row else {
+            return Ok(None);
+        };
+        let columns = match columns_json {
+            Some(c) => serde_json::from_str(&c)
+                .with_context(|| format!("export '{export_name}': unreadable load spec columns"))?,
+            None => Vec::new(),
+        };
+        let primary_key = primary_key_json
+            .map(|p| serde_json::from_str(&p))
+            .transpose()
+            .with_context(|| format!("export '{export_name}': unreadable load spec primary key"))?;
+        Ok(Some(LoadSpec {
+            export_name: export_name.to_string(),
+            unit: unit.map(str::to_string),
+            columns,
+            primary_key,
+            run_id,
+            origin,
+            captured_at,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TimeUnit;
+
+    fn col(name: &str, rivet_type: RivetType) -> LoadSpecColumn {
+        LoadSpecColumn {
+            name: name.into(),
+            source_type: "native".into(),
+            rivet_type,
+            fidelity: TypeFidelity::Exact,
+            nullable: true,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_recorded_spec_reads_back_with_every_type_intact() {
+        let s = StateStore::open_in_memory().unwrap();
+        let columns = vec![
+            col("id", RivetType::Int64),
+            col(
+                "amount",
+                RivetType::Decimal {
+                    precision: 38,
+                    scale: 9,
+                },
+            ),
+            col(
+                "at",
+                RivetType::Timestamp {
+                    unit: TimeUnit::Microsecond,
+                    timezone: Some("UTC".into()),
+                },
+            ),
+            col(
+                "tags",
+                RivetType::List {
+                    inner: Box::new(RivetType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    }),
+                },
+            ),
+        ];
+        let pk = vec!["tenant".to_string(), "id".to_string()];
+        s.record_load_spec("orders", None, &columns, Some(&pk), "run_1")
+            .unwrap();
+
+        let spec = s.load_spec("orders", None).unwrap().unwrap();
+        assert_eq!(spec.columns, columns);
+        assert_eq!(spec.primary_key, Some(pk));
+        assert_eq!(spec.run_id.as_deref(), Some("run_1"));
+        assert_eq!(spec.origin, "run");
+    }
+
+    #[test]
+    fn a_capture_without_a_key_keeps_the_key_recorded_before_it() {
+        let s = StateStore::open_in_memory().unwrap();
+        let pk = vec!["id".to_string()];
+        s.record_load_spec(
+            "q",
+            None,
+            &[col("id", RivetType::Int64)],
+            Some(&pk),
+            "run_1",
+        )
+        .unwrap();
+        s.record_load_spec(
+            "q",
+            None,
+            &[col("id", RivetType::Int64), col("v", RivetType::String)],
+            None,
+            "run_2",
+        )
+        .unwrap();
+
+        let spec = s.load_spec("q", None).unwrap().unwrap();
+        assert_eq!(spec.primary_key, Some(pk));
+        assert_eq!(spec.columns.len(), 2);
+        assert_eq!(spec.run_id.as_deref(), Some("run_2"));
+    }
+
+    #[test]
+    fn a_key_init_recorded_survives_the_run_that_records_the_columns() {
+        let s = StateStore::open_in_memory().unwrap();
+        let pk = vec!["b".to_string(), "a".to_string()];
+        s.record_primary_key("q", None, &pk).unwrap();
+        let init_only = s.load_spec("q", None).unwrap().unwrap();
+        assert!(init_only.columns.is_empty());
+        assert_eq!(init_only.origin, "init");
+
+        s.record_load_spec("q", None, &[col("a", RivetType::Int32)], None, "run_1")
+            .unwrap();
+        let spec = s.load_spec("q", None).unwrap().unwrap();
+        assert_eq!(spec.primary_key, Some(pk.clone()));
+        assert_eq!(spec.columns.len(), 1);
+
+        s.record_primary_key("q", None, &pk).unwrap();
+        assert_eq!(s.load_spec("q", None).unwrap().unwrap().columns.len(), 1);
+    }
+
+    #[test]
+    fn units_of_one_export_are_recorded_apart() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.record_load_spec("cdc", Some("a"), &[col("x", RivetType::Int32)], None, "r")
+            .unwrap();
+        s.record_load_spec("cdc", Some("b"), &[col("y", RivetType::Bool)], None, "r")
+            .unwrap();
+
+        assert_eq!(
+            s.load_spec("cdc", Some("a")).unwrap().unwrap().columns[0].name,
+            "x"
+        );
+        assert_eq!(
+            s.load_spec("cdc", Some("b")).unwrap().unwrap().columns[0].name,
+            "y"
+        );
+        assert!(s.load_spec("cdc", None).unwrap().is_none());
+        assert!(s.load_spec("other", Some("a")).unwrap().is_none());
+    }
+
+    #[test]
+    fn to_mapping_rederives_the_arrow_type_from_the_rivet_type() {
+        let m = col("id", RivetType::Int64).to_mapping();
+        assert_eq!(m.arrow_type, Some(arrow::datatypes::DataType::Int64));
+        assert_eq!(
+            LoadSpecColumn::from_mapping(&m),
+            col("id", RivetType::Int64)
+        );
+    }
+}

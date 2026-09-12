@@ -211,9 +211,9 @@ impl TargetLoader for SnowflakeLoader {
         table: &str,
         specs: &[TargetColumnSpec],
         uris: &[String],
-        pk: &[String],
+        _pk: &[String],
     ) -> Result<u64> {
-        let sql = self.build_append_changelog_sql(table, specs, uris, pk)?;
+        let sql = self.build_append_changelog_sql(table, specs, uris)?;
         let result = self.run_snow(&sql)?;
         let before = extract_named(&result, "BEFORE_")
             .context("CDC load ran but the pre-append count (BEFORE_) could not be read")?;
@@ -249,6 +249,41 @@ impl TargetLoader for SnowflakeLoader {
         }
     }
 
+    fn object_kind(&self, table: &str) -> Result<super::ObjectKind> {
+        let v = self.run_snow(&self.build_object_kind_sql(table))?;
+        super::ObjectKind::from_probe(
+            extract_named(&v, "KIND_")
+                .context("object-kind probe ran but KIND_ was not in snow's output")?,
+        )
+    }
+
+    fn column_overlap(&self, table: &str, names: &[&str]) -> Result<(u64, u64)> {
+        let v = self.run_snow(&self.build_column_overlap_sql(table, names))?;
+        let total = extract_named(&v, "TOTAL_")
+            .context("column probe ran but TOTAL_ was not in snow's output")?;
+        let matched = extract_named(&v, "MATCHED_")
+            .context("column probe ran but MATCHED_ was not in snow's output")?;
+        Ok((total, matched))
+    }
+
+    fn row_count(&self, table: &str) -> Result<u64> {
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             USE WAREHOUSE {wh};\n\
+             SELECT COUNT(*) AS N_ FROM {fqtn};",
+            tag = self.query_tag(table),
+            wh = self.warehouse,
+            fqtn = self.fqtn(table),
+        );
+        extract_named(&self.run_snow(&sql)?, "N_")
+            .context("row count ran but N_ was not in snow's output")
+    }
+
+    fn adopt_as_changelog(&self, table: &str) -> Result<()> {
+        self.run_snow(&self.build_adoption_sql(table))?;
+        Ok(())
+    }
+
     fn warehouse(&self) -> crate::load::cdc::Warehouse {
         crate::load::cdc::Warehouse::Snowflake
     }
@@ -266,6 +301,63 @@ impl TargetLoader for SnowflakeLoader {
 }
 
 impl SnowflakeLoader {
+    /// Probe whose `KIND_` is `1·table + 2·view + 4·other` for `table`.
+    fn build_object_kind_sql(&self, table: &str) -> String {
+        format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             USE WAREHOUSE {wh};\n\
+             SELECT COUNT_IF(TABLE_TYPE = 'BASE TABLE') + 2 * COUNT_IF(TABLE_TYPE = 'VIEW') \
+             + 4 * COUNT_IF(TABLE_TYPE NOT IN ('BASE TABLE', 'VIEW')) AS KIND_ \
+             FROM {db}.INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = UPPER('{sc}') AND TABLE_NAME = UPPER('{table}');",
+            tag = self.query_tag(table),
+            wh = self.warehouse,
+            db = self.database,
+            sc = self.schema,
+        )
+    }
+
+    /// Probe returning the `TOTAL_` columns of `table` and how many are `MATCHED_` in `names`.
+    fn build_column_overlap_sql(&self, table: &str, names: &[&str]) -> String {
+        let list = if names.is_empty() {
+            "''".to_string()
+        } else {
+            names
+                .iter()
+                .map(|n| format!("'{}'", n.to_lowercase()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             USE WAREHOUSE {wh};\n\
+             SELECT COUNT(*) AS TOTAL_, COUNT_IF(LOWER(COLUMN_NAME) IN ({list})) AS MATCHED_ \
+             FROM {db}.INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = UPPER('{sc}') AND TABLE_NAME = UPPER('{table}');",
+            tag = self.query_tag(table),
+            wh = self.warehouse,
+            db = self.database,
+            sc = self.schema,
+        )
+    }
+
+    /// Rename `table` to `<table>__changes` and add the meta columns (NULL on every row),
+    /// keeping its rows and clustering.
+    fn build_adoption_sql(&self, table: &str) -> String {
+        let changes = self.fqtn(&format!("{table}__changes"));
+        let meta = crate::load::cdc::meta_column_specs(crate::load::cdc::Warehouse::Snowflake);
+        format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             USE WAREHOUSE {wh};\n\
+             ALTER TABLE {src} RENAME TO {changes};\n\
+             {add}",
+            tag = self.query_tag(table),
+            wh = self.warehouse,
+            src = self.fqtn(table),
+            add = build_alter_add_columns_sql(&changes, &meta),
+        )
+    }
+
     /// The append script for one CDC load, separated from its EXECUTION so the
     /// schema-reconciliation step can be asserted without a Snowflake account.
     /// The reconciling `ALTER` shipped on BigQuery only, so "the builder exists"
@@ -275,7 +367,6 @@ impl SnowflakeLoader {
         table: &str,
         specs: &[TargetColumnSpec],
         uris: &[String],
-        pk: &[String],
     ) -> Result<String> {
         use crate::load::cdc::Warehouse;
         // Full change-log schema: rivet's `__op`/`__pos`/`__seq` meta columns
@@ -293,7 +384,7 @@ impl SnowflakeLoader {
         let ddl = Self::build_schema_ddl(&full);
         let select = Self::build_copy_select(&full);
         let columns = Self::build_column_list(&full);
-        let cluster = Self::cluster_clause(pk);
+        let cluster = Self::cluster_clause(&self.cluster_by);
         let stage = format!("rivet_stage_{}", sanitize_tag(&changes));
         let files = copy_files_clause(&self.gcs_url, uris)?;
 
@@ -585,12 +676,7 @@ mod tests {
         l.database = "DB".into();
         l.schema = "SC".into();
         let sql = l
-            .build_append_changelog_sql(
-                "t",
-                &specs,
-                &["gs://b/p/part-0.parquet".to_string()],
-                &["id".to_string()],
-            )
+            .build_append_changelog_sql("t", &specs, &["gs://b/p/part-0.parquet".to_string()])
             .unwrap();
         let create = sql
             .find("CREATE TABLE IF NOT EXISTS")
@@ -661,5 +747,122 @@ mod tests {
         assert_eq!(extract_named(&v, "BEFORE_"), Some(10));
         assert_eq!(extract_named(&v, "AFTER_"), Some(35));
         assert_eq!(extract_named(&v, "MISSING_"), None);
+    }
+
+    fn adoption_loader() -> SnowflakeLoader {
+        let mut l = SnowflakeLoader::new("rivet".to_string());
+        l.warehouse = "WH".into();
+        l.database = "DB".into();
+        l.schema = "SC".into();
+        l
+    }
+
+    fn col(name: &str, ty: &str) -> TargetColumnSpec {
+        TargetColumnSpec {
+            column_name: name.into(),
+            target_type: ty.into(),
+            autoload_type: String::new(),
+            status: TargetStatus::Ok,
+            note: None,
+            cast_sql: None,
+        }
+    }
+
+    #[test]
+    fn object_kind_probe_reads_the_schema_catalog_with_uppercased_names() {
+        let sql = adoption_loader().build_object_kind_sql("orders");
+        assert!(sql.contains("USE WAREHOUSE WH;"), "{sql}");
+        assert!(
+            sql.contains(
+                "FROM DB.INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = UPPER('SC') \
+                 AND TABLE_NAME = UPPER('orders')"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("AS KIND_"), "{sql}");
+    }
+
+    #[test]
+    fn column_overlap_probe_lowercases_the_export_names() {
+        let sql = adoption_loader().build_column_overlap_sql("orders", &["Id", "amount"]);
+        assert!(
+            sql.contains("COUNT_IF(LOWER(COLUMN_NAME) IN ('id', 'amount')) AS MATCHED_"),
+            "{sql}"
+        );
+        assert!(sql.contains("COUNT(*) AS TOTAL_"), "{sql}");
+    }
+
+    #[test]
+    fn adoption_renames_the_table_and_adds_the_meta_columns() {
+        let sql = adoption_loader().build_adoption_sql("orders");
+        assert!(
+            sql.contains("ALTER TABLE DB.SC.orders RENAME TO DB.SC.orders__changes;"),
+            "{sql}"
+        );
+        assert!(sql.contains("ALTER TABLE DB.SC.orders__changes"), "{sql}");
+        for col in ["__op VARCHAR", "__pos VARCHAR", "__seq INTEGER"] {
+            assert!(sql.contains(col), "{sql}");
+        }
+        assert!(!sql.contains("SELECT"), "no query reads the table: {sql}");
+    }
+
+    #[test]
+    #[ignore = "live: requires SNOWFLAKE_TEST_CONNECTION"]
+    fn snowflake_live_adopts_a_full_load_table_as_the_changelog_baseline() {
+        let Ok(connection) = std::env::var("SNOWFLAKE_TEST_CONNECTION") else {
+            eprintln!("skipping: SNOWFLAKE_TEST_CONNECTION unset");
+            return;
+        };
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let mut loader = SnowflakeLoader::new(connection);
+        loader.warehouse = env("RIVET_SF_TEST_WAREHOUSE", "RIVET_LOAD_TEST");
+        loader.database = env("RIVET_SF_TEST_DATABASE", "RIVET_LOAD_TEST");
+        loader.schema = env("RIVET_SF_TEST_SCHEMA", "PUBLIC");
+        loader.private_key_path = std::env::var("RIVET_SNOWFLAKE_KEY").ok();
+        let table = format!("RIVET_SF_LIVE_ADOPT_{}", std::process::id());
+        let changes = format!("{table}__changes");
+        let (fq, changes_fq) = (loader.fqtn(&table), loader.fqtn(&changes));
+
+        loader
+            .run_snow(&format!(
+                "USE WAREHOUSE {};\nCREATE OR REPLACE TABLE {fq} AS \
+                 SELECT column1 AS id, 'v' || column1 AS v FROM VALUES (1), (2), (3);",
+                loader.warehouse
+            ))
+            .expect("fixture table");
+        let specs = [col("id", "NUMBER"), col("v", "VARCHAR")];
+        let adopted = crate::load::adopt_full_load_table(
+            &loader,
+            &table,
+            &specs,
+            crate::load::Ownership::Own,
+        );
+        let view_sql = crate::load::cdc::inc_dedup_view_sql(
+            crate::load::cdc::Warehouse::Snowflake,
+            &fq,
+            &changes_fq,
+            &["id"],
+            "id",
+        );
+        let view = adopted
+            .as_ref()
+            .ok()
+            .map(|_| loader.create_view(&table, &view_sql));
+        let kind = loader.object_kind(&table);
+        let copied = loader.row_count(&changes);
+        let viewed = loader.row_count(&table);
+        for drop in [
+            format!("DROP VIEW IF EXISTS {fq};"),
+            format!("DROP TABLE IF EXISTS {fq};"),
+            format!("DROP TABLE IF EXISTS {changes_fq};"),
+        ] {
+            let _ = loader.run_snow(&drop);
+        }
+
+        assert_eq!(adopted.unwrap(), Some(3));
+        view.unwrap().unwrap();
+        assert_eq!(kind.unwrap(), crate::load::ObjectKind::View);
+        assert_eq!(copied.unwrap(), 3);
+        assert_eq!(viewed.unwrap(), 3);
     }
 }

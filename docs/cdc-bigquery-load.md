@@ -118,8 +118,10 @@ passes its own op — only jobs you run yourself need labels of your own.
 ## The one command: `rivet load`
 
 `rivet load -c cfg.yaml` — where the export is `mode: cdc` and the config carries
-a top-level `load:` block with `target: bigquery` and `pk:` — does both steps
-automatically:
+a top-level `load:` block with `target: bigquery` — does both steps
+automatically. The view's key is the source primary key `rivet run` recorded
+(`pk: auto`, the default); `pk: [..]` overrides it and is required only when
+none was recorded (a `query:` export, a table without a primary key):
 
 1. free `LOAD DATA` of the CDC Parquet into `<table>__changes` (the same
    native-schema batched loader, with `__op`/`__pos`/`__seq` in the schema);
@@ -136,7 +138,7 @@ load:
   target: bigquery      # or: snowflake (+ connection/warehouse/database/schema/storage_integration)
   project: my-proj
   dataset: analytics
-  pk: [id]              # the view's PARTITION BY
+  # pk: [id]            # the view's PARTITION BY; default: the source primary key
   cleanup_source: true
 ```
 
@@ -171,15 +173,14 @@ load:
   target: bigquery
   project: my-proj
   dataset: analytics
-  pk: [id]
 ```
 
 The capture fans each table out under `<prefix>/<table>/` (its own
 `manifest.json` + `_SUCCESS`, with `initial: snapshot` nested a level below as
 `<prefix>/<table>/snapshot/`), and `rivet load` follows that layout: **one
 `<table>__changes` + one dedup view per SOURCE table**, each loaded from its own
-sub-prefix only. `pk:` and the rest of the `load:` block are shared by every
-table of the stream; `rivet check --target bigquery` prints one resolver document
+sub-prefix only. Each table is keyed on its own recorded primary key; the rest of
+the `load:` block is shared by every table of the stream; `rivet check --target bigquery` prints one resolver document
 per table (`Export: cdc/orders`), so you see each table's native schema before
 loading it. Live-verified against BigQuery over a 3-table PostgreSQL stream
 (#252).

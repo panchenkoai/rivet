@@ -491,7 +491,9 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
+        self.reset_warehouse_objects(&env, &self.loaded_table_name())?;
 
+        self.reset_cdc_anchor(&prefix);
         self.seed(&env)?; // the heavy base
         // Same filename `pro_load` reads — one config drives both extract & load.
         let cdc_cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
@@ -564,6 +566,7 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
+        self.reset_warehouse_objects(&env, &self.loaded_table_name())?;
         // A fresh checkpoint so the anchor pins at the current resume token.
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("ckpt-matrix_mongo_{coll}_")));
@@ -652,6 +655,7 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
+        self.reset_warehouse_objects(&env, &coll)?;
 
         // ONE config drives extract + load; the Mongo batch source_ref is a
         // `table:` (collection), not a SQL query (see extraction_yaml).
@@ -729,21 +733,8 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
-        let _ = std::fs::remove_file(
-            std::env::temp_dir().join(format!("ckpt-{}", prefix.replace('/', "_"))),
-        );
-        // Postgres anchors CDC by CREATING the replication slot, so a slot left
-        // by a prior run means `initial: snapshot` gets no fresh anchor and
-        // resumes from a stale position instead of snapshotting. Drop it — the
-        // slot IS the PG equivalent of the MySQL checkpoint file removed above.
-        // (MySQL keys on server_id, Mongo on a resume token — no server-side
-        // anchor to clear.)
-        if self.engine == Engine::Postgres {
-            let _ = self.source_raw(
-                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-                 WHERE slot_name = 'rivet_matrix_soak'",
-            );
-        }
+        self.reset_warehouse_objects(&env, &self.loaded_table_name())?;
+        self.reset_cdc_anchor(&prefix);
 
         let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
         // Anchor → full snapshot of the N preexisting rows → drain (initial: snapshot).
@@ -841,6 +832,7 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
+        self.reset_warehouse_objects(&env, &t)?;
 
         // One config drives both extract (incremental) and load. The state DB is
         // fresh (TempWork), so run 1 has no cursor and pulls all N rows.
@@ -1137,6 +1129,21 @@ impl Verification {
     }
 
     // ── stage 1: seed the fixture (OSS `seed` binary, as a process) ──────────
+    /// Forget the CDC position a prior cell left for `prefix` (the checkpoint file,
+    /// and on Postgres the replication slot that is its server-side twin), so a
+    /// re-seeded fixture anchors fresh instead of resuming into the seed's TRUNCATE.
+    fn reset_cdc_anchor(&self, prefix: &str) {
+        let _ = std::fs::remove_file(
+            std::env::temp_dir().join(format!("ckpt-{}", prefix.replace('/', "_"))),
+        );
+        if self.engine == Engine::Postgres {
+            let _ = self.source_raw(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                 WHERE slot_name = 'rivet_matrix_soak'",
+            );
+        }
+    }
+
     fn seed(&self, env: &HarnessEnv) -> Result<()> {
         let lane = self.lane();
         let Some(target) = lane.seed_target else {
@@ -1194,6 +1201,7 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
+        self.reset_warehouse_objects(env, &self.loaded_table_name())?;
         let cfg = work.write("extract.yaml", &self.extraction_yaml(env, &prefix)?);
         run(
             Command::new("rivet").args(["run", "-c"]).arg(&cfg),
@@ -1239,6 +1247,50 @@ impl Verification {
                 format!("{}.{}.{}", sf.database, sf.schema, table)
             }
         })
+    }
+
+    /// Drop the cell's warehouse objects an earlier run left — the view, the table and its
+    /// change log — so a load with a fresh state DB never meets a table it did not create.
+    fn reset_warehouse_objects(&self, env: &HarnessEnv, table: &str) -> Result<()> {
+        let changes = format!("{table}__changes");
+        let objects = match self.warehouse {
+            Warehouse::BigQuery => bq_rows(&format!(
+                "SELECT table_name, table_type FROM `{}.{MATRIX_DATASET}`.INFORMATION_SCHEMA.TABLES \
+                 WHERE table_name IN ('{table}', '{changes}')",
+                env.bq_project()?
+            ))?,
+            Warehouse::Snowflake => {
+                let sf = env.sf()?;
+                sf_rows(
+                    &self.sf_conn()?,
+                    &format!(
+                        "SELECT TABLE_NAME, TABLE_TYPE FROM {}.INFORMATION_SCHEMA.TABLES \
+                         WHERE TABLE_SCHEMA = UPPER('{}') \
+                         AND TABLE_NAME IN (UPPER('{table}'), UPPER('{changes}'))",
+                        sf.database, sf.schema
+                    ),
+                )?
+            }
+        };
+        for (name, kind) in objects {
+            let verb = if kind.to_uppercase().contains("VIEW") {
+                "DROP VIEW"
+            } else {
+                "DROP TABLE"
+            };
+            let fq = self.wh_table(&self.warehouse_table_ref(env, &name)?);
+            let sql = format!("{verb} {fq}");
+            match self.warehouse {
+                Warehouse::BigQuery => run(
+                    Command::new("bq").args(["query", "--nouse_legacy_sql", "--format=none", &sql]),
+                    "bq drop (reset_warehouse_objects)",
+                )?,
+                Warehouse::Snowflake => {
+                    snow_json(&self.sf_conn()?, &sql)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The cleanup side-effect: after a `cleanup_source: true` load, the GCS

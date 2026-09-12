@@ -719,6 +719,22 @@ impl super::Source for MysqlSource {
         Ok(())
     }
 
+    fn primary_key(&mut self, table: &str) -> Result<Option<Vec<String>>> {
+        let bare = table.replace('`', "");
+        let (schema, name) = match bare.split_once('.') {
+            Some((s, t)) => (format!("'{}'", s.replace('\'', "''")), t.to_string()),
+            None => ("DATABASE()".to_string(), bare.clone()),
+        };
+        let sql = format!(
+            "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION SEPARATOR '\u{1f}') \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE CONSTRAINT_NAME = 'PRIMARY' AND TABLE_SCHEMA = {schema} \
+             AND TABLE_NAME = '{}'",
+            name.replace('\'', "''")
+        );
+        Ok(crate::source::split_key_list(self.query_scalar(&sql)?))
+    }
+
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
         let mut conn = self.pool.get_conn()?;
         // Pin the SAME session state the export/worker connections get (sql_mode with

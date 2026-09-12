@@ -1163,6 +1163,16 @@ impl Config {
             }
         }
 
+        if export.settle.is_some() && export.mode != ExportMode::Incremental {
+            anyhow::bail!(
+                "export '{}': `settle` requires `mode: incremental` — it bounds the incremental \
+                 cursor query and is silently ignored in `mode: {:?}`.\n  \
+                 Hint: set `mode: incremental` with a `cursor_column`, or remove `settle`.",
+                export.name,
+                export.mode,
+            );
+        }
+
         match export.mode {
             ExportMode::Incremental => {
                 if export.cursor_column.is_none() {
@@ -1170,6 +1180,22 @@ impl Config {
                         "export '{}': incremental mode requires cursor_column",
                         export.name
                     );
+                }
+                if let Some(settle) = &export.settle {
+                    settle
+                        .after_secs()
+                        .map_err(|e| anyhow::anyhow!("export '{}': {e:#}", export.name))?;
+                    if settle
+                        .column
+                        .as_deref()
+                        .is_some_and(|c| c.trim().is_empty())
+                    {
+                        anyhow::bail!(
+                            "export '{}': settle.column is empty — name a date/timestamp \
+                             column, or omit it to settle on the cursor",
+                            export.name
+                        );
+                    }
                 }
                 match export.incremental_cursor_mode {
                     IncrementalCursorMode::Coalesce => {

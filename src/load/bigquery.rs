@@ -89,7 +89,7 @@ use std::sync::{Arc, OnceLock};
 // ── BigQuery ─────────────────────────────────────────────────────────────────
 
 /// Maximum clustering columns BigQuery allows.
-const MAX_CLUSTER_COLUMNS: usize = 4;
+pub(crate) const MAX_CLUSTER_COLUMNS: usize = 4;
 
 /// BigQuery's hard cap on partitions modified by a single job.
 const DEFAULT_MAX_PARTITIONS_PER_JOB: usize = 4000;
@@ -180,12 +180,52 @@ impl BigQueryLoader {
             .map(|_job_id| ())
     }
 
-    fn count_rows(&self, fqtn: &str, table: &str) -> Result<u64> {
-        // COUNT(*) reads table metadata — 0 bytes billed.
-        self.api()?.run_query_scalar(
-            &format!("SELECT COUNT(*) AS n FROM `{fqtn}`"),
-            &self.labels("count", table),
-        )
+    /// Rows in `table`: table metadata for a table, a `COUNT(*)` for a view.
+    fn count_rows(&self, table: &str) -> Result<u64> {
+        let api = self.api()?;
+        match api.table_num_rows(&self.dataset, table)? {
+            Some(rows) => Ok(rows),
+            None => api.run_query_scalar(
+                &format!("SELECT COUNT(*) AS n FROM `{}`", self.fqtn(table)),
+                &self.labels("count", table),
+            ),
+        }
+    }
+
+    /// Refuse a clustering list BigQuery would reject or that is not a plain identifier.
+    fn check_cluster_by(&self) -> Result<()> {
+        if self.cluster_by.len() > MAX_CLUSTER_COLUMNS {
+            bail!(
+                "BigQuery allows at most {MAX_CLUSTER_COLUMNS} clustering columns, got {}",
+                self.cluster_by.len()
+            );
+        }
+        // Gate each clustering column: it splices raw into `CLUSTER BY <cols>`
+        // (an identifier list, no quoting) — the same is_safe_load_ident gate the
+        // table / column / pk names get. Config-derived, so operator self-harm,
+        // but gated for consistency with the round-5/6 injection surface.
+        // (`partition_by` is intentionally NOT gated here — it is a BigQuery
+        // partition EXPRESSION, e.g. `DATE(created_at)`, not a bare identifier.)
+        for c in &self.cluster_by {
+            if !super::is_safe_load_ident(c) {
+                bail!(
+                    "BigQuery load: clustering column `{}` is not a plain SQL identifier \
+                     ([A-Za-z_][A-Za-z0-9_]*) — it splices into CLUSTER BY. Rename it.",
+                    c.escape_default()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The partitioning, clustering and options of `table`, or `None` when it is no base table.
+    fn existing_shape(&self, table: &str) -> Result<Option<TableShape>> {
+        let sql = build_ddl_probe_sql(&self.project, &self.dataset, table);
+        Ok(self
+            .api()?
+            .run_query_text(&sql, &self.labels("probe", table))?
+            .as_deref()
+            .map(parse_table_ddl))
     }
 
     /// Split `uris` into free-load batches that each stay under the per-job
@@ -226,28 +266,64 @@ impl TargetLoader for BigQueryLoader {
         format!("{}.{}.{}", self.project, self.dataset, table)
     }
 
-    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
-        if self.cluster_by.len() > MAX_CLUSTER_COLUMNS {
-            bail!(
-                "BigQuery allows at most {MAX_CLUSTER_COLUMNS} clustering columns, got {}",
-                self.cluster_by.len()
+    fn object_kind(&self, table: &str) -> Result<super::ObjectKind> {
+        let sql = build_object_kind_sql(&self.project, &self.dataset, table);
+        super::ObjectKind::from_probe(
+            self.api()?
+                .run_query_scalar(&sql, &self.labels("probe", table))?,
+        )
+    }
+
+    fn column_overlap(&self, table: &str, names: &[&str]) -> Result<(u64, u64)> {
+        let (total, matched) = build_column_overlap_sql(&self.project, &self.dataset, table, names);
+        let (api, labels) = (self.api()?, self.labels("probe", table));
+        Ok((
+            api.run_query_scalar(&total, &labels)?,
+            api.run_query_scalar(&matched, &labels)?,
+        ))
+    }
+
+    fn row_count(&self, table: &str) -> Result<u64> {
+        self.count_rows(table)
+    }
+
+    fn adopt_as_changelog(&self, table: &str) -> Result<()> {
+        let src = self.fqtn(table);
+        let changes = self.fqtn(&format!("{table}__changes"));
+        let shape = self.existing_shape(table)?.unwrap_or_default();
+        for sql in build_adoption_sql(&src, table, &changes, &shape) {
+            self.run_sql(&sql, "baseline", table)?;
+        }
+        if shape.requires_partition_filter() {
+            eprintln!(
+                "  note: `{changes}` does not require a partition filter, unlike `{src}` did — \
+                 the current-state view reads all of it"
             );
         }
-        // Gate each clustering column: it splices raw into `CLUSTER BY <cols>`
-        // (an identifier list, no quoting) — the same is_safe_load_ident gate the
-        // table / column / pk names get. Config-derived, so operator self-harm,
-        // but gated for consistency with the round-5/6 injection surface.
-        // (`partition_by` is intentionally NOT gated here — it is a BigQuery
-        // partition EXPRESSION, e.g. `DATE(created_at)`, not a bare identifier.)
-        for c in &self.cluster_by {
-            if !super::is_safe_load_ident(c) {
-                bail!(
-                    "BigQuery load: clustering column `{}` is not a plain SQL identifier \
-                     ([A-Za-z_][A-Za-z0-9_]*) — it splices into CLUSTER BY. Rename it.",
-                    c.escape_default()
-                );
-            }
+        if shape.ingestion_partitioned() && shape.expires_partitions() {
+            eprintln!(
+                "  note: `{changes}` keeps its load-date partitions without expiry — expiring them \
+                 would drop rows that never changed from the current-state view"
+            );
         }
+        if !same_columns(&shape.cluster, &self.cluster_by) {
+            eprintln!(
+                "  note: `{changes}` keeps the clustering `{src}` had ({}); `cluster_by` applies \
+                 to a change log rivet creates",
+                shape.cluster.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    fn table_shape_conflict(&self, table: &str) -> Result<Option<String>> {
+        Ok(self
+            .existing_shape(table)?
+            .and_then(|shape| shape_conflict(&shape, &self.partition_by, &self.cluster_by)))
+    }
+
+    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
+        self.check_cluster_by()?;
         let target = self.fqtn(table);
         let schema = build_schema(specs);
 
@@ -268,10 +344,7 @@ impl TargetLoader for BigQueryLoader {
             );
             self.run_sql(&sql, "load", table)?;
         }
-        // ponytail: rows via COUNT(*) (a 0-byte-billed metadata read); can become
-        // the load job's `outputRows` (also metadata) behind this seam, no driver
-        // change.
-        self.count_rows(&target, table)
+        self.count_rows(table)
     }
 
     fn append_changelog(
@@ -279,9 +352,10 @@ impl TargetLoader for BigQueryLoader {
         table: &str,
         specs: &[TargetColumnSpec],
         uris: &[String],
-        pk: &[String],
+        _pk: &[String],
     ) -> Result<u64> {
         use crate::load::cdc::Warehouse;
+        self.check_cluster_by()?;
         // Full change-log schema: rivet's `__op`/`__pos`/`__seq` meta columns
         // (not reported by `rivet check`) ahead of the resolved data columns.
         let mut full = crate::load::cdc::meta_column_specs(Warehouse::BigQuery);
@@ -296,9 +370,9 @@ impl TargetLoader for BigQueryLoader {
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
 
-        // Ensure the append-only log exists, clustered on the PK so the dedup
-        // view prunes efficiently. Idempotent: created once, appended forever.
-        let create = build_create_changes_sql(&changes_fqtn, &schema, pk);
+        // Ensure the append-only log exists, clustered on the load's `cluster_by`.
+        // Idempotent: created once, appended forever.
+        let create = build_create_changes_sql(&changes_fqtn, &schema, &self.cluster_by);
         self.run_sql(&create, "create", &changes)?;
 
         // …and, for a log that ALREADY existed, add whatever the declared
@@ -312,10 +386,10 @@ impl TargetLoader for BigQueryLoader {
 
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
-        let before = self.count_rows(&changes_fqtn, &changes)?;
+        let before = self.count_rows(&changes)?;
         let load = build_load_data_sql(&changes_fqtn, false, &schema, &None, &[], uris);
         self.run_sql(&load, "load", &changes)?;
-        let after = self.count_rows(&changes_fqtn, &changes)?;
+        let after = self.count_rows(&changes)?;
         Ok(after.saturating_sub(before))
     }
 
@@ -336,17 +410,199 @@ fn is_meta_column(name: &str) -> bool {
     crate::load::cdc::is_meta_column(name)
 }
 
-/// `CREATE TABLE IF NOT EXISTS` for the change log, clustered on the PK (capped
-/// at BigQuery's 4 clustering columns). Idempotent — the log is created once and
-/// appended to on every CDC load.
-fn build_create_changes_sql(fqtn: &str, schema: &str, pk: &[String]) -> String {
-    let cluster_cols = pk
+/// `CREATE TABLE IF NOT EXISTS` for the change log, clustered on `cluster_by` (capped
+/// at BigQuery's 4 clustering columns; none when empty). Idempotent — the log is
+/// created once and appended to on every CDC load.
+fn build_create_changes_sql(fqtn: &str, schema: &str, cluster_by: &[String]) -> String {
+    let cluster: Vec<String> = cluster_by
         .iter()
         .take(MAX_CLUSTER_COLUMNS)
-        .map(|c| format!("`{c}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("CREATE TABLE IF NOT EXISTS `{fqtn}` (\n{schema}\n)\nCLUSTER BY {cluster_cols};")
+        .cloned()
+        .collect();
+    format!(
+        "CREATE TABLE IF NOT EXISTS `{fqtn}` (\n{schema}\n){};",
+        table_shape_clauses(&None, &cluster)
+    )
+}
+
+/// The partitioning, clustering and table options of an existing table, from its DDL.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct TableShape {
+    partition: Option<String>,
+    cluster: Vec<String>,
+    options: Option<String>,
+}
+
+impl TableShape {
+    fn ingestion_partitioned(&self) -> bool {
+        self.partition
+            .as_deref()
+            .is_some_and(|p| p.contains("_PARTITIONTIME") || p.contains("_PARTITIONDATE"))
+    }
+
+    fn requires_partition_filter(&self) -> bool {
+        self.options
+            .as_deref()
+            .is_some_and(|o| o.replace(' ', "").contains("require_partition_filter=true"))
+    }
+
+    fn expires_partitions(&self) -> bool {
+        self.options
+            .as_deref()
+            .is_some_and(|o| o.contains("partition_expiration_days"))
+    }
+}
+
+/// The DDL of `table` when it is a base table.
+fn build_ddl_probe_sql(project: &str, dataset: &str, table: &str) -> String {
+    format!(
+        "SELECT ddl FROM `{project}.{dataset}`.INFORMATION_SCHEMA.TABLES \
+         WHERE table_name = '{table}' AND table_type = 'BASE TABLE'"
+    )
+}
+
+/// The table-level `PARTITION BY`, `CLUSTER BY` and `OPTIONS(...)` of a BigQuery DDL;
+/// column options are indented inside the column list and not read.
+fn parse_table_ddl(ddl: &str) -> TableShape {
+    let mut shape = TableShape::default();
+    let mut lines = ddl.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end().trim_end_matches(';');
+        if let Some(p) = line.strip_prefix("PARTITION BY ") {
+            shape.partition = Some(p.trim().to_string());
+        } else if let Some(c) = line.strip_prefix("CLUSTER BY ") {
+            shape.cluster = c
+                .split(',')
+                .map(|col| col.trim().trim_matches('`').to_string())
+                .filter(|col| !col.is_empty())
+                .collect();
+        } else if let Some(rest) = line.strip_prefix("OPTIONS(") {
+            let mut body = Vec::new();
+            match rest.trim().strip_suffix(')') {
+                Some(inline) => body.push(inline.trim().to_string()),
+                None => {
+                    body.push(rest.trim().to_string());
+                    for l in lines.by_ref() {
+                        let l = l.trim().trim_end_matches(';');
+                        if l == ")" {
+                            break;
+                        }
+                        body.push(l.to_string());
+                    }
+                }
+            }
+            let joined = body
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            shape.options = (!joined.is_empty()).then_some(joined);
+        }
+    }
+    shape
+}
+
+/// Whether two clustering lists name the same columns in the same order.
+fn same_columns(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// How an existing table's partitioning or clustering differs from what this load declares, or `None`.
+fn shape_conflict(
+    shape: &TableShape,
+    partition_by: &Option<String>,
+    cluster_by: &[String],
+) -> Option<String> {
+    let describe =
+        |p: Option<&str>, none: &str| p.map_or(none.to_string(), |p| format!("`{}`", p.trim()));
+    let list = |cols: &[String]| {
+        if cols.is_empty() {
+            "nothing".to_string()
+        } else {
+            cols.iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut diffs = Vec::new();
+    if shape.partition.as_deref().map(str::trim) != partition_by.as_deref().map(str::trim) {
+        diffs.push(format!(
+            "it is partitioned by {}, the load declares {}",
+            describe(shape.partition.as_deref(), "nothing"),
+            describe(partition_by.as_deref(), "no partitioning")
+        ));
+    }
+    if !same_columns(&shape.cluster, cluster_by) {
+        diffs.push(format!(
+            "it is clustered on {}, `cluster_by` resolves to {}",
+            list(&shape.cluster),
+            list(cluster_by)
+        ));
+    }
+    (!diffs.is_empty()).then(|| diffs.join("; "))
+}
+
+/// Probe whose scalar is `1·table + 2·view + 4·other` for `table` in the dataset.
+fn build_object_kind_sql(project: &str, dataset: &str, table: &str) -> String {
+    format!(
+        "SELECT COUNTIF(table_type = 'BASE TABLE') + 2 * COUNTIF(table_type = 'VIEW') \
+         + 4 * COUNTIF(table_type NOT IN ('BASE TABLE', 'VIEW')) AS n \
+         FROM `{project}.{dataset}`.INFORMATION_SCHEMA.TABLES WHERE table_name = '{table}'"
+    )
+}
+
+/// Probes counting all columns of `table` and those among `names`.
+fn build_column_overlap_sql(
+    project: &str,
+    dataset: &str,
+    table: &str,
+    names: &[&str],
+) -> (String, String) {
+    let from = format!(
+        "FROM `{project}.{dataset}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{table}'"
+    );
+    let list = if names.is_empty() {
+        "''".to_string()
+    } else {
+        names
+            .iter()
+            .map(|n| format!("'{}'", n.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (
+        format!("SELECT COUNT(*) AS n {from}"),
+        format!("SELECT COUNT(*) AS n {from} AND LOWER(column_name) IN ({list})"),
+    )
+}
+
+/// Turn the full-load table into `<table>__changes` without a query: a rename keeps its
+/// rows, partitioning, clustering and options, then the meta columns are added (NULL on
+/// every existing row). A partition filter requirement is dropped, since the current-state
+/// view reads the whole log, and so is expiry of load-date partitions.
+fn build_adoption_sql(
+    src_fqtn: &str,
+    table: &str,
+    changes_fqtn: &str,
+    shape: &TableShape,
+) -> Vec<String> {
+    let meta = crate::load::cdc::meta_column_specs(crate::load::cdc::Warehouse::BigQuery);
+    let mut out = vec![format!(
+        "ALTER TABLE `{src_fqtn}` RENAME TO {table}__changes;"
+    )];
+    out.extend(build_alter_add_columns_sql(changes_fqtn, &meta));
+    if shape.requires_partition_filter() {
+        out.push(format!(
+            "ALTER TABLE `{changes_fqtn}` SET OPTIONS(require_partition_filter = false);"
+        ));
+    }
+    if shape.ingestion_partitioned() && shape.expires_partitions() {
+        out.push(format!(
+            "ALTER TABLE `{changes_fqtn}` SET OPTIONS(partition_expiration_days = NULL);"
+        ));
+    }
+    out
 }
 
 /// Bring an EXISTING table's schema up to the declared one by ADDING what is
@@ -576,6 +832,76 @@ mod tests {
         vec!["gs://b/a.parquet".into(), "gs://b/b.parquet".into()]
     }
 
+    #[test]
+    fn object_kind_probe_reads_the_dataset_catalog() {
+        let sql = build_object_kind_sql("p", "d", "orders");
+        assert!(
+            sql.contains("FROM `p.d`.INFORMATION_SCHEMA.TABLES WHERE table_name = 'orders'"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("COUNTIF(table_type = 'BASE TABLE') + 2 * COUNTIF(table_type = 'VIEW')"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn column_overlap_probes_lowercase_the_export_names() {
+        let (total, matched) = build_column_overlap_sql("p", "d", "orders", &["Id", "amount"]);
+        assert_eq!(
+            total,
+            "SELECT COUNT(*) AS n FROM `p.d`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'orders'"
+        );
+        assert!(
+            matched.ends_with("AND LOWER(column_name) IN ('id', 'amount')"),
+            "{matched}"
+        );
+    }
+
+    #[test]
+    fn adoption_renames_the_full_table_then_adds_the_meta_columns() {
+        let sql = build_adoption_sql(
+            "p.d.orders",
+            "orders",
+            "p.d.orders__changes",
+            &TableShape::default(),
+        );
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert_eq!(
+            sql[0],
+            "ALTER TABLE `p.d.orders` RENAME TO orders__changes;"
+        );
+        assert!(sql[1].starts_with("ALTER TABLE `p.d.orders__changes`"));
+        for col in ["`__op` STRING", "`__pos` STRING", "`__seq` INT64"] {
+            assert!(sql[1].contains(col), "{}", sql[1]);
+        }
+    }
+
+    #[test]
+    fn adoption_drops_the_partition_filter_and_load_date_expiry() {
+        let shape = parse_table_ddl(
+            "CREATE TABLE `p.d.t`\n(\n  id INT64\n)\nPARTITION BY DATE(_PARTITIONTIME)\n\
+             OPTIONS(\n  partition_expiration_days=30.0,\n  require_partition_filter=true\n);",
+        );
+        let sql = build_adoption_sql("p.d.t", "t", "p.d.t__changes", &shape).join("\n");
+        assert!(
+            sql.contains("SET OPTIONS(require_partition_filter = false)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("SET OPTIONS(partition_expiration_days = NULL)"),
+            "{sql}"
+        );
+
+        let column_partitioned = parse_table_ddl(
+            "CREATE TABLE `p.d.t`\n(\n  d DATE\n)\nPARTITION BY d\n\
+             OPTIONS(\n  partition_expiration_days=30.0\n);",
+        );
+        let sql =
+            build_adoption_sql("p.d.t", "t", "p.d.t__changes", &column_partitioned).join("\n");
+        assert!(!sql.contains("partition_expiration_days"), "{sql}");
+    }
+
     fn typed(name: &str, target_type: &str) -> TargetColumnSpec {
         TargetColumnSpec {
             column_name: name.into(),
@@ -632,6 +958,66 @@ mod tests {
         );
         assert!(sql.contains("PARTITION BY DATE(created_at)"));
         assert!(sql.contains("CLUSTER BY `customer_id`, `region`"));
+    }
+
+    #[test]
+    fn the_table_ddl_yields_its_partitioning_clustering_and_options() {
+        let shape = parse_table_ddl(
+            "CREATE TABLE `p.d.pp`\n(\n  id INT64 OPTIONS(description=\"x\"),\n  d DATE,\n  \
+             v STRING\n)\nPARTITION BY d\nCLUSTER BY v, `order`\nOPTIONS(\n  \
+             require_partition_filter=true\n);",
+        );
+        assert_eq!(shape.partition.as_deref(), Some("d"));
+        assert_eq!(shape.cluster, ["v", "order"]);
+        assert_eq!(
+            shape.options.as_deref(),
+            Some("require_partition_filter=true")
+        );
+        assert!(shape.requires_partition_filter());
+
+        let bare = parse_table_ddl(
+            "CREATE TABLE `p.d.t`\n(\n  ts TIMESTAMP\n)\nPARTITION BY TIMESTAMP_TRUNC(ts, HOUR);",
+        );
+        assert_eq!(bare.partition.as_deref(), Some("TIMESTAMP_TRUNC(ts, HOUR)"));
+        assert!(bare.cluster.is_empty() && bare.options.is_none());
+    }
+
+    #[test]
+    fn an_existing_tables_shape_conflicts_when_partitioning_or_clustering_differ() {
+        let existing = TableShape {
+            partition: Some("d".into()),
+            cluster: vec!["v".into()],
+            options: None,
+        };
+        let id = vec!["id".to_string()];
+        let diff = shape_conflict(&existing, &None, &id).expect("differs");
+        assert!(diff.contains("partitioned by `d`"), "{diff}");
+        assert!(diff.contains("declares no partitioning"), "{diff}");
+        assert!(
+            diff.contains("clustered on `v`, `cluster_by` resolves to `id`"),
+            "{diff}"
+        );
+
+        assert_eq!(
+            shape_conflict(&existing, &Some("d".into()), &["V".to_string()]),
+            None,
+            "the same shape, clustering compared without case"
+        );
+        let plain = TableShape::default();
+        assert_eq!(shape_conflict(&plain, &None, &[]), None);
+        let diff = shape_conflict(&plain, &None, &id).expect("differs");
+        assert!(diff.contains("clustered on nothing"), "{diff}");
+        assert!(!diff.contains("partitioned"), "{diff}");
+    }
+
+    #[test]
+    fn an_unclustered_changelog_carries_no_cluster_clause() {
+        let create = build_create_changes_sql("p.d.t__changes", "  `id` INT64", &[]);
+        assert!(!create.contains("CLUSTER BY"), "{create}");
+        assert!(
+            create.ends_with(")\n;") || create.ends_with(");"),
+            "{create}"
+        );
     }
 
     #[test]
@@ -923,9 +1309,16 @@ mod tests {
         let loader = BigQueryLoader::new(project, dataset);
         // Drive it through the real driver (no gate, no cleanup) — same path prod
         // takes, exercising validate → materialize.
-        let report =
-            crate::load::run_load(&loader, "rivet_bq_live_test", &specs, &[uri], None, None)
-                .expect("live load should succeed");
+        let report = crate::load::run_load(
+            &loader,
+            "rivet_bq_live_test",
+            &specs,
+            &[uri],
+            None,
+            None,
+            crate::load::Ownership::Own,
+        )
+        .expect("live load should succeed");
         assert!(
             report.rows_loaded > 0,
             "expected rows, got {}",
@@ -985,9 +1378,21 @@ mod tests {
         // 2. A scalar job: the getQueryResults leg, against a count this test
         //    seeded itself (not one rivet reported).
         assert_eq!(
-            loader.count_rows(&fqtn, table).expect("count over REST"),
+            loader
+                .api()
+                .unwrap()
+                .run_query_scalar(
+                    &format!("SELECT COUNT(*) AS n FROM `{fqtn}`"),
+                    &loader.labels("count", table)
+                )
+                .expect("count over REST"),
             2,
             "the count must come back from getQueryResults"
+        );
+        assert_eq!(
+            loader.count_rows(table).expect("numRows over REST"),
+            2,
+            "…and the same count from tables.get metadata"
         );
 
         // 3. The labels, read back from BigQuery's catalog. `run_id` is unique
@@ -1092,6 +1497,7 @@ mod tests {
             crate::load::cdc::SourceEngine::MySql,
             None,
             None,
+            crate::load::Ownership::Own,
         )
         .expect("first CDC append + view build should succeed");
         let second = crate::load::run_load_cdc(
@@ -1103,6 +1509,7 @@ mod tests {
             crate::load::cdc::SourceEngine::MySql,
             None,
             None,
+            crate::load::Ownership::Own,
         )
         .expect("second CDC append (at-least-once) should succeed");
         assert!(second.rows_appended > 0, "second append added rows");
@@ -1110,7 +1517,12 @@ mod tests {
         // The dedup VIEW must report the current state, independent of how many
         // times the log was appended.
         let state_rows = loader
-            .count_rows(&second.view, table)
+            .api()
+            .unwrap()
+            .run_query_scalar(
+                &format!("SELECT COUNT(*) AS n FROM `{}`", second.view),
+                &loader.labels("count", table),
+            )
             .expect("counting the dedup view should succeed");
         if expected_state > 0 {
             assert_eq!(
@@ -1119,5 +1531,95 @@ mod tests {
                  (incl tombstones), got {state_rows}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "live: requires BIGQUERY_TEST_PROJECT"]
+    fn bigquery_live_adopts_a_full_load_table_as_the_changelog_baseline() {
+        let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
+            eprintln!("skipping: BIGQUERY_TEST_PROJECT unset");
+            return;
+        };
+        let dataset =
+            std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
+        let loader = BigQueryLoader::new(&project, &dataset);
+        let table = format!("rivet_bq_live_adopt_{}", std::process::id());
+        let changes = format!("{table}__changes");
+        let (fq, changes_fq) = (loader.fqtn(&table), loader.fqtn(&changes));
+        let probe = format!("{table}_probe");
+        let probe_fq = loader.fqtn(&probe);
+        let fixture = |fqtn: &str| {
+            loader.run_sql(
+                &format!(
+                    "CREATE OR REPLACE TABLE `{fqtn}` AS \
+                     SELECT id, CONCAT('v', CAST(id AS STRING)) AS v FROM UNNEST([1, 2, 3]) AS id"
+                ),
+                "fixture",
+                &table,
+            )
+        };
+
+        fixture(&probe_fq).expect("probe table");
+        let collision = loader.create_view(
+            &probe,
+            &format!("CREATE OR REPLACE VIEW `{probe_fq}` AS SELECT 1 AS id"),
+        );
+        let probe_kind = loader.object_kind(&probe);
+        let _ = loader.run_sql(
+            &format!("DROP TABLE IF EXISTS `{probe_fq}`"),
+            "cleanup",
+            &probe,
+        );
+        let _ = loader.run_sql(
+            &format!("DROP VIEW IF EXISTS `{probe_fq}`"),
+            "cleanup",
+            &probe,
+        );
+        eprintln!(
+            "view over a full-load table without adoption: {collision:?}, kind after: {probe_kind:?}"
+        );
+        assert!(
+            collision.is_err(),
+            "CREATE OR REPLACE VIEW over a table must fail, not replace it"
+        );
+        assert_eq!(probe_kind.unwrap(), crate::load::ObjectKind::Table);
+
+        fixture(&fq).expect("fixture table");
+        let before = loader.object_kind(&table);
+        let specs = [typed("id", "INT64"), typed("v", "STRING")];
+        let adopted = crate::load::adopt_full_load_table(
+            &loader,
+            &table,
+            &specs,
+            crate::load::Ownership::Own,
+        );
+        let view_sql = crate::load::cdc::inc_dedup_view_sql(
+            crate::load::cdc::Warehouse::BigQuery,
+            &fq,
+            &changes_fq,
+            &["id"],
+            "id",
+        );
+        let view = adopted
+            .as_ref()
+            .ok()
+            .map(|_| loader.create_view(&table, &view_sql));
+        let after = loader.object_kind(&table);
+        let copied = loader.row_count(&changes);
+        let viewed = loader.row_count(&table);
+        for drop in [
+            format!("DROP VIEW IF EXISTS `{fq}`"),
+            format!("DROP TABLE IF EXISTS `{fq}`"),
+            format!("DROP TABLE IF EXISTS `{changes_fq}`"),
+        ] {
+            let _ = loader.run_sql(&drop, "cleanup", &table);
+        }
+
+        assert_eq!(before.unwrap(), crate::load::ObjectKind::Table);
+        assert_eq!(adopted.unwrap(), Some(3));
+        view.unwrap().unwrap();
+        assert_eq!(after.unwrap(), crate::load::ObjectKind::View);
+        assert_eq!(copied.unwrap(), 3);
+        assert_eq!(viewed.unwrap(), 3);
     }
 }

@@ -1201,6 +1201,68 @@ exports:
     assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
 }
 
+fn settle_yaml(mode_lines: &str, settle: &str) -> String {
+    format!(
+        r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT * FROM events"
+{mode_lines}
+    settle: {settle}
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#
+    )
+}
+
+#[test]
+fn settle_outside_incremental_mode_rejected() {
+    let yaml = settle_yaml("    mode: full", "{ after: 1h }");
+    let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
+    assert!(
+        msg.contains("settle") && msg.contains("mode: incremental"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn settle_after_must_be_a_positive_duration_with_a_unit() {
+    for bad in ["3600", "0h", "1x", "h", "-1h", "1.5h", "99999999d"] {
+        let yaml = settle_yaml(
+            "    mode: incremental\n    cursor_column: id",
+            &format!("{{ after: \"{bad}\" }}"),
+        );
+        let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
+        assert!(msg.contains("settle.after"), "{bad}: {msg}");
+    }
+}
+
+#[test]
+fn settle_accepted_under_incremental() {
+    for settle in [
+        "{ after: 1h }",
+        "{ after: 90s, column: server_time }",
+        "{ after: 2d }",
+    ] {
+        let yaml = settle_yaml("    mode: incremental\n    cursor_column: id", settle);
+        Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{settle}: {e:#}"));
+    }
+}
+
+#[test]
+fn settle_unknown_key_rejected() {
+    let yaml = settle_yaml(
+        "    mode: incremental\n    cursor_column: id",
+        "{ after: 1h, colum: ts }",
+    );
+    assert!(Config::from_yaml(&yaml).is_err());
+}
+
 #[test]
 fn keyset_incremental_requires_chunk_by_key() {
     // Under chunked but with a RANGE chunk_column — no key to resume from.

@@ -36,6 +36,10 @@ enum CloudDest {
         container: String,
         prefix: String,
     },
+    GcsLive {
+        bucket: String,
+        prefix: String,
+    },
 }
 
 pub struct Rig {
@@ -76,6 +80,8 @@ pub struct Rig {
     dest_stdout: bool,
     /// Key column for the census DISTINCT legs (see `Rig::census_key`).
     census_key: Option<String>,
+    /// Top-level lines rendered after the exports. See [`Rig::top_line`].
+    top_lines: Vec<String>,
     /// Caller-owned config copies produced by [`Rig::config_in`] — a
     /// sanctioned mutation re-renders every one of them (materialize.rs).
     materialized_copies: std::cell::RefCell<Vec<PathBuf>>,
@@ -132,6 +138,7 @@ impl Rig {
             ckpt_override: None,
             dest_stdout: false,
             census_key: None,
+            top_lines: Vec::new(),
             cloud_dest: None,
             materialized_copies: std::cell::RefCell::new(Vec::new()),
             past_renders: std::cell::RefCell::new(Vec::new()),
@@ -224,6 +231,13 @@ impl Rig {
         self
     }
 
+    /// Switch to another mode and export lines, keeping this rig's config dir and state DB.
+    pub fn restage(mut self, mode: &str, lines: &[&str]) -> Self {
+        self.mode = mode.to_string();
+        self.extra_lines = lines.iter().map(|l| l.to_string()).collect();
+        self
+    }
+
     /// Query-based export (replaces the `table:` shortcut in the render).
     pub fn query(mut self, sql: &str) -> Self {
         self.query = Some(sql.to_string());
@@ -269,6 +283,18 @@ impl Rig {
         self
     }
 
+    /// A top-level config line verbatim, rendered after the exports (`load: {..}`).
+    pub fn top_line(mut self, line: &str) -> Self {
+        self.top_lines.push(line.to_string());
+        self
+    }
+
+    /// Drop every top-level line, to restage the same export with a different one.
+    pub fn clear_top_lines(mut self) -> Self {
+        self.top_lines.clear();
+        self
+    }
+
     /// Send every export to an S3-compatible bucket instead of the rig's local
     /// tempdir — the SAME rig, so a cloud test does not fork into a hand-rolled
     /// YAML builder (the ~250 templates the rig replaced came back one engine at
@@ -301,6 +327,15 @@ impl Rig {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             endpoint: endpoint.to_string(),
+        });
+        self
+    }
+
+    /// A real GCS bucket through the ambient credentials, for live warehouse loads.
+    pub fn dest_gcs_live(mut self, bucket: &str, prefix: &str) -> Self {
+        self.cloud_dest = Some(CloudDest::GcsLive {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
         });
         self
     }

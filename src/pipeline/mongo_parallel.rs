@@ -66,6 +66,7 @@ pub(crate) fn run_mongo_parallel(
         primary_column: kp.key_column.clone(),
         fallback_column: None,
         mode: IncrementalCursorMode::SingleColumn,
+        settle: None,
     };
 
     // Fan out: each worker reads its disjoint slice, writes its parts, returns

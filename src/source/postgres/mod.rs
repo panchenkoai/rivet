@@ -771,6 +771,18 @@ impl super::Source for PostgresSource {
         Ok(())
     }
 
+    fn primary_key(&mut self, table: &str) -> Result<Option<Vec<String>>> {
+        let sql = format!(
+            "SELECT string_agg(a.attname::text, chr(31) ORDER BY k.ord) \
+             FROM pg_index i \
+             CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+             WHERE i.indrelid = to_regclass('{}') AND i.indisprimary",
+            table.replace('\'', "''")
+        );
+        Ok(crate::source::split_key_list(self.query_scalar(&sql)?))
+    }
+
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
         let rows = self.client.query(sql, &[])?;
         if rows.is_empty() {

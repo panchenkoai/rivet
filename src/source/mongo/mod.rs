@@ -742,6 +742,10 @@ impl Source for MongoSource {
         Ok(blob_mappings())
     }
 
+    fn primary_key(&mut self, _table: &str) -> Result<Option<Vec<String>>> {
+        Ok(Some(vec!["_id".to_string()]))
+    }
+
     /// The only scalar rivet asks a `mode: full` source is the reconcile row
     /// count — `SELECT COUNT(*) FROM (SELECT * FROM <coll>) AS _rivet_reconcile`.
     /// Recognize that shape and answer it with `countDocuments` so

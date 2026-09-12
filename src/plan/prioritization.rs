@@ -207,6 +207,7 @@ mod tests {
                     primary_column: "x".into(),
                     fallback_column: None,
                     mode: IncrementalCursorMode::SingleColumn,
+                    settle: None,
                 }
             )),
             PrioritizationStrategyKind::Incremental

@@ -105,6 +105,8 @@ mod live_destination_parity;
 mod live_governor;
 #[path = "live/live_harness_canary.rs"]
 mod live_harness_canary;
+#[path = "live/live_incremental_settle.rs"]
+mod live_incremental_settle;
 #[path = "live/live_init.rs"]
 mod live_init;
 #[path = "live/live_init_extended.rs"]
@@ -115,8 +117,12 @@ mod live_keyset;
 mod live_keyset_metrics;
 #[path = "live/live_keyset_parallel.rs"]
 mod live_keyset_parallel;
+#[path = "live/live_load_spec.rs"]
+mod live_load_spec;
 #[path = "live/live_metrics_persist.rs"]
 mod live_metrics_persist;
+#[path = "live/live_mode_transition.rs"]
+mod live_mode_transition;
 #[path = "live/live_mongo.rs"]
 mod live_mongo;
 #[path = "live/live_mongo_crash_recovery.rs"]

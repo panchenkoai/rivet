@@ -103,7 +103,13 @@ impl<'a> RunStore<'a> {
     pub fn commit(self) -> Result<()> {
         // ADR-0001 I3 — cursor: fatal on error.
         if let Some(cursor_val) = self.cursor.as_deref() {
-            self.state.update(&self.plan.export_name, cursor_val)?;
+            match self.plan.strategy.cursor_identity() {
+                Some(column) => {
+                    self.state
+                        .update_with_column(&self.plan.export_name, cursor_val, &column)?
+                }
+                None => self.state.update(&self.plan.export_name, cursor_val)?,
+            }
 
             // Test fault-point: cursor advanced, but the outer-pipeline
             // record_metric has NOT been recorded. QA backlog Task 1.1.

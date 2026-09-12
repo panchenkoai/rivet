@@ -46,6 +46,28 @@ pub struct CdcLoadReport {
     pub source_cleaned: bool,
 }
 
+/// What a name currently is in the warehouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Absent,
+    Table,
+    View,
+    Other,
+}
+
+impl ObjectKind {
+    /// Decode an adapter probe's `1·table + 2·view + 4·other` code.
+    pub(crate) fn from_probe(code: u64) -> Result<Self> {
+        Ok(match code {
+            0 => ObjectKind::Absent,
+            1 => ObjectKind::Table,
+            2 => ObjectKind::View,
+            4 => ObjectKind::Other,
+            n => bail!("object-kind probe returned {n}, expected 0, 1, 2 or 4"),
+        })
+    }
+}
+
 /// A warehouse **adapter** — the small, warehouse-specific seam the
 /// [driver](run_load) drives. Dialect + transport (BigQuery's REST API since
 /// #264, Snowflake's `snow` CLI), the external stage,
@@ -92,6 +114,82 @@ pub trait TargetLoader {
     /// load must sail through, and ledger rows survive a truncate. A missing
     /// `__changes` table reads `false` (the first cycle).
     fn changes_has_prior_changes(&self, table: &str) -> Result<bool>;
+
+    /// What `table` currently is: absent, a table, a view, or another object.
+    fn object_kind(&self, table: &str) -> Result<ObjectKind>;
+
+    /// `(columns in table, how many of them are among names)`, compared case-insensitively.
+    fn column_overlap(&self, table: &str, names: &[&str]) -> Result<(u64, u64)>;
+
+    /// Row count of `table`.
+    fn row_count(&self, table: &str) -> Result<u64>;
+
+    /// Rename `table` to `<table>__changes` and add `__op` / `__pos` / `__seq` (NULL on
+    /// every existing row), keeping its rows, partitioning and clustering.
+    fn adopt_as_changelog(&self, table: &str) -> Result<()>;
+
+    /// How the existing `table` differs from what this load would create (partitioning,
+    /// clustering), or `None` when it matches or the warehouse replaces it regardless.
+    fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Whether an existing warehouse table is one rivet loaded, per the load ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    Own,
+    Foreign,
+    /// No ledger to ask (a stateless load).
+    Unknown,
+}
+
+/// Refuse to touch a table rivet did not load; without a ledger, proceed with a note.
+fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
+    match ownership {
+        Ownership::Own => Ok(()),
+        Ownership::Foreign => bail!(
+            "refusing to {verb} `{fqtn}`: it exists, and this state DB's load ledger has no \
+             record of rivet loading it — it may hold someone else's data. Drop or rename it, \
+             or load into another table"
+        ),
+        Ownership::Unknown => {
+            eprintln!(
+                "  note: `{fqtn}` exists and there is no load ledger to confirm rivet loaded it — \
+                 proceeding on its shape alone"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Refuse a whole-table load onto a table that is not rivet's own, differs in shape, or is a view.
+fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Ownership) -> Result<()> {
+    let fqtn = loader.fqtn(table);
+    match loader.object_kind(table)? {
+        ObjectKind::Absent => Ok(()),
+        ObjectKind::Table => {
+            ensure_own(&fqtn, ownership, "overwrite")?;
+            if let Some(diff) = loader.table_shape_conflict(table)? {
+                bail!(
+                    "refusing to overwrite `{fqtn}`: {diff}. A warehouse table cannot change \
+                     its partitioning or clustering in place — drop or rename it, or align the \
+                     config with it"
+                );
+            }
+            Ok(())
+        }
+        ObjectKind::View => bail!(
+            "refusing to overwrite `{fqtn}`: it is a view over `{fqtn}__changes`, the change log \
+             of an earlier incremental or CDC load, and this run holds the whole table (a full \
+             load, or an incremental run with no cursor to resume from) — a full pass cannot be \
+             appended to a change log. To start over, drop the view and `{fqtn}__changes`; to \
+             keep the log, resume the incremental cursor"
+        ),
+        ObjectKind::Other => {
+            bail!("refusing to overwrite `{fqtn}`: it exists and is neither a table nor a view")
+        }
+    }
 }
 
 /// A plain SQL identifier the load layer can safely interpolate into DDL/COPY
@@ -224,12 +322,14 @@ pub fn run_load(
     uris: &[String],
     expected_rows: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
+    ownership: Ownership,
 ) -> Result<LoadReport> {
     if uris.is_empty() {
         bail!("no Parquet URIs to load into `{table}`");
     }
     ensure_safe_load_uris(uris)?;
     validate_specs(table, specs)?;
+    ensure_overwritable(loader, table, ownership)?;
 
     let rows_loaded = loader.materialize(table, specs, uris)?;
 
@@ -272,6 +372,7 @@ fn append_and_view(
     pk: &[String],
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
+    ownership: Ownership,
     label: &str,
     build_view: impl FnOnce(&dyn TargetLoader) -> Result<()>,
 ) -> Result<CdcLoadReport> {
@@ -304,6 +405,15 @@ fn append_and_view(
     }
     validate_specs(&format!("{table}__changes"), specs)?;
 
+    if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership)? {
+        eprintln!(
+            "  note: `{}` held {rows} rows from an earlier full load — it is now `{}`, the change \
+             log this load appends to, and the name becomes the current-state view",
+            loader.fqtn(table),
+            loader.fqtn(&format!("{table}__changes"))
+        );
+    }
+
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
 
     if let Some(expected) = expected_delta
@@ -332,6 +442,58 @@ fn append_and_view(
     })
 }
 
+/// Turn a table an earlier whole-table load left at the view's name into `<table>__changes`
+/// by renaming it; its rows become the change log's baseline. `None` when there is no such table.
+pub(crate) fn adopt_full_load_table(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    ownership: Ownership,
+) -> Result<Option<u64>> {
+    if loader.object_kind(table)? != ObjectKind::Table {
+        return Ok(None);
+    }
+    let changes = format!("{table}__changes");
+    if loader.object_kind(&changes)? != ObjectKind::Absent {
+        bail!(
+            "cannot load `{}`: it is a table and `{}` already exists, so this is not an untouched \
+             full load — refusing to guess which one holds the data. Keep one: drop the table, or \
+             rename it aside and re-run.",
+            loader.fqtn(table),
+            loader.fqtn(&changes)
+        );
+    }
+    ensure_own(&loader.fqtn(table), ownership, "turn into a change log")?;
+    let names: Vec<&str> = specs
+        .iter()
+        .map(|s| s.column_name.as_str())
+        .filter(|c| !cdc::is_meta_column(c))
+        .collect();
+    let (total, matched) = loader.column_overlap(table, &names)?;
+    if total != matched || matched != names.len() as u64 {
+        bail!(
+            "cannot turn `{}` (a table from an earlier full load) into the change-log \
+             baseline: it has {total} column(s), {matched} of the export's {} — the view over \
+             it would not match the export. Align the export with the table, or rename the \
+             table aside and re-run.",
+            loader.fqtn(table),
+            names.len()
+        );
+    }
+    let rows = loader.row_count(table)?;
+    loader.adopt_as_changelog(table)?;
+    let after = loader.row_count(&changes)?;
+    if after != rows {
+        bail!(
+            "`{}` holds {after} rows but `{}` held {rows} before the rename — investigate before \
+             re-running",
+            loader.fqtn(&changes),
+            loader.fqtn(table)
+        );
+    }
+    Ok(Some(rows))
+}
+
 #[allow(clippy::too_many_arguments, private_interfaces)]
 pub fn run_load_cdc(
     loader: &dyn TargetLoader,
@@ -342,6 +504,7 @@ pub fn run_load_cdc(
     engine: cdc::SourceEngine,
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
+    ownership: Ownership,
 ) -> Result<CdcLoadReport> {
     // PK-injection gating lives in the SHARED seam `append_and_view` (below), which
     // covers both the CDC and incremental drivers — no per-driver copy (the old
@@ -354,6 +517,7 @@ pub fn run_load_cdc(
         pk,
         expected_delta,
         cleanup,
+        ownership,
         "CDC",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
@@ -387,6 +551,7 @@ pub fn run_load_incremental(
     cursor_column: &str,
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
+    ownership: Ownership,
 ) -> Result<CdcLoadReport> {
     // uris + pk are checked by `append_and_view`; the cursor guards are incremental-only.
     if cursor_column.is_empty() {
@@ -418,6 +583,7 @@ pub fn run_load_incremental(
         pk,
         expected_delta,
         cleanup,
+        ownership,
         "incremental",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
@@ -496,7 +662,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             project,
             dataset,
             plan.partition_by.as_deref(),
-            &load.cluster_by,
+            &plan.cluster_by,
             run_id,
         )),
         LoadTarget::Snowflake {
@@ -511,7 +677,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.database = database.clone();
             l.schema = schema.clone();
             l.storage_integration = storage_integration.clone();
-            l.cluster_by = load.cluster_by.clone();
+            l.cluster_by = plan.cluster_by.clone();
             l.run_id = Some(run_id.to_string());
             // Snowflake's external stage wants the `gcs://` scheme, not `gs://`.
             l.gcs_url = plan.gcs_prefix.replacen("gs://", "gcs://", 1);
@@ -557,6 +723,12 @@ mod tests {
         materialized: RefCell<Vec<String>>,
         appended: RefCell<Vec<String>>,
         views: RefCell<Vec<String>>,
+        kinds: RefCell<std::collections::HashMap<String, ObjectKind>>,
+        counts: RefCell<std::collections::HashMap<String, u64>>,
+        overlap: Option<(u64, u64)>,
+        prior_changes: bool,
+        shape_conflict: Option<String>,
+        calls: RefCell<Vec<String>>,
     }
 
     impl TargetLoader for FakeLoader {
@@ -565,7 +737,36 @@ mod tests {
         }
 
         fn changes_has_prior_changes(&self, _table: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self.prior_changes)
+        }
+        fn object_kind(&self, table: &str) -> Result<ObjectKind> {
+            Ok(self
+                .kinds
+                .borrow()
+                .get(table)
+                .copied()
+                .unwrap_or(ObjectKind::Absent))
+        }
+        fn column_overlap(&self, _table: &str, names: &[&str]) -> Result<(u64, u64)> {
+            let n = names.len() as u64;
+            Ok(self.overlap.unwrap_or((n, n)))
+        }
+        fn row_count(&self, table: &str) -> Result<u64> {
+            Ok(self.counts.borrow().get(table).copied().unwrap_or(0))
+        }
+        fn adopt_as_changelog(&self, table: &str) -> Result<()> {
+            self.calls.borrow_mut().push(format!("adopt {table}"));
+            let rows = self.row_count(table)?;
+            let changes = format!("{table}__changes");
+            self.kinds.borrow_mut().remove(table);
+            self.kinds
+                .borrow_mut()
+                .insert(changes.clone(), ObjectKind::Table);
+            self.counts.borrow_mut().insert(changes, rows);
+            Ok(())
+        }
+        fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
+            Ok(self.shape_conflict.clone())
         }
         fn materialize(&self, table: &str, _: &[TargetColumnSpec], _: &[String]) -> Result<u64> {
             self.materialized.borrow_mut().push(table.into());
@@ -578,6 +779,7 @@ mod tests {
             _: &[String],
             _: &[String],
         ) -> Result<u64> {
+            self.calls.borrow_mut().push(format!("append {table}"));
             self.appended.borrow_mut().push(table.into());
             Ok(self.rows)
         }
@@ -588,6 +790,250 @@ mod tests {
             self.views.borrow_mut().push(table.into());
             Ok(())
         }
+    }
+
+    fn full_load_left(rows: u64) -> FakeLoader {
+        let f = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        f.kinds.borrow_mut().insert("t".into(), ObjectKind::Table);
+        f.counts.borrow_mut().insert("t".into(), rows);
+        f
+    }
+
+    fn load_incremental(f: &FakeLoader) -> Result<CdcLoadReport> {
+        load_incremental_as(f, Ownership::Own)
+    }
+
+    fn load_incremental_as(f: &FakeLoader, ownership: Ownership) -> Result<CdcLoadReport> {
+        run_load_incremental(
+            f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".to_string()],
+            "id",
+            Some(3),
+            None,
+            ownership,
+        )
+    }
+
+    fn calls(f: &FakeLoader) -> Vec<String> {
+        f.calls.borrow().clone()
+    }
+
+    #[test]
+    fn a_full_load_table_becomes_the_changelog_before_the_first_append() {
+        let f = full_load_left(5);
+        load_incremental(&f).unwrap();
+        assert_eq!(calls(&f), ["adopt t", "append t"]);
+        assert_eq!(*f.views.borrow(), ["t"]);
+        assert_eq!(f.object_kind("t").unwrap(), ObjectKind::Absent);
+        assert_eq!(f.object_kind("t__changes").unwrap(), ObjectKind::Table);
+    }
+
+    #[test]
+    fn a_table_rivet_did_not_load_is_not_taken_over() {
+        let f = full_load_left(5);
+        let err = format!(
+            "{:#}",
+            load_incremental_as(&f, Ownership::Foreign).unwrap_err()
+        );
+        assert!(err.contains("no record of rivet loading it"), "{err}");
+        assert!(calls(&f).is_empty(), "nothing renamed or appended");
+    }
+
+    #[test]
+    fn without_a_ledger_the_table_is_taken_over_on_its_shape() {
+        let f = full_load_left(5);
+        load_incremental_as(&f, Ownership::Unknown).unwrap();
+        assert_eq!(calls(&f), ["adopt t", "append t"]);
+    }
+
+    fn full_load(f: &FakeLoader, ownership: Ownership) -> Result<LoadReport> {
+        run_load(
+            f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            Some(3),
+            None,
+            ownership,
+        )
+    }
+
+    #[test]
+    fn a_full_load_overwrites_its_own_table_and_refuses_the_rest() {
+        let fresh = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        full_load(&fresh, Ownership::Foreign).unwrap();
+        assert_eq!(
+            *fresh.materialized.borrow(),
+            ["t"],
+            "an absent table is created"
+        );
+
+        full_load(&full_load_left(5), Ownership::Own).unwrap();
+        full_load(&full_load_left(5), Ownership::Unknown).unwrap();
+
+        let reshaped = FakeLoader {
+            shape_conflict: Some("it is clustered on `v`, the config clusters on `id`".into()),
+            ..full_load_left(5)
+        };
+        let err = format!("{:#}", full_load(&reshaped, Ownership::Own).unwrap_err());
+        assert!(err.contains("clustered on `v`"), "{err}");
+        assert!(reshaped.materialized.borrow().is_empty());
+
+        let foreign = full_load_left(5);
+        let err = format!("{:#}", full_load(&foreign, Ownership::Foreign).unwrap_err());
+        assert!(err.contains("no record of rivet loading it"), "{err}");
+        assert!(foreign.materialized.borrow().is_empty());
+
+        let viewed = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        viewed
+            .kinds
+            .borrow_mut()
+            .insert("t".into(), ObjectKind::View);
+        let err = format!("{:#}", full_load(&viewed, Ownership::Own).unwrap_err());
+        assert!(err.contains("it is a view over `db.t__changes`"), "{err}");
+        assert!(viewed.materialized.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_full_load_table_is_adopted_on_the_cdc_path_too() {
+        let f = full_load_left(5);
+        run_load_cdc(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".to_string()],
+            cdc::SourceEngine::MySql,
+            Some(3),
+            None,
+            Ownership::Own,
+        )
+        .unwrap();
+        assert_eq!(calls(&f), ["adopt t", "append t"]);
+    }
+
+    #[test]
+    fn a_full_load_table_with_other_columns_is_refused_untouched() {
+        let f = FakeLoader {
+            overlap: Some((3, 1)),
+            ..full_load_left(5)
+        };
+        let err = format!("{:#}", load_incremental(&f).unwrap_err());
+        assert!(
+            err.contains("baseline") && err.contains("3 column"),
+            "{err}"
+        );
+        assert!(calls(&f).is_empty(), "nothing renamed or appended");
+    }
+
+    #[test]
+    fn a_table_beside_an_existing_changelog_is_refused_untouched() {
+        for (changes_rows, prior) in [(5, false), (9, false), (5, true)] {
+            let f = FakeLoader {
+                prior_changes: prior,
+                ..full_load_left(5)
+            };
+            f.kinds
+                .borrow_mut()
+                .insert("t__changes".into(), ObjectKind::Table);
+            f.counts
+                .borrow_mut()
+                .insert("t__changes".into(), changes_rows);
+            let err = format!("{:#}", load_incremental(&f).unwrap_err());
+            assert!(err.contains("already exists"), "{err}");
+            assert!(
+                calls(&f).is_empty(),
+                "{changes_rows}/{prior}: nothing touched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rename_that_loses_rows_is_reported() {
+        struct ShortCopy(FakeLoader);
+        impl TargetLoader for ShortCopy {
+            fn fqtn(&self, t: &str) -> String {
+                self.0.fqtn(t)
+            }
+            fn changes_has_prior_changes(&self, t: &str) -> Result<bool> {
+                self.0.changes_has_prior_changes(t)
+            }
+            fn object_kind(&self, t: &str) -> Result<ObjectKind> {
+                self.0.object_kind(t)
+            }
+            fn column_overlap(&self, t: &str, n: &[&str]) -> Result<(u64, u64)> {
+                self.0.column_overlap(t, n)
+            }
+            fn row_count(&self, t: &str) -> Result<u64> {
+                Ok(self.0.row_count(t)? - u64::from(t.ends_with("__changes")))
+            }
+            fn adopt_as_changelog(&self, t: &str) -> Result<()> {
+                self.0.adopt_as_changelog(t)
+            }
+            fn materialize(&self, t: &str, s: &[TargetColumnSpec], u: &[String]) -> Result<u64> {
+                self.0.materialize(t, s, u)
+            }
+            fn append_changelog(
+                &self,
+                t: &str,
+                s: &[TargetColumnSpec],
+                u: &[String],
+                p: &[String],
+            ) -> Result<u64> {
+                self.0.append_changelog(t, s, u, p)
+            }
+            fn warehouse(&self) -> cdc::Warehouse {
+                self.0.warehouse()
+            }
+            fn create_view(&self, t: &str, v: &str) -> Result<()> {
+                self.0.create_view(t, v)
+            }
+        }
+        let f = ShortCopy(full_load_left(5));
+        let err = format!(
+            "{:#}",
+            adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own).unwrap_err()
+        );
+        assert!(err.contains("before the rename"), "{err}");
+        assert_eq!(
+            calls(&f.0),
+            ["adopt t"],
+            "nothing is appended after a short rename"
+        );
+    }
+
+    #[test]
+    fn a_view_or_an_absent_name_is_not_adopted() {
+        for kind in [ObjectKind::View, ObjectKind::Absent, ObjectKind::Other] {
+            let f = FakeLoader {
+                rows: 3,
+                ..Default::default()
+            };
+            f.kinds.borrow_mut().insert("t".into(), kind);
+            load_incremental(&f).unwrap();
+            assert_eq!(calls(&f), ["append t"], "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn object_kind_probe_codes_decode_and_unknown_codes_fail() {
+        assert_eq!(ObjectKind::from_probe(0).unwrap(), ObjectKind::Absent);
+        assert_eq!(ObjectKind::from_probe(1).unwrap(), ObjectKind::Table);
+        assert_eq!(ObjectKind::from_probe(2).unwrap(), ObjectKind::View);
+        assert_eq!(ObjectKind::from_probe(4).unwrap(), ObjectKind::Other);
+        assert!(ObjectKind::from_probe(3).is_err());
     }
 
     /// An fs-backed [`GcsStore`] seeded with one object under the bucket-relative
@@ -674,14 +1120,36 @@ mod tests {
             rows: 10,
             ..Default::default()
         };
-        assert!(run_load(&f, "t", &spec(TargetStatus::Ok), &[], Some(10), None).is_err());
+        assert!(
+            run_load(
+                &f,
+                "t",
+                &spec(TargetStatus::Ok),
+                &[],
+                Some(10),
+                None,
+                Ownership::Own
+            )
+            .is_err()
+        );
         assert!(f.materialized.borrow().is_empty());
     }
 
     #[test]
     fn fail_spec_bails_before_materialize() {
         let f = FakeLoader::default();
-        assert!(run_load(&f, "t", &spec(TargetStatus::Fail), &uris(), Some(10), None).is_err());
+        assert!(
+            run_load(
+                &f,
+                "t",
+                &spec(TargetStatus::Fail),
+                &uris(),
+                Some(10),
+                None,
+                Ownership::Own
+            )
+            .is_err()
+        );
         assert!(f.materialized.borrow().is_empty());
     }
 
@@ -700,6 +1168,7 @@ mod tests {
             &uris(),
             Some(10),
             Some((&store, PREFIX)),
+            Ownership::Own,
         )
         .unwrap_err()
         .to_string();
@@ -725,6 +1194,7 @@ mod tests {
             &uris(),
             Some(10),
             Some((&store, PREFIX)),
+            Ownership::Own,
         )
         .unwrap();
         assert!(r.source_cleaned);
@@ -741,7 +1211,16 @@ mod tests {
             rows: 10,
             ..Default::default()
         };
-        let r = run_load(&f, "t", &spec(TargetStatus::Ok), &uris(), Some(10), None).unwrap();
+        let r = run_load(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            Some(10),
+            None,
+            Ownership::Own,
+        )
+        .unwrap();
         assert!(!r.source_cleaned);
     }
 
@@ -752,7 +1231,18 @@ mod tests {
             ..Default::default()
         };
         // No expected count → any landed rows pass (an ad-hoc load).
-        assert!(run_load(&f, "t", &spec(TargetStatus::Ok), &uris(), None, None).is_ok());
+        assert!(
+            run_load(
+                &f,
+                "t",
+                &spec(TargetStatus::Ok),
+                &uris(),
+                None,
+                None,
+                Ownership::Own
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -772,6 +1262,7 @@ mod tests {
             cdc::SourceEngine::MySql,
             Some(5),
             Some((&store, PREFIX)),
+            Ownership::Own,
         )
         .unwrap_err()
         .to_string();
@@ -803,6 +1294,7 @@ mod tests {
             cdc::SourceEngine::MySql,
             Some(5),
             Some((&store, PREFIX)),
+            Ownership::Own,
         )
         .unwrap();
         assert_eq!(r.rows_appended, 5);
@@ -896,7 +1388,8 @@ mod tests {
                 &[],
                 cdc::SourceEngine::MySql,
                 None,
-                None
+                None,
+                Ownership::Own
             )
             .is_err()
         );
@@ -921,7 +1414,16 @@ mod tests {
             };
             let uris = vec![bad.to_string()];
             assert!(
-                run_load(&f, "t", &spec(TargetStatus::Ok), &uris, Some(1), None).is_err(),
+                run_load(
+                    &f,
+                    "t",
+                    &spec(TargetStatus::Ok),
+                    &uris,
+                    Some(1),
+                    None,
+                    Ownership::Own
+                )
+                .is_err(),
                 "run_load must reject the injection URI {bad:?}"
             );
             assert!(
@@ -938,6 +1440,7 @@ mod tests {
                     cdc::SourceEngine::MySql,
                     Some(1),
                     None,
+                    Ownership::Own,
                 )
                 .is_err(),
                 "run_load_cdc must reject the injection URI {bad:?}"
@@ -967,6 +1470,7 @@ mod tests {
             "updated_at",
             None,
             None,
+            Ownership::Own,
         )
         .unwrap_err()
         .to_string();
@@ -997,6 +1501,7 @@ mod tests {
             "id",                             // valid cursor (in specs) so we reach the pk gate
             None,
             None,
+            Ownership::Own,
         )
         .unwrap_err()
         .to_string();

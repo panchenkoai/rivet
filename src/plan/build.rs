@@ -98,10 +98,18 @@ pub fn build_plan(
             })?;
             let fallback_column = export.cursor_fallback_column.clone();
             let mode = export.incremental_cursor_mode;
+            let settle = match &export.settle {
+                Some(s) => Some(crate::plan::SettlePlan {
+                    column: s.column.clone(),
+                    after_secs: s.after_secs()?,
+                }),
+                None => None,
+            };
             ExtractionStrategy::Incremental(IncrementalCursorPlan {
                 primary_column,
                 fallback_column,
                 mode,
+                settle,
             })
         }
         ExportMode::Chunked => resolve_chunked_strategy(config, export, &tuning)?,

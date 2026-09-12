@@ -12,21 +12,92 @@ impl StateStore {
     pub fn get(&self, export_name: &str) -> Result<CursorState> {
         Ok(self
             .query_opt(
-                "SELECT last_cursor_value, last_run_at FROM export_state WHERE export_name = ?1",
+                "SELECT last_cursor_value, last_run_at, cursor_column FROM export_state \
+                 WHERE export_name = ?1",
                 &[export_name.into()],
                 |r| CursorState {
                     export_name: export_name.to_string(),
                     last_cursor_value: r.opt_text(0),
                     last_run_at: r.opt_text(1),
+                    cursor_column: r.opt_text(2),
                 },
             )?
             .unwrap_or_else(|| CursorState {
                 export_name: export_name.to_string(),
                 last_cursor_value: None,
                 last_run_at: None,
+                cursor_column: None,
             }))
     }
 
+    /// Read the cursor for a run progressing on `expected`, refusing one written for another column.
+    pub fn get_owned(&self, export_name: &str, expected: &str) -> Result<CursorState> {
+        let state = self.get(export_name)?;
+        let Some(value) = state.last_cursor_value.as_deref() else {
+            return Ok(state);
+        };
+        let owner = match &state.cursor_column {
+            Some(c) => Some(c.clone()),
+            None => self.legacy_cursor_owner(export_name, value)?,
+        };
+        if let Some(owner) = owner
+            && owner != expected
+        {
+            anyhow::bail!(
+                "export '{export_name}': the stored cursor `{value}` was written for `{owner}`, \
+                 but this export now progresses on `{expected}` — comparing `{expected}` against \
+                 it selects the wrong rows (on MySQL silently none, on every run).\n  \
+                 Hint: `rivet state reset --export {export_name}` starts `{expected}` over with a \
+                 full pass; or restore the previous cursor (`{owner}`)."
+            );
+        }
+        Ok(state)
+    }
+
+    /// Owner of a pre-v26 row: the key of the latest successful keyset run that wrote this value.
+    fn legacy_cursor_owner(&self, export_name: &str, value: &str) -> Result<Option<String>> {
+        let latest = self.query_opt(
+            "SELECT mode, chunk_key, cursor_max FROM export_metrics \
+             WHERE export_name = ?1 AND status = 'success' ORDER BY id DESC LIMIT 1",
+            &[export_name.into()],
+            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2)),
+        )?;
+        Ok(match latest {
+            Some((Some(mode), Some(key), Some(max))) if mode == "keyset" && max == value => {
+                Some(key)
+            }
+            _ => None,
+        })
+    }
+
+    /// Advance the cursor and record which column/key it belongs to.
+    pub fn update_with_column(
+        &self,
+        export_name: &str,
+        cursor_value: &str,
+        cursor_column: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let sql =
+            "INSERT INTO export_state (export_name, last_cursor_value, last_run_at, cursor_column)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(export_name) DO UPDATE SET
+                last_cursor_value = excluded.last_cursor_value,
+                last_run_at = excluded.last_run_at,
+                cursor_column = excluded.cursor_column";
+        self.execute(
+            sql,
+            &[
+                export_name.into(),
+                cursor_value.into(),
+                now.into(),
+                cursor_column.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Advance the cursor value only, leaving any recorded `cursor_column` as is.
     pub fn update(&self, export_name: &str, cursor_value: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state (export_name, last_cursor_value, last_run_at)
@@ -105,12 +176,14 @@ impl StateStore {
 
     pub fn list_all(&self) -> Result<Vec<CursorState>> {
         self.query(
-            "SELECT export_name, last_cursor_value, last_run_at FROM export_state ORDER BY export_name",
+            "SELECT export_name, last_cursor_value, last_run_at, cursor_column FROM export_state \
+             ORDER BY export_name",
             &[],
             |r| CursorState {
                 export_name: r.text(0),
                 last_cursor_value: r.opt_text(1),
                 last_run_at: r.opt_text(2),
+                cursor_column: r.opt_text(3),
             },
         )
     }
@@ -293,5 +366,81 @@ mod tests {
             s.get_progression("users").unwrap().committed.is_some(),
             "reset must not touch another export's progression"
         );
+    }
+
+    fn metric(s: &StateStore, mode: &str, key: Option<&str>, max: &str) {
+        s.execute(
+            "INSERT INTO export_metrics \
+             (export_name, run_at, duration_ms, total_rows, status, mode, chunk_key, cursor_max) \
+             VALUES ('orders', '2026-09-11T00:00:00Z', 1, 1, 'success', ?1, ?2, ?3)",
+            &[mode.into(), key.map(str::to_string).into(), max.into()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn get_owned_accepts_the_identity_that_wrote_the_cursor() {
+        let s = store();
+        s.update_with_column("orders", "100", "id").unwrap();
+        let c = s.get_owned("orders", "id").unwrap();
+        assert_eq!(c.last_cursor_value.as_deref(), Some("100"));
+        assert_eq!(c.cursor_column.as_deref(), Some("id"));
+    }
+
+    #[test]
+    fn get_owned_refuses_a_cursor_written_for_another_column() {
+        let s = store();
+        s.update_with_column("orders", "3711169", "idvisit")
+            .unwrap();
+        let msg = format!(
+            "{:#}",
+            s.get_owned("orders", "visit_last_action_time").unwrap_err()
+        );
+        assert!(
+            msg.contains("idvisit")
+                && msg.contains("visit_last_action_time")
+                && msg.contains("state reset"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn update_keeps_the_recorded_column() {
+        let s = store();
+        s.update_with_column("orders", "1", "id").unwrap();
+        s.update("orders", "2").unwrap();
+        assert_eq!(
+            s.get("orders").unwrap().cursor_column.as_deref(),
+            Some("id")
+        );
+    }
+
+    #[test]
+    fn get_owned_without_a_cursor_value_never_refuses() {
+        let s = store();
+        s.set_resume_run_id("orders", "r1").unwrap();
+        assert!(s.get_owned("orders", "anything").is_ok());
+    }
+
+    #[test]
+    fn legacy_row_is_owned_by_the_keyset_run_that_wrote_it() {
+        let s = store();
+        s.update("orders", "3711169").unwrap();
+        metric(&s, "keyset", Some("idvisit"), "3711169");
+        assert!(s.get_owned("orders", "idvisit").is_ok());
+        assert!(s.get_owned("orders", "visit_last_action_time").is_err());
+    }
+
+    #[test]
+    fn legacy_row_without_a_matching_keyset_run_is_not_refused() {
+        let s = store();
+        s.update("orders", "2026-09-11 10:00:00").unwrap();
+        metric(&s, "keyset", Some("idvisit"), "3711169");
+        assert!(s.get_owned("orders", "updated_at").is_ok());
+
+        let t = store();
+        t.update("orders", "500").unwrap();
+        metric(&t, "incremental", None, "500");
+        assert!(t.get_owned("orders", "anything").is_ok());
     }
 }

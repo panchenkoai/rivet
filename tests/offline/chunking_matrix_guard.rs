@@ -237,6 +237,8 @@ const MATRICES: &[(&str, usize)] = &[
     // was filled by `checkpoint_governor_backs_off_under_concurrent_write_pressure`.
     // At 0 this ledger admits nothing: any new gap cell fails here immediately.
     ("docs/runner-coverage-matrix.yaml", 0),
+    // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
+    ("docs/mode-transition-matrix.yaml", 3),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

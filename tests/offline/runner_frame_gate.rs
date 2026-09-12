@@ -384,8 +384,15 @@ fn assert_both_job_entry_points_do(needles: &[(&str, &str)], harm: &str) {
     // The script's own body is then graded for every needle directly, so the
     // contract cannot be satisfied by a route to a hollowed-out script.
     let script_entry = "fn execute_resolved_plan(";
+    let run_wrapper = text
+        .find("pub(super) fn run_export_job(")
+        .expect("the `rivet run` entry point moved or was renamed");
+    assert!(
+        body_of(&text, run_wrapper).contains("run_export_job_inner("),
+        "the `rivet run` entry point must run its body, `run_export_job_inner`"
+    );
     for entry in [
-        "pub(super) fn run_export_job(",
+        "fn run_export_job_inner(",
         "pub(crate) fn run_export_job_with_chunk_source(",
         script_entry,
     ] {

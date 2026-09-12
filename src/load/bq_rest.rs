@@ -142,6 +142,39 @@ impl BigQueryApi {
         parse_scalar_u64(&results)
     }
 
+    /// Run a query job and read the first cell of its first row as text; `None`
+    /// when there is no row or the cell is NULL.
+    pub(crate) fn run_query_text(
+        &self,
+        sql: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Option<String>> {
+        let job_ref = self.settle(self.insert_query_job(sql, labels)?)?;
+        let results = self.get_json(&self.query_results_url(&job_ref), "getQueryResults")?;
+        Ok(parse_scalar_text(&results))
+    }
+
+    /// `numRows` of `dataset.table` from `tables.get`: table metadata, no query job, so
+    /// it needs no partition filter on a table that requires one. `None` for anything
+    /// but a table — a view reports a meaningless zero.
+    pub(crate) fn table_num_rows(&self, dataset: &str, table: &str) -> Result<Option<u64>> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
+            self.endpoint, self.project
+        );
+        let meta = self.get_json(&url, "tables.get")?;
+        if meta.get("type").and_then(Value::as_str) != Some("TABLE") {
+            return Ok(None);
+        }
+        let rows = meta
+            .get("numRows")
+            .and_then(Value::as_str)
+            .context("BigQuery tables.get returned no numRows")?;
+        rows.parse::<u64>()
+            .map(Some)
+            .with_context(|| format!("BigQuery returned a non-numeric numRows: {rows}"))
+    }
+
     /// Take an inserted job to a terminal state. A short statement often
     /// completes inside the insert call, so the body already in hand is graded
     /// before a poll is spent.
@@ -579,6 +612,20 @@ pub(crate) fn parse_scalar_u64(results: &Value) -> Result<u64> {
             .context("BigQuery returned a count that is not a non-negative integer"),
         other => bail!("BigQuery returned a count of an unexpected JSON type: {other}"),
     }
+}
+
+/// The first cell of the first row of a `getQueryResults` reply as text, or `None`.
+pub(crate) fn parse_scalar_text(results: &Value) -> Option<String> {
+    results
+        .get("rows")?
+        .as_array()?
+        .first()?
+        .get("f")?
+        .as_array()?
+        .first()?
+        .get("v")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// `?location=<loc>` when the job has one, else empty.

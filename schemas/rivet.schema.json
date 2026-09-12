@@ -542,6 +542,18 @@
           "$ref": "#/$defs/IncrementalCursorMode",
           "default": "single_column"
         },
+        "settle": {
+          "description": "Incremental only: export a row once it is older than `settle.after` (source clock).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SettleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "chunk_column": {
           "type": [
             "string",
@@ -926,6 +938,28 @@
           "type": "string",
           "const": "coalesce"
         }
+      ]
+    },
+    "SettleConfig": {
+      "description": "Settle window for `mode: incremental`: hold rows back until they stop changing.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "description": "Date/timestamp column to age; defaults to the cursor. Zone-less values are UTC.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "after": {
+          "description": "Minimum age before a row exports: `<n>s`, `<n>m`, `<n>h` or `<n>d`, e.g. `1h`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "after"
       ]
     },
     "TimeColumnType": {

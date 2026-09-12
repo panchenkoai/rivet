@@ -213,7 +213,8 @@ rivet load -c rivet.yaml    # load → warehouse (native types; count-gated befo
 
 The load follows the export's `mode:` — `full` overwrites the latest snapshot;
 `incremental` / `cdc` append to `<table>__changes` and expose a current-state
-dedup view (add `pk: [id]` to the `load:` block as the dedup key). Recipes:
+dedup view keyed on the source primary key `rivet run` recorded (set `pk: [id]`
+in the `load:` block for a `query:` export or to override it). Recipes:
 [snowflake-load.md](recipes/snowflake-load.md) ·
 [cdc-bigquery-load.md](cdc-bigquery-load.md).
 

@@ -67,6 +67,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `cursor_column` | `string` |  |  |
 | `cursor_fallback_column` | `string` |  | Secondary column for [`IncrementalCursorMode::Coalesce`] only (see ADR-0007). |
 | `incremental_cursor_mode` | `single_column` \| `coalesce` |  | How primary (and optional fallback) columns drive incremental progression. |
+| `settle` | [SettleConfig](#settleconfig) |  | Incremental only: export a row once it is older than `settle.after` (source clock). |
 | `chunk_column` | `string` |  |  |
 | `chunk_dense` | `boolean` |  |  |
 | `chunk_size` | `integer` |  |  |

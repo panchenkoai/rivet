@@ -22,6 +22,7 @@ mod governor;
 pub(crate) mod ipc;
 mod job;
 mod keyset;
+mod load_spec;
 mod manifest_reconcile;
 pub(crate) mod manifest_writer;
 mod mongo_parallel;

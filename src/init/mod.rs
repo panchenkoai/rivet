@@ -595,6 +595,7 @@ pub fn init(
         Some(path) => {
             write_config_output(path, &text)?;
             record_strategy_snapshots(path, &snapshots);
+            record_primary_keys(path, source_url, tls, &snapshots);
             let label_written = match format {
                 InitFormat::Yaml => "Config",
                 InitFormat::DiscoveryJson => "Discovery artifact",
@@ -1167,6 +1168,56 @@ fn record_strategy_snapshots(config_path: &str, snapshots: &[crate::state::Strat
                 s.export_name
             );
         }
+    }
+}
+
+/// Record each scaffolded export's source primary key in key order, so `rivet load`
+/// has one for a `query:` export, which `rivet run` cannot read a key from. Connects
+/// with init's own URL: the scaffold's `url_env` is usually unset in this process.
+fn record_primary_keys(
+    config_path: &str,
+    source_url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+    snapshots: &[crate::state::StrategySnapshot],
+) {
+    if snapshots.is_empty() {
+        return;
+    }
+    let recorded = (|| -> Result<()> {
+        let config = crate::config::Config::load(config_path)?;
+        let store = crate::state::StateStore::open(config_path)?;
+        let mut src = crate::preflight::type_report::connect_source(&config, source_url, tls)?;
+        for s in snapshots {
+            let relation = relation_for_key(
+                &config.source.source_type,
+                s.source_schema.as_deref(),
+                &s.source_table,
+            );
+            if let Some(pk) = src.primary_key(&relation)? {
+                store.record_primary_key(&s.export_name, None, &pk)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = recorded {
+        log::warn!("init: source primary keys not recorded for `rivet load`: {e:#}");
+    }
+}
+
+/// `schema.table` quoted the way the engine's catalog lookup reads it.
+fn relation_for_key(
+    source_type: &crate::config::SourceType,
+    schema: Option<&str>,
+    table: &str,
+) -> String {
+    let quote = |part: &str| match source_type {
+        crate::config::SourceType::Mysql => format!("`{}`", part.replace('`', "``")),
+        crate::config::SourceType::Mssql => format!("[{}]", part.replace(']', "]]")),
+        _ => format!("\"{}\"", part.replace('"', "\"\"")),
+    };
+    match schema {
+        Some(s) => format!("{}.{}", quote(s), quote(table)),
+        None => quote(table),
     }
 }
 

@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- **`load: { pk, cluster_by }` default to the source primary key** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
+  Both take `auto` (the default), `none`, or a column list. `pk: auto` is the primary key
+  `rivet run` recorded, so an incremental / CDC load no longer needs `pk:` for a table with
+  one; `cluster_by: auto` clusters the table the load writes (the full-load table or
+  `<table>__changes`) on that key, skipping columns BigQuery cannot cluster and keeping at
+  most four. An explicit `cluster_by` column BigQuery cannot hold is refused at plan time.
+  `<table>__changes` is now clustered on `cluster_by` rather than always on `pk`.
+  `rivet init -o` records each scaffolded export's key too, so a `query:` export — which
+  `rivet run` cannot read a key from — also gets one.
+- **An incremental export's first run lands as a plain table; the change log starts with the
+  first delta.** A run that re-read the whole table (the first run, or one after `rivet state
+  reset`) is loaded into `<table>` exactly like a full load. The first delta then renames that
+  table to `<table>__changes`, adds `__op` / `__pos` / `__seq` (NULL on the existing rows) and
+  puts the current-state view under the old name — no copy, nothing dropped, and the change
+  log keeps the table's partitioning and clustering (a `require_partition_filter` is lifted,
+  since the view reads the whole log). The same rename turns a full-load table into the log
+  when a keyset export continues as incremental on the same key, or a CDC stream starts over
+  it without `initial: snapshot`. Previously the first append copied the table into the log
+  with a billed `CREATE TABLE … AS SELECT`, and after a full → incremental switch that copy
+  duplicated every row the first run had re-read.
+- **A load never touches a table it does not own.** A whole-table load onto an existing table
+  proceeds only when the load ledger shows rivet loaded it and its partitioning and clustering
+  match the config. A table rivet did not load, one whose shape differs (partitioned or
+  re-clustered by hand, or `cluster_by` changed), or a view left by an incremental / CDC load
+  fails the load naming the table and the difference, and nothing is changed. A CDC load that
+  carries an initial snapshot over a table an earlier full load left is refused the same way:
+  keep one baseline. Without a ledger (a stateless load) the table's shape is the only
+  evidence, and the load says so. On BigQuery row counts come from table metadata, so a table
+  that requires a partition filter can be counted.
+- **`rivet load` no longer reads the source** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
+  A successful `rivet run` of an export in a config with a `load:` block records the
+  column types it wrote and the source primary key in the state DB (schema v27,
+  `export_load_spec`); `rivet load` plans the warehouse schema from that record and opens
+  no source connection. A load with nothing recorded fails naming the export — after
+  upgrading, run `rivet run` once before the next `rivet load`.
+
+- **New: `settle` for `mode: incremental`.** `settle: { after: 1h, column: server_time }`
+  exports a row only once it is older than `after` by the source clock — for rows the
+  application keeps writing into after their insert, with no column that records it.
+  With a separate settle column the cursor also stops below the first unsettled row, so
+  an out-of-order commit is never skipped. MySQL, PostgreSQL and SQL Server.
+- **Fix: changing an export's cursor no longer exports nothing, silently.** The stored
+  cursor was keyed by export name alone, so a new `cursor_column` (or keyset →
+  incremental on another column) compared the new column against the old value — on
+  MySQL a zero-row match with exit 0, on every run. The cursor's column is now recorded
+  (state schema v26) and a mismatch fails naming both columns and `rivet state reset`;
+  cursors written by keyset before v26 are recognised from the run history.
+- **Mode transitions are a contract** ([ADR-0033](docs/adr/0033-mode-transitions.md)): what
+  an export inherits when it switches to incremental — a full pass after `full` /
+  `time_window` / range `chunked`, a continuation on the same key after keyset, a loud
+  refusal on a different column. `docs/mode-transition-matrix.yaml` covers 13 transitions
+  on MySQL, PostgreSQL and SQL Server with live tests.
+- **Fix: the first incremental / CDC `rivet load` after a full load.** The full load left
+  `<table>` as a table, and the incremental load's `CREATE OR REPLACE VIEW <table>`
+  collided with it (and its view would have hidden the full-loaded rows). The load now
+  copies that table into `<table>__changes` as the baseline, checks the row count and
+  drops it; it refuses, touching nothing, when the columns differ. BigQuery and Snowflake.
+
 ## 0.25.0 — 2026-08-30
 
 - **New: `rivet state runs` and `rivet state finish-run`** — the frozen-prefix
