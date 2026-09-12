@@ -255,9 +255,12 @@ impl MssqlSource {
             .map_err(|e| anyhow::anyhow!("mssql: tokio runtime build failed: {e}"))?;
 
         let client = rt.block_on(async {
-            let tcp = TcpStream::connect(config.get_addr())
-                .await
-                .map_err(|e| anyhow::anyhow!("mssql: TCP connect failed: {e}"))?;
+            let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
+                crate::source::describe_connect_error(
+                    url,
+                    anyhow::anyhow!("mssql: TCP connect failed: {e}"),
+                )
+            })?;
             tcp.set_nodelay(true).ok();
             Client::connect(config, tcp.compat_write())
                 .await

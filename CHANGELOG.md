@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
+  text ("failed to lookup address information…", or MongoDB's whole topology dump); a
+  connection that fails before the server answers now says `cannot resolve host <host> —
+  check the host name in url:`, `nothing is listening on <host>:<port>`, or `no answer from
+  <host>:<port>`, with the driver's text after it. MySQL dials at open, so the message comes
+  from `rivet init` / `rivet run` start, not from the first query.
+- **`rivet init --include a b c`** — several globs after one `--include` / `--exclude`
+  (the repeated form still works).
 - **`load: { pk, cluster_by }` default to the source primary key** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
   Both take `auto` (the default), `none`, or a column list. `pk: auto` is the primary key
   `rivet run` recorded, so an incremental / CDC load no longer needs `pk:` for a table with

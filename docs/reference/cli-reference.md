@@ -358,8 +358,8 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--source-file <PATH>` — Path to a file containing just the database URL (one line). Credentials stay on disk instead of entering the process command line
 * `--table <TABLE>` — Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database
 * `--schema <SCHEMA>` — PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL)
-* `--include <GLOB>` — Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all
-* `--exclude <GLOB>` — Whole-schema only: drop tables/views matching this glob (`*`/`?`). Repeatable; `--exclude` wins over `--include`
+* `--include <GLOB>` — Whole-schema only: keep only tables/views matching these globs (`*`/`?`) — several after one flag (`--include orders users`) or the flag repeated; a table is kept if it matches any. No `--include` = keep all
+* `--exclude <GLOB>` — Whole-schema only: drop tables/views matching these globs (`*`/`?`) — several after one flag or the flag repeated; `--exclude` wins over `--include`
 * `-o`, `--output <OUTPUT>` — Write output to this file instead of stdout
 * `--discover` — Emit a machine-readable JSON discovery artifact instead of a YAML scaffold. Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes. Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags
 * `--mode <MODE>` — Override the suggested extraction mode for every scaffolded export. `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block with engine-specific stream params) instead of a batch query. Other values (full / incremental / chunked / time_window) just override the auto-suggested mode

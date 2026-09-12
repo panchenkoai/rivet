@@ -128,30 +128,16 @@ impl MysqlSource {
         Self { pool, proxy_kind }
     }
 
-    /// Connect with no transport security (legacy path).
+    /// Connect with no transport security (legacy path); the live tests reach it
+    /// through the library surface, so the binary unit sees it as unused.
+    #[allow(dead_code)]
     pub fn connect(url: &str) -> Result<Self> {
-        let opts =
-            Opts::from(OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()));
-        Ok(Self::from_pool(Pool::new(opts)?))
+        Ok(Self::from_pool(connect_pool(url, None)?))
     }
 
     /// Connect honoring the user's [`TlsConfig`].
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
-        crate::source::require_tls_or_loopback(url, tls)?;
-        match tls {
-            Some(cfg) if cfg.mode.is_enforced() => {
-                let base = Opts::from_url(url)?;
-                let ssl = build_mysql_ssl_opts(cfg);
-                let opts = Opts::from(
-                    OptsBuilder::from_opts(base)
-                        .ssl_opts(Some(ssl))
-                        .pool_opts(lean_pool_opts()),
-                );
-                Ok(Self::from_pool(Pool::new(opts)?))
-            }
-            _ => Self::connect(url),
-        }
+        Ok(Self::from_pool(connect_pool(url, tls)?))
     }
 
     /// Expose the proxy classification for diagnostic tools (preflight,
@@ -174,24 +160,18 @@ impl MysqlSource {
 pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
-    match tls {
+    let builder = OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts());
+    let opts = match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
-            let base = Opts::from_url(url)?;
-            let ssl = build_mysql_ssl_opts(cfg);
-            let opts = Opts::from(
-                OptsBuilder::from_opts(base)
-                    .ssl_opts(Some(ssl))
-                    .pool_opts(lean_pool_opts()),
-            );
-            Ok(Pool::new(opts)?)
+            Opts::from(builder.ssl_opts(Some(build_mysql_ssl_opts(cfg))))
         }
-        _ => {
-            let opts = Opts::from(
-                OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()),
-            );
-            Ok(Pool::new(opts)?)
-        }
-    }
+        _ => Opts::from(builder),
+    };
+    let pool = Pool::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
+    // Dial now, so a wrong host or port fails here with its name and not at the first query.
+    pool.get_conn()
+        .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
+    Ok(pool)
 }
 
 /// Threshold above which `AVG_ROW_LENGTH` is treated as inflated by InnoDB BLOB

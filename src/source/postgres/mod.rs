@@ -72,7 +72,8 @@ impl PostgresSource {
     /// Connect with no transport security (legacy path). Prefer [`Self::connect_with_tls`]
     /// for production workloads so credentials and result sets are not visible on the wire.
     pub fn connect(url: &str) -> Result<Self> {
-        let mut client = Client::connect(url, NoTls)?;
+        let mut client = Client::connect(url, NoTls)
+            .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
         let transaction_pooler = detect_pg_transaction_pooler(&mut client);
         if transaction_pooler {
             log::warn!(
@@ -97,7 +98,9 @@ impl PostgresSource {
                 let connector = build_native_tls(cfg)?;
                 let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
                 // Forced ssl_mode overrides the URL's sslmode; see connect_client.
-                let mut client = pg_config_ssl_forced(url)?.connect(make_tls)?;
+                let mut client = pg_config_ssl_forced(url)?
+                    .connect(make_tls)
+                    .map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
                 let transaction_pooler = detect_pg_transaction_pooler(&mut client);
                 if transaction_pooler {
                     log::warn!(
@@ -526,9 +529,12 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
             // Config::connect, NOT Client::connect(url, …): the forced
             // ssl_mode(Require) overrides the URL's sslmode so the connector is
             // actually used (see pg_config_ssl_forced).
-            Ok(pg_config_ssl_forced(url)?.connect(make_tls)?)
+            pg_config_ssl_forced(url)?
+                .connect(make_tls)
+                .map_err(|e| crate::source::describe_connect_error(url, e.into()))
         }
-        _ => Ok(Client::connect(url, NoTls)?),
+        _ => Client::connect(url, NoTls)
+            .map_err(|e| crate::source::describe_connect_error(url, e.into())),
     }
 }
 
