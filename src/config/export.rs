@@ -357,10 +357,10 @@ pub struct ExportConfig {
     pub target: Option<String>,
 
     /// Per-export overrides for the top-level `load:` block (`pk`,
-    /// `cleanup_source`, `gc_orphans`, `cluster_by`, `allow_source_drift`); any
-    /// field omitted here inherits the top-level value. The warehouse `target`
-    /// is shared and stays in the top-level `load:` — it cannot be overridden
-    /// per export.
+    /// `cleanup_source`, `gc_orphans`, `cluster_by`, `partition`,
+    /// `allow_source_drift`); any field omitted here inherits the top-level
+    /// value. The warehouse `target` is shared and stays in the top-level
+    /// `load:` — it cannot be overridden per export.
     ///
     /// ```yaml
     /// load: { target: bigquery, project: p, dataset: d }   # shared default
@@ -368,7 +368,9 @@ pub struct ExportConfig {
     ///   - name: orders
     ///     table: orders
     ///     mode: cdc
-    ///     load: { pk: [id] }                                # this table's pk
+    ///     load:
+    ///       pk: [id]                                        # this table's pk
+    ///       partition: { column: created_at, granularity: day, expiration_days: 400 }
     /// ```
     ///
     /// Raw JSON (parsed by the load module) so `config` carries no load types —

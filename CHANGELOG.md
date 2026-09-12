@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **`load: { partition }` — the warehouse table's partitioning, per table**
+  ([ADR-0034](docs/adr/0034-load-table-spec.md)). `partition: { column: ts, granularity: day,
+  expiration_days: 400, require_filter: true }` partitions the table the load writes by a DATE /
+  DATETIME / TIMESTAMP column at `hour` / `day` / `month` / `year`; `{ range: { column, start,
+  end, interval } }` buckets an INT64 column; `{ ingestion: day }` partitions by load time;
+  `none` (the default) leaves the table flat. Rivet writes the BigQuery expression from the
+  column type `rivet run` recorded (`TIMESTAMP_TRUNC` / `DATETIME_TRUNC` / `DATE_TRUNC` /
+  `RANGE_BUCKET` / `_PARTITIONDATE`) — the config never carries SQL — and refuses a form the
+  type cannot take (`hour` on a DATE, `range` on a TIMESTAMP). The change log inherits the
+  table's partition through the rename, or takes it when rivet creates the log; it never
+  requires a partition filter and never expires load-date partitions. A full load onto its own
+  table with a different partition is refused naming both (the shape is read from `tables.get`
+  and compared as metadata); a changed `expiration_days` / `require_filter` is applied in
+  place. Before any job runs, the load reads the partition column's range from the Parquet
+  footers and refuses a span over BigQuery's 4,000 partitions per job, naming the granularity
+  that fits. On Snowflake `partition` becomes a leading `DATE_TRUNC` clustering expression
+  (`range` / `ingestion` / the options are refused). The per-job Hive batching of the old
+  export-`partition_by` loader path — unreachable since `partition_by` and `load:` exclude
+  each other — is gone.
 - **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
   text ("failed to lookup address information…", or MongoDB's whole topology dump); a
   connection that fails before the server answers now says `cannot resolve host <host> —

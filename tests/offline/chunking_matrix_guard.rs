@@ -253,6 +253,10 @@ const MATRICES: &[(&str, usize)] = &[
     // GENERATIVELY complete over RivetType (matrix_cdc_type_rows_cover_every_rivet_type).
     // 0 gaps: every (type × engine) cell is a test or a justified n/a.
     ("docs/cdc-type-fidelity-matrix.yaml", 0),
+    // Load spec (ADR-0034) — `load.partition` form × granularity × warehouse target. The
+    // BigQuery form cells are live (run + load + tables.get per cell); Snowflake cells are
+    // SQL-text proofs (no live Snowflake from this stand); duckdb/clickhouse are `na`. 0 gaps.
+    ("docs/load-spec-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]

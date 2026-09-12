@@ -17,6 +17,7 @@ mod bigquery;
 mod bq_rest;
 pub mod cdc;
 pub mod orchestrate;
+pub(crate) mod partition_budget;
 pub mod plan;
 pub mod reconcile;
 mod snowflake;
@@ -661,7 +662,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
         LoadTarget::Bigquery { project, dataset } => Box::new(build_bigquery_loader(
             project,
             dataset,
-            plan.partition_by.as_deref(),
+            plan.partition.as_ref(),
             &plan.cluster_by,
             run_id,
         )),
@@ -678,6 +679,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.schema = schema.clone();
             l.storage_integration = storage_integration.clone();
             l.cluster_by = plan.cluster_by.clone();
+            l.partition_expr = plan.partition.as_ref().map(|p| p.expr.clone());
             l.run_id = Some(run_id.to_string());
             // Snowflake's external stage wants the `gcs://` scheme, not `gs://`.
             l.gcs_url = plan.gcs_prefix.replacen("gs://", "gcs://", 1);
@@ -688,7 +690,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
     }
 }
 
-/// Wire a [`BigQueryLoader`] from a resolved plan's fields — `partition_by` and
+/// Wire a [`BigQueryLoader`] from a resolved plan's fields — `partition` and
 /// `cluster_by` applied ONLY when set. A concrete return (not the boxed trait)
 /// so the wiring is unit-testable: a mis-guarded key would silently DROP the
 /// clustering/partitioning the config asked for — a degradation invisible
@@ -696,13 +698,13 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
 fn build_bigquery_loader(
     project: &str,
     dataset: &str,
-    partition_by: Option<&str>,
+    partition: Option<&plan::TablePartition>,
     cluster_by: &[String],
     run_id: &str,
 ) -> BigQueryLoader {
     let mut l = BigQueryLoader::new(project, dataset).run_id(run_id);
-    if let Some(part) = partition_by {
-        l = l.partition_by(part);
+    if let Some(part) = partition {
+        l = l.partition(part.clone());
     }
     if !cluster_by.is_empty() {
         l = l.cluster_by(cluster_by.to_vec());
@@ -1322,22 +1324,31 @@ mod tests {
     fn build_bigquery_loader_wires_partition_and_cluster_keys() {
         // A non-empty cluster/partition MUST reach the loader; if the guard
         // inverts, a real key is silently dropped and the load omits the
-        // clustering the config asked for. Reading cluster_by/partition_by pins
+        // clustering the config asked for. Reading cluster_by/partition pins
         // the wiring that `Box<dyn TargetLoader>` hides.
+        let daily = plan::TablePartition {
+            key: plan::PartitionKey::Time {
+                column: Some("ts".into()),
+                granularity: plan::Granularity::Day,
+            },
+            expr: "TIMESTAMP_TRUNC(ts, DAY)".into(),
+            expiration_days: None,
+            require_filter: false,
+        };
         let l = build_bigquery_loader(
             "proj",
             "ds",
-            Some("day"),
+            Some(&daily),
             &["customer_id".to_string(), "region".to_string()],
             "run-1",
         );
         assert_eq!(l.cluster_by, ["customer_id", "region"]);
-        assert_eq!(l.partition_by.as_deref(), Some("day"));
+        assert_eq!(l.partition.as_ref(), Some(&daily));
 
         // No keys set → neither clause (the default), never a spurious one.
         let bare = build_bigquery_loader("proj", "ds", None, &[], "run-1");
         assert!(bare.cluster_by.is_empty());
-        assert!(bare.partition_by.is_none());
+        assert!(bare.partition.is_none());
     }
 
     #[test]

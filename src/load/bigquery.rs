@@ -34,12 +34,16 @@
 //! ## Two BigQuery limits this respects
 //!
 //! - `PARTITION BY` / `CLUSTER BY` apply **only when the table is created**;
-//!   you cannot convert an existing table by overwriting it, and clustering is
-//!   capped at 4 columns. The loader manages its own target table.
-//! - A single load *or* query job may modify at most **4,000 partitions**. A
-//!   partitioned load spanning more is split into several `LOAD DATA` jobs, each
-//!   under the cap (see `plan_load_batches`); a non-splittable overflow surfaces
-//!   an actionable error telling you to split the URIs by partition range.
+//!   an overwrite must repeat them, and BigQuery refuses a changed spec — so an
+//!   existing table's shape is read from `tables.get` and compared before the
+//!   load (`table_shape_conflict`). Clustering is capped at 4 columns. Partition
+//!   options (`partition_expiration_days`, `require_partition_filter`) are set
+//!   at creation and changed in place with `ALTER TABLE SET OPTIONS`, since an
+//!   overwrite that declares different ones is refused too (verified 2026-09-12).
+//! - A single load *or* query job may modify at most **4,000 partitions**. The
+//!   driver estimates the partitions a load touches from the Parquet footers
+//!   before the job runs (`partition_budget`); BigQuery's own refusal is the
+//!   backstop, surfaced as an actionable error.
 //!
 //! ## Cost attribution via job labels
 //!
@@ -82,26 +86,24 @@
 
 use super::TargetLoader;
 use super::bq_rest::BigQueryApi;
+use crate::load::plan::{Granularity, PartitionKey, TablePartition};
 use crate::types::target::TargetColumnSpec;
 use anyhow::{Result, bail};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 // ── BigQuery ─────────────────────────────────────────────────────────────────
 
 /// Maximum clustering columns BigQuery allows.
 pub(crate) const MAX_CLUSTER_COLUMNS: usize = 4;
 
-/// BigQuery's hard cap on partitions modified by a single job.
-const DEFAULT_MAX_PARTITIONS_PER_JOB: usize = 4000;
-
 /// Loads Rivet Parquet into a BigQuery dataset over the REST API.
 #[derive(Debug, Clone)]
 pub struct BigQueryLoader {
     pub project: String,
     pub dataset: String,
-    /// Partition expression for table creation, e.g. `DATE(created_at)` or a
-    /// `DATE`/`TIMESTAMP` column. Applied only when the table is created.
-    pub partition_by: Option<String>,
+    /// The resolved `load.partition` of the table the load writes. Applied only when
+    /// the table is created; its options are kept in step on a rivet-owned table.
+    pub partition: Option<TablePartition>,
     /// Up to 4 clustering columns. Applied only when the table is created.
     pub cluster_by: Vec<String>,
     /// Load-run correlation id, emitted as the automatic `rivet_run:<id>` job
@@ -109,12 +111,6 @@ pub struct BigQueryLoader {
     /// cost slices per run (across tables) as well as per table. `None` omits
     /// the label entirely.
     pub run_id: Option<String>,
-    /// Max distinct partitions a single load job may create — BigQuery's hard
-    /// limit is 4,000. When a daily-partitioned, Hive-prefixed input
-    /// (`<col>=YYYY-MM-DD/…`, as rivet's `partition_by` writes) spans more than
-    /// this, the free load is split into several `LOAD DATA` jobs, each under
-    /// the cap.
-    pub max_partitions_per_job: usize,
     /// The REST client, built on first use and shared by every clone — so one
     /// access token serves a whole load instead of one per statement. Not part
     /// of the loader's identity: constructing a loader must stay free of I/O
@@ -128,17 +124,22 @@ impl BigQueryLoader {
         Self {
             project: project.into(),
             dataset: dataset.into(),
-            partition_by: None,
+            partition: None,
             cluster_by: Vec::new(),
             run_id: None,
-            max_partitions_per_job: DEFAULT_MAX_PARTITIONS_PER_JOB,
             api: Arc::new(OnceLock::new()),
         }
     }
 
-    pub fn partition_by(mut self, expr: impl Into<String>) -> Self {
-        self.partition_by = Some(expr.into());
+    /// Partition the table the load creates.
+    pub fn partition(mut self, partition: TablePartition) -> Self {
+        self.partition = Some(partition);
         self
+    }
+
+    /// The `PARTITION BY` expression, when the load partitions.
+    fn partition_expr(&self) -> Option<&str> {
+        self.partition.as_ref().map(|p| p.expr.as_str())
     }
 
     /// Set the load-run correlation id, emitted as the `rivet_run` job label.
@@ -204,8 +205,8 @@ impl BigQueryLoader {
         // (an identifier list, no quoting) — the same is_safe_load_ident gate the
         // table / column / pk names get. Config-derived, so operator self-harm,
         // but gated for consistency with the round-5/6 injection surface.
-        // (`partition_by` is intentionally NOT gated here — it is a BigQuery
-        // partition EXPRESSION, e.g. `DATE(created_at)`, not a bare identifier.)
+        // (The partition expression is not gated here — its column was gated as
+        // a plain identifier when the plan resolved it, and the rest is rivet's.)
         for c in &self.cluster_by {
             if !super::is_safe_load_ident(c) {
                 bail!(
@@ -218,29 +219,14 @@ impl BigQueryLoader {
         Ok(())
     }
 
-    /// The partitioning, clustering and options of `table`, or `None` when it is no base table.
+    /// The partitioning, clustering and partition options of `table` from `tables.get`,
+    /// or `None` when it is no base table.
     fn existing_shape(&self, table: &str) -> Result<Option<TableShape>> {
-        let sql = build_ddl_probe_sql(&self.project, &self.dataset, table);
         Ok(self
             .api()?
-            .run_query_text(&sql, &self.labels("probe", table))?
-            .as_deref()
-            .map(parse_table_ddl))
-    }
-
-    /// Split `uris` into free-load batches that each stay under the per-job
-    /// partition cap. Splits only when partitioning on a bare column whose
-    /// Hive `<col>=value/` prefix is present on the URIs and the distinct
-    /// partition count exceeds the cap; otherwise the whole set is one batch
-    /// (non-Hive inputs load in one job, as before).
-    fn plan_load_batches(&self, uris: &[String]) -> Vec<Vec<String>> {
-        match self.partition_by.as_deref() {
-            Some(col) if is_bare_column(col) => {
-                plan_hive_batches(uris, col, self.max_partitions_per_job)
-                    .unwrap_or_else(|_| vec![uris.to_vec()])
-            }
-            _ => vec![uris.to_vec()],
-        }
+            .table_metadata(&self.dataset, table)?
+            .as_ref()
+            .map(parse_table_shape))
     }
 }
 
@@ -294,13 +280,13 @@ impl TargetLoader for BigQueryLoader {
         for sql in build_adoption_sql(&src, table, &changes, &shape) {
             self.run_sql(&sql, "baseline", table)?;
         }
-        if shape.requires_partition_filter() {
+        if shape.require_partition_filter {
             eprintln!(
                 "  note: `{changes}` does not require a partition filter, unlike `{src}` did — \
                  the current-state view reads all of it"
             );
         }
-        if shape.ingestion_partitioned() && shape.expires_partitions() {
+        if shape.expires_load_dates() {
             eprintln!(
                 "  note: `{changes}` keeps its load-date partitions without expiry — expiring them \
                  would drop rows that never changed from the current-state view"
@@ -317,9 +303,10 @@ impl TargetLoader for BigQueryLoader {
     }
 
     fn table_shape_conflict(&self, table: &str) -> Result<Option<String>> {
+        let want = self.partition.as_ref().map(|p| &p.key);
         Ok(self
             .existing_shape(table)?
-            .and_then(|shape| shape_conflict(&shape, &self.partition_by, &self.cluster_by)))
+            .and_then(|shape| shape_conflict(&shape, want, &self.cluster_by)))
     }
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
@@ -329,20 +316,24 @@ impl TargetLoader for BigQueryLoader {
 
         // ONE free path: declaring each column's native `target_type` inline in
         // LOAD DATA makes BigQuery coerce the Parquet on load — JSON, DATETIME,
-        // NUMERIC, … land natively for FREE (a load job, not a query). A
-        // daily-partitioned, Hive-prefixed input over the per-job partition cap
-        // is split into several free LOAD DATA jobs: batch 0 OVERWRITEs the
-        // table, later batches append so they add to — not clobber — it.
-        for (i, batch) in self.plan_load_batches(uris).iter().enumerate() {
-            let sql = build_load_data_sql(
-                &target,
-                i == 0, // overwrite the first batch, append the rest
-                &schema,
-                &self.partition_by,
-                &self.cluster_by,
-                batch,
-            );
-            self.run_sql(&sql, "load", table)?;
+        // NUMERIC, … land natively for FREE (a load job, not a query). Partition
+        // options ride on the statement only when it CREATES the table; on an
+        // existing one BigQuery refuses different options, so they are altered.
+        let existing = self.existing_shape(table)?;
+        let options = creation_options(existing.is_none(), self.partition.as_ref());
+        let sql = build_load_data_sql(
+            &target,
+            true,
+            &schema,
+            self.partition_expr(),
+            &self.cluster_by,
+            options.as_deref(),
+            uris,
+        );
+        self.run_sql(&sql, "load", table)?;
+        if let Some(alter) = options_drift(&target, existing.as_ref(), self.partition.as_ref()) {
+            self.run_sql(&alter, "alter", table)?;
+            eprintln!("  note: `{target}` partition options changed: {alter}");
         }
         self.count_rows(table)
     }
@@ -370,9 +361,14 @@ impl TargetLoader for BigQueryLoader {
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
 
-        // Ensure the append-only log exists, clustered on the load's `cluster_by`.
-        // Idempotent: created once, appended forever.
-        let create = build_create_changes_sql(&changes_fqtn, &schema, &self.cluster_by);
+        // Ensure the append-only log exists, partitioned and clustered as the load
+        // declares. Idempotent: created once, appended forever.
+        let create = build_create_changes_sql(
+            &changes_fqtn,
+            &schema,
+            self.partition.as_ref(),
+            &self.cluster_by,
+        );
         self.run_sql(&create, "create", &changes)?;
 
         // …and, for a log that ALREADY existed, add whatever the declared
@@ -387,7 +383,7 @@ impl TargetLoader for BigQueryLoader {
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes)?;
-        let load = build_load_data_sql(&changes_fqtn, false, &schema, &None, &[], uris);
+        let load = build_load_data_sql(&changes_fqtn, false, &schema, None, &[], None, uris);
         self.run_sql(&load, "load", &changes)?;
         let after = self.count_rows(&changes)?;
         Ok(after.saturating_sub(before))
@@ -410,95 +406,105 @@ fn is_meta_column(name: &str) -> bool {
     crate::load::cdc::is_meta_column(name)
 }
 
-/// `CREATE TABLE IF NOT EXISTS` for the change log, clustered on `cluster_by` (capped
-/// at BigQuery's 4 clustering columns; none when empty). Idempotent — the log is
-/// created once and appended to on every CDC load.
-fn build_create_changes_sql(fqtn: &str, schema: &str, cluster_by: &[String]) -> String {
+/// `CREATE TABLE IF NOT EXISTS` for the change log, partitioned as the load declares and
+/// clustered on `cluster_by` (capped at BigQuery's 4 clustering columns; none when empty).
+/// Idempotent — the log is created once and appended to on every CDC load.
+fn build_create_changes_sql(
+    fqtn: &str,
+    schema: &str,
+    partition: Option<&TablePartition>,
+    cluster_by: &[String],
+) -> String {
     let cluster: Vec<String> = cluster_by
         .iter()
         .take(MAX_CLUSTER_COLUMNS)
         .cloned()
         .collect();
+    let options = partition.and_then(changelog_options_sql);
     format!(
         "CREATE TABLE IF NOT EXISTS `{fqtn}` (\n{schema}\n){};",
-        table_shape_clauses(&None, &cluster)
+        table_shape_clauses(
+            partition.map(|p| p.expr.as_str()),
+            &cluster,
+            options.as_deref()
+        )
     )
 }
 
-/// The partitioning, clustering and table options of an existing table, from its DDL.
+/// Milliseconds in a day, the unit `tables.get` reports partition expiry in.
+const DAY_MS: u64 = 86_400_000;
+
+/// The partitioning, clustering and partition options of an existing table, from `tables.get`.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct TableShape {
-    partition: Option<String>,
+    partition: Option<PartitionKey>,
     cluster: Vec<String>,
-    options: Option<String>,
+    require_partition_filter: bool,
+    expiration_ms: Option<u64>,
 }
 
 impl TableShape {
-    fn ingestion_partitioned(&self) -> bool {
-        self.partition
-            .as_deref()
-            .is_some_and(|p| p.contains("_PARTITIONTIME") || p.contains("_PARTITIONDATE"))
-    }
-
-    fn requires_partition_filter(&self) -> bool {
-        self.options
-            .as_deref()
-            .is_some_and(|o| o.replace(' ', "").contains("require_partition_filter=true"))
-    }
-
-    fn expires_partitions(&self) -> bool {
-        self.options
-            .as_deref()
-            .is_some_and(|o| o.contains("partition_expiration_days"))
+    /// Partitioned by load time with an expiry.
+    fn expires_load_dates(&self) -> bool {
+        let ingestion = matches!(
+            self.partition,
+            Some(PartitionKey::Time { column: None, .. })
+        );
+        ingestion && self.expiration_ms.is_some()
     }
 }
 
-/// The DDL of `table` when it is a base table.
-fn build_ddl_probe_sql(project: &str, dataset: &str, table: &str) -> String {
-    format!(
-        "SELECT ddl FROM `{project}.{dataset}`.INFORMATION_SCHEMA.TABLES \
-         WHERE table_name = '{table}' AND table_type = 'BASE TABLE'"
-    )
-}
-
-/// The table-level `PARTITION BY`, `CLUSTER BY` and `OPTIONS(...)` of a BigQuery DDL;
-/// column options are indented inside the column list and not read.
-fn parse_table_ddl(ddl: &str) -> TableShape {
+/// The shape a `tables.get` resource describes (`timePartitioning`, `rangePartitioning`,
+/// `clustering`, `requirePartitionFilter`).
+fn parse_table_shape(meta: &serde_json::Value) -> TableShape {
+    use serde_json::Value;
+    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(String::from);
+    let int = |v: &Value, key: &str| text(v, key).and_then(|s| s.parse::<i64>().ok());
     let mut shape = TableShape::default();
-    let mut lines = ddl.lines();
-    while let Some(line) = lines.next() {
-        let line = line.trim_end().trim_end_matches(';');
-        if let Some(p) = line.strip_prefix("PARTITION BY ") {
-            shape.partition = Some(p.trim().to_string());
-        } else if let Some(c) = line.strip_prefix("CLUSTER BY ") {
-            shape.cluster = c
-                .split(',')
-                .map(|col| col.trim().trim_matches('`').to_string())
-                .filter(|col| !col.is_empty())
-                .collect();
-        } else if let Some(rest) = line.strip_prefix("OPTIONS(") {
-            let mut body = Vec::new();
-            match rest.trim().strip_suffix(')') {
-                Some(inline) => body.push(inline.trim().to_string()),
-                None => {
-                    body.push(rest.trim().to_string());
-                    for l in lines.by_ref() {
-                        let l = l.trim().trim_end_matches(';');
-                        if l == ")" {
-                            break;
-                        }
-                        body.push(l.to_string());
-                    }
-                }
-            }
-            let joined = body
-                .into_iter()
-                .filter(|b| !b.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            shape.options = (!joined.is_empty()).then_some(joined);
-        }
+    if let Some(tp) = meta.get("timePartitioning") {
+        let granularity = text(tp, "type")
+            .as_deref()
+            .and_then(Granularity::parse_sql)
+            .unwrap_or(Granularity::Day);
+        shape.partition = Some(PartitionKey::Time {
+            column: text(tp, "field"),
+            granularity,
+        });
+        shape.expiration_ms = text(tp, "expirationMs").and_then(|s| s.parse().ok());
+        shape.require_partition_filter = tp
+            .get("requirePartitionFilter")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     }
+    if let Some(rp) = meta.get("rangePartitioning")
+        && let (Some(column), Some(range)) = (text(rp, "field"), rp.get("range"))
+        && let (Some(start), Some(end), Some(interval)) = (
+            int(range, "start"),
+            int(range, "end"),
+            int(range, "interval"),
+        )
+    {
+        shape.partition = Some(PartitionKey::Range {
+            column,
+            start,
+            end,
+            interval,
+        });
+    }
+    if let Some(required) = meta.get("requirePartitionFilter").and_then(Value::as_bool) {
+        shape.require_partition_filter |= required;
+    }
+    shape.cluster = meta
+        .pointer("/clustering/fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
     shape
 }
 
@@ -507,14 +513,23 @@ fn same_columns(a: &[String], b: &[String]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+/// Whether an existing table's partition key is the one the load declares.
+fn same_partition(existing: Option<&PartitionKey>, want: Option<&PartitionKey>) -> bool {
+    match (existing, want) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same_as(b),
+        _ => false,
+    }
+}
+
 /// How an existing table's partitioning or clustering differs from what this load declares, or `None`.
 fn shape_conflict(
     shape: &TableShape,
-    partition_by: &Option<String>,
+    partition: Option<&PartitionKey>,
     cluster_by: &[String],
 ) -> Option<String> {
     let describe =
-        |p: Option<&str>, none: &str| p.map_or(none.to_string(), |p| format!("`{}`", p.trim()));
+        |k: Option<&PartitionKey>, none: &str| k.map_or(none.to_string(), PartitionKey::describe);
     let list = |cols: &[String]| {
         if cols.is_empty() {
             "nothing".to_string()
@@ -526,11 +541,11 @@ fn shape_conflict(
         }
     };
     let mut diffs = Vec::new();
-    if shape.partition.as_deref().map(str::trim) != partition_by.as_deref().map(str::trim) {
+    if !same_partition(shape.partition.as_ref(), partition) {
         diffs.push(format!(
             "it is partitioned by {}, the load declares {}",
-            describe(shape.partition.as_deref(), "nothing"),
-            describe(partition_by.as_deref(), "no partitioning")
+            describe(shape.partition.as_ref(), "nothing"),
+            describe(partition, "no partitioning")
         ));
     }
     if !same_columns(&shape.cluster, cluster_by) {
@@ -592,17 +607,72 @@ fn build_adoption_sql(
         "ALTER TABLE `{src_fqtn}` RENAME TO {table}__changes;"
     )];
     out.extend(build_alter_add_columns_sql(changes_fqtn, &meta));
-    if shape.requires_partition_filter() {
+    if shape.require_partition_filter {
         out.push(format!(
             "ALTER TABLE `{changes_fqtn}` SET OPTIONS(require_partition_filter = false);"
         ));
     }
-    if shape.ingestion_partitioned() && shape.expires_partitions() {
+    if shape.expires_load_dates() {
         out.push(format!(
             "ALTER TABLE `{changes_fqtn}` SET OPTIONS(partition_expiration_days = NULL);"
         ));
     }
     out
+}
+
+/// The `OPTIONS(...)` a load creating the full table declares, or `None` when there is
+/// no partition or nothing to set. `creating` is false when the table already exists —
+/// BigQuery refuses an overwrite that declares different options, so they go through
+/// [`options_drift`] instead.
+fn creation_options(creating: bool, partition: Option<&TablePartition>) -> Option<String> {
+    if !creating {
+        return None;
+    }
+    let p = partition?;
+    let mut opts = Vec::new();
+    if let Some(days) = p.expiration_days {
+        opts.push(format!("partition_expiration_days = {days}"));
+    }
+    if p.require_filter {
+        opts.push("require_partition_filter = true".to_string());
+    }
+    (!opts.is_empty()).then(|| opts.join(", "))
+}
+
+/// The `OPTIONS(...)` of a change log rivet creates: the expiry of a column or range
+/// partition only. Load-date partitions never expire (expiring them would drop rows that
+/// never changed from the view), and the log never requires a partition filter.
+fn changelog_options_sql(partition: &TablePartition) -> Option<String> {
+    let days = partition.expiration_days?;
+    partition
+        .key
+        .column()
+        .map(|_| format!("partition_expiration_days = {days}"))
+}
+
+/// `ALTER TABLE … SET OPTIONS(...)` bringing an existing table's partition options to
+/// what the load declares, or `None` when they already match (or the table is new).
+fn options_drift(
+    fqtn: &str,
+    existing: Option<&TableShape>,
+    partition: Option<&TablePartition>,
+) -> Option<String> {
+    let (shape, want) = (existing?, partition?);
+    let mut opts = Vec::new();
+    let want_ms = want.expiration_days.map(|d| u64::from(d) * DAY_MS);
+    if shape.expiration_ms != want_ms {
+        opts.push(match want.expiration_days {
+            Some(days) => format!("partition_expiration_days = {days}"),
+            None => "partition_expiration_days = NULL".to_string(),
+        });
+    }
+    if shape.require_partition_filter != want.require_filter {
+        opts.push(format!(
+            "require_partition_filter = {}",
+            want.require_filter
+        ));
+    }
+    (!opts.is_empty()).then(|| format!("ALTER TABLE `{fqtn}` SET OPTIONS({});", opts.join(", ")))
 }
 
 /// Bring an EXISTING table's schema up to the declared one by ADDING what is
@@ -639,63 +709,23 @@ fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> Option
     Some(format!("ALTER TABLE `{fqtn}`\n  {adds};"))
 }
 
-/// Whether `c` is a bare column identifier (so it matches a Hive path key),
-/// not an expression like `DATE(x)` or `DATE_TRUNC(d, MONTH)`.
-fn is_bare_column(c: &str) -> bool {
-    !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-/// The Hive partition value for `column` in a URI path, e.g.
-/// `gs://b/t/d=2023-01-01/part-0.parquet` + `d` → `2023-01-01`.
-fn hive_partition_value(uri: &str, column: &str) -> Option<String> {
-    let needle = format!("{column}=");
-    uri.split('/')
-        .find_map(|seg| seg.strip_prefix(&needle).map(str::to_string))
-}
-
-/// Group `uris` so each batch holds at most `max` distinct Hive partition
-/// values of `column`. URIs sharing a value stay together. Errors if any URI
-/// lacks the `<column>=` segment (caller falls back to a single batch).
-fn plan_hive_batches(uris: &[String], column: &str, max: usize) -> Result<Vec<Vec<String>>> {
-    let pairs: Vec<(&String, String)> = uris
-        .iter()
-        .map(|u| {
-            hive_partition_value(u, column)
-                .map(|v| (u, v))
-                .ok_or_else(|| anyhow::anyhow!("uri has no `{column}=` Hive segment: {u}"))
-        })
-        .collect::<Result<_>>()?;
-
-    let mut values: Vec<&str> = pairs.iter().map(|(_, v)| v.as_str()).collect();
-    values.sort_unstable();
-    values.dedup();
-    if values.len() <= max {
-        return Ok(vec![uris.to_vec()]);
-    }
-
-    // Contiguous windows of `max` distinct (sorted) values → one batch each.
-    let batch_of: HashMap<&str, usize> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (*v, i / max))
-        .collect();
-    let mut batches: Vec<Vec<String>> = vec![Vec::new(); values.len().div_ceil(max)];
-    for (u, v) in &pairs {
-        batches[batch_of[v.as_str()]].push((*u).clone());
-    }
-    Ok(batches)
-}
-
-/// `PARTITION BY … / CLUSTER BY …` clauses (empty when unset). Both apply only
-/// at table creation, per BigQuery.
-fn table_shape_clauses(partition_by: &Option<String>, cluster_by: &[String]) -> String {
+/// `PARTITION BY … / CLUSTER BY … / OPTIONS(…)` clauses (empty when unset). All three
+/// apply only at table creation, per BigQuery.
+fn table_shape_clauses(
+    partition_expr: Option<&str>,
+    cluster_by: &[String],
+    options: Option<&str>,
+) -> String {
     let mut s = String::new();
-    if let Some(expr) = partition_by {
+    if let Some(expr) = partition_expr {
         s.push_str(&format!("\nPARTITION BY {expr}"));
     }
     if !cluster_by.is_empty() {
         let quoted: Vec<String> = cluster_by.iter().map(|c| format!("`{c}`")).collect();
         s.push_str(&format!("\nCLUSTER BY {}", quoted.join(", ")));
+    }
+    if let Some(opts) = options {
+        s.push_str(&format!("\nOPTIONS({opts})"));
     }
     s
 }
@@ -740,12 +770,13 @@ fn build_load_data_sql(
     fqtn: &str,
     overwrite: bool,
     schema: &str,
-    partition_by: &Option<String>,
+    partition_expr: Option<&str>,
     cluster_by: &[String],
+    options: Option<&str>,
     uris: &[String],
 ) -> String {
     let kw = if overwrite { "OVERWRITE" } else { "INTO" };
-    let clauses = table_shape_clauses(partition_by, cluster_by);
+    let clauses = table_shape_clauses(partition_expr, cluster_by, options);
     format!(
         "LOAD DATA {kw} `{fqtn}` (\n{schema}\n){clauses}\n{};",
         from_files(uris)
@@ -877,12 +908,55 @@ mod tests {
         }
     }
 
+    /// A `tables.get` resource with the given partitioning, clustering and options.
+    fn meta(
+        partition: serde_json::Value,
+        cluster: &[&str],
+        require_filter: bool,
+    ) -> serde_json::Value {
+        let mut m = serde_json::json!({ "type": "TABLE", "numRows": "3" });
+        if let Some(tp) = partition.get("time") {
+            m["timePartitioning"] = tp.clone();
+        }
+        if let Some(rp) = partition.get("range") {
+            m["rangePartitioning"] = rp.clone();
+        }
+        if !cluster.is_empty() {
+            m["clustering"] = serde_json::json!({ "fields": cluster });
+        }
+        if require_filter {
+            m["requirePartitionFilter"] = serde_json::json!(true);
+        }
+        m
+    }
+
+    fn time_key(column: Option<&str>, granularity: Granularity) -> PartitionKey {
+        PartitionKey::Time {
+            column: column.map(String::from),
+            granularity,
+        }
+    }
+
+    fn partition_at(
+        key: PartitionKey,
+        expiration_days: Option<u32>,
+        require_filter: bool,
+    ) -> TablePartition {
+        TablePartition {
+            expr: "TIMESTAMP_TRUNC(ts, DAY)".into(),
+            key,
+            expiration_days,
+            require_filter,
+        }
+    }
+
     #[test]
     fn adoption_drops_the_partition_filter_and_load_date_expiry() {
-        let shape = parse_table_ddl(
-            "CREATE TABLE `p.d.t`\n(\n  id INT64\n)\nPARTITION BY DATE(_PARTITIONTIME)\n\
-             OPTIONS(\n  partition_expiration_days=30.0,\n  require_partition_filter=true\n);",
-        );
+        let shape = parse_table_shape(&meta(
+            serde_json::json!({ "time": { "type": "DAY", "expirationMs": "2592000000", "requirePartitionFilter": true } }),
+            &[],
+            false,
+        ));
         let sql = build_adoption_sql("p.d.t", "t", "p.d.t__changes", &shape).join("\n");
         assert!(
             sql.contains("SET OPTIONS(require_partition_filter = false)"),
@@ -893,13 +967,141 @@ mod tests {
             "{sql}"
         );
 
-        let column_partitioned = parse_table_ddl(
-            "CREATE TABLE `p.d.t`\n(\n  d DATE\n)\nPARTITION BY d\n\
-             OPTIONS(\n  partition_expiration_days=30.0\n);",
-        );
+        let column_partitioned = parse_table_shape(&meta(
+            serde_json::json!({ "time": { "type": "DAY", "field": "d", "expirationMs": "2592000000" } }),
+            &[],
+            false,
+        ));
         let sql =
             build_adoption_sql("p.d.t", "t", "p.d.t__changes", &column_partitioned).join("\n");
         assert!(!sql.contains("partition_expiration_days"), "{sql}");
+        assert!(!sql.contains("require_partition_filter"), "{sql}");
+    }
+
+    #[test]
+    fn tables_get_metadata_yields_the_shape() {
+        let shape = parse_table_shape(&meta(
+            serde_json::json!({ "time": { "type": "HOUR", "field": "ts", "expirationMs": "86400000" } }),
+            &["v", "order"],
+            true,
+        ));
+        assert_eq!(
+            shape,
+            TableShape {
+                partition: Some(time_key(Some("ts"), Granularity::Hour)),
+                cluster: vec!["v".into(), "order".into()],
+                require_partition_filter: true,
+                expiration_ms: Some(DAY_MS),
+            }
+        );
+        let range = parse_table_shape(&meta(
+            serde_json::json!({ "range": { "field": "n", "range": { "start": "0", "end": "1000", "interval": "10" } } }),
+            &[],
+            false,
+        ));
+        assert_eq!(
+            range.partition,
+            Some(PartitionKey::Range {
+                column: "n".into(),
+                start: 0,
+                end: 1000,
+                interval: 10
+            })
+        );
+        let ingestion = parse_table_shape(&meta(
+            serde_json::json!({ "time": { "type": "DAY", "expirationMs": "3" } }),
+            &[],
+            false,
+        ));
+        assert_eq!(ingestion.partition, Some(time_key(None, Granularity::Day)));
+        assert!(ingestion.expires_load_dates());
+        assert!(
+            !shape.expires_load_dates(),
+            "a column partition's expiry is not a load-date one"
+        );
+        let plain = parse_table_shape(&serde_json::json!({ "type": "TABLE" }));
+        assert_eq!(plain, TableShape::default());
+    }
+
+    #[test]
+    fn creation_options_ride_only_on_a_creating_load() {
+        let p = partition_at(time_key(Some("ts"), Granularity::Day), Some(400), true);
+        assert_eq!(
+            creation_options(true, Some(&p)).as_deref(),
+            Some("partition_expiration_days = 400, require_partition_filter = true")
+        );
+        assert_eq!(
+            creation_options(false, Some(&p)),
+            None,
+            "an existing table is altered instead"
+        );
+        assert_eq!(creation_options(true, None), None);
+        let bare = partition_at(time_key(Some("ts"), Granularity::Day), None, false);
+        assert_eq!(creation_options(true, Some(&bare)), None);
+        let sql = build_load_data_sql(
+            "p.d.t",
+            true,
+            "  `ts` TIMESTAMP",
+            Some(&p.expr),
+            &[],
+            creation_options(true, Some(&p)).as_deref(),
+            &uris(),
+        );
+        assert!(
+            sql.contains("PARTITION BY TIMESTAMP_TRUNC(ts, DAY)\nOPTIONS(partition_expiration_days = 400, require_partition_filter = true)\nFROM FILES"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn options_drift_alters_only_what_differs() {
+        let shape = TableShape {
+            partition: Some(time_key(Some("ts"), Granularity::Day)),
+            cluster: vec![],
+            require_partition_filter: true,
+            expiration_ms: Some(400 * DAY_MS),
+        };
+        let same = partition_at(time_key(Some("ts"), Granularity::Day), Some(400), true);
+        assert_eq!(options_drift("p.d.t", Some(&shape), Some(&same)), None);
+        let shorter = partition_at(time_key(Some("ts"), Granularity::Day), Some(30), true);
+        assert_eq!(
+            options_drift("p.d.t", Some(&shape), Some(&shorter)).as_deref(),
+            Some("ALTER TABLE `p.d.t` SET OPTIONS(partition_expiration_days = 30);")
+        );
+        let cleared = partition_at(time_key(Some("ts"), Granularity::Day), None, false);
+        assert_eq!(
+            options_drift("p.d.t", Some(&shape), Some(&cleared)).as_deref(),
+            Some(
+                "ALTER TABLE `p.d.t` SET OPTIONS(partition_expiration_days = NULL, require_partition_filter = false);"
+            )
+        );
+        assert_eq!(
+            options_drift("p.d.t", None, Some(&shorter)),
+            None,
+            "a new table took its options at creation"
+        );
+        assert_eq!(options_drift("p.d.t", Some(&shape), None), None);
+    }
+
+    #[test]
+    fn a_changelog_is_partitioned_like_the_table_but_never_requires_a_filter() {
+        let p = partition_at(time_key(Some("ts"), Granularity::Day), Some(400), true);
+        let sql = build_create_changes_sql(
+            "p.d.t__changes",
+            "  `ts` TIMESTAMP",
+            Some(&p),
+            &["id".into()],
+        );
+        assert!(sql.contains("PARTITION BY TIMESTAMP_TRUNC(ts, DAY)\nCLUSTER BY `id`\nOPTIONS(partition_expiration_days = 400)"), "{sql}");
+        assert!(!sql.contains("require_partition_filter"), "{sql}");
+        let mut ingestion = partition_at(time_key(None, Granularity::Day), Some(3), false);
+        ingestion.expr = "_PARTITIONDATE".into();
+        let sql = build_create_changes_sql("p.d.t__changes", "  `id` INT64", Some(&ingestion), &[]);
+        assert!(sql.ends_with("PARTITION BY _PARTITIONDATE;"), "{sql}");
+        assert!(
+            !sql.contains("expiration"),
+            "load-date partitions of a log never expire: {sql}"
+        );
     }
 
     fn typed(name: &str, target_type: &str) -> TargetColumnSpec {
@@ -928,7 +1130,7 @@ mod tests {
     #[test]
     fn load_data_declares_native_schema_and_is_a_free_batch_load() {
         let schema = build_schema(&[typed("id", "INT64"), typed("json_col", "JSON")]);
-        let sql = build_load_data_sql("p.d.orders", true, &schema, &None, &[], &uris());
+        let sql = build_load_data_sql("p.d.orders", true, &schema, None, &[], None, &uris());
         assert!(sql.starts_with("LOAD DATA OVERWRITE `p.d.orders` ("));
         // Native types declared inline → BigQuery coerces on load, for free.
         // Backticked (round-6): a reserved-word column must survive the DDL.
@@ -941,7 +1143,7 @@ mod tests {
     #[test]
     fn load_data_append_uses_into() {
         let schema = build_schema(&[typed("id", "INT64")]);
-        let sql = build_load_data_sql("p.d.orders", false, &schema, &None, &[], &uris());
+        let sql = build_load_data_sql("p.d.orders", false, &schema, None, &[], None, &uris());
         assert!(sql.starts_with("LOAD DATA INTO `p.d.orders`"));
     }
 
@@ -952,67 +1154,67 @@ mod tests {
             "p.d.orders",
             true,
             &schema,
-            &Some("DATE(created_at)".into()),
+            Some("DATE(created_at)"),
             &["customer_id".into(), "region".into()],
+            None,
             &uris(),
         );
         assert!(sql.contains("PARTITION BY DATE(created_at)"));
         assert!(sql.contains("CLUSTER BY `customer_id`, `region`"));
-    }
-
-    #[test]
-    fn the_table_ddl_yields_its_partitioning_clustering_and_options() {
-        let shape = parse_table_ddl(
-            "CREATE TABLE `p.d.pp`\n(\n  id INT64 OPTIONS(description=\"x\"),\n  d DATE,\n  \
-             v STRING\n)\nPARTITION BY d\nCLUSTER BY v, `order`\nOPTIONS(\n  \
-             require_partition_filter=true\n);",
-        );
-        assert_eq!(shape.partition.as_deref(), Some("d"));
-        assert_eq!(shape.cluster, ["v", "order"]);
-        assert_eq!(
-            shape.options.as_deref(),
-            Some("require_partition_filter=true")
-        );
-        assert!(shape.requires_partition_filter());
-
-        let bare = parse_table_ddl(
-            "CREATE TABLE `p.d.t`\n(\n  ts TIMESTAMP\n)\nPARTITION BY TIMESTAMP_TRUNC(ts, HOUR);",
-        );
-        assert_eq!(bare.partition.as_deref(), Some("TIMESTAMP_TRUNC(ts, HOUR)"));
-        assert!(bare.cluster.is_empty() && bare.options.is_none());
+        assert!(!sql.contains("OPTIONS"));
     }
 
     #[test]
     fn an_existing_tables_shape_conflicts_when_partitioning_or_clustering_differ() {
         let existing = TableShape {
-            partition: Some("d".into()),
+            partition: Some(time_key(Some("d"), Granularity::Day)),
             cluster: vec!["v".into()],
-            options: None,
+            require_partition_filter: false,
+            expiration_ms: None,
         };
         let id = vec!["id".to_string()];
-        let diff = shape_conflict(&existing, &None, &id).expect("differs");
-        assert!(diff.contains("partitioned by `d`"), "{diff}");
+        let diff = shape_conflict(&existing, None, &id).expect("differs");
+        assert!(diff.contains("partitioned by `d` by day"), "{diff}");
         assert!(diff.contains("declares no partitioning"), "{diff}");
         assert!(
             diff.contains("clustered on `v`, `cluster_by` resolves to `id`"),
             "{diff}"
         );
 
+        let same_key = time_key(Some("D"), Granularity::Day);
         assert_eq!(
-            shape_conflict(&existing, &Some("d".into()), &["V".to_string()]),
+            shape_conflict(&existing, Some(&same_key), &["V".to_string()]),
             None,
-            "the same shape, clustering compared without case"
+            "the same shape, names compared without case"
+        );
+        let monthly = time_key(Some("d"), Granularity::Month);
+        let diff = shape_conflict(&existing, Some(&monthly), &["v".to_string()]).expect("differs");
+        assert!(
+            diff.contains("partitioned by `d` by day, the load declares `d` by month"),
+            "{diff}"
+        );
+        assert!(!diff.contains("clustered"), "{diff}");
+
+        let with_options = TableShape {
+            require_partition_filter: true,
+            expiration_ms: Some(DAY_MS),
+            ..existing.clone()
+        };
+        assert_eq!(
+            shape_conflict(&with_options, Some(&same_key), &["v".to_string()]),
+            None,
+            "options are altered in place, never a conflict"
         );
         let plain = TableShape::default();
-        assert_eq!(shape_conflict(&plain, &None, &[]), None);
-        let diff = shape_conflict(&plain, &None, &id).expect("differs");
+        assert_eq!(shape_conflict(&plain, None, &[]), None);
+        let diff = shape_conflict(&plain, None, &id).expect("differs");
         assert!(diff.contains("clustered on nothing"), "{diff}");
         assert!(!diff.contains("partitioned"), "{diff}");
     }
 
     #[test]
     fn an_unclustered_changelog_carries_no_cluster_clause() {
-        let create = build_create_changes_sql("p.d.t__changes", "  `id` INT64", &[]);
+        let create = build_create_changes_sql("p.d.t__changes", "  `id` INT64", None, &[]);
         assert!(!create.contains("CLUSTER BY"), "{create}");
         assert!(
             create.ends_with(")\n;") || create.ends_with(");"),
@@ -1023,7 +1225,7 @@ mod tests {
     #[test]
     fn create_changes_clusters_on_pk_capped_at_four_columns() {
         let schema = build_schema(&[typed("__op", "STRING"), typed("id", "INT64")]);
-        let sql = build_create_changes_sql("p.d.orders__changes", &schema, &["id".into()]);
+        let sql = build_create_changes_sql("p.d.orders__changes", &schema, None, &["id".into()]);
         assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS `p.d.orders__changes` ("));
         assert!(sql.contains("CLUSTER BY `id`"));
         // A >4-column PK is capped to BigQuery's clustering limit.
@@ -1031,7 +1233,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let sql2 = build_create_changes_sql("t", &schema, &wide);
+        let sql2 = build_create_changes_sql("t", &schema, None, &wide);
         let bt = |c: &str| format!("`{c}`");
         assert!(sql2.contains(&format!(
             "CLUSTER BY {}, {}, {}, {}",
@@ -1165,10 +1367,18 @@ mod tests {
     /// must survive a load with its rows intact.
     #[test]
     fn changelog_sql_is_create_if_not_exists_plus_append_only() {
-        let create = build_create_changes_sql("p.d.t__changes", "  `id` INT64", &["id".into()]);
+        let create =
+            build_create_changes_sql("p.d.t__changes", "  `id` INT64", None, &["id".into()]);
         assert!(create.starts_with("CREATE TABLE IF NOT EXISTS"), "{create}");
-        let load =
-            build_load_data_sql("p.d.t__changes", false, "  `id` INT64", &None, &[], &uris());
+        let load = build_load_data_sql(
+            "p.d.t__changes",
+            false,
+            "  `id` INT64",
+            None,
+            &[],
+            None,
+            &uris(),
+        );
         assert!(load.starts_with("LOAD DATA INTO"), "{load}");
         assert!(!load.contains("OVERWRITE"), "{load}");
     }
@@ -1207,77 +1417,6 @@ mod tests {
             err.contains("not a plain SQL identifier") && err.contains("CLUSTER BY"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn hive_partition_value_parses_col_segment() {
-        assert_eq!(
-            hive_partition_value("gs://b/t/d=2023-01-01/part-0.parquet", "d").as_deref(),
-            Some("2023-01-01")
-        );
-        assert_eq!(
-            hive_partition_value("gs://b/t/created_at=2023-01-01/p.parquet", "created_at")
-                .as_deref(),
-            Some("2023-01-01")
-        );
-        assert!(hive_partition_value("gs://b/t/part-0.parquet", "d").is_none());
-    }
-
-    #[test]
-    fn is_bare_column_rejects_expressions() {
-        assert!(is_bare_column("d"));
-        assert!(is_bare_column("created_at"));
-        assert!(!is_bare_column("DATE(d)"));
-        assert!(!is_bare_column("DATE_TRUNC(d, MONTH)"));
-        assert!(!is_bare_column(""));
-    }
-
-    #[test]
-    fn hive_batches_split_by_distinct_partition_cap() {
-        // 5 distinct days (day 01-01 has 2 files), cap 2 → 3 batches.
-        let uris: Vec<String> = [
-            "gs://b/t/d=2023-01-01/a.parquet",
-            "gs://b/t/d=2023-01-01/b.parquet",
-            "gs://b/t/d=2023-01-02/a.parquet",
-            "gs://b/t/d=2023-01-03/a.parquet",
-            "gs://b/t/d=2023-01-04/a.parquet",
-            "gs://b/t/d=2023-01-05/a.parquet",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let batches = plan_hive_batches(&uris, "d", 2).unwrap();
-        assert_eq!(batches.len(), 3);
-        for b in &batches {
-            let mut days: Vec<_> = b
-                .iter()
-                .map(|u| hive_partition_value(u, "d").unwrap())
-                .collect();
-            days.sort();
-            days.dedup();
-            assert!(
-                days.len() <= 2,
-                "batch touches {} distinct days",
-                days.len()
-            );
-        }
-        // Files that share a day stay together; the union is the whole input.
-        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), uris.len());
-    }
-
-    #[test]
-    fn hive_batches_single_when_under_cap() {
-        let uris = vec![
-            "gs://b/t/d=2023-01-01/a.parquet".to_string(),
-            "gs://b/t/d=2023-01-02/a.parquet".to_string(),
-        ];
-        assert_eq!(plan_hive_batches(&uris, "d", 4000).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn hive_batches_error_when_uri_lacks_segment() {
-        let uris = vec!["gs://b/t/no-hive/a.parquet".to_string()];
-        assert!(plan_hive_batches(&uris, "d", 2).is_err());
     }
 
     /// Live BigQuery load. Requires ADC, a dataset, and a GCS Parquet URI —

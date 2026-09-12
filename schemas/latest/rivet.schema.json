@@ -779,7 +779,7 @@
           "default": null
         },
         "load": {
-          "description": "Per-export overrides for the top-level `load:` block (`pk`,\n`cleanup_source`, `gc_orphans`, `cluster_by`, `allow_source_drift`); any\nfield omitted here inherits the top-level value. The warehouse `target`\nis shared and stays in the top-level `load:` — it cannot be overridden\nper export.\n\n```yaml\nload: { target: bigquery, project: p, dataset: d }   # shared default\nexports:\n  - name: orders\n    table: orders\n    mode: cdc\n    load: { pk: [id] }                                # this table's pk\n```\n\nRaw JSON (parsed by the load module) so `config` carries no load types —\nmirrors the top-level [`crate::config::Config::load`].",
+          "description": "Per-export overrides for the top-level `load:` block (`pk`,\n`cleanup_source`, `gc_orphans`, `cluster_by`, `partition`,\n`allow_source_drift`); any field omitted here inherits the top-level\nvalue. The warehouse `target` is shared and stays in the top-level\n`load:` — it cannot be overridden per export.\n\n```yaml\nload: { target: bigquery, project: p, dataset: d }   # shared default\nexports:\n  - name: orders\n    table: orders\n    mode: cdc\n    load:\n      pk: [id]                                        # this table's pk\n      partition: { column: created_at, granularity: day, expiration_days: 400 }\n```\n\nRaw JSON (parsed by the load module) so `config` carries no load types —\nmirrors the top-level [`crate::config::Config::load`].",
           "default": null
         },
         "on_schema_drift": {

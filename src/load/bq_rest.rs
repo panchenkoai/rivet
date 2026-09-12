@@ -142,30 +142,25 @@ impl BigQueryApi {
         parse_scalar_u64(&results)
     }
 
-    /// Run a query job and read the first cell of its first row as text; `None`
-    /// when there is no row or the cell is NULL.
-    pub(crate) fn run_query_text(
-        &self,
-        sql: &str,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<Option<String>> {
-        let job_ref = self.settle(self.insert_query_job(sql, labels)?)?;
-        let results = self.get_json(&self.query_results_url(&job_ref), "getQueryResults")?;
-        Ok(parse_scalar_text(&results))
+    /// The `tables.get` resource of `dataset.table` when it is a table: metadata, no
+    /// query job. `None` for a view, or when nothing has that name.
+    pub(crate) fn table_metadata(&self, dataset: &str, table: &str) -> Result<Option<Value>> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
+            self.endpoint, self.project
+        );
+        Ok(self
+            .get_json_if_found(&url, "tables.get")?
+            .filter(|meta| meta.get("type").and_then(Value::as_str) == Some("TABLE")))
     }
 
     /// `numRows` of `dataset.table` from `tables.get`: table metadata, no query job, so
     /// it needs no partition filter on a table that requires one. `None` for anything
     /// but a table — a view reports a meaningless zero.
     pub(crate) fn table_num_rows(&self, dataset: &str, table: &str) -> Result<Option<u64>> {
-        let url = format!(
-            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
-            self.endpoint, self.project
-        );
-        let meta = self.get_json(&url, "tables.get")?;
-        if meta.get("type").and_then(Value::as_str) != Some("TABLE") {
+        let Some(meta) = self.table_metadata(dataset, table)? else {
             return Ok(None);
-        }
+        };
         let rows = meta
             .get("numRows")
             .and_then(Value::as_str)
@@ -246,6 +241,21 @@ impl BigQueryApi {
     /// endpoint in any error, so an operator reading the message knows whether
     /// the poll or the result fetch was refused.
     fn get_json(&self, url: &str, what: &str) -> Result<Value> {
+        let resp = self.get_response(url, what)?;
+        self.read_json(resp, what)
+    }
+
+    /// [`BigQueryApi::get_json`] that reads a 404 as `None` — a resource that may not exist.
+    fn get_json_if_found(&self, url: &str, what: &str) -> Result<Option<Value>> {
+        let resp = self.get_response(url, what)?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        self.read_json(resp, what).map(Some)
+    }
+
+    /// The non-transient response of an idempotent GET, retrying transient failures.
+    fn get_response(&self, url: &str, what: &str) -> Result<reqwest::blocking::Response> {
         let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
         for attempt in 0..=MAX_TRANSIENT_RETRIES {
             if attempt > 0 {
@@ -259,7 +269,7 @@ impl BigQueryApi {
                         resp.status().as_u16()
                     );
                 }
-                Ok(resp) => return self.read_json(resp, what),
+                Ok(resp) => return Ok(resp),
                 // A connection reset mid-poll is the same class as a 503.
                 Err(e) => last = anyhow::Error::new(e).context("BigQuery request failed"),
             }
@@ -612,20 +622,6 @@ pub(crate) fn parse_scalar_u64(results: &Value) -> Result<u64> {
             .context("BigQuery returned a count that is not a non-negative integer"),
         other => bail!("BigQuery returned a count of an unexpected JSON type: {other}"),
     }
-}
-
-/// The first cell of the first row of a `getQueryResults` reply as text, or `None`.
-pub(crate) fn parse_scalar_text(results: &Value) -> Option<String> {
-    results
-        .get("rows")?
-        .as_array()?
-        .first()?
-        .get("f")?
-        .as_array()?
-        .first()?
-        .get("v")?
-        .as_str()
-        .map(str::to_string)
 }
 
 /// `?location=<loc>` when the job has one, else empty.

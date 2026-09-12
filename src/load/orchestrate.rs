@@ -15,6 +15,7 @@
 use crate::error::Result;
 use crate::load;
 use crate::state::{LoadRecord, StateStore};
+use anyhow::Context as _;
 
 pub struct LoadArgs {
     pub config: String,
@@ -863,7 +864,9 @@ fn execute_load<R>(
         }
     };
     progress(&inputs);
-    let (rows, report) = match run(&*loader, &store, &inputs) {
+    let (rows, report) = match partition_budget_ok(&store, job.plan, &inputs.uris)
+        .and_then(|()| run(&*loader, &store, &inputs))
+    {
         Ok(v) => v,
         Err(e) => {
             ctx.record_failed(&inputs.source_run_ids);
@@ -873,6 +876,29 @@ fn execute_load<R>(
     ctx.record_success(&inputs.source_run_ids, rows as i64);
     done(&inputs, &report);
     Ok(Some(report))
+}
+
+/// The pre-load partition budget of a BigQuery plan (ADR-0034 D4); no other target
+/// caps the partitions one job writes.
+fn partition_budget_ok(
+    store: &crate::destination::gcs::GcsStore,
+    plan: &load::plan::LoadPlan,
+    uris: &[String],
+) -> Result<()> {
+    match (&plan.load.target, &plan.partition) {
+        (load::plan::LoadTarget::Bigquery { .. }, Some(partition)) => {
+            load::partition_budget::check_partition_budget(store, uris, partition)
+                .with_context(|| format!("export `{}`", plan.export_name))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The partition a load declares, for the progress line.
+fn partition_label(plan: &load::plan::LoadPlan) -> String {
+    plan.partition
+        .as_ref()
+        .map_or_else(|| "none".to_string(), |p| p.key.describe())
 }
 
 /// The `(source cleaned)` suffix: a load that deleted its staged Parquet says so,
@@ -1412,11 +1438,11 @@ fn load_one(
         job,
         |inputs| {
             eprintln!(
-                "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
+                "  load {} → {} | columns={} partition={} manifests={} parquet_files={} expected_rows={}",
                 plan.table,
                 plan.load.target.name(),
                 plan.specs.len(),
-                plan.partition_by,
+                partition_label(plan),
                 inputs.integrity.manifests,
                 inputs.uris.len(),
                 inputs.integrity.file_rows,
@@ -1490,7 +1516,7 @@ mod load_ledger_tests {
         let plan = LoadPlan {
             export_name: "c1".into(),
             table: "content_items".into(),
-            partition_by: None,
+            partition: None,
             specs: vec![],
             gcs_prefix: String::new(),
             destination: crate::config::DestinationConfig::default(),
@@ -1504,6 +1530,7 @@ mod load_ledger_tests {
                 allow_source_drift: false,
                 gc_orphans: false,
                 cluster_by: load::plan::KeyColumns::Auto,
+                partition: None,
             },
             mode: LoadMode::Cdc,
             cursor_column: None,
@@ -1762,7 +1789,7 @@ mod live_only_decisions {
         LoadPlan {
             export_name: "orders".into(),
             table: "orders".into(),
-            partition_by: None,
+            partition: None,
             specs: vec![],
             gcs_prefix: gcs_prefix.into(),
             destination: crate::config::DestinationConfig::default(),
@@ -1776,6 +1803,7 @@ mod live_only_decisions {
                 allow_source_drift: false,
                 gc_orphans: false,
                 cluster_by: load::plan::KeyColumns::None,
+                partition: None,
             },
             mode,
             cursor_column: None,

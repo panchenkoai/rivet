@@ -41,19 +41,31 @@ impl BqLive {
         )
     }
 
-    /// Rows of `sql` as JSON objects (every value a string, as `bq` renders them).
+    /// Rows of `sql` as JSON objects (every value a string, as `bq` renders them). Every `bq`
+    /// call runs under `timeout`: the CLI can hang on a finished job, and a hang that fails
+    /// loudly is rerun, one that never returns eats the whole run.
     pub fn read_bq_rows(&self, sql: &str) -> Vec<serde_json::Value> {
-        let out = Command::new("bq")
-            .arg(format!("--project_id={}", self.project))
-            .args([
-                "query",
-                "--use_legacy_sql=false",
-                "--format=json",
-                "--max_rows=100000",
-            ])
-            .arg(sql)
-            .output()
-            .expect("`bq query` must run");
+        let run = || {
+            Command::new("timeout")
+                .args(["120", "bq"])
+                .arg(format!("--project_id={}", self.project))
+                .args([
+                    "query",
+                    "--use_legacy_sql=false",
+                    "--format=json",
+                    "--max_rows=100000",
+                ])
+                .arg(sql)
+                .output()
+                .expect("`bq query` must run")
+        };
+        let mut out = run();
+        // A hang (exit 124 from `timeout`) after the job finished is the CLI's, not
+        // the query's: seen twice on the same count right after a load. One retry.
+        if out.status.code() == Some(124) {
+            eprintln!("bq query hung and was killed; retrying once: {sql}");
+            out = run();
+        }
         assert!(
             out.status.success(),
             "bq query failed: {sql}\n{}{}",
@@ -115,6 +127,74 @@ impl BqLive {
             .to_string()
     }
 
+    /// The `tables.get` resource of `table` (`bq show --format=json`); the table must exist.
+    pub fn read_bq_meta(&self, table: &str) -> serde_json::Value {
+        let out = Command::new("timeout")
+            .args(["120", "bq"])
+            .arg(format!("--project_id={}", self.project))
+            .args(["show", "--format=json"])
+            .arg(format!("{}.{table}", self.dataset))
+            .output()
+            .expect("`bq show` must run");
+        assert!(
+            out.status.success(),
+            "bq show failed for {table}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("bq show returned non-JSON for {table}: {e}"))
+    }
+
+    /// `(type, field)` of `table`'s time partitioning, e.g. `("DAY", Some("ts"))`;
+    /// `field` is `None` for load-time partitions, the whole thing for no time partitioning.
+    pub fn read_bq_time_partitioning(&self, table: &str) -> Option<(String, Option<String>)> {
+        time_partitioning(&self.read_bq_meta(table))
+    }
+
+    /// `(column, start, end, interval)` of `table`'s integer-range partitioning.
+    pub fn read_bq_range_partitioning(&self, table: &str) -> Option<(String, i64, i64, i64)> {
+        let meta = self.read_bq_meta(table);
+        let rp = meta.get("rangePartitioning")?;
+        let int = |k: &str| rp["range"][k].as_str()?.parse::<i64>().ok();
+        Some((
+            rp["field"].as_str()?.to_string(),
+            int("start")?,
+            int("end")?,
+            int("interval")?,
+        ))
+    }
+
+    /// `partition_expiration_days` of `table`, from its `expirationMs`.
+    pub fn read_bq_partition_expiration_days(&self, table: &str) -> Option<f64> {
+        let meta = self.read_bq_meta(table);
+        let ms = meta["timePartitioning"]["expirationMs"]
+            .as_str()?
+            .parse::<f64>()
+            .ok()?;
+        Some(ms / 86_400_000.0)
+    }
+
+    /// Whether `table` requires a partition filter.
+    pub fn read_bq_requires_partition_filter(&self, table: &str) -> bool {
+        let meta = self.read_bq_meta(table);
+        meta["requirePartitionFilter"].as_bool().unwrap_or(false)
+            || meta["timePartitioning"]["requirePartitionFilter"]
+                .as_bool()
+                .unwrap_or(false)
+    }
+
+    /// `COUNT(*)` of `table` under `where_sql` — for a table that requires a partition filter.
+    pub fn read_bq_count_where(&self, table: &str, where_sql: &str) -> String {
+        self.read_bq_rows(&format!(
+            "SELECT COUNT(*) AS n FROM `{}.{}.{table}` WHERE {where_sql}",
+            self.project, self.dataset
+        ))[0]["n"]
+            .as_str()
+            .expect("count")
+            .to_string()
+    }
+
     /// One table option of `table` as BigQuery renders it, or `None` when unset.
     pub fn read_bq_option(&self, table: &str, option: &str) -> Option<String> {
         self.read_bq_rows(&format!(
@@ -133,7 +213,8 @@ impl BqLive {
 
     /// Run one DDL statement, panicking on failure.
     pub fn exec(&self, sql: &str) {
-        let out = Command::new("bq")
+        let out = Command::new("timeout")
+            .args(["120", "bq"])
             .arg(format!("--project_id={}", self.project))
             .args(["query", "--use_legacy_sql=false"])
             .arg(sql)
@@ -156,6 +237,15 @@ impl BqLive {
             gcs: format!("gs://{}/{}/**", self.bucket, self.prefix),
         }
     }
+}
+
+/// `(type, field)` of a `tables.get` resource's time partitioning.
+pub fn time_partitioning(meta: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let tp = meta.get("timePartitioning")?;
+    Some((
+        tp["type"].as_str()?.to_string(),
+        tp["field"].as_str().map(String::from),
+    ))
 }
 
 /// See [`BqLive::cleanup`].

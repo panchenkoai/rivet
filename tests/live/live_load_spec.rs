@@ -418,3 +418,248 @@ fn bigquery_changelog_keeps_the_shape_of_the_table_it_grew_from() {
     );
     assert_eq!(distinct_ids(&bq, &table), "35");
 }
+
+/// A Postgres table with a column of each partitionable type, ids `1..=n` over five days.
+fn temporal_pg_table(prefix: &str, n: i64) -> (String, Box<dyn std::any::Any>) {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, guard) = e.create(
+        prefix,
+        "id INT NOT NULL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL, dt TIMESTAMP NOT NULL, \
+         d DATE NOT NULL, n INT NOT NULL, v VARCHAR(20) NULL",
+    );
+    add_temporal_rows(&table, 1, n);
+    (table, guard)
+}
+
+fn add_temporal_rows(table: &str, from: i64, to: i64) {
+    SqlEngine::Pg.exec(&format!(
+        "INSERT INTO {table} (id, ts, dt, d, n, v) SELECT g, \
+         TIMESTAMPTZ '2026-09-01 10:00:00+00' + (g % 5) * INTERVAL '1 day', \
+         TIMESTAMP '2026-09-01 10:00:00' + (g % 5) * INTERVAL '1 day', \
+         DATE '2026-09-01' + (g % 5)::int, g * 7, 'v' || g FROM generate_series({from}, {to}) g"
+    ));
+}
+
+fn partition_line(bq: &BqLive, block: &str) -> String {
+    bq.load_line(&format!(", partition: {block}"))
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step() {
+    let Some(bq) = BqLive::from_env("bq_part_day") else {
+        return;
+    };
+    let (table, _guard) = temporal_pg_table("bq_part_day", 30);
+    let _cleanup = bq.cleanup(&[&table]);
+    let rig = SqlEngine::Pg
+        .rig(&table)
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&partition_line(
+            &bq,
+            "{ column: ts, granularity: day, expiration_days: 400, require_filter: true }",
+        ));
+    rig.run_ok();
+    load_ok(&rig);
+    let daily = Some(("DAY".to_string(), Some("ts".to_string())));
+    assert_eq!(bq.read_bq_time_partitioning(&table), daily);
+    assert_eq!(bq.read_bq_partition_expiration_days(&table), Some(400.0));
+    assert!(bq.read_bq_requires_partition_filter(&table));
+    assert_eq!(bq.read_bq_clustering(&table), ["id"]);
+    let all = "ts >= TIMESTAMP '2000-01-01'";
+    assert_eq!(bq.read_bq_count_where(&table, all), "30");
+
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(
+        bq.read_bq_count_where(&table, all),
+        "30",
+        "overwrites its own table"
+    );
+
+    let rig = rig.clear_top_lines().top_line(&partition_line(
+        &bq,
+        "{ column: ts, granularity: day, expiration_days: 30 }",
+    ));
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_time_partitioning(&table), daily);
+    assert_eq!(
+        bq.read_bq_partition_expiration_days(&table),
+        Some(30.0),
+        "options change in place"
+    );
+    assert!(!bq.read_bq_requires_partition_filter(&table));
+    assert_eq!(bq.read_bq_count(&table), "30");
+
+    let rig = rig
+        .clear_top_lines()
+        .top_line(&partition_line(&bq, "{ column: ts, granularity: month }"));
+    rig.run_ok();
+    let said = load_fails(&rig);
+    assert!(
+        said.contains("partitioned by `ts` by day, the load declares `ts` by month"),
+        "the refusal names the difference:\n{said}"
+    );
+    assert_eq!(bq.read_bq_time_partitioning(&table), daily, "untouched");
+    assert_eq!(bq.read_bq_count(&table), "30");
+}
+
+/// Run + load `block`'s partition on a fresh 20-row table and return the table's metadata.
+fn partition_lands(bq: &BqLive, label: &str, block: &str) -> serde_json::Value {
+    let (table, _guard) = temporal_pg_table(label, 20);
+    let _cleanup = bq.cleanup(&[&table]);
+    let rig = SqlEngine::Pg
+        .rig(&table)
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&partition_line(bq, block));
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_count(&table), "20", "{label}");
+    bq.read_bq_meta(&table)
+}
+
+fn column_partitions_at_every_granularity(label: &str, column: &str, granularities: &[&str]) {
+    let Some(bq) = BqLive::from_env(label) else {
+        return;
+    };
+    for g in granularities {
+        let meta = partition_lands(
+            &bq,
+            &format!("{label}_{g}"),
+            &format!("{{ column: {column}, granularity: {g} }}"),
+        );
+        assert_eq!(
+            time_partitioning(&meta),
+            Some((g.to_uppercase(), Some(column.to_string()))),
+            "{column} by {g}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_timestamp_partitions_land_at_every_granularity() {
+    column_partitions_at_every_granularity("bq_part_ts", "ts", &["hour", "day", "month", "year"]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_datetime_partitions_land_at_every_granularity() {
+    column_partitions_at_every_granularity("bq_part_dt", "dt", &["hour", "day", "month", "year"]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_date_partitions_land_by_day_month_and_year() {
+    column_partitions_at_every_granularity("bq_part_d", "d", &["day", "month", "year"]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_range_and_load_time_partitions_land_as_declared() {
+    let Some(bq) = BqLive::from_env("bq_part_misc") else {
+        return;
+    };
+    let meta = partition_lands(
+        &bq,
+        "bq_part_range",
+        "{ range: { column: n, start: 0, end: 1000, interval: 100 } }",
+    );
+    assert_eq!(
+        meta["rangePartitioning"]["field"].as_str(),
+        Some("n"),
+        "{meta}"
+    );
+    assert_eq!(
+        meta["rangePartitioning"]["range"]["interval"].as_str(),
+        Some("100")
+    );
+    for g in ["hour", "day", "month", "year"] {
+        let meta = partition_lands(
+            &bq,
+            &format!("bq_part_ing_{g}"),
+            &format!("{{ ingestion: {g} }}"),
+        );
+        assert_eq!(
+            time_partitioning(&meta),
+            Some((g.to_uppercase(), None)),
+            "load time by {g}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_changelog_inherits_the_partition_rivet_gave_the_table() {
+    let Some(bq) = BqLive::from_env("bq_part_inherit") else {
+        return;
+    };
+    let (table, _guard) = temporal_pg_table("bq_part_inherit", 30);
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    let rig = SqlEngine::Pg
+        .rig(&table)
+        .restage("incremental", &["cursor_column: id"])
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&partition_line(
+            &bq,
+            "{ column: ts, granularity: day, require_filter: true }",
+        ));
+    rig.run_ok();
+    load_ok(&rig);
+    let daily = Some(("DAY".to_string(), Some("ts".to_string())));
+    assert_eq!(bq.read_bq_time_partitioning(&table), daily);
+    assert!(bq.read_bq_requires_partition_filter(&table));
+
+    add_temporal_rows(&table, 31, 35);
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_table_type(&table).as_deref(), Some("VIEW"));
+    assert_eq!(bq.read_bq_time_partitioning(&changes), daily);
+    assert!(
+        !bq.read_bq_requires_partition_filter(&changes),
+        "the view reads all of the log"
+    );
+    assert_eq!(bq.read_bq_clustering(&changes), ["id"]);
+    assert_eq!(bq.read_bq_count(&changes), "35");
+    assert_eq!(distinct_ids(&bq, &table), "35");
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load() {
+    let Some(bq) = BqLive::from_env("bq_part_cap") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.create(
+        "bq_part_cap",
+        "id INT NOT NULL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL",
+    );
+    let _cleanup = bq.cleanup(&[&table]);
+    e.exec(&format!(
+        "INSERT INTO {table} (id, ts) SELECT g, TIMESTAMPTZ '2026-01-01 10:00:00+00' + \
+         (g - 1) * INTERVAL '1 day' FROM generate_series(1, 200) g"
+    ));
+    let rig = e
+        .rig(&table)
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&partition_line(
+            &bq,
+            "{ column: ts, granularity: hour, expiration_days: 30 }",
+        ));
+    rig.run_ok();
+    let said = load_fails(&rig);
+    assert!(
+        said.contains("about 4777 hour partitions of `ts`"),
+        "the refusal counts the partitions:\n{said}"
+    );
+    assert!(
+        said.contains("use `granularity: day` (about 200)"),
+        "and names the granularity that fits:\n{said}"
+    );
+    assert_eq!(bq.read_bq_table_type(&table), None, "no job ran");
+}

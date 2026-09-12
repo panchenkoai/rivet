@@ -39,6 +39,9 @@ pub struct SnowflakeLoader {
     /// background auto-clustering. Empty = no clustering key. Applies only at
     /// table creation.
     pub cluster_by: Vec<String>,
+    /// The `load.partition` mapped to a leading clustering expression
+    /// (`DATE_TRUNC('DAY', c)`), ahead of `cluster_by` — Snowflake has no partitions.
+    pub partition_expr: Option<String>,
     /// Absolute path to the connection's private key. The `snow` CLI does not
     /// expand `~`, so a `~`-relative `private_key_path` in the connection file
     /// must be overridden with an absolute path via env.
@@ -113,6 +116,15 @@ impl SnowflakeLoader {
         }
     }
 
+    /// The clustering key: the partition expression first, then `cluster_by`.
+    fn cluster_keys(&self) -> Vec<String> {
+        self.partition_expr
+            .iter()
+            .chain(self.cluster_by.iter())
+            .cloned()
+            .collect()
+    }
+
     /// A JSON query tag for post-hoc cost attribution in `QUERY_HISTORY`.
     /// Carries `rivet_run` too when a load-run id is set, so credits summed from
     /// `QUERY_ATTRIBUTION_HISTORY` slice per run as well as per table.
@@ -174,7 +186,7 @@ impl TargetLoader for SnowflakeLoader {
         // `PATTERN` over the prefix would load stale runs and fail the count gate).
         let stage = format!("rivet_stage_{}", sanitize_tag(table));
         let files = copy_files_clause(&self.gcs_url, uris)?;
-        let cluster = Self::cluster_clause(&self.cluster_by);
+        let cluster = Self::cluster_clause(&self.cluster_keys());
 
         // `CREATE OR REPLACE` (overwrite): storage is the source of truth. Pin
         // the session to UTC before the COPY — Snowflake otherwise stamps a
@@ -384,7 +396,7 @@ impl SnowflakeLoader {
         let ddl = Self::build_schema_ddl(&full);
         let select = Self::build_copy_select(&full);
         let columns = Self::build_column_list(&full);
-        let cluster = Self::cluster_clause(&self.cluster_by);
+        let cluster = Self::cluster_clause(&self.cluster_keys());
         let stage = format!("rivet_stage_{}", sanitize_tag(&changes));
         let files = copy_files_clause(&self.gcs_url, uris)?;
 
@@ -617,6 +629,39 @@ mod tests {
             "  id NUMBER(38,0),\n  meta VARIANT"
         );
         assert_eq!(SnowflakeLoader::build_column_list(&specs), "id, meta");
+    }
+
+    #[test]
+    fn a_partition_expression_leads_the_clustering_key() {
+        let mut l = SnowflakeLoader::new("c");
+        l.cluster_by = vec!["customer".into()];
+        l.partition_expr = Some("DATE_TRUNC('DAY', created)".into());
+        assert_eq!(
+            SnowflakeLoader::cluster_clause(&l.cluster_keys()),
+            " CLUSTER BY (DATE_TRUNC('DAY', created), customer)"
+        );
+        l.database = "DB".into();
+        l.schema = "SC".into();
+        let append = l
+            .build_append_changelog_sql(
+                "t",
+                &[spec("id", "NUMBER")],
+                &["gs://b/p/part-0.parquet".to_string()],
+            )
+            .unwrap();
+        assert!(
+            append.contains(
+                "CREATE TABLE IF NOT EXISTS DB.SC.t__changes (\n  __op VARCHAR,\n  __pos VARCHAR,\n  __seq INTEGER,\n  id NUMBER\n) CLUSTER BY (DATE_TRUNC('DAY', created), customer);"
+            ),
+            "the change log rivet creates takes the same key:\n{append}"
+        );
+        l.cluster_by.clear();
+        assert_eq!(
+            SnowflakeLoader::cluster_clause(&l.cluster_keys()),
+            " CLUSTER BY (DATE_TRUNC('DAY', created))"
+        );
+        l.partition_expr = None;
+        assert_eq!(SnowflakeLoader::cluster_clause(&l.cluster_keys()), "");
     }
 
     #[test]

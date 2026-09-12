@@ -1,0 +1,210 @@
+# Load-spec matrix (ADR-0034) — `load.partition` form × granularity × warehouse target.
+# Columns are the ExportTarget variants: `bigquery` and `snowflake` load; `duckdb` and
+# `clickhouse` are not load targets and carry `na` on every row. Cell = { test } | { na } | { gap }.
+#
+# What this guards: rivet writes the warehouse partition expression from the column type
+# the metabase recorded (D3), so every (type × granularity) pair has one expression, one
+# refusal, or one warehouse-specific mapping — and each is a cell here. The BigQuery
+# `test:` cells for the forms are LIVE (a run + load per cell on the test project, the
+# metadata read back through `tables.get`); the Snowflake ones are SQL-text proofs, since
+# Snowflake is not live-run from this stand. Validation rows are target-agnostic config
+# checks and cite the same test in both load columns.
+
+engines: [bigquery, snowflake, duckdb, clickhouse]
+
+scenarios:
+  - id: timestamp_hour
+    what: "a TIMESTAMP column by hour → TIMESTAMP_TRUNC(c, HOUR); Snowflake a leading DATE_TRUNC('HOUR', c) clustering expression"
+    bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: timestamp_day
+    what: "a TIMESTAMP column by day → TIMESTAMP_TRUNC(c, DAY) (BigQuery renders it DATE(c); compared as metadata, not text)"
+    bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: timestamp_month
+    what: "a TIMESTAMP column by month → TIMESTAMP_TRUNC(c, MONTH)"
+    bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: timestamp_year
+    what: "a TIMESTAMP column by year → TIMESTAMP_TRUNC(c, YEAR)"
+    bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: datetime_hour
+    what: "a DATETIME column by hour → DATETIME_TRUNC(c, HOUR)"
+    bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: datetime_day
+    what: "a DATETIME column by day → DATETIME_TRUNC(c, DAY)"
+    bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: datetime_month
+    what: "a DATETIME column by month → DATETIME_TRUNC(c, MONTH)"
+    bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: datetime_year
+    what: "a DATETIME column by year → DATETIME_TRUNC(c, YEAR)"
+    bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: date_day
+    what: "a DATE column by day → the column itself"
+    bigquery:   { test: bigquery_date_partitions_land_by_day_month_and_year }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: date_month
+    what: "a DATE column by month → DATE_TRUNC(c, MONTH)"
+    bigquery:   { test: bigquery_date_partitions_land_by_day_month_and_year }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: date_year
+    what: "a DATE column by year → DATE_TRUNC(c, YEAR)"
+    bigquery:   { test: bigquery_date_partitions_land_by_day_month_and_year }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: date_hour_refused
+    what: "a DATE column by hour is refused at plan time — a DATE has no hours"
+    bigquery:   { test: bigquery_partition_refuses_a_form_the_column_type_cannot_take }
+    snowflake:  { na: "Snowflake's DATE_TRUNC truncates a DATE at any granularity; nothing to refuse" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: non_temporal_column_refused
+    what: "a STRING / INT64 column under `column:` is refused, naming the type; the column lookup is one seam for both targets (resolve_partition)"
+    bigquery:   { test: bigquery_partition_refuses_a_form_the_column_type_cannot_take }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: range_int64
+    what: "an INT64 column with `range` → RANGE_BUCKET(c, GENERATE_ARRAY(start, end, interval))"
+    bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: range_on_a_non_integer_refused
+    what: "`range` on anything but INT64 is refused at plan time"
+    bigquery:   { test: bigquery_partition_refuses_a_form_the_column_type_cannot_take }
+    snowflake:  { na: "Snowflake has no range partitions; the form itself is refused (range_int64)" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: ingestion_hour
+    what: "load time by hour → TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)"
+    bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: ingestion_day
+    what: "load time by day → _PARTITIONDATE"
+    bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: ingestion_month
+    what: "load time by month → TIMESTAMP_TRUNC(_PARTITIONTIME, MONTH)"
+    bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: ingestion_year
+    what: "load time by year → TIMESTAMP_TRUNC(_PARTITIONTIME, YEAR)"
+    bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: one_form_per_block
+    what: "a `partition:` block names exactly one of column / range / ingestion; a stray granularity, a zero expiry, a reversed or too-fine range and a typo'd key are refused when the block is read"
+    bigquery:   { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
+    snowflake:  { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: per_export_override_and_none
+    what: "a per-export `partition:` replaces the top-level one, `none` included; the top-level default is `none`"
+    bigquery:   { test: a_per_export_partition_replaces_the_top_level_one_none_included }
+    snowflake:  { test: a_per_export_partition_replaces_the_top_level_one_none_included }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: expiration_and_filter_options
+    what: "`expiration_days` / `require_filter` land as partition_expiration_days / require_partition_filter on the full table; Snowflake refuses both"
+    bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
+    snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: options_change_in_place
+    what: "a changed expiry / filter is applied with ALTER TABLE SET OPTIONS after the overwrite — BigQuery refuses an overwrite declaring different options (verified 2026-09-12)"
+    bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
+    snowflake:  { na: "no partition options" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: changed_partition_of_a_full_table_refused
+    what: "a full load onto rivet's own table with a different partition key or granularity is refused naming both, nothing touched (D5)"
+    bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
+    snowflake:  { na: "CREATE OR REPLACE TABLE re-creates the table with the new clustering key — Snowflake has no partition spec to conflict" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: changelog_inherits_the_table_partition
+    what: "the first delta renames the partitioned full table to `__changes`, keeping the partition and lifting require_partition_filter (MT7)"
+    bigquery:   { test: bigquery_changelog_inherits_the_partition_rivet_gave_the_table }
+    snowflake:  { test: adoption_renames_the_table_and_adds_the_meta_columns }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: changelog_created_by_rivet_is_partitioned_without_a_filter
+    what: "a change log rivet creates (CDC) takes the partition and a column/range expiry, never require_partition_filter or a load-date expiry"
+    bigquery:   { test: a_changelog_is_partitioned_like_the_table_but_never_requires_a_filter }
+    snowflake:  { test: a_partition_expression_leads_the_clustering_key }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: span_over_the_job_cap_refused
+    what: "a load whose Parquet spans more than 4,000 partitions is refused from the footer statistics before any job, naming the granularity that fits (D4)"
+    bigquery:   { test: bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load }
+    snowflake:  { na: "no per-job partition cap" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }
+
+  - id: hourly_lifetime_warning
+    what: "hourly partitions without an expiry of at most 416 days warn at plan time — 10,000 partitions per table"
+    bigquery:   { test: hourly_partitions_outlive_the_table_without_a_short_expiry }
+    snowflake:  { na: "no per-table partition cap" }
+    duckdb:     { na: "not a load target" }
+    clickhouse: { na: "not a load target" }

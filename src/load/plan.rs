@@ -55,6 +55,316 @@ pub struct LoadSection {
     /// `none`, or explicit columns (at most 4 on BigQuery).
     #[serde(default)]
     pub cluster_by: KeyColumns,
+    /// How the table the load writes is partitioned: `none` (default), or exactly one of
+    /// `column` (+ `granularity`), an integer `range`, or `ingestion` time.
+    #[serde(default, deserialize_with = "partition_setting")]
+    pub partition: Option<PartitionSpec>,
+}
+
+/// A partition granularity: `hour`, `day`, `month` or `year`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Granularity {
+    Hour,
+    Day,
+    Month,
+    Year,
+}
+
+impl Granularity {
+    /// The name BigQuery uses in `*_TRUNC(…)` and `timePartitioning.type`.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Granularity::Hour => "HOUR",
+            Granularity::Day => "DAY",
+            Granularity::Month => "MONTH",
+            Granularity::Year => "YEAR",
+        }
+    }
+
+    /// The name as the config writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Granularity::Hour => "hour",
+            Granularity::Day => "day",
+            Granularity::Month => "month",
+            Granularity::Year => "year",
+        }
+    }
+
+    /// `HOUR` / `DAY` / `MONTH` / `YEAR` back to a granularity.
+    pub fn parse_sql(s: &str) -> Option<Self> {
+        match s {
+            "HOUR" => Some(Granularity::Hour),
+            "DAY" => Some(Granularity::Day),
+            "MONTH" => Some(Granularity::Month),
+            "YEAR" => Some(Granularity::Year),
+            _ => None,
+        }
+    }
+
+    /// The next coarser granularity, if there is one.
+    pub fn coarser(self) -> Option<Self> {
+        match self {
+            Granularity::Hour => Some(Granularity::Day),
+            Granularity::Day => Some(Granularity::Month),
+            Granularity::Month => Some(Granularity::Year),
+            Granularity::Year => None,
+        }
+    }
+}
+
+/// A `partition:` block: one form plus the table options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionSpec {
+    pub form: PartitionForm,
+    /// `partition_expiration_days`.
+    pub expiration_days: Option<u32>,
+    /// `require_partition_filter`.
+    pub require_filter: bool,
+}
+
+/// The one partition form a `partition:` block names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionForm {
+    /// A DATE / DATETIME / TIMESTAMP column at a granularity.
+    Column {
+        column: String,
+        granularity: Granularity,
+    },
+    /// An INT64 column in `interval`-wide buckets from `start` up to `end`.
+    Range {
+        column: String,
+        start: i64,
+        end: i64,
+        interval: i64,
+    },
+    /// The load time, at a granularity.
+    Ingestion(Granularity),
+}
+
+/// BigQuery's cap on partitions per table.
+pub(crate) const MAX_TABLE_PARTITIONS: i64 = 10_000;
+
+/// Days before an hourly-partitioned table reaches [`MAX_TABLE_PARTITIONS`].
+pub(crate) const HOURLY_LIFETIME_DAYS: u32 = (MAX_TABLE_PARTITIONS / 24) as u32;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPartition {
+    #[serde(default)]
+    column: Option<String>,
+    #[serde(default)]
+    granularity: Option<Granularity>,
+    #[serde(default)]
+    range: Option<RawRange>,
+    #[serde(default)]
+    ingestion: Option<Granularity>,
+    #[serde(default)]
+    expiration_days: Option<u32>,
+    #[serde(default)]
+    require_filter: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRange {
+    column: String,
+    start: i64,
+    end: i64,
+    interval: i64,
+}
+
+impl RawPartition {
+    /// Check the block names exactly one well-formed partition form.
+    fn into_spec(self) -> std::result::Result<PartitionSpec, String> {
+        let forms = [
+            self.column.is_some(),
+            self.range.is_some(),
+            self.ingestion.is_some(),
+        ]
+        .iter()
+        .filter(|f| **f)
+        .count();
+        if forms != 1 {
+            return Err(
+                "`partition` takes exactly one of `column`, `range` or `ingestion`".to_string(),
+            );
+        }
+        if self.granularity.is_some() && self.column.is_none() {
+            return Err(
+                "`granularity` goes with `column`; an `ingestion` partition names its \
+                        granularity directly (`ingestion: day`)"
+                    .to_string(),
+            );
+        }
+        if self.expiration_days == Some(0) {
+            return Err(
+                "`expiration_days` must be positive; omit it to keep partitions forever"
+                    .to_string(),
+            );
+        }
+        let form = if let Some(column) = self.column {
+            PartitionForm::Column {
+                column,
+                granularity: self.granularity.unwrap_or(Granularity::Day),
+            }
+        } else if let Some(r) = self.range {
+            if r.interval <= 0 {
+                return Err(format!(
+                    "`range.interval` must be positive, got {}",
+                    r.interval
+                ));
+            }
+            if r.start >= r.end {
+                return Err(format!(
+                    "`range.start` ({}) must be below `range.end` ({})",
+                    r.start, r.end
+                ));
+            }
+            let (span, interval) = (
+                i128::from(r.end) - i128::from(r.start),
+                i128::from(r.interval),
+            );
+            let buckets = (span + interval - 1) / interval;
+            if buckets > i128::from(MAX_TABLE_PARTITIONS) {
+                return Err(format!(
+                    "`range` makes {buckets} partitions; BigQuery allows {MAX_TABLE_PARTITIONS} \
+                     per table — widen `interval`"
+                ));
+            }
+            PartitionForm::Range {
+                column: r.column,
+                start: r.start,
+                end: r.end,
+                interval: r.interval,
+            }
+        } else {
+            PartitionForm::Ingestion(self.ingestion.expect("one form is present"))
+        };
+        Ok(PartitionSpec {
+            form,
+            expiration_days: self.expiration_days,
+            require_filter: self.require_filter,
+        })
+    }
+}
+
+/// `none`, or a partition block.
+fn partition_setting<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<PartitionSpec>, D::Error> {
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(w) if w == "none" => Ok(None),
+        serde_json::Value::String(w) => Err(D::Error::custom(format!(
+            "expected `none` or a partition block, got `{w}`"
+        ))),
+        block => {
+            let raw: RawPartition = serde_json::from_value(block).map_err(D::Error::custom)?;
+            raw.into_spec().map(Some).map_err(D::Error::custom)
+        }
+    }
+}
+
+/// A per-export `partition:` — present means replace, `none` included.
+fn partition_override<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<Option<PartitionSpec>>, D::Error> {
+    partition_setting(d).map(Some)
+}
+
+/// A resolved `partition:`: what the table is partitioned on, the expression that
+/// creates it, and its options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TablePartition {
+    pub key: PartitionKey,
+    /// The warehouse's `PARTITION BY` expression (BigQuery) or clustering expression (Snowflake).
+    pub expr: String,
+    pub expiration_days: Option<u32>,
+    pub require_filter: bool,
+}
+
+/// What a table is partitioned on, as the warehouse records it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionKey {
+    /// A time column at a granularity; `column: None` is the load (ingestion) time.
+    Time {
+        column: Option<String>,
+        granularity: Granularity,
+    },
+    Range {
+        column: String,
+        start: i64,
+        end: i64,
+        interval: i64,
+    },
+}
+
+impl PartitionKey {
+    /// The partition column, when the key is one.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            PartitionKey::Time { column, .. } => column.as_deref(),
+            PartitionKey::Range { column, .. } => Some(column),
+        }
+    }
+
+    /// `` `ts` by day ``, `load time by hour`, `` `n` in steps of 10 from 0 to 1000 ``.
+    pub fn describe(&self) -> String {
+        match self {
+            PartitionKey::Time {
+                column: Some(c),
+                granularity,
+            } => format!("`{c}` by {}", granularity.as_str()),
+            PartitionKey::Time {
+                column: None,
+                granularity,
+            } => format!("load time by {}", granularity.as_str()),
+            PartitionKey::Range {
+                column,
+                start,
+                end,
+                interval,
+            } => format!("`{column}` in steps of {interval} from {start} to {end}"),
+        }
+    }
+
+    /// The same column (case-insensitively) at the same granularity or range.
+    pub fn same_as(&self, other: &PartitionKey) -> bool {
+        let same_col = |a: &Option<String>, b: &Option<String>| match (a, b) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        };
+        match (self, other) {
+            (
+                PartitionKey::Time {
+                    column: a,
+                    granularity: ga,
+                },
+                PartitionKey::Time {
+                    column: b,
+                    granularity: gb,
+                },
+            ) => same_col(a, b) && ga == gb,
+            (
+                PartitionKey::Range {
+                    column: a,
+                    start: sa,
+                    end: ea,
+                    interval: ia,
+                },
+                PartitionKey::Range {
+                    column: b,
+                    start: sb,
+                    end: eb,
+                    interval: ib,
+                },
+            ) => a.eq_ignore_ascii_case(b) && sa == sb && ea == eb && ia == ib,
+            _ => false,
+        }
+    }
 }
 
 /// A column list in a `load:` block: `auto` (from the recorded source primary key),
@@ -110,6 +420,8 @@ struct LoadOverride {
     cluster_by: Option<KeyColumns>,
     #[serde(default)]
     allow_source_drift: Option<bool>,
+    #[serde(default, deserialize_with = "partition_override")]
+    partition: Option<Option<PartitionSpec>>,
     /// Only to REJECT — a per-export `load:` cannot re-target the warehouse.
     #[serde(default)]
     target: Option<serde_json::Value>,
@@ -135,6 +447,9 @@ impl LoadSection {
         }
         if let Some(d) = o.allow_source_drift {
             eff.allow_source_drift = d;
+        }
+        if let Some(p) = &o.partition {
+            eff.partition = p.clone();
         }
         eff
     }
@@ -235,7 +550,8 @@ pub struct LoadPlan {
     /// export).
     pub export_name: String,
     pub table: String,
-    pub partition_by: Option<String>,
+    /// The resolved `load.partition` of the table the load writes.
+    pub partition: Option<TablePartition>,
     pub specs: Vec<TargetColumnSpec>,
     /// `gs://bucket/base/` — the destination prefix up to the `{partition}`
     /// token, i.e. the root to list source Parquet under.
@@ -273,6 +589,7 @@ const LOAD_KEYS: &[&str] = &[
     "allow_source_drift",
     "gc_orphans",
     "cluster_by",
+    "partition",
     // LoadTarget::{Bigquery, Snowflake} variant fields (flattened in).
     "project",
     "dataset",
@@ -650,10 +967,11 @@ fn build_plans_keyed(
             keys.get(&(export.name.clone(), unit)).map(Vec::as_slice),
             &specs,
         )?;
+        let partition = resolve_partition(&export.name, &eff_load, mode, &specs)?;
         plans.push(LoadPlan {
             export_name: export.name.clone(),
             table,
-            partition_by: export.partition_by.clone(),
+            partition,
             specs,
             gcs_prefix,
             destination: export.destination.clone(),
@@ -748,14 +1066,208 @@ fn resolve_keys(
     Ok((pk, cluster_by))
 }
 
-/// Whether BigQuery can cluster a column of this native type.
-fn bigquery_clusterable(target_type: &str) -> bool {
-    let base = target_type
+/// Resolve `partition` for one export against the warehouse column types (ADR-0034 D3).
+fn resolve_partition(
+    export: &str,
+    load: &LoadSection,
+    mode: LoadMode,
+    specs: &[TargetColumnSpec],
+) -> Result<Option<TablePartition>> {
+    let Some(spec) = &load.partition else {
+        return Ok(None);
+    };
+    let column_type = |c: &str| -> Result<String> {
+        if !super::is_safe_load_ident(c) {
+            bail!(
+                "export `{export}`: partition column `{}` is not a plain SQL identifier \
+                 ([A-Za-z_][A-Za-z0-9_]*)",
+                c.escape_default()
+            );
+        }
+        specs
+            .iter()
+            .find(|s| s.column_name == c)
+            .map(|s| base_type(&s.target_type))
+            .with_context(|| {
+                format!("export `{export}`: partition column `{c}` is not a column of the export")
+            })
+    };
+    let (key, expr) = match &load.target {
+        LoadTarget::Bigquery { .. } => bigquery_partition(export, &spec.form, column_type)?,
+        LoadTarget::Snowflake { .. } => snowflake_partition(export, spec, column_type)?,
+    };
+    if hourly_partitions_outlive_the_table(&key, spec.expiration_days) {
+        eprintln!(
+            "  warning: export `{export}`: hourly partitions reach BigQuery's \
+             {MAX_TABLE_PARTITIONS}-partition limit after {HOURLY_LIFETIME_DAYS} days — set \
+             `expiration_days` to at most {HOURLY_LIFETIME_DAYS}, or use `granularity: day`"
+        );
+    }
+    if mode != LoadMode::Full {
+        if spec.require_filter {
+            eprintln!(
+                "  note: export `{export}`: `require_filter` shapes a full-load table; the change \
+                 log `__changes` cannot require a partition filter, since the current-state view \
+                 reads all of it"
+            );
+        }
+        if is_ingestion(&key) && spec.expiration_days.is_some() {
+            eprintln!(
+                "  note: export `{export}`: load-date partitions of the change log `__changes` \
+                 do not expire — expiring them would drop rows that never changed from the \
+                 current-state view"
+            );
+        }
+    }
+    Ok(Some(TablePartition {
+        key,
+        expr,
+        expiration_days: spec.expiration_days,
+        require_filter: spec.require_filter,
+    }))
+}
+
+/// The BigQuery `PARTITION BY` expression for a form, by the column's native type.
+fn bigquery_partition(
+    export: &str,
+    form: &PartitionForm,
+    column_type: impl Fn(&str) -> Result<String>,
+) -> Result<(PartitionKey, String)> {
+    Ok(match form {
+        PartitionForm::Column {
+            column,
+            granularity,
+        } => {
+            let t = column_type(column)?;
+            let g = granularity.as_sql();
+            let expr = match (t.as_str(), granularity) {
+                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC({column}, {g})"),
+                ("DATETIME", _) => format!("DATETIME_TRUNC({column}, {g})"),
+                ("DATE", Granularity::Day) => column.clone(),
+                ("DATE", Granularity::Hour) => bail!(
+                    "export `{export}`: `{column}` is a DATE, which has no hours — partition it \
+                     by day, month or year"
+                ),
+                ("DATE", _) => format!("DATE_TRUNC({column}, {g})"),
+                _ => bail!(
+                    "export `{export}`: cannot partition on `{column}` ({t}); BigQuery partitions \
+                     a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`"
+                ),
+            };
+            (
+                PartitionKey::Time {
+                    column: Some(column.clone()),
+                    granularity: *granularity,
+                },
+                expr,
+            )
+        }
+        PartitionForm::Range {
+            column,
+            start,
+            end,
+            interval,
+        } => {
+            let t = column_type(column)?;
+            if t != "INT64" {
+                bail!(
+                    "export `{export}`: `range` partitions an INT64 column, and `{column}` is {t}"
+                );
+            }
+            (
+                PartitionKey::Range {
+                    column: column.clone(),
+                    start: *start,
+                    end: *end,
+                    interval: *interval,
+                },
+                format!("RANGE_BUCKET({column}, GENERATE_ARRAY({start}, {end}, {interval}))"),
+            )
+        }
+        PartitionForm::Ingestion(g) => {
+            let expr = match g {
+                Granularity::Day => "_PARTITIONDATE".to_string(),
+                _ => format!("TIMESTAMP_TRUNC(_PARTITIONTIME, {})", g.as_sql()),
+            };
+            (
+                PartitionKey::Time {
+                    column: None,
+                    granularity: *g,
+                },
+                expr,
+            )
+        }
+    })
+}
+
+/// Snowflake has no partitions: a date column maps to a leading `DATE_TRUNC` clustering
+/// expression, and the BigQuery-only forms and options are refused (ADR-0034 D6).
+fn snowflake_partition(
+    export: &str,
+    spec: &PartitionSpec,
+    column_type: impl Fn(&str) -> Result<String>,
+) -> Result<(PartitionKey, String)> {
+    if spec.expiration_days.is_some() || spec.require_filter {
+        bail!(
+            "export `{export}`: Snowflake has no partition expiry or partition filter — drop \
+             `expiration_days` / `require_filter` from `partition`"
+        );
+    }
+    let PartitionForm::Column {
+        column,
+        granularity,
+    } = &spec.form
+    else {
+        bail!(
+            "export `{export}`: Snowflake partitions by a date column only (`column` + \
+             `granularity`); it has no `range` or `ingestion` partitions"
+        );
+    };
+    let t = column_type(column)?;
+    if !(t.starts_with("DATE") || t.starts_with("TIMESTAMP")) {
+        bail!(
+            "export `{export}`: cannot partition on `{column}` ({t}); Snowflake clusters a DATE \
+             or TIMESTAMP column by time"
+        );
+    }
+    Ok((
+        PartitionKey::Time {
+            column: Some(column.clone()),
+            granularity: *granularity,
+        },
+        format!("DATE_TRUNC('{}', {column})", granularity.as_sql()),
+    ))
+}
+
+/// Whether an hourly key with this expiry can outgrow BigQuery's per-table partition cap.
+fn hourly_partitions_outlive_the_table(key: &PartitionKey, expiration_days: Option<u32>) -> bool {
+    matches!(
+        key,
+        PartitionKey::Time {
+            granularity: Granularity::Hour,
+            ..
+        }
+    ) && expiration_days.is_none_or(|d| d > HOURLY_LIFETIME_DAYS)
+}
+
+/// Whether the key is the load time.
+fn is_ingestion(key: &PartitionKey) -> bool {
+    matches!(key, PartitionKey::Time { column: None, .. })
+}
+
+/// `NUMERIC(12, 2)` → `NUMERIC`, `ARRAY<INT64>` → `ARRAY`.
+fn base_type(target_type: &str) -> String {
+    target_type
         .split(['(', '<'])
         .next()
         .unwrap_or_default()
         .trim()
-        .to_ascii_uppercase();
+        .to_ascii_uppercase()
+}
+
+/// Whether BigQuery can cluster a column of this native type.
+fn bigquery_clusterable(target_type: &str) -> bool {
+    let base = base_type(target_type);
     matches!(
         base.as_str(),
         "BIGNUMERIC"
@@ -1446,7 +1958,7 @@ load:
         let ok = serde_json::json!({
             "target": "bigquery", "project": "p", "dataset": "d",
             "gc_orphans": true, "cleanup_source": false, "pk": ["id"],
-            "allow_source_drift": true, "cluster_by": ["a"]
+            "allow_source_drift": true, "cluster_by": ["a"], "partition": "none"
         });
         assert!(check_load_keys(&ok, "top-level").is_ok());
     }
@@ -1893,5 +2405,332 @@ load:
         assert!(!bigquery_clusterable("ARRAY<INT64>"));
         assert!(!bigquery_clusterable("JSON"));
         assert!(!bigquery_clusterable("BYTES"));
+    }
+
+    fn partition_of(target: &str, block: serde_json::Value) -> Option<PartitionSpec> {
+        load_with(target, serde_json::json!({ "partition": block })).partition
+    }
+
+    fn partition_error(block: serde_json::Value) -> String {
+        let v = serde_json::json!({
+            "target": "bigquery", "project": "p", "dataset": "d", "partition": block
+        });
+        serde_json::from_value::<LoadSection>(v)
+            .expect_err("the block must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn partition_block_reads_one_form_and_none() {
+        assert_eq!(load_with("bigquery", serde_json::json!({})).partition, None);
+        assert_eq!(partition_of("bigquery", serde_json::json!("none")), None);
+        assert_eq!(
+            partition_of("bigquery", serde_json::json!({ "column": "ts" })),
+            Some(PartitionSpec {
+                form: PartitionForm::Column {
+                    column: "ts".into(),
+                    granularity: Granularity::Day
+                },
+                expiration_days: None,
+                require_filter: false,
+            }),
+            "granularity defaults to day"
+        );
+        let full = partition_of(
+            "bigquery",
+            serde_json::json!({
+                "column": "ts", "granularity": "hour", "expiration_days": 30, "require_filter": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            (full.expiration_days, full.require_filter),
+            (Some(30), true)
+        );
+        assert!(matches!(
+            full.form,
+            PartitionForm::Column {
+                granularity: Granularity::Hour,
+                ..
+            }
+        ));
+        let range = partition_of(
+            "bigquery",
+            serde_json::json!({ "range": { "column": "n", "start": 0, "end": 1000, "interval": 10 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            range.form,
+            PartitionForm::Range {
+                column: "n".into(),
+                start: 0,
+                end: 1000,
+                interval: 10
+            }
+        );
+        assert_eq!(
+            partition_of("bigquery", serde_json::json!({ "ingestion": "month" }))
+                .unwrap()
+                .form,
+            PartitionForm::Ingestion(Granularity::Month)
+        );
+    }
+
+    #[test]
+    fn partition_block_refuses_two_forms_bad_ranges_and_zero_expiry() {
+        let e = partition_error(serde_json::json!({ "column": "ts", "ingestion": "day" }));
+        assert!(e.contains("exactly one of"), "{e}");
+        let e = partition_error(serde_json::json!({}));
+        assert!(e.contains("exactly one of"), "{e}");
+        let e = partition_error(serde_json::json!({ "ingestion": "day", "granularity": "hour" }));
+        assert!(e.contains("`granularity` goes with `column`"), "{e}");
+        let e = partition_error(serde_json::json!({ "column": "ts", "granularity": "week" }));
+        assert!(e.contains("week"), "{e}");
+        let e = partition_error(serde_json::json!({ "column": "ts", "expiration_days": 0 }));
+        assert!(e.contains("`expiration_days` must be positive"), "{e}");
+        let e = partition_error(serde_json::json!({ "column": "ts", "expiration_day": 3 }));
+        assert!(e.contains("expiration_day"), "{e}");
+        let e = partition_error(serde_json::json!("weekly"));
+        assert!(e.contains("expected `none` or a partition block"), "{e}");
+        let range = |start: i64, end: i64, interval: i64| {
+            partition_error(serde_json::json!({
+                "range": { "column": "n", "start": start, "end": end, "interval": interval }
+            }))
+        };
+        assert!(range(0, 10, 0).contains("`range.interval` must be positive"));
+        assert!(range(10, 10, 1).contains("must be below `range.end`"));
+        assert!(range(0, 1_000_000, 1).contains("allows 10000 per table"));
+        assert!(
+            partition_of(
+                "bigquery",
+                serde_json::json!({ "range": { "column": "n", "start": 0, "end": 10000, "interval": 1 } })
+            )
+            .is_some(),
+            "exactly the cap is allowed"
+        );
+    }
+
+    fn resolve_bq(
+        block: serde_json::Value,
+        specs: &[TargetColumnSpec],
+    ) -> Result<Option<TablePartition>> {
+        resolve_partition(
+            "e",
+            &load_with("bigquery", serde_json::json!({ "partition": block })),
+            LoadMode::Full,
+            specs,
+        )
+    }
+
+    #[test]
+    fn bigquery_partition_expressions_follow_the_column_type() {
+        let specs = [
+            typed("ts", "TIMESTAMP"),
+            typed("dt", "DATETIME"),
+            typed("d", "DATE"),
+            typed("n", "INT64"),
+            typed("v", "STRING"),
+        ];
+        let expr = |block: serde_json::Value| resolve_bq(block, &specs).unwrap().unwrap().expr;
+        let col = |c: &str, g: &str| serde_json::json!({ "column": c, "granularity": g });
+        assert_eq!(expr(col("ts", "hour")), "TIMESTAMP_TRUNC(ts, HOUR)");
+        assert_eq!(expr(col("ts", "day")), "TIMESTAMP_TRUNC(ts, DAY)");
+        assert_eq!(expr(col("ts", "month")), "TIMESTAMP_TRUNC(ts, MONTH)");
+        assert_eq!(expr(col("ts", "year")), "TIMESTAMP_TRUNC(ts, YEAR)");
+        assert_eq!(expr(col("dt", "hour")), "DATETIME_TRUNC(dt, HOUR)");
+        assert_eq!(expr(col("dt", "day")), "DATETIME_TRUNC(dt, DAY)");
+        assert_eq!(expr(col("dt", "month")), "DATETIME_TRUNC(dt, MONTH)");
+        assert_eq!(expr(col("dt", "year")), "DATETIME_TRUNC(dt, YEAR)");
+        assert_eq!(expr(col("d", "day")), "d");
+        assert_eq!(expr(col("d", "month")), "DATE_TRUNC(d, MONTH)");
+        assert_eq!(expr(col("d", "year")), "DATE_TRUNC(d, YEAR)");
+        assert_eq!(
+            expr(
+                serde_json::json!({ "range": { "column": "n", "start": 0, "end": 100, "interval": 5 } })
+            ),
+            "RANGE_BUCKET(n, GENERATE_ARRAY(0, 100, 5))"
+        );
+        assert_eq!(
+            expr(serde_json::json!({ "ingestion": "hour" })),
+            "TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)"
+        );
+        assert_eq!(
+            expr(serde_json::json!({ "ingestion": "day" })),
+            "_PARTITIONDATE"
+        );
+        assert_eq!(
+            expr(serde_json::json!({ "ingestion": "month" })),
+            "TIMESTAMP_TRUNC(_PARTITIONTIME, MONTH)"
+        );
+        assert_eq!(
+            expr(serde_json::json!({ "ingestion": "year" })),
+            "TIMESTAMP_TRUNC(_PARTITIONTIME, YEAR)"
+        );
+
+        let key = resolve_bq(col("ts", "day"), &specs).unwrap().unwrap().key;
+        assert_eq!(
+            key,
+            PartitionKey::Time {
+                column: Some("ts".into()),
+                granularity: Granularity::Day
+            }
+        );
+        assert_eq!(
+            resolve_bq(serde_json::json!({ "ingestion": "day" }), &specs)
+                .unwrap()
+                .unwrap()
+                .key,
+            PartitionKey::Time {
+                column: None,
+                granularity: Granularity::Day
+            }
+        );
+    }
+
+    #[test]
+    fn bigquery_partition_refuses_a_form_the_column_type_cannot_take() {
+        let specs = [
+            typed("ts", "TIMESTAMP"),
+            typed("d", "DATE"),
+            typed("v", "STRING"),
+            typed("n", "INT64"),
+        ];
+        let err = |block: serde_json::Value| resolve_bq(block, &specs).unwrap_err().to_string();
+        let e = err(serde_json::json!({ "column": "d", "granularity": "hour" }));
+        assert!(e.contains("`d` is a DATE, which has no hours"), "{e}");
+        let e = err(serde_json::json!({ "column": "v" }));
+        assert!(e.contains("cannot partition on `v` (STRING)"), "{e}");
+        let e = err(serde_json::json!({ "column": "n" }));
+        assert!(e.contains("cannot partition on `n` (INT64)"), "{e}");
+        let e = err(serde_json::json!({ "column": "nope" }));
+        assert!(e.contains("`nope` is not a column of the export"), "{e}");
+        let e = err(
+            serde_json::json!({ "range": { "column": "ts", "start": 0, "end": 10, "interval": 1 } }),
+        );
+        assert!(
+            e.contains("`range` partitions an INT64 column, and `ts` is TIMESTAMP"),
+            "{e}"
+        );
+        let e = err(serde_json::json!({ "column": "d) FROM x; --" }));
+        assert!(e.contains("not a plain SQL identifier"), "{e}");
+    }
+
+    #[test]
+    fn snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms() {
+        let specs = [
+            typed("ts", "TIMESTAMP_NTZ(6)"),
+            typed("d", "DATE"),
+            typed("n", "NUMBER(38,0)"),
+        ];
+        let resolve = |block: serde_json::Value| {
+            resolve_partition(
+                "e",
+                &load_with("snowflake", serde_json::json!({ "partition": block })),
+                LoadMode::Full,
+                &specs,
+            )
+        };
+        let p = resolve(serde_json::json!({ "column": "ts", "granularity": "month" }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.expr, "DATE_TRUNC('MONTH', ts)");
+        assert_eq!(
+            resolve(serde_json::json!({ "column": "d" }))
+                .unwrap()
+                .unwrap()
+                .expr,
+            "DATE_TRUNC('DAY', d)"
+        );
+        let err = |block| resolve(block).unwrap_err().to_string();
+        let e = err(serde_json::json!({ "column": "ts", "expiration_days": 30 }));
+        assert!(e.contains("Snowflake has no partition expiry"), "{e}");
+        let e = err(serde_json::json!({ "column": "ts", "require_filter": true }));
+        assert!(e.contains("Snowflake has no partition expiry"), "{e}");
+        let e = err(serde_json::json!({ "ingestion": "day" }));
+        assert!(e.contains("no `range` or `ingestion` partitions"), "{e}");
+        let e = err(
+            serde_json::json!({ "range": { "column": "n", "start": 0, "end": 10, "interval": 1 } }),
+        );
+        assert!(e.contains("no `range` or `ingestion` partitions"), "{e}");
+        let e = err(serde_json::json!({ "column": "n" }));
+        assert!(e.contains("cannot partition on `n` (NUMBER)"), "{e}");
+    }
+
+    #[test]
+    fn a_per_export_partition_replaces_the_top_level_one_none_included() {
+        let top = load_with(
+            "bigquery",
+            serde_json::json!({ "partition": { "column": "ts", "granularity": "day" } }),
+        );
+        let inherit: LoadOverride = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(top.with_override(&inherit).partition, top.partition);
+        let cleared: LoadOverride =
+            serde_json::from_value(serde_json::json!({ "partition": "none" })).unwrap();
+        assert_eq!(top.with_override(&cleared).partition, None);
+        let replaced: LoadOverride =
+            serde_json::from_value(serde_json::json!({ "partition": { "ingestion": "hour" } }))
+                .unwrap();
+        assert_eq!(
+            top.with_override(&replaced).partition.unwrap().form,
+            PartitionForm::Ingestion(Granularity::Hour)
+        );
+        let typo = serde_json::json!({ "partition": { "column": "ts", "granularty": "day" } });
+        assert!(serde_json::from_value::<LoadOverride>(typo).is_err());
+    }
+
+    #[test]
+    fn hourly_partitions_outlive_the_table_without_a_short_expiry() {
+        let hourly = |column: Option<&str>| PartitionKey::Time {
+            column: column.map(String::from),
+            granularity: Granularity::Hour,
+        };
+        assert!(hourly_partitions_outlive_the_table(
+            &hourly(Some("ts")),
+            None
+        ));
+        assert!(hourly_partitions_outlive_the_table(
+            &hourly(None),
+            Some(417)
+        ));
+        assert!(!hourly_partitions_outlive_the_table(
+            &hourly(Some("ts")),
+            Some(416)
+        ));
+        let daily = PartitionKey::Time {
+            column: Some("ts".into()),
+            granularity: Granularity::Day,
+        };
+        assert!(!hourly_partitions_outlive_the_table(&daily, None));
+        assert_eq!(HOURLY_LIFETIME_DAYS, 416);
+    }
+
+    #[test]
+    fn partition_keys_compare_by_column_and_spec() {
+        let time = |c: Option<&str>, g| PartitionKey::Time {
+            column: c.map(String::from),
+            granularity: g,
+        };
+        assert!(time(Some("ts"), Granularity::Day).same_as(&time(Some("TS"), Granularity::Day)));
+        assert!(!time(Some("ts"), Granularity::Day).same_as(&time(Some("ts"), Granularity::Month)));
+        assert!(!time(Some("ts"), Granularity::Day).same_as(&time(None, Granularity::Day)));
+        let range = |interval| PartitionKey::Range {
+            column: "n".into(),
+            start: 0,
+            end: 100,
+            interval,
+        };
+        assert!(range(5).same_as(&range(5)));
+        assert!(!range(5).same_as(&range(10)));
+        assert!(!range(5).same_as(&time(Some("n"), Granularity::Day)));
+        assert_eq!(time(Some("ts"), Granularity::Day).describe(), "`ts` by day");
+        assert_eq!(
+            time(None, Granularity::Hour).describe(),
+            "load time by hour"
+        );
+        assert_eq!(range(5).describe(), "`n` in steps of 5 from 0 to 100");
+        assert_eq!(Granularity::Hour.coarser(), Some(Granularity::Day));
+        assert_eq!(Granularity::Year.coarser(), None);
+        assert_eq!(Granularity::parse_sql("MONTH"), Some(Granularity::Month));
+        assert_eq!(Granularity::parse_sql("WEEK"), None);
     }
 }
