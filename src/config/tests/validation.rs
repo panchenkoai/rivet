@@ -1454,3 +1454,64 @@ fn misplaced_tuning_list_covers_every_field() {
         "TUNING_FIELD_NAMES must equal TuningConfig's own fields (schema-derived)"
     );
 }
+
+// ─── typed `load:` block flags ────────────────────────────────
+
+/// `allow_source_drift`, `gc_orphans` and `cleanup_source` are the booleans of the typed
+/// `load:` block: read when the config is read, flipped per export by a `load:` override
+/// that inherits the rest, and refused on a typo at either level.
+#[test]
+fn load_block_flags_are_typed_overridable_and_a_typo_is_refused() {
+    let head = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+load:
+  target: bigquery
+  project: p
+  dataset: d
+  FLAG: true
+  gc_orphans: true
+  cleanup_source: true
+exports:
+  - name: t
+    table: t
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let yaml = |flag: &str, export_load: &str| head.replace("FLAG", flag).to_string() + export_load;
+
+    let cfg = Config::from_yaml(&yaml(
+        "allow_source_drift",
+        "    load: { allow_source_drift: false }\n",
+    ))
+    .unwrap();
+    let load = cfg.load.as_ref().expect("the typed load block");
+    assert!(load.allow_source_drift && load.gc_orphans && load.cleanup_source);
+    let eff = load.with_override(cfg.exports[0].load.as_ref().expect("the override"));
+    assert!(
+        !eff.allow_source_drift,
+        "the export override flips the flag"
+    );
+    assert!(
+        eff.gc_orphans && eff.cleanup_source,
+        "and inherits the rest"
+    );
+
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&yaml("allow_source_drfit", "")).unwrap_err()
+    );
+    assert!(err.contains("allow_source_drfit"), "{err}");
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&yaml(
+            "allow_source_drift",
+            "    load: { allow_source_drfit: false }\n"
+        ))
+        .unwrap_err()
+    );
+    assert!(err.contains("allow_source_drfit"), "{err}");
+}

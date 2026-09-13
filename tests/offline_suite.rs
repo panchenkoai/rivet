@@ -96,6 +96,8 @@ mod cli_flag_coverage_guard;
 mod live_only_purity_gate;
 #[path = "offline/live_service_ports_guard.rs"]
 mod live_service_ports_guard;
+#[path = "offline/load_allow_source_drift.rs"]
+mod load_allow_source_drift;
 #[path = "offline/rig_adoption_guard.rs"]
 mod rig_adoption_guard;
 #[path = "offline/runner_frame_gate.rs"]
