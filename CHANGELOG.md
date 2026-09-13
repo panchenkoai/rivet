@@ -43,6 +43,13 @@
   (`rivet state loads`), and only a load that reached the write (`failed` or `success`)
   counts for ownership. Previously the refusal's `failed` row made the foreign table rivet's
   own, and the next `rivet load` (a scheduler retry) overwrote or adopted it.
+- **An incremental load never overwrites a table that already exists.** A run with no
+  cursor to resume from holds the whole table (the first run after `mode: full`, after
+  `state reset`, or on a lost state DB). It lands as a plain `<table>` only when that name
+  is free; when a table is already there it is renamed into `<table>__changes` first and
+  the run is appended to it, so rows the source has since deleted stay in the log. The
+  overlap between the kept baseline and the re-read pass is at-least-once and the
+  current-state view dedups it by key. Previously such a run replaced the table.
 - **An incremental whole-table run onto its own view joins the change log.** After
   `state reset`, or on a stateless cycle that re-selects the first run, the run is appended
   to `<table>__changes` at least once (the view keeps the latest row per key) instead of

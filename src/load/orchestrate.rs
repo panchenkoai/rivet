@@ -1341,11 +1341,28 @@ impl SplitRuns {
 }
 
 /// Whether a whole-table run joins the change log rather than landing as `<table>`:
-/// when that name is already the current-state view over the log (a re-run after
-/// `state reset`, or a stateless cycle re-selecting the first run), a whole pass
-/// cannot replace the view — appended, the view still reads the latest row per key.
+/// whenever that name is already taken. An incremental load never overwrites an existing
+/// table — the table becomes the log's baseline and the run is appended to it — and it
+/// cannot replace a view at all. Only an absent name is landed as a new table.
 fn whole_table_run_joins_the_log(kind: load::ObjectKind) -> bool {
-    kind == load::ObjectKind::View
+    matches!(kind, load::ObjectKind::Table | load::ObjectKind::View)
+}
+
+/// Why a whole-table run is appended to the change log instead of landing as `<table>`.
+fn whole_table_run_note(kind: load::ObjectKind, fqtn: &str, run_id: &str) -> String {
+    match kind {
+        load::ObjectKind::View => format!(
+            "  note: `{fqtn}` is already the current-state view over its change log — run \
+             {run_id} re-read the whole table, so it is appended to the log (at least once; the \
+             view keeps the latest row per key) instead of replacing it"
+        ),
+        _ => format!(
+            "  note: `{fqtn}` already holds rows from an earlier load, and an incremental load \
+             never overwrites a table that exists — it becomes the change log `{fqtn}__changes` \
+             and run {run_id}'s whole pass is appended to it (at least once; the view keeps the \
+             latest row per key), so rows the source has since dropped stay in the log"
+        ),
+    }
 }
 
 fn split_runs(runs: &[(String, crate::manifest::RunManifest)]) -> SplitRuns {
@@ -1421,11 +1438,8 @@ fn load_one_incremental(
                 let kind = load::before_write(loader.object_kind(&plan.table))?;
                 if whole_table_run_joins_the_log(kind) {
                     eprintln!(
-                        "  note: `{}` is already the current-state view over its change log — \
-                         run {} re-read the whole table, so it is appended to the log (at least \
-                         once; the view keeps the latest row per key) instead of replacing it",
-                        loader.fqtn(&plan.table),
-                        first.run_id
+                        "{}",
+                        whole_table_run_note(kind, &loader.fqtn(&plan.table), &first.run_id)
                     );
                     split.whole_table_run_joins_the_log();
                 }
@@ -2112,16 +2126,27 @@ mod live_only_decisions {
         assert!(split_runs(&[first, delta]).has_deltas());
     }
 
-    /// A whole-table run selected while `<table>` is already the view (the ledger lost
-    /// its record, a stateless cycle, a re-run after `state reset`) is appended, in
-    /// started-at order with the deltas, never landed over the view. RED against the
-    /// pre-fix path, which fed it to `run_load` and stopped on the view.
+    /// A whole-table run is landed as `<table>` ONLY when that name is free. An existing
+    /// TABLE becomes the change log's baseline and the run is appended to it — an
+    /// incremental load never overwrites a table that exists — and an existing VIEW (a
+    /// re-run after `state reset`, a stateless cycle) is likewise appended, never replaced.
+    /// RED against both pre-fix paths: `run_load` overwriting the table, and stopping on
+    /// the view.
     #[test]
-    fn a_whole_table_run_joins_the_log_when_the_name_is_already_the_view() {
+    fn a_whole_table_run_joins_the_log_whenever_the_target_already_exists() {
         use load::ObjectKind::*;
         assert!(whole_table_run_joins_the_log(View));
-        assert!(!whole_table_run_joins_the_log(Table));
+        assert!(whole_table_run_joins_the_log(Table));
         assert!(!whole_table_run_joins_the_log(Absent));
+
+        let on_table = whole_table_run_note(Table, "p.d.orders", "f1");
+        assert!(
+            on_table.contains("never overwrites a table that exists"),
+            "{on_table}"
+        );
+        assert!(on_table.contains("p.d.orders__changes"), "{on_table}");
+        let on_view = whole_table_run_note(View, "p.d.orders", "f1");
+        assert!(on_view.contains("instead of replacing it"), "{on_view}");
 
         let first = incremental_manifest("f1", "2026-09-02T00:00:00Z", None);
         let before = incremental_manifest("d0", "2026-09-01T00:00:00Z", Some("1"));

@@ -841,7 +841,7 @@ fn bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebu
 /// current-state view.
 #[test]
 #[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
-fn bigquery_full_load_then_incremental_adopts_the_table_as_the_change_log() {
+fn bigquery_incremental_never_overwrites_an_existing_table_and_adopts_it_as_the_log() {
     let Some(bq) = BqLive::from_env("bq_full_to_inc") else {
         return;
     };
@@ -867,38 +867,45 @@ fn bigquery_full_load_then_incremental_adopts_the_table_as_the_change_log() {
     );
     assert_eq!(bq.read_bq_table_type(&changes), None, "no change log yet");
 
-    // 2. Switch to incremental (MT1): no cursor was stored, so this run is a whole-table
-    //    pass and lands as the table — still a table, no change log.
+    // 2. Switch to incremental (MT1): no cursor was stored, so this run re-reads the whole
+    //    table. The table already exists, so it is NOT overwritten — it is renamed into the
+    //    change log and the pass is appended to it. Row 5 is deleted at the source first,
+    //    so the pass cannot carry it: finding it afterwards proves the earlier rows were
+    //    kept rather than replaced.
     e.insert(&table, 11..=13, 5, Some(2));
+    SqlEngine::Pg.exec(&format!("DELETE FROM {table} WHERE id = 5"));
     let rig = rig.restage("incremental", &["cursor_column: id"]);
     rig.run_ok();
     load_ok(&rig);
     assert_eq!(
         bq.read_bq_table_type(&table).as_deref(),
-        Some("BASE TABLE"),
-        "the first incremental run is a full pass (MT1), so it lands as the table"
+        Some("VIEW"),
+        "the existing table became the change log and the name became the view"
     );
-    let after_whole_pass = bq.read_bq_count(&table);
+    let after_whole_pass = bq.read_bq_count(&changes);
     assert_eq!(
-        after_whole_pass, "13",
-        "the whole pass OVERWRITES the full load's table — 13 rows, not 10 + 13"
+        after_whole_pass, "22",
+        "10 kept as the baseline + the 12-row whole pass — nothing was overwritten"
     );
-    assert_eq!(bq.read_bq_table_type(&changes), None, "still no change log");
+    assert_eq!(
+        bq.read_bq_count_where(&changes, "id = 5"),
+        "1",
+        "the row deleted at the source survives in the log: the table was not replaced"
+    );
     assert_eq!(
         StateDb::next_to_config(&rig.config_path()).cursor_column(&table),
         Some("id".to_string()),
         "and the cursor is recorded under its column"
     );
 
-    // 3. The first delta adopts the table as the change log (rename, no copy) and puts
-    //    the current-state view under the old name.
+    // 3. An ordinary delta appends on top.
     e.insert(&table, 14..=16, 5, Some(3));
     rig.run_ok();
     load_ok(&rig);
     assert_eq!(bq.read_bq_table_type(&table).as_deref(), Some("VIEW"));
 
-    // Counted in BigQuery, split by leg: the adopted baseline (ids 1..=13, everything the
-    // full + whole-pass legs had landed) and the incremental delta (ids 14..=16).
+    // Counted in BigQuery, split by leg: what the full load left as the baseline (ids
+    // 1..=10), what the whole pass re-read (ids 1..=13 less the deleted 5) and the delta.
     let log_total = bq.read_bq_count(&changes);
     let adopted = bq.read_bq_count_where(&changes, "id <= 13");
     let via_incremental = bq.read_bq_count_where(&changes, "id >= 14");
@@ -911,25 +918,25 @@ fn bigquery_full_load_then_incremental_adopts_the_table_as_the_change_log() {
         bq.project, bq.dataset
     ));
     eprintln!(
-        "BQ COUNTS full={after_full} whole_pass={after_whole_pass} log_total={log_total} \
-         adopted_baseline={adopted} via_incremental_delta={via_incremental} \
+        "BQ COUNTS full_baseline={after_full} log_after_switch={after_whole_pass} \
+         log_total={log_total} baseline_plus_pass={adopted} via_delta={via_incremental} \
          log_distinct={:?} view={:?}",
         rows[0]["d"].as_str(),
         view[0]["n"].as_str()
     );
     assert_eq!(
         (adopted.as_str(), via_incremental.as_str()),
-        ("13", "3"),
-        "the baseline is adopted whole and only the delta is appended"
+        ("22", "3"),
+        "10 baseline + 12 whole pass, then only the delta on top"
     );
     assert_eq!(
-        log_total, "16",
-        "13 adopted as the baseline + 3 delta — nothing copied, nothing re-loaded"
+        log_total, "25",
+        "the log keeps every leg: nothing was overwritten at any point"
     );
     assert_eq!(
         (rows[0]["n"].as_str(), rows[0]["d"].as_str()),
-        (Some("16"), Some("16")),
-        "and no row is duplicated by the adoption"
+        (Some("25"), Some("16")),
+        "the overlap is at-least-once; the view is what dedups it"
     );
     assert_eq!(
         (view[0]["n"].as_str(), view[0]["d"].as_str()),
