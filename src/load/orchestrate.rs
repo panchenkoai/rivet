@@ -799,6 +799,7 @@ impl LoadCtx<'_> {
         self.record(&[], 0, "success");
     }
     /// The load errored after consuming `run_ids`.
+    #[cfg(test)]
     fn record_failed(&self, run_ids: &[String]) {
         self.record(run_ids, 0, "failed");
     }
@@ -833,6 +834,7 @@ fn execute_load<R>(
         &dyn load::TargetLoader,
         &crate::destination::gcs::GcsStore,
         &LoadInputs,
+        &mut LegLedger<'_>,
     ) -> Result<(u64, R)>,
     done: impl FnOnce(&LoadInputs, &R),
 ) -> Result<Option<R>> {
@@ -874,18 +876,70 @@ fn execute_load<R>(
         }
     };
     progress(&inputs);
-    let (rows, report) = match partition_budget_ok(&store, job.plan, &inputs.uris)
-        .and_then(|()| run(&*loader, &store, &inputs))
-    {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.record_failed(&inputs.source_run_ids);
-            return Err(e);
-        }
+    let mut legs = LegLedger {
+        ctx: &ctx,
+        consumed: Vec::new(),
     };
-    ctx.record_success(&inputs.source_run_ids, rows as i64);
+    let (rows, report) =
+        match load::before_write(partition_budget_ok(&store, job.plan, &inputs.uris))
+            .and_then(|()| run(&*loader, &store, &inputs, &mut legs))
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
+                ctx.record(&remaining, 0, ledger_status(&e));
+                return Err(e);
+            }
+        };
+    let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
+    if closing_record_applies(&remaining, &legs.consumed) {
+        ctx.record_success(&remaining, rows as i64);
+    }
     done(&inputs, &report);
     Ok(Some(report))
+}
+
+/// How the ledger records a load that did not complete: `refused` when it stopped before
+/// any warehouse write (the target is not rivet's own for having been refused), `failed`
+/// otherwise.
+fn ledger_status(e: &anyhow::Error) -> &'static str {
+    match e.downcast_ref::<load::Refused>() {
+        Some(_) => "refused",
+        None => "failed",
+    }
+}
+
+/// The ledger rows of one load, written per LEG: a run closure that lands some of
+/// its runs before the rest (the incremental first pass, then the deltas) records the
+/// landed part at once, so a failure further on leaves it consumed — never re-loaded,
+/// never marked failed for a leg that succeeded.
+struct LegLedger<'a> {
+    ctx: &'a LoadCtx<'a>,
+    consumed: Vec<String>,
+}
+
+impl LegLedger<'_> {
+    /// Record `run_ids` as loaded with `rows`, ahead of the load's closing record.
+    fn landed(&mut self, run_ids: &[String], rows: u64) {
+        self.ctx.record_success(run_ids, rows as i64);
+        self.consumed.extend(run_ids.iter().cloned());
+    }
+}
+
+/// Whether the load's closing ledger row is written: there is something left to
+/// record, or no leg recorded anything (the ordinary one-row load, an up-to-date one
+/// included) — never a second empty row after the legs covered every run.
+fn closing_record_applies(remaining: &[String], consumed: &[String]) -> bool {
+    !remaining.is_empty() || consumed.is_empty()
+}
+
+/// The run ids a load's closing record still covers: every selected run a leg has not
+/// already recorded.
+fn remaining_run_ids(all: &[String], consumed: &[String]) -> Vec<String> {
+    all.iter()
+        .filter(|id| !consumed.contains(id))
+        .cloned()
+        .collect()
 }
 
 /// The pre-load partition budget of a BigQuery plan (ADR-0034 D4); no other target
@@ -1151,18 +1205,19 @@ fn load_one_cdc(
                 inputs.integrity.file_rows,
             );
         },
-        |loader, store, inputs| {
+        |loader, store, inputs, _legs| {
             // Round-6 re-baseline guard: warn BEFORE appending a snapshot leg
             // into a __changes prior cycles already fed (see rebaseline_shape/rebaseline_action).
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
-            if snapshot_over_full_table(shape, loader.object_kind(&plan.table)?) {
-                anyhow::bail!(
+            let kind = load::before_write(loader.object_kind(&plan.table))?;
+            if snapshot_over_full_table(shape, kind) {
+                return Err(load::refused(format!(
                     "`{}` is a table from an earlier full load, and this CDC load carries an \
                      initial snapshot of the same table — the snapshot is a new baseline, so \
                      keep one: drop the table (the snapshot replaces it), or run the stream \
                      without `initial: snapshot` to keep the table's rows as the baseline",
                     loader.fqtn(&plan.table)
-                );
+                )));
             }
             if shape {
                 // The refusal stands EVEN FOR A STAMPED baseline (round-10
@@ -1184,14 +1239,14 @@ fn load_one_cdc(
                 let ledger = LedgerSignal::classify(ledger_errored, state.is_some());
                 let prior = match ledger {
                     LedgerSignal::AbsentByDesign => true, // any value: same arm
-                    _ => loader.changes_has_prior_changes(&plan.table)?,
+                    _ => load::before_write(loader.changes_has_prior_changes(&plan.table))?,
                 };
                 match rebaseline_action(prior, ledger) {
                     RebaselineAction::Refuse => {
-                        anyhow::bail!(
-                            "{}",
-                            rebaseline_refusal(&loader.fqtn(&plan.table), loader.warehouse())
-                        );
+                        return Err(load::refused(rebaseline_refusal(
+                            &loader.fqtn(&plan.table),
+                            loader.warehouse(),
+                        )));
                     }
                     RebaselineAction::WarnStateless => eprintln!(
                         "  note: this STATELESS load re-selects the snapshot leg every \
@@ -1273,6 +1328,24 @@ impl SplitRuns {
     fn has_deltas(&self) -> bool {
         !self.deltas.is_empty()
     }
+
+    /// The whole-table run joins the deltas: appended into the change log (at least
+    /// once — the view keeps the latest row per key) instead of landing as the table.
+    fn whole_table_run_joins_the_log(&mut self) {
+        if let Some(first) = self.first_pass.take() {
+            self.deltas.push(first);
+            self.deltas
+                .sort_by(|a, b| a.1.started_at.cmp(&b.1.started_at));
+        }
+    }
+}
+
+/// Whether a whole-table run joins the change log rather than landing as `<table>`:
+/// when that name is already the current-state view over the log (a re-run after
+/// `state reset`, or a stateless cycle re-selecting the first run), a whole pass
+/// cannot replace the view — appended, the view still reads the latest row per key.
+fn whole_table_run_joins_the_log(kind: load::ObjectKind) -> bool {
+    kind == load::ObjectKind::View
 }
 
 fn split_runs(runs: &[(String, crate::manifest::RunManifest)]) -> SplitRuns {
@@ -1342,8 +1415,21 @@ fn load_one_incremental(
                 inputs.integrity.file_rows,
             );
         },
-        |loader, store, inputs| {
-            let split = split_runs(&inputs.runs);
+        |loader, store, inputs, legs| {
+            let mut split = split_runs(&inputs.runs);
+            if let Some((_, first)) = &split.first_pass {
+                let kind = load::before_write(loader.object_kind(&plan.table))?;
+                if whole_table_run_joins_the_log(kind) {
+                    eprintln!(
+                        "  note: `{}` is already the current-state view over its change log — \
+                         run {} re-read the whole table, so it is appended to the log (at least \
+                         once; the view keeps the latest row per key) instead of replacing it",
+                        loader.fqtn(&plan.table),
+                        first.run_id
+                    );
+                    split.whole_table_run_joins_the_log();
+                }
+            }
             for id in &split.superseded {
                 eprintln!(
                     "  note: run {id} started before the latest whole-table run and is superseded \
@@ -1355,6 +1441,9 @@ fn load_one_incremental(
             let landed_table = split.first_pass.is_some();
             let has_deltas = split.has_deltas();
             if let Some(first) = split.first_pass {
+                // The runs this leg consumes: the whole-table run and those it supersedes.
+                let mut landed_ids = split.superseded.clone();
+                landed_ids.push(first.1.run_id.clone());
                 let uris = load::reconcile::select_load_uris(
                     store,
                     &plan.gcs_prefix,
@@ -1384,7 +1473,7 @@ fn load_one_incremental(
                     inputs.ownership,
                 )?;
                 eprintln!("{}", full_done_line(&integrity, &r));
-                rows += r.rows_loaded;
+                legs.landed(&landed_ids, r.rows_loaded);
                 report = Some(IncrementalReport::Table(r));
             }
             if has_deltas {
@@ -1462,7 +1551,7 @@ fn load_one(
                 inputs.integrity.file_rows,
             );
         },
-        |loader, store, inputs| {
+        |loader, store, inputs, _legs| {
             let cleanup = cleanup_target(plan, store, state);
             let report = load::run_load(
                 loader,
@@ -1549,8 +1638,7 @@ mod load_ledger_tests {
             mode: LoadMode::Cdc,
             cursor_column: None,
             pk: vec![],
-            cluster_by: vec![],
-            cluster_declared: false,
+            clustering: load::plan::Clustering::Auto(vec![]),
         };
         let err = require_pk(&plan, "cdc").unwrap_err().to_string();
         assert!(err.contains("export `c1`"), "must name the export: {err}");
@@ -1799,6 +1887,85 @@ mod live_only_decisions {
     use crate::destination::gcs::GcsStore;
     use load::plan::{LoadMode, LoadPlan, LoadSection, LoadTarget};
 
+    /// `ledger_status`: a `Refused` stop, however deep under context, is `refused`;
+    /// anything else is `failed`.
+    #[test]
+    fn ledger_status_tells_a_stop_before_the_write_from_a_failure() {
+        let stop = load::refused("refusing to overwrite `p.d.t`".into());
+        assert_eq!(ledger_status(&stop), "refused");
+        let wrapped = load::before_write::<()>(Err(anyhow::anyhow!("no partition statistics")))
+            .unwrap_err()
+            .context("loading orders");
+        assert_eq!(ledger_status(&wrapped), "refused");
+        assert_eq!(
+            format!("{wrapped:#}"),
+            "loading orders: no partition statistics",
+            "the message keeps its chain"
+        );
+        assert_eq!(
+            ledger_status(&anyhow::anyhow!("count validation failed")),
+            "failed"
+        );
+    }
+
+    /// The ownership guard must hold on EVERY `rivet load`, not just the first: the
+    /// refusal it raises is journaled, and a `failed` row would make the foreign table
+    /// rivet's own on the next cycle (a scheduler retry), which then overwrites it. The
+    /// stop is journaled as `refused`, which `has_load_attempt` never counts. RED against
+    /// recording the stop as `failed` (the pre-fix `record_failed` catch-all).
+    #[test]
+    fn a_refused_load_does_not_make_a_foreign_table_rivets_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        write_at(&dir, "base/part-0.parquet", b"x");
+        let m = success_manifest("run-1", "part-0.parquet");
+        write_at(
+            &dir,
+            "base/manifest-run-1.json",
+            &serde_json::to_vec(&m).unwrap(),
+        );
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = plan_at(LoadMode::Full, prefix);
+        let target = "p.d.orders";
+        let ownership = |state: &StateStore| {
+            prepare_load(&store, &plan, Some(state), target, false)
+                .unwrap()
+                .expect("the run is unloaded")
+                .ownership
+        };
+        assert_eq!(ownership(&state), load::Ownership::Foreign);
+
+        // What execute_load records when the run closure stops before writing.
+        let ctx = LoadCtx {
+            state: Some(&state),
+            load_id: "load-1",
+            export_name: "orders",
+            target_fqtn: target,
+            warehouse: "bigquery",
+            mode: LoadMode::Full,
+            source_prefix: prefix,
+            source_ident: String::new(),
+            active_at_fetch: Some(Default::default()),
+        };
+        let stop = load::refused("refusing to overwrite".into());
+        ctx.record(&["run-1".to_string()], 0, ledger_status(&stop));
+        assert_eq!(
+            ownership(&state),
+            load::Ownership::Foreign,
+            "the second cycle refuses again"
+        );
+        assert_eq!(
+            state.recent_loads(Some(target), 10).unwrap()[0].status,
+            "refused",
+            "and the stop is on the record"
+        );
+
+        // A failure AFTER the write is what makes the table rivet's own.
+        ctx.record_failed(&["run-1".to_string()]);
+        assert_eq!(ownership(&state), load::Ownership::Own);
+    }
+
     /// A resolved plan, so a test can vary the ONE field it is about.
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         LoadPlan {
@@ -1823,8 +1990,7 @@ mod live_only_decisions {
             mode,
             cursor_column: None,
             pk: vec!["id".into()],
-            cluster_by: vec![],
-            cluster_declared: false,
+            clustering: load::plan::Clustering::Auto(vec![]),
         }
     }
 
@@ -1912,12 +2078,73 @@ mod live_only_decisions {
     }
 
     #[test]
+    fn a_landed_leg_leaves_only_the_rest_for_the_closing_record() {
+        let all = ids(&[
+            incremental_manifest("f1", "2026-09-01T00:00:00Z", None),
+            incremental_manifest("d2", "2026-09-02T00:00:00Z", Some("3")),
+            incremental_manifest("d3", "2026-09-03T00:00:00Z", Some("5")),
+        ]);
+        assert_eq!(remaining_run_ids(&all, &["f1".to_string()]), ["d2", "d3"]);
+        assert_eq!(remaining_run_ids(&all, &[]), all);
+        assert!(remaining_run_ids(&all, &all).is_empty());
+        let one = ["f1".to_string()];
+        assert!(closing_record_applies(&all, &[]), "one-row load");
+        assert!(
+            closing_record_applies(&[], &[]),
+            "an up-to-date load still records"
+        );
+        assert!(
+            closing_record_applies(&one, &one),
+            "deltas after a landed leg"
+        );
+        assert!(
+            !closing_record_applies(&[], &one),
+            "the legs covered everything: no empty second row"
+        );
+    }
+
+    #[test]
     fn has_deltas_reads_the_split() {
         let delta = incremental_manifest("d1", "2026-09-02T00:00:00Z", Some("1"));
         let first = incremental_manifest("f1", "2026-09-01T00:00:00Z", None);
         assert!(split_runs(std::slice::from_ref(&delta)).has_deltas());
         assert!(!split_runs(std::slice::from_ref(&first)).has_deltas());
         assert!(split_runs(&[first, delta]).has_deltas());
+    }
+
+    /// A whole-table run selected while `<table>` is already the view (the ledger lost
+    /// its record, a stateless cycle, a re-run after `state reset`) is appended, in
+    /// started-at order with the deltas, never landed over the view. RED against the
+    /// pre-fix path, which fed it to `run_load` and stopped on the view.
+    #[test]
+    fn a_whole_table_run_joins_the_log_when_the_name_is_already_the_view() {
+        use load::ObjectKind::*;
+        assert!(whole_table_run_joins_the_log(View));
+        assert!(!whole_table_run_joins_the_log(Table));
+        assert!(!whole_table_run_joins_the_log(Absent));
+
+        let first = incremental_manifest("f1", "2026-09-02T00:00:00Z", None);
+        let before = incremental_manifest("d0", "2026-09-01T00:00:00Z", Some("1"));
+        let after = incremental_manifest("d2", "2026-09-03T00:00:00Z", Some("9"));
+        let mut split = split_runs(&[after.clone(), first.clone(), before]);
+        assert_eq!(split.superseded, ["d0"]);
+        split.whole_table_run_joins_the_log();
+        assert!(split.first_pass.is_none());
+        let deltas: Vec<&str> = split
+            .deltas
+            .iter()
+            .map(|(_, m)| m.run_id.as_str())
+            .collect();
+        assert_eq!(deltas, ["f1", "d2"], "in started-at order");
+        assert_eq!(
+            split.superseded,
+            ["d0"],
+            "a run the whole pass covers stays superseded"
+        );
+
+        let mut none = split_runs(std::slice::from_ref(&after));
+        none.whole_table_run_joins_the_log();
+        assert_eq!(none.deltas.len(), 1, "nothing to demote");
     }
 
     #[test]

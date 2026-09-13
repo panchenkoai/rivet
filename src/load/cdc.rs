@@ -55,6 +55,14 @@ pub enum Warehouse {
 }
 
 impl Warehouse {
+    /// The warehouse's name in operator-facing notes.
+    pub fn label(self) -> &'static str {
+        match self {
+            Warehouse::BigQuery => "BigQuery",
+            Warehouse::Snowflake => "Snowflake",
+        }
+    }
+
     /// The `SELECT *`-minus-columns keyword: BigQuery spells it `EXCEPT`,
     /// Snowflake `EXCLUDE`.
     fn except_keyword(self) -> &'static str {

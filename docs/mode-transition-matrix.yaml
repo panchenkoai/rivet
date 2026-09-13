@@ -99,8 +99,8 @@ scenarios:
     mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
 
   - id: legacy_incremental_state_then_other_column
-    what: "MT6 — a pre-v26 incremental cursor records no column anywhere; a cursor_column change is not detected"
-    postgres: { gap: "no identity recoverable from state, metrics or journal for pre-v26 incremental cursors — reset when changing the cursor" }
-    mysql:    { gap: "no identity recoverable from state, metrics or journal for pre-v26 incremental cursors — reset when changing the cursor" }
-    mssql:    { gap: "no identity recoverable from state, metrics or journal for pre-v26 incremental cursors — reset when changing the cursor" }
+    what: "MT6 — a pre-v26 incremental cursor is attributed to the column the run's key descriptor (export_metrics.key_descriptor_json, v18+) names: refused; a row older than v18 records no identity anywhere — reset when changing the cursor"
+    postgres: { test: legacy_incremental_state_then_other_column_postgres }
+    mysql:    { test: legacy_incremental_state_then_other_column_mysql }
+    mssql:    { test: legacy_incremental_state_then_other_column_mssql }
     mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }

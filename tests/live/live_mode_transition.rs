@@ -207,6 +207,19 @@ fn incremental_adding_settle(e: SqlEngine) {
     );
 }
 
+/// MT6: a pre-v26 incremental cursor is attributed to the column the run's key
+/// descriptor names; switching `cursor_column` without a reset is refused, never run
+/// against the old column's value (exit 0, zero rows, on MySQL).
+fn legacy_incremental_state_then_other_column(e: SqlEngine) {
+    transition_with(
+        e,
+        INCREMENTAL_ID,
+        INCREMENTAL_TIME,
+        Expect::Refused(&["`id`", "`server_time`"]),
+        forget_cursor_column,
+    );
+}
+
 fn legacy_keyset_state_then_other_column(e: SqlEngine) {
     transition_with(
         e,
@@ -437,6 +450,24 @@ fn incremental_adding_settle_mssql() {
 #[ignore = "live: requires docker compose mysql"]
 fn legacy_keyset_state_then_other_column_mysql() {
     legacy_keyset_state_then_other_column(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn legacy_incremental_state_then_other_column_mysql() {
+    legacy_incremental_state_then_other_column(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn legacy_incremental_state_then_other_column_postgres() {
+    legacy_incremental_state_then_other_column(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn legacy_incremental_state_then_other_column_mssql() {
+    legacy_incremental_state_then_other_column(SqlEngine::Mssql);
 }
 
 #[test]

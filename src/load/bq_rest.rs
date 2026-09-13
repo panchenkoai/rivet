@@ -71,6 +71,11 @@ pub(crate) struct BigQueryApi {
     /// `jobReference.location` for inserted jobs; `None` lets BigQuery infer it
     /// from the referenced datasets (the CLI's behaviour).
     location: Option<String>,
+    /// The dataset the jobs write, whose location a job inserted without an answer
+    /// is fetched in (`jobs.get` 404s without one outside the US/EU multi-regions).
+    dataset: Option<String>,
+    /// That dataset's location, read once from `datasets.get` when first needed.
+    dataset_location: std::sync::OnceLock<Option<String>>,
     endpoint: String,
     http: reqwest::blocking::Client,
     auth: Auth,
@@ -115,6 +120,8 @@ impl BigQueryApi {
             location: std::env::var("RIVET_BQ_LOCATION")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: std::env::var("RIVET_BQ_API_ENDPOINT")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -122,6 +129,47 @@ impl BigQueryApi {
             auth: Auth::resolve(&http)?,
             http,
         })
+    }
+
+    /// A client whose jobs write `dataset`, so a job it has to fetch by id is polled in
+    /// that dataset's location.
+    pub(crate) fn for_dataset(project: &str, dataset: &str) -> Result<Self> {
+        let mut api = Self::new(project)?;
+        api.dataset = Some(dataset.to_string());
+        Ok(api)
+    }
+
+    /// The location a job inserted without an answer is fetched in: the configured
+    /// one, else the dataset's (read once), else none (a US/EU multi-region job).
+    fn fetch_location(&self) -> Option<String> {
+        if self.location.is_some() {
+            return self.location.clone();
+        }
+        let dataset = self.dataset.as_deref()?;
+        self.dataset_location
+            .get_or_init(|| match self.read_dataset_location(dataset) {
+                Ok(loc) => loc,
+                Err(e) => {
+                    log::warn!(
+                        "BigQuery datasets.get for {dataset} failed ({e:#}); polling without a \
+                         location"
+                    );
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// `location` of `dataset` from `datasets.get`.
+    fn read_dataset_location(&self, dataset: &str) -> Result<Option<String>> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}",
+            self.endpoint, self.project
+        );
+        Ok(self
+            .get_json_if_found(&url, "datasets.get")?
+            .as_ref()
+            .and_then(parse_dataset_location))
     }
 
     /// Run a query job to completion, tagged with `labels`. `Ok(job_id)` when
@@ -154,6 +202,21 @@ impl BigQueryApi {
         Ok(self
             .get_json_if_found(&url, "tables.get")?
             .filter(|meta| meta.get("type").and_then(Value::as_str) == Some("TABLE")))
+    }
+
+    /// How many row access policies `dataset.table` has (`rowAccessPolicies.list`); a
+    /// rebuilt copy of the table carries none.
+    pub(crate) fn row_access_policy_count(&self, dataset: &str, table: &str) -> Result<usize> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}/rowAccessPolicies",
+            self.endpoint, self.project
+        );
+        Ok(self
+            .get_json_if_found(&url, "rowAccessPolicies.list")?
+            .as_ref()
+            .and_then(|v| v.get("rowAccessPolicies"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len))
     }
 
     /// `tables.patch` on `dataset.table` with `body` — the metadata-only changes
@@ -244,12 +307,13 @@ impl BigQueryApi {
         ))
     }
 
-    /// The job an earlier, unanswered insert created under `job_id`.
+    /// The job an earlier, unanswered insert created under `job_id`, fetched in the
+    /// dataset's location: the insert's answer, which would have named it, never came.
     fn fetch_inserted(&self, job_id: &str) -> Result<Value> {
         let job_ref = JobRef {
             project: self.project.clone(),
             job_id: job_id.to_string(),
-            location: self.location.clone(),
+            location: self.fetch_location(),
         };
         self.get_json(&self.job_url(&job_ref), "jobs.get")
             .with_context(|| {
@@ -574,6 +638,14 @@ pub(crate) fn insert_outcome(status: u16) -> InsertOutcome {
     }
 }
 
+/// The `location` a `datasets.get` resource reports.
+pub(crate) fn parse_dataset_location(meta: &Value) -> Option<String> {
+    meta.get("location")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// The identity a job is polled by. `location` comes from what the insert
 /// RETURNED — `jobs.get` on a non-US job 404s without it.
 #[derive(Debug, PartialEq, Eq)]
@@ -818,6 +890,45 @@ mod tests {
         assert_eq!(b["jobReference"]["location"], "EU");
         assert_eq!(b["jobReference"]["projectId"], "proj");
         assert_eq!(b["jobReference"]["jobId"], "rivet_2");
+    }
+
+    /// A job inserted under the client's id whose insert never answered is fetched by
+    /// `jobs.get`, which 404s on a single-region dataset without `?location=`; the
+    /// insert's answer would have named the location, so the dataset's is read instead.
+    #[test]
+    fn a_dataset_resource_names_the_location_the_fetch_polls_in() {
+        assert_eq!(
+            parse_dataset_location(&json!({"location": "europe-west2"})).as_deref(),
+            Some("europe-west2")
+        );
+        assert_eq!(parse_dataset_location(&json!({"location": ""})), None);
+        assert_eq!(parse_dataset_location(&json!({"id": "p:d"})), None);
+    }
+
+    /// The fetch of an unanswered insert polls in the configured location when there is
+    /// one, and asks nothing of a client that knows no dataset.
+    #[test]
+    fn fetch_location_prefers_the_configured_one_and_needs_a_dataset_otherwise() {
+        let api = |location: Option<&str>, dataset: Option<&str>| BigQueryApi {
+            project: "p".into(),
+            location: location.map(str::to_string),
+            dataset: dataset.map(str::to_string),
+            dataset_location: std::sync::OnceLock::new(),
+            endpoint: "https://e".into(),
+            http: reqwest::blocking::Client::new(),
+            auth: Auth::Static(Zeroizing::new("t".into())),
+        };
+        assert_eq!(
+            api(Some("EU"), Some("d")).fetch_location().as_deref(),
+            Some("EU")
+        );
+        assert_eq!(api(None, None).fetch_location(), None);
+        let known = api(None, Some("d"));
+        known
+            .dataset_location
+            .set(Some("europe-west2".into()))
+            .unwrap();
+        assert_eq!(known.fetch_location().as_deref(), Some("europe-west2"));
     }
 
     #[test]
@@ -1099,6 +1210,8 @@ mod tests {
         let api = BigQueryApi {
             project: "p".into(),
             location: None,
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
@@ -1128,6 +1241,8 @@ mod tests {
         let api = BigQueryApi {
             project: "p".into(),
             location: None,
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
@@ -1151,6 +1266,8 @@ mod tests {
         let api = BigQueryApi {
             project: "p".into(),
             location: Some("EU".into()),
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: DEFAULT_ENDPOINT.into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("ya29.SECRET-TOKEN".into())),

@@ -106,6 +106,18 @@ impl StateDb {
             .flatten()
     }
 
+    /// The `load_run.status` of every load into `target_table`, oldest first.
+    pub fn load_statuses(&self, target_table: &str) -> Vec<String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status FROM load_run WHERE target_table = ?1 ORDER BY finished_at")
+            .expect("prepare load_run query");
+        stmt.query_map([target_table], |r| r.get::<_, String>(0))
+            .expect("query load_run")
+            .map(|r| r.expect("load_run.status"))
+            .collect()
+    }
+
     /// The column names and primary key recorded for `rivet load`, or `None` without a row.
     pub fn load_spec(
         &self,

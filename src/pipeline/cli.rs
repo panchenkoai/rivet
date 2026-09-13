@@ -1041,7 +1041,7 @@ exports:
     fn show_state_with_cursor_record_returns_ok() {
         let (dir, config_path) = setup_dir();
         let state = open_state(&dir);
-        state.update("orders", "2025-01-15").unwrap();
+        state.update_legacy("orders", "2025-01-15").unwrap();
         drop(state);
         assert!(show_state(&config_path, false).is_ok());
     }
@@ -1213,8 +1213,8 @@ exports:
         // show` / `state files` (the None branch) — the wired-into-only-some class.
         let (dir, config_path) = setup_dir(); // declares orders + transactions
         let state = open_state(&dir);
-        state.update("orders", "2025-01-01").unwrap();
-        state.update("beta_foreign", "2025-01-02").unwrap(); // another config, same DB
+        state.update_legacy("orders", "2025-01-01").unwrap();
+        state.update_legacy("beta_foreign", "2025-01-02").unwrap(); // another config, same DB
         let f = |run: &str, export: &str, name: &str| {
             state
                 .record_file(FilePart {
@@ -1310,7 +1310,7 @@ exports:
         let (dir, config_path) = setup_dir();
         write_two_export_config(&config_path);
         let state = open_state(&dir);
-        state.update("orders", "100").unwrap();
+        state.update_legacy("orders", "100").unwrap();
         drop(state);
         assert!(reset_state(&config_path, "orders").is_ok());
     }

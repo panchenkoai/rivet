@@ -186,6 +186,37 @@ fn bigquery_full_load_clusters_on_the_recorded_key_and_overwrites_its_own_table(
     assert_eq!(distinct_a_keys(&bq, &table), "40");
 }
 
+/// A table an earlier release created unclustered (no `cluster_by` then), met by a config
+/// whose `cluster_by` now defaults to `auto` (= the key): nothing is written, so the load
+/// follows the table — it overwrites it and keeps it unclustered — instead of refusing
+/// every such table in the fleet after an upgrade. A written `cluster_by` still refuses
+/// (the test above).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_full_load_follows_the_clustering_of_the_table_it_overwrites() {
+    let Some(bq) = BqLive::from_env("bq_full_auto_cluster") else {
+        return;
+    };
+    let (table, _guard) = keyed_pg_table("bq_full_auto_cluster");
+    let _cleanup = bq.cleanup(&[&table]);
+    let rig = SqlEngine::Pg
+        .rig(&table)
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(", cluster_by: []"));
+    rig.run_ok();
+    load_ok(&rig);
+    assert!(bq.read_bq_clustering(&table).is_empty());
+
+    let rig = rig.clear_top_lines().top_line(&bq.load_line(""));
+    rig.run_ok();
+    load_ok(&rig);
+    assert!(
+        bq.read_bq_clustering(&table).is_empty(),
+        "an unwritten cluster_by keeps the table's own clustering"
+    );
+    assert_eq!(distinct_a_keys(&bq, &table), "40");
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
 fn bigquery_full_load_refuses_its_table_when_the_clustering_changed() {
@@ -253,15 +284,29 @@ fn bigquery_incremental_first_run_lands_as_a_table_and_the_first_delta_starts_th
         (Some("13"), Some("13"))
     );
 
+    // A whole-table run onto the view (after `state reset`) joins the log: appended,
+    // the view still reads one current row per key. Pre-fix this refused, and a
+    // stateless cycle re-selecting the first run was wedged the same way.
     let reset = rig.cli(&["state", "reset", "--export", &table]);
     assert!(reset.status.success());
+    e.insert(&table, 14..=15, 5, Some(3));
     rig.run_ok();
-    let said = load_fails(&rig);
-    assert!(
-        said.contains("a full pass cannot be appended"),
-        "a whole-table run onto the change log is refused:\n{said}"
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_table_type(&table).as_deref(), Some("VIEW"));
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "28",
+        "13 + the 15-row whole pass"
     );
-    assert_eq!(bq.read_bq_count(&changes), "13", "untouched");
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d FROM `{}.{}.{table}`",
+        bq.project, bq.dataset
+    ));
+    assert_eq!(
+        (rows[0]["n"].as_str(), rows[0]["d"].as_str()),
+        (Some("15"), Some("15")),
+        "the view is the current state"
+    );
 }
 
 #[test]
@@ -366,6 +411,54 @@ fn bigquery_full_load_refuses_a_table_it_did_not_load() {
     assert_eq!(bq.read_bq_partitioning(&table).as_deref(), Some("d"));
     assert_eq!(bq.read_bq_clustering(&table), ["v"]);
     assert_eq!(bq.read_bq_count(&table), "0", "untouched");
+}
+
+/// The refusal holds on every attempt: the table is created by hand in exactly the shape
+/// rivet would give it (nothing but the ownership guard can refuse it), and the second
+/// `rivet load` — the scheduler's retry — still refuses, leaves it untouched, and adopts
+/// nothing. RED against the pre-fix ledger, whose `failed` row for the first refusal made
+/// the table rivet's own for the second.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_load_refuses_a_table_it_did_not_load_on_every_attempt() {
+    let Some(bq) = BqLive::from_env("bq_foreign_retry") else {
+        return;
+    };
+    let (table, _guard) = dated_pg_table("bq_foreign_retry", 30);
+    let _cleanup = bq.cleanup(&[&table]);
+    bq.exec(&format!(
+        "CREATE TABLE `{}.{}.{table}` (id INT64, d DATE, v STRING)",
+        bq.project, bq.dataset
+    ));
+    let rig = SqlEngine::Pg
+        .rig(&table)
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(""));
+    rig.run_ok();
+    for attempt in 1..=2 {
+        let said = load_fails(&rig);
+        assert!(
+            said.contains("no record of rivet loading it"),
+            "attempt {attempt} refuses for the same reason:\n{said}"
+        );
+        assert_eq!(
+            bq.read_bq_count(&table),
+            "0",
+            "attempt {attempt}: untouched"
+        );
+        assert_eq!(
+            bq.read_bq_table_type(&format!("{table}__changes")),
+            None,
+            "attempt {attempt}: nothing adopted"
+        );
+    }
+    let loads = StateDb::next_to_config(&rig.config_path())
+        .load_statuses(&format!("{}.{}.{table}", bq.project, bq.dataset));
+    assert_eq!(
+        loads,
+        ["refused", "refused"],
+        "both stops are on the record"
+    );
 }
 
 /// Re-create `table` under its own name, partitioned on `d`, clustered on `v`, with `options`.

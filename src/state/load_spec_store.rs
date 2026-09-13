@@ -58,8 +58,10 @@ pub struct LoadSpec {
 }
 
 impl StateStore {
-    /// Upsert the columns and primary key a successful run captured for one unit;
-    /// a capture that found no key keeps the key recorded before it.
+    /// Upsert the columns and primary key a successful run captured for one unit. A
+    /// capture that found no key clears one a run recorded before it — the export no
+    /// longer reads the relation that key belonged to — and keeps one `rivet init`
+    /// recorded (`key_origin = 'init'`), the scaffold's declaration for a `query:` export.
     pub fn record_load_spec(
         &self,
         export_name: &str,
@@ -73,12 +75,20 @@ impl StateStore {
         let now = chrono::Utc::now().to_rfc3339();
         self.execute(
             "INSERT INTO export_load_spec
-                 (export_name, unit, columns_json, primary_key_json, run_id, origin, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'run', ?6)
+                 (export_name, unit, columns_json, primary_key_json, key_origin,
+                  run_id, origin, captured_at)
+             VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 IS NULL THEN NULL ELSE 'run' END,
+                     ?5, 'run', ?6)
              ON CONFLICT (export_name, unit) DO UPDATE SET
                  columns_json     = excluded.columns_json,
-                 primary_key_json = COALESCE(excluded.primary_key_json,
-                                             export_load_spec.primary_key_json),
+                 primary_key_json = CASE
+                     WHEN excluded.primary_key_json IS NOT NULL THEN excluded.primary_key_json
+                     WHEN export_load_spec.key_origin = 'init' THEN export_load_spec.primary_key_json
+                     ELSE NULL END,
+                 key_origin       = CASE
+                     WHEN excluded.primary_key_json IS NOT NULL THEN 'run'
+                     WHEN export_load_spec.key_origin = 'init' THEN 'init'
+                     ELSE NULL END,
                  run_id           = excluded.run_id,
                  origin           = excluded.origin,
                  captured_at      = excluded.captured_at",
@@ -105,10 +115,12 @@ impl StateStore {
         let now = chrono::Utc::now().to_rfc3339();
         self.execute(
             "INSERT INTO export_load_spec
-                 (export_name, unit, columns_json, primary_key_json, run_id, origin, captured_at)
-             VALUES (?1, ?2, NULL, ?3, NULL, 'init', ?4)
+                 (export_name, unit, columns_json, primary_key_json, key_origin,
+                  run_id, origin, captured_at)
+             VALUES (?1, ?2, NULL, ?3, 'init', NULL, 'init', ?4)
              ON CONFLICT (export_name, unit) DO UPDATE SET
-                 primary_key_json = excluded.primary_key_json",
+                 primary_key_json = excluded.primary_key_json,
+                 key_origin       = 'init'",
             &[
                 export_name.into(),
                 unit.unwrap_or("").into(),
@@ -215,8 +227,12 @@ mod tests {
         assert_eq!(spec.origin, "run");
     }
 
+    /// `pk: auto` reads the recorded key, so a key a RUN captured from `table: orders`
+    /// must not outlive the export's move to a `query:` (or another relation) that
+    /// records none: the dedup view would partition by a key the export no longer
+    /// reads. RED against the pre-fix `COALESCE(excluded, old)` upsert.
     #[test]
-    fn a_capture_without_a_key_keeps_the_key_recorded_before_it() {
+    fn a_capture_without_a_key_clears_the_key_a_run_recorded_before_it() {
         let s = StateStore::open_in_memory().unwrap();
         let pk = vec!["id".to_string()];
         s.record_load_spec(
@@ -237,7 +253,10 @@ mod tests {
         .unwrap();
 
         let spec = s.load_spec("q", None).unwrap().unwrap();
-        assert_eq!(spec.primary_key, Some(pk));
+        assert_eq!(
+            spec.primary_key, None,
+            "the key belonged to a relation no longer read"
+        );
         assert_eq!(spec.columns.len(), 2);
         assert_eq!(spec.run_id.as_deref(), Some("run_2"));
     }
@@ -256,9 +275,35 @@ mod tests {
         let spec = s.load_spec("q", None).unwrap().unwrap();
         assert_eq!(spec.primary_key, Some(pk.clone()));
         assert_eq!(spec.columns.len(), 1);
+        s.record_load_spec("q", None, &[col("a", RivetType::Int32)], None, "run_2")
+            .unwrap();
+        assert_eq!(
+            s.load_spec("q", None).unwrap().unwrap().primary_key,
+            Some(pk.clone()),
+            "init's key outlives every keyless capture"
+        );
 
         s.record_primary_key("q", None, &pk).unwrap();
         assert_eq!(s.load_spec("q", None).unwrap().unwrap().columns.len(), 1);
+
+        // Once a run records a key of its own, that key is a run's: the next keyless
+        // capture clears it.
+        let seen = vec!["a".to_string()];
+        s.record_load_spec(
+            "q",
+            None,
+            &[col("a", RivetType::Int32)],
+            Some(&seen),
+            "run_3",
+        )
+        .unwrap();
+        assert_eq!(
+            s.load_spec("q", None).unwrap().unwrap().primary_key,
+            Some(seen)
+        );
+        s.record_load_spec("q", None, &[col("a", RivetType::Int32)], None, "run_4")
+            .unwrap();
+        assert_eq!(s.load_spec("q", None).unwrap().unwrap().primary_key, None);
     }
 
     #[test]

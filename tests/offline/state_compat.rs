@@ -60,7 +60,7 @@ fn existing_db_missing_required_tables_is_healed_by_migration() {
 
     let store = StateStore::open_at_path(tmp.path())
         .expect("migrations must heal a DB that lacks the required tables");
-    store.update("heal_test", "v1").unwrap();
+    store.update_legacy("heal_test", "v1").unwrap();
     assert_eq!(
         store.get("heal_test").unwrap().last_cursor_value.as_deref(),
         Some("v1")
@@ -76,7 +76,7 @@ fn corrupted_cursor_row_is_handled_without_panic() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     {
         let store = StateStore::open_at_path(tmp.path()).unwrap();
-        store.update("orders", "2024-06-01").unwrap();
+        store.update_legacy("orders", "2024-06-01").unwrap();
     }
     {
         let conn = rusqlite::Connection::open(tmp.path()).unwrap();
@@ -113,7 +113,9 @@ fn fresh_db_opens_and_is_functional_end_to_end() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = StateStore::open_at_path(tmp.path()).unwrap();
 
-    store.update("orders", "2024-01-01T00:00:00Z").unwrap();
+    store
+        .update_legacy("orders", "2024-01-01T00:00:00Z")
+        .unwrap();
     store
         .record_file(FilePart {
             run_id: "run-1",
@@ -140,7 +142,7 @@ fn reopening_an_existing_db_is_idempotent() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     {
         let s = StateStore::open_at_path(tmp.path()).unwrap();
-        s.update("orders", "v1").unwrap();
+        s.update_legacy("orders", "v1").unwrap();
     }
     {
         let s = StateStore::open_at_path(tmp.path()).unwrap();
@@ -149,7 +151,7 @@ fn reopening_an_existing_db_is_idempotent() {
             Some("v1"),
             "reopening must preserve data"
         );
-        s.update("orders", "v2").unwrap();
+        s.update_legacy("orders", "v2").unwrap();
     }
     {
         let s = StateStore::open_at_path(tmp.path()).unwrap();
@@ -219,7 +221,7 @@ fn db_with_only_schema_version_table_upgrades_cleanly() {
             .unwrap();
     }
     let store = StateStore::open_at_path(tmp.path()).unwrap();
-    store.update("x", "y").unwrap();
+    store.update_legacy("x", "y").unwrap();
     assert_eq!(
         store.get("x").unwrap().last_cursor_value.as_deref(),
         Some("y")

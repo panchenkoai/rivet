@@ -35,7 +35,41 @@
 - **BigQuery load jobs are inserted under a client job id.** A `jobs.insert` that times
   out or is refused transiently is sent again with the same id, so the statement never runs
   twice: a repeat of an insert that did land answers `409 Already Exists`, and the job is
-  fetched and polled instead. Previously such a timeout failed the load outright.
+  fetched and polled instead — in the dataset's location (`datasets.get`), since a single-
+  region job cannot be fetched by id alone. Previously such a timeout failed the load outright.
+- **A refused load never makes the table rivet's own.** A load that stops before touching
+  the warehouse — a table rivet did not load, a shape that differs, a view under a full pass,
+  a partition over budget, an interrupted rebuild's leftovers — is journaled as `refused`
+  (`rivet state loads`), and only a load that reached the write (`failed` or `success`)
+  counts for ownership. Previously the refusal's `failed` row made the foreign table rivet's
+  own, and the next `rivet load` (a scheduler retry) overwrote or adopted it.
+- **An incremental whole-table run onto its own view joins the change log.** After
+  `state reset`, or on a stateless cycle that re-selects the first run, the run is appended
+  to `<table>__changes` at least once (the view keeps the latest row per key) instead of
+  refusing "a full pass cannot be appended" on every later cycle.
+- **`pk: auto` forgets a key the export no longer reads.** A run that finds no source key
+  (a `query:` export, a relation without one) clears the key an earlier run recorded, so the
+  dedup view never partitions by a column of a table the export moved away from; a key
+  `rivet init` recorded for a `query:` scaffold is kept. A `pk` column the export does not
+  project is refused at plan time, not after the append.
+- **A 0.25.0 incremental cursor is attributed to its column.** `rivet state` rows written
+  before v26 carry no cursor identity; a keyset run's was recovered from its metrics, an
+  incremental run's was not — so a changed `cursor_column` compared the new column against
+  the old value (on MySQL: exit 0, zero rows, every run). The incremental run's key
+  descriptor (`export_metrics.key_descriptor_json`, v18+) now attributes it, and the switch
+  is refused naming both columns and `state reset` (MT6).
+- **An unwritten `cluster_by` follows the table.** A full load onto its own table with
+  `cluster_by` left at `auto` keeps the clustering the table has — a table an earlier
+  release created unclustered is overwritten as it is, not refused after the upgrade. A
+  written `cluster_by` still conflicts.
+- **`--rebuild-changelog` carries the log's properties.** The copy takes the description,
+  labels, friendly name, table expiry and KMS key of the log; a log with column policy tags
+  or row access policies is refused, since a copy carries neither.
+- **Partition budget and expiry corner cases.** A part without statistics no longer hides
+  the span the other parts prove; an INT32-stored range column (PostgreSQL `integer`, MySQL
+  `int`) is budgeted like INT64; `range` + `expiration_days` is refused when the config is
+  read (BigQuery has no expiry for integer ranges); a change log partitioned on
+  `_rivet_exported_at` — one value per run — never expires, like a load-date partition.
 - **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
   text ("failed to lookup address information…", or MongoDB's whole topology dump); a
   connection that fails before the server answers now says `cannot resolve host <host> —

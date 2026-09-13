@@ -12,267 +12,12 @@
 
 use crate::types::target::TargetColumnSpec;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
-/// The warehouse load target — the config's **top-level `load:` block**,
-/// declared ONCE for all exports. OSS accepts and ignores this block (a
-/// reserved passthrough); the loader reads it here. One config file drives
-/// both the export and the load — no second file, no per-table repetition.
-///
-/// `cleanup_source`/`cluster_by` are target-agnostic; the warehouse and its
-/// connection config live in [`LoadTarget`], keyed on the `target:`
-/// discriminator. NOTE: `#[serde(flatten)]` on `target` DISABLES serde's
-/// `deny_unknown_fields`, so cross-warehouse fields do NOT fail to deserialize —
-/// a `target: snowflake` block silently accepted BigQuery's `project:`/`dataset:`
-/// (dogfood LOW). [`reject_foreign_target_fields`] is the runtime guard that
-/// closes that gap; the "invalid combos fail to deserialize" belief was false.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LoadSection {
-    #[serde(flatten)]
-    pub target: LoadTarget,
-    #[serde(default)]
-    pub cleanup_source: bool,
-    /// Dedup key of the incremental/CDC current-state view: `auto` (default) is the
-    /// source primary key `rivet run` recorded, or explicit columns; ignored for `full`.
-    #[serde(default)]
-    pub pk: KeyColumns,
-    /// Load even when a run manifest's source count disagrees with what it
-    /// extracted (source→file drift): warn instead of blocking. The
-    /// file→warehouse count gate and manifest gates still apply.
-    #[serde(default)]
-    pub allow_source_drift: bool,
-    /// After a successful load, delete staged Parquet under the export prefix
-    /// that no `Success` manifest references — crash leftovers from an
-    /// interrupted extract. Keeps the current run's files, manifests, and
-    /// `_SUCCESS`; strictly gentler than `cleanup_source`, which wipes the whole
-    /// prefix. Off by default. ⚠️ Only enable when no extract writes this prefix
-    /// concurrently — it can't tell a crash orphan from a live run's in-flight
-    /// parts (see `reconcile::gc_orphans`); the normal load-after-extract flow is
-    /// safe.
-    #[serde(default)]
-    pub gc_orphans: bool,
-    /// `CLUSTER BY` of the table the load writes: `auto` (default) is the primary key,
-    /// `none`, or explicit columns (at most 4 on BigQuery).
-    #[serde(default)]
-    pub cluster_by: KeyColumns,
-    /// How the table the load writes is partitioned: `none` (default), or exactly one of
-    /// `column` (+ `granularity`), an integer `range`, or `ingestion` time.
-    #[serde(default, deserialize_with = "partition_setting")]
-    pub partition: Option<PartitionSpec>,
-}
-
-/// A partition granularity: `hour`, `day`, `month` or `year`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Granularity {
-    Hour,
-    Day,
-    Month,
-    Year,
-}
-
-impl Granularity {
-    /// The name BigQuery uses in `*_TRUNC(…)` and `timePartitioning.type`.
-    pub fn as_sql(self) -> &'static str {
-        match self {
-            Granularity::Hour => "HOUR",
-            Granularity::Day => "DAY",
-            Granularity::Month => "MONTH",
-            Granularity::Year => "YEAR",
-        }
-    }
-
-    /// The name as the config writes it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Granularity::Hour => "hour",
-            Granularity::Day => "day",
-            Granularity::Month => "month",
-            Granularity::Year => "year",
-        }
-    }
-
-    /// `HOUR` / `DAY` / `MONTH` / `YEAR` back to a granularity.
-    pub fn parse_sql(s: &str) -> Option<Self> {
-        match s {
-            "HOUR" => Some(Granularity::Hour),
-            "DAY" => Some(Granularity::Day),
-            "MONTH" => Some(Granularity::Month),
-            "YEAR" => Some(Granularity::Year),
-            _ => None,
-        }
-    }
-
-    /// The next coarser granularity, if there is one.
-    pub fn coarser(self) -> Option<Self> {
-        match self {
-            Granularity::Hour => Some(Granularity::Day),
-            Granularity::Day => Some(Granularity::Month),
-            Granularity::Month => Some(Granularity::Year),
-            Granularity::Year => None,
-        }
-    }
-}
-
-/// A `partition:` block: one form plus the table options.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PartitionSpec {
-    pub form: PartitionForm,
-    /// `partition_expiration_days`.
-    pub expiration_days: Option<u32>,
-    /// `require_partition_filter`.
-    pub require_filter: bool,
-}
-
-/// The one partition form a `partition:` block names.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PartitionForm {
-    /// A DATE / DATETIME / TIMESTAMP column at a granularity.
-    Column {
-        column: String,
-        granularity: Granularity,
-    },
-    /// An INT64 column in `interval`-wide buckets from `start` up to `end`.
-    Range {
-        column: String,
-        start: i64,
-        end: i64,
-        interval: i64,
-    },
-    /// The load time, at a granularity.
-    Ingestion(Granularity),
-}
-
-/// BigQuery's cap on partitions per table.
-pub(crate) const MAX_TABLE_PARTITIONS: i64 = 10_000;
-
-/// Days before an hourly-partitioned table reaches [`MAX_TABLE_PARTITIONS`].
-pub(crate) const HOURLY_LIFETIME_DAYS: u32 = (MAX_TABLE_PARTITIONS / 24) as u32;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPartition {
-    #[serde(default)]
-    column: Option<String>,
-    #[serde(default)]
-    granularity: Option<Granularity>,
-    #[serde(default)]
-    range: Option<RawRange>,
-    #[serde(default)]
-    ingestion: Option<Granularity>,
-    #[serde(default)]
-    expiration_days: Option<u32>,
-    #[serde(default)]
-    require_filter: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRange {
-    column: String,
-    start: i64,
-    end: i64,
-    interval: i64,
-}
-
-impl RawPartition {
-    /// Check the block names exactly one well-formed partition form.
-    fn into_spec(self) -> std::result::Result<PartitionSpec, String> {
-        let forms = [
-            self.column.is_some(),
-            self.range.is_some(),
-            self.ingestion.is_some(),
-        ]
-        .iter()
-        .filter(|f| **f)
-        .count();
-        if forms != 1 {
-            return Err(
-                "`partition` takes exactly one of `column`, `range` or `ingestion`".to_string(),
-            );
-        }
-        if self.granularity.is_some() && self.column.is_none() {
-            return Err(
-                "`granularity` goes with `column`; an `ingestion` partition names its \
-                        granularity directly (`ingestion: day`)"
-                    .to_string(),
-            );
-        }
-        if self.expiration_days == Some(0) {
-            return Err(
-                "`expiration_days` must be positive; omit it to keep partitions forever"
-                    .to_string(),
-            );
-        }
-        let form = if let Some(column) = self.column {
-            PartitionForm::Column {
-                column,
-                granularity: self.granularity.unwrap_or(Granularity::Day),
-            }
-        } else if let Some(r) = self.range {
-            if r.interval <= 0 {
-                return Err(format!(
-                    "`range.interval` must be positive, got {}",
-                    r.interval
-                ));
-            }
-            if r.start >= r.end {
-                return Err(format!(
-                    "`range.start` ({}) must be below `range.end` ({})",
-                    r.start, r.end
-                ));
-            }
-            let (span, interval) = (
-                i128::from(r.end) - i128::from(r.start),
-                i128::from(r.interval),
-            );
-            let buckets = (span + interval - 1) / interval;
-            if buckets > i128::from(MAX_TABLE_PARTITIONS) {
-                return Err(format!(
-                    "`range` makes {buckets} partitions; BigQuery allows {MAX_TABLE_PARTITIONS} \
-                     per table — widen `interval`"
-                ));
-            }
-            PartitionForm::Range {
-                column: r.column,
-                start: r.start,
-                end: r.end,
-                interval: r.interval,
-            }
-        } else {
-            PartitionForm::Ingestion(self.ingestion.expect("one form is present"))
-        };
-        Ok(PartitionSpec {
-            form,
-            expiration_days: self.expiration_days,
-            require_filter: self.require_filter,
-        })
-    }
-}
-
-/// `none`, or a partition block.
-fn partition_setting<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Option<PartitionSpec>, D::Error> {
-    use serde::de::Error;
-    match serde_json::Value::deserialize(d)? {
-        serde_json::Value::String(w) if w == "none" => Ok(None),
-        serde_json::Value::String(w) => Err(D::Error::custom(format!(
-            "expected `none` or a partition block, got `{w}`"
-        ))),
-        block => {
-            let raw: RawPartition = serde_json::from_value(block).map_err(D::Error::custom)?;
-            raw.into_spec().map(Some).map_err(D::Error::custom)
-        }
-    }
-}
-
-/// A per-export `partition:` — present means replace, `none` included.
-fn partition_override<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Option<Option<PartitionSpec>>, D::Error> {
-    partition_setting(d).map(Some)
-}
+use crate::config::load::HOURLY_LIFETIME_DAYS;
+use crate::config::load::MAX_TABLE_PARTITIONS;
+pub use crate::config::load::{
+    Granularity, KeyColumns, LoadSection, LoadTarget, PartitionForm, PartitionSpec,
+};
 
 /// A resolved `partition:`: what the table is partitioned on, the expression that
 /// creates it, and its options.
@@ -308,6 +53,23 @@ impl PartitionKey {
             PartitionKey::Time { column, .. } => column.as_deref(),
             PartitionKey::Range { column, .. } => Some(column),
         }
+    }
+
+    /// Whether the key is a load date: the load time, or rivet's extraction stamp
+    /// `_rivet_exported_at`, which every row of a run shares.
+    pub fn is_load_date(&self) -> bool {
+        match self {
+            PartitionKey::Time { column: None, .. } => true,
+            PartitionKey::Time {
+                column: Some(c), ..
+            } => c == crate::enrich::COL_EXPORTED_AT,
+            PartitionKey::Range { .. } => false,
+        }
+    }
+
+    /// Whether partitions of this key can expire: BigQuery has no expiry for integer ranges.
+    pub fn takes_expiry(&self) -> bool {
+        !matches!(self, PartitionKey::Range { .. })
     }
 
     /// `` `ts` by day ``, `load time by hour`, `` `n` in steps of 10 from 0 to 1000 ``.
@@ -367,121 +129,8 @@ impl PartitionKey {
     }
 }
 
-/// A column list in a `load:` block: `auto` (from the recorded source primary key),
-/// `none`, or explicit columns.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum KeyColumns {
-    #[default]
-    Auto,
-    None,
-    Columns(Vec<String>),
-}
-
-impl<'de> Deserialize<'de> for KeyColumns {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Word(String),
-            List(Vec<String>),
-        }
-        match Raw::deserialize(d)? {
-            Raw::Word(w) if w == "auto" => Ok(KeyColumns::Auto),
-            Raw::Word(w) if w == "none" => Ok(KeyColumns::None),
-            Raw::Word(w) => Err(serde::de::Error::custom(format!(
-                "expected `auto`, `none` or a list of columns, got `{w}`"
-            ))),
-            Raw::List(cols) => Ok(KeyColumns::Columns(cols)),
-        }
-    }
-}
-
 /// Source primary keys `rivet run` recorded, by `(export, unit)`.
 pub type RecordedKeys = std::collections::HashMap<(String, Option<String>), Vec<String>>;
-
-/// Per-export overrides of the top-level [`LoadSection`] — every field optional,
-/// `None` inherits the top-level value. `target` is present ONLY to reject it:
-/// the warehouse is shared (`plan_loads` resolves ONE target's types for every
-/// export), so it stays top-level.
-// `deny_unknown_fields` so a per-export `load:` typo (`gc_orphan`, `cleanupsrc`)
-// fails loudly instead of silently deserializing to the default and dropping the
-// override. (LoadOverride has no `#[serde(flatten)]`, so unlike LoadSection this
-// works directly.)
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LoadOverride {
-    #[serde(default)]
-    pk: Option<KeyColumns>,
-    #[serde(default)]
-    cleanup_source: Option<bool>,
-    #[serde(default)]
-    gc_orphans: Option<bool>,
-    #[serde(default)]
-    cluster_by: Option<KeyColumns>,
-    #[serde(default)]
-    allow_source_drift: Option<bool>,
-    #[serde(default, deserialize_with = "partition_override")]
-    partition: Option<Option<PartitionSpec>>,
-    /// Only to REJECT — a per-export `load:` cannot re-target the warehouse.
-    #[serde(default)]
-    target: Option<serde_json::Value>,
-}
-
-impl LoadSection {
-    /// The effective load config for one export: this top-level section with the
-    /// export's [`LoadOverride`] applied — each `Some` field replaces, each
-    /// `None` inherits. `target` is never overridden.
-    fn with_override(&self, o: &LoadOverride) -> LoadSection {
-        let mut eff = self.clone();
-        if let Some(pk) = &o.pk {
-            eff.pk = pk.clone();
-        }
-        if let Some(c) = o.cleanup_source {
-            eff.cleanup_source = c;
-        }
-        if let Some(g) = o.gc_orphans {
-            eff.gc_orphans = g;
-        }
-        if let Some(cb) = &o.cluster_by {
-            eff.cluster_by = cb.clone();
-        }
-        if let Some(d) = o.allow_source_drift {
-            eff.allow_source_drift = d;
-        }
-        if let Some(p) = &o.partition {
-            eff.partition = p.clone();
-        }
-        eff
-    }
-}
-
-/// A warehouse and its connection config. `target:` is the serde discriminator.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "target", rename_all = "lowercase")]
-pub enum LoadTarget {
-    Bigquery {
-        project: String,
-        dataset: String,
-    },
-    Snowflake {
-        connection: String,
-        warehouse: String,
-        database: String,
-        schema: String,
-        storage_integration: String,
-    },
-}
-
-impl LoadTarget {
-    /// The target name the type resolver is keyed on (`ExportTarget::parse`) —
-    /// the same token `rivet check --target` takes.
-    pub fn name(&self) -> &'static str {
-        match self {
-            LoadTarget::Bigquery { .. } => "bigquery",
-            LoadTarget::Snowflake { .. } => "snowflake",
-        }
-    }
-}
 
 /// Which load strategy an export's `mode` maps to. Drives BOTH the ledger's
 /// file selection and the warehouse write path:
@@ -568,11 +217,31 @@ pub struct LoadPlan {
     pub cursor_column: Option<String>,
     /// The resolved dedup key: the configured `pk`, or the recorded source key for `auto`.
     pub pk: Vec<String>,
-    /// The resolved clustering columns of the table the load writes.
-    pub cluster_by: Vec<String>,
-    /// Whether `cluster_by` was written in the config (a list or `none`) rather than
-    /// left at `auto` — a change log follows a declared clustering, keeps its own otherwise.
-    pub cluster_declared: bool,
+    /// The clustering of the table the load writes.
+    pub clustering: Clustering,
+}
+
+/// The clustering columns of the table a load writes, and where they came from: a
+/// change log follows a `Written` clustering and keeps its own under `Auto`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Clustering {
+    /// Resolved from `cluster_by: auto` — the recorded source key, or nothing.
+    Auto(Vec<String>),
+    /// Written in the config: a column list, or `none`.
+    Written(Vec<String>),
+}
+
+impl Clustering {
+    pub fn columns(&self) -> &[String] {
+        match self {
+            Clustering::Auto(c) | Clustering::Written(c) => c,
+        }
+    }
+
+    /// Whether the config wrote the clustering rather than leaving it at `auto`.
+    pub fn is_written(&self) -> bool {
+        matches!(self, Clustering::Written(_))
+    }
 }
 
 /// Resolve a rivet config into **one [`LoadPlan`] per export** — the shared
@@ -580,83 +249,6 @@ pub struct LoadPlan {
 /// destination / native schema. The type resolver returns one report per
 /// export, so a multi-table config produces a plan per table, all pointed
 /// at the same warehouse target.
-/// Every key a `load:` block may carry — the [`LoadSection`] fields plus the
-/// flattened [`LoadTarget`] variant fields. The top-level block can't use serde
-/// `deny_unknown_fields` (incompatible with the flattened `target` enum), so we
-/// check its keys by hand — else a typo (`gc_orphan`, `cleanupsource`) silently
-/// deserializes to the default and the setting never applies.
-const LOAD_KEYS: &[&str] = &[
-    "target",
-    "cleanup_source",
-    "pk",
-    "allow_source_drift",
-    "gc_orphans",
-    "cluster_by",
-    "partition",
-    // LoadTarget::{Bigquery, Snowflake} variant fields (flattened in).
-    "project",
-    "dataset",
-    "connection",
-    "warehouse",
-    "database",
-    "schema",
-    "storage_integration",
-];
-
-/// Reject any key in a `load:` block that isn't in [`LOAD_KEYS`] — turns a
-/// silently-ignored typo into a loud error naming the valid keys.
-fn check_load_keys(value: &serde_json::Value, whose: &str) -> Result<()> {
-    if let Some(obj) = value.as_object() {
-        for k in obj.keys() {
-            if !LOAD_KEYS.contains(&k.as_str()) {
-                bail!(
-                    "unknown key `{k}` in the {whose} `load:` block — valid keys are: {}",
-                    LOAD_KEYS.join(", ")
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Warehouse fields that belong to exactly ONE target.
-const BIGQUERY_ONLY: &[&str] = &["project", "dataset"];
-const SNOWFLAKE_ONLY: &[&str] = &[
-    "connection",
-    "warehouse",
-    "database",
-    "schema",
-    "storage_integration",
-];
-
-/// Reject fields that belong to a DIFFERENT warehouse than the resolved
-/// `target`. `#[serde(flatten)]` on the target enum can't `deny_unknown_fields`,
-/// so `LOAD_KEYS` (the union of all warehouses' fields) let a `target: snowflake`
-/// block silently carry — and ignore — BigQuery's `project:`/`dataset:` (and
-/// vice versa) (dogfood LOW). Name the offending key and its warehouse.
-fn reject_foreign_target_fields(
-    value: &serde_json::Value,
-    target: &str,
-    whose: &str,
-) -> Result<()> {
-    let (foreign, other) = match target {
-        "bigquery" => (SNOWFLAKE_ONLY, "snowflake"),
-        "snowflake" => (BIGQUERY_ONLY, "bigquery"),
-        _ => return Ok(()),
-    };
-    if let Some(obj) = value.as_object() {
-        for k in obj.keys() {
-            if foreign.contains(&k.as_str()) {
-                bail!(
-                    "the {whose} `load:` block targets `{target}` but carries `{k}`, a `{other}` \
-                     field — remove it (it would be silently ignored, masking a mis-configured load)"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Resolve a load's staging prefix from an export destination.
 ///
 /// Expands the same `{date}`/`{export}`/`{table}` placeholders the export wrote
@@ -750,15 +342,10 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
         bail!("config has no exports");
     }
 
-    // The `load:` target from the same config (OSS accepts + ignores it),
-    // shared by every export.
-    let load_value = cfg.load.clone().context(
+    // The `load:` target from the same config, shared by every export.
+    let load = cfg.load.clone().context(
         "config has no top-level `load:` block — add `load: { target, ... }` to load into a warehouse",
     )?;
-    check_load_keys(&load_value, "top-level")?;
-    let load: LoadSection = serde_json::from_value(load_value.clone())
-        .context("parsing the top-level `load:` block")?;
-    reject_foreign_target_fields(&load_value, load.target.name(), "top-level")?;
 
     let target = crate::types::target::ExportTarget::parse(load.target.name())
         .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
@@ -949,19 +536,7 @@ fn build_plans_keyed(
         // own `load:` block overriding the table-specific fields (pk, cleanup, …).
         // The warehouse `target` is shared and cannot be re-targeted per export.
         let eff_load = match &export.load {
-            Some(v) => {
-                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {
-                    format!("parsing export `{}` `load:` override", export.name)
-                })?;
-                if o.target.is_some() {
-                    bail!(
-                        "export `{}`: a per-export `load:` cannot override `target:` — the \
-                         warehouse is shared; set `target:` in the top-level `load:` block only",
-                        export.name
-                    );
-                }
-                load.with_override(&o)
-            }
+            Some(o) => load.with_override(o),
             None => load.clone(),
         };
         let (pk, cluster_by) = resolve_keys(
@@ -971,7 +546,10 @@ fn build_plans_keyed(
             &specs,
         )?;
         let partition = resolve_partition(&export.name, &eff_load, mode, &specs)?;
-        let cluster_declared = !matches!(eff_load.cluster_by, KeyColumns::Auto);
+        let clustering = match eff_load.cluster_by {
+            KeyColumns::Auto => Clustering::Auto(cluster_by),
+            _ => Clustering::Written(cluster_by),
+        };
         plans.push(LoadPlan {
             export_name: export.name.clone(),
             table,
@@ -983,8 +561,7 @@ fn build_plans_keyed(
             mode,
             cursor_column: export.cursor_column.clone(),
             pk,
-            cluster_by,
-            cluster_declared,
+            clustering,
         });
     }
     reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;
@@ -1022,6 +599,19 @@ fn resolve_keys(
             .find(|s| s.column_name == c)
             .map(|s| s.target_type.as_str())
     };
+    if let Some(missing) = pk.iter().find(|c| type_of(c).is_none()) {
+        let fix = match &load.pk {
+            KeyColumns::Auto => {
+                "`rivet run` recorded it as the source table's key; name the export's own key \
+                 columns under `pk:` in its `load:` block"
+            }
+            _ => "fix `pk` in the export's `load:` block",
+        };
+        bail!(
+            "export `{export}`: primary-key column `{missing}` is not a column of the export — \
+             the dedup view partitions by it. {fix}"
+        );
+    }
     let cluster_by = match &load.cluster_by {
         KeyColumns::None => Vec::new(),
         KeyColumns::Columns(cols) => {
@@ -1036,7 +626,7 @@ fn resolve_keys(
                     None => bail!(
                         "export `{export}`: `cluster_by` column `{c}` is not a column of the export"
                     ),
-                    Some(t) if bigquery && !bigquery_clusterable(t) => bail!(
+                    Some(t) if bigquery && !super::bigquery::clusterable(t) => bail!(
                         "export `{export}`: BigQuery cannot cluster on `{c}` ({t}); clusterable \
                          types are INT64, NUMERIC, BIGNUMERIC, STRING, BOOL, DATE, DATETIME, \
                          TIMESTAMP, GEOGRAPHY and RANGE"
@@ -1050,7 +640,7 @@ fn resolve_keys(
             let mut cols = Vec::new();
             for c in &pk {
                 match type_of(c) {
-                    Some(t) if bigquery && !bigquery_clusterable(t) => eprintln!(
+                    Some(t) if bigquery && !super::bigquery::clusterable(t) => eprintln!(
                         "  warning: export `{export}`: not clustering on key column `{c}` — \
                          BigQuery cannot cluster a {t} column"
                     ),
@@ -1098,8 +688,12 @@ fn resolve_partition(
             })
     };
     let (key, expr) = match &load.target {
-        LoadTarget::Bigquery { .. } => bigquery_partition(export, &spec.form, column_type)?,
-        LoadTarget::Snowflake { .. } => snowflake_partition(export, spec, column_type)?,
+        LoadTarget::Bigquery { .. } => {
+            super::bigquery::partition_expr(export, &spec.form, &column_type)?
+        }
+        LoadTarget::Snowflake { .. } => {
+            super::snowflake::partition_expr(export, spec, &column_type)?
+        }
     };
     if hourly_partitions_outlive_the_table(&key, spec.expiration_days) {
         eprintln!(
@@ -1116,11 +710,11 @@ fn resolve_partition(
                  reads all of it"
             );
         }
-        if is_ingestion(&key) && spec.expiration_days.is_some() {
+        if key.is_load_date() && spec.expiration_days.is_some() {
             eprintln!(
                 "  note: export `{export}`: load-date partitions of the change log `__changes` \
-                 do not expire — expiring them would drop rows that never changed from the \
-                 current-state view"
+                 (the load time, or `_rivet_exported_at`) do not expire — expiring them would \
+                 drop rows that never changed from the current-state view"
             );
         }
     }
@@ -1130,118 +724,6 @@ fn resolve_partition(
         expiration_days: spec.expiration_days,
         require_filter: spec.require_filter,
     }))
-}
-
-/// The BigQuery `PARTITION BY` expression for a form, by the column's native type.
-fn bigquery_partition(
-    export: &str,
-    form: &PartitionForm,
-    column_type: impl Fn(&str) -> Result<String>,
-) -> Result<(PartitionKey, String)> {
-    Ok(match form {
-        PartitionForm::Column {
-            column,
-            granularity,
-        } => {
-            let t = column_type(column)?;
-            let g = granularity.as_sql();
-            let expr = match (t.as_str(), granularity) {
-                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC({column}, {g})"),
-                ("DATETIME", _) => format!("DATETIME_TRUNC({column}, {g})"),
-                ("DATE", Granularity::Day) => column.clone(),
-                ("DATE", Granularity::Hour) => bail!(
-                    "export `{export}`: `{column}` is a DATE, which has no hours — partition it \
-                     by day, month or year"
-                ),
-                ("DATE", _) => format!("DATE_TRUNC({column}, {g})"),
-                _ => bail!(
-                    "export `{export}`: cannot partition on `{column}` ({t}); BigQuery partitions \
-                     a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`"
-                ),
-            };
-            (
-                PartitionKey::Time {
-                    column: Some(column.clone()),
-                    granularity: *granularity,
-                },
-                expr,
-            )
-        }
-        PartitionForm::Range {
-            column,
-            start,
-            end,
-            interval,
-        } => {
-            let t = column_type(column)?;
-            if t != "INT64" {
-                bail!(
-                    "export `{export}`: `range` partitions an INT64 column, and `{column}` is {t}"
-                );
-            }
-            (
-                PartitionKey::Range {
-                    column: column.clone(),
-                    start: *start,
-                    end: *end,
-                    interval: *interval,
-                },
-                format!("RANGE_BUCKET({column}, GENERATE_ARRAY({start}, {end}, {interval}))"),
-            )
-        }
-        PartitionForm::Ingestion(g) => {
-            let expr = match g {
-                Granularity::Day => "_PARTITIONDATE".to_string(),
-                _ => format!("TIMESTAMP_TRUNC(_PARTITIONTIME, {})", g.as_sql()),
-            };
-            (
-                PartitionKey::Time {
-                    column: None,
-                    granularity: *g,
-                },
-                expr,
-            )
-        }
-    })
-}
-
-/// Snowflake has no partitions: a date column maps to a leading `DATE_TRUNC` clustering
-/// expression, and the BigQuery-only forms and options are refused (ADR-0034 D6).
-fn snowflake_partition(
-    export: &str,
-    spec: &PartitionSpec,
-    column_type: impl Fn(&str) -> Result<String>,
-) -> Result<(PartitionKey, String)> {
-    if spec.expiration_days.is_some() || spec.require_filter {
-        bail!(
-            "export `{export}`: Snowflake has no partition expiry or partition filter — drop \
-             `expiration_days` / `require_filter` from `partition`"
-        );
-    }
-    let PartitionForm::Column {
-        column,
-        granularity,
-    } = &spec.form
-    else {
-        bail!(
-            "export `{export}`: Snowflake partitions by a date column only (`column` + \
-             `granularity`); it has no `range` or `ingestion` partitions"
-        );
-    };
-    let t = column_type(column)?;
-    if !(t.starts_with("DATE") || t.starts_with("TIMESTAMP")) {
-        bail!(
-            "export `{export}`: cannot partition on `{column}` ({t}); Snowflake clusters a DATE \
-             or TIMESTAMP column by time"
-        );
-    }
-    Ok((
-        PartitionKey::Time {
-            column: Some(column.clone()),
-            granularity: *granularity,
-        },
-        format!("DATE_TRUNC('{}', {column})", granularity.as_sql()),
-    ))
 }
 
 /// Whether an hourly key with this expiry can outgrow BigQuery's per-table partition cap.
@@ -1255,37 +737,14 @@ fn hourly_partitions_outlive_the_table(key: &PartitionKey, expiration_days: Opti
     ) && expiration_days.is_none_or(|d| d > HOURLY_LIFETIME_DAYS)
 }
 
-/// Whether the key is the load time.
-fn is_ingestion(key: &PartitionKey) -> bool {
-    matches!(key, PartitionKey::Time { column: None, .. })
-}
-
 /// `NUMERIC(12, 2)` → `NUMERIC`, `ARRAY<INT64>` → `ARRAY`.
-fn base_type(target_type: &str) -> String {
+pub(crate) fn base_type(target_type: &str) -> String {
     target_type
         .split(['(', '<'])
         .next()
         .unwrap_or_default()
         .trim()
         .to_ascii_uppercase()
-}
-
-/// Whether BigQuery can cluster a column of this native type.
-fn bigquery_clusterable(target_type: &str) -> bool {
-    let base = base_type(target_type);
-    matches!(
-        base.as_str(),
-        "BIGNUMERIC"
-            | "BOOL"
-            | "DATE"
-            | "DATETIME"
-            | "GEOGRAPHY"
-            | "INT64"
-            | "NUMERIC"
-            | "RANGE"
-            | "STRING"
-            | "TIMESTAMP"
-    )
 }
 
 /// Reject two exports that resolve to the SAME warehouse table. The `target:` is
@@ -1500,7 +959,7 @@ load:
 "#,
         )
         .unwrap();
-        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let load = cfg.load.clone().unwrap();
         let reports = vec![report("alpha", vec![col("id", TargetStatus::Ok)])];
         let err = build_plans(&cfg, &load, reports)
             .expect_err("s3 + load: must refuse at plan time")
@@ -1543,7 +1002,7 @@ load:
 "#,
         )
         .unwrap();
-        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let load = cfg.load.clone().unwrap();
 
         // Reports arrive in the OPPOSITE order to the exports, so a plan only
         // lands on the right table if its export is found by NAME, not position.
@@ -1607,7 +1066,7 @@ load:
         };
 
         let without = crate::config::Config::from_yaml(&yaml("")).unwrap();
-        let load: LoadSection = serde_json::from_value(without.load.clone().unwrap()).unwrap();
+        let load = without.load.clone().unwrap();
         let plans = build_plans(&without, &load, reports()).unwrap();
         assert_eq!(
             plans[0]
@@ -1623,7 +1082,7 @@ load:
             "    meta_columns:\n      row_hash: [id, status]\n",
         ))
         .unwrap();
-        let load: LoadSection = serde_json::from_value(with.load.clone().unwrap()).unwrap();
+        let load = with.load.clone().unwrap();
         let plans = build_plans(&with, &load, reports()).unwrap();
         let last = plans[0].specs.last().unwrap();
         assert_eq!(last.column_name, crate::enrich::COL_ROW_HASH);
@@ -1644,7 +1103,7 @@ load:
             "    meta_columns:\n      exported_at: true\n      row_hash: true\n",
         ))
         .unwrap();
-        let load: LoadSection = serde_json::from_value(both.load.clone().unwrap()).unwrap();
+        let load = both.load.clone().unwrap();
         let plans = build_plans(&both, &load, reports()).unwrap();
         let names: Vec<&str> = plans[0]
             .specs
@@ -1727,7 +1186,7 @@ load:
     #[test]
     fn build_plans_fans_a_multiplex_tables_export_out_to_one_plan_per_table() {
         let cfg = multiplex_cfg();
-        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let load = cfg.load.clone().unwrap();
         let tables = cfg.exports[0]
             .multiplex_tables()
             .expect("a `mode: cdc` export with `tables:` IS a multiplex")
@@ -1809,7 +1268,7 @@ load:
              target: bigquery\n  project: p\n  dataset: d\n",
         )
         .unwrap();
-        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let load = cfg.load.clone().unwrap();
         let reports = vec![report("ghost", vec![])];
         let err = build_plans(&cfg, &load, reports).unwrap_err().to_string();
         assert!(err.contains("ghost") && err.contains("not found"), "{err}");
@@ -1822,162 +1281,6 @@ load:
         assert!(reject_duplicate_target_tables(&["orders", "events", "orders"]).is_err());
         assert!(reject_duplicate_target_tables(&["orders", "events"]).is_ok());
         assert!(reject_duplicate_target_tables(&[]).is_ok());
-    }
-
-    #[test]
-    fn bigquery_load_section_deserializes_into_its_variant() {
-        let value = serde_json::json!({
-            "target": "bigquery", "project": "p", "dataset": "d",
-            "cleanup_source": true, "cluster_by": ["customer"]
-        });
-        let load: LoadSection = serde_json::from_value(value).unwrap();
-        assert_eq!(load.target.name(), "bigquery");
-        assert!(load.cleanup_source);
-        assert_eq!(
-            load.cluster_by,
-            KeyColumns::Columns(vec!["customer".into()])
-        );
-        match load.target {
-            LoadTarget::Bigquery { project, dataset } => {
-                assert_eq!((project.as_str(), dataset.as_str()), ("p", "d"));
-            }
-            _ => panic!("expected Bigquery variant"),
-        }
-    }
-
-    #[test]
-    fn snowflake_missing_field_is_unrepresentable_no_runtime_validate() {
-        let full = serde_json::json!({
-            "target": "snowflake", "connection": "rivet", "warehouse": "wh",
-            "database": "db", "schema": "sc", "storage_integration": "si"
-        });
-        let load: LoadSection = serde_json::from_value(full).unwrap();
-        assert_eq!(load.target.name(), "snowflake");
-
-        // A snowflake block missing storage_integration doesn't deserialize —
-        // the type makes it unrepresentable, so there is no runtime validate().
-        let partial = serde_json::json!({
-            "target": "snowflake", "connection": "rivet", "warehouse": "wh",
-            "database": "db", "schema": "sc"
-        });
-        let err = serde_json::from_value::<LoadSection>(partial).unwrap_err();
-        assert!(
-            err.to_string().contains("storage_integration"),
-            "error should name the missing field: {err}"
-        );
-    }
-
-    #[test]
-    fn unknown_target_is_rejected_at_deserialize() {
-        let value = serde_json::json!({ "target": "redshift", "project": "p" });
-        assert!(serde_json::from_value::<LoadSection>(value).is_err());
-    }
-
-    fn top_level_load() -> LoadSection {
-        serde_json::from_value(serde_json::json!({
-            "target": "bigquery", "project": "p", "dataset": "d",
-            "pk": ["top"], "cleanup_source": true, "gc_orphans": false,
-            "cluster_by": ["c0"], "allow_source_drift": false,
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn with_override_replaces_some_fields_and_inherits_the_rest() {
-        let top = top_level_load();
-        // Override ONLY pk + gc_orphans; the rest must inherit the top-level.
-        let o: LoadOverride =
-            serde_json::from_value(serde_json::json!({ "pk": ["id"], "gc_orphans": true }))
-                .unwrap();
-        let eff = top.with_override(&o);
-        assert_eq!(
-            eff.pk,
-            KeyColumns::Columns(vec!["id".into()]),
-            "pk replaced"
-        );
-        assert!(eff.gc_orphans, "gc_orphans replaced");
-        assert!(
-            eff.cleanup_source,
-            "cleanup_source inherited (top-level true)"
-        );
-        assert_eq!(
-            eff.cluster_by,
-            KeyColumns::Columns(vec!["c0".into()]),
-            "cluster_by inherited"
-        );
-        assert!(!eff.allow_source_drift, "allow_source_drift inherited");
-    }
-
-    #[test]
-    fn override_parsing_leaves_omitted_fields_none() {
-        let o: LoadOverride = serde_json::from_value(serde_json::json!({ "pk": ["id"] })).unwrap();
-        assert_eq!(o.pk, Some(KeyColumns::Columns(vec!["id".into()])));
-        assert!(o.cleanup_source.is_none());
-        assert!(o.gc_orphans.is_none());
-        assert!(o.cluster_by.is_none());
-        assert!(o.allow_source_drift.is_none());
-        assert!(o.target.is_none());
-    }
-
-    #[test]
-    fn empty_override_is_distinct_from_inherit() {
-        let top = top_level_load();
-        // An EXPLICIT empty pk clears the inherited one; a missing pk keeps it.
-        let cleared: LoadOverride =
-            serde_json::from_value(serde_json::json!({ "pk": [] })).unwrap();
-        assert_eq!(
-            top.with_override(&cleared).pk,
-            KeyColumns::Columns(vec![]),
-            "explicit [] clears"
-        );
-        let inherit: LoadOverride = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(
-            top.with_override(&inherit).pk,
-            KeyColumns::Columns(vec!["top".into()]),
-            "omitted inherits"
-        );
-    }
-
-    #[test]
-    fn override_carrying_target_is_detected() {
-        // The plan_loads guard rejects a per-export `load:` that re-targets the
-        // warehouse; the override captures `target:` so the guard can see it.
-        let o: LoadOverride =
-            serde_json::from_value(serde_json::json!({ "target": "snowflake" })).unwrap();
-        assert!(
-            o.target.is_some(),
-            "target captured for the plan_loads guard"
-        );
-    }
-
-    #[test]
-    fn unknown_top_level_load_key_is_rejected() {
-        // A typo (`gc_orphan` for `gc_orphans`) must fail loudly, not silently
-        // deserialize to the default so the setting never applies.
-        let typo = serde_json::json!({
-            "target": "bigquery", "project": "p", "dataset": "d", "gc_orphan": true
-        });
-        let err = check_load_keys(&typo, "top-level").unwrap_err().to_string();
-        assert!(err.contains("gc_orphan"), "{err}");
-        // Every valid LoadSection + LoadTarget key passes.
-        let ok = serde_json::json!({
-            "target": "bigquery", "project": "p", "dataset": "d",
-            "gc_orphans": true, "cleanup_source": false, "pk": ["id"],
-            "allow_source_drift": true, "cluster_by": ["a"], "partition": "none"
-        });
-        assert!(check_load_keys(&ok, "top-level").is_ok());
-    }
-
-    #[test]
-    fn unknown_per_export_override_key_is_rejected() {
-        // `deny_unknown_fields` on LoadOverride catches per-export typos.
-        let typo = serde_json::json!({ "pk": ["id"], "cluster_bye": ["x"] });
-        assert!(
-            serde_json::from_value::<LoadOverride>(typo).is_err(),
-            "a typo'd override key must fail to parse"
-        );
-        let ok = serde_json::json!({ "pk": ["id"], "cleanup_source": true });
-        assert!(serde_json::from_value::<LoadOverride>(ok).is_ok());
     }
 
     #[test]
@@ -2008,33 +1311,6 @@ load:
         );
     }
 
-    #[test]
-    fn cross_warehouse_load_fields_are_rejected() {
-        // #dogfood LOW: `#[serde(flatten)]` on the target enum disables
-        // deny_unknown_fields, so a `target: snowflake` block silently accepted
-        // (and ignored) BigQuery's `project:`/`dataset:`. Now a loud error.
-        let snow_with_bq = serde_json::json!({
-            "target": "snowflake", "connection": "c", "warehouse": "w",
-            "database": "db", "schema": "s", "storage_integration": "si",
-            "project": "STALE", "dataset": "STALE"
-        });
-        let err = reject_foreign_target_fields(&snow_with_bq, "snowflake", "top-level")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("project") && err.contains("bigquery"),
-            "snowflake+project must name the foreign field and warehouse: {err}"
-        );
-        // The reverse: bigquery target carrying a snowflake-only field.
-        let bq_with_snow = serde_json::json!({
-            "target": "bigquery", "project": "p", "dataset": "d", "warehouse": "WH"
-        });
-        assert!(reject_foreign_target_fields(&bq_with_snow, "bigquery", "top-level").is_err());
-        // A clean, target-matching block passes.
-        let clean = serde_json::json!({ "target": "bigquery", "project": "p", "dataset": "d" });
-        assert!(reject_foreign_target_fields(&clean, "bigquery", "top-level").is_ok());
-    }
-
     /// The report row IS the resolver's spec, split across optional fields — so
     /// the plan must rebuild the WHOLE spec, not the two fields the old JSON
     /// mirror declared.
@@ -2063,7 +1339,7 @@ load:
              target: bigquery\n  project: p\n  dataset: d\n",
         )
         .unwrap();
-        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let load = cfg.load.clone().unwrap();
 
         let resolved = ExportTarget::BigQuery.resolve_column(TargetInput {
             column_name: "payload",
@@ -2136,7 +1412,7 @@ load:
              target: bigquery\n  project: p\n  dataset: d\n",
         )
         .unwrap();
-        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let load = cfg.load.clone().unwrap();
         let mut untyped = col("mystery", TargetStatus::Ok);
         untyped.target_type = None;
         untyped.target_status = None;
@@ -2170,7 +1446,7 @@ load:
     /// Honest about which half a mutant can move: the missing-block arm is
     /// ordered by construction (the target comes FROM the block, so nothing can
     /// resolve types before it parses), and only pins the message. The typo arm
-    /// is the graded one — deleting `check_load_keys` from `plan_loads` takes
+    /// is the graded one — parsing the block permissively in `Config::from_yaml` takes
     /// the run past the gate and into the empty state DB.
     #[test]
     fn plan_loads_gates_the_load_block_before_any_source_io() {
@@ -2192,7 +1468,7 @@ load:
              destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
              target: bigquery\n  project: p\n  dataset: d\n  gc_orphan: true\n"
         ));
-        let err = plan_loads(&path).unwrap_err().to_string();
+        let err = format!("{:#}", plan_loads(&path).unwrap_err());
         assert!(err.contains("gc_orphan"), "{err}");
     }
 
@@ -2251,9 +1527,9 @@ load:
         assert!(specs[1].1.starts_with("NUMERIC"), "{specs:?}");
         assert_eq!(plans[0].pk, vec!["id"], "pk: auto is the recorded key");
         assert_eq!(
-            plans[0].cluster_by,
-            vec!["id"],
-            "cluster_by: auto is the key"
+            plans[0].clustering,
+            Clustering::Auto(vec!["id".into()]),
+            "cluster_by: auto is the key, and stays auto"
         );
     }
 
@@ -2299,24 +1575,6 @@ load:
 
     fn cols(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
-    }
-
-    #[test]
-    fn key_columns_read_auto_none_and_lists_and_default_to_auto() {
-        let parse = serde_json::from_value::<KeyColumns>;
-        assert_eq!(parse(serde_json::json!("auto")).unwrap(), KeyColumns::Auto);
-        assert_eq!(parse(serde_json::json!("none")).unwrap(), KeyColumns::None);
-        assert_eq!(
-            parse(serde_json::json!(["a", "b"])).unwrap(),
-            KeyColumns::Columns(cols(&["a", "b"]))
-        );
-        let err = parse(serde_json::json!("id")).unwrap_err().to_string();
-        assert!(err.contains("`auto`, `none` or a list"), "{err}");
-        let defaults = load_with("bigquery", serde_json::json!({}));
-        assert_eq!(
-            (defaults.pk, defaults.cluster_by),
-            (KeyColumns::Auto, KeyColumns::Auto)
-        );
     }
 
     #[test]
@@ -2372,6 +1630,37 @@ load:
         assert!(e.contains("at most 4"), "{e}");
     }
 
+    /// A key column the export does not project cannot partition the dedup view; the
+    /// refusal comes at plan time, not after the append (which would then be retried).
+    #[test]
+    fn resolve_keys_refuses_a_pk_column_the_export_does_not_have() {
+        let specs = [typed("id", "INT64"), typed("v", "STRING")];
+        let e = resolve_keys(
+            "e",
+            &load_with("bigquery", serde_json::json!({ "pk": ["idd"] })),
+            None,
+            &specs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("primary-key column `idd` is not a column"),
+            "{e}"
+        );
+        assert!(e.contains("fix `pk`"), "{e}");
+        // The recorded source key of a relation the export no longer projects.
+        let e = resolve_keys(
+            "e",
+            &load_with("bigquery", serde_json::json!({})),
+            Some(&cols(&["id", "missing"])),
+            &specs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("`missing` is not a column"), "{e}");
+        assert!(e.contains("`rivet run` recorded it"), "{e}");
+    }
+
     #[test]
     fn an_explicit_pk_wins_over_the_recorded_key_and_none_clusters_nothing() {
         let specs = [typed("id", "INT64"), typed("ext", "INT64")];
@@ -2399,120 +1688,6 @@ load:
         )
         .unwrap();
         assert!(pk.is_empty() && cluster.is_empty());
-    }
-
-    #[test]
-    fn bigquery_clusterable_reads_the_type_name_before_its_parameters() {
-        assert!(bigquery_clusterable("NUMERIC(12, 2)"));
-        assert!(bigquery_clusterable("DATETIME"));
-        assert!(bigquery_clusterable("STRING"));
-        assert!(!bigquery_clusterable("FLOAT64"));
-        assert!(!bigquery_clusterable("ARRAY<INT64>"));
-        assert!(!bigquery_clusterable("JSON"));
-        assert!(!bigquery_clusterable("BYTES"));
-    }
-
-    fn partition_of(target: &str, block: serde_json::Value) -> Option<PartitionSpec> {
-        load_with(target, serde_json::json!({ "partition": block })).partition
-    }
-
-    fn partition_error(block: serde_json::Value) -> String {
-        let v = serde_json::json!({
-            "target": "bigquery", "project": "p", "dataset": "d", "partition": block
-        });
-        serde_json::from_value::<LoadSection>(v)
-            .expect_err("the block must be refused")
-            .to_string()
-    }
-
-    #[test]
-    fn partition_block_reads_one_form_and_none() {
-        assert_eq!(load_with("bigquery", serde_json::json!({})).partition, None);
-        assert_eq!(partition_of("bigquery", serde_json::json!("none")), None);
-        assert_eq!(
-            partition_of("bigquery", serde_json::json!({ "column": "ts" })),
-            Some(PartitionSpec {
-                form: PartitionForm::Column {
-                    column: "ts".into(),
-                    granularity: Granularity::Day
-                },
-                expiration_days: None,
-                require_filter: false,
-            }),
-            "granularity defaults to day"
-        );
-        let full = partition_of(
-            "bigquery",
-            serde_json::json!({
-                "column": "ts", "granularity": "hour", "expiration_days": 30, "require_filter": true
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            (full.expiration_days, full.require_filter),
-            (Some(30), true)
-        );
-        assert!(matches!(
-            full.form,
-            PartitionForm::Column {
-                granularity: Granularity::Hour,
-                ..
-            }
-        ));
-        let range = partition_of(
-            "bigquery",
-            serde_json::json!({ "range": { "column": "n", "start": 0, "end": 1000, "interval": 10 } }),
-        )
-        .unwrap();
-        assert_eq!(
-            range.form,
-            PartitionForm::Range {
-                column: "n".into(),
-                start: 0,
-                end: 1000,
-                interval: 10
-            }
-        );
-        assert_eq!(
-            partition_of("bigquery", serde_json::json!({ "ingestion": "month" }))
-                .unwrap()
-                .form,
-            PartitionForm::Ingestion(Granularity::Month)
-        );
-    }
-
-    #[test]
-    fn partition_block_refuses_two_forms_bad_ranges_and_zero_expiry() {
-        let e = partition_error(serde_json::json!({ "column": "ts", "ingestion": "day" }));
-        assert!(e.contains("exactly one of"), "{e}");
-        let e = partition_error(serde_json::json!({}));
-        assert!(e.contains("exactly one of"), "{e}");
-        let e = partition_error(serde_json::json!({ "ingestion": "day", "granularity": "hour" }));
-        assert!(e.contains("`granularity` goes with `column`"), "{e}");
-        let e = partition_error(serde_json::json!({ "column": "ts", "granularity": "week" }));
-        assert!(e.contains("week"), "{e}");
-        let e = partition_error(serde_json::json!({ "column": "ts", "expiration_days": 0 }));
-        assert!(e.contains("`expiration_days` must be positive"), "{e}");
-        let e = partition_error(serde_json::json!({ "column": "ts", "expiration_day": 3 }));
-        assert!(e.contains("expiration_day"), "{e}");
-        let e = partition_error(serde_json::json!("weekly"));
-        assert!(e.contains("expected `none` or a partition block"), "{e}");
-        let range = |start: i64, end: i64, interval: i64| {
-            partition_error(serde_json::json!({
-                "range": { "column": "n", "start": start, "end": end, "interval": interval }
-            }))
-        };
-        assert!(range(0, 10, 0).contains("`range.interval` must be positive"));
-        assert!(range(10, 10, 1).contains("must be below `range.end`"));
-        assert!(range(0, 1_000_000, 1).contains("allows 10000 per table"));
-        assert!(
-            partition_of(
-                "bigquery",
-                serde_json::json!({ "range": { "column": "n", "start": 0, "end": 10000, "interval": 1 } })
-            )
-            .is_some(),
-            "exactly the cap is allowed"
-        );
     }
 
     fn resolve_bq(
@@ -2659,28 +1834,6 @@ load:
         assert!(e.contains("no `range` or `ingestion` partitions"), "{e}");
         let e = err(serde_json::json!({ "column": "n" }));
         assert!(e.contains("cannot partition on `n` (NUMBER)"), "{e}");
-    }
-
-    #[test]
-    fn a_per_export_partition_replaces_the_top_level_one_none_included() {
-        let top = load_with(
-            "bigquery",
-            serde_json::json!({ "partition": { "column": "ts", "granularity": "day" } }),
-        );
-        let inherit: LoadOverride = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(top.with_override(&inherit).partition, top.partition);
-        let cleared: LoadOverride =
-            serde_json::from_value(serde_json::json!({ "partition": "none" })).unwrap();
-        assert_eq!(top.with_override(&cleared).partition, None);
-        let replaced: LoadOverride =
-            serde_json::from_value(serde_json::json!({ "partition": { "ingestion": "hour" } }))
-                .unwrap();
-        assert_eq!(
-            top.with_override(&replaced).partition.unwrap().form,
-            PartitionForm::Ingestion(Granularity::Hour)
-        );
-        let typo = serde_json::json!({ "partition": { "column": "ts", "granularty": "day" } });
-        assert!(serde_json::from_value::<LoadOverride>(typo).is_err());
     }
 
     #[test]

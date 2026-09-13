@@ -32,11 +32,11 @@ fn pg_store() -> Option<StateStore> {
 fn pg_cursor_round_trip() {
     let Some(s) = pg_store() else { return };
 
-    s.update("pg_orders", "2024-06-01").unwrap();
+    s.update_legacy("pg_orders", "2024-06-01").unwrap();
     let got = s.get("pg_orders").unwrap();
     assert_eq!(got.last_cursor_value.as_deref(), Some("2024-06-01"));
 
-    s.update("pg_orders", "2024-07-01").unwrap();
+    s.update_legacy("pg_orders", "2024-07-01").unwrap();
     let got2 = s.get("pg_orders").unwrap();
     assert_eq!(got2.last_cursor_value.as_deref(), Some("2024-07-01"));
 

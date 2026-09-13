@@ -428,6 +428,46 @@ impl SnowflakeLoader {
     }
 }
 
+/// Snowflake has no partitions: a `partition:` column maps to a leading `DATE_TRUNC`
+/// clustering expression; the BigQuery-only forms and options are refused (ADR-0034 D6).
+pub(crate) fn partition_expr(
+    export: &str,
+    spec: &crate::load::plan::PartitionSpec,
+    column_type: &dyn Fn(&str) -> Result<String>,
+) -> Result<(crate::load::plan::PartitionKey, String)> {
+    use crate::load::plan::{PartitionForm, PartitionKey};
+    if spec.expiration_days.is_some() || spec.require_filter {
+        bail!(
+            "export `{export}`: Snowflake has no partition expiry or partition filter — drop \
+             `expiration_days` / `require_filter` from `partition`"
+        );
+    }
+    let PartitionForm::Column {
+        column,
+        granularity,
+    } = &spec.form
+    else {
+        bail!(
+            "export `{export}`: Snowflake partitions by a date column only (`column` + \
+             `granularity`); it has no `range` or `ingestion` partitions"
+        );
+    };
+    let t = column_type(column)?;
+    if !(t.starts_with("DATE") || t.starts_with("TIMESTAMP")) {
+        bail!(
+            "export `{export}`: cannot partition on `{column}` ({t}); Snowflake clusters a DATE \
+             or TIMESTAMP column by time"
+        );
+    }
+    Ok((
+        PartitionKey::Time {
+            column: Some(column.clone()),
+            granularity: *granularity,
+        },
+        format!("DATE_TRUNC('{}', {column})", granularity.as_sql()),
+    ))
+}
+
 /// Whether a column name is one of rivet's CDC meta columns.
 fn is_meta_column(name: &str) -> bool {
     crate::load::cdc::is_meta_column(name)

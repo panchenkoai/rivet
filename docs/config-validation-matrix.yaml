@@ -72,8 +72,8 @@ scenarios:
 
   - id: cross_warehouse_load_field
     what: "a load: block carrying a field for a DIFFERENT warehouse (target: snowflake + BigQuery's project:/dataset:) — silently accepted and IGNORED because #[serde(flatten)] on the target enum disables deny_unknown_fields (dogfood LOW; the 'invalid combos fail to deserialize' comment was false). Now a loud reject naming the foreign field + its warehouse; a target-matching block still loads (accept assert in the same test)."
-    rejected_wrong_mode: { test: cross_warehouse_load_fields_are_rejected }
-    valid_form_accepted: { test: cross_warehouse_load_fields_are_rejected }
+    rejected_wrong_mode: { test: a_load_block_needs_its_own_targets_fields_and_none_of_the_others }
+    valid_form_accepted: { test: a_load_block_needs_its_own_targets_fields_and_none_of_the_others }
 
   - id: chunked_needs_a_strategy
     what: "chunked mode with NO strategy at all (no chunk_column / chunk_by_key / chunk_count / chunk_by_days and no table:) is rejected at config-load — but chunk_by_key IS a strategy, so chunk_by_key + query: LOADS (the table: requirement is a plan-time concern, with an accurate 'needs table:' message). Fixes the dead-end that recommended chunk_by_key when it was already set (dogfood MED)."

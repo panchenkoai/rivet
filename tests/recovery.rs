@@ -86,7 +86,9 @@ fn f1_pre_write_failure_leaves_cursor_at_prior_value() {
     let state = StateStore::open_in_memory().unwrap();
 
     // Cursor was advanced by a previous successful run.
-    state.update("orders", "2024-01-31T00:00:00Z").unwrap();
+    state
+        .update_legacy("orders", "2024-01-31T00:00:00Z")
+        .unwrap();
 
     // Export fails — state.update() is never called again.
 
@@ -178,7 +180,9 @@ fn f3_write_cycle_complete_without_metric_is_recoverable() {
 
     // Full write cycle: file written, cursor advanced.
     record_file(&state, "run-c", "users", "users_20240601.parquet", 200);
-    state.update("users", "2024-06-01T00:00:00Z").unwrap();
+    state
+        .update_legacy("users", "2024-06-01T00:00:00Z")
+        .unwrap();
 
     // state.record_metric() never called — process crashed before final verdict.
 

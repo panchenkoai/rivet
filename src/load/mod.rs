@@ -129,36 +129,42 @@ pub trait TargetLoader {
     /// every existing row), keeping its rows, partitioning and clustering.
     fn adopt_as_changelog(&self, table: &str) -> Result<()>;
 
-    /// How the existing `table` differs from what this load would create (partitioning,
-    /// clustering), or `None` when it matches or the warehouse replaces it regardless.
-    fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
-        Ok(None)
+    /// The warehouse's shape control, when it has one: reading and changing the
+    /// partitioning and clustering of the tables the load writes. `None` means the
+    /// driver cannot verify a shape here and says so, rather than assuming it matches.
+    fn shape(&self) -> Option<&dyn ShapeControl> {
+        None
     }
+}
+
+/// Reading and changing the shape of the tables a load writes (ADR-0034 D5).
+pub trait ShapeControl {
+    /// How the existing `table` differs from what this load would create (partitioning,
+    /// clustering), or `None` when it matches.
+    fn table_shape_conflict(&self, table: &str) -> Result<Option<String>>;
 
     /// How `<table>__changes` differs from what the load DECLARES, or `None` when it
-    /// matches, is absent, nothing is declared, or the warehouse cannot tell.
-    fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
-        Ok(None)
-    }
+    /// matches, is absent, or nothing is declared.
+    fn changelog_drift(&self, table: &str) -> Result<Option<ChangelogDrift>>;
 
     /// Re-cluster `<table>__changes` in place to the load's `cluster_by`.
-    fn recluster_changelog(&self, _table: &str) -> Result<()> {
-        Ok(())
-    }
+    fn recluster_changelog(&self, table: &str) -> Result<()>;
 
     /// Rebuild `<table>__changes` with the load's partition — a billed copy of every
     /// row — and swap it in.
-    fn rebuild_changelog(&self, table: &str) -> Result<()> {
-        bail!(
-            "rebuilding `{}` is not supported on this warehouse",
-            self.fqtn(&format!("{table}__changes"))
-        )
-    }
+    fn rebuild_changelog(&self, table: &str) -> Result<()>;
 
     /// Objects an interrupted rebuild of `<table>__changes` left behind.
-    fn rebuild_leftovers(&self, _table: &str) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
+    fn rebuild_leftovers(&self, table: &str) -> Result<Vec<String>>;
+}
+
+/// The one line a load prints when its warehouse cannot verify a table's shape.
+fn shape_unverified_note(warehouse: cdc::Warehouse, fqtn: &str) -> String {
+    format!(
+        "  note: `{fqtn}` — {} has no shape control here, so its partitioning and clustering \
+         are not compared with the config",
+        warehouse.label()
+    )
 }
 
 /// How an existing change log differs from what the load declares (ADR-0034 D5).
@@ -181,10 +187,14 @@ pub enum ChangelogDrift {
 /// a changed partition only when asked for, else refuse naming the cost.
 fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool) -> Result<()> {
     let changes = loader.fqtn(&format!("{table}__changes"));
-    match loader.changelog_drift(table)? {
+    let Some(shape) = loader.shape() else {
+        eprintln!("{}", shape_unverified_note(loader.warehouse(), &changes));
+        return Ok(());
+    };
+    match before_write(shape.changelog_drift(table))? {
         None => Ok(()),
         Some(ChangelogDrift::Cluster { existing, declared }) => {
-            loader.recluster_changelog(table)?;
+            shape.recluster_changelog(table)?;
             eprintln!(
                 "  note: `{changes}` now clusters on {}, was {} — new rows land clustered and \
                  the warehouse re-clusters the rest in the background",
@@ -199,9 +209,11 @@ fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool)
             bytes,
         }) => {
             if !rebuild {
-                bail!("{}", rebuild_refusal(&changes, &existing, &declared, bytes));
+                return Err(refused(rebuild_refusal(
+                    &changes, &existing, &declared, bytes,
+                )));
             }
-            loader.rebuild_changelog(table)?;
+            shape.rebuild_changelog(table)?;
             eprintln!("  note: `{changes}` rebuilt: partitioned by {declared}, was {existing}");
             Ok(())
         }
@@ -212,7 +224,7 @@ fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool)
 fn rebuild_refusal(changes: &str, existing: &str, declared: &str, bytes: Option<u64>) -> String {
     let reads = bytes.map_or_else(
         || "every row".to_string(),
-        |b| format!("every row ({})", human_size(b)),
+        |b| format!("every row ({})", crate::pipeline::format_bytes(b)),
     );
     format!(
         "`{changes}` is partitioned by {existing}, the load declares {declared}; a table cannot \
@@ -235,7 +247,7 @@ fn leftovers_refusal(changes: &str, leftovers: &[String]) -> String {
 }
 
 /// `` `a`, `b` `` or `nothing`.
-fn column_list(cols: &[String]) -> String {
+pub(crate) fn column_list(cols: &[String]) -> String {
     if cols.is_empty() {
         return "nothing".to_string();
     }
@@ -245,20 +257,37 @@ fn column_list(cols: &[String]) -> String {
         .join(", ")
 }
 
-/// `1.5 GiB` for a byte count.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
+/// A load that stopped before touching the warehouse. The ledger records such a stop as
+/// `refused`, which never makes the target rivet's own — a `failed` row can.
+#[derive(Debug)]
+pub struct Refused(anyhow::Error);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
+}
+
+impl std::error::Error for Refused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
     }
+}
+
+/// Mark whatever went wrong before any warehouse write as a stop, not a failure.
+pub(crate) fn before_write<T>(r: Result<T>) -> Result<T> {
+    r.map_err(|e| {
+        if e.is::<Refused>() {
+            e
+        } else {
+            anyhow::Error::new(Refused(e))
+        }
+    })
+}
+
+/// A stop before any warehouse write, with its reason.
+pub(crate) fn refused(reason: String) -> anyhow::Error {
+    anyhow::Error::new(Refused(anyhow::anyhow!(reason)))
 }
 
 /// Whether an existing warehouse table is one rivet loaded, per the load ledger.
@@ -296,7 +325,11 @@ fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Owners
         ObjectKind::Absent => Ok(()),
         ObjectKind::Table => {
             ensure_own(&fqtn, ownership, "overwrite")?;
-            if let Some(diff) = loader.table_shape_conflict(table)? {
+            let Some(shape) = loader.shape() else {
+                eprintln!("{}", shape_unverified_note(loader.warehouse(), &fqtn));
+                return Ok(());
+            };
+            if let Some(diff) = shape.table_shape_conflict(table)? {
                 bail!(
                     "refusing to overwrite `{fqtn}`: {diff}. A warehouse table cannot change \
                      its partitioning or clustering in place — drop or rename it, or align the \
@@ -450,12 +483,7 @@ pub fn run_load(
     cleanup: Option<(&GcsStore, &str)>,
     ownership: Ownership,
 ) -> Result<LoadReport> {
-    if uris.is_empty() {
-        bail!("no Parquet URIs to load into `{table}`");
-    }
-    ensure_safe_load_uris(uris)?;
-    validate_specs(table, specs)?;
-    ensure_overwritable(loader, table, ownership)?;
+    before_write(whole_table_preflight(loader, table, specs, uris, ownership))?;
 
     let rows_loaded = loader.materialize(table, specs, uris)?;
 
@@ -475,6 +503,22 @@ pub fn run_load(
         target_table: loader.fqtn(table),
         source_cleaned,
     })
+}
+
+/// Everything a whole-table load checks before it writes.
+fn whole_table_preflight(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    uris: &[String],
+    ownership: Ownership,
+) -> Result<()> {
+    if uris.is_empty() {
+        bail!("no Parquet URIs to load into `{table}`");
+    }
+    ensure_safe_load_uris(uris)?;
+    validate_specs(table, specs)?;
+    ensure_overwritable(loader, table, ownership)
 }
 
 /// **CDC load driver.** Append the change log, gate the appended delta against
@@ -503,41 +547,7 @@ fn append_and_view(
     label: &str,
     build_view: impl FnOnce(&dyn TargetLoader) -> Result<()>,
 ) -> Result<CdcLoadReport> {
-    if uris.is_empty() {
-        bail!("no Parquet URIs to append into `{table}__changes`");
-    }
-    ensure_safe_load_uris(uris)?;
-    if pk.is_empty() {
-        bail!(
-            "{label} load of `{table}` needs a primary key for the dedup view — add \
-             `pk: [<column>]` under the export's `load:` block (no --pk flag exists)"
-        );
-    }
-    // Gate the PK columns at the SHARED seam: both the CDC and the INCREMENTAL
-    // driver splice them into the dedup view's `PARTITION BY` via quote_ident
-    // (Snowflake emits them bare; BigQuery wraps in backticks WITHOUT escaping an
-    // internal backtick), so a name outside a plain identifier is an injection
-    // vector. Round-6 gated this inline in the CDC path only — the incremental
-    // path (`run_load_incremental`) reached the same splice UNGATED. Hoisting it
-    // here covers both, so no load driver can bypass it (the runner-bypass class).
-    for c in pk {
-        if !is_safe_load_ident(c) {
-            bail!(
-                "cannot load `{table}`: primary-key column `{}` is not a plain SQL identifier \
-                 ([A-Za-z_][A-Za-z0-9_]*) — it is spliced into the dedup view's PARTITION BY. \
-                 Rename or alias it in the export.",
-                c.escape_default()
-            );
-        }
-    }
-    validate_specs(&format!("{table}__changes"), specs)?;
-    let leftovers = loader.rebuild_leftovers(table)?;
-    if !leftovers.is_empty() {
-        bail!(
-            "{}",
-            leftovers_refusal(&loader.fqtn(&format!("{table}__changes")), &leftovers)
-        );
-    }
+    before_write(append_preflight(loader, table, specs, uris, pk, label))?;
 
     if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership)? {
         eprintln!(
@@ -577,6 +587,57 @@ fn append_and_view(
     })
 }
 
+/// Everything an append checks before it writes: URIs, the dedup key, the specs, and no
+/// remains of an interrupted rebuild.
+fn append_preflight(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    uris: &[String],
+    pk: &[String],
+    label: &str,
+) -> Result<()> {
+    if uris.is_empty() {
+        bail!("no Parquet URIs to append into `{table}__changes`");
+    }
+    ensure_safe_load_uris(uris)?;
+    if pk.is_empty() {
+        bail!(
+            "{label} load of `{table}` needs a primary key for the dedup view — add \
+             `pk: [<column>]` under the export's `load:` block (no --pk flag exists)"
+        );
+    }
+    // Gate the PK columns at the SHARED seam: both the CDC and the INCREMENTAL
+    // driver splice them into the dedup view's `PARTITION BY` via quote_ident
+    // (Snowflake emits them bare; BigQuery wraps in backticks WITHOUT escaping an
+    // internal backtick), so a name outside a plain identifier is an injection
+    // vector. Round-6 gated this inline in the CDC path only — the incremental
+    // path (`run_load_incremental`) reached the same splice UNGATED. Hoisting it
+    // here covers both, so no load driver can bypass it (the runner-bypass class).
+    for c in pk {
+        if !is_safe_load_ident(c) {
+            bail!(
+                "cannot load `{table}`: primary-key column `{}` is not a plain SQL identifier \
+                 ([A-Za-z_][A-Za-z0-9_]*) — it is spliced into the dedup view's PARTITION BY. \
+                 Rename or alias it in the export.",
+                c.escape_default()
+            );
+        }
+    }
+    validate_specs(&format!("{table}__changes"), specs)?;
+    let leftovers = match loader.shape() {
+        Some(shape) => shape.rebuild_leftovers(table)?,
+        None => Vec::new(),
+    };
+    if !leftovers.is_empty() {
+        bail!(
+            "{}",
+            leftovers_refusal(&loader.fqtn(&format!("{table}__changes")), &leftovers)
+        );
+    }
+    Ok(())
+}
+
 /// Turn a table an earlier whole-table load left at the view's name into `<table>__changes`
 /// by renaming it; its rows become the change log's baseline. `None` when there is no such table.
 pub(crate) fn adopt_full_load_table(
@@ -585,8 +646,34 @@ pub(crate) fn adopt_full_load_table(
     specs: &[TargetColumnSpec],
     ownership: Ownership,
 ) -> Result<Option<u64>> {
-    if loader.object_kind(table)? != ObjectKind::Table {
+    if !before_write(adoptable(loader, table, specs, ownership))? {
         return Ok(None);
+    }
+    let changes = format!("{table}__changes");
+    let rows = before_write(loader.row_count(table))?;
+    loader.adopt_as_changelog(table)?;
+    let after = loader.row_count(&changes)?;
+    if after != rows {
+        bail!(
+            "`{}` holds {after} rows but `{}` held {rows} before the rename — investigate before \
+             re-running",
+            loader.fqtn(&changes),
+            loader.fqtn(table)
+        );
+    }
+    Ok(Some(rows))
+}
+
+/// Whether `<table>` is a whole-table load this append may turn into its change log:
+/// `false` when nothing is there to adopt, an error when what is there cannot be.
+fn adoptable(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    ownership: Ownership,
+) -> Result<bool> {
+    if loader.object_kind(table)? != ObjectKind::Table {
+        return Ok(false);
     }
     let changes = format!("{table}__changes");
     if loader.object_kind(&changes)? != ObjectKind::Absent {
@@ -615,18 +702,7 @@ pub(crate) fn adopt_full_load_table(
             names.len()
         );
     }
-    let rows = loader.row_count(table)?;
-    loader.adopt_as_changelog(table)?;
-    let after = loader.row_count(&changes)?;
-    if after != rows {
-        bail!(
-            "`{}` holds {after} rows but `{}` held {rows} before the rename — investigate before \
-             re-running",
-            loader.fqtn(&changes),
-            loader.fqtn(table)
-        );
-    }
-    Ok(Some(rows))
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments, private_interfaces)]
@@ -692,27 +768,7 @@ pub fn run_load_incremental(
     rebuild_changelog: bool,
 ) -> Result<CdcLoadReport> {
     // uris + pk are checked by `append_and_view`; the cursor guards are incremental-only.
-    if cursor_column.is_empty() {
-        bail!(
-            "incremental load of `{table}` needs a cursor column (the export's `cursor_column:`) \
-             for the dedup view's latest-per-PK ordering"
-        );
-    }
-    // The cursor must be an EXPORTED column: the dedup view orders `__changes` by
-    // it (`ORDER BY <cursor> DESC`). A cursor used only in the extract's WHERE and
-    // not projected (e.g. `SELECT id, v` with `cursor_column: updated_at`, or
-    // incremental-coalesce which strips its synthetic cursor) is absent from
-    // `__changes`, so the view creation would fail AFTER the append — turn that
-    // into a loud pre-append bail instead of a broken view + a retried re-append.
-    if !specs.iter().any(|s| s.column_name == cursor_column) {
-        let cols: Vec<&str> = specs.iter().map(|s| s.column_name.as_str()).collect();
-        bail!(
-            "incremental load of `{table}`: cursor_column `{cursor_column}` is not one of the \
-             exported columns [{}] — add it to the export's SELECT so the dedup view can order \
-             the change log by it",
-            cols.join(", ")
-        );
-    }
+    before_write(cursor_preflight(table, specs, cursor_column))?;
     append_and_view(
         loader,
         table,
@@ -736,6 +792,28 @@ pub fn run_load_incremental(
             l.create_view(table, &sql)
         },
     )
+}
+
+/// The cursor the dedup view orders by must be named and exported: a cursor used only in
+/// the extract's WHERE (or a coalesce cursor stripped from the output) is absent from
+/// `__changes`, so the view would fail AFTER the append and the delta be re-appended.
+fn cursor_preflight(table: &str, specs: &[TargetColumnSpec], cursor_column: &str) -> Result<()> {
+    if cursor_column.is_empty() {
+        bail!(
+            "incremental load of `{table}` needs a cursor column (the export's `cursor_column:`) \
+             for the dedup view's latest-per-PK ordering"
+        );
+    }
+    if !specs.iter().any(|s| s.column_name == cursor_column) {
+        let cols: Vec<&str> = specs.iter().map(|s| s.column_name.as_str()).collect();
+        bail!(
+            "incremental load of `{table}`: cursor_column `{cursor_column}` is not one of the \
+             exported columns [{}] — add it to the export's SELECT so the dedup view can order \
+             the change log by it",
+            cols.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
@@ -797,16 +875,13 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
-        LoadTarget::Bigquery { project, dataset } => Box::new(
-            build_bigquery_loader(
-                project,
-                dataset,
-                plan.partition.as_ref(),
-                &plan.cluster_by,
-                run_id,
-            )
-            .cluster_declared(plan.cluster_declared),
-        ),
+        LoadTarget::Bigquery { project, dataset } => Box::new(build_bigquery_loader(
+            project,
+            dataset,
+            plan.partition.as_ref(),
+            &plan.clustering,
+            run_id,
+        )),
         LoadTarget::Snowflake {
             connection,
             warehouse,
@@ -819,7 +894,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.database = database.clone();
             l.schema = schema.clone();
             l.storage_integration = storage_integration.clone();
-            l.cluster_by = plan.cluster_by.clone();
+            l.cluster_by = plan.clustering.columns().to_vec();
             l.partition_expr = plan.partition.as_ref().map(|p| p.expr.clone());
             l.run_id = Some(run_id.to_string());
             // Snowflake's external stage wants the `gcs://` scheme, not `gs://`.
@@ -840,15 +915,15 @@ fn build_bigquery_loader(
     project: &str,
     dataset: &str,
     partition: Option<&plan::TablePartition>,
-    cluster_by: &[String],
+    clustering: &plan::Clustering,
     run_id: &str,
 ) -> BigQueryLoader {
     let mut l = BigQueryLoader::new(project, dataset).run_id(run_id);
     if let Some(part) = partition {
         l = l.partition(part.clone());
     }
-    if !cluster_by.is_empty() {
-        l = l.cluster_by(cluster_by.to_vec());
+    if !clustering.columns().is_empty() || clustering.is_written() {
+        l.clustering = clustering.clone();
     }
     l
 }
@@ -873,10 +948,38 @@ mod tests {
         shape_conflict: Option<String>,
         drift: RefCell<Option<ChangelogDrift>>,
         leftovers: Vec<String>,
+        /// A warehouse without shape control (the Snowflake shape).
+        shapeless: bool,
         calls: RefCell<Vec<String>>,
     }
 
+    impl ShapeControl for FakeLoader {
+        fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
+            Ok(self.shape_conflict.clone())
+        }
+        fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
+            Ok(self.drift.borrow().clone())
+        }
+        fn recluster_changelog(&self, table: &str) -> Result<()> {
+            self.calls.borrow_mut().push(format!("recluster {table}"));
+            *self.drift.borrow_mut() = None;
+            Ok(())
+        }
+        fn rebuild_changelog(&self, table: &str) -> Result<()> {
+            self.calls.borrow_mut().push(format!("rebuild {table}"));
+            *self.drift.borrow_mut() = None;
+            Ok(())
+        }
+        fn rebuild_leftovers(&self, _table: &str) -> Result<Vec<String>> {
+            Ok(self.leftovers.clone())
+        }
+    }
+
     impl TargetLoader for FakeLoader {
+        fn shape(&self) -> Option<&dyn ShapeControl> {
+            if self.shapeless { None } else { Some(self) }
+        }
+
         fn fqtn(&self, table: &str) -> String {
             format!("db.{table}")
         }
@@ -909,25 +1012,6 @@ mod tests {
                 .insert(changes.clone(), ObjectKind::Table);
             self.counts.borrow_mut().insert(changes, rows);
             Ok(())
-        }
-        fn table_shape_conflict(&self, _table: &str) -> Result<Option<String>> {
-            Ok(self.shape_conflict.clone())
-        }
-        fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
-            Ok(self.drift.borrow().clone())
-        }
-        fn recluster_changelog(&self, table: &str) -> Result<()> {
-            self.calls.borrow_mut().push(format!("recluster {table}"));
-            *self.drift.borrow_mut() = None;
-            Ok(())
-        }
-        fn rebuild_changelog(&self, table: &str) -> Result<()> {
-            self.calls.borrow_mut().push(format!("rebuild {table}"));
-            *self.drift.borrow_mut() = None;
-            Ok(())
-        }
-        fn rebuild_leftovers(&self, _table: &str) -> Result<Vec<String>> {
-            Ok(self.leftovers.clone())
         }
         fn materialize(&self, table: &str, _: &[TargetColumnSpec], _: &[String]) -> Result<u64> {
             self.materialized.borrow_mut().push(table.into());
@@ -1032,14 +1116,102 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains("--rebuild-changelog") && err.contains("3.5 GiB"),
+            err.contains("--rebuild-changelog") && err.contains("3.5 GB"),
             "{err}"
         );
         assert!(calls(&f).is_empty(), "nothing appended: {:?}", calls(&f));
+        assert!(
+            load_incremental(&changelog_with(drift()))
+                .unwrap_err()
+                .is::<Refused>(),
+            "a refusal before the write is typed"
+        );
 
         let f = changelog_with(drift());
         load_incremental_with(&f, Ownership::Own, true).unwrap();
         assert_eq!(calls(&f), ["rebuild t", "append t"]);
+    }
+
+    /// The ledger tells a stop before the write (never makes the table rivet's own) from a
+    /// failure after it (may have) by the error's type: every pre-write check of the three
+    /// drivers stops as `Refused`; the count gate after the write fails plainly.
+    #[test]
+    fn a_stop_before_the_write_is_typed_and_a_failure_after_it_is_not() {
+        let stops: Vec<(&str, anyhow::Error)> = vec![
+            (
+                "foreign full table",
+                full_load(&full_load_left(5), Ownership::Foreign).unwrap_err(),
+            ),
+            (
+                "shape conflict",
+                full_load(
+                    &FakeLoader {
+                        shape_conflict: Some("it is clustered on `v`".into()),
+                        ..full_load_left(5)
+                    },
+                    Ownership::Own,
+                )
+                .unwrap_err(),
+            ),
+            (
+                "foreign table on the append path",
+                load_incremental_as(&full_load_left(5), Ownership::Foreign).unwrap_err(),
+            ),
+            (
+                "rebuild leftovers",
+                load_incremental(&FakeLoader {
+                    rows: 3,
+                    leftovers: vec!["db.t__changes__old".into()],
+                    ..Default::default()
+                })
+                .unwrap_err(),
+            ),
+            (
+                "no key",
+                run_load_incremental(
+                    &FakeLoader::default(),
+                    "t",
+                    &spec(TargetStatus::Ok),
+                    &uris(),
+                    &[],
+                    "updated_at",
+                    None,
+                    None,
+                    Ownership::Own,
+                    false,
+                )
+                .unwrap_err(),
+            ),
+        ];
+        for (what, err) in &stops {
+            assert!(err.is::<Refused>(), "{what} must stop as Refused: {err:#}");
+        }
+        let foreign = format!("{:#}", stops[0].1);
+        assert!(
+            foreign.contains("no record of rivet loading it"),
+            "{foreign}"
+        );
+
+        let wrote = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        let err = run_load(
+            &wrote,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            Some(99),
+            None,
+            Ownership::Own,
+        )
+        .unwrap_err();
+        assert_eq!(*wrote.materialized.borrow(), ["t"]);
+        assert!(
+            !err.is::<Refused>(),
+            "the count gate fails AFTER the write: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("count validation failed"));
     }
 
     #[test]
@@ -1055,9 +1227,48 @@ mod tests {
             "{err}"
         );
         assert!(calls(&f).is_empty());
-        assert_eq!(human_size(999), "999 B");
-        assert_eq!(human_size(1536), "1.5 KiB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    #[test]
+    fn a_warehouse_without_shape_control_proceeds_and_never_reshapes() {
+        let f = FakeLoader {
+            rows: 3,
+            shapeless: true,
+            shape_conflict: Some("would conflict".into()),
+            leftovers: vec!["db.t__changes__old".into()],
+            ..Default::default()
+        };
+        *f.drift.borrow_mut() = Some(ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: None,
+        });
+        f.kinds.borrow_mut().insert("t".into(), ObjectKind::Table);
+        f.counts.borrow_mut().insert("t".into(), 3);
+        full_load(&f, Ownership::Own).unwrap();
+        assert_eq!(
+            *f.materialized.borrow(),
+            ["t"],
+            "no shape to compare, the overwrite proceeds"
+        );
+        let f = FakeLoader {
+            rows: 3,
+            shapeless: true,
+            ..Default::default()
+        };
+        *f.drift.borrow_mut() = Some(ChangelogDrift::Cluster {
+            existing: vec!["id".into()],
+            declared: vec!["v".into()],
+        });
+        f.kinds
+            .borrow_mut()
+            .insert("t__changes".into(), ObjectKind::Table);
+        load_incremental(&f).unwrap();
+        assert_eq!(
+            calls(&f),
+            ["append t"],
+            "no recluster or rebuild without shape control"
+        );
     }
 
     #[test]
@@ -1572,19 +1783,17 @@ mod tests {
             expiration_days: None,
             require_filter: false,
         };
-        let l = build_bigquery_loader(
-            "proj",
-            "ds",
-            Some(&daily),
-            &["customer_id".to_string(), "region".to_string()],
-            "run-1",
-        );
-        assert_eq!(l.cluster_by, ["customer_id", "region"]);
+        let written = plan::Clustering::Written(vec!["customer_id".into(), "region".into()]);
+        let l = build_bigquery_loader("proj", "ds", Some(&daily), &written, "run-1");
+        assert_eq!(l.cluster_by(), ["customer_id", "region"]);
+        assert!(l.clustering.is_written());
         assert_eq!(l.partition.as_ref(), Some(&daily));
 
         // No keys set → neither clause (the default), never a spurious one.
-        let bare = build_bigquery_loader("proj", "ds", None, &[], "run-1");
-        assert!(bare.cluster_by.is_empty());
+        let auto = plan::Clustering::Auto(vec![]);
+        let bare = build_bigquery_loader("proj", "ds", None, &auto, "run-1");
+        assert!(bare.cluster_by().is_empty());
+        assert!(!bare.clustering.is_written());
         assert!(bare.partition.is_none());
     }
 

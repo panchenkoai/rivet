@@ -118,7 +118,12 @@ fn key_descriptor_json(plan: &ResolvedRunPlan, key_native_type: Option<&str>) ->
 ///
 /// Never fails the run: any probe error is logged at debug and dropped. One extra
 /// lightweight connection per export — cheap relative to the run it forensicates.
-fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &mut RunSummary) {
+fn capture_open_forensics(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    summary: &mut RunSummary,
+    want_key: bool,
+) {
     let mut src = match crate::source::create_source(&plan.source) {
         Ok(s) => s,
         Err(e) => {
@@ -130,8 +135,23 @@ fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &
         }
     };
     summary.server_context_json = src.server_context();
-    match src.type_mappings(&plan.base_query, &plan.column_overrides) {
+    // The same resolution the type report and the load spec use, so what this run
+    // records for `rivet load` is what it resolved, not a second reading.
+    match crate::preflight::type_report::probe_mappings(
+        src.as_mut(),
+        &plan.base_query,
+        &plan.column_overrides,
+    ) {
         Ok(mappings) => {
+            if want_key && let Some(relation) = plan.source_table.as_deref() {
+                summary.open_primary_key = src.primary_key(relation).unwrap_or_else(|e| {
+                    log::warn!(
+                        "export '{}': could not read the primary key of `{relation}`: {e:#}",
+                        plan.export_name
+                    );
+                    None
+                });
+            }
             // Arrow repr matches the success path's `arrow_schema_to_columns` format
             // (so a later successful overwrite is consistent), and still names
             // unsignedness (`UInt64`). Fall back to the source native type only when
@@ -167,12 +187,43 @@ fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &
                     summary.export_name
                 );
             }
+            summary.open_mappings = Some(mappings);
         }
         Err(e) => log::debug!(
             "open-forensics: type_mappings failed for '{}': {e}",
             plan.export_name
         ),
     }
+}
+
+/// A settle column must be a date/timestamp: the window compares it with the source
+/// clock. Checked from the open probe so a wrong column fails before the query runs;
+/// the sink repeats the check on the schema it writes, for a run whose probe failed.
+fn settle_columns_are_temporal(
+    plan: &ResolvedRunPlan,
+    mappings: Option<&[crate::types::TypeMapping]>,
+) -> Result<()> {
+    let (Some(inc), Some(mappings)) = (plan.strategy.incremental_plan(), mappings) else {
+        return Ok(());
+    };
+    for name in inc.settle_columns() {
+        let Some(m) = mappings.iter().find(|m| m.column_name == name) else {
+            continue;
+        };
+        if !matches!(
+            m.rivet_type,
+            crate::types::RivetType::Date | crate::types::RivetType::Timestamp { .. }
+        ) {
+            anyhow::bail!(
+                "export '{}': settle column `{name}` is {}, not a date/timestamp — the settle \
+                 window compares it against the source clock. Point `settle.column` at the \
+                 row's insert/update time (the cursor is used when `settle.column` is omitted).",
+                plan.export_name,
+                m.source_native_type
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Assemble the full `export_metrics` row (v9) from the finished run summary +
@@ -760,6 +811,8 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         cursor_column: None,
         cursor_low: None,
         cursor_high: None,
+        open_mappings: None,
+        open_primary_key: None,
         offending_value: None,
         server_context_json: None,
         key_native_type: None,
@@ -943,6 +996,9 @@ struct TailPolicy<'a> {
     allow_reconcile: bool,
     /// Run-path notifications; apply sends none.
     notifications: Option<&'a crate::config::NotificationsConfig>,
+    /// Whether the config has a `load:` block, so the open probe also reads the
+    /// source primary key the load spec records.
+    record_load_spec: bool,
     /// Plan (rule, message) warnings the run path journals as `PlanWarning`
     /// events; apply logs them at validate time and journals none (existing
     /// behavior, preserved).
@@ -1059,7 +1115,7 @@ fn execute_resolved_plan(
     let ledger_run_id = summary.run_id.clone();
     // Failure forensics at open: source schema + server limits, so a run that fails
     // before finalize still explains itself (export_schema is otherwise success-only).
-    capture_open_forensics(plan, state, &mut summary);
+    capture_open_forensics(plan, state, &mut summary, tail.record_load_spec);
 
     // PG cursor / sort spill probe — captured around the actual run window.
     // Cluster-level counter, so this is a noisy upper bound on a shared host
@@ -1078,26 +1134,28 @@ fn execute_resolved_plan(
         });
     }
 
-    let result = if plan.strategy.requires_parallel_execution() {
-        if plan.strategy.is_resumable() {
-            run_chunked_parallel_checkpoint(
-                tail.runner_config_path,
-                state,
-                plan,
-                &mut summary,
-                tail.chunk_source,
-            )
-        } else {
-            chunked::run_chunked_parallel(state, plan, &mut summary, tail.chunk_source)
+    let result = match settle_columns_are_temporal(plan, summary.open_mappings.as_deref()) {
+        Err(e) => Err(e),
+        Ok(()) if plan.strategy.requires_parallel_execution() => {
+            if plan.strategy.is_resumable() {
+                run_chunked_parallel_checkpoint(
+                    tail.runner_config_path,
+                    state,
+                    plan,
+                    &mut summary,
+                    tail.chunk_source,
+                )
+            } else {
+                chunked::run_chunked_parallel(state, plan, &mut summary, tail.chunk_source)
+            }
         }
-    } else {
-        run_with_reconnect(
+        Ok(()) => run_with_reconnect(
             state,
             plan,
             &mut summary,
             tail.runner_config_path,
             tail.chunk_source,
-        )
+        ),
     };
     // ADR-0028: THE export tail — apply the ledger the runner fed exactly once,
     // here, before anything downstream reads the summary. On runner success the
@@ -1342,7 +1400,7 @@ pub(super) fn run_export_job(
             state,
             config_dir,
             opts.params,
-            &summary.run_id,
+            &summary,
         );
     }
     (result, summary)
@@ -1504,6 +1562,7 @@ fn run_export_job_inner(
             apply_context: None,
             allow_reconcile: true,
             notifications: config.notifications.as_ref(),
+            record_load_spec: config.load.is_some(),
             plan_warnings,
         },
     )
@@ -1598,6 +1657,7 @@ pub(crate) fn run_export_job_with_chunk_source(
             apply_context,
             allow_reconcile: false,
             notifications: None,
+            record_load_spec: false,
             plan_warnings: Vec::new(),
         },
     )
@@ -2265,6 +2325,66 @@ mod tests {
     };
     use crate::plan::{ChunkedPlan, ExtractionStrategy, ResolvedRunPlan};
     use crate::tuning::SourceTuning;
+
+    #[test]
+    fn a_settle_column_that_is_not_temporal_fails_before_the_query_runs() {
+        use crate::plan::{ExtractionStrategy, IncrementalCursorPlan, SettlePlan};
+        use crate::types::{RivetType, TypeFidelity, TypeMapping};
+        let mapping = |name: &str, native: &str, rivet_type: RivetType| TypeMapping {
+            column_name: name.into(),
+            source_native_type: native.into(),
+            arrow_type: crate::types::rivet_type_to_arrow(&rivet_type),
+            rivet_type,
+            fidelity: TypeFidelity::Exact,
+            nullable: true,
+            warnings: Vec::new(),
+        };
+        let mappings = [
+            mapping("id", "bigint", RivetType::Int64),
+            mapping(
+                "ts",
+                "timestamptz",
+                RivetType::Timestamp {
+                    unit: crate::types::TimeUnit::Microsecond,
+                    timezone: Some("UTC".into()),
+                },
+            ),
+            mapping("d", "date", RivetType::Date),
+            mapping("v", "text", RivetType::String),
+        ];
+        let mut plan = chunked_plan_with_quality(None);
+        let settled = |column: Option<&str>| {
+            ExtractionStrategy::Incremental(IncrementalCursorPlan {
+                primary_column: "id".into(),
+                fallback_column: None,
+                mode: crate::config::IncrementalCursorMode::SingleColumn,
+                settle: Some(SettlePlan {
+                    column: column.map(String::from),
+                    after_secs: 60,
+                }),
+            })
+        };
+        plan.strategy = settled(Some("ts"));
+        assert!(settle_columns_are_temporal(&plan, Some(&mappings)).is_ok());
+        plan.strategy = settled(Some("d"));
+        assert!(settle_columns_are_temporal(&plan, Some(&mappings)).is_ok());
+        plan.strategy = settled(Some("v"));
+        let err = settle_columns_are_temporal(&plan, Some(&mappings))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("settle column `v` is text"), "{err}");
+        plan.strategy = settled(None);
+        let err = settle_columns_are_temporal(&plan, Some(&mappings))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("settle column `id` is bigint"), "{err}");
+        assert!(
+            settle_columns_are_temporal(&plan, None).is_ok(),
+            "no probe: the sink's own check is the backstop"
+        );
+        plan.strategy = settled(Some("absent"));
+        assert!(settle_columns_are_temporal(&plan, Some(&mappings)).is_ok());
+    }
 
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {

@@ -35,7 +35,8 @@ struct Span {
 }
 
 /// Refuse a load whose Parquet spans more partitions than one BigQuery job may write.
-/// A file without statistics for the column skips the check: BigQuery is the backstop.
+/// A file without statistics for the column adds nothing to the span; the others still
+/// count, and BigQuery is the backstop.
 pub(crate) fn check_partition_budget(
     store: &GcsStore,
     uris: &[String],
@@ -50,7 +51,7 @@ pub(crate) fn check_partition_budget(
         let meta = read_footer(store, key)
             .with_context(|| format!("reading the Parquet footer of {uri}"))?;
         let Some(file) = column_span(&meta, column) else {
-            return Ok(());
+            continue;
         };
         span = Some(match span {
             None => file,
@@ -120,7 +121,8 @@ fn stored_unit(logical: Option<&LogicalType>, physical: PhysicalType) -> Option<
             TimeUnit::MICROS => Unit::Micros,
             TimeUnit::NANOS => Unit::Nanos,
         }),
-        (None, PhysicalType::INT64) | (Some(LogicalType::Integer { .. }), PhysicalType::INT64) => {
+        (None, PhysicalType::INT64 | PhysicalType::INT32)
+        | (Some(LogicalType::Integer { .. }), PhysicalType::INT64 | PhysicalType::INT32) => {
             Some(Unit::Plain)
         }
         _ => None,
@@ -247,7 +249,9 @@ fn over_budget_message(key: &PartitionKey, span: Span, touched: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Date32Array, Int64Array, TimestampMicrosecondArray};
+    use arrow::array::{
+        ArrayRef, Date32Array, Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowUnit};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
@@ -416,6 +420,64 @@ mod tests {
         );
         assert!(err.contains("widen `range.interval`"), "{err}");
         assert!(check(dir.path(), &["n.parquet"], &range(2)).is_ok());
+    }
+
+    /// A narrower integer column (PG `integer`, MySQL `int`) is stored as INT32 with the
+    /// same statistics; the range budget reads it like INT64.
+    #[test]
+    fn a_range_on_an_int32_column_is_budgeted_like_int64() {
+        let dir = tempfile::tempdir().unwrap();
+        let i32_col: ArrayRef = Arc::new(Int32Array::from(vec![-5_i32, 6_000]));
+        write(
+            dir.path(),
+            "i32.parquet",
+            Field::new("n", DataType::Int32, false),
+            i32_col,
+            true,
+        );
+        let i16_col: ArrayRef = Arc::new(Int16Array::from(vec![-5_i16, 6_000]));
+        write(
+            dir.path(),
+            "i16.parquet",
+            Field::new("n", DataType::Int16, false),
+            i16_col,
+            true,
+        );
+        let range = |interval: i64| TablePartition {
+            key: PartitionKey::Range {
+                column: "n".into(),
+                start: 0,
+                end: 5_000,
+                interval,
+            },
+            ..time("n", Granularity::Day)
+        };
+        for file in ["i32.parquet", "i16.parquet"] {
+            let err = check(dir.path(), &[file], &range(1))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("about 5001 ranges of `n`"), "{file}: {err}");
+            assert!(check(dir.path(), &[file], &range(2)).is_ok(), "{file}");
+        }
+    }
+
+    /// One part without statistics leaves the check to BigQuery for ITS rows only: the
+    /// span the other parts prove is still refused, whichever order the parts come in.
+    #[test]
+    fn a_stats_less_file_does_not_hide_the_other_files_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2026, 1, 1, 0);
+        ts_file(dir.path(), "a.parquet", &[start, start + 200 * DAY], true);
+        ts_file(dir.path(), "b.parquet", &[start], false);
+        for files in [["a.parquet", "b.parquet"], ["b.parquet", "a.parquet"]] {
+            let err = check(dir.path(), &files, &time("ts", Granularity::Hour))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("about 4801 hour partitions"),
+                "{files:?}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -8,6 +8,32 @@ use super::StateStore;
 /// The cursor records the last extracted value so incremental runs can pick up
 /// where the previous run left off.  Invariant I3 (Write Before Cursor) governs
 /// the ordering of cursor updates relative to destination writes.
+/// Whether a stored cursor's owner is the identity a run progresses on. A legacy owner
+/// (attributed from a run's key descriptor, which names the primary column only) also
+/// matches a coalesce identity led by that column.
+fn identity_matches(owner: &str, expected: &str, legacy: bool) -> bool {
+    if owner == expected {
+        return true;
+    }
+    legacy
+        && expected
+            .strip_prefix("coalesce(")
+            .and_then(|rest| rest.strip_prefix(owner))
+            .is_some_and(|rest| rest.starts_with(','))
+}
+
+/// The cursor column an incremental run's `key_descriptor_json` names, or `None` for
+/// any other strategy's descriptor.
+fn descriptor_cursor_column(descriptor: &str) -> Option<String> {
+    let d: serde_json::Value = serde_json::from_str(descriptor).ok()?;
+    if d.get("strategy").and_then(serde_json::Value::as_str) != Some("incremental") {
+        return None;
+    }
+    d.get("key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 impl StateStore {
     pub fn get(&self, export_name: &str) -> Result<CursorState> {
         Ok(self
@@ -36,12 +62,12 @@ impl StateStore {
         let Some(value) = state.last_cursor_value.as_deref() else {
             return Ok(state);
         };
-        let owner = match &state.cursor_column {
-            Some(c) => Some(c.clone()),
-            None => self.legacy_cursor_owner(export_name, value)?,
+        let (owner, legacy) = match &state.cursor_column {
+            Some(c) => (Some(c.clone()), false),
+            None => (self.legacy_cursor_owner(export_name, value)?, true),
         };
         if let Some(owner) = owner
-            && owner != expected
+            && !identity_matches(&owner, expected, legacy)
         {
             anyhow::bail!(
                 "export '{export_name}': the stored cursor `{value}` was written for `{owner}`, \
@@ -54,18 +80,20 @@ impl StateStore {
         Ok(state)
     }
 
-    /// Owner of a pre-v26 row: the key of the latest successful keyset run that wrote this value.
+    /// Owner of a pre-v26 row: the key of the latest successful run that wrote this
+    /// value — a keyset run's `chunk_key`, or the cursor column an incremental run
+    /// named in its key descriptor.
     fn legacy_cursor_owner(&self, export_name: &str, value: &str) -> Result<Option<String>> {
         let latest = self.query_opt(
-            "SELECT mode, chunk_key, cursor_max FROM export_metrics \
+            "SELECT mode, chunk_key, cursor_max, key_descriptor_json FROM export_metrics \
              WHERE export_name = ?1 AND status = 'success' ORDER BY id DESC LIMIT 1",
             &[export_name.into()],
-            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2)),
+            |r| (r.opt_text(0), r.opt_text(1), r.opt_text(2), r.opt_text(3)),
         )?;
         Ok(match latest {
-            Some((Some(mode), Some(key), Some(max))) if mode == "keyset" && max == value => {
-                Some(key)
-            }
+            Some((_, _, Some(max), _)) if max != value => None,
+            Some((Some(mode), Some(key), Some(_), _)) if mode == "keyset" => Some(key),
+            Some((_, _, Some(_), Some(descriptor))) => descriptor_cursor_column(&descriptor),
             _ => None,
         })
     }
@@ -97,8 +125,10 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance the cursor value only, leaving any recorded `cursor_column` as is.
-    pub fn update(&self, export_name: &str, cursor_value: &str) -> Result<()> {
+    /// Advance the cursor value without an identity: a pre-v26 row, as a fixture writes
+    /// it. Every runner records which column the value belongs to (`update_with_column`).
+    #[allow(dead_code)] // fixtures only: unit, offline and live tests stage pre-v26 rows
+    pub fn update_legacy(&self, export_name: &str, cursor_value: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_state (export_name, last_cursor_value, last_run_at)
              VALUES (?1, ?2, ?3)
@@ -207,7 +237,7 @@ mod tests {
     #[test]
     fn update_then_get_returns_stored_cursor() {
         let s = store();
-        s.update("orders", "2024-06-01").unwrap();
+        s.update_legacy("orders", "2024-06-01").unwrap();
         assert_eq!(
             s.get("orders").unwrap().last_cursor_value.as_deref(),
             Some("2024-06-01")
@@ -217,8 +247,8 @@ mod tests {
     #[test]
     fn update_overwrites_previous_cursor() {
         let s = store();
-        s.update("orders", "100").unwrap();
-        s.update("orders", "200").unwrap();
+        s.update_legacy("orders", "100").unwrap();
+        s.update_legacy("orders", "200").unwrap();
         assert_eq!(
             s.get("orders").unwrap().last_cursor_value.as_deref(),
             Some("200")
@@ -228,7 +258,7 @@ mod tests {
     #[test]
     fn reset_clears_cursor_state() {
         let s = store();
-        s.update("orders", "100").unwrap();
+        s.update_legacy("orders", "100").unwrap();
         s.reset("orders").unwrap();
         assert!(s.get("orders").unwrap().last_cursor_value.is_none());
     }
@@ -240,7 +270,7 @@ mod tests {
         // resume from it (skipping the whole table) — WITHOUT dropping the fresh
         // resume_run_id it is about to set (crash-recovery needs that).
         let s = store();
-        s.update("orders", "9000000").unwrap();
+        s.update_legacy("orders", "9000000").unwrap();
         s.set_resume_run_id("orders", "run_2").unwrap();
         s.clear_cursor_value("orders").unwrap();
         assert!(
@@ -262,9 +292,9 @@ mod tests {
     #[test]
     fn list_all_returns_entries_sorted_by_name() {
         let s = store();
-        s.update("gamma", "3").unwrap();
-        s.update("alpha", "1").unwrap();
-        s.update("beta", "2").unwrap();
+        s.update_legacy("gamma", "3").unwrap();
+        s.update_legacy("alpha", "1").unwrap();
+        s.update_legacy("beta", "2").unwrap();
         let all = s.list_all().unwrap();
         assert_eq!(all[0].export_name, "alpha");
         assert_eq!(all[2].export_name, "gamma");
@@ -283,8 +313,8 @@ mod tests {
     #[test]
     fn duplicate_cursor_values_are_stored_as_written() {
         let s = store();
-        s.update("orders", "2024-06-01T00:00:00Z").unwrap();
-        s.update("orders", "2024-06-01T00:00:00Z").unwrap();
+        s.update_legacy("orders", "2024-06-01T00:00:00Z").unwrap();
+        s.update_legacy("orders", "2024-06-01T00:00:00Z").unwrap();
         assert_eq!(
             s.get("orders").unwrap().last_cursor_value.as_deref(),
             Some("2024-06-01T00:00:00Z")
@@ -298,7 +328,7 @@ mod tests {
     fn high_precision_timestamp_is_preserved_byte_for_byte() {
         let s = store();
         let ts = "2024-06-01T12:34:56.123456789+02:00";
-        s.update("events", ts).unwrap();
+        s.update_legacy("events", ts).unwrap();
         assert_eq!(
             s.get("events").unwrap().last_cursor_value.as_deref(),
             Some(ts)
@@ -318,7 +348,7 @@ mod tests {
             "",
         ];
         for v in values {
-            s.update("t", v).unwrap();
+            s.update_legacy("t", v).unwrap();
             assert_eq!(
                 s.get("t").unwrap().last_cursor_value.as_deref(),
                 Some(v),
@@ -332,7 +362,7 @@ mod tests {
     #[test]
     fn reset_clears_cursor_state_completely() {
         let s = store();
-        s.update("orders", "2024-06-01").unwrap();
+        s.update_legacy("orders", "2024-06-01").unwrap();
         s.reset("orders").unwrap();
         let after = s.get("orders").unwrap();
         assert!(after.last_cursor_value.is_none());
@@ -348,7 +378,7 @@ mod tests {
     #[test]
     fn reset_clears_committed_progression() {
         let s = store();
-        s.update("orders", "100").unwrap();
+        s.update_legacy("orders", "100").unwrap();
         s.record_committed_incremental("orders", "100", "run-1")
             .unwrap();
         // Other exports' progression must survive — reset is per-export.
@@ -369,11 +399,27 @@ mod tests {
     }
 
     fn metric(s: &StateStore, mode: &str, key: Option<&str>, max: &str) {
+        metric_with_descriptor(s, mode, key, max, None);
+    }
+
+    fn metric_with_descriptor(
+        s: &StateStore,
+        mode: &str,
+        key: Option<&str>,
+        max: &str,
+        descriptor: Option<&str>,
+    ) {
         s.execute(
             "INSERT INTO export_metrics \
-             (export_name, run_at, duration_ms, total_rows, status, mode, chunk_key, cursor_max) \
-             VALUES ('orders', '2026-09-11T00:00:00Z', 1, 1, 'success', ?1, ?2, ?3)",
-            &[mode.into(), key.map(str::to_string).into(), max.into()],
+             (export_name, run_at, duration_ms, total_rows, status, mode, chunk_key, cursor_max, \
+              key_descriptor_json) \
+             VALUES ('orders', '2026-09-11T00:00:00Z', 1, 1, 'success', ?1, ?2, ?3, ?4)",
+            &[
+                mode.into(),
+                key.map(str::to_string).into(),
+                max.into(),
+                descriptor.map(str::to_string).into(),
+            ],
         )
         .unwrap();
     }
@@ -408,7 +454,7 @@ mod tests {
     fn update_keeps_the_recorded_column() {
         let s = store();
         s.update_with_column("orders", "1", "id").unwrap();
-        s.update("orders", "2").unwrap();
+        s.update_legacy("orders", "2").unwrap();
         assert_eq!(
             s.get("orders").unwrap().cursor_column.as_deref(),
             Some("id")
@@ -425,21 +471,86 @@ mod tests {
     #[test]
     fn legacy_row_is_owned_by_the_keyset_run_that_wrote_it() {
         let s = store();
-        s.update("orders", "3711169").unwrap();
+        s.update_legacy("orders", "3711169").unwrap();
         metric(&s, "keyset", Some("idvisit"), "3711169");
         assert!(s.get_owned("orders", "idvisit").is_ok());
         assert!(s.get_owned("orders", "visit_last_action_time").is_err());
     }
 
+    /// A 0.25.0 incremental run left no `cursor_column`, but its `export_metrics` row
+    /// carries `key_descriptor_json = {"strategy":"incremental","key":<column>}` and the
+    /// value it wrote: the cursor is attributed to that column, and a switched
+    /// `cursor_column` is refused instead of comparing the new column against the old
+    /// column's value (MT6 — the field bug on every 0.25.0 upgrade). RED against the
+    /// keyset-only attribution.
+    #[test]
+    fn legacy_row_is_owned_by_the_incremental_run_that_wrote_it() {
+        let s = store();
+        s.update_legacy("orders", "3711169").unwrap();
+        metric_with_descriptor(
+            &s,
+            "incremental",
+            None,
+            "3711169",
+            Some(r#"{"strategy":"incremental","key":"idvisit","db_type":"int(10) unsigned"}"#),
+        );
+        assert!(s.get_owned("orders", "idvisit").is_ok());
+        let err = s
+            .get_owned("orders", "visit_last_action_time")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("written for `idvisit`"), "{err}");
+        assert!(err.contains("state reset"), "{err}");
+        // The descriptor names the primary column; a coalesce identity led by it is the
+        // same cursor continuing, not a switch.
+        assert!(
+            s.get_owned("orders", "coalesce(idvisit,updated_at)")
+                .is_ok()
+        );
+        assert!(
+            s.get_owned("orders", "coalesce(updated_at,idvisit)")
+                .is_err()
+        );
+        // Another value than the one the run wrote: not that run's cursor.
+        let t = store();
+        t.update_legacy("orders", "500").unwrap();
+        metric_with_descriptor(
+            &t,
+            "incremental",
+            None,
+            "499",
+            Some(r#"{"strategy":"incremental","key":"id"}"#),
+        );
+        assert!(t.get_owned("orders", "other").is_ok());
+    }
+
+    #[test]
+    fn a_recorded_identity_is_matched_exactly_and_a_legacy_one_by_its_leading_column() {
+        assert!(identity_matches("id", "id", false));
+        assert!(!identity_matches("id", "coalesce(id,updated_at)", false));
+        assert!(identity_matches("id", "coalesce(id,updated_at)", true));
+        assert!(!identity_matches("id", "coalesce(idx,updated_at)", true));
+        assert!(!identity_matches("id", "coalesce(updated_at,id)", true));
+        assert_eq!(
+            descriptor_cursor_column(r#"{"strategy":"incremental","key":"ts"}"#).as_deref(),
+            Some("ts")
+        );
+        assert_eq!(
+            descriptor_cursor_column(r#"{"strategy":"chunked","key":"id"}"#),
+            None
+        );
+        assert_eq!(descriptor_cursor_column("not json"), None);
+    }
+
     #[test]
     fn legacy_row_without_a_matching_keyset_run_is_not_refused() {
         let s = store();
-        s.update("orders", "2026-09-11 10:00:00").unwrap();
+        s.update_legacy("orders", "2026-09-11 10:00:00").unwrap();
         metric(&s, "keyset", Some("idvisit"), "3711169");
         assert!(s.get_owned("orders", "updated_at").is_ok());
 
         let t = store();
-        t.update("orders", "500").unwrap();
+        t.update_legacy("orders", "500").unwrap();
         metric(&t, "incremental", None, "500");
         assert!(t.get_owned("orders", "anything").is_ok());
     }

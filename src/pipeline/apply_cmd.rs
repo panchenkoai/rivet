@@ -230,7 +230,7 @@ pub fn run_apply_command(
         let cfg_dir = Path::new(cfg_path)
             .parent()
             .unwrap_or_else(|| Path::new("."));
-        super::load_spec::record_after_run(&config, export, &state, cfg_dir, None, &summary.run_id);
+        super::load_spec::record_after_run(&config, export, &state, cfg_dir, None, &summary);
     }
 
     // 7. The run's tail. This arm is a FULL orchestrator — it opens the state

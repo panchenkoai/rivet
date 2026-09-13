@@ -171,6 +171,10 @@ pub struct RunSummary {
     pub cursor_column: Option<String>,
     pub cursor_low: Option<String>,
     pub cursor_high: Option<String>,
+    /// The source columns as the run resolved them at OPEN — what the load spec records.
+    pub open_mappings: Option<Vec<crate::types::TypeMapping>>,
+    /// The source primary key of the run's table, read at OPEN with the mappings.
+    pub open_primary_key: Option<Vec<String>>,
     pub error_message: Option<String>,
     /// v18 failure forensics. `offending_value`: the last key read before an
     /// unadvanceable keyset row (with `cursor_high` this brackets the value that
@@ -330,6 +334,8 @@ impl RunSummary {
             cursor_column: None,
             cursor_low: None,
             cursor_high: None,
+            open_mappings: None,
+            open_primary_key: None,
             journal,
         }
     }
@@ -406,6 +412,8 @@ impl RunSummary {
             cursor_column: None,
             cursor_low: None,
             cursor_high: None,
+            open_mappings: None,
+            open_primary_key: None,
             journal,
         }
     }

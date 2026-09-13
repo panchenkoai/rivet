@@ -238,7 +238,7 @@ const MATRICES: &[(&str, usize)] = &[
     // At 0 this ledger admits nothing: any new gap cell fails here immediately.
     ("docs/runner-coverage-matrix.yaml", 0),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
-    ("docs/mode-transition-matrix.yaml", 3),
+    ("docs/mode-transition-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
@@ -265,6 +265,12 @@ struct Matrix {
     /// per-matrix so a ledger can be keyed on engines (postgres/mysql/…) or on
     /// warehouse targets (duckdb/bigquery/…) with the same guard.
     engines: Vec<String>,
+    /// Keyed on the warehouses `rivet load` writes (`LoadTargetKind`), not on every
+    /// `ExportTarget` the type resolver knows: the completeness check then demands
+    /// exactly the load targets, so a ledger about loading carries no `na` column
+    /// for a warehouse nothing can load into.
+    #[serde(default)]
+    load_targets: bool,
     scenarios: Vec<Scenario>,
 }
 
@@ -806,9 +812,24 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
         "DestinationType parse produced {dests:?} (expected the 5 destination kinds)"
     );
 
+    let load_targets = enum_variants_lowercased("src/config/load.rs", "LoadTargetKind");
+    assert!(
+        load_targets.len() == 2 && load_targets.contains("bigquery"),
+        "LoadTargetKind parse produced {load_targets:?} (expected the 2 load targets)"
+    );
+
     for (path, _) in MATRICES {
         let matrix = load_matrix(path);
         let declared: HashSet<&str> = matrix.engines.iter().map(String::as_str).collect();
+        if matrix.load_targets {
+            let want: HashSet<&str> = load_targets.iter().map(String::as_str).collect();
+            assert_eq!(
+                declared, want,
+                "{path} is keyed on LOAD targets (`load_targets: true`) and must declare exactly \
+                 the `LoadTargetKind` variants — a warehouse `rivet load` gained or lost"
+            );
+            continue;
+        }
         let keyed_on_sources = matrix.engines.iter().any(|e| sources.contains(e.as_str()));
         let keyed_on_targets = matrix.engines.iter().any(|e| targets.contains(e.as_str()));
         // Ordered after the other two on purpose: `local`/`s3`/`gcs` are unique

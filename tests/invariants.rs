@@ -179,7 +179,9 @@ fn i3_cursor_absent_until_explicitly_updated() {
         "cursor must be absent before any run"
     );
 
-    state.update("my_export", "2024-06-01T00:00:00Z").unwrap();
+    state
+        .update_legacy("my_export", "2024-06-01T00:00:00Z")
+        .unwrap();
 
     let after = state.get("my_export").unwrap();
     assert_eq!(
@@ -194,8 +196,8 @@ fn i3_cursor_absent_until_explicitly_updated() {
 #[test]
 fn i3_cursor_update_is_last_write_wins() {
     let state = StateStore::open_in_memory().unwrap();
-    state.update("exp", "2024-01-01T00:00:00Z").unwrap();
-    state.update("exp", "2024-06-15T00:00:00Z").unwrap();
+    state.update_legacy("exp", "2024-01-01T00:00:00Z").unwrap();
+    state.update_legacy("exp", "2024-06-15T00:00:00Z").unwrap();
 
     let val = state.get("exp").unwrap().last_cursor_value.unwrap();
     assert_eq!(
@@ -215,9 +217,9 @@ fn i3_cursor_update_is_last_write_wins() {
 #[test]
 fn i3_state_store_does_not_enforce_cursor_monotonicity() {
     let state = StateStore::open_in_memory().unwrap();
-    state.update("exp", "2024-06-15T00:00:00Z").unwrap();
+    state.update_legacy("exp", "2024-06-15T00:00:00Z").unwrap();
     // Deliberately write an older value — the store accepts it without error.
-    state.update("exp", "2024-01-01T00:00:00Z").unwrap();
+    state.update_legacy("exp", "2024-01-01T00:00:00Z").unwrap();
 
     let val = state.get("exp").unwrap().last_cursor_value.unwrap();
     assert_eq!(

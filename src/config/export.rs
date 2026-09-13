@@ -372,11 +372,8 @@ pub struct ExportConfig {
     ///       pk: [id]                                        # this table's pk
     ///       partition: { column: created_at, granularity: day, expiration_days: 400 }
     /// ```
-    ///
-    /// Raw JSON (parsed by the load module) so `config` carries no load types —
-    /// mirrors the top-level [`crate::config::Config::load`].
     #[serde(default)]
-    pub load: Option<serde_json::Value>,
+    pub load: Option<crate::config::load::LoadOverride>,
 
     /// Policy applied when structural schema drift is detected (column added, removed, or retyped).
     /// Defaults to `warn`: log a warning and continue.

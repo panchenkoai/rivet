@@ -540,7 +540,7 @@ fn collect_one(
 }
 
 /// One unit's resolved mappings, with overrides that narrow the source type downgraded to lossy.
-fn probe_mappings(
+pub(crate) fn probe_mappings(
     src: &mut dyn source::Source,
     query: &str,
     column_overrides: &ColumnOverrides,
