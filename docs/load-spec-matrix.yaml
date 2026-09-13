@@ -204,6 +204,16 @@ scenarios:
     bigquery:   { test: bigquery_incremental_first_run_lands_as_a_table_and_the_first_delta_starts_the_changelog }
     snowflake:  { test: a_whole_table_run_joins_the_log_when_the_name_is_already_the_view }
 
+  - id: full_then_incremental_adopts_the_table
+    what: "an export switched from `mode: full` to incremental: the first incremental run is a whole pass (MT1) and OVERWRITES the table; only the first delta renames it into `__changes` (baseline adopted whole, nothing copied) with the view under the old name — counted in the warehouse per leg"
+    bigquery:   { test: bigquery_full_load_then_incremental_adopts_the_table_as_the_change_log }
+    snowflake:  { test: adoption_renames_the_table_and_adds_the_meta_columns }
+
+  - id: incremental_onto_a_pre_existing_table_refused
+    what: "`mode: incremental` from the first run onto a table already in the dataset that the ledger does not know: refused on every attempt, nothing written, no `__changes` adopted"
+    bigquery:   { test: bigquery_incremental_onto_a_table_already_in_the_dataset_is_refused_every_time }
+    snowflake:  { test: a_table_rivet_did_not_load_is_not_taken_over }
+
   - id: rebuild_carries_the_logs_properties
     what: "`--rebuild-changelog` carries description, labels, friendly name, table expiry and the KMS key onto the copy, and refuses a log with column policy tags or row access policies (a copy carries neither)"
     bigquery:   { test: a_rebuild_carries_the_logs_properties_and_refuses_the_policies_it_cannot }

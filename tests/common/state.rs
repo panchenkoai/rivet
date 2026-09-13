@@ -106,6 +106,20 @@ impl StateDb {
             .flatten()
     }
 
+    /// The column the persisted cursor belongs to (`export_state.cursor_column`), or
+    /// `None` when the export has no row or the row predates the identity (pre-v26).
+    pub fn cursor_column(&self, export: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT cursor_column FROM export_state WHERE export_name = ?1",
+                [export],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("query export_state")
+            .flatten()
+    }
+
     /// The `load_run.status` of every load into `target_table`, oldest first.
     pub fn load_statuses(&self, target_table: &str) -> Vec<String> {
         let mut stmt = self

@@ -832,3 +832,170 @@ fn bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebu
     );
     assert_eq!(bq.read_bq_table_type(&rebuild), None);
 }
+
+/// The documented switch: an export runs `mode: full` for a while, then becomes
+/// incremental. MT1 says `full` stores no cursor, so the first incremental run re-reads
+/// the whole table and lands as the table again (an overwrite of rivet's own); only the
+/// FIRST DELTA turns that table into `<table>__changes` — by renaming it, so its rows
+/// become the baseline and nothing is copied or re-loaded — and the old name becomes the
+/// current-state view.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_full_load_then_incremental_adopts_the_table_as_the_change_log() {
+    let Some(bq) = BqLive::from_env("bq_full_to_inc") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("bq_full_to_inc");
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    e.insert(&table, 1..=10, 10, Some(1));
+
+    // 1. `mode: full` → a plain table.
+    let rig = e
+        .rig(&table)
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(""));
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_table_type(&table).as_deref(), Some("BASE TABLE"));
+    let after_full = bq.read_bq_count(&table);
+    assert_eq!(
+        after_full, "10",
+        "the full load's rows, counted in BigQuery"
+    );
+    assert_eq!(bq.read_bq_table_type(&changes), None, "no change log yet");
+
+    // 2. Switch to incremental (MT1): no cursor was stored, so this run is a whole-table
+    //    pass and lands as the table — still a table, no change log.
+    e.insert(&table, 11..=13, 5, Some(2));
+    let rig = rig.restage("incremental", &["cursor_column: id"]);
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(
+        bq.read_bq_table_type(&table).as_deref(),
+        Some("BASE TABLE"),
+        "the first incremental run is a full pass (MT1), so it lands as the table"
+    );
+    let after_whole_pass = bq.read_bq_count(&table);
+    assert_eq!(
+        after_whole_pass, "13",
+        "the whole pass OVERWRITES the full load's table — 13 rows, not 10 + 13"
+    );
+    assert_eq!(bq.read_bq_table_type(&changes), None, "still no change log");
+    assert_eq!(
+        StateDb::next_to_config(&rig.config_path()).cursor_column(&table),
+        Some("id".to_string()),
+        "and the cursor is recorded under its column"
+    );
+
+    // 3. The first delta adopts the table as the change log (rename, no copy) and puts
+    //    the current-state view under the old name.
+    e.insert(&table, 14..=16, 5, Some(3));
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_table_type(&table).as_deref(), Some("VIEW"));
+
+    // Counted in BigQuery, split by leg: the adopted baseline (ids 1..=13, everything the
+    // full + whole-pass legs had landed) and the incremental delta (ids 14..=16).
+    let log_total = bq.read_bq_count(&changes);
+    let adopted = bq.read_bq_count_where(&changes, "id <= 13");
+    let via_incremental = bq.read_bq_count_where(&changes, "id >= 14");
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d FROM `{}.{}.{changes}`",
+        bq.project, bq.dataset
+    ));
+    let view = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d FROM `{}.{}.{table}`",
+        bq.project, bq.dataset
+    ));
+    eprintln!(
+        "BQ COUNTS full={after_full} whole_pass={after_whole_pass} log_total={log_total} \
+         adopted_baseline={adopted} via_incremental_delta={via_incremental} \
+         log_distinct={:?} view={:?}",
+        rows[0]["d"].as_str(),
+        view[0]["n"].as_str()
+    );
+    assert_eq!(
+        (adopted.as_str(), via_incremental.as_str()),
+        ("13", "3"),
+        "the baseline is adopted whole and only the delta is appended"
+    );
+    assert_eq!(
+        log_total, "16",
+        "13 adopted as the baseline + 3 delta — nothing copied, nothing re-loaded"
+    );
+    assert_eq!(
+        (rows[0]["n"].as_str(), rows[0]["d"].as_str()),
+        (Some("16"), Some("16")),
+        "and no row is duplicated by the adoption"
+    );
+    assert_eq!(
+        (view[0]["n"].as_str(), view[0]["d"].as_str()),
+        (Some("16"), Some("16")),
+        "the view is the current state, one row per key"
+    );
+}
+
+/// `mode: incremental` from the very first run, onto a table that is ALREADY in the
+/// dataset and that rivet's ledger knows nothing about. The whole-table first pass would
+/// overwrite it and the first delta would rename it into the change log, so both are
+/// refused — on every attempt, not just the first (the refusal is journaled `refused`,
+/// which never makes the table rivet's own).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
+fn bigquery_incremental_onto_a_table_already_in_the_dataset_is_refused_every_time() {
+    let Some(bq) = BqLive::from_env("bq_inc_existing") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("bq_inc_existing");
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    e.insert(&table, 1..=10, 10, Some(1));
+    // Someone else's table, with the export's exact columns: nothing but the ownership
+    // guard can refuse it.
+    bq.exec(&format!(
+        "CREATE TABLE `{}.{}.{table}` (id INT64, ext_id INT64, server_time DATETIME, \
+         updated_at DATETIME, time_spent INT64)",
+        bq.project, bq.dataset
+    ));
+
+    let rig = e
+        .rig(&table)
+        .restage("incremental", &["cursor_column: id"])
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(""));
+    rig.run_ok();
+    for attempt in 1..=2 {
+        let said = load_fails(&rig);
+        assert!(
+            said.contains("no record of rivet loading it"),
+            "attempt {attempt} refuses for the same reason:\n{said}"
+        );
+        assert_eq!(
+            bq.read_bq_count(&table),
+            "0",
+            "attempt {attempt}: untouched"
+        );
+        assert_eq!(
+            bq.read_bq_table_type(&table).as_deref(),
+            Some("BASE TABLE"),
+            "attempt {attempt}: still their table, not a view"
+        );
+        assert_eq!(
+            bq.read_bq_table_type(&changes),
+            None,
+            "attempt {attempt}: nothing adopted"
+        );
+    }
+    let loads = StateDb::next_to_config(&rig.config_path())
+        .load_statuses(&format!("{}.{}.{table}", bq.project, bq.dataset));
+    assert_eq!(
+        loads,
+        ["refused", "refused"],
+        "a stop before the write is journaled `refused`, never `failed`"
+    );
+}
