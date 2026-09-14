@@ -7,7 +7,7 @@ use crate::pipeline::summary::RunSummary;
 use crate::state::{LoadSpecColumn, StateStore};
 
 /// Record what `rivet load` plans from after a successful run of an export in a
-/// config with a `load:` block: the columns the run resolved at open and the key it
+/// any run: the columns it resolved at open and the key it
 /// read then; a run whose open probe failed (or a CDC multiplex export, which has
 /// no single probe) is captured from the source. A failed capture warns and keeps
 /// the previous record.
@@ -19,7 +19,7 @@ pub(super) fn record_after_run(
     params: Option<&HashMap<String, String>>,
     summary: &RunSummary,
 ) {
-    if config.load.is_none() || export.snapshot_parent.is_some() {
+    if export.snapshot_parent.is_some() {
         return;
     }
     let recorded = match &summary.open_mappings {
@@ -30,6 +30,8 @@ pub(super) fn record_after_run(
             summary.open_primary_key.as_deref(),
             &summary.run_id,
         ),
+        // Capturing costs a second source connection, so pay it only for a configured load.
+        None if config.load.is_none() => return,
         None => capture_and_record(config, export, state, config_dir, params, &summary.run_id),
     };
     if let Err(e) = recorded {

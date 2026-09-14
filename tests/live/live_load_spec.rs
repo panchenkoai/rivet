@@ -81,9 +81,10 @@ fn a_query_export_records_its_columns_and_no_key() {
     assert_eq!(key, None);
 }
 
+/// A run records the spec with no `load:` block, so adding one later needs no re-run.
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]
-fn a_config_without_a_load_block_records_no_load_spec() {
+fn a_config_without_a_load_block_still_records_the_load_spec() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("load_spec_none");
@@ -92,11 +93,11 @@ fn a_config_without_a_load_block_records_no_load_spec() {
     rig.run_ok();
 
     assert_eq!(read_ids(&rig.out_dir()), vec![1, 2, 3]);
-    assert!(
-        StateDb::next_to_config(&rig.config_path())
-            .load_spec(&table, None)
-            .is_none()
-    );
+    let (columns, key) = StateDb::next_to_config(&rig.config_path())
+        .load_spec(&table, None)
+        .expect("the run records the spec with no `load:` block");
+    assert!(columns.contains(&"id".to_string()), "{columns:?}");
+    assert_eq!(key, Some(vec!["id".to_string()]));
 }
 
 #[test]

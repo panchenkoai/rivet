@@ -1562,7 +1562,7 @@ fn run_export_job_inner(
             apply_context: None,
             allow_reconcile: true,
             notifications: config.notifications.as_ref(),
-            record_load_spec: config.load.is_some(),
+            record_load_spec: true,
             plan_warnings,
         },
     )
