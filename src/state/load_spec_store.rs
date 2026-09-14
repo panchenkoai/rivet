@@ -72,13 +72,14 @@ impl StateStore {
     ) -> Result<()> {
         let columns_json = serde_json::to_string(columns)?;
         let primary_key_json = primary_key.map(serde_json::to_string).transpose()?;
+        // Bound, not `CASE WHEN ?4 IS NULL`: Postgres cannot type a parameter from `IS NULL`.
+        let key_origin = primary_key_json.as_ref().map(|_| "run".to_string());
         let now = chrono::Utc::now().to_rfc3339();
         self.execute(
             "INSERT INTO export_load_spec
                  (export_name, unit, columns_json, primary_key_json, key_origin,
                   run_id, origin, captured_at)
-             VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 IS NULL THEN NULL ELSE 'run' END,
-                     ?5, 'run', ?6)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'run', ?7)
              ON CONFLICT (export_name, unit) DO UPDATE SET
                  columns_json     = excluded.columns_json,
                  primary_key_json = CASE
@@ -97,6 +98,7 @@ impl StateStore {
                 unit.unwrap_or("").into(),
                 columns_json.into(),
                 primary_key_json.into(),
+                key_origin.into(),
                 run_id.into(),
                 now.into(),
             ],
