@@ -431,7 +431,8 @@ def verify_concurrent_writers_share_a_prefix(
     # the same independent decode, plus a copy step.
     dl = work / f"dl_gcs_{stamp}"
     dl.mkdir(parents=True, exist_ok=True)
-    pulled = run(["gsutil", "-m", "cp", "-r", f"gs://{bucket}/{pfx}/*", str(dl)], timeout=900)
+    # `gcloud storage`, not `gsutil -m`: -m workers hold the captured pipe open and hang.
+    pulled = run(["gcloud", "storage", "cp", "-r", f"gs://{bucket}/{pfx}/*", str(dl)], timeout=900)
     rows_read = _duckdb_count(f"{dl}/**/*.parquet") if pulled.ok else None
     if rows_read is None:
         _skipped(led, "-", "-", "concurrent_writers_share_a_prefix", "gcs-rows",

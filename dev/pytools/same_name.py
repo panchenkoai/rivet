@@ -217,7 +217,8 @@ def bigquery_leg(work: Path) -> tuple[str, list[str], list[str]]:
             )
     else:
         problems.append(f"could not read the loaded table back: {q}")
-    sh(["gsutil", "-m", "rm", "-r", f"gs://{BUCKET}/{pfx}"], timeout=600)
+    # `gcloud storage`, not `gsutil -m`: -m workers hold the captured pipe open and hang.
+    sh(["gcloud", "storage", "rm", "-r", f"gs://{BUCKET}/{pfx}"], timeout=600)
     sh(["bq", "--project_id", BQ_PROJECT, "rm", "-f", "-t", f"{BQ_DATASET}.{TABLE}"], timeout=300)
     return label, problems, notes
 
