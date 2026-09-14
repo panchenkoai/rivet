@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.26.0 — 2026-09-14
+
 - **`load: { partition }` — the warehouse table's partitioning, per table**
   ([ADR-0034](docs/adr/0034-load-table-spec.md)). `partition: { column: ts, granularity: day,
   expiration_days: 400, require_filter: true }` partitions the table the load writes by a DATE /
