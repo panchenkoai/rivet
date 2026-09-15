@@ -159,6 +159,7 @@ pub(crate) fn read_keyset_page_bounded(
         export_name: plan.export_name.clone(),
         last_cursor_value: Some(v.to_string()),
         last_run_at: None,
+        cursor_column: None,
     });
     let mut sink = ExportSink::new(plan)?;
     src.export(
@@ -436,9 +437,10 @@ fn run_keyset_parallel(
     let incremental = kp.incremental;
     let (floor, ceil): (Option<String>, Option<String>) = if incremental && resume_run_id.is_none()
     {
-        let anchor = state
-            .and_then(|s| s.get(&plan.export_name).ok())
-            .and_then(|c| c.last_cursor_value);
+        let anchor = match state {
+            Some(s) => s.get_owned(&plan.export_name, &key)?.last_cursor_value,
+            None => None,
+        };
         let key_q = crate::sql::quote_ident(plan.source.source_type, &key);
         let cur_max = src.query_scalar(&format!(
             "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
@@ -1014,6 +1016,7 @@ pub(crate) fn run_keyset(
         primary_column: kp.key_column.clone(),
         fallback_column: None,
         mode: IncrementalCursorMode::SingleColumn,
+        settle: None,
     };
 
     // Parallel keyset (feat/parallel-keyset): N ROW-percentile-range workers seek
@@ -1060,9 +1063,13 @@ pub(crate) fn run_keyset(
     summary.resumed = recovering_crash;
 
     let mut last: Option<String> = if kp.checkpoint && (recovering_crash || kp.incremental) {
-        state
-            .and_then(|s| s.get(&plan.export_name).ok())
-            .and_then(|cs| cs.last_cursor_value)
+        match state {
+            Some(s) => {
+                s.get_owned(&plan.export_name, &kp.key_column)?
+                    .last_cursor_value
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -1240,7 +1247,7 @@ pub(crate) fn run_keyset(
         if kp.checkpoint
             && let (Some(st), Some(v)) = (state, page.next_cursor.as_ref())
         {
-            st.update(&plan.export_name, v)?;
+            st.update_with_column(&plan.export_name, v, &kp.key_column)?;
         }
         // Fault point: page durably committed (parts + file_log + cursor advanced),
         // NO destination manifest yet — a crash here must be resume-recoverable

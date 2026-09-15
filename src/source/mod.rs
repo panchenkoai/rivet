@@ -388,6 +388,69 @@ pub trait Source: Send {
     fn server_context(&mut self) -> Option<String> {
         None
     }
+
+    /// The primary key columns of `table` in key order; `None` when it has none
+    /// or the engine cannot tell.
+    fn primary_key(&mut self, _table: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+}
+
+/// Split a catalog's unit-separator-joined key list; an empty list is no key.
+pub(crate) fn split_key_list(joined: Option<String>) -> Option<Vec<String>> {
+    let cols: Vec<String> = joined?
+        .split('\u{1f}')
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!cols.is_empty()).then_some(cols)
+}
+
+/// Name the `url:` host and port when a connection failed before the server answered —
+/// an unresolvable name, a refused port, a timeout — since the driver's text alone
+/// does not say which part of the URL is wrong. Other errors pass through unchanged.
+pub(crate) fn describe_connect_error(url: &str, err: anyhow::Error) -> anyhow::Error {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    let (host, port) = url_host_port(url);
+    let at = if port.is_empty() {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    let hint = if [
+        "failed to lookup address",
+        "nodename nor servname",
+        "name or service not known",
+        "no such host",
+        "temporary failure in name resolution",
+        "dns error",
+    ]
+    .iter()
+    .any(|p| text.contains(p))
+    {
+        format!("cannot resolve host `{host}` — check the host name in `url:`")
+    } else if text.contains("connection refused") {
+        format!("nothing is listening on {at} — check the port in `url:` and that the server is up")
+    } else if text.contains("timed out") || text.contains("timeout") {
+        format!("no answer from {at} — check the host and port in `url:`, and the firewall")
+    } else {
+        return err;
+    };
+    anyhow::anyhow!("{hint} (driver: {err:#})")
+}
+
+/// The `(host, port)` of a connection URL; the port is empty when the URL has none.
+fn url_host_port(url: &str) -> (String, String) {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let hosts = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let first = hosts.split(',').next().unwrap_or(hosts);
+    match first.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.trim_matches(['[', ']']).to_string(), p.to_string())
+        }
+        _ => (first.trim_matches(['[', ']']).to_string(), String::new()),
+    }
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
@@ -448,6 +511,118 @@ pub(crate) fn value_within_ceiling(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod connect_error_tests {
+    use super::{describe_connect_error, url_host_port};
+
+    fn described(url: &str, driver: &str) -> String {
+        format!(
+            "{:#}",
+            describe_connect_error(url, anyhow::anyhow!("{driver}"))
+        )
+    }
+
+    #[test]
+    fn an_unresolvable_host_is_named_on_every_engine() {
+        let cases = [
+            (
+                "postgresql://u:p@nosuch-host.invalid:5432/db",
+                "error connecting to server: failed to lookup address information: nodename nor servname provided, or not known",
+            ),
+            (
+                "mysql://u:p@nosuch-host.invalid:3306/db",
+                "DriverError { Could not connect to address `nosuch-host.invalid:3306': failed to lookup address information: nodename nor servname provided, or not known }",
+            ),
+            (
+                "sqlserver://u:p@nosuch-host.invalid:1433/db",
+                "mssql: TCP connect failed: failed to lookup address information: nodename nor servname provided, or not known",
+            ),
+            (
+                "mongodb://nosuch-host.invalid:27017/db",
+                "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: nosuch-host.invalid:27017, Type: Unknown, Error: Kind: I/O error: failed to lookup address information: nodename nor servname provided, or not known, labels: {}, source: None } ] }",
+            ),
+            (
+                "postgresql://u:p@nosuch-host.invalid/db",
+                "error connecting to server: Name or service not known",
+            ),
+        ];
+        for (url, driver) in cases {
+            let msg = described(url, driver);
+            assert!(
+                msg.starts_with(
+                    "cannot resolve host `nosuch-host.invalid` — check the host name in `url:`"
+                ),
+                "{url}: {msg}"
+            );
+            assert!(msg.contains("driver:"), "the driver's text stays: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_refused_port_and_a_timeout_name_the_endpoint() {
+        let refused = described(
+            "postgresql://u:p@127.0.0.1:1/db",
+            "error connecting to server: Connection refused (os error 61)",
+        );
+        assert!(
+            refused.starts_with("nothing is listening on 127.0.0.1:1"),
+            "{refused}"
+        );
+        let timeout = described(
+            "mysql://u:p@10.0.0.9:3306/db",
+            "DriverError { Could not connect to address `10.0.0.9:3306': connection timed out }",
+        );
+        assert!(
+            timeout.starts_with("no answer from 10.0.0.9:3306"),
+            "{timeout}"
+        );
+    }
+
+    #[test]
+    fn other_errors_pass_through_unchanged() {
+        let auth = "MySqlError { ERROR 1045 (28000): Access denied for user 'u'@'%' }";
+        assert_eq!(described("mysql://u:p@db.example:3306/db", auth), auth);
+    }
+
+    #[test]
+    fn host_and_port_come_out_of_any_url_shape() {
+        let hp = |u: &str| {
+            let (h, p) = url_host_port(u);
+            format!("{h}|{p}")
+        };
+        assert_eq!(
+            hp("postgresql://u:p%40ss@db.example:5432/db?sslmode=require"),
+            "db.example|5432"
+        );
+        assert_eq!(hp("mysql://u:p@10.0.0.5/billing"), "10.0.0.5|");
+        assert_eq!(
+            hp("mongodb://a.example:27017,b.example:27017/db?replicaSet=rs0"),
+            "a.example|27017"
+        );
+        assert_eq!(hp("sqlserver://sa:p@[::1]:1433/db"), "::1|1433");
+        assert_eq!(hp("localhost:5432"), "localhost|5432");
+    }
+}
+
+#[cfg(test)]
+mod key_list_tests {
+    use super::split_key_list;
+
+    #[test]
+    fn a_joined_key_splits_in_key_order_and_an_empty_one_is_no_key() {
+        assert_eq!(
+            split_key_list(Some("tenant\u{1f}id".into())),
+            Some(vec!["tenant".to_string(), "id".to_string()])
+        );
+        assert_eq!(
+            split_key_list(Some("a,b".into())),
+            Some(vec!["a,b".to_string()])
+        );
+        assert_eq!(split_key_list(Some(String::new())), None);
+        assert_eq!(split_key_list(None), None);
+    }
 }
 
 #[cfg(test)]

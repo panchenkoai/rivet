@@ -164,6 +164,17 @@ pub struct IncrementalCursorPlan {
     pub primary_column: String,
     pub fallback_column: Option<String>,
     pub mode: IncrementalCursorMode,
+    /// Settle window; omitted from serialized plans when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle: Option<SettlePlan>,
+}
+
+/// Resolved settle window: rows export once older than `after_secs` by the source clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlePlan {
+    /// Settle column; `None` means the cursor itself.
+    pub column: Option<String>,
+    pub after_secs: u64,
 }
 
 impl IncrementalCursorPlan {
@@ -175,6 +186,32 @@ impl IncrementalCursorPlan {
         match self.mode {
             IncrementalCursorMode::SingleColumn => self.primary_column.as_str(),
             IncrementalCursorMode::Coalesce => Self::RIVET_COALESCE_CURSOR_COL,
+        }
+    }
+
+    /// Identity recorded next to the stored cursor value.
+    pub fn cursor_identity(&self) -> String {
+        match self.mode {
+            IncrementalCursorMode::SingleColumn => self.primary_column.clone(),
+            IncrementalCursorMode::Coalesce => format!(
+                "coalesce({},{})",
+                self.primary_column,
+                self.fallback_column.as_deref().unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Real columns the settle window compares; they must be date/timestamp.
+    pub fn settle_columns(&self) -> Vec<String> {
+        let Some(settle) = &self.settle else {
+            return Vec::new();
+        };
+        match (&settle.column, self.mode) {
+            (Some(c), _) => vec![c.clone()],
+            (None, IncrementalCursorMode::SingleColumn) => vec![self.primary_column.clone()],
+            (None, IncrementalCursorMode::Coalesce) => std::iter::once(self.primary_column.clone())
+                .chain(self.fallback_column.clone())
+                .collect(),
         }
     }
 }
@@ -237,6 +274,15 @@ impl ExtractionStrategy {
         match self {
             ExtractionStrategy::Chunked(cp) => Some(cp.column.as_str()),
             ExtractionStrategy::Keyset(kp) => Some(kp.key_column.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What a cursor persisted by this strategy refers to: the incremental cursor or keyset key.
+    pub fn cursor_identity(&self) -> Option<String> {
+        match self {
+            ExtractionStrategy::Incremental(p) => Some(p.cursor_identity()),
+            ExtractionStrategy::Keyset(k) => Some(k.key_column.clone()),
             _ => None,
         }
     }
@@ -441,6 +487,7 @@ mod tests {
                 primary_column: "updated_at".into(),
                 fallback_column: None,
                 mode: IncrementalCursorMode::SingleColumn,
+                settle: None,
             })
             .reconcile_subset_skip()
             .is_some()
@@ -459,6 +506,7 @@ mod tests {
             primary_column: "updated_at".into(),
             fallback_column: None,
             mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
         });
         assert!(s.needs_cursor_state());
         assert!(!s.is_resumable());

@@ -92,7 +92,7 @@ def start_stores(led: Ledger) -> None:
 
     # MinIO: its own client, run on the host network so 127.0.0.1 means the host.
     run(["docker", "run", "--rm", "--network", "host", "--entrypoint", "sh",
-         "minio/mc:latest", "-c",
+         "quay.io/minio/mc:latest", "-c",
          f"mc alias set o http://127.0.0.1:9000 {scenarios.MINIO_ACCESS_KEY} "
          f"{scenarios.MINIO_SECRET_KEY} >/dev/null 2>&1 && mc mb -p o/{BUCKET} >/dev/null 2>&1; true"],
         timeout=180)

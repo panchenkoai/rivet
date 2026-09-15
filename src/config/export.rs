@@ -160,6 +160,9 @@ pub struct ExportConfig {
     /// How primary (and optional fallback) columns drive incremental progression.
     #[serde(default)]
     pub incremental_cursor_mode: IncrementalCursorMode,
+    /// Incremental only: export a row once it is older than `settle.after` (source clock).
+    #[serde(default)]
+    pub settle: Option<SettleConfig>,
     pub chunk_column: Option<String>,
     #[serde(default)]
     pub chunk_dense: bool,
@@ -354,10 +357,10 @@ pub struct ExportConfig {
     pub target: Option<String>,
 
     /// Per-export overrides for the top-level `load:` block (`pk`,
-    /// `cleanup_source`, `gc_orphans`, `cluster_by`, `allow_source_drift`); any
-    /// field omitted here inherits the top-level value. The warehouse `target`
-    /// is shared and stays in the top-level `load:` — it cannot be overridden
-    /// per export.
+    /// `cleanup_source`, `gc_orphans`, `cluster_by`, `partition`,
+    /// `allow_source_drift`); any field omitted here inherits the top-level
+    /// value. The warehouse `target` is shared and stays in the top-level
+    /// `load:` — it cannot be overridden per export.
     ///
     /// ```yaml
     /// load: { target: bigquery, project: p, dataset: d }   # shared default
@@ -365,13 +368,12 @@ pub struct ExportConfig {
     ///   - name: orders
     ///     table: orders
     ///     mode: cdc
-    ///     load: { pk: [id] }                                # this table's pk
+    ///     load:
+    ///       pk: [id]                                        # this table's pk
+    ///       partition: { column: created_at, granularity: day, expiration_days: 400 }
     /// ```
-    ///
-    /// Raw JSON (parsed by the load module) so `config` carries no load types —
-    /// mirrors the top-level [`crate::config::Config::load`].
     #[serde(default)]
-    pub load: Option<serde_json::Value>,
+    pub load: Option<crate::config::load::LoadOverride>,
 
     /// Policy applied when structural schema drift is detected (column added, removed, or retyped).
     /// Defaults to `warn`: log a warning and continue.
@@ -675,6 +677,63 @@ impl RowHash {
     }
 }
 
+/// Settle window for `mode: incremental`: hold rows back until they stop changing.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SettleConfig {
+    /// Date/timestamp column to age; defaults to the cursor. Zone-less values are UTC.
+    #[serde(default)]
+    pub column: Option<String>,
+    /// Minimum age before a row exports: `<n>s`, `<n>m`, `<n>h` or `<n>d`, e.g. `1h`.
+    pub after: String,
+}
+
+impl SettleConfig {
+    /// `after` in whole seconds.
+    pub fn after_secs(&self) -> crate::error::Result<u64> {
+        parse_settle_after(&self.after)
+    }
+}
+
+/// Parse `90s` / `30m` / `1h` / `2d` into seconds (positive, at most `i32::MAX`).
+pub(crate) fn parse_settle_after(raw: &str) -> crate::error::Result<u64> {
+    let s = raw.trim();
+    let bad = || {
+        anyhow::anyhow!(
+            "settle.after `{raw}` is not a duration — use a positive number with a unit: \
+             `90s`, `30m`, `1h` or `2d`"
+        )
+    };
+    let unit = s.chars().last().ok_or_else(bad)?;
+    let multiplier: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let digits = &s[..s.len() - unit.len_utf8()];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let secs = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .ok_or_else(bad)?;
+    if secs == 0 {
+        anyhow::bail!("settle.after `{raw}` is zero — a settle window needs a positive age");
+    }
+    if secs > i32::MAX as u64 {
+        anyhow::bail!(
+            "settle.after `{raw}` exceeds {} seconds (~68 years), the largest age every source \
+             can compute",
+            i32::MAX
+        );
+    }
+    Ok(secs)
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MetaColumns {
@@ -923,6 +982,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         name: name.into(),
         target: None,
         load: None,
+        settle: None,
         verify: VerifyMode::Size,
         query: Some("SELECT 1".into()),
         query_file: None,

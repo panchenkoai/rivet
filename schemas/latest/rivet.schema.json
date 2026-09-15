@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.25.0)",
+  "title": "Rivet config (rivet-cli 0.26.0)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -32,8 +32,15 @@
       "default": false
     },
     "load": {
-      "description": "The warehouse **load** target — consumed by `rivet load` (and `rivet load\n--cdc`), so ONE config drives both the export and the downstream load. The\nextraction commands (`rivet check` / `run` / `apply`) accept and ignore it:\nit shapes the load, not the extract.",
-      "default": null
+      "description": "The warehouse **load** target — consumed by `rivet load`, so ONE config drives\nboth the export and the downstream load. The extraction commands validate it\n(a malformed block fails `rivet check` before an extract runs) and otherwise\nignore it: it shapes the load, not the extract.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LoadSection"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -542,6 +549,18 @@
           "$ref": "#/$defs/IncrementalCursorMode",
           "default": "single_column"
         },
+        "settle": {
+          "description": "Incremental only: export a row once it is older than `settle.after` (source clock).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SettleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "chunk_column": {
           "type": [
             "string",
@@ -767,8 +786,15 @@
           "default": null
         },
         "load": {
-          "description": "Per-export overrides for the top-level `load:` block (`pk`,\n`cleanup_source`, `gc_orphans`, `cluster_by`, `allow_source_drift`); any\nfield omitted here inherits the top-level value. The warehouse `target`\nis shared and stays in the top-level `load:` — it cannot be overridden\nper export.\n\n```yaml\nload: { target: bigquery, project: p, dataset: d }   # shared default\nexports:\n  - name: orders\n    table: orders\n    mode: cdc\n    load: { pk: [id] }                                # this table's pk\n```\n\nRaw JSON (parsed by the load module) so `config` carries no load types —\nmirrors the top-level [`crate::config::Config::load`].",
-          "default": null
+          "description": "Per-export overrides for the top-level `load:` block (`pk`,\n`cleanup_source`, `gc_orphans`, `cluster_by`, `partition`,\n`allow_source_drift`); any field omitted here inherits the top-level\nvalue. The warehouse `target` is shared and stays in the top-level\n`load:` — it cannot be overridden per export.\n\n```yaml\nload: { target: bigquery, project: p, dataset: d }   # shared default\nexports:\n  - name: orders\n    table: orders\n    mode: cdc\n    load:\n      pk: [id]                                        # this table's pk\n      partition: { column: created_at, granularity: day, expiration_days: 400 }\n```",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoadOverride"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "on_schema_drift": {
           "description": "Policy applied when structural schema drift is detected (column added, removed, or retyped).\nDefaults to `warn`: log a warning and continue.",
@@ -926,6 +952,28 @@
           "type": "string",
           "const": "coalesce"
         }
+      ]
+    },
+    "SettleConfig": {
+      "description": "Settle window for `mode: incremental`: hold rows back until they stop changing.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "description": "Date/timestamp column to age; defaults to the cursor. Zone-less values are UTC.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "after": {
+          "description": "Minimum age before a row exports: `<n>s`, `<n>m`, `<n>h` or `<n>d`, e.g. `1h`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "after"
       ]
     },
     "TimeColumnType": {
@@ -1181,6 +1229,204 @@
       },
       "additionalProperties": false
     },
+    "LoadOverride": {
+      "description": "Per-export overrides of the top-level [`LoadSection`]: every field optional, `None`\ninherits. The warehouse is shared, so `target` is not among them.",
+      "type": "object",
+      "properties": {
+        "pk": {
+          "description": "Dedup key of this table's current-state view.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeyColumns"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cleanup_source": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "gc_orphans": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "cluster_by": {
+          "description": "`CLUSTER BY` of this table.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeyColumns"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allow_source_drift": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "partition": {
+          "description": "This table's partitioning; `none` clears an inherited one.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionSetting"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "KeyColumns": {
+      "description": "`auto` (the source primary key `rivet run` recorded), `none`, or a list of columns",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "auto",
+            "none"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "PartitionSetting": {
+      "description": "The schema of a `partition:` value: `none`, or a block.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NoneWord"
+        },
+        {
+          "$ref": "#/$defs/RawPartition"
+        }
+      ]
+    },
+    "NoneWord": {
+      "description": "The literal `none`.",
+      "type": "string",
+      "enum": [
+        "none"
+      ]
+    },
+    "RawPartition": {
+      "description": "A `partition:` block as written.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "description": "A DATE / DATETIME / TIMESTAMP column to partition by.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "granularity": {
+          "description": "`hour` / `day` (default) / `month` / `year`, with `column`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Granularity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "range": {
+          "description": "Integer-range partitioning of an INT64 column.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ingestion": {
+          "description": "Partition by load time at this granularity.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Granularity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expiration_days": {
+          "description": "`partition_expiration_days`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
+        },
+        "require_filter": {
+          "description": "`require_partition_filter` on the full-load table.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Granularity": {
+      "description": "A partition granularity: `hour`, `day`, `month` or `year`.",
+      "type": "string",
+      "enum": [
+        "hour",
+        "day",
+        "month",
+        "year"
+      ]
+    },
+    "RawRange": {
+      "description": "`range: { column, start, end, interval }`.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "start": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "end": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "interval": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "column",
+        "start",
+        "end",
+        "interval"
+      ]
+    },
     "SchemaDriftPolicy": {
       "oneOf": [
         {
@@ -1311,6 +1557,117 @@
         "failure",
         "schema_change",
         "degraded"
+      ]
+    },
+    "LoadSection": {
+      "description": "The block as written: `target` plus the union of both warehouses' fields.",
+      "type": "object",
+      "properties": {
+        "target": {
+          "description": "The warehouse: `bigquery` or `snowflake`.",
+          "$ref": "#/$defs/LoadTargetKind"
+        },
+        "project": {
+          "description": "BigQuery: the project the dataset lives in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "dataset": {
+          "description": "BigQuery: the dataset the tables are created in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "connection": {
+          "description": "Snowflake: the `snow` CLI connection name.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "warehouse": {
+          "description": "Snowflake: the virtual warehouse the load runs on.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "database": {
+          "description": "Snowflake: the database the tables are created in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "schema": {
+          "description": "Snowflake: the schema the tables are created in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "storage_integration": {
+          "description": "Snowflake: a pre-created GCS `STORAGE INTEGRATION`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "cleanup_source": {
+          "description": "After a successful load, delete the staged Parquet under the export prefix.",
+          "type": "boolean",
+          "default": false
+        },
+        "pk": {
+          "description": "Dedup key of the incremental/CDC current-state view: `auto` (the source primary\nkey `rivet run` recorded), `none`, or explicit columns; ignored for `full`.",
+          "$ref": "#/$defs/KeyColumns"
+        },
+        "allow_source_drift": {
+          "description": "Load even when a run manifest's source count disagrees with what it extracted\n(source→file drift): warn instead of blocking.",
+          "type": "boolean",
+          "default": false
+        },
+        "gc_orphans": {
+          "description": "After a successful load, delete staged Parquet under the export prefix that no\n`Success` manifest references — crash leftovers. Only when no extract writes the\nprefix concurrently.",
+          "type": "boolean",
+          "default": false
+        },
+        "cluster_by": {
+          "description": "`CLUSTER BY` of the table the load writes: `auto` (the primary key), `none`, or\nexplicit columns (at most 4 on BigQuery).",
+          "$ref": "#/$defs/KeyColumns"
+        },
+        "partition": {
+          "description": "How the table the load writes is partitioned: `none` (default), or exactly one of\n`column` (+ `granularity`), an integer `range`, or `ingestion` time.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionSetting"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ]
+    },
+    "LoadTargetKind": {
+      "type": "string",
+      "enum": [
+        "bigquery",
+        "snowflake"
       ]
     }
   }

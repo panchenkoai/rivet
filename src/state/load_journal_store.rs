@@ -6,7 +6,8 @@ use super::{StateConn, StateStore};
 
 /// One `rivet load` invocation's ledger record: the `load_run` audit row plus
 /// the extraction `source_run_ids` it consumed (written into `loaded_source_run`
-/// so a later load skips them). `status` ∈ `success` | `failed`.
+/// so a later load skips them). `status` ∈ `success` | `failed` | `refused` — a
+/// `refused` load stopped before touching the warehouse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadRecord {
     pub load_id: String,
@@ -157,6 +158,21 @@ impl StateStore {
         Ok(out)
     }
 
+    /// Whether a load ever wrote `target_table` — a success that consumed runs, or a
+    /// failure after the warehouse write — so the table is rivet's own. A load that
+    /// stopped before writing (`refused`) never makes it so.
+    pub fn has_load_attempt(&self, target_table: &str) -> Result<bool> {
+        Ok(self
+            .query_opt(
+                "SELECT COUNT(*) FROM load_run WHERE target_table = ?1 \
+                 AND (status = 'failed' OR (status = 'success' AND source_run_ids <> '[]'))",
+                &[target_table.into()],
+                |r| r.i64(0),
+            )?
+            .unwrap_or(0)
+            > 0)
+    }
+
     pub fn loaded_source_run_ids(&self, target_table: &str) -> Result<HashSet<String>> {
         Ok(self
             .query(
@@ -211,6 +227,38 @@ impl StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_table_is_rivets_own_once_a_load_wrote_it() {
+        let s = StateStore::open_in_memory().unwrap();
+        assert!(!s.has_load_attempt("p.d.t").unwrap());
+        s.store_load(&rec("skip", "p.d.t", &[], 0, "success"))
+            .unwrap();
+        assert!(
+            !s.has_load_attempt("p.d.t").unwrap(),
+            "an up-to-date skip wrote nothing"
+        );
+        s.store_load(&rec("refused", "p.d.t", &["r1"], 0, "refused"))
+            .unwrap();
+        assert!(
+            !s.has_load_attempt("p.d.t").unwrap(),
+            "a load that stopped before writing does not make the table rivet's own"
+        );
+        assert!(
+            s.loaded_source_run_ids("p.d.t").unwrap().is_empty(),
+            "nor does it consume the run"
+        );
+        s.store_load(&rec("fail", "p.d.t", &["r1"], 0, "failed"))
+            .unwrap();
+        assert!(
+            s.has_load_attempt("p.d.t").unwrap(),
+            "a failed load may have written the table"
+        );
+        s.store_load(&rec("ok", "p.d.other", &["r2"], 5, "success"))
+            .unwrap();
+        assert!(s.has_load_attempt("p.d.other").unwrap());
+        assert!(!s.has_load_attempt("p.d.none").unwrap());
+    }
 
     fn rec(load_id: &str, target: &str, runs: &[&str], rows: i64, status: &str) -> LoadRecord {
         LoadRecord {

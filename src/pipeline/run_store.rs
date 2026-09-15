@@ -103,7 +103,18 @@ impl<'a> RunStore<'a> {
     pub fn commit(self) -> Result<()> {
         // ADR-0001 I3 — cursor: fatal on error.
         if let Some(cursor_val) = self.cursor.as_deref() {
-            self.state.update(&self.plan.export_name, cursor_val)?;
+            // A cursor no later run can attribute is the MT6 gap reborn: refuse to
+            // write one rather than store it without its column.
+            let column = self.plan.strategy.cursor_identity().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "export '{}': the run committed cursor `{cursor_val}` but its strategy has \
+                     no cursor identity to record it under — a defect in the strategy, not the \
+                     data; nothing was written",
+                    self.plan.export_name
+                )
+            })?;
+            self.state
+                .update_with_column(&self.plan.export_name, cursor_val, &column)?;
 
             // Test fault-point: cursor advanced, but the outer-pipeline
             // record_metric has NOT been recorded. QA backlog Task 1.1.
@@ -232,13 +243,25 @@ mod tests {
             .unwrap();
     }
 
+    /// The cursor-carrying shape: an incremental plan on `updated_at`.
+    fn incremental_plan(export_name: &str) -> ResolvedRunPlan {
+        let mut plan = test_plan(export_name);
+        plan.strategy = ExtractionStrategy::Incremental(crate::plan::IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: crate::config::IncrementalCursorMode::SingleColumn,
+            settle: None,
+        });
+        plan
+    }
+
     #[test]
     fn finalize_with_cursor_only_advances_state_cursor() {
         // Incremental cursor with no progression (rare but valid:
         // single.rs's incremental path technically supports this when
         // the progression write is skipped — e.g., a future flag).
         let state = StateStore::open_in_memory().unwrap();
-        let plan = test_plan("orders");
+        let plan = incremental_plan("orders");
         let summary = test_summary(&plan, "run-1");
 
         RunStore::finalize(&state, &plan, &summary)
@@ -250,8 +273,27 @@ mod tests {
         assert_eq!(
             cursor.last_cursor_value.as_deref(),
             Some("2026-05-30T12:00:00Z"),
-            "I3: state.update must persist the cursor value"
+            "I3: the cursor value is persisted"
         );
+        assert_eq!(
+            cursor.cursor_column.as_deref(),
+            Some("updated_at"),
+            "MT4: every cursor write records its identity"
+        );
+    }
+
+    #[test]
+    fn a_cursor_from_a_strategy_without_an_identity_is_refused() {
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = test_plan("orders");
+        let summary = test_summary(&plan, "run-1");
+        let err = RunStore::finalize(&state, &plan, &summary)
+            .with_cursor("99".into())
+            .commit()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no cursor identity"), "{err}");
+        assert_eq!(state.get("orders").unwrap().last_cursor_value, None);
     }
 
     #[test]
@@ -317,7 +359,7 @@ mod tests {
         // one batch. Both side effects must be observable on state
         // after commit().
         let state = StateStore::open_in_memory().unwrap();
-        let plan = test_plan("orders");
+        let plan = incremental_plan("orders");
         let summary = test_summary(&plan, "run-4");
 
         RunStore::finalize(&state, &plan, &summary)

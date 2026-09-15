@@ -90,61 +90,124 @@ pub(crate) fn build_incremental_query(
     let cursor_value = cursor.and_then(|c| c.last_cursor_value.as_deref());
     let primary = quote_ident(source_type, &plan.primary_column);
 
-    match plan.mode {
-        IncrementalCursorMode::SingleColumn => {
-            if let Some(val) = cursor_value {
-                let (predicate_rhs, cursor_param) = cursor_rhs(source_type, val);
-                BuiltQuery {
-                    sql: format!(
-                        "SELECT * FROM ({base}) AS _rivet WHERE {p} > {rhs} ORDER BY {p}",
-                        base = base_query,
-                        p = primary,
-                        rhs = predicate_rhs,
-                    ),
-                    cursor_param,
-                }
-            } else {
-                BuiltQuery::without_param(format!(
-                    "SELECT * FROM ({base}) AS _rivet ORDER BY {p}",
-                    base = base_query,
-                    p = primary,
-                ))
-            }
-        }
+    let prefix = match plan.mode {
+        IncrementalCursorMode::SingleColumn => "",
+        IncrementalCursorMode::Coalesce => "_rivet.",
+    };
+    let cursor = cursor_expr(plan, prefix, source_type);
+
+    let mut preds: Vec<String> = Vec::new();
+    let mut cursor_param = None;
+    if let Some(val) = cursor_value {
+        let (rhs, param) = cursor_rhs(source_type, val);
+        preds.push(format!("{cursor} > {rhs}"));
+        cursor_param = param;
+    }
+    if let Some(settle) = &plan.settle {
+        preds.extend(settle_predicates(
+            plan,
+            settle.column.as_deref(),
+            settle.after_secs,
+            prefix,
+            base_query,
+            cursor_value,
+            source_type,
+        ));
+    }
+    let where_clause = if preds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", preds.join(" AND "))
+    };
+
+    let sql = match plan.mode {
+        IncrementalCursorMode::SingleColumn => format!(
+            "SELECT * FROM ({base}) AS _rivet{where_clause} ORDER BY {primary}",
+            base = base_query,
+        ),
         IncrementalCursorMode::Coalesce => {
-            let fallback_name = plan
-                .fallback_column
-                .as_deref()
-                .expect("coalesce requires fallback_column (enforced by Config::validate)");
-            let fallback = quote_ident(source_type, fallback_name);
-            let coalesce = format!("COALESCE(_rivet.{primary}, _rivet.{fallback})");
+            let fallback = quote_ident(source_type, coalesce_fallback(plan));
             let synthetic = quote_ident(
                 source_type,
                 IncrementalCursorPlan::RIVET_COALESCE_CURSOR_COL,
             );
-
-            let (where_clause, cursor_param) = match cursor_value {
-                Some(val) => {
-                    let (rhs, param) = cursor_rhs(source_type, val);
-                    (format!(" WHERE {coalesce} > {rhs}"), param)
-                }
-                None => (String::new(), None),
-            };
-
-            BuiltQuery {
-                sql: format!(
-                    "SELECT _rivet.*, {coalesce} AS {synthetic} FROM ({base}) AS _rivet{where_clause} \
-                     ORDER BY {coalesce}, _rivet.{primary}, _rivet.{fallback}",
-                    base = base_query,
-                    coalesce = coalesce,
-                    synthetic = synthetic,
-                    where_clause = where_clause,
-                    primary = primary,
-                    fallback = fallback,
-                ),
-                cursor_param,
-            }
+            format!(
+                "SELECT _rivet.*, {cursor} AS {synthetic} FROM ({base}) AS _rivet{where_clause} \
+                 ORDER BY {cursor}, _rivet.{primary}, _rivet.{fallback}",
+                base = base_query,
+            )
         }
+    };
+    BuiltQuery { sql, cursor_param }
+}
+
+fn coalesce_fallback(plan: &IncrementalCursorPlan) -> &str {
+    plan.fallback_column
+        .as_deref()
+        .expect("coalesce requires fallback_column (enforced by Config::validate)")
+}
+
+/// The cursor expression (primary column or its COALESCE) over a table prefix.
+fn cursor_expr(plan: &IncrementalCursorPlan, prefix: &str, source_type: SourceType) -> String {
+    let primary = quote_ident(source_type, &plan.primary_column);
+    match plan.mode {
+        IncrementalCursorMode::SingleColumn => format!("{prefix}{primary}"),
+        IncrementalCursorMode::Coalesce => {
+            let fallback = quote_ident(source_type, coalesce_fallback(plan));
+            format!("COALESCE({prefix}{primary}, {prefix}{fallback})")
+        }
+    }
+}
+
+/// Settle predicates: the row has aged past `after_secs`, and when the settle column is
+/// not the cursor, the cursor stays below the first still-settling row.
+fn settle_predicates(
+    plan: &IncrementalCursorPlan,
+    settle_column: Option<&str>,
+    after_secs: u64,
+    prefix: &str,
+    base_query: &str,
+    last: Option<&str>,
+    source_type: SourceType,
+) -> Vec<String> {
+    let threshold = settle_threshold(source_type, after_secs);
+    let target = |pre: &str| match settle_column {
+        Some(c) => format!("{pre}{}", quote_ident(source_type, c)),
+        None => cursor_expr(plan, pre, source_type),
+    };
+    let t = target(prefix);
+    let mut preds = vec![format!("({t} IS NULL OR {t} < {threshold})")];
+
+    let settle_is_cursor = match (settle_column, plan.mode) {
+        (None, _) => true,
+        (Some(c), IncrementalCursorMode::SingleColumn) => c == plan.primary_column,
+        (Some(_), IncrementalCursorMode::Coalesce) => false,
+    };
+    if !settle_is_cursor {
+        let young = cursor_expr(plan, "_rivet_young.", source_type);
+        let mut young_where = vec![format!("{young} IS NOT NULL")];
+        if let Some(v) = last {
+            young_where.push(format!("{young} > {}", inline_literal(source_type, v)));
+        }
+        young_where.push(format!("{} >= {threshold}", target("_rivet_young.")));
+        preds.push(format!(
+            "{cursor} < ALL (SELECT {young} FROM ({base_query}) AS _rivet_young WHERE {cond})",
+            cursor = cursor_expr(plan, prefix, source_type),
+            cond = young_where.join(" AND "),
+        ));
+    }
+    preds
+}
+
+/// `now − after_secs` on the source clock (every engine reads in a UTC session).
+fn settle_threshold(source_type: SourceType, after_secs: u64) -> String {
+    match source_type {
+        SourceType::Mysql => format!("(NOW() - INTERVAL {after_secs} SECOND)"),
+        SourceType::Postgres => format!("(now() - INTERVAL '{after_secs} seconds')"),
+        SourceType::Mssql => format!("DATEADD(SECOND, -{after_secs}, SYSUTCDATETIME())"),
+        SourceType::Mongo => unreachable!(
+            "settle_threshold: MongoDB incremental cursor is not a SQL path (guarded by full-mode-only validation)"
+        ),
     }
 }
 
@@ -403,6 +466,7 @@ mod tests {
             export_name: "t".into(),
             last_cursor_value: val.map(str::to_string),
             last_run_at: None,
+            cursor_column: None,
         }
     }
 
@@ -411,6 +475,7 @@ mod tests {
             primary_column: col.into(),
             fallback_column: None,
             mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
         }
     }
 
@@ -419,7 +484,16 @@ mod tests {
             primary_column: p.into(),
             fallback_column: Some(f.into()),
             mode: IncrementalCursorMode::Coalesce,
+            settle: None,
         }
+    }
+
+    fn settled(mut plan: IncrementalCursorPlan, column: Option<&str>) -> IncrementalCursorPlan {
+        plan.settle = Some(crate::plan::SettlePlan {
+            column: column.map(str::to_string),
+            after_secs: 3600,
+        });
+        plan
     }
 
     #[test]
@@ -749,5 +823,141 @@ mod tests {
         assert!(!q.sql.contains("WHERE"), "{}", q.sql);
         assert!(q.sql.contains("ORDER BY COALESCE"), "{}", q.sql);
         assert_eq!(q.cursor_param, None);
+    }
+
+    #[test]
+    fn settle_on_the_cursor_itself_is_a_plain_age_filter_on_first_and_later_runs() {
+        let p = settled(single("updated_at"), None);
+        let first = build_incremental_query("SELECT * FROM t", Some(&p), None, SourceType::Mysql);
+        assert_eq!(
+            first.sql,
+            "SELECT * FROM (SELECT * FROM t) AS _rivet WHERE (`updated_at` IS NULL OR \
+             `updated_at` < (NOW() - INTERVAL 3600 SECOND)) ORDER BY `updated_at`"
+        );
+        assert_eq!(first.cursor_param, None);
+
+        let next = build_incremental_query(
+            "SELECT * FROM t",
+            Some(&p),
+            Some(&cursor_with(Some("2026-09-11 10:00:00"))),
+            SourceType::Mysql,
+        );
+        assert_eq!(
+            next.sql,
+            "SELECT * FROM (SELECT * FROM t) AS _rivet WHERE `updated_at` > ? AND \
+             (`updated_at` IS NULL OR `updated_at` < (NOW() - INTERVAL 3600 SECOND)) \
+             ORDER BY `updated_at`"
+        );
+        assert_eq!(next.cursor_param.as_deref(), Some("2026-09-11 10:00:00"));
+        assert!(!next.sql.contains("ALL ("), "{}", next.sql);
+
+        let explicit = settled(single("updated_at"), Some("updated_at"));
+        let q = build_incremental_query(
+            "SELECT * FROM t",
+            Some(&explicit),
+            Some(&cursor_with(Some("x"))),
+            SourceType::Mysql,
+        );
+        assert_eq!(q.sql, next.sql);
+    }
+
+    #[test]
+    fn settle_threshold_is_the_source_clock_in_every_dialect() {
+        let p = settled(single("ts"), None);
+        let pg = build_incremental_query("SELECT * FROM t", Some(&p), None, SourceType::Postgres);
+        assert!(
+            pg.sql
+                .contains("(\"ts\" IS NULL OR \"ts\" < (now() - INTERVAL '3600 seconds'))"),
+            "{}",
+            pg.sql
+        );
+        let ms = build_incremental_query("SELECT * FROM t", Some(&p), None, SourceType::Mssql);
+        assert!(
+            ms.sql
+                .contains("([ts] IS NULL OR [ts] < DATEADD(SECOND, -3600, SYSUTCDATETIME()))"),
+            "{}",
+            ms.sql
+        );
+    }
+
+    #[test]
+    fn settle_on_another_column_bounds_the_cursor_below_the_first_settling_row() {
+        let p = settled(single("idlink_va"), Some("server_time"));
+        let q = build_incremental_query(
+            "SELECT * FROM lva",
+            Some(&p),
+            Some(&cursor_with(Some("42"))),
+            SourceType::Mysql,
+        );
+        assert_eq!(
+            q.sql,
+            "SELECT * FROM (SELECT * FROM lva) AS _rivet WHERE `idlink_va` > ? AND \
+             (`server_time` IS NULL OR `server_time` < (NOW() - INTERVAL 3600 SECOND)) AND \
+             `idlink_va` < ALL (SELECT _rivet_young.`idlink_va` FROM (SELECT * FROM lva) AS \
+             _rivet_young WHERE _rivet_young.`idlink_va` IS NOT NULL AND \
+             _rivet_young.`idlink_va` > '42' AND \
+             _rivet_young.`server_time` >= (NOW() - INTERVAL 3600 SECOND)) ORDER BY `idlink_va`"
+        );
+        assert_eq!(q.cursor_param.as_deref(), Some("42"));
+
+        let first = build_incremental_query("SELECT * FROM lva", Some(&p), None, SourceType::Mysql);
+        assert!(
+            first.sql.contains(
+                "WHERE _rivet_young.`idlink_va` IS NOT NULL AND \
+                 _rivet_young.`server_time` >= (NOW()"
+            ),
+            "{}",
+            first.sql
+        );
+    }
+
+    #[test]
+    fn settle_tail_bound_value_is_escaped_not_spliced() {
+        let p = settled(single("k"), Some("ts"));
+        let evil = "1' OR '1'='1";
+        let pg = build_incremental_query(
+            "SELECT * FROM t",
+            Some(&p),
+            Some(&cursor_with(Some(evil))),
+            SourceType::Postgres,
+        );
+        assert!(pg.sql.contains(r"> E'1\' OR \'1\'=\'1'"), "{}", pg.sql);
+        let ms = build_incremental_query(
+            "SELECT * FROM t",
+            Some(&p),
+            Some(&cursor_with(Some(evil))),
+            SourceType::Mssql,
+        );
+        assert!(ms.sql.contains("> N'1'' OR ''1''=''1'"), "{}", ms.sql);
+    }
+
+    #[test]
+    fn settle_in_coalesce_mode_defaults_to_the_coalesced_cursor() {
+        let p = settled(coalesce("updated_at", "created_at"), None);
+        let q = build_incremental_query(
+            "SELECT * FROM t",
+            Some(&p),
+            Some(&cursor_with(Some("2024-01-01"))),
+            SourceType::Postgres,
+        );
+        let c = "COALESCE(_rivet.\"updated_at\", _rivet.\"created_at\")";
+        assert!(
+            q.sql.contains(&format!(
+                "WHERE {c} > E'2024-01-01' AND ({c} IS NULL OR {c} < (now() - INTERVAL '3600 seconds'))"
+            )),
+            "{}",
+            q.sql
+        );
+        assert!(!q.sql.contains("ALL ("), "{}", q.sql);
+
+        let other = settled(coalesce("updated_at", "created_at"), Some("created_at"));
+        let q =
+            build_incremental_query("SELECT * FROM t", Some(&other), None, SourceType::Postgres);
+        assert!(
+            q.sql
+                .contains(&format!("{c} < ALL (SELECT COALESCE(_rivet_young.")),
+            "{}",
+            q.sql
+        );
     }
 }

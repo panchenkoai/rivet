@@ -205,6 +205,7 @@ mod tests {
             primary_column: "updated_at".into(),
             fallback_column: None,
             mode,
+            settle: None,
         }))
     }
 

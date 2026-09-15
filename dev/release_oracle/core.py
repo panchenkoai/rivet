@@ -301,9 +301,13 @@ def run(
         )
         return Proc(argv, p.returncode, p.stdout, p.stderr)
     except subprocess.TimeoutExpired as e:
-        out = e.stdout or ""
-        err = (e.stderr or "") + f"\n[timeout after {timeout}s]"
-        return Proc(argv, 124, out if isinstance(out, str) else out.decode(), err)
+        # TimeoutExpired carries raw bytes even under `text=True`; decode both streams.
+        def _text(v: "bytes | str | None") -> str:
+            if v is None:
+                return ""
+            return v if isinstance(v, str) else v.decode(errors="replace")
+
+        return Proc(argv, 124, _text(e.stdout), _text(e.stderr) + f"\n[timeout after {timeout}s]")
     except FileNotFoundError as e:
         return Proc(argv, 127, "", str(e))
 

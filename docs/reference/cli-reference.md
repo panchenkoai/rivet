@@ -165,7 +165,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
 Load an export's Parquet into a warehouse (BigQuery / Snowflake)
 
-The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads every export into the shared target, one after another.
+The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads every export into the shared target, one after another. Column types come from the state DB, recorded by each export's last successful `rivet run`; the load never connects to the source.
 
 **Usage:** `rivet load [OPTIONS] --config <CONFIG>`
 
@@ -173,6 +173,7 @@ The native column schema, target table, partition, and source URIs are all deriv
 
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
+* `--rebuild-changelog` — Rebuild a `<table>__changes` whose partitioning differs from the config's `load.partition` — a billed query copying every row — and swap it in. Without this flag such a load is refused naming the difference; a rebuild is never a side effect of a scheduled load
 
 
 
@@ -358,8 +359,8 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--source-file <PATH>` — Path to a file containing just the database URL (one line). Credentials stay on disk instead of entering the process command line
 * `--table <TABLE>` — Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database
 * `--schema <SCHEMA>` — PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL)
-* `--include <GLOB>` — Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all
-* `--exclude <GLOB>` — Whole-schema only: drop tables/views matching this glob (`*`/`?`). Repeatable; `--exclude` wins over `--include`
+* `--include <GLOB>` — Whole-schema only: keep only tables/views matching these globs (`*`/`?`) — several after one flag (`--include orders users`) or the flag repeated; a table is kept if it matches any. No `--include` = keep all
+* `--exclude <GLOB>` — Whole-schema only: drop tables/views matching these globs (`*`/`?`) — several after one flag or the flag repeated; `--exclude` wins over `--include`
 * `-o`, `--output <OUTPUT>` — Write output to this file instead of stdout
 * `--discover` — Emit a machine-readable JSON discovery artifact instead of a YAML scaffold. Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes. Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags
 * `--mode <MODE>` — Override the suggested extraction mode for every scaffolded export. `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block with engine-specific stream params) instead of a batch query. Other values (full / incremental / chunked / time_window) just override the auto-suggested mode

@@ -9,6 +9,7 @@ mod file_log;
 mod journal_store;
 mod keyset_range;
 mod load_journal_store;
+mod load_spec_store;
 mod metrics;
 mod progression;
 mod row;
@@ -27,6 +28,8 @@ pub use file_log::{DurablePart, FilePart, FileRecord};
 #[allow(unused_imports)]
 pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
 pub use load_journal_store::LoadRecord;
+#[allow(unused_imports)]
+pub use load_spec_store::{LoadSpec, LoadSpecColumn};
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
 pub use metrics::MetricRow;
@@ -466,6 +469,24 @@ const MIGRATIONS: &[(i64, &str)] = &[
     // dup and its multi-part-rotation variant at the root (a re-read that never happens can't
     // duplicate). Nullable: only the sequential keyset checkpoint path writes it.
     (25, "ALTER TABLE file_log ADD COLUMN cursor_high TEXT;"),
+    (
+        26,
+        "ALTER TABLE export_state ADD COLUMN cursor_column TEXT;",
+    ),
+    (
+        27,
+        "CREATE TABLE IF NOT EXISTS export_load_spec (
+             export_name TEXT NOT NULL,
+             unit TEXT NOT NULL DEFAULT '',
+             columns_json TEXT,
+             primary_key_json TEXT,
+             key_origin TEXT,
+             run_id TEXT,
+             origin TEXT NOT NULL,
+             captured_at TEXT NOT NULL,
+             PRIMARY KEY (export_name, unit)
+         );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -845,6 +866,24 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         25,
         "ALTER TABLE file_log ADD COLUMN IF NOT EXISTS cursor_high TEXT;",
+    ),
+    (
+        26,
+        "ALTER TABLE export_state ADD COLUMN IF NOT EXISTS cursor_column TEXT;",
+    ),
+    (
+        27,
+        "CREATE TABLE IF NOT EXISTS export_load_spec (
+             export_name TEXT NOT NULL,
+             unit TEXT NOT NULL DEFAULT '',
+             columns_json TEXT,
+             primary_key_json TEXT,
+             key_origin TEXT,
+             run_id TEXT,
+             origin TEXT NOT NULL,
+             captured_at TEXT NOT NULL,
+             PRIMARY KEY (export_name, unit)
+         );",
     ),
 ];
 

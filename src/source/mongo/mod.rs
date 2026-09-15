@@ -123,25 +123,27 @@ impl MongoSession {
             .worker_threads(2)
             .enable_all()
             .build()?;
-        let (client, db) = rt.block_on(async {
-            let mut opts = ClientOptions::parse(url).await?;
-            // Honor the `tls:` block. Without this the driver used only the URL's
-            // `?tls=` — so `tls: { mode: verify-full }` on a URL that didn't opt
-            // in connected in PLAINTEXT, the exact posture the operator asked to
-            // forbid (bug-hunt find). `None` ⇒ leave the URL's own tls setting.
-            if let Some(cfg) = tls {
-                opts.tls = Some(tls_to_mongo(cfg));
-            }
-            let db = opts.default_database.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "mongodb url must include a database: mongodb://user:pass@host:port/<db>"
-                )
-            })?;
-            let client = Client::with_options(opts)?;
-            // Round-trip so a bad host/auth fails at connect, not first read.
-            client.database(&db).run_command(doc! { "ping": 1 }).await?;
-            Ok::<_, anyhow::Error>((client, db))
-        })?;
+        let (client, db) = rt
+            .block_on(async {
+                let mut opts = ClientOptions::parse(url).await?;
+                // Honor the `tls:` block. Without this the driver used only the URL's
+                // `?tls=` — so `tls: { mode: verify-full }` on a URL that didn't opt
+                // in connected in PLAINTEXT, the exact posture the operator asked to
+                // forbid (bug-hunt find). `None` ⇒ leave the URL's own tls setting.
+                if let Some(cfg) = tls {
+                    opts.tls = Some(tls_to_mongo(cfg));
+                }
+                let db = opts.default_database.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mongodb url must include a database: mongodb://user:pass@host:port/<db>"
+                    )
+                })?;
+                let client = Client::with_options(opts)?;
+                // Round-trip so a bad host/auth fails at connect, not first read.
+                client.database(&db).run_command(doc! { "ping": 1 }).await?;
+                Ok::<_, anyhow::Error>((client, db))
+            })
+            .map_err(|e| crate::source::describe_connect_error(url, e))?;
         Ok(Self { rt, client, db })
     }
 
@@ -740,6 +742,10 @@ impl Source for MongoSource {
         _column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>> {
         Ok(blob_mappings())
+    }
+
+    fn primary_key(&mut self, _table: &str) -> Result<Option<Vec<String>>> {
+        Ok(Some(vec!["_id".to_string()]))
     }
 
     /// The only scalar rivet asks a `mode: full` source is the reconcile row

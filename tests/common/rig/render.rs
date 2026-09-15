@@ -91,8 +91,9 @@ impl Rig {
                 )
             })
             .collect();
+        let top: String = self.top_lines.iter().map(|l| format!("{l}\n")).collect();
         let yaml = format!(
-            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {out}\n{secondaries}",
+            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {out}\n{secondaries}{top}",
             name = self.name,
             tables = tables,
             mode = self.mode,
@@ -127,6 +128,9 @@ impl Rig {
                 "{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}/\", \
                  endpoint: \"{endpoint}\", allow_anonymous: true }}"
             ),
+            Some(CloudDest::GcsLive { bucket, prefix }) => {
+                format!("{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}/\" }}")
+            }
             Some(CloudDest::Azure { container, prefix }) => format!(
                 "{{ type: azure, bucket: {container}, prefix: \"{prefix}/{export}/\", \
                  account_name: {act}, account_key_env: RIVET_TEST_AZURITE_KEY, \

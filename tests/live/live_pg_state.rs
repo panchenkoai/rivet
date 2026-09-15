@@ -32,11 +32,11 @@ fn pg_store() -> Option<StateStore> {
 fn pg_cursor_round_trip() {
     let Some(s) = pg_store() else { return };
 
-    s.update("pg_orders", "2024-06-01").unwrap();
+    s.update_legacy("pg_orders", "2024-06-01").unwrap();
     let got = s.get("pg_orders").unwrap();
     assert_eq!(got.last_cursor_value.as_deref(), Some("2024-06-01"));
 
-    s.update("pg_orders", "2024-07-01").unwrap();
+    s.update_legacy("pg_orders", "2024-07-01").unwrap();
     let got2 = s.get("pg_orders").unwrap();
     assert_eq!(got2.last_cursor_value.as_deref(), Some("2024-07-01"));
 
@@ -314,4 +314,49 @@ fn pg_cdc_snapshot_completion_round_trip() {
     // Idempotent upsert on (export, table).
     s.mark_snapshot_done(&export, "t1", "run_pg_2").unwrap();
     assert!(s.snapshot_done(&export, "t1").unwrap());
+}
+
+/// The load spec round-trips on a Postgres state backend (RED on a CASE-bound parameter).
+#[test]
+#[ignore]
+fn pg_load_spec_round_trips() {
+    use rivet::state::LoadSpecColumn;
+    use rivet::types::{RivetType, TypeFidelity};
+    let Some(s) = pg_store() else { return };
+    let export = "pg_load_spec_rt";
+    let col = LoadSpecColumn {
+        name: "id".into(),
+        source_type: "int8".into(),
+        rivet_type: RivetType::Int64,
+        fidelity: TypeFidelity::Exact,
+        nullable: false,
+        warnings: Vec::new(),
+    };
+    let pk = vec!["id".to_string()];
+    s.record_load_spec(
+        export,
+        None,
+        std::slice::from_ref(&col),
+        Some(&pk),
+        "run_pg_1",
+    )
+    .expect("recording a load spec must succeed on Postgres");
+
+    let spec = s
+        .load_spec(export, None)
+        .unwrap()
+        .expect("the spec must read back");
+    assert_eq!(spec.columns, vec![col.clone()]);
+    assert_eq!(spec.primary_key, Some(pk));
+    assert_eq!(spec.run_id.as_deref(), Some("run_pg_1"));
+    assert_eq!(spec.origin, "run");
+
+    // The UPDATE arms carry the same shape: a later capture with no key clears a key
+    // a RUN recorded (the export stopped reading that relation).
+    s.record_load_spec(export, None, std::slice::from_ref(&col), None, "run_pg_2")
+        .expect("the keyless capture must also succeed");
+    assert_eq!(
+        s.load_spec(export, None).unwrap().unwrap().primary_key,
+        None
+    );
 }

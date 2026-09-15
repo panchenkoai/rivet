@@ -352,6 +352,7 @@ Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB
 | `cursor_column` | string | **yes** | — | Primary progression column. Must be **strictly per-row-distinct and monotonically increasing** — resume uses `WHERE cursor > last_value`, so rows that *tie* on the high-watermark value and become visible after it is passed are skipped. A low-resolution `updated_at` (second granularity) can tie; prefer a sequence/identity id or a sub-value-unique timestamp. See [semantics.md → Known non-guarantees](../semantics.md#known-non-guarantees). |
 | `cursor_fallback_column` | string | when `coalesce` | — | Fallback column used when primary is `NULL`. Only valid with `incremental_cursor_mode: coalesce` |
 | `incremental_cursor_mode` | `single_column` \| `coalesce` | no | `single_column` | `coalesce` progresses on `COALESCE(primary, fallback)`. See [modes/incremental-coalesce.md](../modes/incremental-coalesce.md) and [ADR-0007](../adr/0007-cursor-policy-contracts.md). |
+| `settle` | object | no | — | Hold rows back until they stop changing: `{ after: 1h }` ages the cursor itself, `{ after: 1h, column: server_time }` ages another date/timestamp column. A row exports only once it is older than `after` (`s`/`m`/`h`/`d`) by the source clock. See [modes/incremental.md § Settle window](../modes/incremental.md#settle-window). |
 
 **Chunked** (`mode: chunked`):
 

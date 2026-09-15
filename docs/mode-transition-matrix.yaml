@@ -1,0 +1,106 @@
+# Mode-transition matrix — ADR-0033. What an export inherits from its PREVIOUS mode when it
+# switches to incremental (or keyset_incremental): a full pass (no cursor was stored), a
+# continuation (same cursor identity), or a loud refusal (different identity). Each cell runs
+# the previous mode over 10 rows, inserts 3 more, restages the same Rig to the new mode and
+# re-reads the destination (tests/live/live_mode_transition.rs).
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: full_then_incremental
+    what: "MT1 — mode: full stores no cursor; the first incremental run is a full pass"
+    postgres: { test: full_then_incremental_postgres }
+    mysql:    { test: full_then_incremental_mysql }
+    mssql:    { test: full_then_incremental_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: time_window_then_incremental
+    what: "MT1 — time_window stores no cursor; full pass"
+    postgres: { test: time_window_then_incremental_postgres }
+    mysql:    { test: time_window_then_incremental_mysql }
+    mssql:    { test: time_window_then_incremental_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: range_chunked_then_incremental
+    what: "MT1 — range chunking (chunk_column + chunk_checkpoint) keeps chunk_task state, never a cursor; full pass"
+    postgres: { test: range_chunked_then_incremental_postgres }
+    mysql:    { test: range_chunked_then_incremental_mysql }
+    mssql:    { test: range_chunked_then_incremental_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: keyset_then_incremental_same_key
+    what: "MT2 — keyset without chunk_checkpoint still records its final high-water; incremental on the key continues"
+    postgres: { test: keyset_then_incremental_same_key_postgres }
+    mysql:    { test: keyset_then_incremental_same_key_mysql }
+    mssql:    { test: keyset_then_incremental_same_key_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: keyset_checkpoint_then_incremental_same_key
+    what: "MT2 — keyset with chunk_checkpoint (the init default); incremental on the key continues"
+    postgres: { test: keyset_checkpoint_then_incremental_same_key_postgres }
+    mysql:    { test: keyset_checkpoint_then_incremental_same_key_mysql }
+    mssql:    { test: keyset_checkpoint_then_incremental_same_key_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: parallel_keyset_then_incremental_same_key
+    what: "MT2 — parallel keyset records the highest range max; incremental on the key continues"
+    postgres: { test: parallel_keyset_then_incremental_same_key_postgres }
+    mysql:    { test: parallel_keyset_then_incremental_same_key_mysql }
+    mssql:    { test: parallel_keyset_then_incremental_same_key_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: keyset_then_incremental_other_column
+    what: "MT3 — keyset on id, then incremental on server_time: refused, nothing exported; full pass after state reset (the field case)"
+    postgres: { test: keyset_then_incremental_other_column_postgres }
+    mysql:    { test: keyset_then_incremental_other_column_mysql }
+    mssql:    { test: keyset_then_incremental_other_column_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: keyset_incremental_key_change
+    what: "MT3 — keyset_incremental on id, then on another unique key: the keyset runner refuses its own anchor"
+    postgres: { test: keyset_incremental_key_change_postgres }
+    mysql:    { test: keyset_incremental_key_change_mysql }
+    mssql:    { test: keyset_incremental_key_change_mssql }
+    mongo:    { na: "Mongo _id keyset resume has its own checkpoint, not export_state" }
+
+  - id: incremental_then_keyset_incremental_same_key
+    what: "MT2 — incremental on id, then keyset_incremental on id: continues from the incremental cursor"
+    postgres: { test: incremental_then_keyset_incremental_same_key_postgres }
+    mysql:    { test: incremental_then_keyset_incremental_same_key_mysql }
+    mssql:    { test: incremental_then_keyset_incremental_same_key_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: incremental_cursor_change
+    what: "MT3 — cursor_column changed without a reset: refused; full pass after state reset"
+    postgres: { test: incremental_cursor_change_postgres }
+    mysql:    { test: incremental_cursor_change_mysql }
+    mssql:    { test: incremental_cursor_change_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: incremental_single_to_coalesce
+    what: "MT3 — single_column → coalesce on the same primary changes the identity: refused (rows with a NULL primary were never exported)"
+    postgres: { test: incremental_single_to_coalesce_postgres }
+    mysql:    { test: incremental_single_to_coalesce_mysql }
+    mssql:    { test: incremental_single_to_coalesce_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: incremental_adding_settle
+    what: "MT2 — adding settle keeps the identity: continues"
+    postgres: { test: incremental_adding_settle_postgres }
+    mysql:    { test: incremental_adding_settle_mysql }
+    mssql:    { test: incremental_adding_settle_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: legacy_keyset_state_then_other_column
+    what: "MT5 — a pre-v26 keyset cursor (no identity) is attributed to the keyset run that wrote it: refused"
+    postgres: { test: legacy_keyset_state_then_other_column_postgres }
+    mysql:    { test: legacy_keyset_state_then_other_column_mysql }
+    mssql:    { test: legacy_keyset_state_then_other_column_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }
+
+  - id: legacy_incremental_state_then_other_column
+    what: "MT6 — a pre-v26 incremental cursor is attributed to the column the run's key descriptor (export_metrics.key_descriptor_json, v18+) names: refused; a row older than v18 records no identity anywhere — reset when changing the cursor"
+    postgres: { test: legacy_incremental_state_then_other_column_postgres }
+    mysql:    { test: legacy_incremental_state_then_other_column_mysql }
+    mssql:    { test: legacy_incremental_state_then_other_column_mssql }
+    mongo:    { na: "Mongo batch has no cursor-column incremental to switch into" }

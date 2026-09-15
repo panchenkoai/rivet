@@ -30,6 +30,13 @@ scenarios:
     mssql:    { test: mssql_incremental_third_run_picks_up_newly_inserted_rows }
     mongo:    { na: "Mongo has no SQL cursor-column incremental; keyset resume (chunking matrix) fills the role" }
 
+  - id: incremental_settle
+    what: "exports[].settle — rows export only once older than `after` by the source clock; a separate settle column keeps the cursor below the first unsettled row (no out-of-order skip)"
+    postgres: { test: settle_on_another_column_never_skips_an_out_of_order_row_postgres }
+    mysql:    { test: settle_on_another_column_never_skips_an_out_of_order_row_mysql }
+    mssql:    { test: settle_on_another_column_never_skips_an_out_of_order_row_mssql }
+    mongo:    { na: "Mongo has no SQL cursor-column incremental" }
+
   - id: mode_time_window
     what: "mode: time_window — bounded date scan (time_column + days_window), anchored on today"
     postgres: { test: time_window_resolves_numeric_via_base_catalog_hint }

@@ -323,6 +323,22 @@ scenarios:
     keyset:         { test: keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest }
     mongo_parallel: { na: "no mid-run delivery position — mongo_parallel takes a quiescent full scan with no checkpoint/cursor advance; the manifest is written once at finalize and a crash re-runs the whole export (steady-state no-loss/no-dup covered by mongo_batch_parallel_integer_id_no_loss_or_dup)" }
 
+  - id: cursor_ownership_guard
+    what: "a persisted cursor records its column/key on write (export_state.cursor_column, v26) and a run on another column refuses it instead of matching nothing"
+    single:         { test: incremental_cursor_change_mysql }
+    chunked:        { na: "range chunking persists chunk_task state, never an export_state cursor" }
+    chunked_checkpoint: { na: "range chunking persists chunk_task state, never an export_state cursor" }
+    keyset:         { test: keyset_incremental_key_change_mysql }
+    mongo_parallel: { na: "quiescent full scan — no cursor read or written" }
+
+  - id: incremental_settle_window
+    what: "exports[].settle bounds the incremental query below the source-clock threshold"
+    single:         { test: settle_holds_back_young_rows_until_they_age_mysql }
+    chunked:        { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
+    chunked_checkpoint: { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
+    keyset:         { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
+    mongo_parallel: { na: "settle is rejected outside mode: incremental, which runs only on the single runner" }
+
   - id: sparse_chunk_warn
     what: "run-start sparse-key cost warning (sparse_chunk_action) — a key span that divides into far more windows than the row count justifies is flagged at warn level before the windows execute."
     single:         { na: "no chunk windows — single mode issues one query, no BETWEEN-window explosion possible" }
@@ -434,3 +450,11 @@ scenarios:
     chunked_checkpoint: { test: the_memory_throttle_is_wired_into_every_chunked_variant }
     keyset:         { na: "documented absent (tuning.md): keyset pages are bounded by page_size and the governor sheds workers under source pressure; absence pinned downward by the_memory_throttle_stays_out_of_the_runners_the_doc_says_lack_it" }
     mongo_parallel: { na: "documented absent (tuning.md): worker batches are bounded by page_size; absence pinned downward by the_memory_throttle_stays_out_of_the_runners_the_doc_says_lack_it" }
+
+  - id: load_spec_record
+    what: "ADR-0034 D1: a successful run of an export in a config with a `load:` block records its resolved column types and source primary key in export_load_spec (state v27), so `rivet load` plans without the source. Recorded once in the run_export_job wrapper after the runner (or the CDC runner) returns Ok, so no runner can bypass it; the separate apply entry point (run_export_job_with_chunk_source) re-calls it."
+    single:         { test: run_records_the_load_spec_key_in_key_order_mysql }
+    chunked:        { na: "shared seam: record_after_run runs in the run_export_job wrapper after the strategy dispatch returns Ok" }
+    chunked_checkpoint: { na: "shared seam (run_export_job wrapper)" }
+    keyset:         { na: "shared seam (run_export_job wrapper)" }
+    mongo_parallel: { na: "shared seam (run_export_job wrapper); the Mongo capture itself is proven by run_records_the_load_spec_of_a_mongo_collection" }

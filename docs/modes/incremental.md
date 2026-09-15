@@ -129,7 +129,46 @@ exports:
       path: ./output
 ```
 
+## Switching to incremental
+
+The usual path is a full load first, then `mode: incremental` on the same export. What the first incremental run does depends on the export's previous mode ([ADR-0033](../adr/0033-mode-transitions.md), [matrix](../mode-transition-matrix.yaml)):
+
+| Previous mode | New cursor | First incremental run |
+|---|---|---|
+| `full`, `time_window`, range `chunked` | any | full pass — no cursor was stored |
+| keyset (`chunk_by_key`), any variant | the same key | continues after the last exported key |
+| keyset or `incremental` | a different column, or a changed `incremental_cursor_mode` | refused until `rivet state reset --export <name>` |
+| `incremental` | the same column with `settle` added | continues |
+
+`rivet load` follows what each run holds. A run that re-read the whole table — a full load, or an incremental export's first run — lands as a plain `<table>`. The first delta renames that table to `<table>__changes`, adds `__op` / `__pos` / `__seq` (NULL on the rows it already held) and makes `<table>` a view over it; the log keeps the table's partitioning and clustering, and nothing is copied or dropped. A whole-table load onto a table rivet did not load, one whose partitioning or clustering differs from the config, or a view left by an earlier incremental load fails naming the difference and changes nothing — drop or rename the table, or align the config. The rename refuses the same way when the table's columns differ from the export's or a `<table>__changes` already exists beside it.
+
+## Settle window
+
+Some rows keep changing for a while after they are inserted, and no column records when: a page view's time-on-page arrives with the next hit, a session's totals grow until it closes. A cursor exports such a row as soon as it appears, before its final values exist, and never sees the later write.
+
+`settle` holds each row back until it is older than `after` by the source clock:
+
+```yaml
+exports:
+  - name: page_views
+    table: page_views
+    mode: incremental
+    cursor_column: id              # a cheap primary-key range per run
+    settle:
+      column: server_time          # the row's insert time
+      after: 1h                    # longer than the time the row keeps changing
+```
+
+- `after` takes `s`, `m`, `h` or `d`. The warehouse copy lags the source by that much.
+- Without `column`, the cursor itself is aged (`cursor_column`, or the `COALESCE` in coalesce mode) — the right choice for an `updated_at` cursor.
+- With a separate `column`, the cursor also stops below the first row that is still settling, so a row committed out of id order is never skipped.
+- A row whose settle value is `NULL` never ages, so it is exported without waiting.
+- The column must be a date or timestamp; zone-less values are compared as UTC.
+- Deletes stay invisible to a cursor. Use `mode: cdc` when they must reach the warehouse.
+
 ## Troubleshooting
+
+**`the stored cursor ... was written for ...`** -- The export's cursor changed (a new `cursor_column`, or a keyset `chunk_by_key` export switched to incremental on another column). The old value means nothing for the new column; `rivet state reset --config ... --export <name>` starts the new cursor with a full pass.
 
 **No new rows but export still runs** -- Add `skip_empty: true` to avoid empty files.
 

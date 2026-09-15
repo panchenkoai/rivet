@@ -2,6 +2,149 @@
 
 ## Unreleased
 
+## 0.26.0 — 2026-09-14
+
+- **`load: { partition }` — the warehouse table's partitioning, per table**
+  ([ADR-0034](docs/adr/0034-load-table-spec.md)). `partition: { column: ts, granularity: day,
+  expiration_days: 400, require_filter: true }` partitions the table the load writes by a DATE /
+  DATETIME / TIMESTAMP column at `hour` / `day` / `month` / `year`; `{ range: { column, start,
+  end, interval } }` buckets an INT64 column; `{ ingestion: day }` partitions by load time;
+  `none` (the default) leaves the table flat. Rivet writes the BigQuery expression from the
+  column type `rivet run` recorded (`TIMESTAMP_TRUNC` / `DATETIME_TRUNC` / `DATE_TRUNC` /
+  `RANGE_BUCKET` / `_PARTITIONDATE`) — the config never carries SQL — and refuses a form the
+  type cannot take (`hour` on a DATE, `range` on a TIMESTAMP). The change log inherits the
+  table's partition through the rename, or takes it when rivet creates the log; it never
+  requires a partition filter and never expires load-date partitions. A full load onto its own
+  table with a different partition is refused naming both (the shape is read from `tables.get`
+  and compared as metadata); a changed `expiration_days` / `require_filter` is applied in
+  place. Before any job runs, the load reads the partition column's range from the Parquet
+  footers and refuses a span over BigQuery's 4,000 partitions per job, naming the granularity
+  that fits. On Snowflake `partition` becomes a leading `DATE_TRUNC` clustering expression
+  (`range` / `ingestion` / the options are refused). The per-job Hive batching of the old
+  export-`partition_by` loader path — unreachable since `partition_by` and `load:` exclude
+  each other — is gone.
+- **A change log follows a written `partition:` / `cluster_by:`; `rivet load
+  --rebuild-changelog` re-partitions it.** With the defaults (`partition` absent,
+  `cluster_by: auto`) `<table>__changes` keeps whatever shape it has. Once the config writes
+  `cluster_by`, a log clustered otherwise is re-clustered in place (new rows land clustered,
+  BigQuery re-clusters the rest in the background). Once it writes `partition`, a log
+  partitioned otherwise refuses the load naming both keys and the bytes a rebuild reads;
+  `rivet load --rebuild-changelog` copies the log in the declared shape with a billed query,
+  checks the row count and swaps it in — never as a side effect of a scheduled load. A load
+  that finds the remains of an interrupted swap (`<table>__changes__old` / `__rebuild`) stops
+  before touching anything and says which to keep. A changed `expiration_days` is altered in
+  place on the log as on the table.
+- **BigQuery load jobs are inserted under a client job id.** A `jobs.insert` that times
+  out or is refused transiently is sent again with the same id, so the statement never runs
+  twice: a repeat of an insert that did land answers `409 Already Exists`, and the job is
+  fetched and polled instead — in the dataset's location (`datasets.get`), since a single-
+  region job cannot be fetched by id alone. Previously such a timeout failed the load outright.
+- **A refused load never makes the table rivet's own.** A load that stops before touching
+  the warehouse — a table rivet did not load, a shape that differs, a view under a full pass,
+  a partition over budget, an interrupted rebuild's leftovers — is journaled as `refused`
+  (`rivet state loads`), and only a load that reached the write (`failed` or `success`)
+  counts for ownership. Previously the refusal's `failed` row made the foreign table rivet's
+  own, and the next `rivet load` (a scheduler retry) overwrote or adopted it.
+- **An incremental load never overwrites a table that already exists.** A run with no
+  cursor to resume from holds the whole table (the first run after `mode: full`, after
+  `state reset`, or on a lost state DB). It lands as a plain `<table>` only when that name
+  is free; when a table is already there it is renamed into `<table>__changes` first and
+  the run is appended to it, so rows the source has since deleted stay in the log. The
+  overlap between the kept baseline and the re-read pass is at-least-once and the
+  current-state view dedups it by key. Previously such a run replaced the table.
+- **An incremental whole-table run onto its own view joins the change log.** After
+  `state reset`, or on a stateless cycle that re-selects the first run, the run is appended
+  to `<table>__changes` at least once (the view keeps the latest row per key) instead of
+  refusing "a full pass cannot be appended" on every later cycle.
+- **`pk: auto` forgets a key the export no longer reads.** A run that finds no source key
+  (a `query:` export, a relation without one) clears the key an earlier run recorded, so the
+  dedup view never partitions by a column of a table the export moved away from; a key
+  `rivet init` recorded for a `query:` scaffold is kept. A `pk` column the export does not
+  project is refused at plan time, not after the append.
+- **A 0.25.0 incremental cursor is attributed to its column.** `rivet state` rows written
+  before v26 carry no cursor identity; a keyset run's was recovered from its metrics, an
+  incremental run's was not — so a changed `cursor_column` compared the new column against
+  the old value (on MySQL: exit 0, zero rows, every run). The incremental run's key
+  descriptor (`export_metrics.key_descriptor_json`, v18+) now attributes it, and the switch
+  is refused naming both columns and `state reset` (MT6).
+- **An unwritten `cluster_by` follows the table.** A full load onto its own table with
+  `cluster_by` left at `auto` keeps the clustering the table has — a table an earlier
+  release created unclustered is overwritten as it is, not refused after the upgrade. A
+  written `cluster_by` still conflicts.
+- **`--rebuild-changelog` carries the log's properties.** The copy takes the description,
+  labels, friendly name, table expiry and KMS key of the log; a log with column policy tags
+  or row access policies is refused, since a copy carries neither.
+- **Partition budget and expiry corner cases.** A part without statistics no longer hides
+  the span the other parts prove; an INT32-stored range column (PostgreSQL `integer`, MySQL
+  `int`) is budgeted like INT64; `range` + `expiration_days` is refused when the config is
+  read (BigQuery has no expiry for integer ranges); a change log partitioned on
+  `_rivet_exported_at` — one value per run — never expires, like a load-date partition.
+- **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
+  text ("failed to lookup address information…", or MongoDB's whole topology dump); a
+  connection that fails before the server answers now says `cannot resolve host <host> —
+  check the host name in url:`, `nothing is listening on <host>:<port>`, or `no answer from
+  <host>:<port>`, with the driver's text after it. MySQL dials at open, so the message comes
+  from `rivet init` / `rivet run` start, not from the first query.
+- **`rivet init --include a b c`** — several globs after one `--include` / `--exclude`
+  (the repeated form still works).
+- **`load: { pk, cluster_by }` default to the source primary key** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
+  Both take `auto` (the default), `none`, or a column list. `pk: auto` is the primary key
+  `rivet run` recorded, so an incremental / CDC load no longer needs `pk:` for a table with
+  one; `cluster_by: auto` clusters the table the load writes (the full-load table or
+  `<table>__changes`) on that key, skipping columns BigQuery cannot cluster and keeping at
+  most four. An explicit `cluster_by` column BigQuery cannot hold is refused at plan time.
+  `<table>__changes` is now clustered on `cluster_by` rather than always on `pk`.
+  `rivet init -o` records each scaffolded export's key too, so a `query:` export — which
+  `rivet run` cannot read a key from — also gets one.
+- **An incremental export's first run lands as a plain table; the change log starts with the
+  first delta.** A run that re-read the whole table (the first run, or one after `rivet state
+  reset`) is loaded into `<table>` exactly like a full load. The first delta then renames that
+  table to `<table>__changes`, adds `__op` / `__pos` / `__seq` (NULL on the existing rows) and
+  puts the current-state view under the old name — no copy, nothing dropped, and the change
+  log keeps the table's partitioning and clustering (a `require_partition_filter` is lifted,
+  since the view reads the whole log). The same rename turns a full-load table into the log
+  when a keyset export continues as incremental on the same key, or a CDC stream starts over
+  it without `initial: snapshot`. Previously the first append copied the table into the log
+  with a billed `CREATE TABLE … AS SELECT`, and after a full → incremental switch that copy
+  duplicated every row the first run had re-read.
+- **A load never touches a table it does not own.** A whole-table load onto an existing table
+  proceeds only when the load ledger shows rivet loaded it and its partitioning and clustering
+  match the config. A table rivet did not load, one whose shape differs (partitioned or
+  re-clustered by hand, or `cluster_by` changed), or a view left by an incremental / CDC load
+  fails the load naming the table and the difference, and nothing is changed. A CDC load that
+  carries an initial snapshot over a table an earlier full load left is refused the same way:
+  keep one baseline. Without a ledger (a stateless load) the table's shape is the only
+  evidence, and the load says so. On BigQuery row counts come from table metadata, so a table
+  that requires a partition filter can be counted.
+- **`rivet load` no longer reads the source** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
+  A successful `rivet run` of an export in a config with a `load:` block records the
+  column types it wrote and the source primary key in the state DB (schema v27,
+  `export_load_spec`); `rivet load` plans the warehouse schema from that record and opens
+  no source connection. A load with nothing recorded fails naming the export — after
+  upgrading, run `rivet run` once before the next `rivet load`.
+
+- **New: `settle` for `mode: incremental`.** `settle: { after: 1h, column: server_time }`
+  exports a row only once it is older than `after` by the source clock — for rows the
+  application keeps writing into after their insert, with no column that records it.
+  With a separate settle column the cursor also stops below the first unsettled row, so
+  an out-of-order commit is never skipped. MySQL, PostgreSQL and SQL Server.
+- **Fix: changing an export's cursor no longer exports nothing, silently.** The stored
+  cursor was keyed by export name alone, so a new `cursor_column` (or keyset →
+  incremental on another column) compared the new column against the old value — on
+  MySQL a zero-row match with exit 0, on every run. The cursor's column is now recorded
+  (state schema v26) and a mismatch fails naming both columns and `rivet state reset`;
+  cursors written by keyset before v26 are recognised from the run history.
+- **Mode transitions are a contract** ([ADR-0033](docs/adr/0033-mode-transitions.md)): what
+  an export inherits when it switches to incremental — a full pass after `full` /
+  `time_window` / range `chunked`, a continuation on the same key after keyset, a loud
+  refusal on a different column. `docs/mode-transition-matrix.yaml` covers 13 transitions
+  on MySQL, PostgreSQL and SQL Server with live tests.
+- **Fix: the first incremental / CDC `rivet load` after a full load.** The full load left
+  `<table>` as a table, and the incremental load's `CREATE OR REPLACE VIEW <table>`
+  collided with it (and its view would have hidden the full-loaded rows). The load now
+  copies that table into `<table>__changes` as the baseline, checks the row count and
+  drops it; it refuses, touching nothing, when the columns differ. BigQuery and Snowflake.
+
 ## 0.25.0 — 2026-08-30
 
 - **New: `rivet state runs` and `rivet state finish-run`** — the frozen-prefix

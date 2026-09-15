@@ -101,6 +101,15 @@ impl GcsStore {
         Ok(self.op.read(path)?.to_vec())
     }
 
+    /// `len` bytes of the object at the bucket-relative `path`, from offset `start`.
+    pub(crate) fn read_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let opts = opendal::options::ReadOptions {
+            range: (start..start + len).into(),
+            ..Default::default()
+        };
+        Ok(self.op.read_options(path, opts)?.to_vec())
+    }
+
     /// Recursively delete everything under the bucket-relative `path`.
     ///
     /// Normalise to a DIRECTORY boundary first (`dir_boundary`): opendal — and
@@ -251,6 +260,15 @@ mod tests {
         write_at(dir.path(), "p/hello.bin", b"payload");
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(store.read("p/hello.bin").unwrap(), b"payload");
+    }
+
+    #[test]
+    fn read_range_returns_the_requested_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "exports/a.bin", b"0123456789");
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(store.read_range("exports/a.bin", 3, 4).unwrap(), b"3456");
+        assert_eq!(store.read_range("exports/a.bin", 8, 2).unwrap(), b"89");
     }
 
     #[test]

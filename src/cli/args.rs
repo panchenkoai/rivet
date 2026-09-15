@@ -188,7 +188,9 @@ pub enum Commands {
     /// The native column schema, target table, partition, and source URIs are
     /// all derived from the config's top-level `load:` block — nothing is
     /// hand-typed. A multi-table config loads every export into the shared
-    /// target, one after another.
+    /// target, one after another. Column types come from the state DB, recorded
+    /// by each export's last successful `rivet run`; the load never connects to
+    /// the source.
     Load {
         /// Path to YAML config file — extraction PLUS a top-level `load:` block.
         /// ONE file drives both the export and the load: the mode
@@ -201,6 +203,12 @@ pub enum Commands {
         /// per run as well as per table. Defaults to a generated id.
         #[arg(long, env = "RIVET_RUN_ID")]
         run_id: Option<String>,
+        /// Rebuild a `<table>__changes` whose partitioning differs from the config's
+        /// `load.partition` — a billed query copying every row — and swap it in.
+        /// Without this flag such a load is refused naming the difference; a
+        /// rebuild is never a side effect of a scheduled load.
+        #[arg(long)]
+        rebuild_changelog: bool,
     },
     /// Manage export state
     State {
@@ -234,11 +242,11 @@ pub enum Commands {
         /// PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL).
         #[arg(long)]
         schema: Option<String>,
-        /// Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all.
-        #[arg(long, value_name = "GLOB")]
+        /// Whole-schema only: keep only tables/views matching these globs (`*`/`?`) — several after one flag (`--include orders users`) or the flag repeated; a table is kept if it matches any. No `--include` = keep all.
+        #[arg(long, value_name = "GLOB", num_args = 1..)]
         include: Vec<String>,
-        /// Whole-schema only: drop tables/views matching this glob (`*`/`?`). Repeatable; `--exclude` wins over `--include`.
-        #[arg(long, value_name = "GLOB")]
+        /// Whole-schema only: drop tables/views matching these globs (`*`/`?`) — several after one flag or the flag repeated; `--exclude` wins over `--include`.
+        #[arg(long, value_name = "GLOB", num_args = 1..)]
         exclude: Vec<String>,
         /// Write output to this file instead of stdout
         #[arg(short, long)]
@@ -816,6 +824,43 @@ mod tests {
             } => {
                 assert_eq!(include, vec!["orders", "users"]);
                 assert_eq!(exclude, vec!["bench_*"]);
+            }
+            _ => panic!("expected Init command"),
+        }
+    }
+
+    #[test]
+    fn init_clap_takes_several_globs_after_one_include_or_exclude() {
+        let cli = Cli::try_parse_from([
+            "rivet",
+            "init",
+            "--source",
+            "postgresql://localhost/db",
+            "--include",
+            "orders",
+            "users",
+            "log_*",
+            "--exclude",
+            "bench_*",
+            "tmp_*",
+            "--output",
+            "rivet.yaml",
+        ])
+        .expect("space-separated globs after one flag must parse");
+        match cli.command {
+            Commands::Init {
+                include,
+                exclude,
+                output,
+                ..
+            } => {
+                assert_eq!(include, vec!["orders", "users", "log_*"]);
+                assert_eq!(exclude, vec!["bench_*", "tmp_*"]);
+                assert_eq!(
+                    output.as_deref(),
+                    Some("rivet.yaml"),
+                    "the next flag ends the list"
+                );
             }
             _ => panic!("expected Init command"),
         }

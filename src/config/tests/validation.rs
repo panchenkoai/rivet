@@ -1201,6 +1201,68 @@ exports:
     assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
 }
 
+fn settle_yaml(mode_lines: &str, settle: &str) -> String {
+    format!(
+        r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: t
+    query: "SELECT * FROM events"
+{mode_lines}
+    settle: {settle}
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#
+    )
+}
+
+#[test]
+fn settle_outside_incremental_mode_rejected() {
+    let yaml = settle_yaml("    mode: full", "{ after: 1h }");
+    let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
+    assert!(
+        msg.contains("settle") && msg.contains("mode: incremental"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn settle_after_must_be_a_positive_duration_with_a_unit() {
+    for bad in ["3600", "0h", "1x", "h", "-1h", "1.5h", "99999999d"] {
+        let yaml = settle_yaml(
+            "    mode: incremental\n    cursor_column: id",
+            &format!("{{ after: \"{bad}\" }}"),
+        );
+        let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
+        assert!(msg.contains("settle.after"), "{bad}: {msg}");
+    }
+}
+
+#[test]
+fn settle_accepted_under_incremental() {
+    for settle in [
+        "{ after: 1h }",
+        "{ after: 90s, column: server_time }",
+        "{ after: 2d }",
+    ] {
+        let yaml = settle_yaml("    mode: incremental\n    cursor_column: id", settle);
+        Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{settle}: {e:#}"));
+    }
+}
+
+#[test]
+fn settle_unknown_key_rejected() {
+    let yaml = settle_yaml(
+        "    mode: incremental\n    cursor_column: id",
+        "{ after: 1h, colum: ts }",
+    );
+    assert!(Config::from_yaml(&yaml).is_err());
+}
+
 #[test]
 fn keyset_incremental_requires_chunk_by_key() {
     // Under chunked but with a RANGE chunk_column — no key to resume from.
@@ -1391,4 +1453,65 @@ fn misplaced_tuning_list_covers_every_field() {
         listed, props,
         "TUNING_FIELD_NAMES must equal TuningConfig's own fields (schema-derived)"
     );
+}
+
+// ─── typed `load:` block flags ────────────────────────────────
+
+/// `allow_source_drift`, `gc_orphans` and `cleanup_source` are the booleans of the typed
+/// `load:` block: read when the config is read, flipped per export by a `load:` override
+/// that inherits the rest, and refused on a typo at either level.
+#[test]
+fn load_block_flags_are_typed_overridable_and_a_typo_is_refused() {
+    let head = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+load:
+  target: bigquery
+  project: p
+  dataset: d
+  FLAG: true
+  gc_orphans: true
+  cleanup_source: true
+exports:
+  - name: t
+    table: t
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let yaml = |flag: &str, export_load: &str| head.replace("FLAG", flag).to_string() + export_load;
+
+    let cfg = Config::from_yaml(&yaml(
+        "allow_source_drift",
+        "    load: { allow_source_drift: false }\n",
+    ))
+    .unwrap();
+    let load = cfg.load.as_ref().expect("the typed load block");
+    assert!(load.allow_source_drift && load.gc_orphans && load.cleanup_source);
+    let eff = load.with_override(cfg.exports[0].load.as_ref().expect("the override"));
+    assert!(
+        !eff.allow_source_drift,
+        "the export override flips the flag"
+    );
+    assert!(
+        eff.gc_orphans && eff.cleanup_source,
+        "and inherits the rest"
+    );
+
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&yaml("allow_source_drfit", "")).unwrap_err()
+    );
+    assert!(err.contains("allow_source_drfit"), "{err}");
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&yaml(
+            "allow_source_drift",
+            "    load: { allow_source_drfit: false }\n"
+        ))
+        .unwrap_err()
+    );
+    assert!(err.contains("allow_source_drfit"), "{err}");
 }

@@ -228,9 +228,66 @@ pub fn collect_reports(
         params,
         on_unresolved,
     } = ctx;
-    let mut units = report_units(export, config_dir, params)?;
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
+    let units = resolved_units(config, export, &url, tls, config_dir, params, on_unresolved)?;
+    let mut src = connect_source(config, &url, tls)?;
+
+    units
+        .into_iter()
+        .map(|unit| {
+            // A `columns:` override on a multiplex export can be qualified
+            // (`orders.amount`) or bare — narrow it to THIS table exactly the way
+            // the capture does, so `check`/`load` type a table the same way `run`
+            // writes it.
+            // The unit's table: a `tables:` entry for a multiplex export, else
+            // the export's OWN `table:`. `None` only for a `query:` export.
+            //
+            // The `.or(export.table)` fallback is the half that was missing: the
+            // multiplex arm narrowed and the single-table arm passed the map
+            // through whole, so on `table: public.orders` a qualified key
+            // (`orders.amount`) matched NOTHING here while `plan::build` applied
+            // it to the run. `overrides_for_unit` is the ONE rule all three
+            // sites now share, so they cannot drift apart again.
+            let overrides = unit_overrides(export, unit.table.as_deref(), column_overrides);
+            collect_one(
+                src.as_mut(),
+                export,
+                unit.table,
+                &unit.query,
+                &overrides,
+                policy,
+                target,
+            )
+        })
+        .collect()
+}
+
+/// One resolver unit: the report's table, its probe query, and the relation that holds its primary key.
+struct ReportUnit {
+    table: Option<String>,
+    query: String,
+    relation: Option<String>,
+}
+
+/// The export's resolver units, a SQL Server capture instance resolved to the relation it captures.
+fn resolved_units(
+    config: &Config,
+    export: &ExportConfig,
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+    config_dir: &std::path::Path,
+    params: Option<&std::collections::HashMap<String, String>>,
+    on_unresolved: OnUnresolvedCapture,
+) -> Result<Vec<ReportUnit>> {
+    let mut units: Vec<ReportUnit> = report_units(export, config_dir, params)?
+        .into_iter()
+        .map(|(table, query)| ReportUnit {
+            relation: table.clone().or_else(|| export.table.clone()),
+            table,
+            query,
+        })
+        .collect();
 
     // The THIRD reading of one config, and it must agree with the other two.
     //
@@ -262,7 +319,7 @@ pub fn collect_reports(
         // one relation on any connection, whatever the default schema — so degrading
         // to it is safe for either caller. A BARE name is not, and that is the only
         // case where the two callers must part.
-        let resolved = crate::source::mssql::cdc::source_object_of_capture_instance(&url, ci, tls);
+        let resolved = crate::source::mssql::cdc::source_object_of_capture_instance(url, ci, tls);
         // WHY it is unresolved decides which repair to name. Round 8: the single
         // remedy "restore access to the cdc schema" was inert on the no-row branch,
         // which is reached with cdc access working — the same shape (a remedy correct
@@ -284,10 +341,9 @@ pub fn collect_reports(
         };
         match (resolved, why) {
             (Ok(Some((schema, table))), _) => {
-                for (unit, query) in units.iter_mut() {
-                    if unit.is_none() {
-                        *query = format!("SELECT * FROM {schema}.{table}");
-                    }
+                for unit in units.iter_mut().filter(|u| u.table.is_none()) {
+                    unit.query = format!("SELECT * FROM {schema}.{table}");
+                    unit.relation = Some(format!("{schema}.{table}"));
                 }
             }
             (_, Some(why)) => {
@@ -350,42 +406,73 @@ pub fn collect_reports(
             (Err(_), None) | (Ok(None), None) => unreachable!("every non-resolution has a reason"),
         }
     }
+    Ok(units)
+}
 
-    let mut src: Box<dyn source::Source> = match config.source.source_type {
+/// Open the configured source for scan-free probes.
+pub(crate) fn connect_source(
+    config: &Config,
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+) -> Result<Box<dyn source::Source>> {
+    Ok(match config.source.source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
-            &url, tls,
+            url, tls,
         )?),
-        SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(&url, tls)?),
-        SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(&url, tls)?),
-        SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(&url, tls, None)?),
-    };
+        SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(url, tls)?),
+        SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(url, tls)?),
+        SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(url, tls, None)?),
+    })
+}
 
+/// What a successful run records for the load about one unit: its resolved
+/// column types and the source primary key, in key order.
+pub struct CapturedUnit {
+    pub table: Option<String>,
+    pub mappings: Vec<crate::types::TypeMapping>,
+    pub primary_key: Option<Vec<String>>,
+}
+
+/// Capture from the source, at run time, everything `rivet load` later plans from without it.
+pub fn capture_load_units(
+    config: &Config,
+    export: &ExportConfig,
+    column_overrides: &ColumnOverrides,
+    config_dir: &std::path::Path,
+    params: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Vec<CapturedUnit>> {
+    let url = config.source.resolve_url()?;
+    let tls = config.source.tls.as_ref();
+    let units = resolved_units(
+        config,
+        export,
+        &url,
+        tls,
+        config_dir,
+        params,
+        OnUnresolvedCapture::Fail,
+    )?;
+    let mut src = connect_source(config, &url, tls)?;
     units
         .into_iter()
-        .map(|(table, query)| {
-            // A `columns:` override on a multiplex export can be qualified
-            // (`orders.amount`) or bare — narrow it to THIS table exactly the way
-            // the capture does, so `check`/`load` type a table the same way `run`
-            // writes it.
-            // The unit's table: a `tables:` entry for a multiplex export, else
-            // the export's OWN `table:`. `None` only for a `query:` export.
-            //
-            // The `.or(export.table)` fallback is the half that was missing: the
-            // multiplex arm narrowed and the single-table arm passed the map
-            // through whole, so on `table: public.orders` a qualified key
-            // (`orders.amount`) matched NOTHING here while `plan::build` applied
-            // it to the run. `overrides_for_unit` is the ONE rule all three
-            // sites now share, so they cannot drift apart again.
-            let overrides = unit_overrides(export, table.as_deref(), column_overrides);
-            collect_one(
-                src.as_mut(),
-                export,
-                table,
-                &query,
-                &overrides,
-                policy,
-                target,
-            )
+        .map(|unit| {
+            let overrides = unit_overrides(export, unit.table.as_deref(), column_overrides);
+            let mappings = probe_mappings(src.as_mut(), &unit.query, &overrides)?;
+            let primary_key = match unit.relation.as_deref() {
+                Some(relation) => src.primary_key(relation).unwrap_or_else(|e| {
+                    log::warn!(
+                        "export '{}': could not read the primary key of `{relation}`: {e:#}",
+                        export.name
+                    );
+                    None
+                }),
+                None => None,
+            };
+            Ok(CapturedUnit {
+                table: unit.table,
+                mappings,
+                primary_key,
+            })
         })
         .collect()
 }
@@ -446,12 +533,34 @@ fn collect_one(
     policy: &TypePolicy,
     target: Option<ExportTarget>,
 ) -> Result<ExportTypeReport> {
+    let mappings = probe_mappings(src, query, column_overrides)?;
+    Ok(report_from_mappings(
+        export, table, mappings, policy, target,
+    ))
+}
+
+/// One unit's resolved mappings, with overrides that narrow the source type downgraded to lossy.
+pub(crate) fn probe_mappings(
+    src: &mut dyn source::Source,
+    query: &str,
+    column_overrides: &ColumnOverrides,
+) -> Result<Vec<crate::types::TypeMapping>> {
     let mut mappings = src.type_mappings(query, column_overrides)?;
 
     downgrade_narrowing_overrides(&mut mappings, column_overrides, || {
         src.type_mappings(query, &ColumnOverrides::new())
     })?;
+    Ok(mappings)
+}
 
+/// One unit's report from already-resolved mappings, with no source connection.
+pub fn report_from_mappings(
+    export: &ExportConfig,
+    table: Option<String>,
+    mappings: Vec<crate::types::TypeMapping>,
+    policy: &TypePolicy,
+    target: Option<ExportTarget>,
+) -> ExportTypeReport {
     let mut violations = policy.validate(&mappings);
 
     // Format-awareness: type resolution above is for the Parquet representation,
@@ -533,14 +642,14 @@ fn collect_one(
     let sql_table = table.as_deref().unwrap_or(&export.name);
     let recovery_sql = target.and_then(|t| t.recovery_sql(&t.resolve_table(&mappings), sql_table));
 
-    Ok(ExportTypeReport {
+    ExportTypeReport {
         export: export.name.clone(),
         table,
         columns: rows,
         violations,
         target_failures,
         recovery_sql,
-    })
+    }
 }
 
 /// Print the report as a human-readable table to stdout.

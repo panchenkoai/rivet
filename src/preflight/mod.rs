@@ -574,78 +574,61 @@ pub fn check(
     Ok(clean)
 }
 
-/// One type report per export against `target`, **collected and returned rather
-/// than printed** — the in-process form of `rivet check --target <t> --json` for
-/// a caller that needs the DATA instead of the rendering (the warehouse load
-/// planner, `load::plan::plan_loads`).
+/// One type report per export unit against `target`, typed from the load spec
+/// `rivet run` recorded in the state DB, so `rivet load` never reads the source;
+/// returned with the source primary keys it recorded.
 ///
-/// It goes through the same [`type_report::collect_report`] that [`check`]
-/// renders from, including the `columns:` override parse, so the types a load
-/// declares to the warehouse cannot differ from the ones `rivet check` shows for
-/// the same config. `rivet load` used to obtain them by SPAWNING `rivet check
-/// --target X --json` and parsing its stdout; which binary that was depended on
-/// `--rivet-bin` / `current_exe()`, so a version-skewed resolver was a real
-/// (mitigated, never eliminated) failure mode — in-process it is impossible by
-/// construction, and the load planner becomes testable without a subprocess.
-///
-/// Two deliberate differences from the `check` command, both because this is a
-/// data path and not a diagnostic:
-/// - the policy is always `warn_only` (`--strict`'s whole effect is a non-zero
-///   exit code; the load's own `validate_specs` is what refuses a `Fail` column);
-/// - a report that cannot be collected is an ERROR, not a logged warning. `check`
-///   can afford to skip an export it could not type; for a load, a missing report
-///   is a table that silently does not load.
-///
-/// The source-connection DIAGNOSTICS and the destination-credential probe the
-/// `check` COMMAND also runs are not part of a type report and are not collected
-/// here: the load reads Parquet an extract already wrote, so a `run`-shaped
-/// verdict about the source read path has nothing to say about it.
-pub fn collect_type_reports(
+/// The recorded columns went through the same resolver `rivet check` renders from
+/// (`type_report::capture_load_units`), so the types a load declares cannot differ
+/// from the ones the run wrote. The policy is `warn_only`: the load's own
+/// `validate_specs` is what refuses a `Fail` column. A unit with nothing recorded
+/// is an ERROR, accumulated across exports, because a table that cannot be typed
+/// must not silently not-load.
+pub fn load_type_reports(
     config: &Config,
-    config_path: &str,
+    state: &crate::state::StateStore,
     target: ExportTarget,
-) -> Result<Vec<type_report::ExportTypeReport>> {
+) -> Result<(
+    Vec<type_report::ExportTypeReport>,
+    crate::load::plan::RecordedKeys,
+)> {
     let policy = TypePolicy::warn_only();
-    let config_dir = std::path::Path::new(config_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
     let mut out = Vec::with_capacity(config.exports.len());
-    // Failures are ACCUMULATED, not raised at the first one. The load stays
-    // fail-closed as a whole — its own contract is that a table which cannot be
-    // typed must not silently not-load — but reporting only the first unresolvable
-    // export makes the operator fix them one run at a time, and a `rivet load` over
-    // a many-export config is not a cheap round trip (round 8).
+    let mut keys = crate::load::plan::RecordedKeys::new();
     let mut failures: Vec<String> = Vec::new();
     for export in &config.exports {
-        let column_overrides =
-            crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
-        // One report per UNIT: a multiplex `tables:` CDC export yields one per
-        // captured table, because each is a separate warehouse table with its own
-        // sub-prefix and its own column set (#252). Flattened rather than nested
-        // so the load planner keeps mapping report → plan one-to-one.
-        let reports = type_report::collect_reports(
-            config,
-            export,
-            &column_overrides,
-            &policy,
-            type_report::ReportContext {
-                target: Some(target),
-                config_dir,
-                params: None,
-                // The load PLANS from these reports; see `OnUnresolvedCapture`.
-                on_unresolved: type_report::OnUnresolvedCapture::Fail,
-            },
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "export '{}': resolving column types for the {} load: {e:#}",
-                export.name,
-                target.label()
-            )
-        });
-        match reports {
-            Ok(r) => out.extend(r),
-            Err(e) => failures.push(format!("{e:#}")),
+        let units: Vec<Option<String>> = match export.multiplex_tables() {
+            Some(tables) => tables.iter().cloned().map(Some).collect(),
+            None => vec![None],
+        };
+        for unit in units {
+            match state.load_spec(&export.name, unit.as_deref()) {
+                Ok(Some(spec)) if !spec.columns.is_empty() => {
+                    let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
+                    if let Some(pk) = spec.primary_key {
+                        keys.insert((export.name.clone(), unit.clone()), pk);
+                    }
+                    out.push(type_report::report_from_mappings(
+                        export,
+                        unit,
+                        mappings,
+                        &policy,
+                        Some(target),
+                    ));
+                }
+                Ok(_) => failures.push(format!(
+                    "export '{}'{}: no column types recorded in the state DB — run \
+                     `rivet run` for this export first",
+                    export.name,
+                    unit.as_deref()
+                        .map(|t| format!(" table '{t}'"))
+                        .unwrap_or_default()
+                )),
+                Err(e) => failures.push(format!(
+                    "export '{}': reading its load spec from the state DB: {e:#}",
+                    export.name
+                )),
+            }
         }
     }
     if !failures.is_empty() {
@@ -657,7 +640,7 @@ pub fn collect_type_reports(
             failures.join("\n  - ")
         );
     }
-    Ok(out)
+    Ok((out, keys))
 }
 
 /// Emit one export's `--json` line: the type report (`export`/`columns`/

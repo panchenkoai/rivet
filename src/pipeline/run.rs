@@ -4174,7 +4174,7 @@ mod run_tail_tests {
         // (file, fn) -> why this candidate is not a run tail.
         let exempt: &[(&str, &str, &str)] = &[(
             "job.rs",
-            "run_export_job",
+            "run_export_job_inner",
             "a PER-EXPORT job, not a run tail: it calls itself only to dispatch a \
              CDC initial-snapshot child. The orchestrator that drives it (run / \
              run_waves / run_pool) owns the run's self-check, and emitting one \

@@ -55,7 +55,7 @@ load:
   target: bigquery        # or: snowflake (+ connection/warehouse/database/schema/storage_integration)
   project: my-proj
   dataset: analytics
-  pk: [id]                # incremental/cdc: the dedup key
+  pk: [id]                # incremental/cdc dedup key; default: the source primary key
   cleanup_source: true    # wipe staging only after the count gate passes
 ```
 

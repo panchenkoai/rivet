@@ -106,6 +106,66 @@ impl StateDb {
             .flatten()
     }
 
+    /// The column the persisted cursor belongs to (`export_state.cursor_column`), or
+    /// `None` when the export has no row or the row predates the identity (pre-v26).
+    pub fn cursor_column(&self, export: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT cursor_column FROM export_state WHERE export_name = ?1",
+                [export],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("query export_state")
+            .flatten()
+    }
+
+    /// The `load_run.status` of every load into `target_table`, oldest first.
+    pub fn load_statuses(&self, target_table: &str) -> Vec<String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status FROM load_run WHERE target_table = ?1 ORDER BY finished_at")
+            .expect("prepare load_run query");
+        stmt.query_map([target_table], |r| r.get::<_, String>(0))
+            .expect("query load_run")
+            .map(|r| r.expect("load_run.status"))
+            .collect()
+    }
+
+    /// The column names and primary key recorded for `rivet load`, or `None` without a row.
+    pub fn load_spec(
+        &self,
+        export: &str,
+        unit: Option<&str>,
+    ) -> Option<(Vec<String>, Option<Vec<String>>)> {
+        let (columns, key) = self
+            .conn
+            .query_row(
+                "SELECT columns_json, primary_key_json FROM export_load_spec \
+                 WHERE export_name = ?1 AND unit = ?2",
+                [export, unit.unwrap_or("")],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .expect("query export_load_spec")?;
+        let names = columns
+            .map(|c| {
+                serde_json::from_str::<Vec<serde_json::Value>>(&c)
+                    .expect("columns_json")
+                    .iter()
+                    .map(|v| v["name"].as_str().expect("column name").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let key = key.map(|k| serde_json::from_str(&k).expect("primary_key_json"));
+        Some((names, key))
+    }
+
     /// The full `export_metrics` row for `run_id`, read in one query.
     pub fn metrics_row(&self, run_id: &str) -> MetricsRow {
         self.conn

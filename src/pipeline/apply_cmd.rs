@@ -219,6 +219,19 @@ pub fn run_apply_command(
         plan_file,
         Some(apply_context),
     );
+    if result.is_ok()
+        && let Some(cfg_path) = artifact.config_path.as_deref()
+        && let Ok(config) = crate::config::Config::load(cfg_path)
+        && let Some(export) = config
+            .exports
+            .iter()
+            .find(|e| e.name == artifact.export_name)
+    {
+        let cfg_dir = Path::new(cfg_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        super::load_spec::record_after_run(&config, export, &state, cfg_dir, None, &summary);
+    }
 
     // 7. The run's tail. This arm is a FULL orchestrator — it opens the state
     // store, drives one export to completion and writes its `export_metrics`

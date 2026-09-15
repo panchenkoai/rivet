@@ -18,7 +18,7 @@
 //! - [`TypeFidelity::Unsupported`] — Rivet refuses to export the column
 //!   without an explicit policy override.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Fidelity tag attached to every [`crate::types::TypeMapping`].
 ///
@@ -28,7 +28,7 @@ use serde::Serialize;
 /// `Exact > Compatible > LogicalString > Lossy > Unsupported`.
 // `Lossy` and `is_unsafe_for_strict_mode` are used by TypePolicy (Chunk 4).
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeFidelity {
     /// Value and type semantics fully preserved on disk.

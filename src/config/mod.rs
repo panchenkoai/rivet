@@ -3,6 +3,7 @@ mod destination;
 mod export;
 mod format;
 mod lints;
+pub mod load;
 mod notifications;
 pub mod resolve;
 pub mod schema;
@@ -38,15 +39,12 @@ pub struct Config {
     pub parallel_exports: bool,
     #[serde(default)]
     pub parallel_export_processes: bool,
-    /// The warehouse **load** target — consumed by `rivet load` (and `rivet load
-    /// --cdc`), so ONE config drives both the export and the downstream load. The
-    /// extraction commands (`rivet check` / `run` / `apply`) accept and ignore it:
-    /// it shapes the load, not the extract.
-    // Kept as a raw `serde_json::Value` so the extraction path neither depends on
-    // nor validates the load schema — the load module (`crate::load::plan`) parses
-    // it into a typed `LoadSection`.
+    /// The warehouse **load** target — consumed by `rivet load`, so ONE config drives
+    /// both the export and the downstream load. The extraction commands validate it
+    /// (a malformed block fails `rivet check` before an extract runs) and otherwise
+    /// ignore it: it shapes the load, not the extract.
     #[serde(default)]
-    pub load: Option<serde_json::Value>,
+    pub load: Option<load::LoadSection>,
 }
 
 /// Two configured `tables:` entries that can name ONE relation, if any.
@@ -407,7 +405,25 @@ impl Config {
         }
         self.validate_cdc_resource_conflicts()?;
         self.validate_csv_exports_are_not_loaded()?;
+        self.validate_load_overrides()?;
         self.validate_non_sql_source_modes()?;
+        Ok(())
+    }
+
+    /// A per-export `load:` override needs the top-level block it overrides.
+    fn validate_load_overrides(&self) -> crate::error::Result<()> {
+        if self.load.is_some() {
+            return Ok(());
+        }
+        if let Some(e) = self.exports.iter().find(|e| e.load.is_some()) {
+            anyhow::bail!(
+                "export '{}' has a `load:` override but the config has no top-level `load:` \
+                 block — the warehouse (`target`, `project`/`dataset`, …) is declared once, at \
+                 the top level; the export's block only overrides `pk`, `cluster_by`, \
+                 `partition`, `cleanup_source`, `gc_orphans` and `allow_source_drift`",
+                e.name
+            );
+        }
         Ok(())
     }
 
@@ -1163,6 +1179,16 @@ impl Config {
             }
         }
 
+        if export.settle.is_some() && export.mode != ExportMode::Incremental {
+            anyhow::bail!(
+                "export '{}': `settle` requires `mode: incremental` — it bounds the incremental \
+                 cursor query and is silently ignored in `mode: {:?}`.\n  \
+                 Hint: set `mode: incremental` with a `cursor_column`, or remove `settle`.",
+                export.name,
+                export.mode,
+            );
+        }
+
         match export.mode {
             ExportMode::Incremental => {
                 if export.cursor_column.is_none() {
@@ -1170,6 +1196,22 @@ impl Config {
                         "export '{}': incremental mode requires cursor_column",
                         export.name
                     );
+                }
+                if let Some(settle) = &export.settle {
+                    settle
+                        .after_secs()
+                        .map_err(|e| anyhow::anyhow!("export '{}': {e:#}", export.name))?;
+                    if settle
+                        .column
+                        .as_deref()
+                        .is_some_and(|c| c.trim().is_empty())
+                    {
+                        anyhow::bail!(
+                            "export '{}': settle.column is empty — name a date/timestamp \
+                             column, or omit it to settle on the cursor",
+                            export.name
+                        );
+                    }
                 }
                 match export.incremental_cursor_mode {
                     IncrementalCursorMode::Coalesce => {
@@ -1912,13 +1954,55 @@ mod reserved_load_extension {
     //! single-file config. Reverting the reserved field turns this red.
     use super::*;
 
+    fn loaded_yaml(load: &str) -> String {
+        format!(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    destination:\n      type: gcs\n      bucket: b\n      prefix: \"t/\"\n{load}"
+        )
+    }
+
     #[test]
-    fn reserved_top_level_load_block_is_accepted_and_ignored() {
+    fn a_top_level_load_block_is_typed_when_the_config_is_read() {
+        let cfg = Config::from_yaml(&loaded_yaml(
+            "load:\n  target: bigquery\n  project: p\n  dataset: d\n  cleanup_source: true\n",
+        ))
+        .expect("a well-formed `load:` block parses");
+        let load = cfg.load.expect("typed");
+        assert_eq!(load.target.name(), "bigquery");
+        assert!(load.cleanup_source);
+    }
+
+    #[test]
+    fn a_malformed_load_block_fails_the_config_not_the_load() {
+        let err = Config::from_yaml(&loaded_yaml(
+            "load:\n  project: p\n  dataset: d\n  cleanup_source: true\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("target"), "a block without a target: {err}");
+        let err = Config::from_yaml(&loaded_yaml(
+            "load:\n  target: bigquery\n  project: p\n  dataset: d\n  partition: { column: ts, granularity: week }\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("week"), "a bad partition granularity: {err}");
+        let err = Config::from_yaml(&loaded_yaml(
+            "load:\n  target: bigquery\n  project: p\n  dataset: d\n  gc_orphan: true\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gc_orphan"), "a typo'd key: {err}");
+    }
+
+    #[test]
+    fn a_per_export_load_override_needs_the_top_level_block() {
         let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
-             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    destination:\n      type: gcs\n      bucket: b\n      prefix: \"t/\"\n\
-             load:\n  project: p\n  dataset: d\n  cleanup_source: true\n";
-        let cfg = Config::from_yaml(yaml).expect("config with a reserved `load:` block must parse");
-        assert!(cfg.load.is_some(), "the load block is captured opaquely");
+             exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n    load: { pk: [id] }\n    destination:\n      type: gcs\n      bucket: b\n      prefix: \"t/\"\n";
+        let err = Config::from_yaml(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("no top-level `load:` block"),
+            "an override with nothing to override: {err}"
+        );
     }
 }
 
@@ -2527,7 +2611,10 @@ exports:
     destination: {type: local, path: /tmp/out/}
 "#;
         let cfg = base
-            .replace("LOAD_BLOCK", "load: {target: duckdb, path: /tmp/w.db}")
+            .replace(
+                "LOAD_BLOCK",
+                "load: {target: bigquery, project: p, dataset: d}",
+            )
             .replace("FORMAT", "csv");
         let err = Config::from_yaml(&cfg).expect_err("csv + load").to_string();
         assert!(
@@ -2538,7 +2625,10 @@ exports:
         // FORMAT, not the load feature.
         Config::from_yaml(
             &base
-                .replace("LOAD_BLOCK", "load: {target: duckdb, path: /tmp/w.db}")
+                .replace(
+                    "LOAD_BLOCK",
+                    "load: {target: bigquery, project: p, dataset: d}",
+                )
                 .replace("FORMAT", "parquet"),
         )
         .expect("parquet + load must validate");

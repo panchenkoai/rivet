@@ -20,6 +20,8 @@ mod audit_validate_warning_label;
 mod cargo_manifest_chef;
 #[path = "offline/cdc_axis_matrix_guard.rs"]
 mod cdc_axis_matrix_guard;
+#[path = "offline/connect_error_hints.rs"]
+mod connect_error_hints;
 #[path = "offline/memory_throttle_wiring.rs"]
 mod memory_throttle_wiring;
 #[path = "offline/skip_is_not_a_pass_guard.rs"]
@@ -94,6 +96,8 @@ mod cli_flag_coverage_guard;
 mod live_only_purity_gate;
 #[path = "offline/live_service_ports_guard.rs"]
 mod live_service_ports_guard;
+#[path = "offline/load_allow_source_drift.rs"]
+mod load_allow_source_drift;
 #[path = "offline/rig_adoption_guard.rs"]
 mod rig_adoption_guard;
 #[path = "offline/runner_frame_gate.rs"]

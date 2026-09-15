@@ -12,6 +12,7 @@
 
 - [Who is Rivet for?](who-is-this-for.md)
 - [Getting started](getting-started.md)
+- [Cheat sheet](cheat-sheet.md)
 - [Concepts](concepts.md)
 - [Execution semantics](semantics.md)
 - [Type mapping](type-mapping.md)

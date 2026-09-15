@@ -97,6 +97,12 @@ scenarios:
     incremental: { na: "`tables:` is refused at config-load outside `mode: cdc` — an incremental export is always one unit" }
     cdc:         { test: build_plans_fans_a_multiplex_tables_export_out_to_one_plan_per_table }
 
+  - id: adopt_full_load_table
+    what: "the first delta over a `<table>` a whole-table load created renames it to `<table>__changes` (its rows, partitioning and clustering kept, meta columns added); a table rivet did not load, a column mismatch or an existing changelog beside it is refused untouched (ADR-0033 MT7)"
+    full:        { test: a_full_load_overwrites_its_own_table_and_refuses_the_rest }
+    incremental: { test: a_full_load_table_becomes_the_changelog_before_the_first_append }
+    cdc:         { test: a_full_load_table_is_adopted_on_the_cdc_path_too }
+
   - id: cleanup_source_safe_end_to_end
     what: "cleanup_source: true wipes the staged Parquet after a recorded load without losing data — proven live end to end"
     full:        { test: warehouse_cell_smoke_batch_mysql }

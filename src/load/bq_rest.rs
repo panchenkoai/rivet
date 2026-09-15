@@ -28,10 +28,12 @@
 //!
 //! ## Retries
 //!
-//! Only the polling GETs are retried (they are idempotent). `jobs.insert` is
-//! NOT: a retried insert would create a SECOND job, and `LOAD DATA INTO` (the
-//! CDC change-log append) is not idempotent — a duplicate append is silent row
-//! inflation. A transport error on insert fails the load loudly instead.
+//! The polling GETs are retried (they are idempotent). So is `jobs.insert`, but
+//! only because every job is sent under a CLIENT job id: a repeat of an insert
+//! that did land answers `409 Already Exists`, and the job is fetched instead of
+//! run again — `LOAD DATA INTO` (the change-log append) is not idempotent, and a
+//! duplicate append is silent row inflation. Before the client id, a transport
+//! timeout on insert failed the load outright (seen repeatedly on live runs).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -69,6 +71,11 @@ pub(crate) struct BigQueryApi {
     /// `jobReference.location` for inserted jobs; `None` lets BigQuery infer it
     /// from the referenced datasets (the CLI's behaviour).
     location: Option<String>,
+    /// The dataset the jobs write, whose location a job inserted without an answer
+    /// is fetched in (`jobs.get` 404s without one outside the US/EU multi-regions).
+    dataset: Option<String>,
+    /// That dataset's location, read once from `datasets.get` when first needed.
+    dataset_location: std::sync::OnceLock<Option<String>>,
     endpoint: String,
     http: reqwest::blocking::Client,
     auth: Auth,
@@ -113,6 +120,8 @@ impl BigQueryApi {
             location: std::env::var("RIVET_BQ_LOCATION")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: std::env::var("RIVET_BQ_API_ENDPOINT")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -120,6 +129,47 @@ impl BigQueryApi {
             auth: Auth::resolve(&http)?,
             http,
         })
+    }
+
+    /// A client whose jobs write `dataset`, so a job it has to fetch by id is polled in
+    /// that dataset's location.
+    pub(crate) fn for_dataset(project: &str, dataset: &str) -> Result<Self> {
+        let mut api = Self::new(project)?;
+        api.dataset = Some(dataset.to_string());
+        Ok(api)
+    }
+
+    /// The location a job inserted without an answer is fetched in: the configured
+    /// one, else the dataset's (read once), else none (a US/EU multi-region job).
+    fn fetch_location(&self) -> Option<String> {
+        if self.location.is_some() {
+            return self.location.clone();
+        }
+        let dataset = self.dataset.as_deref()?;
+        self.dataset_location
+            .get_or_init(|| match self.read_dataset_location(dataset) {
+                Ok(loc) => loc,
+                Err(e) => {
+                    log::warn!(
+                        "BigQuery datasets.get for {dataset} failed ({e:#}); polling without a \
+                         location"
+                    );
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// `location` of `dataset` from `datasets.get`.
+    fn read_dataset_location(&self, dataset: &str) -> Result<Option<String>> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}",
+            self.endpoint, self.project
+        );
+        Ok(self
+            .get_json_if_found(&url, "datasets.get")?
+            .as_ref()
+            .and_then(parse_dataset_location))
     }
 
     /// Run a query job to completion, tagged with `labels`. `Ok(job_id)` when
@@ -142,6 +192,64 @@ impl BigQueryApi {
         parse_scalar_u64(&results)
     }
 
+    /// The `tables.get` resource of `dataset.table` when it is a table: metadata, no
+    /// query job. `None` for a view, or when nothing has that name.
+    pub(crate) fn table_metadata(&self, dataset: &str, table: &str) -> Result<Option<Value>> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
+            self.endpoint, self.project
+        );
+        Ok(self
+            .get_json_if_found(&url, "tables.get")?
+            .filter(|meta| meta.get("type").and_then(Value::as_str) == Some("TABLE")))
+    }
+
+    /// How many row access policies `dataset.table` has (`rowAccessPolicies.list`); a
+    /// rebuilt copy of the table carries none.
+    pub(crate) fn row_access_policy_count(&self, dataset: &str, table: &str) -> Result<usize> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}/rowAccessPolicies",
+            self.endpoint, self.project
+        );
+        Ok(self
+            .get_json_if_found(&url, "rowAccessPolicies.list")?
+            .as_ref()
+            .and_then(|v| v.get("rowAccessPolicies"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len))
+    }
+
+    /// `tables.patch` on `dataset.table` with `body` — the metadata-only changes
+    /// (clustering) no DDL statement can make.
+    pub(crate) fn patch_table(&self, dataset: &str, table: &str, body: &Value) -> Result<Value> {
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
+            self.endpoint, self.project
+        );
+        let resp = self
+            .authorized(self.http.patch(&url))?
+            .json(body)
+            .send()
+            .context("BigQuery tables.patch request failed")?;
+        self.read_json(resp, "tables.patch")
+    }
+
+    /// `numRows` of `dataset.table` from `tables.get`: table metadata, no query job, so
+    /// it needs no partition filter on a table that requires one. `None` for anything
+    /// but a table — a view reports a meaningless zero.
+    pub(crate) fn table_num_rows(&self, dataset: &str, table: &str) -> Result<Option<u64>> {
+        let Some(meta) = self.table_metadata(dataset, table)? else {
+            return Ok(None);
+        };
+        let rows = meta
+            .get("numRows")
+            .and_then(Value::as_str)
+            .context("BigQuery tables.get returned no numRows")?;
+        rows.parse::<u64>()
+            .map(Some)
+            .with_context(|| format!("BigQuery returned a non-numeric numRows: {rows}"))
+    }
+
     /// Take an inserted job to a terminal state. A short statement often
     /// completes inside the insert call, so the body already in hand is graded
     /// before a poll is spent.
@@ -154,18 +262,63 @@ impl BigQueryApi {
         }
     }
 
+    /// Insert a query job under a client-chosen job id, so a request that times out or
+    /// is refused transiently can be sent again without running the statement twice:
+    /// a repeat of an insert that did land answers 409, and the job is fetched instead.
     fn insert_query_job(&self, sql: &str, labels: &BTreeMap<String, String>) -> Result<Value> {
-        let body = query_job_body(sql, labels, &self.project, self.location.as_deref());
+        let job_id = new_job_id();
+        let body = query_job_body(
+            sql,
+            labels,
+            &self.project,
+            self.location.as_deref(),
+            &job_id,
+        );
         let url = format!(
             "{}/bigquery/v2/projects/{}/jobs",
             self.endpoint, self.project
         );
-        let resp = self
-            .authorized(self.http.post(&url))?
-            .json(&body)
-            .send()
-            .context("BigQuery jobs.insert request failed")?;
-        self.read_json(resp, "jobs.insert")
+        let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
+        for attempt in 0..=MAX_TRANSIENT_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(poll_interval(attempt));
+            }
+            let sent = self.authorized(self.http.post(&url))?.json(&body).send();
+            match sent {
+                Ok(resp) => match insert_outcome(resp.status().as_u16()) {
+                    InsertOutcome::Answered => return self.read_json(resp, "jobs.insert"),
+                    InsertOutcome::AlreadyExists => return self.fetch_inserted(&job_id),
+                    InsertOutcome::Transient => {
+                        last = anyhow::anyhow!(
+                            "BigQuery replied HTTP {} (transient)",
+                            resp.status().as_u16()
+                        );
+                    }
+                },
+                // A timeout or reset: the job may or may not have been created; the
+                // same id makes the repeat safe either way.
+                Err(e) => {
+                    last = anyhow::Error::new(e).context("BigQuery jobs.insert request failed");
+                }
+            }
+        }
+        Err(last).context(format!(
+            "BigQuery jobs.insert kept failing after {MAX_TRANSIENT_RETRIES} retries"
+        ))
+    }
+
+    /// The job an earlier, unanswered insert created under `job_id`, fetched in the
+    /// dataset's location: the insert's answer, which would have named it, never came.
+    fn fetch_inserted(&self, job_id: &str) -> Result<Value> {
+        let job_ref = JobRef {
+            project: self.project.clone(),
+            job_id: job_id.to_string(),
+            location: self.fetch_location(),
+        };
+        self.get_json(&self.job_url(&job_ref), "jobs.get")
+            .with_context(|| {
+                format!("job {job_id} exists from an earlier insert but could not be fetched")
+            })
     }
 
     /// Poll `jobs.get` until the job reaches a terminal state.
@@ -213,6 +366,21 @@ impl BigQueryApi {
     /// endpoint in any error, so an operator reading the message knows whether
     /// the poll or the result fetch was refused.
     fn get_json(&self, url: &str, what: &str) -> Result<Value> {
+        let resp = self.get_response(url, what)?;
+        self.read_json(resp, what)
+    }
+
+    /// [`BigQueryApi::get_json`] that reads a 404 as `None` — a resource that may not exist.
+    fn get_json_if_found(&self, url: &str, what: &str) -> Result<Option<Value>> {
+        let resp = self.get_response(url, what)?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        self.read_json(resp, what).map(Some)
+    }
+
+    /// The non-transient response of an idempotent GET, retrying transient failures.
+    fn get_response(&self, url: &str, what: &str) -> Result<reqwest::blocking::Response> {
         let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
         for attempt in 0..=MAX_TRANSIENT_RETRIES {
             if attempt > 0 {
@@ -226,7 +394,7 @@ impl BigQueryApi {
                         resp.status().as_u16()
                     );
                 }
-                Ok(resp) => return self.read_json(resp, what),
+                Ok(resp) => return Ok(resp),
                 // A connection reset mid-poll is the same class as a 503.
                 Err(e) => last = anyhow::Error::new(e).context("BigQuery request failed"),
             }
@@ -411,24 +579,71 @@ fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
 /// `configuration.labels` — where `INFORMATION_SCHEMA.JOBS.labels` reads them
 /// from, so the billing queries in the loader's docs keep working unchanged.
 ///
-/// `jobReference` is emitted ONLY to pin a location; omitting it lets BigQuery
-/// generate the job id and infer the location from the referenced datasets.
+/// `jobReference.jobId` is the client's, so a repeated insert is idempotent; the
+/// location is pinned only when configured — otherwise BigQuery infers it from the
+/// referenced datasets.
 pub(crate) fn query_job_body(
     sql: &str,
     labels: &BTreeMap<String, String>,
     project: &str,
     location: Option<&str>,
+    job_id: &str,
 ) -> Value {
     let mut body = json!({
         "configuration": {
             "query": { "query": sql, "useLegacySql": false },
             "labels": labels,
-        }
+        },
+        "jobReference": { "projectId": project, "jobId": job_id },
     });
     if let Some(loc) = location {
-        body["jobReference"] = json!({ "projectId": project, "location": loc });
+        body["jobReference"]["location"] = json!(loc);
     }
     body
+}
+
+/// A job id unique to this process and moment: `rivet_<micros hex>_<pid hex>_<n>`,
+/// within BigQuery's `[A-Za-z0-9_-]` job-id charset.
+pub(crate) fn new_job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!(
+        "rivet_{micros:x}_{:x}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// What an insert's HTTP status means for a job sent under a client id.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InsertOutcome {
+    /// BigQuery answered — a job body, or a refusal to report.
+    Answered,
+    /// An earlier, unanswered attempt created the job: fetch it.
+    AlreadyExists,
+    /// Rate limit or server fault: send the same body again.
+    Transient,
+}
+
+pub(crate) fn insert_outcome(status: u16) -> InsertOutcome {
+    match status {
+        409 => InsertOutcome::AlreadyExists,
+        s if is_transient_status(s) => InsertOutcome::Transient,
+        _ => InsertOutcome::Answered,
+    }
+}
+
+/// The `location` a `datasets.get` resource reports.
+pub(crate) fn parse_dataset_location(meta: &Value) -> Option<String> {
+    meta.get("location")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// The identity a job is polled by. `location` comes from what the insert
@@ -657,23 +872,88 @@ mod tests {
     /// silently: the job runs, the billing query returns nothing.
     #[test]
     fn query_job_body_carries_sql_and_labels_where_bigquery_reads_them() {
-        let b = query_job_body("SELECT 1", &labels(), "proj", None);
+        let b = query_job_body("SELECT 1", &labels(), "proj", None, "rivet_1");
         assert_eq!(b["configuration"]["query"]["query"], "SELECT 1");
         assert_eq!(b["configuration"]["query"]["useLegacySql"], false);
         assert_eq!(b["configuration"]["labels"]["managed_by"], "rivet");
         assert_eq!(b["configuration"]["labels"]["rivet_op"], "load");
-        // No location asked for ⇒ no jobReference at all, so BigQuery both
-        // generates the job id and infers the location from the datasets.
-        assert!(b.get("jobReference").is_none(), "{b}");
+        // The client's job id makes a repeated insert idempotent; no location asked
+        // for ⇒ none pinned, so BigQuery infers it from the datasets.
+        assert_eq!(b["jobReference"]["jobId"], "rivet_1");
+        assert_eq!(b["jobReference"]["projectId"], "proj");
+        assert!(b["jobReference"].get("location").is_none(), "{b}");
     }
 
     #[test]
     fn query_job_body_pins_the_location_when_one_is_configured() {
-        let b = query_job_body("SELECT 1", &labels(), "proj", Some("EU"));
+        let b = query_job_body("SELECT 1", &labels(), "proj", Some("EU"), "rivet_2");
         assert_eq!(b["jobReference"]["location"], "EU");
         assert_eq!(b["jobReference"]["projectId"], "proj");
-        // Still no jobId — a client-side id would collide across runs.
-        assert!(b["jobReference"].get("jobId").is_none(), "{b}");
+        assert_eq!(b["jobReference"]["jobId"], "rivet_2");
+    }
+
+    /// A job inserted under the client's id whose insert never answered is fetched by
+    /// `jobs.get`, which 404s on a single-region dataset without `?location=`; the
+    /// insert's answer would have named the location, so the dataset's is read instead.
+    #[test]
+    fn a_dataset_resource_names_the_location_the_fetch_polls_in() {
+        assert_eq!(
+            parse_dataset_location(&json!({"location": "europe-west2"})).as_deref(),
+            Some("europe-west2")
+        );
+        assert_eq!(parse_dataset_location(&json!({"location": ""})), None);
+        assert_eq!(parse_dataset_location(&json!({"id": "p:d"})), None);
+    }
+
+    /// The fetch of an unanswered insert polls in the configured location when there is
+    /// one, and asks nothing of a client that knows no dataset.
+    #[test]
+    fn fetch_location_prefers_the_configured_one_and_needs_a_dataset_otherwise() {
+        let api = |location: Option<&str>, dataset: Option<&str>| BigQueryApi {
+            project: "p".into(),
+            location: location.map(str::to_string),
+            dataset: dataset.map(str::to_string),
+            dataset_location: std::sync::OnceLock::new(),
+            endpoint: "https://e".into(),
+            http: reqwest::blocking::Client::new(),
+            auth: Auth::Static(Zeroizing::new("t".into())),
+        };
+        assert_eq!(
+            api(Some("EU"), Some("d")).fetch_location().as_deref(),
+            Some("EU")
+        );
+        assert_eq!(api(None, None).fetch_location(), None);
+        let known = api(None, Some("d"));
+        known
+            .dataset_location
+            .set(Some("europe-west2".into()))
+            .unwrap();
+        assert_eq!(known.fetch_location().as_deref(), Some("europe-west2"));
+    }
+
+    #[test]
+    fn job_ids_are_unique_and_within_bigquerys_charset() {
+        let ids: Vec<String> = (0..50).map(|_| new_job_id()).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "{ids:?}");
+        for id in &ids {
+            assert!(id.starts_with("rivet_"), "{id}");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_insert_repeat_reads_409_as_the_job_already_landed() {
+        assert_eq!(insert_outcome(409), InsertOutcome::AlreadyExists);
+        assert_eq!(insert_outcome(200), InsertOutcome::Answered);
+        assert_eq!(insert_outcome(400), InsertOutcome::Answered);
+        assert_eq!(insert_outcome(403), InsertOutcome::Answered);
+        assert_eq!(insert_outcome(429), InsertOutcome::Transient);
+        assert_eq!(insert_outcome(503), InsertOutcome::Transient);
     }
 
     /// Polling a non-US job by id alone 404s, so the location the insert
@@ -930,6 +1210,8 @@ mod tests {
         let api = BigQueryApi {
             project: "p".into(),
             location: None,
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
@@ -959,6 +1241,8 @@ mod tests {
         let api = BigQueryApi {
             project: "p".into(),
             location: None,
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
@@ -982,6 +1266,8 @@ mod tests {
         let api = BigQueryApi {
             project: "p".into(),
             location: Some("EU".into()),
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
             endpoint: DEFAULT_ENDPOINT.into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("ya29.SECRET-TOKEN".into())),
