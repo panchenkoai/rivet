@@ -665,11 +665,17 @@ fn oracle_class_census_is_pinned() {
         "assert_complete(",
         "confirmed_flush_lsn",
         "query_one(",
+        // The warehouse read back through the `bq` CLI — a reader sharing no
+        // code with rivet's write path (live_cdc_backfill's BigQuery cycle).
+        "read_bq_",
     ];
     let shared_codec = [
         "cdc_id_ops(",
         "read_all_parts(",
         "read_cdc_changes(",
+        // Parts under one prefix through rivet's own arrow/parquet crate
+        // (live_cdc_backfill: the snapshot child vs the delta parent).
+        "rows_under(",
         "read_mongo_cdc_changes(",
         "run_and_read(",
         "drain_and_read(",
@@ -743,8 +749,12 @@ fn oracle_class_census_is_pinned() {
 // needs no data oracle — the pressure is (1) tier 2 below keeps completeness
 // CLAIMS out of that bucket, and (2) new data-truth tests land in the left
 // buckets. `self_counter` at 6 is the audit's residue after the 10 upgrades.
-const PIN_INDEPENDENT: usize = 69;
-const PIN_SHARED_CODEC: usize = 57;
+// 2026-09-16, the `cdc.backfill` suite (+7 capture tests): +2 independent (a
+// source re-query on the cycle test, the `bq` CLI on the BigQuery repeated-run
+// test), +5 shared_codec (parts read back under one prefix, the identity
+// checkpoint test's change re-read). `presence` unchanged.
+const PIN_INDEPENDENT: usize = 71;
+const PIN_SHARED_CODEC: usize = 62;
 const PIN_SELF_COUNTER: usize = 6;
 const PIN_PRESENCE: usize = 71;
 
@@ -945,6 +955,11 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("manifest.json")
                 // the mssql change-row replay oracle (read_cdc_rows' sibling);
                 || chunk.contains("read_cdc_changes(")
+                // live_cdc_backfill: parts under ONE prefix (the snapshot child
+                // vs the delta parent) through arrow/parquet, and the warehouse
+                // read back through the `bq` CLI.
+                || chunk.contains("rows_under(")
+                || chunk.contains("read_bq_")
                 // the four-way DuckDB census — the SOURCE table, the delivered
                 // parquet and rivet's two ledgers, from a session sharing no code
                 // with the product. Registered for the soak stand, whose whole

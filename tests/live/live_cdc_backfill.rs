@@ -193,6 +193,11 @@ fn validate_certifies_the_backfilled_baseline_and_does_not_call_it_stray() {
     let (tbl, _guard) = seeded("rivet_bf_validate", 5);
     let rig = backfill_rig(&tbl);
     rig.run_ok();
+    assert_eq!(
+        rows_under(&snapshot_dir(&rig)),
+        5,
+        "inert fixture: validate would certify an EMPTY baseline and prove nothing"
+    );
 
     // The report goes beside the CONFIG, never under the destination — a file
     // under the prefix would itself be the stray object this test forbids.
@@ -234,6 +239,14 @@ fn validate_certifies_the_backfilled_baseline_and_does_not_call_it_stray() {
     );
 }
 
+/// A source re-query — the oracle that shares nothing with the capture path.
+fn query_one(sql: &str) -> i64 {
+    conn()
+        .query_first::<i64, _>(sql)
+        .expect("source query")
+        .expect("one row")
+}
+
 /// One full cycle, and the half a single run cannot show: the SECOND run must
 /// not re-read the baseline, and must capture only what changed after the
 /// anchor. Capture-works is not resume-works.
@@ -245,9 +258,9 @@ fn a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run() {
 
     rig.run_ok();
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
-        5,
-        "run 1 backfills the whole table through the recipe"
+        rows_under(&snapshot_dir(&rig)) as i64,
+        query_one(&format!("SELECT COUNT(*) FROM {tbl}")),
+        "run 1 backfills the whole table through the recipe — graded against the SOURCE"
     );
     assert_eq!(
         rows_under(&rig.out_dir()),
