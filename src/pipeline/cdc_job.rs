@@ -387,6 +387,13 @@ pub(super) fn initial_snapshot_pending(
     // a reference the run would reject cannot have reached this point.
     let recipes = crate::config::resolve_backfill(export, &config.exports)
         .map_err(|why| anyhow::anyhow!(why))?;
+    // EVERY pair, on EVERY run — not only the tables still pending a baseline.
+    // Checked inside the leg builder, a conflict added after the baseline landed
+    // was never seen, and the stream wrote the second type into the log the
+    // baseline had written with the first.
+    for (table, recipe) in &recipes {
+        refuse_backfill_type_conflict(export, table, recipe)?;
+    }
 
     let mut pending = Vec::new();
     for idx in pending_idx {
@@ -415,17 +422,16 @@ pub(super) fn initial_snapshot_pending(
 /// (`types::overrides_for_table`). A column both sides declare DIFFERENTLY is a
 /// refusal — the two legs write into one `<table>__changes`, so two types for one
 /// column is two truths, and the one that loses would be silent.
-fn apply_backfill_recipe(
-    leg: &mut ExportConfig,
-    recipe: &ExportConfig,
+/// Refuse a column `table`'s recipe and the CDC export type DIFFERENTLY — parsed types, so two
+/// spellings of one type (`decimal(11,4)` / `numeric(11,4)`) are not a conflict.
+fn refuse_backfill_type_conflict(
     cdc_export: &ExportConfig,
+    table: &str,
+    recipe: &ExportConfig,
 ) -> Result<()> {
-    // Refuse a disagreement BEFORE copying, comparing parsed types so two
-    // spellings of one type (`decimal(11,4)` / `numeric(11,4)`) are not a conflict.
     let parsed =
         |e: &ExportConfig| crate::plan::build::parse_column_overrides_pub(&e.columns, &e.name);
     let (recipe_types, cdc_types) = (parsed(recipe)?, parsed(cdc_export)?);
-    let table = leg.snapshot_label.as_deref().unwrap_or_default();
     let cdc_for_table = crate::types::overrides_for_unit(&cdc_types, Some(table));
     for (col, mine) in &recipe_types {
         if let Some(theirs) = cdc_for_table.get(col)
@@ -441,7 +447,14 @@ fn apply_backfill_recipe(
             );
         }
     }
+    Ok(())
+}
 
+fn apply_backfill_recipe(
+    leg: &mut ExportConfig,
+    recipe: &ExportConfig,
+    cdc_export: &ExportConfig,
+) -> Result<()> {
     // HOW to read — every field the batch planner consults.
     leg.mode = recipe.mode;
     leg.chunk_column = recipe.chunk_column.clone();
@@ -1106,24 +1119,25 @@ mod tests {
             "an empty table must still publish its marker"
         );
 
-        // Two types for one column is two truths: refused, naming the column.
+        // Two types for one column is two truths: refused, naming the column —
+        // by the check that runs for EVERY pair on EVERY run, not the leg builder
+        // (which runs only for tables still pending a baseline).
         let mut conflicting = stream.clone();
         conflicting.columns =
             std::collections::HashMap::from([("orders.price".into(), "decimal(12,4)".into())]);
-        let mut leg = synth_snapshot_export(&conflicting, "orders", "orders", &dcfg);
         let err = format!(
             "{:#}",
-            apply_backfill_recipe(&mut leg, &recipe, &conflicting)
+            refuse_backfill_type_conflict(&conflicting, "orders", &recipe)
                 .expect_err("the baseline and the stream disagree about `price`")
         );
-        assert!(err.contains("price"), "{err}");
+        assert!(err.contains("price") && err.contains("two types"), "{err}");
 
         // The same column declared the SAME way on both sides is not a conflict.
         let mut agreeing = stream.clone();
         agreeing.columns =
             std::collections::HashMap::from([("orders.price".into(), "decimal(10,2)".into())]);
-        let mut leg = synth_snapshot_export(&agreeing, "orders", "orders", &dcfg);
-        apply_backfill_recipe(&mut leg, &recipe, &agreeing).expect("agreement is not a conflict");
+        refuse_backfill_type_conflict(&agreeing, "orders", &recipe)
+            .expect("agreement is not a conflict");
     }
 
     #[test]

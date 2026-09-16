@@ -337,6 +337,50 @@ fn a_crashed_chunked_baseline_finishes_on_the_next_plain_run() {
     );
 }
 
+/// The type-conflict refusal must hold on EVERY run, not only the one that
+/// builds the leg.
+///
+/// A column the recipe and the CDC export type differently is refused — but
+/// the check ran inside the leg builder, which runs only for tables still
+/// PENDING a baseline. A conflict added after the baseline landed was never
+/// seen: the same config was refused on a fresh state DB and accepted on an
+/// established one, and the stream then wrote the second type into the log
+/// the baseline had written with the first.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn a_type_conflict_added_after_the_baseline_is_still_refused() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_bf_conflict");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v DECIMAL(10,2))"
+    ))
+    .expect("create table");
+    let _guard = Table(tbl.clone());
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, 1.50), (2, 2.50), (3, 3.50)"
+    ))
+    .expect("seed");
+
+    let mut rig = Rig::mysql_cdc(&tbl)
+        .cdc("backfill: auto")
+        .also_batch_export("baseline", &tbl, "full")
+        .also_export_line("columns: { v: \"decimal(10,2)\" }");
+    rig.run_ok();
+    assert_eq!(
+        rows_under(&snapshot_dir(&rig)),
+        3,
+        "inert fixture: the baseline must have landed before the conflict is added"
+    );
+
+    // Run 2: the CDC export now declares the SAME column differently.
+    rig.amend_export_lines(&["columns: { v: \"decimal(12,4)\" }"]);
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("cannot have two types"),
+        "the conflict must be refused whether or not a baseline is pending:\n{said}"
+    );
+}
+
 fn load_ok(rig: &Rig) {
     let out = rig.cli(&["load"]);
     assert!(
