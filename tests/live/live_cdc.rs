@@ -7778,6 +7778,72 @@ fn a_mysql_checkpoint_from_another_server_is_refused() {
     );
 }
 
+/// The identity the anchor records must SURVIVE the first captured transaction.
+///
+/// The anchor wrote `{file, pos, server_uuid, gtid_executed}`; the commit-position
+/// save wrote `{file, pos}` — so one committed change silently disarmed the
+/// foreign-server refusal the test above proves, and every stream that had ever
+/// captured anything resumed unverified. The sibling test cannot see it: it forges
+/// the identity right after the anchor, before any commit rewrote the file.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn a_mysql_checkpoint_keeps_the_server_identity_after_a_captured_transaction() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_srvid_keep").to_lowercase();
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let out = tempfile::tempdir().expect("out dir");
+    let rig = Rig::mysql_cdc(&tbl)
+        .relative_checkpoint("./keep.ckpt")
+        .dest_path(out.path().to_path_buf());
+    rig.run_ok(); // anchors, and records the server's identity
+    let ckpt = rig
+        .config_path()
+        .parent()
+        .expect("config dir")
+        .join("keep.ckpt");
+    let read = |label: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).expect(label)).expect("json")
+    };
+    let anchored = read("the anchor wrote a checkpoint");
+    let uuid = anchored["server_uuid"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !uuid.is_empty(),
+        "inert fixture: the anchor recorded no identity"
+    );
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10)"))
+        .expect("a change to capture");
+    rig.run_ok();
+    assert!(
+        !read_cdc_changes(out.path()).is_empty(),
+        "inert fixture: nothing was captured, so no commit rewrote the checkpoint"
+    );
+
+    let committed = read("the commit rewrote the checkpoint");
+    assert_ne!(
+        committed["pos"], anchored["pos"],
+        "inert fixture: the position did not advance past the anchor"
+    );
+    assert_eq!(
+        committed["server_uuid"].as_str(),
+        Some(uuid.as_str()),
+        "the commit save must carry the server identity the anchor recorded — without \
+         it the next resume cannot tell this server from a foreign one: {committed}"
+    );
+    assert!(
+        committed.get("gtid_executed").is_some(),
+        "the GTID tier must survive too: {committed}"
+    );
+}
+
 /// REGENERATE `tests/fixtures/pgoutput/*.hex` from the rig's own scenarios.
 ///
 /// The unit tests in `src/source/postgres/pgoutput.rs` grade the decoder against

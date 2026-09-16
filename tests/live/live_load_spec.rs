@@ -421,6 +421,47 @@ fn apply_keeps_the_key_run_recorded_postgres() {
     apply_keeps_the_key_run_recorded(SqlEngine::Pg);
 }
 
+/// The recorded key must be the WHOLE key. MySQL's catalog read joined the
+/// columns with `GROUP_CONCAT`, which truncates at `group_concat_max_len`
+/// (1024 bytes by default) with a warning nobody reads — a wide composite key
+/// came back partial, and a partial merge key collapses distinct rows in the
+/// dedup view. Sixteen 64-char names (InnoDB's ceiling on both) are 1039 bytes.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn a_wide_composite_key_is_recorded_whole_mysql() {
+    let e = SqlEngine::Mysql;
+    e.alive();
+    let names: Vec<String> = (0..16)
+        .map(|i| format!("k{i:02}_{}", "x".repeat(60)))
+        .collect();
+    let columns = names
+        .iter()
+        .map(|n| format!("{n} INT NOT NULL"))
+        .chain(std::iter::once(format!(
+            "PRIMARY KEY ({})",
+            names.join(", ")
+        )))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (table, _guard) = e.create("wide_key", &columns);
+    e.exec(&format!(
+        "INSERT INTO {table} ({}) VALUES ({})",
+        names.join(", "),
+        vec!["1"; 16].join(", ")
+    ));
+    let rig = e.rig(&table).top_line(LOAD);
+    rig.run_ok();
+
+    let (_, key) = StateDb::next_to_config(&rig.config_path())
+        .load_spec(&table, None)
+        .expect("a spec is recorded");
+    assert_eq!(
+        key.as_deref(),
+        Some(names.as_slice()),
+        "every key column, in order — a truncated key is a wrong merge key"
+    );
+}
+
 /// A Postgres `(id PK, d DATE, v)` table with ids `1..=n` over five dates.
 fn dated_pg_table(prefix: &str, n: i64) -> (String, Box<dyn std::any::Any>) {
     let e = SqlEngine::Pg;

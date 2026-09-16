@@ -287,13 +287,7 @@ pub(crate) fn overlay_measured_rows(
     // decisions from the truth. These depend only on fields the diagnostic
     // already carries (uses_index, avg_row_bytes) + the export.
     if est != before && est.is_some() {
-        diag.verdict = compute_verdict(
-            est,
-            diag.uses_index,
-            export.cursor_column.is_some(),
-            diag.avg_row_bytes,
-            export.parallel,
-        );
+        diag.verdict = export_verdict(export, est, diag.uses_index, diag.avg_row_bytes);
         diag.recommended_profile = recommend_profile(est, diag.uses_index, export);
         diag.recommended_parallel = recommend_parallelism(export, est, diag.uses_index);
         // Only recompute the suggestion for engines that HAD one. diagnose_mongo
@@ -821,6 +815,26 @@ pub(super) fn collect_warnings(
 /// so the scaffold init writes must not then be scolded by `check`.
 pub(crate) const SMALL_TABLE_ROW_THRESHOLD: i64 = 100_000;
 
+/// The verdict for `export`: the table-scan rules of [`compute_verdict`], except a
+/// `mode: cdc` export, which reads the transaction log and scans nothing.
+pub(crate) fn export_verdict(
+    export: &ExportConfig,
+    row_estimate: Option<i64>,
+    uses_index: bool,
+    avg_row_bytes: Option<i64>,
+) -> HealthVerdict {
+    if export.mode == ExportMode::Cdc {
+        return HealthVerdict::Efficient;
+    }
+    compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        avg_row_bytes,
+        export.parallel,
+    )
+}
+
 pub(crate) fn compute_verdict(
     row_estimate: Option<i64>,
     uses_index: bool,
@@ -1075,13 +1089,7 @@ pub(crate) fn assemble_diagnostic(
     };
 
     let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
-    let verdict = compute_verdict(
-        row_estimate,
-        uses_index,
-        export.cursor_column.is_some(),
-        avg_row_bytes,
-        export.parallel,
-    );
+    let verdict = export_verdict(export, row_estimate, uses_index, avg_row_bytes);
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     let warnings = collect_warnings(
@@ -1636,6 +1644,42 @@ mod tests {
             !d.strategy.contains('?'),
             "the `?` placeholder is the diagnostic-bypass tell"
         );
+    }
+
+    /// A `mode: cdc` export reads the transaction LOG, not the table: no scan, no
+    /// index probe, no cursor. Grading it with the table-scan verdict called a
+    /// perfectly configured stream DEGRADED (or UNSAFE, past 50M rows) and told
+    /// the operator to add a cursor column — the diagnostic-bypass class, on the
+    /// one mode the scan rules cannot describe.
+    #[test]
+    fn assemble_diagnostic_does_not_grade_a_cdc_stream_as_a_table_scan() {
+        for rows in [Some(500_000), Some(5_000_000), Some(500_000_000), None] {
+            let d = assemble_diagnostic(
+                &cfg("mode: cdc\n"),
+                ProbeFacts {
+                    row_estimate: rows,
+                    plan_uses_index: false,
+                    catalog_index: Some(false),
+                    ..facts()
+                },
+            );
+            assert_eq!(d.strategy, "cdc");
+            assert!(
+                matches!(
+                    d.verdict,
+                    HealthVerdict::Efficient | HealthVerdict::Acceptable
+                ),
+                "rows={rows:?}: a log reader is not a table scan, got {}",
+                d.verdict
+            );
+            assert!(
+                d.suggestion
+                    .as_deref()
+                    .is_none_or(|s| !s.contains("cursor")),
+                "rows={rows:?}: no cursor advice for a log reader: {:?}",
+                d.suggestion
+            );
+        }
     }
 
     /// The skeleton is only de-triplicated while every engine ROUTES through it.

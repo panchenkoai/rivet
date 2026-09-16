@@ -96,9 +96,23 @@ pub(crate) struct MysqlChangeStream {
     /// The connection's own database — what a BARE configured name means. Compared
     /// against each event's schema on the wire; see `bare_name_spans_databases`.
     own_db: String,
+    /// The server's `(server_uuid, gtid_executed)` at open, written into EVERY
+    /// position this stream persists — the anchor wrote it and the commit save
+    /// dropped it, so one captured transaction disarmed the foreign-server refusal.
+    identity: (String, String),
 }
 
 impl MysqlChangeStream {
+    /// A checkpoint position at `log_pos` in the current file, carrying the server identity.
+    fn position_at(&self, log_pos: u64) -> Position {
+        Position(json!({
+            "file": self.file,
+            "pos": log_pos,
+            "server_uuid": self.identity.0,
+            "gtid_executed": self.identity.1,
+        }))
+    }
+
     /// Open a stream from an explicit `(binlog_file, pos)` coordinate.
     ///
     /// A [`DrainMode::BoundedAtOpen`] run sets `BINLOG_DUMP_NON_BLOCK` (the
@@ -589,6 +603,9 @@ impl MysqlChangeStream {
         } else {
             None
         };
+        // Every position this stream writes must be verifiable on resume, so the
+        // identity is read here, once, before the dump consumes the connection.
+        let identity = Self::server_identity(url, tls)?;
         let mut conn = connect_conn(url, tls)?;
         // Refuse a compressed binlog rather than read past it in silence.
         refuse_compressed_binlog(&mut conn)?;
@@ -634,6 +651,7 @@ impl MysqlChangeStream {
             // The connection's own database — the meaning of a bare configured
             // name, and the wire-side comparison's fixed reference.
             own_db,
+            identity,
         })
     }
 
@@ -931,7 +949,7 @@ impl MysqlChangeStream {
             self.past_bound = true;
             return false;
         }
-        let commit = Position(json!({ "file": self.file, "pos": log_pos }));
+        let commit = self.position_at(log_pos);
         let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
         self.tx_bytes = 0;
         let tail_len = self
@@ -1073,7 +1091,7 @@ impl MysqlChangeStream {
                     }
                 }
                 // Provisional position; rewritten to the commit position at XID.
-                let position = Position(json!({ "file": self.file, "pos": log_pos }));
+                let position = self.position_at(log_pos);
                 for row in re.rows(&tme) {
                     let (before, after) = row?;
                     let before = before.map(render_row);
