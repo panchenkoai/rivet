@@ -276,6 +276,54 @@ fn a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run() {
     );
 }
 
+/// A baseline leg that CRASHED mid-way must finish on the next plain run.
+///
+/// The recipe the docs bless for "a table with only a non-unique index" is
+/// `mode: chunked` + `chunk_checkpoint: true`. Its in-progress run is recorded
+/// under the leg's synthesized name, and the chunked runner refused the next run
+/// with two commands — `--export <leg> --resume` and `state reset-chunks --export
+/// <leg>` — that both reject a name absent from the config. Every later run
+/// failed identically while the anchor, already taken, pinned the log. The leg is
+/// rivet's own; resuming it is rivet's job, not a command for the operator.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn a_crashed_chunked_baseline_finishes_on_the_next_plain_run() {
+    let (tbl, _guard) = seeded("rivet_bf_crash", 150);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("backfill: auto")
+        .also_batch_export("baseline", &tbl, "chunked")
+        .also_export_line("chunk_column: id")
+        .also_export_line("chunk_size: 50")
+        .also_export_line("chunk_checkpoint: true");
+
+    // Run 1 dies right after the baseline's first chunk is recorded complete.
+    let crash = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")]);
+    assert!(!crash.status.success(), "the crash run must not exit 0");
+    let landed = rows_under(&snapshot_dir(&rig));
+    assert!(
+        landed > 0 && landed < 150,
+        "inert fixture: expected a PARTIAL baseline, got {landed} rows"
+    );
+
+    // Run 2 is the operator's plain re-run — no flags, no synthesized names.
+    let out = rig.run_args(&[]);
+    assert!(
+        out.status.success(),
+        "a plain re-run must finish the baseline, not demand a command it will then reject:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        rows_under(&snapshot_dir(&rig)),
+        150,
+        "the baseline is complete: chunk 0 once, the rest resumed — no gap, no duplicate"
+    );
+    assert_eq!(
+        rows_under(&rig.out_dir()),
+        0,
+        "nothing changed, so no delta"
+    );
+}
+
 fn load_ok(rig: &Rig) {
     let out = rig.cli(&["load"]);
     assert!(

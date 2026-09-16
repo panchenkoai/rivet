@@ -293,7 +293,20 @@ pub(super) fn ensure_chunk_checkpoint_plan(
     );
     let max_att = cp.max_attempts;
 
-    if plan.resume {
+    // A CDC baseline leg is rivet's OWN export: the operator never named it, so the
+    // "use `--export <leg> --resume`" remediation below is one they cannot follow —
+    // both commands reject a name absent from the config. An interrupted leg
+    // resumes on the next plain run instead.
+    // ponytail: leg-ness via the legacy name fold; a flag on the plan if a user
+    // export ever legitimately carries the infix.
+    let is_leg = crate::manifest::snapshot_family(&plan.export_name) != plan.export_name;
+    let resume = plan.resume
+        || (is_leg
+            && state
+                .find_in_progress_chunk_run(&plan.export_name)?
+                .is_some());
+
+    if resume {
         match state.find_in_progress_chunk_run(&plan.export_name)? {
             Some((rid, stored_hash)) => {
                 if stored_hash != plan_hash {
