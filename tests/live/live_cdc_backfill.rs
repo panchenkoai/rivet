@@ -150,6 +150,38 @@ fn a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named() {
     );
 }
 
+/// The same rule on the OTHER whole-config entry point.
+///
+/// `rivet apply <cfg.yaml>` runs every export wave by wave, and it shipped
+/// WITHOUT the recipe filter that `rivet run` had — so the table was read twice
+/// per invocation: once by the recipe into a prefix `rivet load` deliberately
+/// skips, and once by the CDC export's own baseline leg. One entry point
+/// honouring a rule the other ignores is the bug this pins.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn apply_skips_the_backfill_recipe_exactly_as_run_does() {
+    let (tbl, _guard) = seeded("rivet_bf_apply", 5);
+    let rig = backfill_rig(&tbl);
+
+    let cfg = rig.config_path();
+    let out = rig.apply_env(&cfg, &[], &[]);
+    assert!(
+        out.status.success(),
+        "rivet apply failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        rows_under(&rig.out_dir_for("baseline")),
+        0,
+        "apply must not run the recipe as an ordinary export — that is the second full read"
+    );
+    assert_eq!(
+        rows_under(&snapshot_dir(&rig)),
+        5,
+        "the baseline still lands, pulled by the CDC export after its anchor"
+    );
+}
+
 /// One full cycle, and the half a single run cannot show: the SECOND run must
 /// not re-read the baseline, and must capture only what changed after the
 /// anchor. Capture-works is not resume-works.

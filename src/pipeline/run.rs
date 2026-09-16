@@ -435,20 +435,11 @@ pub fn run(
     // Only when the whole config runs: `rivet run -e orders` names it explicitly,
     // and an operator asking for an export by name gets it.
     let exports: Vec<&ExportConfig> = if export_name.is_none() {
-        let recipes = crate::config::backfill_recipe_names(&config.exports);
-        let (kept, skipped): (Vec<_>, Vec<_>) = exports
+        let recipes = backfill_recipes_to_skip(&config.exports);
+        exports
             .into_iter()
-            .partition(|e| !recipes.contains(&e.name));
-        for e in &skipped {
-            log::info!(
-                "export '{}': skipped — it is the backfill recipe of a `mode: cdc` export, \
-                 which runs it after the anchor (run it alone with `-e {}` to export it on \
-                 its own)",
-                e.name,
-                e.name
-            );
-        }
-        kept
+            .filter(|e| !recipes.contains(&e.name))
+            .collect()
     } else {
         exports
     };
@@ -838,7 +829,17 @@ pub(crate) fn run_waves(
     // Group exports by wave (ascending; an export with no `wave:` runs last).
     // The ordering is the contract apply depends on, so it lives in a pure
     // tested helper rather than hiding inline here.
-    let by_wave = group_exports_by_wave(&config.exports);
+    // Same recipe rule as `run`: apply runs the WHOLE config, so a baseline
+    // recipe here would be the second full read of a table the CDC export is
+    // about to read itself.
+    let recipes = backfill_recipes_to_skip(&config.exports);
+    let runnable: Vec<ExportConfig> = config
+        .exports
+        .iter()
+        .filter(|e| !recipes.contains(&e.name))
+        .cloned()
+        .collect();
+    let by_wave = group_exports_by_wave(&runnable);
     let total: usize = by_wave.iter().map(|(_, v)| v.len()).sum();
     if total == 0 {
         log::warn!("apply: config '{config_path}' defines no exports");
@@ -1677,10 +1678,16 @@ pub(crate) fn run_pool(
     // when `--split` is set the pre-skip is deferred to a
     // PER-UNIT skip AFTER the split (below); without `--split` the normal
     // prefix-level skip applies here unchanged.
+    // Same recipe rule as `run`/`run_waves`, and checked BEFORE the `--split`
+    // escape: a recipe must not run here whether or not the pool splits it.
+    let recipes = backfill_recipes_to_skip(&config.exports);
     let mut effective: Vec<ExportConfig> = config
         .exports
         .iter()
         .filter(|e| {
+            if recipes.contains(&e.name) {
+                return false;
+            }
             if split {
                 return true; // per-unit skip happens after the split
             }
@@ -2298,6 +2305,29 @@ pub(crate) fn run_pool(
         failures,
         " in the pool",
     )
+}
+
+/// The exports a WHOLE-CONFIG run must not run itself: each is some `mode: cdc`
+/// export's `backfill:` recipe, which that stream pulls after its anchor.
+///
+/// One definition for all three whole-config entry points ([`run`],
+/// [`run_waves`], [`run_pool`]) — the rule shipped in `run` alone, so
+/// `rivet apply <config.yaml>` read the table twice per invocation, into a
+/// prefix the load deliberately skips. Warns per skipped export, because the
+/// default filter is `warn` and this says an export the operator WROTE did not
+/// run.
+fn backfill_recipes_to_skip(exports: &[ExportConfig]) -> std::collections::HashSet<String> {
+    let recipes = crate::config::backfill_recipe_names(exports);
+    for e in exports.iter().filter(|e| recipes.contains(&e.name)) {
+        log::warn!(
+            "export '{}': skipped — it is the backfill recipe of a `mode: cdc` export, \
+             which runs it after the anchor (run it alone with `-e {}` to export it on \
+             its own)",
+            e.name,
+            e.name
+        );
+    }
+    recipes
 }
 
 /// Group exports by `wave:` in ascending order; an export with no `wave:` runs
