@@ -130,7 +130,7 @@ Source prerequisites:
 | Engine | Server config |
 |---|---|
 | **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1` |
-| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended) |
+| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended), binlog retention ≫ the run interval |
 | **SQL Server** | SQL Server Agent running; Enterprise / Standard / Developer (not Express/Web) |
 | **MongoDB** | Replica set required (`?directConnection=true` for a port-mapped single node) |
 
@@ -143,6 +143,15 @@ Grants for the selected engine:
 Rules of thumb:
 
 - MySQL: connect **directly**, not through ProxySQL/MaxScale. Give rivet a unique `server_id`.
+- **MySQL on RDS / Aurora: two settings that are not in `my.cnf`.** Binary logging
+  follows automated backups — with retention at 0 the instance runs `log_bin = 0`
+  and every binlog query answers `ERROR 1381`, whatever the parameter group says.
+  And retention is *not* `binlog_expire_logs_seconds`: RDS purges a binlog as soon
+  as the engine no longer needs it, so the next run's resume dies with `ERROR 1236`
+  (measured: a checkpoint taken at 13:42 was already past retention at 13:59).
+  Set it explicitly, well above the run interval:
+  `CALL mysql.rds_set_configuration('binlog retention hours', 72);`
+  A read replica also needs `log_replica_updates = 1`.
 - PostgreSQL: an abandoned slot pins WAL and fills the disk. Drop it with
   `SELECT pg_drop_replication_slot('{{SLOT}}');`. Set `max_slot_wal_keep_size` to cap it.
 - SQL Server: change-table retention defaults to about 3 days. A run that falls

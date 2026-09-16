@@ -340,6 +340,29 @@ Notes:
 - `binlog_row_image = FULL` is MySQL's default; the risk is a source that has set
   it to `MINIMAL` to shrink the binlog — that path needs the column-mask MERGE,
   not the simple overwrite (see [Output shape](#output-shape)).
+- **Amazon RDS / Aurora MySQL: two managed-only settings, and neither is in
+  `my.cnf`.** Both were diagnosed the hard way on a customer replica, a day apart.
+  1. **Binary logging follows automated backups.** With backup retention at 0 the
+     instance runs `log_bin = 0` no matter what the parameter group says, and
+     `SHOW BINARY LOGS` answers `ERROR 1381 (HY000): You are not using binary
+     logging`. Set backup retention above zero (this restarts the instance), then
+     `binlog_format = ROW`, `binlog_row_image = FULL` and `binlog_row_metadata =
+     FULL` in the parameter group. A read replica also needs
+     `log_replica_updates = 1` to re-log what it applies.
+  2. **`binlog_expire_logs_seconds` does not govern retention here.** RDS purges a
+     binlog as soon as the engine itself no longer needs it — typically within
+     minutes — so a checkpoint written by one run is unreadable by the next and
+     the resume fails with **ERROR 1236**. Measured: a checkpoint taken at 13:42
+     was already past retention at 13:59. Set the managed knob instead, sized well
+     above the CDC cadence:
+
+     ```sql
+     CALL mysql.rds_set_configuration('binlog retention hours', 72);
+     CALL mysql.rds_show_configuration;   -- confirm
+     ```
+
+  The filenames are the tell: `mysql-bin-changelog.NNNNNN` is RDS's naming, so an
+  `ERROR 1236` naming one of those is this, not `PURGE BINARY LOGS`.
 
 ### PostgreSQL — the logical slot
 
