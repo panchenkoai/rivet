@@ -995,6 +995,13 @@ fn bare(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+impl CdcExportConfig {
+    /// Whether the stream has a baseline leg (`initial: snapshot` or `backfill:`) and so writes the `snapshot/` child.
+    pub fn has_baseline(&self) -> bool {
+        self.initial == Some(CdcInitialMode::Snapshot) || self.backfill.is_some()
+    }
+}
+
 /// Every export some `mode: cdc` export claims as a baseline recipe.
 ///
 /// The run loop asks this to avoid reading one table twice in a single
@@ -1143,6 +1150,19 @@ pub fn resolve_backfill<'a>(
                     missing.join(", ")
                 ));
             }
+        }
+    }
+    // A baseline must read the WHOLE table. An incremental / time-window recipe
+    // reads a slice, and copying its mode without its cursor fails at plan build —
+    // after the anchor already exists, on every run until the config changes.
+    for (t, e) in &pairs {
+        if !matches!(e.mode, ExportMode::Full | ExportMode::Chunked) {
+            return Err(format!(
+                "export '{}': backfill export '{}' for table '{t}' is `mode: {:?}` — a baseline \
+                 must read the whole table, so only a `full` or `chunked` export can be one; an \
+                 incremental read would leave every row outside its window with no baseline.",
+                cdc.name, e.name, e.mode
+            ));
         }
     }
     Ok(pairs)
@@ -1744,6 +1764,18 @@ mod tests {
         let all = vec![orders.clone(), tableless.clone()];
         let e = err(&tableless, &all);
         assert!(e.contains("nothing to pair"), "{e}");
+
+        // A recipe that reads a SLICE of the table is not a baseline — refused
+        // here, before an anchor exists, not at plan build after it.
+        let mut inc = recipe("orders_inc", "orders");
+        inc.mode = ExportMode::Incremental;
+        let listed = stream(&["orders"], CdcBackfill::Exports(vec!["orders_inc".into()]));
+        let all = vec![inc.clone(), listed.clone()];
+        let e = err(&listed, &all);
+        assert!(
+            e.contains("whole table") && e.contains("Incremental"),
+            "{e}"
+        );
     }
 
     /// The run loop asks this to avoid reading one table twice in one invocation.

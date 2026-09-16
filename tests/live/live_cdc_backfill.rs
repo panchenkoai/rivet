@@ -182,6 +182,58 @@ fn apply_skips_the_backfill_recipe_exactly_as_run_does() {
     );
 }
 
+/// `rivet validate` must certify the baseline a `backfill:` stream wrote.
+///
+/// It derived "this stream has a snapshot dataset" from `initial:` alone, so a
+/// backfilled baseline — the largest dataset in the export — was never verified
+/// and its parts were reported as stray in the change prefix, exit 0.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn validate_certifies_the_backfilled_baseline_and_does_not_call_it_stray() {
+    let (tbl, _guard) = seeded("rivet_bf_validate", 5);
+    let rig = backfill_rig(&tbl);
+    rig.run_ok();
+
+    // The report goes beside the CONFIG, never under the destination — a file
+    // under the prefix would itself be the stray object this test forbids.
+    let report = rig.config_path().with_file_name("validate.json");
+    let out = rig.cli(&[
+        "validate",
+        "--format",
+        "json",
+        "--output",
+        report.to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        out.status.success(),
+        "rivet validate failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).expect("report written"))
+            .expect("report is JSON");
+    let exports = json["exports"].as_array().expect("exports array");
+    let snapshot = exports
+        .iter()
+        .find(|e| e["export_name"] == format!("{tbl}/snapshot"))
+        .unwrap_or_else(|| panic!("the baseline dataset must get its own verdict; got: {json}"));
+    assert_eq!(
+        snapshot["verification"]["passed"], true,
+        "the baseline must verify: {snapshot}"
+    );
+    assert!(
+        json["warnings"].as_array().is_some_and(Vec::is_empty),
+        "the baseline parts must not be reported as stray: {}",
+        json["warnings"]
+    );
+    // The recipe never ran, so there is nothing at its prefix to certify: a
+    // verdict on it can only ever say "no manifest", noise that hides a real one.
+    assert!(
+        !exports.iter().any(|e| e["export_name"] == "baseline"),
+        "the recipe is a read recipe, not a dataset to verify: {json}"
+    );
+}
+
 /// One full cycle, and the half a single run cannot show: the SECOND run must
 /// not re-read the baseline, and must capture only what changed after the
 /// anchor. Capture-works is not resume-works.

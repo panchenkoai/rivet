@@ -173,7 +173,7 @@ exports:
     format: parquet
     cdc:
       initial: snapshot            # first run: anchor → full snapshot → drain stream
-      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for MySQL/MSSQL with initial: snapshot
+      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for a baseline (initial:/backfill:) on every engine but PostgreSQL; MySQL/MongoDB need it for any mode: cdc
       until_current: true          # default: drain to the log end as of open, then exit
       {{CDC_PARAM}}
       # rollover: 100000           # rows per part (≈ drain memory)
@@ -293,8 +293,8 @@ Recovery:
 | Symptom | Action |
 |---|---|
 | Run failed | Re-run. The checkpoint did not advance, so the data is re-read, not lost |
-| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-snapshot (`initial: snapshot` or `mode: full`), then start from a fresh checkpoint |
-| MySQL checkpoint used against another server | Refused on purpose. Re-snapshot on the new host |
+| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-anchor FIRST (delete the checkpoint / accept a fresh slot, so the next run pins the current position), THEN re-snapshot (`initial: snapshot` or `mode: full`). Snapshotting first leaves every change in between in neither |
+| MySQL checkpoint used against another server | Refused on purpose. Same order on the new host: fresh checkpoint first, then re-snapshot |
 
 ---
 
@@ -321,7 +321,7 @@ load:
 exports:
   - name: {{NAME}}
     # ...
-    load: { pk: [{{PK}}], partition: none }   # per-export override (every field except target)
+    load: { pk: [{{PK}}], partition: none }   # per-export override: pk, cluster_by, partition, cleanup_source, gc_orphans, allow_source_drift
 ```
 
 Required target fields: BigQuery takes `project` and `dataset`. Snowflake takes

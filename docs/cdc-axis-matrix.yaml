@@ -56,9 +56,17 @@ config_fields:
       loop skipped the recipe but the LOAD still demanded a recorded load spec
       for it, so every config pairing `backfill:` with `load:` refused to load
       at all until the reports were filtered the same way.
+      The bughunt over the branch then found the same rule missing from the
+      OTHER whole-config entry point (`rivet apply`), from `validate` (a
+      backfilled baseline went unverified and was reported as stray), and from
+      the reserved-`snapshot` name guard; each is pinned below.
     also: resolve_backfill_pairs_tables_with_their_recipe_exports,
+      resolve_backfill_refuses_every_pairing_that_would_look_like_success,
+      a_table_named_snapshot_is_refused_under_backfill_as_under_initial,
       a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named,
+      apply_skips_the_backfill_recipe_exactly_as_run_does,
       a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run,
+      validate_certifies_the_backfilled_baseline_and_does_not_call_it_stray,
       repeated_runs_of_one_config_append_only_the_delta_to_the_changelog
   - id: initial
     coverage: swept

@@ -454,9 +454,11 @@ fn apply_backfill_recipe(
     leg.chunk_checkpoint = recipe.chunk_checkpoint;
     leg.chunk_max_attempts = recipe.chunk_max_attempts;
     leg.parallel = recipe.parallel;
-    // The read's own budget: a long single statement is what a chunked recipe
-    // exists to avoid, and the timeout that bounds it is per-export.
-    leg.tuning = recipe.tuning.clone();
+    // The read's own budget where the recipe declares one; a recipe without a
+    // `tuning:` must not erase the CDC export's (the config-clobber class).
+    if recipe.tuning.is_some() {
+        leg.tuning = recipe.tuning.clone();
+    }
     // Types: the recipe's, then the CDC export's (a qualified key still wins where
     // both apply — the conflict above is already refused).
     let mut columns = recipe.columns.clone();
@@ -1063,12 +1065,20 @@ mod tests {
         recipe.chunk_checkpoint = true;
         recipe.columns =
             std::collections::HashMap::from([("price".into(), "decimal(10,2)".into())]);
+        // The CDC export declares a budget, the recipe none: the leg must KEEP
+        // the stream's (a recipe without `tuning:` erased it — config-clobber).
+        stream.tuning = Some(crate::tuning::TuningConfig::default());
+        recipe.tuning = None;
 
         let mut leg = synth_snapshot_export(&stream, "orders", "orders", &dcfg);
         apply_backfill_recipe(&mut leg, &recipe, &stream).expect("no type conflict");
 
         // HOW to read — borrowed.
         assert_eq!(leg.mode, crate::config::ExportMode::Chunked);
+        assert!(
+            leg.tuning.is_some(),
+            "a recipe without `tuning:` must not erase the CDC export's budget"
+        );
         assert_eq!(leg.chunk_by_key.as_deref(), Some("id"));
         assert_eq!(leg.chunk_size, 250_000);
         assert_eq!(leg.parallel, 4);

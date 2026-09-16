@@ -332,6 +332,32 @@ fn cdc_backfill_is_refused_when_it_cannot_mean_one_baseline() {
     assert_eq!(ok.exports.len(), 2);
 }
 
+/// Both baselines write the reserved `snapshot/` sub-prefix, so the collision
+/// refusal for a table NAMED `snapshot` must fire under `backfill:` exactly as
+/// under `initial:` — it shipped keyed on `initial` alone.
+#[test]
+fn a_table_named_snapshot_is_refused_under_backfill_as_under_initial() {
+    let cfg = |cdc: &str| {
+        format!(
+            "\nsource:\n  type: mysql\n  url: \"mysql://u:p@localhost:3306/db\"\n\
+             exports:\n  - name: snap_read\n    table: snapshot\n    mode: full\n    format: parquet\n\
+             \x20   destination: {{ type: local, path: \"/tmp/o\" }}\n\
+             \x20 - name: stream\n    tables: [snapshot]\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: {cdc}\n    destination: {{ type: local, path: \"/tmp/x\" }}\n"
+        )
+    };
+    for cdc in [
+        "{ checkpoint: /tmp/ck, initial: snapshot }",
+        "{ checkpoint: /tmp/ck, backfill: auto }",
+    ] {
+        let err = parse_err(&cfg(cdc));
+        assert!(
+            err.contains("reserved") && err.contains("snapshot"),
+            "{cdc} must be refused for the reserved sub-prefix; got: {err}"
+        );
+    }
+}
+
 #[test]
 fn mssql_cdc_without_a_checkpoint_stays_allowed() {
     // The counterpart to the rule above, so it cannot quietly widen: SQL Server

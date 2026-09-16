@@ -102,7 +102,17 @@ pub fn run_validate_command(
             Some(e) => vec![e],
             None => anyhow::bail!("export '{}' not found in config", name),
         },
-        None => config.exports.iter().collect(),
+        None => {
+            // A `cdc.backfill` recipe never runs on its own, so its prefix holds
+            // nothing to certify; the baseline it describes is verified under the
+            // CDC export's `snapshot/`. Same whole-config rule as `run`.
+            let recipes = crate::config::backfill_recipe_names(&config.exports);
+            config
+                .exports
+                .iter()
+                .filter(|e| !recipes.contains(&e.name))
+                .collect()
+        }
     };
 
     if exports.is_empty() {
@@ -147,8 +157,7 @@ pub fn run_validate_command(
         // fail the `__pos` check on a missing part.
         let multiplex = export.multiplex_tables();
         let has_snapshot = export.mode == crate::config::ExportMode::Cdc
-            && export.cdc.as_ref().and_then(|c| c.initial)
-                == Some(crate::config::CdcInitialMode::Snapshot);
+            && export.cdc.as_ref().is_some_and(|c| c.has_baseline());
         match multiplex {
             Some(tables) => {
                 for table in tables {

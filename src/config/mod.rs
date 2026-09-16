@@ -1525,11 +1525,11 @@ impl Config {
             }
         }
 
-        // `initial: snapshot` writes each table's snapshot under the reserved
-        // sub-prefix `snapshot/` — a table actually NAMED "snapshot" would share
-        // a prefix with another table's marker. Refuse the collision at load.
+        // A baseline (`initial: snapshot` or `backfill:`) writes each table's
+        // snapshot under the reserved sub-prefix `snapshot/` — a table actually
+        // NAMED "snapshot" would share a prefix with another table's marker.
         if let Some(cdc) = &export.cdc
-            && cdc.initial == Some(CdcInitialMode::Snapshot)
+            && cdc.has_baseline()
         {
             let clashes = |t: &str| t.rsplit('.').next().unwrap_or(t) == "snapshot";
             if export.table.as_deref().is_some_and(clashes)
@@ -1537,8 +1537,9 @@ impl Config {
             {
                 anyhow::bail!(
                     "export '{}': a table named 'snapshot' collides with the reserved \
-                     `snapshot/` sub-prefix that `cdc.initial: snapshot` writes — rename \
-                     the table or use a separate export without `initial:`",
+                     `snapshot/` sub-prefix that a baseline (`cdc.initial: snapshot` or \
+                     `cdc.backfill`) writes — rename the table or use a separate export \
+                     without a baseline",
                     export.name
                 );
             }
