@@ -61,7 +61,11 @@ fn probe_failed(e: &anyhow::Error) -> DoctorCheck {
         "CDC health probe".into(),
         false,
         Some(super::doctor::trim_probe_error(e)),
-        Some("the CDC checks need a working source connection — fix the source auth failure above first".into()),
+        Some(
+            "the CDC probe stopped at this error — fix what it reports; any CDC checks listed \
+             above this line already ran and still apply"
+                .into(),
+        ),
     )
 }
 
@@ -82,15 +86,27 @@ pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<Doct
         Err(e) => return vec![probe_failed(&e)],
     };
     let tls = config.source.tls.as_ref();
+    // The engines APPEND to one vec rather than returning their own, so a probe that
+    // dies half-way keeps the verdicts it already reached. This used to be
+    // `Result<Vec<_>>` + `unwrap_or_else`, which REPLACED every collected verdict with
+    // the generic probe failure: against a live MySQL 8.4 replica with `log_bin=OFF`
+    // (2026-09-16) doctor graded "log_bin is OFF — enable binary logging", then threw
+    // that away when the next query (`SHOW BINARY LOGS`) failed with ERROR 1381, and
+    // printed a hint blaming source auth — which had passed. The operator fixed the
+    // grants, not the binlog.
+    let mut checks = Vec::new();
     let result = match config.source.source_type {
-        SourceType::Postgres => pg_checks(&url, tls, &cdc),
-        SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir),
-        SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir),
+        SourceType::Postgres => pg_checks(&url, tls, &cdc, &mut checks),
+        SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir, &mut checks),
+        SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir, &mut checks),
         // Change streams: probe the replica-set requirement + declare the capture
         // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
-        SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir),
+        SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir, &mut checks),
     };
-    result.unwrap_or_else(|e| vec![probe_failed(&e)])
+    if let Err(e) = result {
+        checks.push(probe_failed(&e));
+    }
+    checks
 }
 
 // ─── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -303,9 +319,9 @@ fn pg_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     let mut client = crate::source::postgres::connect_client(url, tls)?;
-    let mut checks = Vec::new();
     let mut ours: Vec<String> = Vec::new();
     for e in exports {
         let slot = e
@@ -336,10 +352,24 @@ fn pg_checks(
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect();
     checks.push(pg_foreign_slots_verdict(&foreign));
-    Ok(checks)
+    Ok(())
 }
 
 // ─── MySQL ───────────────────────────────────────────────────────────────────
+
+/// `true` when the server has binary logging OFF — the one state in which the
+/// retention probe (`SHOW BINARY LOGS`) answers with ERROR 1381 instead of a log
+/// list. Pure, so the skip decision below is graded offline even though the probe
+/// it guards is live-only. MySQL renders the variable as `ON`/`OFF` or `1`/`0`
+/// depending on how it is asked; both spellings mean the same thing.
+fn binlog_disabled(vars: &[(String, String)]) -> bool {
+    let log_bin = vars
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("log_bin"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("OFF");
+    !log_bin.eq_ignore_ascii_case("ON") && log_bin != "1"
+}
 
 /// The binlog server config CDC needs; anything else breaks capture quietly
 /// (STATEMENT rows never arrive; MINIMAL drops the unchanged columns the
@@ -351,10 +381,9 @@ fn mysql_binlog_config_verdict(vars: &[(String, String)]) -> DoctorCheck {
             .map(|(_, v)| v.as_str())
     };
     let name = "CDC binlog server config".to_string();
-    let log_bin = get("log_bin").unwrap_or("OFF");
     let format = get("binlog_format").unwrap_or("?");
     let row_image = get("binlog_row_image").unwrap_or("FULL");
-    if !log_bin.eq_ignore_ascii_case("ON") && log_bin != "1" {
+    if binlog_disabled(vars) {
         return check(
             name,
             false,
@@ -458,17 +487,25 @@ fn mysql_checks(
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
     config_dir: &std::path::Path,
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     use mysql::prelude::Queryable;
     let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
-    let mut checks = Vec::new();
 
     let vars: Vec<(String, String)> = conn.query(
         "SHOW GLOBAL VARIABLES WHERE Variable_name IN \
          ('log_bin','binlog_format','binlog_row_image')",
     )?;
     checks.push(mysql_binlog_config_verdict(&vars));
+    // Binlog OFF ⇒ stop here. The retention probe below (`SHOW BINARY LOGS`) fails
+    // with ERROR 1381 "You are not using binary logging", which says strictly less
+    // than the verdict just pushed, and every checkpoint verdict needs the log list
+    // it would have returned. Returning leaves the operator one actionable line with
+    // nothing contradicting it.
+    if binlog_disabled(&vars) {
+        return Ok(());
+    }
 
     // SHOW BINARY LOGS: Log_name, File_size (+ Encrypted on 8.0.14+); take the
     // first two columns positionally so the extra column never breaks the map.
@@ -528,7 +565,7 @@ fn mysql_checks(
         };
         checks.push(mysql_ckpt_verdict(&e.name, ckpt, &logs));
     }
-    Ok(checks)
+    Ok(())
 }
 
 // ─── SQL Server ──────────────────────────────────────────────────────────────
@@ -664,9 +701,9 @@ fn mssql_checks(
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
     config_dir: &std::path::Path,
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
-    let mut checks = Vec::new();
     for e in exports {
         let ci = e.cdc.as_ref().and_then(|c| c.capture_instance.as_deref());
         let health = src.cdc_health(ci)?;
@@ -720,7 +757,7 @@ fn mssql_checks(
         }
         checks.extend(mssql_verdicts(&e.name, ci, &mssql_health, ckpt_state));
     }
-    Ok(checks)
+    Ok(())
 }
 
 // ─── MongoDB ─────────────────────────────────────────────────────────────────
@@ -734,9 +771,9 @@ fn mongo_checks(
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
     config_dir: &std::path::Path,
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     let cap = crate::source::mongo::cdc::probe_capability(url, tls)?;
-    let mut checks = Vec::new();
 
     // The checkpoint, which this took as `_exports` and never read. `create_change_
     // stream`'s Mongo arm loads it and `Position::load` HARD-FAILS on a corrupt file,
@@ -813,7 +850,7 @@ fn mongo_checks(
                 .to_string()
         }),
     ));
-    Ok(checks)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -966,6 +1003,36 @@ mod tests {
             ("binlog_format".into(), format.into()),
             ("binlog_row_image".into(), image.into()),
         ]
+    }
+
+    /// `log_bin=OFF` must be RECOGNISED as the skip condition, in both spellings the
+    /// server uses. RED against `binlog_disabled` returning false: `mysql_checks` then
+    /// runs `SHOW BINARY LOGS`, which answers ERROR 1381, and the collected verdict —
+    /// the only line naming the real cause — is replaced by a generic probe failure.
+    /// Measured live on a MySQL 8.4.8 replica (2026-09-16), where `@@log_bin` reads `0`.
+    #[test]
+    fn binlog_off_is_detected_in_both_spellings_and_named_in_the_verdict() {
+        let off = |v: &str| {
+            vec![
+                ("log_bin".to_string(), v.to_string()),
+                ("binlog_format".to_string(), "ROW".to_string()),
+                ("binlog_row_image".to_string(), "FULL".to_string()),
+            ]
+        };
+        assert!(binlog_disabled(&off("OFF")), "`OFF` is binlog disabled");
+        assert!(binlog_disabled(&off("0")), "8.x renders @@log_bin as 0/1");
+        assert!(!binlog_disabled(&off("ON")), "`ON` must probe retention");
+        assert!(!binlog_disabled(&off("1")), "`1` must probe retention");
+        assert!(
+            binlog_disabled(&[]),
+            "a server that did not report the variable is not provably logging"
+        );
+        let verdict = mysql_binlog_config_verdict(&off("0"));
+        assert!(!verdict.ok);
+        assert!(
+            verdict.detail.unwrap().contains("log_bin is OFF"),
+            "the failing verdict must name the cause, not the format/image checks below it"
+        );
     }
 
     #[test]
