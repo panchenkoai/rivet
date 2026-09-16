@@ -917,6 +917,51 @@ pub struct CdcExportConfig {
     /// SQL Server CDC capture instance, e.g. `dbo_orders` — required for
     /// `sqlserver://` sources.
     pub capture_instance: Option<String>,
+    /// How the `initial: snapshot` leg READS the table (see [`CdcSnapshotConfig`]).
+    /// Absent ⇒ the leg is a single-stream `mode: full` scan, which is what every
+    /// snapshot did before this knob existed.
+    #[serde(default)]
+    pub snapshot: Option<CdcSnapshotConfig>,
+}
+
+/// The batch strategy the `initial: snapshot` leg runs under.
+///
+/// The leg is an ordinary batch export rivet synthesizes per table, so it can use
+/// the same keyset paging the batch path uses on a large table: `chunk_by_key` plus
+/// `parallel` turn one full scan into N workers seeking disjoint key ranges. On the
+/// tables this exists for that is the difference between minutes and hours — a
+/// single stream reads a 313M-row table end to end while the batch export of the
+/// same table, keyset with `parallel: 4`, took ~22 minutes.
+///
+/// Parallel reading tears the snapshot: workers read their ranges at different
+/// instants, so the leg is not one consistent read. That is SAFE HERE, and only
+/// here, because `initial: snapshot` takes the anchor BEFORE the snapshot — a row
+/// changed mid-read also arrives through the change stream, and the current-state
+/// view keeps the higher `(__pos, __seq)`. The torn read is repaired by the same
+/// overlap the sequential leg already depends on; nothing new is being assumed.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CdcSnapshotConfig {
+    /// The keyset key the leg pages by: a single-column, NOT NULL, UNIQUE or
+    /// PRIMARY key whose type the cursor can read. Required — the key is NOT
+    /// derived from the catalog here, so an unusable one is a refusal at plan
+    /// time (`is_usable_keyset_key`), never a silent fall back to a full scan.
+    pub chunk_by_key: String,
+    /// Workers seeking concurrently over disjoint key slices. `1` (the default)
+    /// still pages by key, on one connection. Each worker is one more connection
+    /// to the source, so this is the source-pressure dial.
+    #[serde(default = "default_snapshot_parallel")]
+    pub parallel: usize,
+    /// Rows per page. Omitted ⇒ the batch default (`chunk_size`), because a CDC
+    /// export cannot carry the batch knob itself.
+    #[serde(default)]
+    pub chunk_size: Option<usize>,
+}
+
+/// One worker: keyset paging, one connection — the conservative default, so
+/// adding the block never increases source pressure by itself.
+fn default_snapshot_parallel() -> usize {
+    1
 }
 
 // Hand-written so the Rust `Default` MATCHES the serde default: `until_current`
@@ -940,6 +985,7 @@ impl Default for CdcExportConfig {
             server_id: None,
             slot: None,
             capture_instance: None,
+            snapshot: None,
         }
     }
 }

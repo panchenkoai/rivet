@@ -925,6 +925,18 @@
             "string",
             "null"
           ]
+        },
+        "snapshot": {
+          "description": "How the `initial: snapshot` leg READS the table (see [`CdcSnapshotConfig`]).\nAbsent ⇒ the leg is a single-stream `mode: full` scan, which is what every\nsnapshot did before this knob existed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CdcSnapshotConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -937,6 +949,37 @@
           "type": "string",
           "const": "snapshot"
         }
+      ]
+    },
+    "CdcSnapshotConfig": {
+      "description": "The batch strategy the `initial: snapshot` leg runs under.\n\nThe leg is an ordinary batch export rivet synthesizes per table, so it can use\nthe same keyset paging the batch path uses on a large table: `chunk_by_key` plus\n`parallel` turn one full scan into N workers seeking disjoint key ranges. On the\ntables this exists for that is the difference between minutes and hours — a\nsingle stream reads a 313M-row table end to end while the batch export of the\nsame table, keyset with `parallel: 4`, took ~22 minutes.\n\nParallel reading tears the snapshot: workers read their ranges at different\ninstants, so the leg is not one consistent read. That is SAFE HERE, and only\nhere, because `initial: snapshot` takes the anchor BEFORE the snapshot — a row\nchanged mid-read also arrives through the change stream, and the current-state\nview keeps the higher `(__pos, __seq)`. The torn read is repaired by the same\noverlap the sequential leg already depends on; nothing new is being assumed.",
+      "type": "object",
+      "properties": {
+        "chunk_by_key": {
+          "description": "The keyset key the leg pages by: a single-column, NOT NULL, UNIQUE or\nPRIMARY key whose type the cursor can read. Required — the key is NOT\nderived from the catalog here, so an unusable one is a refusal at plan\ntime (`is_usable_keyset_key`), never a silent fall back to a full scan.",
+          "type": "string"
+        },
+        "parallel": {
+          "description": "Workers seeking concurrently over disjoint key slices. `1` (the default)\nstill pages by key, on one connection. Each worker is one more connection\nto the source, so this is the source-pressure dial.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 1
+        },
+        "chunk_size": {
+          "description": "Rows per page. Omitted ⇒ the batch default (`chunk_size`), because a CDC\nexport cannot carry the batch knob itself.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "chunk_by_key"
       ]
     },
     "IncrementalCursorMode": {

@@ -119,6 +119,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `server_id` | `integer` |  | MySQL replica server-id for the binlog connection (default 4271; must be distinct from the source's and any other replica). |
 | `slot` | `string` |  | PostgreSQL logical replication slot name (default `rivet_slot`). |
 | `capture_instance` | `string` |  | SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources. |
+| `snapshot` | [CdcSnapshotConfig](#cdcsnapshotconfig) |  | How the `initial: snapshot` leg READS the table (see [`CdcSnapshotConfig`]). Absent ⇒ the leg is a single-stream `mode: full` scan, which is what every snapshot did before this knob existed. |
 
 ### `exports[].tuning`
 

@@ -1566,6 +1566,52 @@ impl Config {
             );
         }
 
+        // `cdc.snapshot` configures the `initial: snapshot` LEG. With no `initial:`
+        // there is no leg to configure, so the block would sit in the file doing
+        // nothing — the accept-but-silently-ignore shape the chunk-knob gate above
+        // refuses for the same reason.
+        if let Some(cdc) = &export.cdc
+            && let Some(snap) = &cdc.snapshot
+        {
+            if cdc.initial.is_none() {
+                anyhow::bail!(
+                    "export '{}': `cdc.snapshot:` configures the `initial: snapshot` leg, but \
+                     `cdc.initial:` is not set — no snapshot runs, so these settings would do \
+                     nothing.\n  Hint: add `cdc.initial: snapshot`, or remove `cdc.snapshot`.",
+                    export.name
+                );
+            }
+            if snap.chunk_by_key.trim().is_empty() {
+                anyhow::bail!(
+                    "export '{}': `cdc.snapshot.chunk_by_key:` is empty — name the single-column, \
+                     NOT NULL, UNIQUE or PRIMARY key the snapshot pages by",
+                    export.name
+                );
+            }
+            if snap.parallel == 0 {
+                anyhow::bail!(
+                    "export '{}': `cdc.snapshot.parallel: 0` reads with no workers — use `1` for \
+                     a single-connection keyset pass, or omit the field",
+                    export.name
+                );
+            }
+            if snap.chunk_size == Some(0) {
+                anyhow::bail!(
+                    "export '{}': `cdc.snapshot.chunk_size: 0` pages zero rows at a time — omit \
+                     it for the default",
+                    export.name
+                );
+            }
+            if self.source.source_type == SourceType::Mongo {
+                anyhow::bail!(
+                    "export '{}': `cdc.snapshot:` is not supported on MongoDB — the leg reads \
+                     documents, not a keyset over a SQL key. Remove the block to keep the \
+                     default full-collection snapshot.",
+                    export.name
+                );
+            }
+        }
+
         // MongoDB change streams and the MySQL binlog have NO server-side resume
         // anchor (unlike a PostgreSQL slot, or SQL Server's change table whose
         // min-LSN floors a missing from-LSN into an over-read): the checkpoint
