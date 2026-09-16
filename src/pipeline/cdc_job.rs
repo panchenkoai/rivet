@@ -242,9 +242,11 @@ pub(super) fn initial_snapshot_pending(
     config_dir: &std::path::Path,
 ) -> Result<Vec<ExportConfig>> {
     let cdc = export.cdc.clone().unwrap_or_default();
-    // `snapshot` is the only OSS `initial:` mode; absence means "capture changes
-    // only", which needs no anchor step and no snapshot legs.
-    if cdc.initial.is_none() {
+    // Two ways to ask for a baseline, one step: `initial: snapshot` synthesizes the
+    // read, `backfill:` borrows it from an export that already describes the table.
+    // Neither ⇒ "capture changes only", which needs no anchor step and no legs.
+    // (Config load refuses both together — one baseline per anchor.)
+    if cdc.initial.is_none() && cdc.backfill.is_none() {
         return Ok(Vec::new());
     }
     let url = config.source.resolve_url()?;
@@ -381,14 +383,86 @@ pub(super) fn initial_snapshot_pending(
         .as_deref()
         .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
         .map(|p| p.0.to_string());
+    // The pairing, resolved by the same function config load already admitted — so
+    // a reference the run would reject cannot have reached this point.
+    let recipes = crate::config::resolve_backfill(export, &config.exports)
+        .map_err(|why| anyhow::anyhow!(why))?;
+
     let mut pending = Vec::new();
     for idx in pending_idx {
         let (label, read, snap_dcfg) = &table_dests[idx];
         let mut synth = synth_snapshot_export(export, label, read, snap_dcfg);
+        if let Some((_, recipe)) = recipes.iter().find(|(t, _)| t == label) {
+            apply_backfill_recipe(&mut synth, recipe, export)?;
+        }
         synth.meta_columns.cdc_snapshot_pos = anchor_pos.clone();
         pending.push(synth);
     }
     Ok(pending)
+}
+
+/// Borrow one table's READ from the export that already describes it, keeping the
+/// leg's own identity.
+///
+/// The split is the whole design: the recipe says HOW to read (mode, key, page
+/// size, workers, resume, tuning, column types), the leg keeps WHERE it writes and
+/// WHO it is (name, snapshot prefix, parent, label, format, meta columns). So the
+/// referenced export contributes a strategy, never a second load target — every
+/// load invariant that holds for a synthesized leg holds unchanged for this one.
+///
+/// Types MERGE rather than replace: the recipe's bare keys describe its one table,
+/// and a qualified `"table.column"` key on the CDC export still wins at resolution
+/// (`types::overrides_for_table`). A column both sides declare DIFFERENTLY is a
+/// refusal — the two legs write into one `<table>__changes`, so two types for one
+/// column is two truths, and the one that loses would be silent.
+fn apply_backfill_recipe(
+    leg: &mut ExportConfig,
+    recipe: &ExportConfig,
+    cdc_export: &ExportConfig,
+) -> Result<()> {
+    // Refuse a disagreement BEFORE copying, comparing parsed types so two
+    // spellings of one type (`decimal(11,4)` / `numeric(11,4)`) are not a conflict.
+    let parsed =
+        |e: &ExportConfig| crate::plan::build::parse_column_overrides_pub(&e.columns, &e.name);
+    let (recipe_types, cdc_types) = (parsed(recipe)?, parsed(cdc_export)?);
+    let table = leg.snapshot_label.as_deref().unwrap_or_default();
+    let cdc_for_table = crate::types::overrides_for_unit(&cdc_types, Some(table));
+    for (col, mine) in &recipe_types {
+        if let Some(theirs) = cdc_for_table.get(col)
+            && theirs != mine
+        {
+            anyhow::bail!(
+                "export '{}': column '{col}' of table '{table}' is declared `{mine:?}` by its \
+                 backfill export '{}' and `{theirs:?}` by the CDC export — the baseline and the \
+                 stream write into one `<table>__changes`, so one column cannot have two types. \
+                 Keep the declaration on the batch export and drop the other.",
+                cdc_export.name,
+                recipe.name
+            );
+        }
+    }
+
+    // HOW to read — every field the batch planner consults.
+    leg.mode = recipe.mode;
+    leg.chunk_column = recipe.chunk_column.clone();
+    leg.chunk_by_key = recipe.chunk_by_key.clone();
+    leg.chunk_size = recipe.chunk_size;
+    leg.chunk_size_memory_mb = recipe.chunk_size_memory_mb;
+    leg.chunk_count = recipe.chunk_count;
+    leg.chunk_dense = recipe.chunk_dense;
+    leg.chunk_by_days = recipe.chunk_by_days;
+    leg.chunk_checkpoint = recipe.chunk_checkpoint;
+    leg.chunk_max_attempts = recipe.chunk_max_attempts;
+    leg.parallel = recipe.parallel;
+    // The read's own budget: a long single statement is what a chunked recipe
+    // exists to avoid, and the timeout that bounds it is per-export.
+    leg.tuning = recipe.tuning.clone();
+    // Types: the recipe's, then the CDC export's (a qualified key still wins where
+    // both apply — the conflict above is already refused).
+    let mut columns = recipe.columns.clone();
+    columns.extend(cdc_export.columns.clone());
+    leg.columns = columns;
+    Ok(())
 }
 
 /// Synthesize the `mode: full` snapshot export for one CDC table — the batch
@@ -959,6 +1033,89 @@ mod tests {
     //   row_hash is KEPT — since §5h both legs produce it, so dropping it on
     //   the snapshot is what would diverge them, leaving every backfilled row's
     //   hash NULL.
+    /// The split `cdc.backfill` rests on: the recipe says HOW to read, the leg
+    /// keeps WHO it is and WHERE it writes. RED against copying the recipe whole
+    /// (the leg would write to the recipe's own prefix, becoming a second load
+    /// target) and against copying nothing (the leg stays a single-stream full
+    /// scan while the config says four workers — the shape that timed out live).
+    #[test]
+    fn backfill_leg_borrows_the_recipe_read_and_keeps_its_own_identity() {
+        let dcfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/tmp/cdc/orders/snapshot".into()),
+            ..Default::default()
+        };
+        let mut stream = crate::config::sample_export("stand_cdc");
+        stream.mode = crate::config::ExportMode::Cdc;
+        stream.table = None;
+        stream.tables = Some(vec!["orders".into()]);
+        stream.columns = std::collections::HashMap::new();
+
+        let mut recipe = crate::config::sample_export("orders");
+        recipe.mode = crate::config::ExportMode::Chunked;
+        recipe.table = Some("orders".into());
+        recipe.tables = None;
+        recipe.cdc = None;
+        recipe.chunk_by_key = Some("id".into());
+        recipe.chunk_column = None;
+        recipe.chunk_size = 250_000;
+        recipe.parallel = 4;
+        recipe.chunk_checkpoint = true;
+        recipe.columns =
+            std::collections::HashMap::from([("price".into(), "decimal(10,2)".into())]);
+
+        let mut leg = synth_snapshot_export(&stream, "orders", "orders", &dcfg);
+        apply_backfill_recipe(&mut leg, &recipe, &stream).expect("no type conflict");
+
+        // HOW to read — borrowed.
+        assert_eq!(leg.mode, crate::config::ExportMode::Chunked);
+        assert_eq!(leg.chunk_by_key.as_deref(), Some("id"));
+        assert_eq!(leg.chunk_size, 250_000);
+        assert_eq!(leg.parallel, 4);
+        assert!(leg.chunk_checkpoint, "the baseline must be resumable");
+        assert_eq!(
+            leg.columns.get("price").map(String::as_str),
+            Some("decimal(10,2)")
+        );
+
+        // WHO it is and WHERE it writes — its own.
+        assert_eq!(leg.snapshot_parent.as_deref(), Some("stand_cdc"));
+        assert_eq!(leg.snapshot_label.as_deref(), Some("orders"));
+        assert!(
+            leg.name.contains(crate::manifest::SNAPSHOT_LEG_INFIX),
+            "{}",
+            leg.name
+        );
+        assert_eq!(
+            leg.destination.path.as_deref(),
+            Some("/tmp/cdc/orders/snapshot")
+        );
+        assert!(leg.cdc.is_none(), "the leg is a batch export, not a stream");
+        assert!(
+            !leg.skip_empty,
+            "an empty table must still publish its marker"
+        );
+
+        // Two types for one column is two truths: refused, naming the column.
+        let mut conflicting = stream.clone();
+        conflicting.columns =
+            std::collections::HashMap::from([("orders.price".into(), "decimal(12,4)".into())]);
+        let mut leg = synth_snapshot_export(&conflicting, "orders", "orders", &dcfg);
+        let err = format!(
+            "{:#}",
+            apply_backfill_recipe(&mut leg, &recipe, &conflicting)
+                .expect_err("the baseline and the stream disagree about `price`")
+        );
+        assert!(err.contains("price"), "{err}");
+
+        // The same column declared the SAME way on both sides is not a conflict.
+        let mut agreeing = stream.clone();
+        agreeing.columns =
+            std::collections::HashMap::from([("orders.price".into(), "decimal(10,2)".into())]);
+        let mut leg = synth_snapshot_export(&agreeing, "orders", "orders", &dcfg);
+        apply_backfill_recipe(&mut leg, &recipe, &agreeing).expect("agreement is not a conflict");
+    }
+
     #[test]
     fn snapshot_leg_clears_exported_at_but_keeps_the_row_hash() {
         let mut e = crate::config::sample_export("orders");

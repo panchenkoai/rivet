@@ -285,6 +285,53 @@ exports:
     );
 }
 
+/// `cdc.backfill` names the exports that supply the baseline. Each refusal below
+/// is a config that would otherwise run and report success while some table's
+/// history was never loaded — or run one read twice over a single anchor.
+#[test]
+fn cdc_backfill_is_refused_when_it_cannot_mean_one_baseline() {
+    let cfg = |cdc: &str, extra_export: &str| {
+        format!(
+            "\nsource:\n  type: mysql\n  url: \"mysql://u:p@localhost:3306/db\"\n\
+             exports:\n{extra_export}\
+             \x20 - name: stream\n    tables: [orders]\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: {cdc}\n    destination: {{ type: local, path: \"/tmp/x\" }}\n"
+        )
+    };
+    let orders = "  - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+                  \x20   destination: { type: local, path: \"/tmp/o\" }\n";
+
+    // Two baselines over one anchor.
+    let err = parse_err(&cfg(
+        "{ checkpoint: /tmp/ck, initial: snapshot, backfill: auto }",
+        orders,
+    ));
+    assert!(
+        err.contains("initial") && err.contains("backfill"),
+        "the refusal must name both baselines; got: {err}"
+    );
+
+    // The anchor is what makes the baseline safe, and on MySQL it is the file.
+    let err = parse_err(&cfg("{ backfill: auto }", orders));
+    assert!(
+        err.contains("checkpoint"),
+        "the refusal must require the anchor; got: {err}"
+    );
+
+    // A captured table with no export to read it.
+    let err = parse_err(&cfg("{ checkpoint: /tmp/ck, backfill: auto }", ""));
+    assert!(
+        err.contains("orders"),
+        "the refusal must name the table left without a baseline; got: {err}"
+    );
+
+    // The valid shape parses — a gate that refuses everything is the bug that
+    // replaces the one it fixed.
+    let ok = Config::from_yaml(&cfg("{ checkpoint: /tmp/ck, backfill: auto }", orders))
+        .expect("a resolvable backfill must parse");
+    assert_eq!(ok.exports.len(), 2);
+}
+
 #[test]
 fn mssql_cdc_without_a_checkpoint_stays_allowed() {
     // The counterpart to the rule above, so it cannot quietly widen: SQL Server

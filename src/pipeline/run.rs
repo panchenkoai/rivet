@@ -427,6 +427,32 @@ pub fn run(
         selected
     };
 
+    // An export named as some CDC export's `backfill:` is that stream's BASELINE
+    // leg, and the CDC export pulls it (anchor first, then the read). Running it
+    // again from this loop would read the whole table a SECOND time in one
+    // invocation — twice the source pressure, for a prefix nothing consumes.
+    //
+    // Only when the whole config runs: `rivet run -e orders` names it explicitly,
+    // and an operator asking for an export by name gets it.
+    let exports: Vec<&ExportConfig> = if export_name.is_none() {
+        let recipes = crate::config::backfill_recipe_names(&config.exports);
+        let (kept, skipped): (Vec<_>, Vec<_>) = exports
+            .into_iter()
+            .partition(|e| !recipes.contains(&e.name));
+        for e in &skipped {
+            log::info!(
+                "export '{}': skipped — it is the backfill recipe of a `mode: cdc` export, \
+                 which runs it after the anchor (run it alone with `-e {}` to export it on \
+                 its own)",
+                e.name,
+                e.name
+            );
+        }
+        kept
+    } else {
+        exports
+    };
+
     let opts = RunOptions {
         validate,
         reconcile,

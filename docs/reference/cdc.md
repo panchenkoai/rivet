@@ -117,6 +117,64 @@ then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
     destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
 ```
 
+**`cdc.backfill:` — the baseline by reference, for tables that disagree.**
+`initial: snapshot` synthesizes ONE read for the whole stream: a single-connection
+`mode: full` scan per table. That is right for a small table and wrong for a large
+one — a 313M-row table read end to end on one statement runs into
+`tuning.statement_timeout_s` (300s under the `balanced` profile) long before it
+finishes, while the same table as a batch export, keyset-paged with `parallel: 4`,
+takes ~22 minutes. And a multiplex stream's tables do not agree on how they are
+read: one has a unique `id` and keysets, another has only a non-unique index and
+must range-chunk.
+
+So the baseline is declared by REFERENCE — each captured table names the ordinary
+batch export that already describes how to read it:
+
+```yaml
+exports:
+  - name: orders                 # an ordinary export; `rivet init` already writes it
+    table: orders
+    mode: chunked
+    chunk_by_key: id             # keyset
+    parallel: 4
+    chunk_checkpoint: true       # the baseline is resumable
+    format: parquet
+    destination: { type: gcs, bucket: my-bucket, prefix: exports/orders/ }
+    columns: { price: decimal(10,2) }
+
+  - name: app_cdc
+    tables: [orders]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: /var/lib/rivet/app.ckpt
+      backfill: auto             # or: [orders, …]
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/ }
+```
+
+`auto` pairs each entry of `tables:` with the export whose `table:` names it;
+a list names them explicitly. One `rivet run` then does anchor → baseline → drain,
+and the ordering is what makes it safe: the anchor is taken before the first row
+is read, so a row changed mid-baseline also arrives on the stream and the
+current-state view keeps the higher `(__pos, __seq)`.
+
+What the leg borrows and what stays its own is the whole design. **Borrowed:**
+mode, `chunk_by_key` / `chunk_column`, page size, `parallel`, `chunk_checkpoint`,
+`tuning` and the column types. **Its own:** the name, the `<destination>/<table>/snapshot/`
+prefix, the format and the meta columns — so the referenced export contributes a
+recipe, never a second load target, and every load invariant that holds for a
+synthesized leg holds unchanged here. Types MERGE (the recipe's, with a qualified
+`"table.column"` key on the CDC export still winning); a column both sides declare
+**differently** is refused, because the two legs write into one `<table>__changes`
+and one column cannot have two types.
+
+The run loop skips an export that is named as a backfill recipe, so a full
+`rivet run` reads each table once — `rivet run -e orders` still exports it on its
+own. `--resume` continues an interrupted baseline from its chunk checkpoints and
+leaves the anchor alone; once a table's baseline is recorded (per table, in the
+state DB), later runs go straight to the drain. `cdc.initial:` and `cdc.backfill:`
+both describe the first run's baseline, so config load refuses the pair.
+
 **Multiple CDC exports: each owns its stream resources.** A PostgreSQL slot has
 ONE consumer (a shared slot is advanced past changes the other export never
 read), a MySQL `server_id` has ONE connection (the server kills the older one),

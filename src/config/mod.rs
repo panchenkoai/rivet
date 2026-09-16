@@ -1566,6 +1566,47 @@ impl Config {
             );
         }
 
+        // `cdc.backfill` is the other way to get a baseline, and it is the same
+        // step: anchor first, then read the table. Declaring both would run two
+        // baselines over one anchor — the synthesized `mode: full` leg AND the
+        // referenced export's — into one prefix, which is not a merge but a
+        // duplicate nobody asked for.
+        if let Some(cdc) = &export.cdc
+            && cdc.backfill.is_some()
+            && cdc.initial.is_some()
+        {
+            anyhow::bail!(
+                "export '{}': `cdc.initial:` and `cdc.backfill:` both describe the FIRST run's \
+                 baseline — keep one. `initial: snapshot` synthesizes a single-stream full scan; \
+                 `backfill:` borrows the read strategy of the batch export that already describes \
+                 the table (its key, workers, page size and resume).",
+                export.name
+            );
+        }
+
+        // The pairing itself, resolved by the ONE function the CDC job also calls,
+        // so a reference the run would reject cannot pass validation.
+        if let Some(cdc) = &export.cdc
+            && cdc.backfill.is_some()
+        {
+            if let Err(why) = export::resolve_backfill(export, &self.exports) {
+                anyhow::bail!(why);
+            }
+            // The anchor must exist before the baseline reads, and on these engines
+            // the checkpoint file IS the anchor — the same requirement `initial:`
+            // carries, for the same reason: without it the next run re-anchors at
+            // the current position and everything between is lost.
+            if self.source.source_type != SourceType::Postgres && cdc.checkpoint.is_none() {
+                anyhow::bail!(
+                    "export '{}': `cdc.backfill:` on {:?} requires `cdc.checkpoint:` — the \
+                     baseline is only safe because the anchor precedes it, and on this engine \
+                     the checkpoint file is that anchor",
+                    export.name,
+                    self.source.source_type
+                );
+            }
+        }
+
         // MongoDB change streams and the MySQL binlog have NO server-side resume
         // anchor (unlike a PostgreSQL slot, or SQL Server's change table whose
         // min-LSN floors a missing from-LSN into an over-read): the checkpoint

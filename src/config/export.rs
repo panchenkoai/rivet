@@ -917,6 +917,235 @@ pub struct CdcExportConfig {
     /// SQL Server CDC capture instance, e.g. `dbo_orders` — required for
     /// `sqlserver://` sources.
     pub capture_instance: Option<String>,
+    /// Which EXPORTS supply the baseline read (see [`CdcBackfill`]). Absent ⇒ no
+    /// baseline: the stream captures changes only, and the operator owns the
+    /// initial load.
+    #[serde(default)]
+    pub backfill: Option<CdcBackfill>,
+}
+
+/// The exports whose read strategy the baseline legs borrow.
+///
+/// A multiplex stream carries tables that do not agree on how they are read: on
+/// the dev stand `orders` and `users` resolve to keyset-parallel over `id` while
+/// `ext_ref_id_history` must range-chunk `ref_id`, having no unique key. One
+/// strategy stated inside the `cdc:` block cannot cover them, and a per-table map
+/// there would be a second vocabulary for what an export block already says — two
+/// ways to declare a key is two truths, the same argument that keeps the type
+/// overrides in one place.
+///
+/// So the baseline is declared by REFERENCE: each table names the ordinary batch
+/// export that already describes how to read it — mode, key, page size, workers,
+/// `chunk_checkpoint`, `tuning`, `columns`. The leg still WRITES where the
+/// snapshot leg always wrote (`<destination>/<table>/snapshot/`), so every load
+/// invariant is untouched: one export owns the prefix, and the referenced export
+/// contributes a recipe, not a second load target.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CdcBackfill {
+    /// `auto` — pair each captured table with the export whose `table:` names it.
+    Auto(AutoWord),
+    /// An explicit list of export names, for a config where the pairing is not
+    /// one-to-one by name.
+    Exports(Vec<String>),
+}
+
+/// The literal `auto`, as its own type so the untagged enum cannot swallow a
+/// mistyped word: `backfill: atuo` must fail the parse, not fall through to the
+/// list arm and then to a confusing "expected a sequence".
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoWord {
+    Auto,
+}
+
+impl schemars::JsonSchema for CdcBackfill {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CdcBackfill".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "`auto` (pair each captured table with the export that names it), \
+                            or a list of export names",
+            "anyOf": [
+                { "type": "string", "enum": ["auto"] },
+                { "type": "array", "items": { "type": "string" } }
+            ]
+        })
+    }
+}
+
+/// The tables one `mode: cdc` export captures, in configured order.
+///
+/// `tables:` is the multiplex form and `table:` the single one; every caller that
+/// asks "which tables does this stream carry" must get the same answer, so the
+/// two spellings are folded HERE rather than at each call site.
+pub fn cdc_captured_tables(export: &ExportConfig) -> Vec<String> {
+    match (&export.tables, &export.table) {
+        (Some(ts), _) => ts.clone(),
+        (None, Some(t)) => vec![t.clone()],
+        (None, None) => Vec::new(),
+    }
+}
+
+/// The bare relation name — `public.orders` and `orders` name one table, and the
+/// pairing below compares what the operator can actually control.
+fn bare(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Every export some `mode: cdc` export claims as a baseline recipe.
+///
+/// The run loop asks this to avoid reading one table twice in a single
+/// invocation: the CDC export pulls its recipes itself, after the anchor. Names
+/// only — an unresolvable reference is config load's business, and this must stay
+/// usable (and silent) on a config that would not validate.
+pub fn backfill_recipe_names(exports: &[ExportConfig]) -> std::collections::HashSet<String> {
+    exports
+        .iter()
+        .filter(|e| e.mode == ExportMode::Cdc)
+        .flat_map(|cdc| resolve_backfill(cdc, exports).unwrap_or_default())
+        .map(|(_, recipe)| recipe.name.clone())
+        .collect()
+}
+
+/// Pair every captured table with the export that supplies its baseline read.
+///
+/// The ONE definition of the pairing, called by config validation (so a broken
+/// reference fails at load, before an anchor exists) and by the CDC job (so the
+/// legs it builds cannot disagree with what validation admitted).
+///
+/// Every refusal here is a case that would otherwise present as success: a table
+/// with no recipe would simply not be backfilled, and a run that captures changes
+/// over a table whose history was never loaded looks exactly like a healthy one
+/// until someone counts rows in the warehouse.
+pub fn resolve_backfill<'a>(
+    cdc: &ExportConfig,
+    all: &'a [ExportConfig],
+) -> std::result::Result<Vec<(String, &'a ExportConfig)>, String> {
+    let Some(spec) = cdc.cdc.as_ref().and_then(|c| c.backfill.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let tables = cdc_captured_tables(cdc);
+    if tables.is_empty() {
+        return Err(format!(
+            "export '{}': `cdc.backfill` needs `table:` or `tables:` — there is nothing to \
+             pair a baseline export with",
+            cdc.name
+        ));
+    }
+
+    // A candidate is any export that reads ONE named relation: a `query:` export
+    // describes rows, not a table, so it can never be the baseline of a captured
+    // table, and another `mode: cdc` export reads a log rather than the table.
+    let candidate = |e: &ExportConfig| -> bool {
+        e.name != cdc.name && e.mode != ExportMode::Cdc && e.table.is_some()
+    };
+
+    let mut pairs: Vec<(String, &ExportConfig)> = Vec::with_capacity(tables.len());
+    match spec {
+        CdcBackfill::Auto(_) => {
+            for t in &tables {
+                let matches: Vec<&ExportConfig> = all
+                    .iter()
+                    .filter(|e| candidate(e) && e.table.as_deref().map(bare) == Some(bare(t)))
+                    .collect();
+                match matches.as_slice() {
+                    [one] => pairs.push((t.clone(), *one)),
+                    [] => {
+                        return Err(format!(
+                            "export '{}': `cdc.backfill: auto` found no export reading table \
+                             '{t}' — add one (the batch export that already describes how to \
+                             read it), or name the exports explicitly with \
+                             `backfill: [<name>, …]`.\n  Without a baseline this table would \
+                             capture changes over history nobody loaded, and the run would \
+                             still report success.",
+                            cdc.name
+                        ));
+                    }
+                    many => {
+                        let names: Vec<&str> = many.iter().map(|e| e.name.as_str()).collect();
+                        return Err(format!(
+                            "export '{}': `cdc.backfill: auto` found {} exports reading table \
+                             '{t}' ({}) — the pairing is ambiguous. Name the one you mean with \
+                             `backfill: [<name>, …]`.",
+                            cdc.name,
+                            many.len(),
+                            names.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+        CdcBackfill::Exports(names) => {
+            for n in names {
+                let Some(e) = all.iter().find(|e| e.name == *n) else {
+                    return Err(format!(
+                        "export '{}': `cdc.backfill` names export '{n}', which this config does \
+                         not define",
+                        cdc.name
+                    ));
+                };
+                if e.name == cdc.name {
+                    return Err(format!(
+                        "export '{}': `cdc.backfill` names the CDC export itself — the baseline \
+                         is read by a BATCH export, not by the stream",
+                        cdc.name
+                    ));
+                }
+                if e.mode == ExportMode::Cdc {
+                    return Err(format!(
+                        "export '{}': `cdc.backfill` names export '{n}', which is `mode: cdc` — \
+                         a baseline reads the TABLE, not another change stream",
+                        cdc.name
+                    ));
+                }
+                let Some(t) = e.table.as_deref() else {
+                    return Err(format!(
+                        "export '{}': `cdc.backfill` names export '{n}', which has no `table:` \
+                         (a `query:` export describes rows, not a relation, so it cannot be a \
+                         captured table's baseline)",
+                        cdc.name
+                    ));
+                };
+                let Some(captured) = tables.iter().find(|c| bare(c) == bare(t)) else {
+                    return Err(format!(
+                        "export '{}': `cdc.backfill` names export '{n}', which reads '{t}' — a \
+                         table this stream does not capture. Capture it, or drop the reference.",
+                        cdc.name
+                    ));
+                };
+                if pairs.iter().any(|(c, _)| c == captured) {
+                    return Err(format!(
+                        "export '{}': `cdc.backfill` names two exports for table '{captured}' — \
+                         one baseline per table",
+                        cdc.name
+                    ));
+                }
+                pairs.push((captured.clone(), e));
+            }
+            // Partial coverage is the silent-success shape: the covered tables get a
+            // baseline, the rest capture changes over history nobody loaded.
+            let missing: Vec<&str> = tables
+                .iter()
+                .filter(|t| !pairs.iter().any(|(c, _)| c == *t))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "export '{}': `cdc.backfill` covers {} of {} captured tables — no baseline \
+                     for {}. List every table's export, or remove the ones you do not want \
+                     captured from `tables:`.",
+                    cdc.name,
+                    pairs.len(),
+                    tables.len(),
+                    missing.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 // Hand-written so the Rust `Default` MATCHES the serde default: `until_current`
@@ -940,6 +1169,7 @@ impl Default for CdcExportConfig {
             server_id: None,
             slot: None,
             capture_instance: None,
+            backfill: None,
         }
     }
 }
@@ -1361,5 +1591,177 @@ mod tests {
         let exp = make_export_direct(None, Some("queries/orders.sql"));
         let q = exp.resolve_query(dir.path(), None).unwrap();
         assert_eq!(q, "SELECT * FROM orders");
+    }
+
+    // ── cdc.backfill: the pairing ────────────────────────────────────────────
+
+    /// A batch export reading one table, named as a recipe candidate.
+    fn recipe(name: &str, table: &str) -> ExportConfig {
+        let mut e = sample_export(name);
+        e.mode = ExportMode::Chunked;
+        e.table = Some(table.to_string());
+        e.tables = None;
+        e.cdc = None;
+        e
+    }
+
+    /// The stream: N tables, one binlog, a `backfill:` spec.
+    fn stream(tables: &[&str], spec: CdcBackfill) -> ExportConfig {
+        let mut e = sample_export("stand_cdc");
+        e.mode = ExportMode::Cdc;
+        e.table = None;
+        e.tables = Some(tables.iter().map(|t| t.to_string()).collect());
+        e.cdc = Some(CdcExportConfig {
+            backfill: Some(spec),
+            ..Default::default()
+        });
+        e
+    }
+
+    /// The happy path both spellings must agree on: every captured table pairs
+    /// with the export that reads it, and the recipes keep their own strategies —
+    /// which is the whole point, since a multiplex stream's tables do not agree on
+    /// how they are read.
+    #[test]
+    fn resolve_backfill_pairs_tables_with_their_recipe_exports() {
+        let orders = recipe("orders", "orders");
+        let mut history = recipe("ext_ref_id_history", "ext_ref_id_history");
+        // Different strategy per table — the case a single `cdc:`-level block
+        // could not express.
+        history.chunk_by_key = None;
+        history.chunk_column = Some("ref_id".into());
+
+        let auto = stream(
+            &["orders", "ext_ref_id_history"],
+            CdcBackfill::Auto(AutoWord::Auto),
+        );
+        let all = vec![orders.clone(), history.clone(), auto.clone()];
+        let pairs = resolve_backfill(&auto, &all).expect("every table has exactly one export");
+        let named: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(t, e)| (t.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("orders", "orders"),
+                ("ext_ref_id_history", "ext_ref_id_history")
+            ]
+        );
+
+        // The explicit spelling resolves to the same pairs, in the captured order.
+        let listed = stream(
+            &["orders", "ext_ref_id_history"],
+            CdcBackfill::Exports(vec!["orders".into(), "ext_ref_id_history".into()]),
+        );
+        let all = vec![orders.clone(), history.clone(), listed.clone()];
+        let pairs = resolve_backfill(&listed, &all).expect("both named");
+        assert_eq!(pairs.len(), 2);
+
+        // A schema-qualified capture still names the same relation.
+        let qualified = stream(&["public.orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![orders.clone(), qualified.clone()];
+        assert_eq!(
+            resolve_backfill(&qualified, &all).expect("bare and qualified are one table")[0]
+                .1
+                .name,
+            "orders"
+        );
+
+        // No `backfill:` at all ⇒ no pairs, not an error: capture-only is a mode.
+        let mut plain = auto.clone();
+        plain.cdc = Some(CdcExportConfig::default());
+        assert!(resolve_backfill(&plain, &all).unwrap().is_empty());
+    }
+
+    /// Every refusal here is a shape that would otherwise present as SUCCESS: the
+    /// stream captures changes over a table whose history nobody loaded, and the
+    /// run exits 0. RED against returning `Ok` for any of them.
+    #[test]
+    fn resolve_backfill_refuses_every_pairing_that_would_look_like_success() {
+        let orders = recipe("orders", "orders");
+        let err = |cdc: &ExportConfig, all: &[ExportConfig]| {
+            resolve_backfill(cdc, all).expect_err("must refuse")
+        };
+
+        // A captured table with no export to read it.
+        let auto = stream(&["orders", "payments"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![orders.clone(), auto.clone()];
+        let e = err(&auto, &all);
+        assert!(e.contains("payments"), "{e}");
+
+        // Two exports read the same table: the pairing is a guess.
+        let twin = recipe("orders_copy", "orders");
+        let auto1 = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![orders.clone(), twin.clone(), auto1.clone()];
+        let e = err(&auto1, &all);
+        assert!(e.contains("ambiguous") && e.contains("orders_copy"), "{e}");
+
+        // A `query:` export describes rows, not a relation.
+        let mut q = recipe("q", "orders");
+        q.table = None;
+        q.query = Some("SELECT 1".into());
+        let listed = stream(&["orders"], CdcBackfill::Exports(vec!["q".into()]));
+        let all = vec![q.clone(), listed.clone()];
+        let e = err(&listed, &all);
+        assert!(e.contains("no `table:`"), "{e}");
+
+        // Another change stream is not a baseline.
+        let other_cdc = {
+            let mut c = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+            c.name = "other_cdc".into();
+            c
+        };
+        let listed = stream(&["orders"], CdcBackfill::Exports(vec!["other_cdc".into()]));
+        let all = vec![other_cdc.clone(), listed.clone()];
+        let e = err(&listed, &all);
+        assert!(e.contains("mode: cdc"), "{e}");
+
+        // An export reading a table this stream does not capture.
+        let elsewhere = recipe("elsewhere", "payments");
+        let listed = stream(&["orders"], CdcBackfill::Exports(vec!["elsewhere".into()]));
+        let all = vec![orders.clone(), elsewhere.clone(), listed.clone()];
+        let e = err(&listed, &all);
+        assert!(e.contains("does not capture"), "{e}");
+
+        // Partial coverage: the uncovered table is the silent half.
+        let history = recipe("hist", "ext_ref_id_history");
+        let listed = stream(
+            &["orders", "ext_ref_id_history"],
+            CdcBackfill::Exports(vec!["orders".into()]),
+        );
+        let all = vec![orders.clone(), history.clone(), listed.clone()];
+        let e = err(&listed, &all);
+        assert!(
+            e.contains("ext_ref_id_history") && e.contains("1 of 2"),
+            "{e}"
+        );
+
+        // A stream with nothing to capture cannot be paired with anything.
+        let mut tableless = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+        tableless.tables = None;
+        tableless.table = None;
+        let all = vec![orders.clone(), tableless.clone()];
+        let e = err(&tableless, &all);
+        assert!(e.contains("nothing to pair"), "{e}");
+    }
+
+    /// The run loop asks this to avoid reading one table twice in one invocation.
+    /// It must stay silent on a config that would NOT validate — it runs before
+    /// validation has a chance to speak, and a panic here would replace a clear
+    /// config error with a crash.
+    #[test]
+    fn backfill_recipe_names_lists_claimed_exports_and_tolerates_a_broken_config() {
+        let orders = recipe("orders", "orders");
+        let auto = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let names = backfill_recipe_names(&[orders.clone(), auto.clone()]);
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["orders"]
+        );
+
+        // Unresolvable: no export for the captured table. Empty, not a panic.
+        let broken = stream(&["payments"], CdcBackfill::Auto(AutoWord::Auto));
+        assert!(backfill_recipe_names(&[orders, broken]).is_empty());
     }
 }
