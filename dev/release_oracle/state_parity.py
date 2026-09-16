@@ -205,6 +205,11 @@ def verify_state_backend_parity(
 
     def cfg_at(base: Path) -> Path:
         c = base / "parity.yaml"
+        # A `load:` block, never loaded: it makes the run RECORD its load spec
+        # (`export_load_spec`), the one table a run writes only when the config has
+        # one. Without it the cell compared 0 to 0 while every Postgres run refused
+        # the spec's upsert (`could not determine data type of parameter $4`, WARN,
+        # exit 0) — found by the bq-load cells, not by this one.
         c.write_text(
             f"source:\n  type: postgres\n  url: \"{src_url}\"\n"
             f"exports:\n"
@@ -215,6 +220,7 @@ def verify_state_backend_parity(
             f"    chunk_column: id\n"
             f"    chunk_size: 500\n"
             f"    destination: {{ type: local, path: {base}/out }}\n"
+            f"load:\n  target: bigquery\n  project: parity-never-loaded\n  dataset: parity\n"
         )
         return c
 
