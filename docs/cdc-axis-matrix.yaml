@@ -52,7 +52,14 @@ config_fields:
       `mode: cdc` export named as a baseline, a reference to a table the stream
       does not capture, two exports for one table, and partial coverage. The leg
       the job builds carries the recipe's read fields and the leg's own identity.
-    also: resolve_backfill_pairs_tables_with_their_recipe_exports
+      Proven live, which is where the recipe's OTHER half showed up: the run
+      loop skipped the recipe but the LOAD still demanded a recorded load spec
+      for it, so every config pairing `backfill:` with `load:` refused to load
+      at all until the reports were filtered the same way.
+    also: resolve_backfill_pairs_tables_with_their_recipe_exports,
+      a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named,
+      a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run,
+      repeated_runs_of_one_config_append_only_the_delta_to_the_changelog
   - id: initial
     coverage: swept
     case: initial_snapshot
