@@ -1016,6 +1016,37 @@ impl CdcExportConfig {
     }
 }
 
+/// Why a baseline on this engine needs `cdc.checkpoint:`, or `None` when it does not.
+///
+/// ONE rule for both ways to declare a baseline (`initial:` in any mode, so a future
+/// mode inherits it; `backfill:`): every engine but PostgreSQL has no server-side
+/// anchor, so the checkpoint file IS the anchor — the baseline is only safe because
+/// the anchor precedes it, and without it each run re-anchors at the current log
+/// position and silently skips every change since the last one.
+pub fn baseline_checkpoint_refusal(
+    export: &ExportConfig,
+    source_type: crate::config::SourceType,
+) -> Option<String> {
+    let cdc = export.cdc.as_ref()?;
+    let declared = if cdc.backfill.is_some() {
+        "`cdc.backfill:`"
+    } else if cdc.initial.is_some() {
+        "`cdc.initial:`"
+    } else {
+        return None;
+    };
+    if source_type == crate::config::SourceType::Postgres || cdc.checkpoint.is_some() {
+        return None;
+    }
+    Some(format!(
+        "export '{}': {declared} on {source_type:?} requires `cdc.checkpoint:` — this engine has \
+         no server-side anchor, so the checkpoint file is the anchor: the baseline is only safe \
+         because the anchor precedes it, and without it each run re-anchors at the current log \
+         position and silently skips every change since the last one",
+        export.name
+    ))
+}
+
 /// The `columns:` a `mode: cdc` export resolves types with: its own, plus every
 /// backfill recipe's — each recipe's bare keys QUALIFIED to its table, so one
 /// table's declaration cannot reach a same-named column elsewhere. The CDC
@@ -1900,6 +1931,48 @@ mod tests {
         let mut plain = auto.clone();
         plain.cdc = None;
         assert_eq!(effective_columns(&plain, &all), plain.columns);
+    }
+
+    /// One predicate for "a baseline on this engine needs a checkpoint": both ways to
+    /// declare the baseline, every engine but PostgreSQL, and a present checkpoint
+    /// satisfies it. It was two rules with two wordings, one per spelling.
+    #[test]
+    fn baseline_checkpoint_refusal_is_one_rule_for_both_baselines() {
+        use crate::config::{CdcInitialMode, SourceType};
+        let with = |initial: Option<CdcInitialMode>, backfill: Option<CdcBackfill>, ckpt: bool| {
+            let mut e = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+            e.cdc = Some(CdcExportConfig {
+                initial,
+                backfill,
+                checkpoint: ckpt.then(|| "/tmp/ck".to_string()),
+                ..Default::default()
+            });
+            e
+        };
+        let snap = Some(CdcInitialMode::Snapshot);
+        let auto = Some(CdcBackfill::Auto(AutoWord::Auto));
+
+        for (e, engine) in [
+            (with(snap, None, false), SourceType::Mysql),
+            (with(None, auto.clone(), false), SourceType::Mysql),
+            (with(snap, None, false), SourceType::Mssql),
+            (with(None, auto.clone(), false), SourceType::Mongo),
+        ] {
+            let why = baseline_checkpoint_refusal(&e, engine).expect("must refuse");
+            assert!(why.contains("cdc.checkpoint"), "{why}");
+        }
+        // PostgreSQL anchors in the slot; a present checkpoint satisfies any engine;
+        // no baseline means nothing to anchor first.
+        assert!(
+            baseline_checkpoint_refusal(&with(snap, None, false), SourceType::Postgres).is_none()
+        );
+        assert!(
+            baseline_checkpoint_refusal(&with(None, auto.clone(), false), SourceType::Postgres)
+                .is_none()
+        );
+        assert!(baseline_checkpoint_refusal(&with(snap, None, true), SourceType::Mysql).is_none());
+        assert!(baseline_checkpoint_refusal(&with(None, auto, true), SourceType::Mssql).is_none());
+        assert!(baseline_checkpoint_refusal(&with(None, None, false), SourceType::Mysql).is_none());
     }
 
     /// The run loop asks this to avoid reading one table twice in one invocation.

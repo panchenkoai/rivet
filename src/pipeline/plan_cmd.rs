@@ -79,7 +79,30 @@ pub fn run_plan_command(
             .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", name))?;
         vec![e]
     } else {
-        config.exports.iter().collect()
+        // The two whole-config skips `run` and `check` already apply: a CDC export
+        // has no batch plan, and a backfill recipe runs inside its stream's own
+        // run. Aborting on the first of them left every mixed config unplannable —
+        // and `--annotate-waves`, which refuses `--export`, with it.
+        let recipes = crate::config::backfill_recipe_names(&config.exports);
+        let (plannable, skipped): (Vec<_>, Vec<_>) = config
+            .exports
+            .iter()
+            .partition(|e| e.mode != crate::config::ExportMode::Cdc && !recipes.contains(&e.name));
+        for e in &skipped {
+            let why = if e.mode == crate::config::ExportMode::Cdc {
+                "a CDC export has no batch plan; it runs with `rivet run`"
+            } else {
+                "it is the backfill recipe of a `mode: cdc` export, which runs it after the anchor"
+            };
+            log::warn!("plan: skipped '{}' — {why}", e.name);
+        }
+        if plannable.is_empty() {
+            anyhow::bail!(
+                "nothing to plan: every export in the config is a CDC stream or a backfill \
+                 recipe (see the skips above) — run them with `rivet run`"
+            );
+        }
+        plannable
     };
 
     let state_path = config_dir.join(".rivet_state.db");

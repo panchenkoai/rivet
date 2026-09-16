@@ -1552,19 +1552,9 @@ impl Config {
         // inherits the requirement instead of silently deferring the failure to
         // `ensure_anchor` — which demands a checkpoint on these engines for ANY
         // mode, i.e. after the run has already started.
-        if let Some(cdc) = &export.cdc
-            && cdc.initial.is_some()
-            && self.source.source_type != SourceType::Postgres
-            && cdc.checkpoint.is_none()
-        {
-            anyhow::bail!(
-                "export '{}': `cdc.initial:` on {:?} requires `cdc.checkpoint:` — these \
-                 engines have no server-side anchor, so the checkpoint file is the anchor, \
-                 and without it each run re-anchors at the current log position and \
-                 silently skips every change since the last one",
-                export.name,
-                self.source.source_type
-            );
+        // One predicate for both baselines (`initial:` and `backfill:`).
+        if let Some(why) = export::baseline_checkpoint_refusal(export, self.source.source_type) {
+            anyhow::bail!(why);
         }
 
         // `cdc.backfill` is the other way to get a baseline, and it is the same
@@ -1587,25 +1577,12 @@ impl Config {
 
         // The pairing itself, resolved by the ONE function the CDC job also calls,
         // so a reference the run would reject cannot pass validation.
+        // (The checkpoint requirement is `baseline_checkpoint_refusal`, above.)
         if let Some(cdc) = &export.cdc
             && cdc.backfill.is_some()
+            && let Err(why) = export::resolve_backfill(export, &self.exports)
         {
-            if let Err(why) = export::resolve_backfill(export, &self.exports) {
-                anyhow::bail!(why);
-            }
-            // The anchor must exist before the baseline reads, and on these engines
-            // the checkpoint file IS the anchor — the same requirement `initial:`
-            // carries, for the same reason: without it the next run re-anchors at
-            // the current position and everything between is lost.
-            if self.source.source_type != SourceType::Postgres && cdc.checkpoint.is_none() {
-                anyhow::bail!(
-                    "export '{}': `cdc.backfill:` on {:?} requires `cdc.checkpoint:` — the \
-                     baseline is only safe because the anchor precedes it, and on this engine \
-                     the checkpoint file is that anchor",
-                    export.name,
-                    self.source.source_type
-                );
-            }
+            anyhow::bail!(why);
         }
 
         // MongoDB change streams and the MySQL binlog have NO server-side resume

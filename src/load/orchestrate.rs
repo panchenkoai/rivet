@@ -487,7 +487,26 @@ fn conflicting_source_ident<'a>(mine: &str, prior: &'a [String]) -> Option<&'a S
         // and never block.
         return None;
     }
-    prior.iter().find(|p| p.as_str() != mine)
+    // A BARE engine (`mysql`, no table recorded) is "this engine, table unknown"
+    // — the same coarsening `ensure_single_source` applies to the manifests under
+    // one prefix. Bare vs qualified of ONE engine is not two sources; two
+    // different engines are, however coarse either side is.
+    prior
+        .iter()
+        .find(|p| p.as_str() != mine && identity_engine(p) != identity_engine(mine))
+        .or_else(|| {
+            prior.iter().find(|p| {
+                p.as_str() != mine
+                    && p.contains(':')
+                    && mine.contains(':')
+                    && identity_engine(p) == identity_engine(mine)
+            })
+        })
+}
+
+/// The engine half of an `engine[:schema.table]` identity.
+fn identity_engine(ident: &str) -> &str {
+    ident.split(':').next().unwrap_or(ident)
 }
 
 /// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
@@ -2579,6 +2598,26 @@ mod live_only_decisions {
     /// the cross-source overwrite the guard exists to stop).
     #[test]
     fn conflicting_source_ident_names_a_different_source_and_only_that() {
+        // A BARE engine is "this engine, table unrecorded" — an UNKNOWN, never
+        // evidence of a second source (the rule `ensure_single_source` already
+        // applies to the manifests under one prefix). A ledger row written from a
+        // bare identity, or a load carrying one, must not refuse a qualified
+        // sibling of the same engine: a snapshot-only cycle recorded `mysql`, the
+        // next drain cycle carried `mysql:orders`, and every load was refused.
+        assert!(
+            conflicting_source_ident("mysql:orders", &["mysql".to_string()]).is_none(),
+            "a bare prior of the same engine is not another source"
+        );
+        assert!(
+            conflicting_source_ident("mysql", &["mysql:orders".to_string()]).is_none(),
+            "a bare carrier of the same engine is not another source"
+        );
+        assert_eq!(
+            conflicting_source_ident("mysql:orders", &["postgres".to_string()]).map(String::as_str),
+            Some("postgres"),
+            "a bare identity of a DIFFERENT engine is still evidence"
+        );
+
         let mine = "postgres:public.orders";
         assert!(
             conflicting_source_ident(mine, &[]).is_none(),

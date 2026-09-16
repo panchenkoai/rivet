@@ -23,7 +23,6 @@
 use crate::common::MysqlCdcTable as Table;
 use crate::common::*;
 use mysql::prelude::Queryable;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn conn() -> mysql::PooledConn {
     mysql::Pool::new(MYSQL_CDC_URL)
@@ -58,29 +57,9 @@ fn backfill_rig(tbl: &str) -> Rig {
         .also_batch_export("baseline", tbl, "full")
 }
 
-/// Rows across every `.parquet` DIRECTLY under `dir` — NOT recursive, because
-/// the baseline lands in the `snapshot/` CHILD of the CDC export's own prefix
-/// and telling the two legs apart is the point of most assertions here.
-/// A missing directory is zero rows (the leg never wrote).
-fn rows_under(dir: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut n = 0;
-    for p in entries.filter_map(|e| e.ok().map(|e| e.path())) {
-        if p.extension().is_some_and(|x| x == "parquet") {
-            let f = std::fs::File::open(&p).expect("open part");
-            let reader = ParquetRecordBatchReaderBuilder::try_new(f)
-                .expect("parquet part")
-                .build()
-                .expect("parquet reader");
-            for b in reader {
-                n += b.expect("batch").num_rows();
-            }
-        }
-    }
-    n
-}
+// Parts are counted with `common::parquet::total_parquet_rows` — DIRECTLY under a
+// dir, not recursive: the baseline lands in the `snapshot/` CHILD of the CDC
+// export's own prefix, and telling the two legs apart is the point here.
 
 /// The baseline's prefix inside the CDC export's own destination (variant A:
 /// the recipe is a READ recipe, not a second load target).
@@ -125,12 +104,12 @@ fn a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named() {
         "the skip line must name the recipe:\n{said}"
     );
     assert_eq!(
-        rows_under(&rig.out_dir_for("baseline")),
+        total_parquet_rows(&rig.out_dir_for("baseline")),
         0,
         "the recipe's OWN prefix must stay empty — it is a read recipe, not a second export"
     );
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
+        total_parquet_rows(&snapshot_dir(&rig)),
         5,
         "the baseline belongs in the CDC export's snapshot prefix"
     );
@@ -144,7 +123,7 @@ fn a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        rows_under(&rig.out_dir_for("baseline")),
+        total_parquet_rows(&rig.out_dir_for("baseline")),
         5,
         "named explicitly, the recipe exports into its own prefix"
     );
@@ -171,12 +150,12 @@ fn apply_skips_the_backfill_recipe_exactly_as_run_does() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        rows_under(&rig.out_dir_for("baseline")),
+        total_parquet_rows(&rig.out_dir_for("baseline")),
         0,
         "apply must not run the recipe as an ordinary export — that is the second full read"
     );
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
+        total_parquet_rows(&snapshot_dir(&rig)),
         5,
         "the baseline still lands, pulled by the CDC export after its anchor"
     );
@@ -194,7 +173,7 @@ fn validate_certifies_the_backfilled_baseline_and_does_not_call_it_stray() {
     let rig = backfill_rig(&tbl);
     rig.run_ok();
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
+        total_parquet_rows(&snapshot_dir(&rig)),
         5,
         "inert fixture: validate would certify an EMPTY baseline and prove nothing"
     );
@@ -258,12 +237,12 @@ fn a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run() {
 
     rig.run_ok();
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)) as i64,
+        total_parquet_rows(&snapshot_dir(&rig)) as i64,
         query_one(&format!("SELECT COUNT(*) FROM {tbl}")),
         "run 1 backfills the whole table through the recipe — graded against the SOURCE"
     );
     assert_eq!(
-        rows_under(&rig.out_dir()),
+        total_parquet_rows(&rig.out_dir()),
         0,
         "nothing changed after the anchor, so the delta leg captures nothing"
     );
@@ -278,12 +257,12 @@ fn a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run() {
 
     rig.run_ok();
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
+        total_parquet_rows(&snapshot_dir(&rig)),
         5,
         "the baseline must NOT be re-read — a completed snapshot is resume evidence"
     );
     assert_eq!(
-        rows_under(&rig.out_dir()),
+        total_parquet_rows(&rig.out_dir()),
         4,
         "only the delta: three inserts and one update"
     );
@@ -312,7 +291,7 @@ fn a_crashed_chunked_baseline_finishes_on_the_next_plain_run() {
     // Run 1 dies right after the baseline's first chunk is recorded complete.
     let crash = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")]);
     assert!(!crash.status.success(), "the crash run must not exit 0");
-    let landed = rows_under(&snapshot_dir(&rig));
+    let landed = total_parquet_rows(&snapshot_dir(&rig));
     assert!(
         landed > 0 && landed < 150,
         "inert fixture: expected a PARTIAL baseline, got {landed} rows"
@@ -326,12 +305,12 @@ fn a_crashed_chunked_baseline_finishes_on_the_next_plain_run() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
+        total_parquet_rows(&snapshot_dir(&rig)),
         150,
         "the baseline is complete: chunk 0 once, the rest resumed — no gap, no duplicate"
     );
     assert_eq!(
-        rows_under(&rig.out_dir()),
+        total_parquet_rows(&rig.out_dir()),
         0,
         "nothing changed, so no delta"
     );
@@ -367,7 +346,7 @@ fn a_type_conflict_added_after_the_baseline_is_still_refused() {
         .also_export_line("columns: { v: \"decimal(10,2)\" }");
     rig.run_ok();
     assert_eq!(
-        rows_under(&snapshot_dir(&rig)),
+        total_parquet_rows(&snapshot_dir(&rig)),
         3,
         "inert fixture: the baseline must have landed before the conflict is added"
     );
@@ -379,23 +358,6 @@ fn a_type_conflict_added_after_the_baseline_is_still_refused() {
         said.contains("cannot have two types"),
         "the conflict must be refused whether or not a baseline is pending:\n{said}"
     );
-}
-
-/// The Arrow type of `col` in the first `.parquet` DIRECTLY under `dir`.
-fn column_type(dir: &std::path::Path, col: &str) -> arrow::datatypes::DataType {
-    let part = std::fs::read_dir(dir)
-        .expect("read dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .unwrap_or_else(|| panic!("no parquet part under {}", dir.display()));
-    let f = std::fs::File::open(&part).expect("open part");
-    ParquetRecordBatchReaderBuilder::try_new(f)
-        .expect("parquet part")
-        .schema()
-        .field_with_name(col)
-        .unwrap_or_else(|e| panic!("column {col} in {}: {e}", part.display()))
-        .data_type()
-        .clone()
 }
 
 /// The baseline and the stream write ONE `__changes`, so a column must have one
@@ -425,12 +387,12 @@ fn the_recipe_column_types_reach_the_stream_and_the_recorded_spec() {
         .also_export_line("columns: { v: \"decimal(12,4)\" }")
         .top_line("load: { target: bigquery, project: p, dataset: d, pk: [id] }");
     rig.run_ok();
-    let baseline_v = column_type(&snapshot_dir(&rig), "v");
+    let baseline_v = parquet_column_type(&snapshot_dir(&rig), "v");
 
     c.query_drop(format!("INSERT INTO {tbl} VALUES (3, 3.50)"))
         .expect("a change to capture");
     rig.run_ok();
-    let delta_v = column_type(&rig.out_dir(), "v");
+    let delta_v = parquet_column_type(&rig.out_dir(), "v");
     assert_eq!(
         baseline_v, delta_v,
         "one log, one type per column: the baseline wrote {baseline_v:?}, the stream {delta_v:?}"
@@ -445,6 +407,44 @@ fn the_recipe_column_types_reach_the_stream_and_the_recorded_spec() {
     assert!(
         v_spec.contains("12") && v_spec.contains('4'),
         "the spec the DDL is typed from must carry the recipe's declared type; got {v_spec}"
+    );
+}
+
+/// `rivet plan` over a config that MIXES a CDC export with a batch one must plan
+/// the batch export and skip the stream — `rivet check` already does exactly
+/// that ("CDC exports are not plannable"), while `plan` took every export and
+/// aborted the whole command on the first `mode: cdc`, so `--annotate-waves`
+/// (which refuses `--export`) was unusable on any mixed config.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn plan_skips_a_cdc_export_instead_of_failing_the_whole_config() {
+    let (tbl, _guard) = seeded("rivet_bf_plan_cdc", 3);
+    let (other, _guard2) = seeded("rivet_bf_plan_batch", 3);
+    let rig = Rig::mysql_cdc(&tbl).also_batch_export("other", &other, "full");
+    let out_path = rig.config_path().with_file_name("plan.json");
+    let out = rig.cli(&[
+        "plan",
+        "--format",
+        "json",
+        "--output",
+        out_path.to_str().expect("utf-8 path"),
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a CDC export must be SKIPPED by plan, not fail the whole config:\n{said}"
+    );
+    assert!(
+        said.contains(&tbl) && said.to_lowercase().contains("skip"),
+        "the skip must be said, naming the stream:\n{said}"
+    );
+    assert!(
+        out_path.exists(),
+        "the batch export's plan must still be written"
     );
 }
 
