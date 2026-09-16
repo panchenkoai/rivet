@@ -593,10 +593,19 @@ pub fn load_type_reports(
     crate::load::plan::RecordedKeys,
 )> {
     let policy = TypePolicy::warn_only();
+    // A `cdc.backfill` recipe is a READ recipe, never a load target: the run loop
+    // deliberately does not run it (the rows it describes land in the CDC export's
+    // own `snapshot/` prefix), so it has no recorded load spec and never will.
+    // Typing it here made EVERY config pairing `backfill:` with `load:` refuse to
+    // load at all — "no column types recorded … run `rivet run` for this export
+    // first", advice no run can satisfy. The skip rule the run loop applies has to
+    // hold on this side too; the load plans are built from these reports, so one
+    // filter here covers the typing and the plan set both.
+    let recipes = crate::config::backfill_recipe_names(&config.exports);
     let mut out = Vec::with_capacity(config.exports.len());
     let mut keys = crate::load::plan::RecordedKeys::new();
     let mut failures: Vec<String> = Vec::new();
-    for export in &config.exports {
+    for export in config.exports.iter().filter(|e| !recipes.contains(&e.name)) {
         let units: Vec<Option<String>> = match export.multiplex_tables() {
             Some(tables) => tables.iter().cloned().map(Some).collect(),
             None => vec![None],

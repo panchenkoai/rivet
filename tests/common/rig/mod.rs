@@ -424,6 +424,28 @@ impl Rig {
         self
     }
 
+    /// A second BATCH export over its OWN table — the shape a `cdc.backfill`
+    /// recipe has to take.
+    ///
+    /// [`Rig::also_export`] renders a `query:` export, which `resolve_backfill`
+    /// refuses BY CONSTRUCTION ("a `query:` export describes rows, not a table,
+    /// so it can never be the baseline of a captured table"), so the backfill
+    /// pairing could not be expressed with it at all. Chunking lines
+    /// (`chunk_column:`, `chunk_by_key:`, `parallel:`, …) go on with
+    /// [`Rig::also_export_line`] — the recipe's read strategy is exactly what
+    /// the backfill leg borrows.
+    pub fn also_batch_export(mut self, name: &str, table: &str, mode: &str) -> Self {
+        self.extra_exports.push(SecondaryExport {
+            name: name.to_string(),
+            query: String::new(),
+            table: Some(table.to_string()),
+            cdc_lines: Vec::new(),
+            mode: mode.to_string(),
+            lines: Vec::new(),
+        });
+        self
+    }
+
     /// A second CDC export over its OWN table, with its own `cdc:` block and its
     /// own checkpoint file.
     ///
