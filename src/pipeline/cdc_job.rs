@@ -432,25 +432,7 @@ fn synth_snapshot_export(
         export.name,
         crate::manifest::SNAPSHOT_LEG_INFIX
     );
-    // The leg is a plain batch export, so it can read the way the batch path reads a
-    // large table: `cdc.snapshot` makes it `mode: chunked` keyset paging with N
-    // workers instead of one full scan. Absent ⇒ `mode: full`, unchanged.
-    //
-    // The parallel leg is a TORN read (workers see different instants), and that is
-    // safe only because the anchor precedes the snapshot: a row changed mid-read
-    // also arrives on the stream, and the dedup keeps the higher `(__pos, __seq)`.
-    // Same overlap the sequential leg already relies on — see `CdcSnapshotConfig`.
-    match export.cdc.as_ref().and_then(|c| c.snapshot.as_ref()) {
-        Some(snap) => {
-            synth.mode = crate::config::ExportMode::Chunked;
-            synth.chunk_by_key = Some(snap.chunk_by_key.clone());
-            synth.parallel = snap.parallel;
-            if let Some(size) = snap.chunk_size {
-                synth.chunk_size = size;
-            }
-        }
-        None => synth.mode = crate::config::ExportMode::Full,
-    }
+    synth.mode = crate::config::ExportMode::Full;
     // The LABEL names the leg (and through it the prefix and the snapshot marker);
     // the READ names the relation. They differ only where a catalog knows better
     // than the configured string.
@@ -1005,58 +987,6 @@ mod tests {
         );
         assert!(!synth.skip_empty, "snapshot must complete even when empty");
         assert_eq!(synth.table.as_deref(), Some("orders"));
-    }
-
-    /// The leg is a batch export, so `cdc.snapshot` must reach it AS the batch
-    /// strategy — mode, key, workers, page size. RED against the leg keeping
-    /// `mode: full`, the shape before this knob: a 313M-row table then reads on one
-    /// connection while the config says four workers, and nothing reports the
-    /// difference (the run succeeds, just for hours).
-    #[test]
-    fn snapshot_leg_pages_by_key_when_cdc_snapshot_is_configured() {
-        let dcfg = DestinationConfig {
-            destination_type: DestinationType::Local,
-            path: Some("/tmp/snap".into()),
-            ..Default::default()
-        };
-        let mut e = crate::config::sample_export("orders");
-        e.cdc = Some(crate::config::CdcExportConfig {
-            initial: Some(crate::config::CdcInitialMode::Snapshot),
-            snapshot: Some(crate::config::CdcSnapshotConfig {
-                chunk_by_key: "id".into(),
-                parallel: 4,
-                chunk_size: Some(250_000),
-            }),
-            ..Default::default()
-        });
-        let synth = synth_snapshot_export(&e, "orders", "orders", &dcfg);
-        assert_eq!(
-            synth.mode,
-            crate::config::ExportMode::Chunked,
-            "a configured snapshot strategy must make the leg chunked, not full"
-        );
-        assert_eq!(synth.chunk_by_key.as_deref(), Some("id"));
-        assert_eq!(synth.parallel, 4, "the workers the operator asked for");
-        assert_eq!(synth.chunk_size, 250_000);
-        // Everything the leg already guaranteed still holds.
-        assert!(synth.cdc.is_none(), "the leg is a plain batch, not CDC");
-        assert!(
-            !synth.skip_empty,
-            "an empty table must still publish its marker"
-        );
-
-        // Omitted block ⇒ the pre-existing single-stream scan. This half is what
-        // keeps the knob opt-in: every config written before it reads as it did.
-        e.cdc = Some(crate::config::CdcExportConfig {
-            initial: Some(crate::config::CdcInitialMode::Snapshot),
-            ..Default::default()
-        });
-        let plain = synth_snapshot_export(&e, "orders", "orders", &dcfg);
-        assert_eq!(
-            plain.mode,
-            crate::config::ExportMode::Full,
-            "without the block the leg must not change shape"
-        );
     }
 
     /// `adopt` (anchor an already-loaded table, move no rows) is a paid-tier

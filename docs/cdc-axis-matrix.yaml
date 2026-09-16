@@ -35,23 +35,6 @@ engines: [postgres, mysql, mssql, mongo]
 
 # ── the config surface: every field of CdcExportConfig ────────────────────────
 config_fields:
-  - id: snapshot
-    coverage: test
-    detail: >-
-      The batch strategy the `initial: snapshot` LEG runs under. Absent — every
-      config written before this knob — keeps the single-stream `mode: full`
-      scan, so the swept `initial_snapshot` case still drives the default path
-      unchanged. Set, it makes the leg keyset-paged with N workers; the leg is an
-      ordinary synthesized batch export, so the strategy is resolved and run by
-      the batch planner and runners, with nothing CDC-specific in the path. What
-      is pinned offline: the synthesized leg carries mode/key/parallel/page size,
-      and the config refuses the combinations that would silently do nothing or
-      cannot run (no `initial:`, empty key, zero parallel, zero page size,
-      MongoDB). The torn-read safety argument is the anchor-before-snapshot
-      overlap the `initial_snapshot` sweep already exercises — a row changed
-      mid-read arrives on the stream too, and the higher `(__pos, __seq)` wins.
-    also: snapshot_leg_pages_by_key_when_cdc_snapshot_is_configured
-
   - id: initial
     coverage: swept
     case: initial_snapshot

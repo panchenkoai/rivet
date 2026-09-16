@@ -117,37 +117,6 @@ then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
     destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
 ```
 
-**`cdc.snapshot:` — read the snapshot the way the batch path reads a big table.**
-The snapshot leg is an ordinary batch export rivet synthesizes per table, and by
-default it is a single-stream `mode: full` scan. On a large table that is the slow
-part of enabling CDC: one connection reading end to end, while the same table as a
-batch export with `chunk_by_key` + `parallel: 4` is keyset-paged across four
-workers. `cdc.snapshot:` gives the leg that strategy:
-
-```yaml
-    cdc:
-      initial: snapshot
-      checkpoint: /var/lib/rivet/orders.ckpt
-      snapshot:
-        chunk_by_key: id        # single-column, NOT NULL, UNIQUE/PRIMARY
-        parallel: 4             # workers seeking disjoint key ranges (default 1)
-        # chunk_size: 250000    # rows per page; omitted ⇒ the batch default
-```
-
-The key is **not** guessed from the catalog: an unusable one (composite, nullable,
-`decimal`) is refused at plan time rather than silently degrading to a full scan.
-Each worker is one more connection, so `parallel` is the source-pressure dial —
-omitted, it stays at one worker and nothing about the run changes.
-
-Parallel reading makes the snapshot a **torn** read: workers see the table at
-different instants, so the leg is not one consistent view. That is safe here for
-the reason the whole `initial: snapshot` flow already rests on — the anchor is
-taken **before** the snapshot, so a row changed mid-read also arrives through the
-change stream, and the current-state view keeps the higher `(__pos, __seq)`. The
-overlap that repairs a torn parallel read is the same overlap the sequential leg
-relies on; nothing new is assumed. (MongoDB is excluded: its leg reads documents,
-not a keyset over a SQL key.)
-
 **Multiple CDC exports: each owns its stream resources.** A PostgreSQL slot has
 ONE consumer (a shared slot is advanced past changes the other export never
 read), a MySQL `server_id` has ONE connection (the server kills the older one),
