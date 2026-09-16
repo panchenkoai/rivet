@@ -119,6 +119,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `server_id` | `integer` |  | MySQL replica server-id for the binlog connection (default 4271; must be distinct from the source's and any other replica). |
 | `slot` | `string` |  | PostgreSQL logical replication slot name (default `rivet_slot`). |
 | `capture_instance` | `string` |  | SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources. |
+| `backfill` | `auto` |  | Which EXPORTS supply the baseline read (see [`CdcBackfill`]). Absent ⇒ no baseline: the stream captures changes only, and the operator owns the initial load. |
 
 ### `exports[].tuning`
 

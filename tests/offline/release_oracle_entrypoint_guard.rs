@@ -196,7 +196,12 @@ fn command_containing(line: &str, needle: &str) -> Option<String> {
 /// which the previous whole-line version of this guard no longer caught.
 #[test]
 fn every_makefile_gate_invocation_carries_a_baseline_or_gives_it_up_by_name() {
-    const DRIVER: &str = "python3 -m dev.release_oracle";
+    // The MODULE, not the interpreter. The recipes launch the driver through
+    // `$(PY)` (`uv run python`, so the harness pin is load-bearing), and a needle
+    // carrying `python3` found ZERO invocations the day that changed — the count
+    // assertion below is what turned that into a failure instead of a guard that
+    // passes while grading nothing.
+    const DRIVER: &str = "-m dev.release_oracle";
 
     let invocations: Vec<(String, String)> = makefile_logical_recipe_lines()
         .into_iter()

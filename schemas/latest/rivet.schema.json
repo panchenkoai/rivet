@@ -925,6 +925,18 @@
             "string",
             "null"
           ]
+        },
+        "backfill": {
+          "description": "Which EXPORTS supply the baseline read (see [`CdcBackfill`]). Absent ⇒ no\nbaseline: the stream captures changes only, and the operator owns the\ninitial load.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CdcBackfill"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -936,6 +948,23 @@
           "description": "Anchor-then-snapshot: create the resume anchor (PostgreSQL slot /\nMySQL binlog checkpoint / SQL Server LSN checkpoint) FIRST, then run a\nfull batch snapshot of each table into `<destination>[/<table>]/snapshot/`,\nthen drain CDC. Because the anchor predates the snapshot read, anything\nchanged during the snapshot also appears in the change stream — an\noverlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,\nenforced by construction instead of operator discipline.",
           "type": "string",
           "const": "snapshot"
+        }
+      ]
+    },
+    "CdcBackfill": {
+      "description": "`auto` (pair each captured table with the export that names it), or a list of export names",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       ]
     },

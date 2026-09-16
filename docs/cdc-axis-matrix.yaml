@@ -35,6 +35,24 @@ engines: [postgres, mysql, mssql, mongo]
 
 # ── the config surface: every field of CdcExportConfig ────────────────────────
 config_fields:
+  - id: backfill
+    coverage: test
+    detail: >-
+      The baseline by REFERENCE: each captured table names the ordinary batch
+      export that already describes how to read it, and the leg borrows that
+      strategy (mode, key, workers, page size, resume, tuning, column types)
+      while still writing where the snapshot leg always wrote — so every load
+      invariant is untouched and the referenced export is a recipe, not a second
+      load target. Absent — every config written before this field — keeps the
+      sweep's `initial_snapshot` path unchanged, and the two are mutually
+      exclusive by config refusal (one baseline per anchor).
+      Pinned offline: the pairing resolves by table name (`auto`) or by an
+      explicit list, and every case that would otherwise present as SUCCESS is a
+      refusal — no export for a captured table, an ambiguous pair, a `query:` or
+      `mode: cdc` export named as a baseline, a reference to a table the stream
+      does not capture, two exports for one table, and partial coverage. The leg
+      the job builds carries the recipe's read fields and the leg's own identity.
+    also: resolve_backfill_pairs_tables_with_their_recipe_exports
   - id: initial
     coverage: swept
     case: initial_snapshot
