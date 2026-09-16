@@ -246,7 +246,7 @@ pub(super) fn initial_snapshot_pending(
     // read, `backfill:` borrows it from an export that already describes the table.
     // Neither ⇒ "capture changes only", which needs no anchor step and no legs.
     // (Config load refuses both together — one baseline per anchor.)
-    if cdc.initial.is_none() && cdc.backfill.is_none() {
+    if cdc.captures_changes_only() {
         return Ok(Vec::new());
     }
     let url = config.source.resolve_url()?;
@@ -304,16 +304,17 @@ pub(super) fn initial_snapshot_pending(
             // instance backfilled one relation into the other's prefix and only then
             // failed the drain.
             for t in &tables {
-                if !crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
-                    anyhow::bail!(
-                        "sqlserver cdc: export '{}' configures `table: {t}` while capture \
-                         instance '{ci}' emits changes for `{schema}.{table}` — the two \
-                         name different relations, so the snapshot would back up one and \
-                         the drain capture the other. Set `table:` to `{schema}.{table}`, \
-                         or point `capture_instance:` at the table you meant.",
-                        export.name,
-                    );
+                if crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
+                    continue;
                 }
+                anyhow::bail!(
+                    "sqlserver cdc: export '{}' configures `table: {t}` while capture \
+                     instance '{ci}' emits changes for `{schema}.{table}` — the two \
+                     name different relations, so the snapshot would back up one and \
+                     the drain capture the other. Set `table:` to `{schema}.{table}`, \
+                     or point `capture_instance:` at the table you meant.",
+                    export.name,
+                );
             }
             Some(format!("{schema}.{table}"))
         }
@@ -399,7 +400,7 @@ pub(super) fn initial_snapshot_pending(
     for idx in pending_idx {
         let (label, read, snap_dcfg) = &table_dests[idx];
         let mut synth = synth_snapshot_export(export, label, read, snap_dcfg);
-        if let Some((_, recipe)) = recipes.iter().find(|(t, _)| t == label) {
+        if let Some(recipe) = crate::config::backfill_recipe_for(&recipes, label) {
             apply_backfill_recipe(&mut synth, recipe, export)?;
         }
         synth.meta_columns.cdc_snapshot_pos = anchor_pos.clone();
@@ -705,7 +706,7 @@ fn run_cdc_inner(
     // `until_current` defaults to `true` (bounded, scheduler-friendly). An explicit
     // `false` opts into a long-lived continuous stream — surface it so it is a
     // deliberate choice, never a silent never-terminating run.
-    if !cdc.until_current {
+    if cdc.runs_until_stopped() {
         // Engine-specific, because the promise is: MySQL blocks on the binlog and
         // genuinely stays up, while the POLL adapters (PostgreSQL, SQL Server)
         // only lose their open-time ceiling and still exit on catch-up — the

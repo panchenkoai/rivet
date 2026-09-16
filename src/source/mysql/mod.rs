@@ -717,7 +717,7 @@ impl super::Source for MysqlSource {
         let mut conn = self.pool.get_conn()?;
         let mut guard = MysqlSessionGuard::apply(&mut conn, None)?;
         let cols: Vec<String> = guard.conn().query(sql)?;
-        Ok((!cols.is_empty()).then_some(cols))
+        Ok(crate::source::split_key_list(Some(cols.join("\u{1f}"))))
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {

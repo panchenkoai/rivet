@@ -436,10 +436,7 @@ pub fn run(
     // and an operator asking for an export by name gets it.
     let exports: Vec<&ExportConfig> = if export_name.is_none() {
         let recipes = backfill_recipes_to_skip(&config.exports);
-        exports
-            .into_iter()
-            .filter(|e| !recipes.contains(&e.name))
-            .collect()
+        crate::config::without_backfill_recipes(exports, &recipes)
     } else {
         exports
     };
@@ -833,12 +830,11 @@ pub(crate) fn run_waves(
     // recipe here would be the second full read of a table the CDC export is
     // about to read itself.
     let recipes = backfill_recipes_to_skip(&config.exports);
-    let runnable: Vec<ExportConfig> = config
-        .exports
-        .iter()
-        .filter(|e| !recipes.contains(&e.name))
-        .cloned()
-        .collect();
+    let runnable: Vec<ExportConfig> =
+        crate::config::without_backfill_recipes(&config.exports, &recipes)
+            .into_iter()
+            .cloned()
+            .collect();
     let by_wave = group_exports_by_wave(&runnable);
     let total: usize = by_wave.iter().map(|(_, v)| v.len()).sum();
     if total == 0 {

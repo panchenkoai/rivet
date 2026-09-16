@@ -84,17 +84,12 @@ pub fn run_plan_command(
         // run. Aborting on the first of them left every mixed config unplannable —
         // and `--annotate-waves`, which refuses `--export`, with it.
         let recipes = crate::config::backfill_recipe_names(&config.exports);
-        let (plannable, skipped): (Vec<_>, Vec<_>) = config
-            .exports
-            .iter()
-            .partition(|e| e.mode != crate::config::ExportMode::Cdc && !recipes.contains(&e.name));
-        for e in &skipped {
-            let why = if e.mode == crate::config::ExportMode::Cdc {
-                "a CDC export has no batch plan; it runs with `rivet run`"
-            } else {
-                "it is the backfill recipe of a `mode: cdc` export, which runs it after the anchor"
-            };
-            log::warn!("plan: skipped '{}' — {why}", e.name);
+        let mut plannable = Vec::new();
+        for e in &config.exports {
+            match crate::config::batch_plan_skip_reason(e, &recipes) {
+                Some(why) => log::warn!("plan: skipped '{}' — {why}", e.name),
+                None => plannable.push(e),
+            }
         }
         if plannable.is_empty() {
             anyhow::bail!(

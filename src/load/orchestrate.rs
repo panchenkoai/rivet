@@ -2617,6 +2617,15 @@ mod live_only_decisions {
             Some("postgres"),
             "a bare identity of a DIFFERENT engine is still evidence"
         );
+        // Two QUALIFIED tables of the SAME engine are two sources: the coarsening
+        // forgives a missing table, never a different one (in-diff mutant `==`→`!=`
+        // on the same-engine arm survived without this case).
+        assert_eq!(
+            conflicting_source_ident("mysql:app.orders", &["mysql:app.payments".to_string()])
+                .map(String::as_str),
+            Some("mysql:app.payments"),
+            "a different qualified table of the same engine is another source"
+        );
 
         let mine = "postgres:public.orders";
         assert!(

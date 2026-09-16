@@ -1014,6 +1014,16 @@ impl CdcExportConfig {
     pub fn has_baseline(&self) -> bool {
         self.initial == Some(CdcInitialMode::Snapshot) || self.backfill.is_some()
     }
+
+    /// `until_current: false` — a continuous stream the operator stops, never a bounded drain.
+    pub fn runs_until_stopped(&self) -> bool {
+        !self.until_current
+    }
+
+    /// Neither `initial: snapshot` nor `backfill:` — no anchor step, no baseline legs.
+    pub fn captures_changes_only(&self) -> bool {
+        !self.has_baseline()
+    }
 }
 
 /// Why a baseline on this engine needs `cdc.checkpoint:`, or `None` when it does not.
@@ -1086,6 +1096,39 @@ pub fn backfill_recipe_names(exports: &[ExportConfig]) -> std::collections::Hash
         .flat_map(|cdc| resolve_backfill(cdc, exports).unwrap_or_default())
         .map(|(_, recipe)| recipe.name.clone())
         .collect()
+}
+
+/// Why a whole-config `rivet plan` skips `export`, or `None` when it plans it.
+pub fn batch_plan_skip_reason(
+    export: &ExportConfig,
+    recipes: &std::collections::HashSet<String>,
+) -> Option<&'static str> {
+    if export.mode == ExportMode::Cdc {
+        Some("a CDC export has no batch plan; it runs with `rivet run`")
+    } else if recipes.contains(&export.name) {
+        Some("it is the backfill recipe of a `mode: cdc` export, which runs it after the anchor")
+    } else {
+        None
+    }
+}
+
+/// `exports` minus the ones named in `recipes` — the whole-config run loop's view.
+pub fn without_backfill_recipes<'a>(
+    exports: impl IntoIterator<Item = &'a ExportConfig>,
+    recipes: &std::collections::HashSet<String>,
+) -> Vec<&'a ExportConfig> {
+    exports
+        .into_iter()
+        .filter(|e| !recipes.contains(&e.name))
+        .collect()
+}
+
+/// The recipe [`resolve_backfill`] paired with `table`, if any.
+pub fn backfill_recipe_for<'a>(
+    pairs: &[(String, &'a ExportConfig)],
+    table: &str,
+) -> Option<&'a ExportConfig> {
+    pairs.iter().find(|(t, _)| t == table).map(|(_, r)| *r)
 }
 
 /// Pair every captured table with the export that supplies its baseline read.
@@ -1992,5 +2035,72 @@ mod tests {
         // Unresolvable: no export for the captured table. Empty, not a panic.
         let broken = stream(&["payments"], CdcBackfill::Auto(AutoWord::Auto));
         assert!(backfill_recipe_names(&[orders, broken]).is_empty());
+    }
+
+    /// The whole-config loops decide through these two, not inline: `rivet run` /
+    /// `apply` drop the recipes, `rivet plan` drops the recipes AND the streams.
+    #[test]
+    fn whole_config_loops_skip_recipes_and_plan_skips_streams_too() {
+        let orders = recipe("orders", "orders");
+        let plain = recipe("payments", "payments");
+        let auto = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = [orders.clone(), plain.clone(), auto.clone()];
+        let recipes = backfill_recipe_names(&all);
+
+        let kept: Vec<&str> = without_backfill_recipes(&all, &recipes)
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["payments", "stand_cdc"],
+            "run keeps the stream, drops its recipe"
+        );
+
+        assert!(batch_plan_skip_reason(&plain, &recipes).is_none());
+        assert!(
+            batch_plan_skip_reason(&orders, &recipes)
+                .is_some_and(|w| w.contains("backfill recipe")),
+            "the recipe is skipped for being a recipe"
+        );
+        assert!(
+            batch_plan_skip_reason(&auto, &recipes).is_some_and(|w| w.contains("CDC export")),
+            "the stream is skipped for being a stream"
+        );
+        // A CDC export that is (wrongly) also named as a recipe is still a stream first.
+        let mut both = auto;
+        both.name = "orders".into();
+        assert!(batch_plan_skip_reason(&both, &recipes).is_some_and(|w| w.contains("CDC export")));
+    }
+
+    /// The three predicates the CDC job's live-only bodies decide through
+    /// (extracted from inline operators the purity gate flagged, 2026-09-17).
+    #[test]
+    fn cdc_job_predicates_have_their_truth_tables() {
+        let orders = recipe("orders", "orders");
+        let all = [
+            orders.clone(),
+            stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto)),
+        ];
+        let pairs = resolve_backfill(&all[1], &all).unwrap();
+        assert_eq!(
+            backfill_recipe_for(&pairs, "orders").map(|r| r.name.as_str()),
+            Some("orders")
+        );
+        assert!(backfill_recipe_for(&pairs, "payments").is_none());
+        assert!(backfill_recipe_for(&[], "orders").is_none());
+
+        let mut cdc = CdcExportConfig::default();
+        assert!(cdc.captures_changes_only(), "no initial, no backfill");
+        cdc.initial = Some(CdcInitialMode::Snapshot);
+        assert!(!cdc.captures_changes_only());
+        cdc.initial = None;
+        cdc.backfill = Some(CdcBackfill::Auto(AutoWord::Auto));
+        assert!(!cdc.captures_changes_only());
+
+        let mut cdc = CdcExportConfig::default();
+        assert!(!cdc.runs_until_stopped(), "the default drain is bounded");
+        cdc.until_current = false;
+        assert!(cdc.runs_until_stopped());
     }
 }

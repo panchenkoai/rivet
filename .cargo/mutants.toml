@@ -566,4 +566,39 @@ exclude_re = [
     # so `|`→`^` yields the identical value — no witness input exists.
     "replace \\| with \\^ in spill_is_held",
     "replace \\| with \\^ in SpillFile::create",
+
+    # ── cdc.backfill by reference (2026-09-17 in-diff triage, 222 mutants) ────
+    # Each entry below is a LIVE-ONLY body: it opens a real source, a BigQuery
+    # REST session or a binlog, so `--lib --bins` executes none of it and the
+    # whole-function stub is unkillable offline by construction. Every DECISION
+    # inside has been pulled into a named pure predicate with a unit test in the
+    # same triage (`batch_plan_skip_reason`, `without_backfill_recipes`,
+    # `classify_drift`, `split_key_list`); what stays is sequencing and I/O. Each
+    # is graded LIVE — the test named is the one that goes RED against the stub.
+    #
+    # BigQuery drift glue: `existing_shape` is a tables.get over REST; the verdict
+    # is `classify_drift` (bigquery/shape.rs, unit-tested in bigquery/tests.rs).
+    # Live: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild.
+    "replace BigQueryLoader::drift_of -> Result<Option<super::ChangelogDrift>>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::changelog_drift -> Result<Option<super::ChangelogDrift>>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::adoption_drift -> Result<Option<super::ChangelogDrift>>",
+    # The CDC job's two source-bound bodies: the baseline pairing (opens the source
+    # to type-check each recipe) and the drain itself. Live: full_cdc_cycle_{mysql,
+    # postgres,mssql,mongo} — a stubbed baseline leaves the warehouse short of the
+    # seed, a stubbed drain captures nothing.
+    "replace initial_snapshot_pending -> Result<Vec<ExportConfig>>",
+    "replace run_cdc_inner -> \\(Vec<crate::manifest::RunManifest>, Result<\\(\\)>\\)",
+    # `capture_load_units` connects to the source to type the load spec. Live:
+    # the_recipe_column_types_reach_the_stream_and_the_recorded_spec (Decimal(12,4)
+    # from the recipe must land in the spec).
+    "replace capture_and_record -> Result<\\(\\)>",
+    # information_schema query; the empty/non-empty decision is `split_key_list`.
+    # Live: a_wide_composite_key_is_recorded_whole_mysql (the GROUP_CONCAT case).
+    "replace <impl super::Source for MysqlSource>::primary_key -> Result<Option<Vec<String>>>",
+    # Binlog framing inside the live-only `MysqlChangeStream::fill` (already
+    # excluded above): the commit-marker close and the rows-event arm. `true`
+    # never defers a past-bound commit (until_current open-bound tests), `false`
+    # never closes a transaction and the arm deletion captures no rows (full cycle).
+    "replace MysqlChangeStream::close_transaction_at -> bool",
+    "delete match arm Some\\(EventData::RowsEvent\\(re\\)\\) in MysqlChangeStream::fill",
 ]
