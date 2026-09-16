@@ -545,6 +545,16 @@ fn prepare_load(
     // disambiguate). Covers Full (wrong-export snapshot pick), incremental, and
     // CDC in one place, before any irreversible step.
     load::reconcile::ensure_single_export(&keyed)?;
+    // The ledger's already-loaded run_ids — empty when stateless (no state DB),
+    // so `select_runs` degrades safely rather than dropping the mode selection.
+    let loaded = match state {
+        Some(s) => s.loaded_source_run_ids(target_fqtn).unwrap_or_default(),
+        None => std::collections::HashSet::new(),
+    };
+    let new = load::reconcile::select_runs(keyed, &loaded, plan.mode)?;
+    if new.is_empty() {
+        return Ok(None);
+    }
     // THE WAREHOUSE TABLE BELONGS TO ONE SOURCE.
     //
     // `ensure_single_export` above refuses two sources sharing a PREFIX. Two
@@ -557,8 +567,14 @@ fn prepare_load(
     // deleting someone else's data. Rows written before the ledger carried the
     // identity read as unknown and never block — an upgrade must not start
     // refusing loads that were fine yesterday.
+    //
+    // Read from the SAME population the recorder below writes — `new`, the
+    // `Success` manifests `select_runs` kept — never the raw listing: a `Running`
+    // marker carries no schema/table and renders as the bare engine, so keyed on
+    // the raw listing one crashed run's marker refused every later load of the
+    // table, forever, with a remediation that named the wrong cause.
     if let Some(s) = state
-        && let Some((_, m)) = keyed.first()
+        && let Some((_, m)) = new.first()
     {
         let mine = crate::manifest::identity_source(m);
         if let Ok(prior) = s.loaded_source_idents(target_fqtn)
@@ -572,16 +588,6 @@ fn prepare_load(
                  name and one prefix."
             );
         }
-    }
-    // The ledger's already-loaded run_ids — empty when stateless (no state DB),
-    // so `select_runs` degrades safely rather than dropping the mode selection.
-    let loaded = match state {
-        Some(s) => s.loaded_source_run_ids(target_fqtn).unwrap_or_default(),
-        None => std::collections::HashSet::new(),
-    };
-    let new = load::reconcile::select_runs(keyed, &loaded, plan.mode)?;
-    if new.is_empty() {
-        return Ok(None);
     }
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
     // Best-effort column-drift check (only manifests with Form B record
@@ -1978,6 +1984,58 @@ mod live_only_decisions {
         // A failure AFTER the write is what makes the table rivet's own.
         ctx.record_failed(&["run-1".to_string()]);
         assert_eq!(ownership(&state), load::Ownership::Own);
+    }
+
+    /// The identity guard reads the SAME population the recorder writes. A live
+    /// run's `Running` marker carries no schema/table and renders as the bare
+    /// engine; when it sorted first in the listing it WAS `mine`, so one crashed
+    /// run's leftover marker refused every later load of the table, forever.
+    #[test]
+    fn a_running_marker_does_not_impersonate_the_source_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        write_at(&dir, "base/part-1.parquet", b"x");
+        let good = success_manifest("run-1", "part-1.parquet");
+        write_at(
+            &dir,
+            "base/manifest-run-1.json",
+            &serde_json::to_vec(&good).unwrap(),
+        );
+        // The marker: sorts FIRST (`run-0` < `run-1`), no committed parts, bare source.
+        let mut marker = success_manifest("run-0", "part-0.parquet");
+        marker.status = crate::manifest::ManifestStatus::Running;
+        marker.source.schema = None;
+        marker.source.table = None;
+        marker.parts.clear();
+        marker.part_count = 0;
+        marker.row_count = 0;
+        write_at(
+            &dir,
+            "base/manifest-run-0.json",
+            &serde_json::to_vec(&marker).unwrap(),
+        );
+
+        // An earlier load of this table recorded the QUALIFIED identity.
+        let state = StateStore::open_in_memory().unwrap();
+        let target = "p.d.orders";
+        LoadCtx {
+            state: Some(&state),
+            load_id: "load-0",
+            export_name: "orders",
+            target_fqtn: target,
+            warehouse: "bigquery",
+            mode: LoadMode::Cdc,
+            source_prefix: prefix,
+            source_ident: crate::manifest::identity_source(&good),
+            active_at_fetch: Some(Default::default()),
+        }
+        .record(&["run-9".to_string()], 1, "success");
+
+        let plan = plan_at(LoadMode::Cdc, prefix);
+        let prepared = prepare_load(&store, &plan, Some(&state), target, false)
+            .expect("a live run's marker is not another source");
+        assert!(prepared.is_some(), "run-1 is unloaded and must be selected");
     }
 
     /// A resolved plan, so a test can vary the ONE field it is about.

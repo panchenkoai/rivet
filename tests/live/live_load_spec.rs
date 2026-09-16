@@ -351,6 +351,76 @@ fn init_records_the_key_a_query_export_cannot_capture() {
     assert_eq!(key, Some(vec!["b_key".to_string(), "a_key".to_string()]));
 }
 
+/// `rivet apply` must not wipe the key `rivet run` recorded. Its tail opted out
+/// of reading the source key and then recorded a load spec anyway; a NULL key
+/// wins over a run-origin one in the store, so a byte-identical plan → apply left
+/// the next load with no dedup key (incremental refuses; full silently drops the
+/// clustering).
+fn apply_keeps_the_key_run_recorded(e: SqlEngine) {
+    e.alive();
+    let (table, _guard) = e.create(
+        "apply_key",
+        "a_key INT NOT NULL, b_key INT NOT NULL, v VARCHAR(20) NULL, PRIMARY KEY (b_key, a_key)",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} (a_key, b_key, v) VALUES (1, 2, 'x'), (2, 2, 'y'), (3, 1, 'z')"
+    ));
+    let url = match e {
+        SqlEngine::Mysql => MYSQL_URL,
+        SqlEngine::Pg => POSTGRES_URL,
+        SqlEngine::Mssql => MSSQL_URL,
+    };
+    let rig = e.rig(&table).source_url_env("DATABASE_URL").top_line(LOAD);
+    let cfg = rig.config_path();
+    let env = [("DATABASE_URL", url)];
+    let key = || {
+        StateDb::next_to_config(&cfg)
+            .load_spec(&table, None)
+            .expect("a spec is recorded")
+            .1
+    };
+    let expected = Some(vec!["b_key".to_string(), "a_key".to_string()]);
+
+    let out = rig.run_args_env(&[], &env);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(key(), expected, "run records the key");
+
+    let plan_path = cfg.with_file_name("plan.json");
+    let out = rig.plan_json_env(&plan_path, &[], &env);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = rig.apply_env(&plan_path, &[], &env);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        key(),
+        expected,
+        "a byte-identical apply must not clear the key run recorded"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn apply_keeps_the_key_run_recorded_mysql() {
+    apply_keeps_the_key_run_recorded(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn apply_keeps_the_key_run_recorded_postgres() {
+    apply_keeps_the_key_run_recorded(SqlEngine::Pg);
+}
+
 /// A Postgres `(id PK, d DATE, v)` table with ids `1..=n` over five dates.
 fn dated_pg_table(prefix: &str, n: i64) -> (String, Box<dyn std::any::Any>) {
     let e = SqlEngine::Pg;

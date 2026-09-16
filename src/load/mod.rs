@@ -147,6 +147,10 @@ pub trait ShapeControl {
     /// matches, is absent, or nothing is declared.
     fn changelog_drift(&self, table: &str) -> Result<Option<ChangelogDrift>>;
 
+    /// The same question of the whole-table `<table>` an append is about to ADOPT as its
+    /// change log — asked BEFORE the rename, so a refusal here changes nothing.
+    fn adoption_drift(&self, table: &str) -> Result<Option<ChangelogDrift>>;
+
     /// Re-cluster `<table>__changes` in place to the load's `cluster_by`.
     fn recluster_changelog(&self, table: &str) -> Result<()>;
 
@@ -218,6 +222,26 @@ fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool)
             Ok(())
         }
     }
+}
+
+/// Why adopting a whole-table load with a different partition is refused before the rename.
+fn adoption_refusal(
+    table: &str,
+    changes: &str,
+    existing: &str,
+    declared: &str,
+    bytes: Option<u64>,
+) -> String {
+    let reads = bytes.map_or_else(
+        || "every row".to_string(),
+        |b| format!("every row ({})", crate::pipeline::format_bytes(b)),
+    );
+    format!(
+        "`{table}` (an earlier whole-table load) is partitioned by {existing}, the append declares \
+         {declared}; adopting it as `{changes}` cannot re-partition it in place. `rivet load \
+         --rebuild-changelog` adopts it and rebuilds the log with a billed query reading {reads} \
+         — nothing was changed"
+    )
 }
 
 /// Why a changed partition of the change log is refused: the rebuild, and what it reads.
@@ -549,7 +573,7 @@ fn append_and_view(
 ) -> Result<CdcLoadReport> {
     before_write(append_preflight(loader, table, specs, uris, pk, label))?;
 
-    if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership)? {
+    if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership, rebuild_changelog)? {
         eprintln!(
             "  note: `{}` held {rows} rows from an earlier full load — it is now `{}`, the change \
              log this load appends to, and the name becomes the current-state view",
@@ -640,14 +664,35 @@ fn append_preflight(
 
 /// Turn a table an earlier whole-table load left at the view's name into `<table>__changes`
 /// by renaming it; its rows become the change log's baseline. `None` when there is no such table.
+///
+/// A partition the load cannot re-shape in place is refused HERE, before the rename:
+/// refusing after it left the serving name gone and the view unbuilt, under an error
+/// that said "nothing was changed".
 pub(crate) fn adopt_full_load_table(
     loader: &dyn TargetLoader,
     table: &str,
     specs: &[TargetColumnSpec],
     ownership: Ownership,
+    rebuild: bool,
 ) -> Result<Option<u64>> {
     if !before_write(adoptable(loader, table, specs, ownership))? {
         return Ok(None);
+    }
+    if !rebuild
+        && let Some(shape) = loader.shape()
+        && let Some(ChangelogDrift::Partition {
+            existing,
+            declared,
+            bytes,
+        }) = before_write(shape.adoption_drift(table))?
+    {
+        return Err(refused(adoption_refusal(
+            &loader.fqtn(table),
+            &loader.fqtn(&format!("{table}__changes")),
+            &existing,
+            &declared,
+            bytes,
+        )));
     }
     let changes = format!("{table}__changes");
     let rows = before_write(loader.row_count(table))?;
@@ -958,6 +1003,9 @@ mod tests {
             Ok(self.shape_conflict.clone())
         }
         fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
+            Ok(self.drift.borrow().clone())
+        }
+        fn adoption_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
             Ok(self.drift.borrow().clone())
         }
         fn recluster_changelog(&self, table: &str) -> Result<()> {
@@ -1281,6 +1329,46 @@ mod tests {
         assert_eq!(f.object_kind("t__changes").unwrap(), ObjectKind::Table);
     }
 
+    /// A whole-table load whose partition the append cannot re-shape is refused
+    /// BEFORE the rename, so the table keeps its name and the operator's next
+    /// command starts from an unchanged warehouse. Refusing after the rename left
+    /// `t` gone and no view, under an error that said "nothing was changed".
+    #[test]
+    fn a_partition_drift_is_refused_before_the_full_load_table_is_adopted() {
+        let f = full_load_left(5);
+        *f.drift.borrow_mut() = Some(ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: None,
+        });
+        let err = format!("{:#}", load_incremental(&f).unwrap_err());
+        assert!(
+            err.contains("nothing was changed") && err.contains("--rebuild-changelog"),
+            "{err}"
+        );
+        assert!(
+            calls(&f).is_empty(),
+            "no rename, no append: {:?}",
+            calls(&f)
+        );
+        assert_eq!(
+            f.object_kind("t").unwrap(),
+            ObjectKind::Table,
+            "the table keeps its name"
+        );
+        assert_eq!(f.object_kind("t__changes").unwrap(), ObjectKind::Absent);
+
+        // Asked for, the rebuild adopts and then rebuilds — the same drift, resolved.
+        let f = full_load_left(5);
+        *f.drift.borrow_mut() = Some(ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: None,
+        });
+        load_incremental_with(&f, Ownership::Own, true).unwrap();
+        assert_eq!(calls(&f), ["adopt t", "rebuild t", "append t"]);
+    }
+
     #[test]
     fn a_table_rivet_did_not_load_is_not_taken_over() {
         let f = full_load_left(5);
@@ -1452,7 +1540,8 @@ mod tests {
         let f = ShortCopy(full_load_left(5));
         let err = format!(
             "{:#}",
-            adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own).unwrap_err()
+            adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own, false)
+                .unwrap_err()
         );
         assert!(err.contains("before the rename"), "{err}");
         assert_eq!(

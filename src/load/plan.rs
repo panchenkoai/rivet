@@ -564,7 +564,12 @@ fn build_plans_keyed(
             clustering,
         });
     }
-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;
+    reject_duplicate_target_tables(
+        &plans
+            .iter()
+            .map(|p| (p.table.as_str(), p.mode))
+            .collect::<Vec<_>>(),
+    )?;
     Ok(plans)
 }
 
@@ -747,20 +752,32 @@ pub(crate) fn base_type(target_type: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Reject two exports that resolve to the SAME warehouse table. The `target:` is
+/// Reject two exports that touch the SAME warehouse object. The `target:` is
 /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one
-/// warehouse object — a full OVERWRITE would clobber what a cdc/incremental
-/// export appends a `<table>__changes` view over, and they'd share one ledger
-/// skip-set. Pure + unit-testable; caught here, not silently at load time.
-fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for t in tables {
-        if !seen.insert(*t) {
-            bail!(
-                "two exports resolve to the same load target table `{t}` — each would clobber \
-                 the other (a full OVERWRITE vs a cdc/incremental append share the table and \
-                 its ledger). Give each export its own `table:` or destination."
-            );
+/// object — a full OVERWRITE would clobber what a cdc/incremental export appends
+/// a `<table>__changes` view over, and they'd share one ledger skip-set.
+///
+/// An append mode occupies TWO objects: `<table>` (the view) and
+/// `<table>__changes` (the log). Comparing plan tables alone missed a full
+/// export of a source table literally named `orders__changes` next to a CDC
+/// export of `orders` — different strings, one warehouse object, and the full
+/// load's OVERWRITE landed on the live change log. Pure + unit-testable.
+fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for (t, mode) in plans {
+        let mut objects = vec![t.to_string()];
+        if !matches!(mode, LoadMode::Full) {
+            objects.push(format!("{t}__changes"));
+        }
+        for o in objects {
+            if let Some(prior) = seen.insert(o.clone(), t) {
+                bail!(
+                    "two exports resolve to the same warehouse object `{o}` (load targets `{prior}` \
+                     and `{t}`) — each would clobber the other (a full OVERWRITE vs a \
+                     cdc/incremental append share the object and its ledger). Give each export \
+                     its own `table:` or destination."
+                );
+            }
         }
     }
     Ok(())
@@ -1278,9 +1295,30 @@ load:
     fn reject_duplicate_target_tables_catches_a_collision() {
         // Two exports resolving to the same warehouse table would clobber each
         // other — caught at plan time, not silently at load time.
-        assert!(reject_duplicate_target_tables(&["orders", "events", "orders"]).is_err());
-        assert!(reject_duplicate_target_tables(&["orders", "events"]).is_ok());
+        use LoadMode::{Cdc, Full, Incremental};
+        assert!(
+            reject_duplicate_target_tables(&[("orders", Full), ("events", Full), ("orders", Full)])
+                .is_err()
+        );
+        assert!(reject_duplicate_target_tables(&[("orders", Full), ("events", Full)]).is_ok());
         assert!(reject_duplicate_target_tables(&[]).is_ok());
+
+        // An append mode also occupies `<table>__changes`: a full export of a
+        // source table NAMED `orders__changes` would OVERWRITE the CDC export's
+        // live change log — two different plan tables, one warehouse object.
+        let err = reject_duplicate_target_tables(&[("orders", Cdc), ("orders__changes", Full)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("orders__changes"), "{err}");
+        assert!(
+            reject_duplicate_target_tables(&[("orders__changes", Full), ("orders", Incremental)])
+                .is_err(),
+            "order-independent"
+        );
+        // Two append exports on different tables occupy four distinct objects.
+        assert!(
+            reject_duplicate_target_tables(&[("orders", Cdc), ("events", Incremental)]).is_ok()
+        );
     }
 
     #[test]

@@ -1156,8 +1156,13 @@ fn bigquery_live_adopts_a_full_load_table_as_the_changelog_baseline() {
     fixture(&fq).expect("fixture table");
     let before = loader.object_kind(&table);
     let specs = [typed("id", "INT64"), typed("v", "STRING")];
-    let adopted =
-        crate::load::adopt_full_load_table(&loader, &table, &specs, crate::load::Ownership::Own);
+    let adopted = crate::load::adopt_full_load_table(
+        &loader,
+        &table,
+        &specs,
+        crate::load::Ownership::Own,
+        false,
+    );
     let view_sql = crate::load::cdc::inc_dedup_view_sql(
         crate::load::cdc::Warehouse::BigQuery,
         &fq,

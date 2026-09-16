@@ -1609,6 +1609,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     chunk_source: chunked::ChunkSource,
     config_path: &str,
     apply_context: Option<crate::pipeline::summary::ApplyContext>,
+    record_load_spec: bool,
 ) -> (Result<()>, RunSummary) {
     // Re-validate the plan from the artifact (fast, no DB queries).
     let diags = validate_plan(plan);
@@ -1657,7 +1658,10 @@ pub(crate) fn run_export_job_with_chunk_source(
             apply_context,
             allow_reconcile: false,
             notifications: None,
-            record_load_spec: false,
+            // The caller's config decides, exactly as on the run path: apply
+            // records the load spec afterwards, and a spec recorded WITHOUT the
+            // key it never asked for wiped the key `rivet run` had recorded.
+            record_load_spec,
             plan_warnings: Vec::new(),
         },
     )

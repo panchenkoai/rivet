@@ -921,6 +921,7 @@ mod tests {
             &table,
             &specs,
             crate::load::Ownership::Own,
+            false,
         );
         let view_sql = crate::load::cdc::inc_dedup_view_sql(
             crate::load::cdc::Warehouse::Snowflake,

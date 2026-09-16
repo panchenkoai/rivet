@@ -212,16 +212,26 @@ pub fn run_apply_command(
         force_bypassed,
     };
     let plan = artifact.resolved_plan.clone();
+    // The config is read BEFORE the run so the open probe knows whether to read
+    // the source primary key — the load spec recorded afterwards carries it.
+    // Recording with the key never asked for cleared the key `rivet run` had
+    // recorded (`record_load_spec` upserts; a NULL key wins over a run-origin one).
+    let config = artifact
+        .config_path
+        .as_deref()
+        .and_then(|p| crate::config::Config::load(p).ok());
+    let record_load_spec = config.as_ref().is_some_and(|c| c.load.is_some());
     let (result, summary) = super::run_export_job_with_chunk_source(
         &plan,
         &state,
         chunk_source,
         plan_file,
         Some(apply_context),
+        record_load_spec,
     );
     if result.is_ok()
         && let Some(cfg_path) = artifact.config_path.as_deref()
-        && let Ok(config) = crate::config::Config::load(cfg_path)
+        && let Some(config) = config.as_ref()
         && let Some(export) = config
             .exports
             .iter()
@@ -230,7 +240,7 @@ pub fn run_apply_command(
         let cfg_dir = Path::new(cfg_path)
             .parent()
             .unwrap_or_else(|| Path::new("."));
-        super::load_spec::record_after_run(&config, export, &state, cfg_dir, None, &summary);
+        super::load_spec::record_after_run(config, export, &state, cfg_dir, None, &summary);
     }
 
     // 7. The run's tail. This arm is a FULL orchestrator — it opens the state

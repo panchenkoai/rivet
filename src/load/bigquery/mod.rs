@@ -404,6 +404,20 @@ impl TargetLoader for BigQueryLoader {
     }
 }
 
+impl BigQueryLoader {
+    /// How `object` differs from the declared partition/clustering, or `None`.
+    fn drift_of(&self, object: &str) -> Result<Option<super::ChangelogDrift>> {
+        let declared_cluster = self.clustering.is_written().then_some(self.cluster_by());
+        Ok(self.existing_shape(object)?.and_then(|shape| {
+            classify_drift(
+                &shape,
+                self.partition.as_ref().map(|p| &p.key),
+                declared_cluster,
+            )
+        }))
+    }
+}
+
 impl super::ShapeControl for BigQueryLoader {
     fn table_shape_conflict(&self, table: &str) -> Result<Option<String>> {
         let want = self.partition.as_ref().map(|p| &p.key);
@@ -414,15 +428,11 @@ impl super::ShapeControl for BigQueryLoader {
     }
 
     fn changelog_drift(&self, table: &str) -> Result<Option<super::ChangelogDrift>> {
-        let changes = format!("{table}__changes");
-        let declared_cluster = self.clustering.is_written().then_some(self.cluster_by());
-        Ok(self.existing_shape(&changes)?.and_then(|shape| {
-            classify_drift(
-                &shape,
-                self.partition.as_ref().map(|p| &p.key),
-                declared_cluster,
-            )
-        }))
+        self.drift_of(&format!("{table}__changes"))
+    }
+
+    fn adoption_drift(&self, table: &str) -> Result<Option<super::ChangelogDrift>> {
+        self.drift_of(table)
     }
 
     fn recluster_changelog(&self, table: &str) -> Result<()> {
