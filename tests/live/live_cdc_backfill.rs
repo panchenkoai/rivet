@@ -381,6 +381,73 @@ fn a_type_conflict_added_after_the_baseline_is_still_refused() {
     );
 }
 
+/// The Arrow type of `col` in the first `.parquet` DIRECTLY under `dir`.
+fn column_type(dir: &std::path::Path, col: &str) -> arrow::datatypes::DataType {
+    let part = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .unwrap_or_else(|| panic!("no parquet part under {}", dir.display()));
+    let f = std::fs::File::open(&part).expect("open part");
+    ParquetRecordBatchReaderBuilder::try_new(f)
+        .expect("parquet part")
+        .schema()
+        .field_with_name(col)
+        .unwrap_or_else(|e| panic!("column {col} in {}: {e}", part.display()))
+        .data_type()
+        .clone()
+}
+
+/// The baseline and the stream write ONE `__changes`, so a column must have one
+/// type in both — and the warehouse DDL must be typed from that one.
+///
+/// The recipe's `columns:` shaped the baseline's Parquet, but the stream and the
+/// recorded load spec resolved types from the CDC export's own `columns:` alone.
+/// A `decimal(12,4)` declared on the recipe — the placement the conflict refusal
+/// itself recommends — produced a `decimal(12,4)` baseline and a `decimal(10,2)`
+/// delta in one log, with the DDL typed from the second.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn the_recipe_column_types_reach_the_stream_and_the_recorded_spec() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_bf_types");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v DECIMAL(10,2))"
+    ))
+    .expect("create table");
+    let _guard = Table(tbl.clone());
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 1.50), (2, 2.50)"))
+        .expect("seed");
+
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("backfill: auto")
+        .also_batch_export("baseline", &tbl, "full")
+        .also_export_line("columns: { v: \"decimal(12,4)\" }")
+        .top_line("load: { target: bigquery, project: p, dataset: d, pk: [id] }");
+    rig.run_ok();
+    let baseline_v = column_type(&snapshot_dir(&rig), "v");
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3, 3.50)"))
+        .expect("a change to capture");
+    rig.run_ok();
+    let delta_v = column_type(&rig.out_dir(), "v");
+    assert_eq!(
+        baseline_v, delta_v,
+        "one log, one type per column: the baseline wrote {baseline_v:?}, the stream {delta_v:?}"
+    );
+
+    let spec = StateDb::next_to_config(&rig.config_path()).load_spec_types(&tbl, None);
+    let v_spec = spec
+        .iter()
+        .find(|(name, _)| name == "v")
+        .map(|(_, t)| t.clone())
+        .expect("`v` in the recorded spec");
+    assert!(
+        v_spec.contains("12") && v_spec.contains('4'),
+        "the spec the DDL is typed from must carry the recipe's declared type; got {v_spec}"
+    );
+}
+
 fn load_ok(rig: &Rig) {
     let out = rig.cli(&["load"]);
     assert!(

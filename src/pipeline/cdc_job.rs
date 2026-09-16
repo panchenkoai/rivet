@@ -681,12 +681,15 @@ fn run_cdc_inner(
     // `columns:` type overrides, narrowed per table: bare keys apply to every
     // captured table; qualified keys ("table.column") only to theirs, winning
     // over bare — so one table's override can never bleed into a same-named
-    // column elsewhere.
-    let all_overrides =
-        match crate::plan::build::parse_column_overrides_pub(&export.columns, &export.name) {
-            Ok(v) => v,
-            Err(e) => return (Vec::new(), Err(e)),
-        };
+    // column elsewhere. The recipes' declarations ride along, qualified to their
+    // tables: the baseline leg wrote its Parquet with them, and the stream writes
+    // into the same `<table>__changes`.
+    let columns = crate::config::effective_columns(export, &config.exports);
+    let all_overrides = match crate::plan::build::parse_column_overrides_pub(&columns, &export.name)
+    {
+        Ok(v) => v,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     let outputs = wired
         .iter()
         .map(|(t, d, u)| crate::source::cdc::CaptureOutput {

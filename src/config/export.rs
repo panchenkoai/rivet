@@ -989,10 +989,24 @@ pub fn cdc_captured_tables(export: &ExportConfig) -> Vec<String> {
     }
 }
 
-/// The bare relation name — `public.orders` and `orders` name one table, and the
-/// pairing below compares what the operator can actually control.
+/// The bare relation name — the last dotted segment.
 fn bare(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Whether two configured relation names name ONE table.
+///
+/// Both QUALIFIED: they must agree in full — `sales.orders` is not `public.orders`,
+/// and a MongoDB collection named `audit.events` is not `app.events` (a dot is a
+/// legal character there, not a qualifier). A BARE side pairs with the other's
+/// last segment: `orders` is `public.orders` to whoever left the schema off.
+/// ponytail: a bare Mongo name against a dotted collection still folds; the
+/// engine-aware rule needs the source type here, which the pairing does not carry.
+fn same_relation(a: &str, b: &str) -> bool {
+    match (a.contains('.'), b.contains('.')) {
+        (true, true) => a == b,
+        _ => bare(a) == bare(b),
+    }
 }
 
 impl CdcExportConfig {
@@ -1000,6 +1014,32 @@ impl CdcExportConfig {
     pub fn has_baseline(&self) -> bool {
         self.initial == Some(CdcInitialMode::Snapshot) || self.backfill.is_some()
     }
+}
+
+/// The `columns:` a `mode: cdc` export resolves types with: its own, plus every
+/// backfill recipe's — each recipe's bare keys QUALIFIED to its table, so one
+/// table's declaration cannot reach a same-named column elsewhere. The CDC
+/// export's own keys win. One map for the baseline leg, the stream and the
+/// recorded load spec: they write one `<table>__changes`, so a column typed on
+/// the recipe alone (the placement the conflict refusal recommends) must reach
+/// all three, not only the leg.
+pub fn effective_columns(
+    export: &ExportConfig,
+    all: &[ExportConfig],
+) -> std::collections::HashMap<String, String> {
+    let mut merged = std::collections::HashMap::new();
+    for (table, recipe) in resolve_backfill(export, all).unwrap_or_default() {
+        for (k, v) in &recipe.columns {
+            let key = if k.contains('.') {
+                k.clone()
+            } else {
+                format!("{table}.{k}")
+            };
+            merged.insert(key, v.clone());
+        }
+    }
+    merged.extend(export.columns.clone());
+    merged
 }
 
 /// Every export some `mode: cdc` export claims as a baseline recipe.
@@ -1056,7 +1096,9 @@ pub fn resolve_backfill<'a>(
             for t in &tables {
                 let matches: Vec<&ExportConfig> = all
                     .iter()
-                    .filter(|e| candidate(e) && e.table.as_deref().map(bare) == Some(bare(t)))
+                    .filter(|e| {
+                        candidate(e) && e.table.as_deref().is_some_and(|et| same_relation(et, t))
+                    })
                     .collect();
                 match matches.as_slice() {
                     [one] => pairs.push((t.clone(), *one)),
@@ -1116,7 +1158,7 @@ pub fn resolve_backfill<'a>(
                         cdc.name
                     ));
                 };
-                let Some(captured) = tables.iter().find(|c| bare(c) == bare(t)) else {
+                let Some(captured) = tables.iter().find(|c| same_relation(c, t)) else {
                     return Err(format!(
                         "export '{}': `cdc.backfill` names export '{n}', which reads '{t}' — a \
                          table this stream does not capture. Capture it, or drop the reference.",
@@ -1776,6 +1818,88 @@ mod tests {
             e.contains("whole table") && e.contains("Incremental"),
             "{e}"
         );
+
+        // Two QUALIFIED names that differ are two relations, whatever their last
+        // segment says: `sales.orders` is not `public.orders`. Pairing them bound
+        // the wrong export's read strategy and types onto the captured table — and
+        // then skipped that export from the run and the load, exit 0.
+        let foreign = recipe("sales_orders", "sales.orders");
+        let auto = stream(&["public.orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![foreign.clone(), auto.clone()];
+        let e = err(&auto, &all);
+        assert!(
+            e.contains("public.orders") && e.contains("no export"),
+            "{e}"
+        );
+
+        // A BARE name still pairs with a qualified one: `orders` is `public.orders`
+        // to an operator who wrote one of them without the schema.
+        let bare_recipe = recipe("orders", "orders");
+        let all = vec![bare_recipe.clone(), auto.clone()];
+        assert_eq!(
+            resolve_backfill(&auto, &all)
+                .expect("a bare name pairs with its qualified spelling")
+                .len(),
+            1
+        );
+    }
+
+    /// One map for the leg, the stream and the spec: a recipe's bare keys arrive
+    /// qualified to ITS table, the CDC export's own keys win, and a stream with no
+    /// recipes is exactly its own `columns:`.
+    #[test]
+    fn effective_columns_qualifies_each_recipe_to_its_table_and_lets_the_stream_win() {
+        use std::collections::HashMap;
+        let mut orders = recipe("orders", "orders");
+        orders.columns = HashMap::from([
+            ("price".to_string(), "decimal(12,4)".to_string()),
+            ("orders.note".to_string(), "string".to_string()),
+        ]);
+        let mut history = recipe("hist", "ext_ref_id_history");
+        history.columns = HashMap::from([("price".to_string(), "decimal(8,2)".to_string())]);
+        let mut auto = stream(
+            &["orders", "ext_ref_id_history"],
+            CdcBackfill::Auto(AutoWord::Auto),
+        );
+        auto.columns = HashMap::from([("flag".to_string(), "bool".to_string())]);
+        let all = vec![orders.clone(), history.clone(), auto.clone()];
+
+        let m = effective_columns(&auto, &all);
+        assert_eq!(
+            m.get("orders.price").map(String::as_str),
+            Some("decimal(12,4)")
+        );
+        assert_eq!(
+            m.get("ext_ref_id_history.price").map(String::as_str),
+            Some("decimal(8,2)"),
+            "each recipe's bare key is qualified to ITS table"
+        );
+        assert_eq!(
+            m.get("orders.note").map(String::as_str),
+            Some("string"),
+            "an already-qualified recipe key is kept as written"
+        );
+        assert_eq!(m.get("flag").map(String::as_str), Some("bool"));
+        assert!(
+            !m.contains_key("price"),
+            "no bare recipe key may bleed across tables: {m:?}"
+        );
+
+        // The stream's own declaration wins over a recipe's for the same column.
+        auto.columns
+            .insert("orders.price".to_string(), "decimal(14,6)".to_string());
+        let all = vec![orders.clone(), history.clone(), auto.clone()];
+        assert_eq!(
+            effective_columns(&auto, &all)
+                .get("orders.price")
+                .map(String::as_str),
+            Some("decimal(14,6)")
+        );
+
+        // No recipes: exactly the export's own map.
+        let mut plain = auto.clone();
+        plain.cdc = None;
+        assert_eq!(effective_columns(&plain, &all), plain.columns);
     }
 
     /// The run loop asks this to avoid reading one table twice in one invocation.

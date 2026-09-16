@@ -166,6 +166,35 @@ impl StateDb {
         Some((names, key))
     }
 
+    /// `(column, rivet_type as recorded)` of the load spec — the TYPE half, for
+    /// tests whose subject is what the warehouse DDL will be typed from.
+    pub fn load_spec_types(&self, export: &str, unit: Option<&str>) -> Vec<(String, String)> {
+        let columns: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT columns_json FROM export_load_spec WHERE export_name = ?1 AND unit = ?2",
+                [export, unit.unwrap_or("")],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("query export_load_spec")
+            .flatten();
+        columns
+            .map(|c| {
+                serde_json::from_str::<Vec<serde_json::Value>>(&c)
+                    .expect("columns_json")
+                    .iter()
+                    .map(|v| {
+                        (
+                            v["name"].as_str().expect("column name").to_string(),
+                            v["rivet_type"].to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The full `export_metrics` row for `run_id`, read in one query.
     pub fn metrics_row(&self, run_id: &str) -> MetricsRow {
         self.conn

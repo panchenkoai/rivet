@@ -63,7 +63,10 @@ fn capture_and_record(
     params: Option<&HashMap<String, String>>,
     run_id: &str,
 ) -> Result<()> {
-    let overrides = crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
+    // The recipes' `columns:` too: the baseline leg wrote its Parquet with them, and
+    // the DDL this spec becomes must describe that log, not the CDC export alone.
+    let columns = crate::config::effective_columns(export, &config.exports);
+    let overrides = crate::plan::parse_column_overrides_pub(&columns, &export.name)?;
     let units = crate::preflight::type_report::capture_load_units(
         config, export, &overrides, config_dir, params,
     )?;
