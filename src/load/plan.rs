@@ -158,6 +158,22 @@ pub enum CdcLayout {
     BaseAndBuffer,
 }
 
+impl CdcLayout {
+    /// The `<table>__changes` log is a disposable per-cycle buffer: no partition
+    /// declaration, no option settling, no `__rebuild` leftovers to look for —
+    /// `compact` drops it whole.
+    pub fn log_is_disposable(self) -> bool {
+        matches!(self, CdcLayout::BaseAndBuffer)
+    }
+
+    /// `rivet compact` has something to merge for this layout: the base is a
+    /// physical table the legs overwrote, the log a buffer of changes since the
+    /// last merge. The changelog + view layout keeps its state in the log itself.
+    pub fn compacts(self) -> bool {
+        matches!(self, CdcLayout::BaseAndBuffer)
+    }
+}
+
 impl LoadMode {
     /// The ledger's `mode` discriminator (the `load_run.mode` column) — the single
     /// source of truth for the string that names each strategy in the state DB, so
@@ -2329,5 +2345,10 @@ load:
             CdcLayout::LogAndView,
             "a batch load of the same export is no CDC layout"
         );
+        // The two properties every site depends on, as a truth table.
+        assert!(CdcLayout::BaseAndBuffer.log_is_disposable());
+        assert!(CdcLayout::BaseAndBuffer.compacts());
+        assert!(!CdcLayout::LogAndView.log_is_disposable());
+        assert!(!CdcLayout::LogAndView.compacts());
     }
 }

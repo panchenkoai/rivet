@@ -124,10 +124,10 @@ pub struct BigQueryLoader {
     /// Where the staged Parquet lives, for the footer reads that pack a load into
     /// jobs of at most 4,000 partitions each; `None` loads everything in one job.
     pub footer_source: Option<crate::config::DestinationConfig>,
-    /// Base-and-buffer layout: `<table>__changes` is a per-cycle buffer — created
-    /// without a partition (whole-scanned by one MERGE, then dropped), never shape-
-    /// settled — and `compact` merges it into the base.
-    pub buffer_layout: bool,
+    /// The CDC layout: under `BaseAndBuffer`, `<table>__changes` is a per-cycle
+    /// buffer — created without a partition (whole-scanned by one MERGE, then
+    /// dropped), never shape-settled — and `compact` merges it into the base.
+    pub layout: crate::load::plan::CdcLayout,
     /// The REST client, built on first use and shared by every clone — so one
     /// access token serves a whole load instead of one per statement. Not part
     /// of the loader's identity: constructing a loader must stay free of I/O
@@ -144,7 +144,7 @@ impl BigQueryLoader {
             partition: None,
             clustering: Clustering::Auto(Vec::new()),
             run_id: None,
-            buffer_layout: false,
+            layout: crate::load::plan::CdcLayout::LogAndView,
             footer_source: None,
             api: Arc::new(OnceLock::new()),
         }
@@ -169,9 +169,9 @@ impl BigQueryLoader {
         self
     }
 
-    /// Lay `<table>__changes` out as the compaction BUFFER (see the field).
-    pub fn buffer_layout(mut self, on: bool) -> Self {
-        self.buffer_layout = on;
+    /// The CDC layout the load writes (see the field).
+    pub fn layout(mut self, layout: crate::load::plan::CdcLayout) -> Self {
+        self.layout = layout;
         self
     }
 
@@ -444,7 +444,7 @@ impl TargetLoader for BigQueryLoader {
         // Ensure the append-only log exists, partitioned and clustered as the load
         // declares. Idempotent: created once, appended forever. A BUFFER takes no
         // partition: one MERGE reads all of it and `compact` drops it.
-        let log_partition_decl = if self.buffer_layout {
+        let log_partition_decl = if self.layout.log_is_disposable() {
             None
         } else {
             self.partition.as_ref()
@@ -479,7 +479,7 @@ impl TargetLoader for BigQueryLoader {
         // …and its partition options, as the log takes them (no filter, no load-date expiry).
         // A buffer has no partition options to settle; a changelog's follow the config.
         let log_partition = self.partition.as_ref().map(changelog_partition);
-        let settle = if self.buffer_layout {
+        let settle = if self.layout.log_is_disposable() {
             None
         } else {
             options_drift(
@@ -716,7 +716,7 @@ impl super::ShapeControl for BigQueryLoader {
     fn rebuild_leftovers(&self, table: &str) -> Result<Vec<String>> {
         // A buffer is never rebuilt in place (`compact` drops it), so it can leave
         // no `__rebuild` / `__old` behind: nothing to look for, no query job.
-        if self.buffer_layout {
+        if self.layout.log_is_disposable() {
             return Ok(Vec::new());
         }
         let changes = format!("{table}__changes");

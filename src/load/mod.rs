@@ -992,7 +992,7 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
                 run_id,
             )
             .batched_by_footers(plan.destination.clone())
-            .buffer_layout(matches!(plan.layout, plan::CdcLayout::BaseAndBuffer)),
+            .layout(plan.layout),
         ),
         LoadTarget::Snowflake {
             connection,

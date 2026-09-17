@@ -1261,9 +1261,9 @@ fn compact_skip_reason(
     mode: &load::plan::LoadMode,
     layout: &load::plan::CdcLayout,
 ) -> Option<&'static str> {
-    match (mode, layout) {
-        (load::plan::LoadMode::Cdc, load::plan::CdcLayout::BaseAndBuffer) => None,
-        (load::plan::LoadMode::Cdc, _) => {
+    match mode {
+        load::plan::LoadMode::Cdc if layout.compacts() => None,
+        load::plan::LoadMode::Cdc => {
             Some("a changelog + view table (`initial: snapshot`); nothing to merge")
         }
         _ => Some("not a CDC table; nothing to merge"),
@@ -1659,7 +1659,7 @@ fn load_one_cdc(
         allow_source_drift,
         mode: plan.mode,
     };
-    if let load::plan::CdcLayout::BaseAndBuffer = plan.layout {
+    if plan.layout.compacts() {
         return load_one_cdc_base(job, pk, allow_source_drift, state);
     }
     execute_load(
