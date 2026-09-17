@@ -118,7 +118,9 @@ def _substitution_out(text: str) -> str:
 # ── lib/normalize.sh ───────────────────────────────────────────────────────────
 # Two timestamp classes are erased so a layout listing is comparable across
 # runs; `_chunk<N>` is deliberately NOT erased — chunk numbering IS the contract.
-_RUNID_RE = re.compile(rb"[0-9]{8}T[0-9]{6}\.[0-9]+")
+# A run id is `<export>_<UTC ms>_<pid>` since the pid joined it (two configs on
+# one scheduler tick sharing one state row); the pid is erased WITH the stamp.
+_RUNID_RE = re.compile(rb"[0-9]{8}T[0-9]{6}\.[0-9]+(?:_[0-9]+)?")
 # The part stamp gained a MILLISECOND field (`%3f`) when second granularity was
 # found to let two sub-second runs into one prefix clobber each other — a real
 # data-loss fix, so the suffix is here to stay. It must be erased WITH the
