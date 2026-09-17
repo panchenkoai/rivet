@@ -1137,7 +1137,8 @@ fn load_one_cdc_base(
                 .iter()
                 .cloned()
                 .partition(|(_, m)| is_baseline_leg(m));
-            let mut rows = 0u64;
+            // Rows this cycle landed, per leg then the buffer; summed for the ledger.
+            let mut landed: Vec<u64> = Vec::new();
             let mut report: Option<load::CdcLoadReport> = None;
             if let [_, ..] = baseline.as_slice() {
                 let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
@@ -1162,7 +1163,7 @@ fn load_one_cdc_base(
                 );
                 let ids: Vec<String> = baseline.iter().map(|(_, m)| m.run_id.clone()).collect();
                 legs.landed(&ids, r.rows_loaded);
-                rows += r.rows_loaded;
+                landed.push(r.rows_loaded);
             }
             let stream_uris = if stream.is_empty() {
                 Vec::new()
@@ -1184,7 +1185,7 @@ fn load_one_cdc_base(
                     Some(integrity.file_rows),
                     cleanup,
                 )?;
-                rows += r.rows_appended;
+                landed.push(r.rows_appended);
                 report = Some(r);
             }
             let report = report.unwrap_or_else(|| load::CdcLoadReport {
@@ -1193,7 +1194,7 @@ fn load_one_cdc_base(
                 view: loader.fqtn(&plan.table),
                 source_cleaned: false,
             });
-            Ok((rows, report))
+            Ok((landed.iter().sum(), report))
         },
         |inputs, report| eprintln!("{}", base_done_line(&inputs.integrity, report)),
     )

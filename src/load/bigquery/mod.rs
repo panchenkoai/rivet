@@ -178,12 +178,13 @@ impl BigQueryLoader {
     /// The load jobs `uris` need under the declared partition: one when nothing bounds
     /// them (no partition column or no footer source), else footer-packed batches.
     fn batches(&self, uris: &[String]) -> Result<Vec<Vec<String>>> {
-        match (&self.footer_source, &self.partition) {
-            (Some(dest), Some(partition)) if partition.key.column().is_some() => {
+        let keyed = self.partition.as_ref().filter(|p| p.key.column().is_some());
+        match self.footer_source.as_ref().zip(keyed) {
+            Some((dest, partition)) => {
                 let store = crate::load::open_store(dest)?;
                 crate::load::partition_budget::plan_load_batches(&store, uris, partition)
             }
-            _ => Ok(vec![uris.to_vec()]),
+            None => Ok(vec![uris.to_vec()]),
         }
     }
 

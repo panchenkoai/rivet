@@ -854,6 +854,30 @@ fn is_transient_status(code: u16) -> bool {
 mod tests {
     use super::*;
 
+    /// The compaction probe reads one row of mixed cells: text stays text, a
+    /// number renders as its digits, a NULL cell is `None`, and a response with
+    /// no row is an error — never an empty or all-NULL row that reads as "0".
+    #[test]
+    fn the_first_row_keeps_every_cell_and_a_missing_row_is_an_error() {
+        let results = serde_json::json!({
+            "rows": [{ "f": [ { "v": "35" }, { "v": "2024-01-01" }, { "v": null }, { "v": 7 }, { "v": true } ] }]
+        });
+        assert_eq!(
+            parse_first_row(&results).unwrap(),
+            vec![
+                Some("35".to_string()),
+                Some("2024-01-01".to_string()),
+                None,
+                Some("7".to_string()),
+                Some("true".to_string())
+            ]
+        );
+        let err = parse_first_row(&serde_json::json!({ "rows": [] }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no rows[0].f"), "{err}");
+    }
+
     /// The gcloud fallback must ask for the APPLICATION-DEFAULT token, not the
     /// logged-in user's.
     ///

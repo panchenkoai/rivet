@@ -635,4 +635,29 @@ exclude_re = [
     # redacting line) has an offline oracle over a piped stderr + the in-process
     # channel (`redact::logger_tests`).
     "replace install_logger with ()",
+    # The BigQuery loader's REST methods (load/bigquery/mod.rs, load/bq_rest.rs):
+    # each is ONE call to the BigQuery API (a query job, a table GET, a DDL
+    # statement) wrapped in the labelled `run_sql` seam — no offline test can run
+    # them, so their body stubs are born MISSED (2026-09-17: they entered the
+    # in-diff scope because every method took the `rivet_op` label). What each one
+    # DECIDES is next door and graded: the SQL it sends (`ddl.rs`, `cdc.rs`
+    # builders incl. `plan_compact_merges`), the batches it packs
+    # (`partition_budget::plan_load_batches`), the row it parses
+    # (`bq_rest::parse_first_row`). Live: live_load_spec, live_cdc_compact,
+    # live_load_partition_batches, the `warehouse_layout` / `partner_shape` gate cells.
+    "replace BigQueryLoader::batches -> Result<Vec<Vec<String>>>",
+    "replace BigQueryLoader::count_rows -> Result<u64>",
+    "replace <impl TargetLoader for BigQueryLoader>::materialize -> Result<u64>",
+    "replace <impl TargetLoader for BigQueryLoader>::append_changelog -> Result<u64>",
+    "replace <impl TargetLoader for BigQueryLoader>::changes_has_prior_changes -> Result<bool>",
+    "replace <impl TargetLoader for BigQueryLoader>::column_overlap -> Result<\\(u64, u64\\)>",
+    "replace <impl TargetLoader for BigQueryLoader>::adopt_as_changelog -> Result<\\(\\)>",
+    "replace <impl TargetLoader for BigQueryLoader>::create_view -> Result<\\(\\)>",
+    "replace <impl TargetLoader for BigQueryLoader>::compact -> Result<crate::load::CompactReport>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_changelog -> Result<\\(\\)>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_leftovers -> Result<Vec<String>>",
+    "replace BigQueryApi::run_query_first_row -> Result<Vec<Option<String>>>",
+    # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
+    # filtering and the redacting line are graded (`redact::logger_tests`).
+    "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",
 ]
