@@ -628,13 +628,8 @@ exclude_re = [
     # tests/live/live_cdc_compact.rs (both cells) and the `warehouse_layout` gate cell.
     "replace load_one_cdc_base ->",
     "replace run_compacts ->",
-    # `redact::install_logger` installs the PROCESS logger (`log::set_boxed_logger`,
-    # once per process). Its stub leaves the `log` facade unset — a unit test cannot
-    # observe that without hijacking the test binary's own logger for every other
-    # test. What it wires IS graded: `UiRoutedLogger` (routing, filtering, the
-    # redacting line) has an offline oracle over a piped stderr + the in-process
-    # channel (`redact::logger_tests`).
-    "replace install_logger with ()",
+    # (`redact::install_logger` is NOT excluded: the gate's offline coverage shows
+    # the CLI tests execute it through the binary — `--lib --bins` grades its stub.)
     # The BigQuery loader's REST methods (load/bigquery/mod.rs, load/bq_rest.rs):
     # each is ONE call to the BigQuery API (a query job, a table GET, a DDL
     # statement) wrapped in the labelled `run_sql` seam — no offline test can run
