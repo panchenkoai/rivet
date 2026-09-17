@@ -25,16 +25,7 @@ impl Drop for LoadLease<'_> {
 
 /// The sidecar an SQLite-state lease locks: beside the DB file, one per table.
 fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
-    let token: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    let token = crate::manifest::file_token(key);
     if db.to_string_lossy() == ":memory:" {
         return std::env::temp_dir().join(format!("rivet-{}-{token}.lease", std::process::id()));
     }

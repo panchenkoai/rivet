@@ -60,8 +60,15 @@ pub const QUARANTINE_PREFIX: &str = "_quarantine";
 /// parts use: an RFC3339 run id carries `:`/`+` (illegal on Windows), so map
 /// anything outside `[A-Za-z0-9._-]` to `-`.
 pub fn run_unique_manifest_name(run_id: &str) -> String {
-    let token: String = run_id
-        .chars()
+    format!("manifest-{}.json", file_token(run_id))
+}
+
+/// `s` as one safe file-name segment: anything outside `[A-Za-z0-9._-]` becomes
+/// `-` (an RFC3339 run id carries `:`/`+`, a table FQTN carries `.`; Windows
+/// refuses the former). The ONE sanitizer for every per-run / per-table sidecar
+/// — the manifest copy and the SQLite load lease name their files through it.
+pub fn file_token(s: &str) -> String {
+    s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -69,8 +76,7 @@ pub fn run_unique_manifest_name(run_id: &str) -> String {
                 '-'
             }
         })
-        .collect();
-    format!("manifest-{token}.json")
+        .collect()
 }
 
 /// True if `name` (a final path segment) is a [`run_unique_manifest_name`] copy
@@ -621,6 +627,21 @@ impl std::error::Error for ManifestInconsistency {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One sanitizer for every sidecar name: the manifest copy and the load
+    /// lease agree on what a run id / table FQTN becomes on disk.
+    #[test]
+    fn file_token_is_the_one_sidecar_sanitizer() {
+        assert_eq!(
+            file_token("users_2026-09-17T10:00:00+00:00_42"),
+            "users_2026-09-17T10-00-00-00-00_42"
+        );
+        assert_eq!(file_token("p.d.t"), "p.d.t", "dots and dashes survive");
+        assert_eq!(
+            run_unique_manifest_name("a:b"),
+            format!("manifest-{}.json", file_token("a:b"))
+        );
+    }
 
     fn part(id: u32, rows: i64, size: u64) -> ManifestPart {
         ManifestPart {
