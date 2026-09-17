@@ -38,7 +38,12 @@ from .cdc import _mysql, _psql
 from .core import Ledger, have, rivet, run
 from .scenarios import NO_TIMEOUT, work_dir
 
-# Per-invocation names: two gates on one stand must not drop each other's tables.
+# Per-invocation TABLE names, so a concurrent invocation's `DROP TABLE` cannot hit
+# ours. Honest scope: the BigQuery dataset (`rivet_partner_<engine>`), the
+# PostgreSQL slot init derives (`rivet_public_cdc`) and MySQL's `server_id` (4271)
+# are per-STAND singletons — two invocations of this cell on one stand still
+# interfere on those, and a killed invocation leaves its pid-named tables behind.
+# One gate per stand at a time is the contract, as for every other CDC cell here.
 TABLES = [f"orc_ps_{s}_{os.getpid()}" for s in ("a", "b", "c")]
 SEED = 5
 DELTA_LIVE = 7  # 5 seeded + 3 inserted - 1 deleted

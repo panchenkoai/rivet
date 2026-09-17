@@ -322,6 +322,7 @@ exports:
   - name: {{NAME}}
     # ...
     load: { pk: [{{PK}}], partition: none }   # per-export override: pk, cluster_by, partition, cleanup_source, gc_orphans, allow_source_drift
+    # a multiplex `tables:` stream adds `tables: { <table>: { pk: [...], partition: none } }` — one block per captured table
 ```
 
 Required target fields: BigQuery takes `project` and `dataset`. Snowflake takes

@@ -401,7 +401,7 @@ pub(super) fn initial_snapshot_pending(
         let (label, read, snap_dcfg) = &table_dests[idx];
         let mut synth = synth_snapshot_export(export, label, read, snap_dcfg);
         if let Some(recipe) = crate::config::backfill_recipe_for(&recipes, label) {
-            apply_backfill_recipe(&mut synth, recipe, export)?;
+            apply_backfill_recipe(&mut synth, recipe, export, label)?;
         }
         synth.meta_columns.cdc_snapshot_pos = anchor_pos.clone();
         pending.push(synth);
@@ -455,6 +455,7 @@ fn apply_backfill_recipe(
     leg: &mut ExportConfig,
     recipe: &ExportConfig,
     cdc_export: &ExportConfig,
+    label: &str,
 ) -> Result<()> {
     // HOW to read — every field the batch planner consults.
     leg.mode = recipe.mode;
@@ -473,10 +474,13 @@ fn apply_backfill_recipe(
     if recipe.tuning.is_some() {
         leg.tuning = recipe.tuning.clone();
     }
-    // Types: the recipe's, then the CDC export's (a qualified key still wins where
-    // both apply — the conflict above is already refused).
-    let mut columns = recipe.columns.clone();
-    columns.extend(cdc_export.columns.clone());
+    // Types: both sides narrowed by the LABEL to bare keys, because the leg reads
+    // by the catalog spelling and would drop a label-cased qualified key.
+    let mut columns = crate::types::overrides_for_unit(&recipe.columns, Some(label));
+    columns.extend(crate::types::overrides_for_unit(
+        &cdc_export.columns,
+        Some(label),
+    ));
     leg.columns = columns;
     Ok(())
 }
@@ -1088,7 +1092,7 @@ mod tests {
         recipe.tuning = None;
 
         let mut leg = synth_snapshot_export(&stream, "orders", "orders", &dcfg);
-        apply_backfill_recipe(&mut leg, &recipe, &stream).expect("no type conflict");
+        apply_backfill_recipe(&mut leg, &recipe, &stream, "orders").expect("no type conflict");
 
         // HOW to read — borrowed.
         assert_eq!(leg.mode, crate::config::ExportMode::Chunked);
@@ -1142,6 +1146,45 @@ mod tests {
             std::collections::HashMap::from([("orders.price".into(), "decimal(10,2)".into())]);
         refuse_backfill_type_conflict(&agreeing, "orders", &recipe)
             .expect("agreement is not a conflict");
+    }
+
+    /// SQL Server: the stream narrows `columns:` by the configured LABEL, the leg by
+    /// the catalog READ — a label-cased key (`Orders.price`, table `dbo.orders`) was
+    /// typed on the stream and DROPPED on the leg, two schemas into one changelog.
+    #[test]
+    fn backfill_leg_keeps_a_label_cased_column_type_when_the_catalog_read_differs() {
+        let dcfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/tmp/cdc/Orders/snapshot".into()),
+            ..Default::default()
+        };
+        let mut stream = crate::config::sample_export("stand_cdc");
+        stream.mode = crate::config::ExportMode::Cdc;
+        stream.table = None;
+        stream.tables = Some(vec!["Orders".into()]);
+        stream.columns =
+            std::collections::HashMap::from([("Orders.price".into(), "decimal(10,2)".into())]);
+        let mut recipe = crate::config::sample_export("Orders");
+        recipe.table = Some("Orders".into());
+        recipe.tables = None;
+        recipe.cdc = None;
+        recipe.columns = std::collections::HashMap::from([("Orders.qty".into(), "int32".into())]);
+
+        let mut leg = synth_snapshot_export(&stream, "Orders", "dbo.orders", &dcfg);
+        apply_backfill_recipe(&mut leg, &recipe, &stream, "Orders").expect("no type conflict");
+
+        // What the batch planner will keep for a `table: dbo.orders` export.
+        let parsed = crate::plan::build::parse_column_overrides_pub(&leg.columns, &leg.name)
+            .expect("valid types");
+        let kept = crate::types::overrides_for_unit(&parsed, leg.table.as_deref());
+        assert_eq!(
+            kept.get("price"),
+            Some(&crate::types::RivetType::Decimal {
+                precision: 10,
+                scale: 2
+            })
+        );
+        assert_eq!(kept.get("qty"), Some(&crate::types::RivetType::Int32));
     }
 
     #[test]

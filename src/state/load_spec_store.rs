@@ -162,6 +162,37 @@ impl StateStore {
         }))
     }
 
+    /// [`Self::load_spec_of_run`], with the ONE key that may legitimately come from
+    /// outside the run: the key `rivet init` recorded (`key_origin = 'init'`) — a
+    /// `query:` export cannot read a key at run time, so its runs record none and
+    /// the scaffold's declaration is the only one there is. A key another RUN wrote
+    /// into the by-name row is never borrowed: that is the last-writer race the
+    /// per-run spec exists to escape.
+    pub fn load_spec_of_run_with_init_key(
+        &self,
+        export_name: &str,
+        unit: Option<&str>,
+        run_id: &str,
+    ) -> Result<Option<LoadSpec>> {
+        let Some(mut spec) = self.load_spec_of_run(export_name, unit, run_id)? else {
+            return Ok(None);
+        };
+        if spec.primary_key.is_none() {
+            let init_key = self.query_opt(
+                "SELECT primary_key_json FROM export_load_spec
+                 WHERE export_name = ?1 AND unit = ?2 AND key_origin = 'init'",
+                &[export_name.into(), unit.unwrap_or("").into()],
+                |r| r.opt_text(0),
+            )?;
+            if let Some(Some(json)) = init_key {
+                spec.primary_key = Some(serde_json::from_str(&json).with_context(|| {
+                    format!("export '{export_name}': unreadable init-recorded primary key")
+                })?);
+            }
+        }
+        Ok(Some(spec))
+    }
+
     /// Record the source primary key `rivet init` read for an export it scaffolded,
     /// leaving any columns a run recorded in place.
     pub fn record_primary_key(
@@ -341,6 +372,51 @@ mod tests {
                 .unwrap()
                 .primary_key,
             Some(vec!["_id".to_string()])
+        );
+    }
+
+    /// A `query:` export records NO key at run time; the key `rivet init` recorded
+    /// is the only one there is, and the by-name upsert keeps it (`key_origin =
+    /// 'init'`). The per-run row is written verbatim (NULL key), so a load pinned to
+    /// the run must borrow the INIT key — and only that: a key another RUN wrote by
+    /// name is the race the pin escapes, so it is never borrowed.
+    #[test]
+    fn the_run_spec_borrows_an_init_recorded_key_but_never_another_runs() {
+        let s = StateStore::open_in_memory().unwrap();
+        let cols = vec![col("id", RivetType::Int64), col("v", RivetType::Int64)];
+        s.record_primary_key("q", None, &["id".to_string()])
+            .unwrap();
+        s.record_load_spec("q", None, &cols, None, "run_1").unwrap();
+        assert_eq!(
+            s.load_spec_of_run("q", None, "run_1")
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            None,
+            "the run itself recorded none"
+        );
+        let pinned = s
+            .load_spec_of_run_with_init_key("q", None, "run_1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pinned.primary_key,
+            Some(vec!["id".to_string()]),
+            "the init key applies"
+        );
+        assert_eq!(pinned.columns, cols, "the run's columns stay the run's");
+
+        // A keyless run of `t` after another RUN wrote a key by name: NOT borrowed.
+        s.record_load_spec("t", None, &cols, Some(&["_id".to_string()]), "other_run")
+            .unwrap();
+        s.record_load_spec("t", None, &cols, None, "mine").unwrap();
+        assert_eq!(
+            s.load_spec_of_run_with_init_key("t", None, "mine")
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            None,
+            "a run-recorded by-name key is the last-writer race, never borrowed"
         );
     }
 

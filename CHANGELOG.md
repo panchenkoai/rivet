@@ -40,6 +40,11 @@
   stream no longer share one partition column and one key. Names must be captured tables.
 - **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
   it used to abort the whole config on the first `mode: cdc` export.
+- **`rivet doctor` keeps the CDC verdicts it already reached when a later probe fails.** Each
+  engine's health probes appended to one list; a probe that died half-way (MySQL `SHOW BINARY
+  LOGS` with `log_bin = 0`) replaced "log_bin is OFF — enable binary logging" with one generic
+  failure blaming source auth. MySQL now stops before the retention probe when binlog is off,
+  and the probe hint no longer names auth.
 - Fixes: a MySQL CDC checkpoint kept `server_uuid` / `gtid_executed` only until the first
   captured transaction, disarming the wrong-server guard afterwards; `rivet check` graded a
   `mode: cdc` export as a table scan; a MySQL primary key wider than 1024 bytes was silently
@@ -48,7 +53,14 @@
   versa — a bare identity is "table unrecorded", two qualified tables of one engine are still
   two sources; `rivet apply` no longer drops the recorded `pk`; a `<table>__changes` log now
   counts as occupying its warehouse table in duplicate-target detection; a full load onto a
-  table with a different partition is refused BEFORE the rename, not after.
+  table with a different partition is refused BEFORE the rename, not after; on SQL Server a
+  label-cased `columns:` key (`Orders.price` on a `dbo.orders` catalog) typed the CDC stream
+  but not its backfill leg — both are now narrowed by the configured table label; two captured
+  tables sharing a leaf name (`sales.orders`, `archive.orders`) with a typed recipe are refused
+  rather than sharing one table's `columns:`; a MongoDB backfill recipe must name the
+  collection literally (`audit.events` is a name, not a schema); a state DB migrated by a
+  newer rivet is refused by name ("schema v29, newer than this rivet knows") instead of
+  "migration incomplete".
 
 ## 0.26.0 — 2026-09-14
 

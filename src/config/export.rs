@@ -1125,6 +1125,20 @@ pub fn without_backfill_recipes<'a>(
         .collect()
 }
 
+/// Two captured tables that share a LEAF name (`sales.orders`, `archive.orders`)
+/// while a recipe of either declares `columns:` — a `table.column` type key is
+/// narrowed by leaf, so one recipe's types would reach BOTH tables.
+pub fn same_leaf_typed_pair(pairs: &[(String, &ExportConfig)]) -> Option<(String, String)> {
+    for (i, (a, ra)) in pairs.iter().enumerate() {
+        for (b, rb) in pairs.iter().skip(i + 1) {
+            if a != b && bare(a) == bare(b) && !(ra.columns.is_empty() && rb.columns.is_empty()) {
+                return Some((a.clone(), b.clone()));
+            }
+        }
+    }
+    None
+}
+
 /// The recipe [`resolve_backfill`] paired with `table`, if any.
 pub fn backfill_recipe_for<'a>(
     pairs: &[(String, &'a ExportConfig)],

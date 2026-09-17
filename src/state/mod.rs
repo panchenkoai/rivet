@@ -1134,6 +1134,13 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
     );
 
     let final_version = get_current_version(conn);
+    if final_version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "state: this state DB is at schema v{final_version}, newer than this rivet knows \
+             (v{SCHEMA_VERSION}) — a newer rivet migrated it. Upgrade rivet, or point this one \
+             at a state DB it created; a downgrade never rewrites the schema"
+        );
+    }
     if final_version != SCHEMA_VERSION {
         anyhow::bail!(
             "state: migration incomplete — expected schema v{} but reached v{}",
@@ -1212,6 +1219,13 @@ fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("state(pg): read final schema version: {:#}", e))?
         .get(0);
+    if final_version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "state(pg): this state DB is at schema v{final_version}, newer than this rivet knows \
+             (v{SCHEMA_VERSION}) — a newer rivet migrated it. Upgrade rivet, or point this one at \
+             a state DB it created; a downgrade never rewrites the schema"
+        );
+    }
     if final_version != SCHEMA_VERSION {
         anyhow::bail!(
             "state(pg): migration incomplete — expected schema v{} but reached v{}",

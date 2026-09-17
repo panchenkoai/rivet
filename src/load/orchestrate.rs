@@ -225,11 +225,23 @@ fn pin_plan_to_its_run(
     if newest_first.is_empty() {
         return unpinned("no loadable run under its prefix yet");
     }
-    newest_first.sort();
-    newest_first.reverse();
+    // ONE definition of "newer" — the census's instant compare, not a byte compare
+    // that mis-orders mixed RFC3339 precision; ties fall to the run id.
+    newest_first.sort_by(|a, b| {
+        use std::cmp::Ordering;
+        if crate::manifest::census::finished_after(&a.0, &b.0) {
+            Ordering::Less
+        } else if crate::manifest::census::finished_after(&b.0, &a.0) {
+            Ordering::Greater
+        } else {
+            b.1.cmp(&a.1)
+        }
+    });
     let mut pinned: Option<(String, crate::state::LoadSpec)> = None;
     for (_, run_id) in &newest_first {
-        match s.load_spec_of_run(&plan.export_name, plan.unit.as_deref(), run_id) {
+        // With the init-recorded key when the run recorded none (a `query:` export
+        // has no key to read) — never with a key another run wrote by name.
+        match s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), run_id) {
             Ok(Some(spec)) => {
                 pinned = Some((run_id.clone(), spec));
                 break;
@@ -243,7 +255,8 @@ fn pin_plan_to_its_run(
     let Some((run_id, spec)) = pinned else {
         return unpinned(&format!(
             "none of its {} loadable run(s) recorded a per-run spec (runs older than this \
-             release, or baseline legs only)",
+             release, baseline legs only, or a continuous stream — `until_current: false` — \
+             that was stopped rather than finished, which records nothing)",
             newest_first.len()
         ));
     };
@@ -254,8 +267,10 @@ fn pin_plan_to_its_run(
     // by-name spec is exactly what this pin exists to distrust.
     load::plan::retype_plan(cfg, plan, &spec, target).with_context(|| {
         format!(
-            "load [{}]: the config does not fit the columns run {run_id} recorded",
-            plan.table
+            "load [{}]: the config does not fit the columns run {run_id} recorded — if the \
+             config changed after that run (a new `pk:` / `partition.column`), run `rivet run \
+             -e {}` once so a run records the column, then load again",
+            plan.table, plan.export_name
         )
     })
 }
@@ -1139,10 +1154,11 @@ fn full_done_line(integrity: &load::reconcile::LoadIntegrity, report: &load::Loa
 /// `contains("/snapshot/")` false-fired forever on an operator prefix with a
 /// `snapshot` segment and on a multiplex TABLE literally named `snapshot`,
 /// prescribing a destructive truncate every cycle.
-/// Column drift between the LIVE source (the specs resolve from it at load
-/// time) and the STAGED parquet (its manifests record the columns when Form B
-/// is on). Round-10, closing the round-6 find: a column dropped from the
-/// source AFTER the extract is silently never loaded — Snowflake's COPY
+/// Column drift between the SPEC the plan is typed from (the columns the run
+/// `rivet load` pins to recorded in the state DB — never the live source) and
+/// the STAGED parquet (its manifests record the columns when Form B is on).
+/// Round-10, closing the round-6 find: a column an OLDER staged run carries but
+/// the newest run's spec lacks is silently never loaded — Snowflake's COPY
 /// projects only spec columns, so the staged data vanishes with every count
 /// gate green (rows agree; columns were never compared). Detection is
 /// best-effort by construction: manifests without checksums record no column
@@ -1164,10 +1180,10 @@ fn spec_manifest_column_drift(
             if !specs.contains(c.name.as_str()) && seen.insert(c.name.clone()) {
                 notes.push(format!(
                     "  WARNING: staged parquet carries column `{}` (recorded by run {}), \
-                     but the LIVE source no longer has it — the load projects only \
-                     live-source columns, so this column's data will be SILENTLY \
-                     omitted from the warehouse. Re-extract after aligning the schema, \
-                     or add the column back.",
+                     but the spec this load is typed from (the newest run's recorded \
+                     columns) lacks it — the load projects only those columns, so this \
+                     column's data will be SILENTLY omitted from the warehouse. \
+                     Re-extract after aligning the schema, or add the column back.",
                     c.name, m.run_id
                 ));
             }

@@ -180,7 +180,14 @@ The capture fans each table out under `<prefix>/<table>/` (its own
 `<prefix>/<table>/snapshot/`), and `rivet load` follows that layout: **one
 `<table>__changes` + one dedup view per SOURCE table**, each loaded from its own
 sub-prefix only. Each table is keyed on its own recorded primary key; the rest of
-the `load:` block is shared by every table of the stream; `rivet check --target bigquery` prints one resolver document
+the `load:` block is shared by every table of the stream unless the export's
+`load:` carries `tables: { orders: { partition: { column: created_at,
+granularity: day } }, customers: { partition: none } }` — one block per captured
+table, layered over the export's and the top-level `load:`. With
+`cdc: { backfill: auto, … }` in place of `initial: snapshot`, each table's
+baseline is read by the batch export that names it (keyset, chunked, with its
+`columns:`) into the same `<prefix>/<table>/snapshot/`, so the load is unchanged
+(`rivet init --mode cdc` scaffolds that shape on MySQL and PostgreSQL); `rivet check --target bigquery` prints one resolver document
 per table (`Export: cdc/orders`), so you see each table's native schema before
 loading it. Live-verified against BigQuery over a 3-table PostgreSQL stream
 (#252).

@@ -617,7 +617,7 @@ pub fn init(
                         path,
                         provenance,
                         mode_override,
-                        text.contains("backfill: auto")
+                        text.contains("      backfill: auto")
                     )
                 );
             }
@@ -633,7 +633,7 @@ pub fn init(
                         "rivet.yaml",
                         provenance,
                         mode_override,
-                        text.contains("backfill: auto")
+                        text.contains("      backfill: auto")
                     )
                 );
             }

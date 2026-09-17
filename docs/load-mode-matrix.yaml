@@ -108,3 +108,15 @@ scenarios:
     full:        { test: warehouse_cell_smoke_batch_mysql }
     incremental: { test: warehouse_cell_incremental_dedup_mysql }
     cdc:         { test: warehouse_cell_cdc_backfill_snapshot_mysql }
+
+  - id: per_run_spec_pin
+    what: "a load is typed from the spec of the RUN it consumes (export_load_spec_run, state v28), not the by-name row: on a state DB shared by two configs whose exports share a name, the by-name row is last-writer-wins and the other config's run retyped this table between the run and its load (measured: a `_id` key on a PostgreSQL `users`). `pin_plan_to_its_run` runs inside the per-table closure for every mode; a run older than v28 or an unlistable prefix keeps the by-name spec and says so."
+    full:        { test: a_load_is_typed_from_its_own_run_not_from_the_last_writer_of_its_name }
+    incremental: { na: "shared seam: the pin runs in the per-table closure before the mode dispatch; the per-run row itself is pinned by each_run_keeps_its_own_spec_while_the_by_name_row_follows_the_last_writer" }
+    cdc:         { na: "shared seam (same closure); the init-recorded key a run cannot see is borrowed by the_run_spec_borrows_an_init_recorded_key_but_never_another_runs" }
+
+  - id: per_table_load_override
+    what: "a multiplex `tables:` stream's `load:` takes `tables: { <table>: {…} }` — each captured table's block layers over the export's, over the top-level `load:`, so six tables through one stream no longer share one partition column and one key"
+    full:        { na: "a batch export has one table; its per-table block IS the export's `load:`" }
+    incremental: { na: "one table per export, as full" }
+    cdc:         { test: a_multiplex_export_takes_per_table_load_overrides }

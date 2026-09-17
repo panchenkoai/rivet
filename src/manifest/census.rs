@@ -275,7 +275,7 @@ fn unit_index<'a>(m: &'a RunManifest, family: &str) -> Option<&'a str> {
 /// to a lexical compare only if either fails to parse). Parses as an INSTANT — a
 /// lexical byte compare mis-picks on mixed RFC3339 precision (`…00.5Z` sorts
 /// before `…00Z`) — and never panics on a malformed manifest.
-fn finished_after(a: &str, b: &str) -> bool {
+pub(crate) fn finished_after(a: &str, b: &str) -> bool {
     match (
         chrono::DateTime::parse_from_rfc3339(a).ok(),
         chrono::DateTime::parse_from_rfc3339(b).ok(),

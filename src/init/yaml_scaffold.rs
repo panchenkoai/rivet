@@ -67,25 +67,30 @@ pub(super) fn generate_schema_config(
     let consolidate_cdc = mode_override == Some("cdc")
         && infos.len() > 1
         && (st == "mysql" || (st == "postgres" && infos.iter().all(|i| i.schema == "public")));
-    if consolidate_cdc {
+    // A table that cannot be read by `table:` cannot be a recipe, and a stream
+    // whose `backfill: auto` finds no recipe for a captured table is refused at
+    // config load — so such a table is left OUT of the stream, said so, rather
+    // than scaffolding a config `rivet check` rejects. Decided BEFORE the headers:
+    // a schema with no readable table (all CamelCase on PostgreSQL) falls through
+    // to the per-table scaffold instead of a stream over nothing.
+    let (readable, skipped): (Vec<&TableInfo>, Vec<&TableInfo>) = if consolidate_cdc {
+        infos.iter().partition(|i| recipe_readable(i, st))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if consolidate_cdc && !readable.is_empty() {
         lines.push(
             "# One CDC stream over ALL tables (one slot / one server_id) — review before running."
                 .to_string(),
         );
         lines.push(
-            "# The batch exports are the stream's baseline RECIPES (`backfill: auto` pairs each by \
-             table): they say HOW to read a table — keyset / range / full, as a batch export \
-             would — and the stream runs them once, after the anchor, into its own `snapshot/`. \
-             `rivet run` skips them on its own; `rivet run -e <table>` exports one alone."
+            "# The batch exports are the stream's baseline RECIPES (paired by table): they say \
+             HOW to read a table — keyset / range / full, as a batch export would — and the \
+             stream runs them once, after the anchor, into its own `snapshot/`. `rivet run` \
+             skips them on its own; `rivet run -e <table>` exports one alone."
                 .to_string(),
         );
         lines.push("exports:".to_string());
-        // A table that cannot be read by `table:` cannot be a recipe, and a stream
-        // whose `backfill: auto` finds no recipe for a captured table is refused at
-        // config load — so such a table is left OUT of the stream, said so, rather
-        // than scaffolding a config `rivet check` rejects.
-        let (readable, skipped): (Vec<&TableInfo>, Vec<&TableInfo>) =
-            infos.iter().partition(|i| recipe_readable(i, st));
         for info in &skipped {
             lines.push(format!(
                 "  # SKIPPED {}: its name cannot be a `table:` shortcut (letters/digits/_ \
@@ -95,9 +100,6 @@ pub(super) fn generate_schema_config(
                  `initial: snapshot`.",
                 yaml_quote_if_needed(&info.table)
             ));
-        }
-        if readable.is_empty() {
-            return Ok(wrap_comments(&(lines.join("\n") + "\n")));
         }
         for info in &readable {
             lines.extend(export_block_lines(
@@ -1779,6 +1781,48 @@ mod tests {
         let cfg = crate::config::Config::from_yaml(&yaml)
             .expect("the scaffold must be a config rivet accepts");
         assert_eq!(cfg.exports.len(), 3, "two recipes + the stream");
+    }
+
+    /// A `public` schema with NO recipe-readable table (every name CamelCase on
+    /// PostgreSQL — Prisma / EF Core shapes) must not become a stream over nothing
+    /// under a header that promises recipes: it falls through to the per-table
+    /// scaffold, whose epilogue says the baseline is the operator's.
+    #[test]
+    fn whole_db_cdc_with_no_readable_table_falls_back_to_the_per_table_scaffold() {
+        let mk = |table: &str| TableInfo {
+            density: None,
+            schema: "public".into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![ColumnInfo {
+                is_primary_key: true,
+                ..col("id", "bigint")
+            }],
+        };
+        let yaml = generate_schema_config(
+            &[mk("Orders"), mk("Items")],
+            "postgresql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            "PostgreSQL schema \"public\"",
+            &InitYamlDestination::default(),
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !yaml.contains("backfill: auto"),
+            "no recipe can exist, so no baseline claim:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("tables: ["),
+            "no consolidated stream over nothing:\n{yaml}"
+        );
+        assert_eq!(
+            yaml.matches("mode: cdc").count(),
+            2,
+            "one per-table cdc export each:\n{yaml}"
+        );
     }
 
     #[test]

@@ -116,3 +116,10 @@ scenarios:
     chunked:     { na: "chunked has no keyset_incremental variant; its anchor is per-chunk-task state cleared at finalize" }
     keyset:      { test: keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest }
     cdc:         { na: "no keyset anchor" }
+
+  - id: cdc_anchor_before_backfill_baseline
+    what: "under `cdc.backfill:` the anchor (slot / checkpoint pin) is taken BEFORE the recipe reads the baseline, so the baseline overlaps the stream (duplicates, which at-least-once dedups) instead of leaving a gap between snapshot and anchor; the next run captures ONLY the delta, judged by the source's own COUNT/SUM, not rivet's summary"
+    incremental: { na: "no anchor step" }
+    chunked:     { na: "no anchor step" }
+    keyset:      { na: "no anchor step" }
+    cdc:         { test: a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run }

@@ -1636,6 +1636,18 @@ impl Config {
                     }
                 }
             }
+            // A `table.column` type key is narrowed by LEAF, so two captured tables
+            // with one leaf cannot be typed apart: a recipe's `columns:` on either
+            // would type both. Refuse rather than let the later recipe win silently.
+            if let Some((a, b)) = export::same_leaf_typed_pair(&pairs) {
+                anyhow::bail!(
+                    "export '{}': captured tables '{a}' and '{b}' share the leaf name and a \
+                     recipe declares `columns:` — per-table column types are keyed \
+                     `table.column` by the bare name, so one declaration would type both. \
+                     Capture them in two `mode: cdc` exports, or drop the recipe's `columns:`.",
+                    export.name
+                );
+            }
         }
 
         // MongoDB change streams and the MySQL binlog have NO server-side resume
@@ -2140,6 +2152,35 @@ mod reserved_load_extension {
             .to_string();
         assert!(
             err.contains("collection name is literal") && err.contains("audit.events"),
+            "{err}"
+        );
+    }
+
+    /// Two captured tables with one LEAF (`sales.orders`, `archive.orders`) route
+    /// fine, but a `table.column` type key is narrowed by leaf — so a recipe's
+    /// `columns:` on either would type both. Refused only when a recipe declares
+    /// types; two untyped recipes are still one stream.
+    #[test]
+    fn two_captured_tables_with_one_leaf_cannot_carry_recipe_column_types() {
+        let cfg = |sales_cols: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                 \x20 - name: sales\n    table: sales.orders\n    mode: full\n    format: parquet\n{sales_cols}    \
+                 destination: {{ type: gcs, bucket: b, prefix: sales/ }}\n\
+                 \x20 - name: archive\n    table: archive.orders\n    mode: full\n    format: parquet\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: archive/ }}\n\
+                 \x20 - name: stream\n    tables: [sales.orders, archive.orders]\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ backfill: auto }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("")).expect("untyped recipes over two same-leaf tables pair fine");
+        let err = Config::from_yaml(&cfg("    columns: { amount: decimal(18,2) }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("share the leaf name")
+                && err.contains("sales.orders")
+                && err.contains("archive.orders"),
             "{err}"
         );
     }

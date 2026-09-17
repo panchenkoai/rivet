@@ -258,7 +258,10 @@ config shape — see [mongodb.md](mongodb.md)):
   engine — **one** `tables:` export on MySQL (and on PostgreSQL when every table
   is in the `public` schema; mixed schemas fall back to per-table exports),
   **one export per table** (distinct `capture_instance`) on SQL Server — so you
-  never hand-list tables.
+  never hand-list tables. Over two or more tables on MySQL/PostgreSQL the stream
+  gets `backfill: auto` and one batch recipe per table (the baseline read), and
+  its `load:` may carry `tables: { <table>: { pk, partition, cluster_by, … } }`
+  so each captured table has its own warehouse shape.
 - `rivet run -c <config>` drains the whole set; add `--parallel-export-processes`
   to run SQL Server's per-table exports concurrently.
 - `rivet validate -c <config>` descends into every table's prefix **and** its

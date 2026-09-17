@@ -60,7 +60,23 @@ config_fields:
       OTHER whole-config entry point (`rivet apply`), from `validate` (a
       backfilled baseline went unverified and was reported as stray), and from
       the reserved-`snapshot` name guard; each is pinned below.
+      Per engine: the anchor → baseline → load → delta → load cycle runs live on
+      all four (`full_cdc_cycle_*`, BigQuery as the second reader) and the
+      init-scaffolded three-table stream on MySQL and PostgreSQL
+      (`partner_shape_three_tables_one_stream_*`) — the two engines where init
+      consolidates into one stream; SQL Server and MongoDB keep one export per
+      table, so the multi-table shape has no live cell there. A Mongo recipe must
+      name the collection literally (a dot is not a qualifier there), and on SQL
+      Server the leg's `columns:` are narrowed by the configured LABEL before the
+      catalog spelling is read, or a label-cased key typed the stream and not the
+      leg.
     also: resolve_backfill_pairs_tables_with_their_recipe_exports,
+      full_cdc_cycle_mysql, full_cdc_cycle_postgres, full_cdc_cycle_mssql,
+      full_cdc_cycle_mongo, partner_shape_three_tables_one_stream_mysql,
+      partner_shape_three_tables_one_stream_postgres,
+      a_mongo_backfill_recipe_must_name_the_collection_exactly,
+      backfill_leg_keeps_a_label_cased_column_type_when_the_catalog_read_differs,
+      two_captured_tables_with_one_leaf_cannot_carry_recipe_column_types,
       resolve_backfill_refuses_every_pairing_that_would_look_like_success,
       a_table_named_snapshot_is_refused_under_backfill_as_under_initial,
       a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named,
