@@ -117,6 +117,9 @@
   the production source's own traffic (45 in 42 s, 995 in 17 min), while ten keyset pages on a
   quiet stand log none (`mysql_keyset_pages_create_no_tmp_disk_tables`). The solo line no
   longer says "the source spilled to disk" as if the export did it.
+- **A recipe and its stream typing one column apart is refused at config load.** The check
+  ran on every `rivet run`, after the anchor; it is a pure config decision and now fails
+  `rivet validate` / `check` / `run` when the config is read, with the same message.
 - **`rivet doctor` keeps the CDC verdicts it already reached when a later probe fails.** Each
   engine's health probes appended to one list; a probe that died half-way (MySQL `SHOW BINARY
   LOGS` with `log_bin = 0`) replaced "log_bin is OFF — enable binary logging" with one generic
