@@ -47,10 +47,13 @@ exports:
 load: { target: bigquery, project: my-proj, dataset: my_ds, pk: auto }
 ```
 
-- `rivet init --source-env SOURCE_URL --mode cdc` scaffolds exactly this shape
-  for every table it discovers (MySQL, PostgreSQL `public`): one recipe per table
-  — keyset where the table has a single-column key, range or `full` otherwise —
-  and one `tables:` stream with `backfill: auto`. Add the `load:` block and run.
+- `rivet init --source-env SOURCE_URL --mode cdc` over two or more tables (MySQL,
+  PostgreSQL `public`) scaffolds exactly this shape: one recipe per table — keyset
+  where the table has a single-column keysettable key, range or `full` otherwise —
+  and one `tables:` stream with `backfill: auto`. A single table, SQL Server,
+  MongoDB or a non-`public` schema get a per-table capture-only stream instead
+  (add `initial: snapshot` or a recipe + `backfill:` yourself). Add the `load:`
+  block and run.
 - A stream over several tables rarely shares one partition column or one key.
   Put the per-table layer on the stream's own `load:` block:
   `load: { partition: { column: created_at, granularity: day }, tables: { customers:
@@ -73,9 +76,10 @@ rivet doctor --config cfg.yaml     # binlog/slot/Agent/replica-set readiness, pe
 rivet plan   --config cfg.yaml     # plans the batch exports; skips the stream and the recipe, saying so
 ```
 
-Expect: no DEGRADED/UNSAFE on the CDC export; every doctor line green; `plan`
-exits 0 on a mixed config (a CDC export has no batch plan — it is skipped, not
-a reason to abort the whole command).
+Expect: no DEGRADED/UNSAFE on the CDC export; every doctor line green. `plan`
+skips the stream and the recipe, saying so — on the §1 config that leaves nothing
+to plan and it stops with "nothing to plan" (expected, not a failure of the
+config); with a plain batch export alongside it plans that one and exits 0.
 
 ## 3. Run 1 — anchor, then baseline — then load 1
 

@@ -1613,9 +1613,29 @@ impl Config {
         // (The checkpoint requirement is `baseline_checkpoint_refusal`, above.)
         if let Some(cdc) = &export.cdc
             && cdc.backfill.is_some()
-            && let Err(why) = export::resolve_backfill(export, &self.exports)
         {
-            anyhow::bail!(why);
+            let pairs = export::resolve_backfill(export, &self.exports)
+                .map_err(|why| anyhow::anyhow!(why))?;
+            // A document store has no schema qualifier: `audit.events` is a
+            // collection, not `events` in schema `audit`. The bare-name fold that
+            // pairs `orders` with `public.orders` on SQL would pair two DIFFERENT
+            // collections here — and turn the other one's export into a recipe the
+            // run loop stops running.
+            if !self.source.source_type.is_sql() {
+                for (captured, recipe) in &pairs {
+                    if recipe.table.as_deref() != Some(captured.as_str()) {
+                        anyhow::bail!(
+                            "export '{}': `cdc.backfill` paired collection '{captured}' with export \
+                             '{}', which reads '{}' — a MongoDB collection name is literal (a dot \
+                             is part of the name, not a schema), so the recipe must read exactly \
+                             `table: {captured}`",
+                            export.name,
+                            recipe.name,
+                            recipe.table.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+            }
         }
 
         // MongoDB change streams and the MySQL binlog have NO server-side resume
@@ -2096,6 +2116,32 @@ mod reserved_load_extension {
         );
         let err = Config::from_yaml(&single).unwrap_err().to_string();
         assert!(err.contains("has one unit"), "{err}");
+    }
+
+    /// On MongoDB a dotted collection name is LITERAL — `audit.events` is not
+    /// `events` in a schema — so the SQL bare-name fold must not pair a captured
+    /// `events` with an export reading `audit.events` (that export would silently
+    /// become a recipe and stop running). Exact names still pair.
+    #[test]
+    fn a_mongo_backfill_recipe_must_name_the_collection_exactly() {
+        let cfg = |recipe_table: &str| {
+            format!(
+                "source:\n  type: mongo\n  url: \"mongodb://localhost/app\"\nexports:\n\
+                 \x20 - name: base\n    table: {recipe_table}\n    mode: full\n    format: parquet\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: base/ }}\n\
+                 \x20 - name: stream\n    table: events\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ backfill: auto, checkpoint: ./c.ckpt }}\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("events")).expect("the exact collection pairs");
+        let err = Config::from_yaml(&cfg("audit.events"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("collection name is literal") && err.contains("audit.events"),
+            "{err}"
+        );
     }
 }
 

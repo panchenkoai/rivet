@@ -413,6 +413,22 @@ pub fn run(
     // concrete child export per bucket *before* the run loop. Non-partitioned
     // exports pass through. The owned vec must outlive the borrowed `exports`
     // view rebuilt over it, so it is declared in the enclosing scope.
+    // An export named as some CDC export's `backfill:` is that stream's BASELINE
+    // leg, and the CDC export pulls it (anchor first, then the read). Running it
+    // again from this loop would read the whole table a SECOND time in one
+    // invocation — twice the source pressure, for a prefix nothing consumes.
+    //
+    // Only when the whole config runs: `rivet run -e orders` names it explicitly,
+    // and an operator asking for an export by name gets it. BEFORE the partition
+    // expansion below: a `partition_by` recipe's children are named
+    // `<recipe>__<value>` and would slip past a filter on the recipe's name.
+    let selected: Vec<&ExportConfig> = if export_name.is_none() {
+        let recipes = backfill_recipes_to_skip(&config.exports);
+        crate::config::without_backfill_recipes(selected, &recipes)
+    } else {
+        selected
+    };
+
     let partitioned = partition_expand::any_partitioned(&selected);
     let expanded_owned: Vec<ExportConfig>;
     let exports: Vec<&ExportConfig> = if partitioned {
@@ -425,20 +441,6 @@ pub fn run(
         expanded_owned.iter().collect()
     } else {
         selected
-    };
-
-    // An export named as some CDC export's `backfill:` is that stream's BASELINE
-    // leg, and the CDC export pulls it (anchor first, then the read). Running it
-    // again from this loop would read the whole table a SECOND time in one
-    // invocation — twice the source pressure, for a prefix nothing consumes.
-    //
-    // Only when the whole config runs: `rivet run -e orders` names it explicitly,
-    // and an operator asking for an export by name gets it.
-    let exports: Vec<&ExportConfig> = if export_name.is_none() {
-        let recipes = backfill_recipes_to_skip(&config.exports);
-        crate::config::without_backfill_recipes(exports, &recipes)
-    } else {
-        exports
     };
 
     let opts = RunOptions {

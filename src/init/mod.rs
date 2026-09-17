@@ -611,7 +611,15 @@ pub fn init(
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block(path, provenance, mode_override));
+                eprint!(
+                    "{}",
+                    next_steps_block(
+                        path,
+                        provenance,
+                        mode_override,
+                        text.contains("backfill: auto")
+                    )
+                );
             }
         }
         None => {
@@ -621,7 +629,12 @@ pub fn init(
             if matches!(format, InitFormat::Yaml) {
                 eprint!(
                     "{}",
-                    next_steps_block("rivet.yaml", provenance, mode_override)
+                    next_steps_block(
+                        "rivet.yaml",
+                        provenance,
+                        mode_override,
+                        text.contains("backfill: auto")
+                    )
                 );
             }
         }
@@ -634,7 +647,15 @@ pub fn init(
 /// inline `--source` URL it leads with a step-0 export reminder, because the
 /// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
 /// literal URL) and would otherwise fail on an unset variable.
-fn next_steps_block(path: &str, provenance: &SourceProvenance, mode: Option<&str>) -> String {
+/// `has_backfill` is read off the scaffold itself (`backfill: auto` present): only the
+/// consolidated multi-table shape carries a baseline; the per-table CDC scaffold
+/// (SQL Server, MongoDB, a non-`public` schema, a single table) captures changes only.
+fn next_steps_block(
+    path: &str,
+    provenance: &SourceProvenance,
+    mode: Option<&str>,
+    has_backfill: bool,
+) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
         s.push_str(
@@ -648,10 +669,17 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance, mode: Option<&str
     ));
     // A CDC scaffold has no batch plan: `rivet plan` skips every export in it and
     // stops with "nothing to plan". Its schedule is the run itself.
-    if mode == Some("cdc") {
+    if mode == Some("cdc") && has_backfill {
         s.push_str(&format!(
             "\nThe first run anchors the stream and reads every table's baseline through its \
              recipe; each later run captures only the changes since. Put it on a schedule:\n  \
+             rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
+        ));
+    } else if mode == Some("cdc") {
+        s.push_str(&format!(
+            "\nThis stream captures CHANGES ONLY from its anchor on — the baseline is yours: add \
+             `cdc.initial: snapshot`, or a batch export of the table plus `cdc.backfill: auto`. \
+             Then put it on a schedule:\n  \
              rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
         ));
     } else {
@@ -1250,6 +1278,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
+            true,
         );
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1257,9 +1286,23 @@ mod tests {
             "a cdc config has no batch plan to seal; block:\n{s}"
         );
         assert!(
-            s.contains("rivet run   -c rivet.yaml") && s.contains("anchors the stream"),
+            s.contains("rivet run   -c rivet.yaml") && s.contains("through its recipe"),
             "block:\n{s}"
         );
+        // The per-table scaffold (SQL Server, Mongo, a single table) has NO baseline:
+        // promising one "through its recipe" would send the operator to capture
+        // changes over history nobody loaded.
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+        );
+        assert!(
+            s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
+            "a capture-only scaffold must say so; block:\n{s}"
+        );
+        assert!(s.contains("cdc.backfill: auto") && s.contains("cdc.initial: snapshot"));
     }
 
     #[test]
@@ -1268,6 +1311,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             None,
+            false,
         );
         // The core three-step path is always present.
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");

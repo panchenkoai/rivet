@@ -1440,6 +1440,15 @@ load:
             vec!["id", "line_no"],
             "the table's own key over the top-level one"
         );
+        assert!(
+            matches!(&by_table("line_items").clustering, Clustering::Written(c) if c.is_empty()),
+            "the table's `cluster_by: none` is a WRITTEN empty clustering: {:?}",
+            by_table("line_items").clustering
+        );
+        assert!(
+            matches!(&by_table("orders").clustering, Clustering::Auto(_)),
+            "a table without its own block inherits the default `cluster_by: auto`"
+        );
     }
 
     /// The multiplex sub-prefix rule itself: the table becomes ONE path segment

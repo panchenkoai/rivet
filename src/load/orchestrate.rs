@@ -81,12 +81,14 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     let mut failures: Vec<anyhow::Error> = Vec::new();
     let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
     for plan in &plans {
-        // Typed from the spec of the run this load consumes, not the by-name row.
-        let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg);
-        let plan = &pinned;
         let load_id = format!("{run_id}:{}", plan.table);
         let drift = plan.load.allow_source_drift;
         let outcome = (|| -> Result<()> {
+            // Typed from the spec of the run this load consumes, not the by-name
+            // row. Inside the per-table closure: a spec the config does not fit is
+            // THIS table's failure, and the others still load.
+            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg)?;
+            let plan = &pinned;
             match plan.mode {
                 // CDC: APPEND the change log + rebuild the current-state dedup view.
                 load::plan::LoadMode::Cdc => {
@@ -194,60 +196,68 @@ fn pin_plan_to_its_run(
     plan: &load::plan::LoadPlan,
     state: Option<&StateStore>,
     cfg: &crate::config::Config,
-) -> load::plan::LoadPlan {
-    let Some(s) = state else {
-        return plan.clone();
+) -> Result<load::plan::LoadPlan> {
+    let unpinned = |why: &str| {
+        eprintln!(
+            "  load [{}]: typed from the by-name load spec — {why}",
+            plan.table
+        );
+        Ok(plan.clone())
     };
-    let newest = load::open_store(&plan.destination)
+    let Some(s) = state else {
+        return unpinned("no state DB, so no per-run spec to pin to");
+    };
+    // Newest first. The listing under `<table>/` also holds the baseline LEGS'
+    // manifests (`snapshot/`, their own run ids, no spec of their own — a leg is a
+    // read recipe), so "the newest run" is "the newest run that RECORDED a spec".
+    let runs = match load::open_store(&plan.destination)
         .and_then(|store| load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix))
         .and_then(|keyed| {
             load::reconcile::select_runs(keyed, &std::collections::HashSet::new(), plan.mode)
-        })
-        .map(|runs| {
-            runs.into_iter()
-                .map(|(_, m)| (m.finished_at.clone(), m.run_id))
-                .max()
-                .map(|(_, run_id)| run_id)
-        });
-    let run_id = match newest {
-        Ok(Some(r)) => r,
-        Ok(None) => return plan.clone(),
-        Err(e) => {
-            eprintln!(
-                "  load [{}]: typed from the by-name load spec — could not list its runs to \
-                 pin the plan ({e:#})",
-                plan.table
-            );
-            return plan.clone();
-        }
+        }) {
+        Ok(runs) => runs,
+        Err(e) => return unpinned(&format!("could not list its runs ({e:#})")),
     };
-    let spec = match s.load_spec_of_run(&plan.export_name, plan.unit.as_deref(), &run_id) {
-        Ok(Some(spec)) => spec,
-        Ok(None) => return plan.clone(), // a run older than the per-run table
-        Err(e) => {
-            eprintln!(
-                "  load [{}]: typed from the by-name load spec — run {run_id}'s own spec is \
-                 unreadable ({e:#})",
-                plan.table
-            );
-            return plan.clone();
-        }
-    };
-    let target = match crate::types::target::ExportTarget::parse(plan.load.target.name()) {
-        Some(t) => t,
-        None => return plan.clone(),
-    };
-    match load::plan::retype_plan(cfg, plan, &spec, target) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "  load [{}]: typed from the by-name load spec — retyping from run {run_id} \
-                 failed ({e:#})",
-                plan.table
-            );
-            plan.clone()
+    let mut newest_first: Vec<(String, String)> = runs
+        .into_iter()
+        .map(|(_, m)| (m.finished_at.clone(), m.run_id))
+        .collect();
+    if newest_first.is_empty() {
+        return unpinned("no loadable run under its prefix yet");
+    }
+    newest_first.sort();
+    newest_first.reverse();
+    let mut pinned: Option<(String, crate::state::LoadSpec)> = None;
+    for (_, run_id) in &newest_first {
+        match s.load_spec_of_run(&plan.export_name, plan.unit.as_deref(), run_id) {
+            Ok(Some(spec)) => {
+                pinned = Some((run_id.clone(), spec));
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                return unpinned(&format!("run {run_id}'s own spec is unreadable ({e:#})"));
+            }
         }
     }
+    let Some((run_id, spec)) = pinned else {
+        return unpinned(&format!(
+            "none of its {} loadable run(s) recorded a per-run spec (runs older than this \
+             release, or baseline legs only)",
+            newest_first.len()
+        ));
+    };
+    let Some(target) = crate::types::target::ExportTarget::parse(plan.load.target.name()) else {
+        return unpinned("unknown load target");
+    };
+    // A readable spec the config does not fit is a REFUSAL, not a fallback: the
+    // by-name spec is exactly what this pin exists to distrust.
+    load::plan::retype_plan(cfg, plan, &spec, target).with_context(|| {
+        format!(
+            "load [{}]: the config does not fit the columns run {run_id} recorded",
+            plan.table
+        )
+    })
 }
 
 /// Does this invocation have to resolve the source's `__pos` parse ENGINE?

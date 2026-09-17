@@ -578,14 +578,20 @@ exclude_re = [
     #
     # BigQuery drift glue: `existing_shape` is a tables.get over REST; the verdict
     # is `classify_drift` (bigquery/shape.rs, unit-tested in bigquery/tests.rs).
-    # Live: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild.
+    # Live: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild
+    # (changelog_drift) and bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step
+    # (adoption_drift — the refusal of a full load onto a differently partitioned table).
     "replace BigQueryLoader::drift_of -> Result<Option<super::ChangelogDrift>>",
     "replace <impl super::ShapeControl for BigQueryLoader>::changelog_drift -> Result<Option<super::ChangelogDrift>>",
     "replace <impl super::ShapeControl for BigQueryLoader>::adoption_drift -> Result<Option<super::ChangelogDrift>>",
     # The CDC job's two source-bound bodies: the baseline pairing (opens the source
     # to type-check each recipe) and the drain itself. Live: full_cdc_cycle_{mysql,
-    # postgres,mssql,mongo} — a stubbed baseline leaves the warehouse short of the
-    # seed, a stubbed drain captures nothing.
+    # mssql,mongo} — a stubbed baseline leaves the warehouse short of the seed, a
+    # stubbed drain captures nothing. NOT the postgres variant for the baseline stub:
+    # `CdcScenario::pg_with` creates the slot BEFORE the seed, so the stream carries
+    # the seed rows and the warehouse is whole without any baseline — green, not
+    # evidence. partner_shape_three_tables_one_stream_postgres (slot created by the
+    # product at run 1, after the seed) is the PG oracle.
     "replace initial_snapshot_pending -> Result<Vec<ExportConfig>>",
     "replace run_cdc_inner -> \\(Vec<crate::manifest::RunManifest>, Result<\\(\\)>\\)",
     # `capture_load_units` connects to the source to type the load spec. Live:
@@ -603,8 +609,13 @@ exclude_re = [
     "delete match arm Some\\(EventData::RowsEvent\\(re\\)\\) in MysqlChangeStream::fill",
     # `pin_plan_to_its_run` (load/orchestrate.rs) lists a real store's manifests
     # and reads the state DB; the decision it feeds — rebuilding the plan from one
-    # run's spec — is `retype_plan` (unit-tested). Stubbed to `plan.clone()` it
-    # is the pre-fix behaviour, which the release gate's parallel engine matrix
-    # grades LIVE (a PostgreSQL `users` typed with Mongo's `_id` key).
-    "replace pin_plan_to_its_run -> load::plan::LoadPlan",
+    # run's spec — is `retype_plan` (unit-tested). Stubbed to `Ok(plan.clone())` it
+    # is the pre-fix behaviour. Live:
+    # a_load_is_typed_from_its_own_run_not_from_the_last_writer_of_its_name
+    # (two `users` exports on one Postgres state). MEASURED under the stub
+    # (2026-09-17): the mysql load SUCCEEDS and BigQuery's catalog shows the
+    # postgres export's columns `["_id", "w"]` on the mysql table — a silent wrong
+    # DDL, not a refusal; the test reads INFORMATION_SCHEMA, never rivet's exit.
+    # The release gate's parallel engine matrix races exactly that.
+    "replace pin_plan_to_its_run -> Result<load::plan::LoadPlan>",
 ]

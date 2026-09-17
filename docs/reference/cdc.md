@@ -118,8 +118,8 @@ then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
 ```
 
 **`cdc.backfill:` — the baseline by reference, for tables that disagree.**
-`initial: snapshot` synthesizes ONE read for the whole stream: a single-connection
-`mode: full` scan per table. That is right for a small table and wrong for a large
+`initial: snapshot` synthesizes one single-connection `mode: full` scan per
+captured table. That is right for a small table and wrong for a large
 one — a 313M-row table read end to end on one statement runs into
 `tuning.statement_timeout_s` (300s under the `balanced` profile) long before it
 finishes, while the same table as a batch export, keyset-paged with `parallel: 4`,
@@ -170,7 +170,8 @@ and one column cannot have two types.
 
 The run loop skips an export that is named as a backfill recipe, so a full
 `rivet run` reads each table once — `rivet run -e orders` still exports it on its
-own. `--resume` continues an interrupted baseline from its chunk checkpoints and
+own. An interrupted baseline resumes on the next plain `rivet run` from its chunk
+checkpoints (range and keyset legs alike — no `--resume`, no synthesized name) and
 leaves the anchor alone; once a table's baseline is recorded (per table, in the
 state DB), later runs go straight to the drain. `cdc.initial:` and `cdc.backfill:`
 both describe the first run's baseline, so config load refuses the pair.

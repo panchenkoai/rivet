@@ -1071,10 +1071,12 @@ pub fn effective_columns(
     let mut merged = std::collections::HashMap::new();
     for (table, recipe) in resolve_backfill(export, all).unwrap_or_default() {
         for (k, v) in &recipe.columns {
+            // BARE table: `overrides_for_unit` narrows a `table.column` key by its
+            // first dot, so `dbo.orders.price` would never reach unit `dbo.orders`.
             let key = if k.contains('.') {
                 k.clone()
             } else {
-                format!("{table}.{k}")
+                format!("{}.{k}", bare(&table))
             };
             merged.insert(key, v.clone());
         }
@@ -1915,6 +1917,32 @@ mod tests {
                 .expect("a bare name pairs with its qualified spelling")
                 .len(),
             1
+        );
+    }
+
+    /// A schema-qualified capture (`dbo.orders` — what init writes on SQL Server
+    /// and for a non-`public` PostgreSQL schema) must qualify the recipe's bare
+    /// key by the BARE table name: the consumer, `types::overrides_for_unit`,
+    /// narrows by `split_once('.')` on a `table.column` key, so `dbo.orders.price`
+    /// splits as (`dbo`, `orders.price`) and never applies — the baseline leg
+    /// (which gets the bare key) is typed by the recipe while the stream and the
+    /// recorded spec are not: two types in one `__changes`. The oracle is the
+    /// consumer's answer, not the map's key shape.
+    #[test]
+    fn effective_columns_reach_the_stream_for_a_schema_qualified_capture() {
+        use std::collections::HashMap;
+        let mut orders = recipe("orders", "dbo.orders");
+        orders.columns = HashMap::from([("price".to_string(), "decimal(12,4)".to_string())]);
+        let auto = stream(&["dbo.orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![orders, auto.clone()];
+
+        let merged = effective_columns(&auto, &all);
+        let parsed = crate::plan::build::parse_column_overrides_pub(&merged, &auto.name).unwrap();
+        let for_stream = crate::types::overrides_for_unit(&parsed, Some("dbo.orders"));
+        assert!(
+            for_stream.contains_key("price"),
+            "the recipe's type must reach the stream's unit `dbo.orders`; merged keys: {:?}",
+            merged.keys().collect::<Vec<_>>()
         );
     }
 

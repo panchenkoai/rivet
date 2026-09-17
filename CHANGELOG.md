@@ -11,17 +11,20 @@
   recipe are refused at config load); `[names]` pairs explicitly. A recipe is a READ recipe,
   never a second load target: whole-config `rivet run` / `apply` / `plan` skip it at `warn`
   (`rivet run -e <recipe>` still exports it alone), `rivet load` never types it, and a column
-  the recipe and the stream type differently is refused before an anchor exists — on every
-  run, not only the first. An `incremental` / `time_window` recipe reads a slice and is
-  refused. A crashed range-chunked baseline leg resumes on the next plain run. MySQL needs
+  the recipe and the stream type differently is refused at the start of every run, before
+  that run's anchor step (not at config load). An `incremental` / `time_window` recipe reads
+  a slice and is refused. A crashed chunked baseline leg (range or keyset) resumes on the
+  next plain run. MySQL needs
   `cdc.checkpoint:` for any baseline (the file is the anchor); PostgreSQL does not (the slot
   is). The step-by-step operator cycle — anchor → backfill → load → delta → load, with the
   interruption points — is `docs/cdc-full-cycle.md`.
 - **`rivet init --mode cdc` over several tables scaffolds that shape**: one batch recipe per
-  table (keyset where the table has a single-column key, range or `full` otherwise, always in
-  the `table:` form) and one `tables:` stream with `backfill: auto`, on MySQL and
-  PostgreSQL `public`. Its next-steps epilogue ends in `rivet run`, not `rivet plan` (a CDC
-  config has no batch plan to seal).
+  table (keyset where the table has a single-column keysettable key, range or `full`
+  otherwise, always in the `table:` form — a name that cannot be a `table:` shortcut is left
+  out of the stream and said so) and one `tables:` stream with `backfill: auto`, on MySQL and
+  PostgreSQL `public` over two or more tables. Its next-steps epilogue ends in `rivet run`,
+  not `rivet plan` (a CDC config has no batch plan to seal), and a per-table capture-only
+  scaffold (SQL Server, MongoDB, a single table) says the baseline is yours.
 - **A load is typed from the spec of the run it consumes.** `rivet run` now records each
   run's columns and key under its run id as well as under the export name; `rivet load` pins
   every table's plan to the newest loadable run under its own prefix and rebuilds the DDL and

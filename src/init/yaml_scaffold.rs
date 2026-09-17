@@ -80,7 +80,26 @@ pub(super) fn generate_schema_config(
                 .to_string(),
         );
         lines.push("exports:".to_string());
-        for info in infos {
+        // A table that cannot be read by `table:` cannot be a recipe, and a stream
+        // whose `backfill: auto` finds no recipe for a captured table is refused at
+        // config load — so such a table is left OUT of the stream, said so, rather
+        // than scaffolding a config `rivet check` rejects.
+        let (readable, skipped): (Vec<&TableInfo>, Vec<&TableInfo>) =
+            infos.iter().partition(|i| recipe_readable(i, st));
+        for info in &skipped {
+            lines.push(format!(
+                "  # SKIPPED {}: its name cannot be a `table:` shortcut (letters/digits/_ \
+                 segments, its own case-fold on PostgreSQL), so it cannot be a backfill \
+                 recipe and is not in the stream — export it with `query:` in its own \
+                 batch export, or capture it in a second `mode: cdc` export with \
+                 `initial: snapshot`.",
+                yaml_quote_if_needed(&info.table)
+            ));
+        }
+        if readable.is_empty() {
+            return Ok(wrap_comments(&(lines.join("\n") + "\n")));
+        }
+        for info in &readable {
             lines.extend(export_block_lines(
                 info,
                 st,
@@ -89,7 +108,8 @@ pub(super) fn generate_schema_config(
                 true,
             ));
         }
-        lines.extend(cdc_multiplex_export_lines(infos, st, dest));
+        let readable: Vec<TableInfo> = readable.into_iter().cloned().collect();
+        lines.extend(cdc_multiplex_export_lines(&readable, st, dest));
         return Ok(wrap_comments(&(lines.join("\n") + "\n")));
     }
 
@@ -473,6 +493,30 @@ fn init_default_decimal_yaml_line(col_name: &str) -> String {
     )
 }
 
+/// Whether `qualified` can be a `table:` shortcut at all — the same shape the
+/// config gate (`validate_table_shortcut_ident`) admits: at most two segments of
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+fn table_shortcut_shape_ok(qualified: &str) -> bool {
+    let parts: Vec<&str> = qualified.split('.').collect();
+    parts.len() <= 2
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// Can this table be a backfill RECIPE — read by `table:` on `source_type`?
+/// A name the shortcut gate refuses (a hyphen, a leading digit) cannot, and a
+/// PostgreSQL name that is not its own case-fold would address a DIFFERENT
+/// relation when a lowercase twin exists.
+fn recipe_readable(info: &TableInfo, source_type: &str) -> bool {
+    let name = &info.table;
+    table_shortcut_shape_ok(name) && (source_type != "postgres" || is_simple_pg_ident(name))
+}
+
 /// The read strategy a table's backfill RECIPE gets: paged when it can be, `full` otherwise.
 fn recipe_mode(info: &TableInfo) -> &'static str {
     if info.keysettable_pk_column().is_some() || info.best_chunk_column().is_some() {
@@ -544,17 +588,7 @@ fn export_block_lines(
     // diverging from the config gate's produced DOA scaffolds twice — a
     // >2-segment name the scaffold accepted and the validator refused, and a
     // hyphenated Mongo collection whose two refusals pointed at each other.
-    let shortcut_shape_ok = {
-        let parts: Vec<&str> = qualified_table.split('.').collect();
-        parts.len() <= 2
-            && parts.iter().all(|p| {
-                !p.is_empty()
-                    && p.chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-    };
+    let shortcut_shape_ok = table_shortcut_shape_ok(&qualified_table);
     let table_form_safe = match source_type {
         "postgres" => shortcut_shape_ok && is_simple_pg_ident(&qualified_table),
         // Mongo has ONLY the table: form — a name the gate cannot pass is
@@ -1704,6 +1738,47 @@ mod tests {
             recipe("audit").table.is_some() && recipe("audit").query.is_none(),
             "a recipe reads by `table:`, never `query:`:\n{yaml}"
         );
+    }
+
+    /// A table whose name cannot be a `table:` shortcut (a hyphen here) cannot be
+    /// a backfill recipe — and a stream whose `backfill: auto` finds no recipe for
+    /// a captured table is refused at config load. So the scaffold leaves it OUT
+    /// of the stream and says so, instead of writing a config `rivet check`
+    /// rejects (the batch scaffold used to fall back to a quoted `query:`, which a
+    /// recipe cannot be).
+    #[test]
+    fn whole_db_cdc_leaves_an_unshortcuttable_table_out_of_the_stream_and_says_so() {
+        let pk = |name: &str, ty: &str| ColumnInfo {
+            is_primary_key: true,
+            ..col(name, ty)
+        };
+        let mk = |table: &str| TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![pk("id", "bigint")],
+        };
+        let yaml = generate_schema_config(
+            &[mk("orders"), mk("user-events"), mk("items")],
+            "mysql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            "MySQL database \"app\"",
+            &InitYamlDestination::default(),
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        assert!(yaml.contains("# SKIPPED user-events"), "{yaml}");
+        assert!(
+            yaml.contains("tables: [orders, items]"),
+            "the stream captures only the recipe-readable tables:\n{yaml}"
+        );
+        assert!(!yaml.contains("table: user-events"), "{yaml}");
+        let cfg = crate::config::Config::from_yaml(&yaml)
+            .expect("the scaffold must be a config rivet accepts");
+        assert_eq!(cfg.exports.len(), 3, "two recipes + the stream");
     }
 
     #[test]
