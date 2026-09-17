@@ -808,9 +808,272 @@ mod tests {
     }
 }
 
+/// What the compaction probe read from the buffer: its rows, the partition
+/// column's MIN/MAX as text (dates for a time key, integers for a range key),
+/// and how many rows carry a NULL partition column.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompactProbe {
+    pub rows: u64,
+    pub lo: String,
+    pub hi: String,
+    pub nulls: u64,
+}
+
+/// The MERGE statements one compaction runs, decided from the probe alone: none
+/// for an empty buffer; one unbounded MERGE when the base has no partition key
+/// (or the key is the load time); otherwise one per window of the key's range —
+/// at most 4,000 partitions each, the cap on what one statement may modify —
+/// plus one for the rows whose key is NULL. Pure, so the loader is glue.
+pub fn plan_compact_merges(
+    base: &str,
+    changes_fqtn: &str,
+    specs: &[TargetColumnSpec],
+    pk: &[String],
+    engine: SourceEngine,
+    key: Option<&crate::load::plan::PartitionKey>,
+    probe: &CompactProbe,
+) -> anyhow::Result<Vec<String>> {
+    use crate::load::plan::{Granularity, PartitionKey};
+    if probe.rows == 0 {
+        return Ok(Vec::new());
+    }
+    let columns: Vec<&str> = specs
+        .iter()
+        .map(|s| s.column_name.as_str())
+        .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
+        .collect();
+    let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    let merge = |bound: Option<&RangeBound>, nulls_only: Option<&str>| {
+        compact_merge_sql(
+            base,
+            changes_fqtn,
+            &columns,
+            &pk_refs,
+            engine,
+            bound,
+            nulls_only,
+        )
+    };
+    let part_col = key.and_then(PartitionKey::column);
+    let mut merges = Vec::new();
+    match (key, part_col) {
+        (Some(PartitionKey::Time { granularity, .. }), Some(col)) if !probe.lo.is_empty() => {
+            let ty = specs
+                .iter()
+                .find(|s| s.column_name == col)
+                .map(|s| s.target_type.as_str())
+                .unwrap_or("TIMESTAMP");
+            // Days per window such that no window touches more than 4,000 partitions
+            // of this granularity. Finite on every arm: `chrono` panics past
+            // ~10^11 days, and a sentinel here did exactly that on a monthly table.
+            let step = match granularity {
+                Granularity::Hour => 166,
+                Granularity::Day => 4000,
+                Granularity::Month => 4000 * 28,
+                Granularity::Year => 4000 * 365,
+            };
+            let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d");
+            let (Ok(lo_d), Ok(hi_d)) = (parse(&probe.lo), parse(&probe.hi)) else {
+                anyhow::bail!(
+                    "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
+                    probe.lo,
+                    probe.hi
+                );
+            };
+            for (from, to) in day_windows(lo_d, hi_d, step) {
+                let bound = RangeBound {
+                    column: col.to_string(),
+                    lo: time_literal(ty, from),
+                    hi_exclusive: time_literal(ty, to),
+                };
+                merges.push(merge(Some(&bound), None));
+            }
+            if probe.nulls > 0 {
+                merges.push(merge(None, Some(col)));
+            }
+        }
+        (Some(PartitionKey::Range { interval, .. }), Some(col)) if !probe.lo.is_empty() => {
+            let (Ok(lo_i), Ok(hi_i)) = (probe.lo.parse::<i64>(), probe.hi.parse::<i64>()) else {
+                anyhow::bail!(
+                    "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
+                    probe.lo,
+                    probe.hi
+                );
+            };
+            let step = interval.saturating_mul(4000).max(1);
+            let mut from = lo_i;
+            while from <= hi_i {
+                let to = from.saturating_add(step);
+                let bound = RangeBound {
+                    column: col.to_string(),
+                    lo: from.to_string(),
+                    hi_exclusive: to.to_string(),
+                };
+                merges.push(merge(Some(&bound), None));
+                from = to;
+            }
+            if probe.nulls > 0 {
+                merges.push(merge(None, Some(col)));
+            }
+        }
+        _ => merges.push(merge(None, None)),
+    }
+    Ok(merges)
+}
+
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+    use crate::load::plan::{Granularity, PartitionKey};
+
+    fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
+        CompactProbe {
+            rows,
+            lo: lo.into(),
+            hi: hi.into(),
+            nulls,
+        }
+    }
+
+    fn specs() -> Vec<TargetColumnSpec> {
+        vec![
+            meta_spec("id", "INT64"),
+            meta_spec("v", "INT64"),
+            meta_spec("created_at", "DATETIME"),
+            meta_spec("__is_deleted", "BOOL"),
+        ]
+    }
+
+    fn plan(key: Option<&PartitionKey>, p: &CompactProbe) -> Vec<String> {
+        plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            key,
+            p,
+        )
+        .expect("a plan")
+    }
+
+    /// An empty buffer plans nothing; no key plans one unbounded MERGE; a day
+    /// key over 5,000 days plans two windows (+ one for the NULL rows when there
+    /// are any); a range key steps by interval × 4,000; the flag column never
+    /// appears among the merged columns.
+    #[test]
+    fn the_compaction_plan_follows_the_probe_and_the_key() {
+        let day = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Day,
+        };
+        assert!(
+            plan(Some(&day), &probe(0, "", "", 0)).is_empty(),
+            "nothing to merge"
+        );
+        let all_null_keys = plan(Some(&day), &probe(3, "", "", 3));
+        assert_eq!(
+            all_null_keys.len(),
+            1,
+            "a key with no range (every row's key NULL) merges once, unbounded"
+        );
+        assert!(
+            all_null_keys[0].contains("ON T.`id` = S.`id`\n"),
+            "{}",
+            all_null_keys[0]
+        );
+        let hour = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Hour,
+        };
+        assert_eq!(
+            plan(Some(&hour), &probe(4, "2024-01-01", "2024-07-18", 0)).len(),
+            2,
+            "hourly partitions: 4,000 of them are 166 days, so 200 days take two windows"
+        );
+        let month = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Month,
+        };
+        assert_eq!(
+            plan(Some(&month), &probe(4, "1990-01-01", "2026-09-17", 0)).len(),
+            1,
+            "monthly partitions never reach the cap: one window"
+        );
+
+        let none = plan(None, &probe(7, "", "", 0));
+        assert_eq!(none.len(), 1);
+        assert!(
+            none[0].contains("ON T.`id` = S.`id`\n"),
+            "unbounded: {}",
+            none[0]
+        );
+        assert!(
+            none[0].contains("SET `id` = S.`id`, `v` = S.`v`, `created_at` = S.`created_at`, `__is_deleted` = FALSE"),
+            "the flag is set, never copied from the buffer: {}",
+            none[0]
+        );
+
+        let two = plan(Some(&day), &probe(9, "2000-01-01", "2013-09-08", 0));
+        assert_eq!(two.len(), 2, "5,000 days → two windows of ≤ 4,000");
+        assert!(
+            two[0].contains("T.`created_at` >= DATETIME '2000-01-01T00:00:00' AND T.`created_at` < DATETIME '2010-12-14T00:00:00'"),
+            "{}",
+            two[0]
+        );
+        assert!(
+            two[1].contains(">= DATETIME '2010-12-14T00:00:00'"),
+            "{}",
+            two[1]
+        );
+
+        let with_nulls = plan(Some(&day), &probe(9, "2024-01-01", "2024-01-02", 3));
+        assert_eq!(with_nulls.len(), 2, "one window + the NULL set");
+        assert!(
+            with_nulls[1].contains("WHERE __rn = 1 AND `created_at` IS NULL"),
+            "{}",
+            with_nulls[1]
+        );
+
+        let range = PartitionKey::Range {
+            column: "bucket".into(),
+            start: 0,
+            end: 1_000_000,
+            interval: 10,
+        };
+        let stepped = plan(Some(&range), &probe(5, "0", "45000", 1));
+        assert_eq!(
+            stepped.len(),
+            3,
+            "45,001 keys at 10 × 4,000 per job → two windows + NULLs"
+        );
+        assert!(
+            stepped[0].contains("`bucket` >= 0 AND `bucket` < 40000"),
+            "{}",
+            stepped[0]
+        );
+        assert!(
+            stepped[1].contains("`bucket` >= 40000 AND `bucket` < 80000"),
+            "{}",
+            stepped[1]
+        );
+
+        let err = plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some(&day),
+            &probe(1, "not-a-date", "x", 0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot read the buffer's `created_at` range"),
+            "{err}"
+        );
+    }
 
     fn bound(lo: &str, hi: &str) -> RangeBound {
         RangeBound {

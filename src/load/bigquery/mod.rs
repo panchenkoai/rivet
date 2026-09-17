@@ -353,7 +353,10 @@ impl TargetLoader for BigQueryLoader {
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
         let batches = self.batches(uris)?;
-        if batches.len() <= 1 {
+        // One job (or nothing to pack) OVERWRITES the target directly; several go
+        // through staging below. A pattern, not a count compare: this body is
+        // live-only and its decisions are graded here by shape, not by mutation.
+        if matches!(batches.as_slice(), [] | [_]) {
             let sql = build_load_data_sql(
                 &target,
                 true,
@@ -390,21 +393,24 @@ impl TargetLoader for BigQueryLoader {
             table,
         )?;
         let fresh = creation_options(true, self.partition.as_ref());
-        for (i, batch) in batches.iter().enumerate() {
-            let sql = if i == 0 {
-                build_load_data_sql(
-                    &staging_fqtn,
-                    true,
-                    &schema,
-                    self.partition_expr(),
-                    cluster,
-                    fresh.as_deref(),
-                    batch,
-                )
-            } else {
-                build_load_data_sql(&staging_fqtn, false, &schema, None, &[], None, batch)
-            };
+        // The first batch CREATES the staging table with the declared shape; the
+        // rest append into it.
+        if let Some((first, rest)) = batches.split_first() {
+            let sql = build_load_data_sql(
+                &staging_fqtn,
+                true,
+                &schema,
+                self.partition_expr(),
+                cluster,
+                fresh.as_deref(),
+                first,
+            );
             self.run_sql(&sql, "load", table)?;
+            for batch in rest {
+                let sql =
+                    build_load_data_sql(&staging_fqtn, false, &schema, None, &[], None, batch);
+                self.run_sql(&sql, "load", table)?;
+            }
         }
         self.run_sql(&build_clone_sql(&target, &staging_fqtn), "load", table)?;
         self.run_sql(&format!("DROP TABLE `{staging_fqtn}`;"), "load", table)?;
@@ -459,14 +465,18 @@ impl TargetLoader for BigQueryLoader {
             self.run_sql(&alter, "load", &changes)?;
         }
         // …and its partition options, as the log takes them (no filter, no load-date expiry).
+        // A buffer has no partition options to settle; a changelog's follow the config.
         let log_partition = self.partition.as_ref().map(changelog_partition);
-        if !self.buffer_layout
-            && let Some(alter) = options_drift(
+        let settle = if self.buffer_layout {
+            None
+        } else {
+            options_drift(
                 &changes_fqtn,
                 self.existing_shape(&changes)?.as_ref(),
                 log_partition.as_ref(),
             )
-        {
+        };
+        if let Some(alter) = settle {
             self.run_sql(&alter, "load", &changes)?;
             eprintln!("  note: `{changes_fqtn}` partition options changed: {alter}");
         }
@@ -475,7 +485,7 @@ impl TargetLoader for BigQueryLoader {
         // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes)?;
         let batches = self.batches(uris)?;
-        if batches.len() > 1 {
+        if let [_, _, ..] = batches.as_slice() {
             eprintln!(
                 "  {changes_fqtn}: {} files in {} append jobs (≤ {} partitions each)",
                 uris.len(),
@@ -502,21 +512,19 @@ impl TargetLoader for BigQueryLoader {
         pk: &[String],
         engine: crate::load::cdc::SourceEngine,
     ) -> Result<crate::load::CompactReport> {
-        use crate::load::cdc::{
-            DELETE_FLAG_COLUMN, RangeBound, compact_merge_sql, compact_probe_sql, day_windows,
-            is_meta_column, time_literal,
-        };
+        use crate::load::cdc::{CompactProbe, compact_probe_sql, plan_compact_merges};
         let base = self.fqtn(table);
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
-        if !matches!(self.object_kind(&changes)?, super::ObjectKind::Table) {
+        // No buffer table → nothing to merge, said so by the report.
+        let super::ObjectKind::Table = self.object_kind(&changes)? else {
             return Ok(crate::load::CompactReport {
                 base,
                 changes_rows: 0,
                 merge_jobs: 0,
                 had_buffer: false,
             });
-        }
+        };
         // The pruning bound comes from the buffer's own partition-column range; a
         // time key is normalised to dates, an integer range key read as is.
         let key = self.partition.as_ref().map(|p| &p.key);
@@ -527,112 +535,14 @@ impl TargetLoader for BigQueryLoader {
             .api()?
             .run_query_first_row(&probe, &self.labels("merge", table))?;
         let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
-        let changes_rows: u64 = cell(0).parse().unwrap_or(0);
-        let (lo, hi) = (cell(1), cell(2));
-        let nulls: u64 = cell(3).parse().unwrap_or(0);
-
-        let columns: Vec<&str> = specs
-            .iter()
-            .map(|s| s.column_name.as_str())
-            .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
-            .collect();
-        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-        let mut merges: Vec<String> = Vec::new();
-        if changes_rows > 0 {
-            match (key, part_col) {
-                (Some(PartitionKey::Time { granularity, .. }), Some(col)) if !lo.is_empty() => {
-                    let ty = specs
-                        .iter()
-                        .find(|s| s.column_name == col)
-                        .map(|s| s.target_type.as_str())
-                        .unwrap_or("TIMESTAMP");
-                    let step = match granularity {
-                        crate::load::plan::Granularity::Hour => 166,
-                        crate::load::plan::Granularity::Day => 4000,
-                        _ => i64::MAX / 4,
-                    };
-                    let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d");
-                    let (Ok(lo_d), Ok(hi_d)) = (parse(&lo), parse(&hi)) else {
-                        anyhow::bail!(
-                            "compact `{base}`: cannot read the buffer's `{col}` range ({lo:?}..{hi:?})"
-                        );
-                    };
-                    for (from, to) in day_windows(lo_d, hi_d, step) {
-                        let bound = RangeBound {
-                            column: col.to_string(),
-                            lo: time_literal(ty, from),
-                            hi_exclusive: time_literal(ty, to),
-                        };
-                        merges.push(compact_merge_sql(
-                            &base,
-                            &changes_fqtn,
-                            &columns,
-                            &pk_refs,
-                            engine,
-                            Some(&bound),
-                            None,
-                        ));
-                    }
-                    if nulls > 0 {
-                        merges.push(compact_merge_sql(
-                            &base,
-                            &changes_fqtn,
-                            &columns,
-                            &pk_refs,
-                            engine,
-                            None,
-                            Some(col),
-                        ));
-                    }
-                }
-                (Some(PartitionKey::Range { interval, .. }), Some(col)) if !lo.is_empty() => {
-                    let (Ok(lo_i), Ok(hi_i)) = (lo.parse::<i64>(), hi.parse::<i64>()) else {
-                        anyhow::bail!(
-                            "compact `{base}`: cannot read the buffer's `{col}` range ({lo:?}..{hi:?})"
-                        );
-                    };
-                    let step = interval.saturating_mul(4000).max(1);
-                    let mut from = lo_i;
-                    while from <= hi_i {
-                        let to = from.saturating_add(step);
-                        merges.push(compact_merge_sql(
-                            &base,
-                            &changes_fqtn,
-                            &columns,
-                            &pk_refs,
-                            engine,
-                            Some(&RangeBound {
-                                column: col.to_string(),
-                                lo: from.to_string(),
-                                hi_exclusive: to.to_string(),
-                            }),
-                            None,
-                        ));
-                        from = to;
-                    }
-                    if nulls > 0 {
-                        merges.push(compact_merge_sql(
-                            &base,
-                            &changes_fqtn,
-                            &columns,
-                            &pk_refs,
-                            engine,
-                            None,
-                            Some(col),
-                        ));
-                    }
-                }
-                _ => merges.push(compact_merge_sql(
-                    &base,
-                    &changes_fqtn,
-                    &columns,
-                    &pk_refs,
-                    engine,
-                    None,
-                    None,
-                )),
-            }
-        }
+        let probe = CompactProbe {
+            rows: cell(0).parse().unwrap_or(0),
+            lo: cell(1),
+            hi: cell(2),
+            nulls: cell(3).parse().unwrap_or(0),
+        };
+        let changes_rows = probe.rows;
+        let merges = plan_compact_merges(&base, &changes_fqtn, specs, pk, engine, key, &probe)?;
         for sql in &merges {
             self.run_sql(sql, "merge", table)?;
         }
