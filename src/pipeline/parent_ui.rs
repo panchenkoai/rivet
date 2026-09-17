@@ -674,10 +674,11 @@ fn render_final_line(
 /// cursor where the next `redraw()` (from a zero anchor) repaints the block.
 fn log_frame(last_drawn_lines: usize, line: &str) -> String {
     let mut out = String::new();
+    // Cursor control only when there IS a block to walk over: the linear renderer
+    // (piped stderr) must stay free of escape bytes — a capture grades that.
     if last_drawn_lines > 0 {
-        out.push_str(&format!("\x1b[{last_drawn_lines}A\r"));
+        out.push_str(&format!("\x1b[{last_drawn_lines}A\r\x1b[2K"));
     }
-    out.push_str("\x1b[2K");
     out.push_str(&sanitize_terminal(line));
     out.push('\n');
     out
@@ -774,8 +775,13 @@ mod tests {
         );
         assert_eq!(
             log_frame(0, "x"),
-            "\x1b[2Kx\n",
-            "no block yet: just the line"
+            "x\n",
+            "no block (linear renderer, or before the first frame): the bare line, no escape bytes"
+        );
+        assert_eq!(
+            log_frame(3, "y"),
+            "\x1b[3A\r\x1b[2Ky\n",
+            "over a block: walk up, erase, print"
         );
         assert!(
             !log_frame(0, "\x1b]0;evil\x07").contains("\x1b]0;"),
