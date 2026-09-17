@@ -805,11 +805,15 @@ impl CdcScenario {
         let m = super::mongo::MongoTest::connect(PORT, &db);
         m.drop_collection(&table);
         let rig = Rig::mongo_cdc(&table).source_url(&super::mongo::MongoTest::url(PORT, &db));
+        let guard = super::mongo::MongoDbGuard {
+            port: PORT,
+            db: db.clone(),
+        };
         Self {
             rig: shape(rig, &table),
             table,
             exec: ScnExec::Mongo(m),
-            _guards: Vec::new(),
+            _guards: vec![Box::new(guard)],
         }
     }
 

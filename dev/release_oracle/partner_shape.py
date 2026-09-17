@@ -38,42 +38,61 @@ from .cdc import _mysql, _psql
 from .core import Ledger, have, rivet, run
 from .scenarios import NO_TIMEOUT, work_dir
 
-TABLES = ["orc_ps_a", "orc_ps_b", "orc_ps_c"]
+# Per-invocation names: two gates on one stand must not drop each other's tables.
+TABLES = [f"orc_ps_{s}_{os.getpid()}" for s in ("a", "b", "c")]
 SEED = 5
 DELTA_LIVE = 7  # 5 seeded + 3 inserted - 1 deleted
+
+
+def _ids(k: int, lo: int, hi: int) -> list[int]:
+    """Table k holds ids k*100+lo..hi — no two tables share a row, so a fan-out that
+    routes one table's events under another's prefix shows in SUM(id) (counts agree)."""
+    return [k * 100 + i for i in range(lo, hi + 1)]
 
 
 def _sql(engine: str, url: str, sql: str):
     return _mysql(url, sql) if engine == "mysql" else _psql(url, "-tA", sql=sql)
 
 
-def _count(engine: str, url: str, table: str) -> int:
-    p = _sql(engine, url, f"SELECT COUNT(*) FROM {table};")
-    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip().isdigit()]
+def _scalar(stdout: str) -> int:
+    lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip().lstrip("-").isdigit()]
     return int(lines[-1]) if lines else -1
+
+
+def _count(engine: str, url: str, table: str) -> int:
+    return _scalar(_sql(engine, url, f"SELECT COUNT(*) FROM {table};").stdout)
+
+
+def _sum_id(engine: str, url: str, table: str) -> int:
+    return _scalar(_sql(engine, url, f"SELECT COALESCE(SUM(id), 0) FROM {table};").stdout)
+
+
+def _bq_scalar(proj: str, dset: str, expr: str, table: str, where: str = "") -> int:
+    q = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=csv",
+             f"SELECT {expr} FROM `{proj}.{dset}.{table}` {where}"], timeout=None)
+    return _scalar(q.stdout)
 
 
 def _bq_count(proj: str, dset: str, table: str, where: str = "") -> int:
-    q = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=csv",
-             f"SELECT COUNT(*) FROM `{proj}.{dset}.{table}` {where}"], timeout=None)
-    lines = [ln.strip() for ln in (q.stdout or "").splitlines() if ln.strip().isdigit()]
-    return int(lines[-1]) if lines else -1
+    return _bq_scalar(proj, dset, "COUNT(*)", table, where)
 
 
 def _seed(engine: str, url: str) -> bool:
-    for t in TABLES:
-        ddl = (f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT); "
-               + f"INSERT INTO {t} (id, v) VALUES " + ", ".join(f"({i},{i})" for i in range(1, SEED + 1)) + ";")
+    for k, t in enumerate(TABLES):
+        rows = ", ".join(f"({i},{i})" for i in _ids(k, 1, SEED))
+        ddl = f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT); INSERT INTO {t} (id, v) VALUES {rows};"
         if not _sql(engine, url, ddl).ok:
             return False
     return True
 
 
 def _delta(engine: str, url: str) -> None:
-    for t in TABLES:
+    for k, t in enumerate(TABLES):
+        rows = ", ".join(f"({i},{i})" for i in _ids(k, 6, 8))
+        one, two = _ids(k, 1, 1)[0], _ids(k, 2, 2)[0]
         _sql(engine, url,
-             f"INSERT INTO {t} (id, v) VALUES (6,6),(7,7),(8,8); "
-             f"UPDATE {t} SET v = 100 WHERE id = 1; DELETE FROM {t} WHERE id = 2;")
+             f"INSERT INTO {t} (id, v) VALUES {rows}; "
+             f"UPDATE {t} SET v = 100 WHERE id = {one}; DELETE FROM {t} WHERE id = {two};")
 
 
 def _cleanup(engine: str, url: str, slot: str | None) -> None:
@@ -176,9 +195,13 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
         l1 = rivet("load", "-c", str(cfg), "--run-id", f"partner-{engine}-{slug}-1", env=env, timeout=NO_TIMEOUT)
         if not _row(led, engine, "load1", l1.ok, f"exit={l1.returncode}" + ("" if l1.ok else f" {(l1.stderr or '')[-240:]}")):
             return
-        got = {t: (_bq_count(proj, dset, t), _count(engine, url, t)) for t in TABLES}
-        ok = all(b == s == SEED for b, s in got.values())
-        if not _row(led, engine, "baseline", ok, "; ".join(f"{t}: bigquery={b} source={s}" for t, (b, s) in got.items())):
+        # Count AND id-sum: identical counts across three tables cannot see a fan-out
+        # that routed one table's rows under another's prefix; the sums can.
+        got = {t: (_bq_count(proj, dset, t), _count(engine, url, t),
+                   _bq_scalar(proj, dset, "IFNULL(SUM(id), 0)", t), _sum_id(engine, url, t)) for t in TABLES}
+        ok = all(b == s == SEED and bs == ss for b, s, bs, ss in got.values())
+        if not _row(led, engine, "baseline", ok,
+                    "; ".join(f"{t}: bigquery={b} source={s} sum(id) bq={bs} src={ss}" for t, (b, s, bs, ss) in got.items())):
             return
 
         # delta in every table → run 2 → load 2: live == source, changelog == baseline + 5.
@@ -191,10 +214,14 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
             return
         got2 = {t: (_bq_count(proj, dset, t, "WHERE NOT __is_deleted"),
                     _bq_count(proj, dset, f"{t}__changes"),
-                    _count(engine, url, t)) for t in TABLES}
-        ok2 = all(live == src == DELTA_LIVE and log == SEED + 5 for live, log, src in got2.values())
+                    _count(engine, url, t),
+                    _bq_scalar(proj, dset, "IFNULL(SUM(id), 0)", t, "WHERE NOT __is_deleted"),
+                    _sum_id(engine, url, t)) for t in TABLES}
+        ok2 = all(live == src == DELTA_LIVE and log == SEED + 5 and bs == ss
+                  for live, log, src, bs, ss in got2.values())
         _row(led, engine, "delta", ok2,
-             "; ".join(f"{t}: live={live} changelog={log} source={src}" for t, (live, log, src) in got2.items()))
+             "; ".join(f"{t}: live={live} changelog={log} source={src} sum(id) bq={bs} src={ss}"
+                       for t, (live, log, src, bs, ss) in got2.items()))
     finally:
         for t in TABLES:
             run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{proj}:{dset}.{t}"])

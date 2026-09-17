@@ -269,6 +269,15 @@ def verify_state_backend_parity(
         }
 
     pop_a, pop_b = populated(a), populated(b)
+    # The `load:` block above exists so the run RECORDS its spec; a run that stops
+    # recording it on BOTH backends would drop the table from the comparison and
+    # read as agreement — the exact 0-vs-0 this cell used to be.
+    if "export_load_spec" not in pop_a:
+        _failed(led, "-", "-", "state_backend_parity", "-",
+                "state-parity: the SQLite run recorded no load spec although the config carries "
+                "a `load:` block — the cell would compare 0 to 0 on the one table it exists for",
+                "no load spec")
+        return
     if BOOKKEEPING & ({k[6:] for k in a} | {k[6:] for k in b}):
         notes.append(
             "the migration bookkeeping table is named `schema_version` on SQLite and "

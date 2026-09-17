@@ -125,6 +125,8 @@ mod live_keyset_metrics;
 mod live_keyset_parallel;
 #[path = "live/live_load_spec.rs"]
 mod live_load_spec;
+#[path = "live/live_load_spec_pin.rs"]
+mod live_load_spec_pin;
 #[path = "live/live_metrics_persist.rs"]
 mod live_metrics_persist;
 #[path = "live/live_mode_transition.rs"]

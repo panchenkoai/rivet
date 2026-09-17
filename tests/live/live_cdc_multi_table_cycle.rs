@@ -19,6 +19,7 @@ use crate::common::*;
 trait Source {
     fn exec(&mut self, sql: &str);
     fn count(&mut self, table: &str) -> i64;
+    fn sum_id(&mut self, table: &str) -> i64;
 }
 
 impl Source for mysql::PooledConn {
@@ -32,6 +33,12 @@ impl Source for mysql::PooledConn {
             .expect("count")
             .expect("one row")
     }
+    fn sum_id(&mut self, table: &str) -> i64 {
+        use mysql::prelude::Queryable as _;
+        self.query_first(format!("SELECT IFNULL(SUM(id), 0) FROM {table}"))
+            .expect("sum")
+            .expect("one row")
+    }
 }
 
 impl Source for postgres::Client {
@@ -42,6 +49,14 @@ impl Source for postgres::Client {
         self.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
             .expect("count")
             .get(0)
+    }
+    fn sum_id(&mut self, table: &str) -> i64 {
+        self.query_one(
+            &format!("SELECT COALESCE(SUM(id), 0)::BIGINT FROM {table}"),
+            &[],
+        )
+        .expect("sum")
+        .get(0)
     }
 }
 
@@ -69,10 +84,18 @@ fn accumulated(bq: &BqLive, table: &str) -> i64 {
     }
 }
 
-/// The LIVE state of one table equals its source, row for row on `id`
-/// (`WHERE NOT __is_deleted` once the object is the dedup view).
+/// Per-table id offset: table k holds ids k*100+1.. — so three tables never share
+/// a row, and a fan-out that lands table A's events under table B's prefix shows
+/// up in `SUM(id)` (every count would still agree).
+fn ids(k: usize, from: i64, to: i64) -> Vec<i64> {
+    (from..=to).map(|i| (k as i64) * 100 + i).collect()
+}
+
+/// The LIVE state of one table equals its source — row count, one row per key,
+/// AND the sum of ids (routing across tables is invisible to counts alone).
 fn assert_table_is_source(bq: &BqLive, table: &str, src: &mut dyn Source, step: &str) {
     let source = src.count(table);
+    let source_sum = src.sum_id(table);
     let live = if bq
         .read_bq_table_type(&format!("{table}__changes"))
         .is_some()
@@ -82,16 +105,22 @@ fn assert_table_is_source(bq: &BqLive, table: &str, src: &mut dyn Source, step: 
         ""
     };
     let row = &bq.read_bq_rows(&format!(
-        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d FROM `{}.{}.{table}` {live}",
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d, IFNULL(SUM(id), 0) AS s \
+         FROM `{}.{}.{table}` {live}",
         bq.project, bq.dataset
     ))[0];
     let n: i64 = row["n"].as_str().expect("count").parse().expect("a count");
     let d: i64 = row["d"].as_str().expect("count").parse().expect("a count");
+    let s: i64 = row["s"].as_str().expect("sum").parse().expect("a sum");
     assert_eq!(
         n, source,
         "{step}: {table}: the live state must equal the source"
     );
     assert_eq!(d, n, "{step}: {table}: one row per key");
+    assert_eq!(
+        s, source_sum,
+        "{step}: {table}: the live rows must be THIS table's rows (id sum), not a sibling's"
+    );
 }
 
 /// The init shape: `tables: [..]` + `backfill: auto`, a keyset recipe per table
@@ -124,8 +153,8 @@ fn cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
     let _cleanup = bq.cleanup(&all);
 
     // Rows that exist BEFORE the anchor: the baseline's whole job, in every table.
-    for t in &tables {
-        for id in 1..=5 {
+    for (k, t) in tables.iter().enumerate() {
+        for id in ids(k, 1, 5) {
             src.exec(&format!("INSERT INTO {t} (id, v) VALUES ({id}, {id})"));
         }
     }
@@ -152,12 +181,15 @@ fn cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
     let base: Vec<i64> = tables.iter().map(|t| accumulated(&bq, t)).collect();
 
     // 2. A delta in EVERY table → run 2 → load 2: exactly the 5 changed rows each.
-    for t in &tables {
-        for id in 6..=8 {
+    for (k, t) in tables.iter().enumerate() {
+        for id in ids(k, 6, 8) {
             src.exec(&format!("INSERT INTO {t} (id, v) VALUES ({id}, {id})"));
         }
-        src.exec(&format!("UPDATE {t} SET v = 100 WHERE id = 1"));
-        src.exec(&format!("DELETE FROM {t} WHERE id = 2"));
+        src.exec(&format!(
+            "UPDATE {t} SET v = 100 WHERE id = {}",
+            ids(k, 1, 1)[0]
+        ));
+        src.exec(&format!("DELETE FROM {t} WHERE id = {}", ids(k, 2, 2)[0]));
     }
     rig.run_ok();
     load_ok(&rig);
@@ -173,8 +205,11 @@ fn cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
 
     // 3. A crash on the CDC leg AFTER the part is flushed, BEFORE the checkpoint
     //    advances: the next plain run re-reads the un-acked changes of every table.
-    for t in &tables {
-        src.exec(&format!("INSERT INTO {t} (id, v) VALUES (9, 9), (10, 10)"));
+    for (k, t) in tables.iter().enumerate() {
+        let [a, b] = [ids(k, 9, 9)[0], ids(k, 10, 10)[0]];
+        src.exec(&format!(
+            "INSERT INTO {t} (id, v) VALUES ({a}, {a}), ({b}, {b})"
+        ));
     }
     let crashed = rig.run_args_env(
         &[],
