@@ -158,6 +158,35 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     assert!(ok && said.contains("COMPACT SKIP"), "{said}");
     assert_eq!(base_profile(&bq, &table).0, 8);
 
+    // 5b. Two loads with NO compact between them — the buffer accumulates both
+    //     cycles (an insert, then its update), and one compact ranks the winner
+    //     over the whole buffer: the key lands once, at its latest value.
+    scn.insert(10);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    scn.update(10);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "2",
+        "two cycles' changes wait in one buffer"
+    );
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("2 change row(s)"), "{said}");
+    assert_eq!(
+        base_profile(&bq, &table).0,
+        9,
+        "one new key, however many cycles carried it"
+    );
+    assert_eq!(
+        v_of(&bq, &table, 10),
+        Some(99),
+        "the later cycle's update won"
+    );
+
     // 6. rivet crashes right after the compaction job returned: the MERGEs and the
     //    DROP were ONE scripted job, so the warehouse is already consistent — the
     //    next compact finds no buffer, merges nothing twice, and the base equals
@@ -178,11 +207,11 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     let (n, live, gone, _, sum) = base_profile(&bq, &table);
     assert_eq!(
         (n, live, gone),
-        (9, 8, 1),
+        (10, 9, 1),
         "one insert, one update, still one tombstone"
     );
     assert_eq!(live, scn.count());
-    assert_eq!(sum, 1 + 3 + 4 + 5 + 6 + 7 + 8 + 9);
+    assert_eq!(sum, 1 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10);
     assert_eq!(v_of(&bq, &table, 3), Some(99), "merged once, not twice");
 }
 

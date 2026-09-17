@@ -1215,6 +1215,10 @@ fn load_one_cdc_base(
 fn cdc_ok_line(report: &load::CdcLoadReport) -> String {
     let cleaned = cleaned_suffix(report.source_cleaned);
     match report.target_kind {
+        load::ChangelogTarget::Base if report.rows_appended == 0 => format!(
+            "no changes buffered by this load into `{}`; `rivet compact` has nothing new for `{}`{cleaned}",
+            report.changes_table, report.target
+        ),
         load::ChangelogTarget::Base => format!(
             "{} change row(s) buffered into `{}` — `rivet compact` merges them into `{}`{cleaned}",
             report.rows_appended, report.changes_table, report.target
@@ -3283,6 +3287,16 @@ mod live_only_decisions {
             cdc_ok_line(&buffered),
             "40 change row(s) buffered into `p.d.orders__changes` — `rivet compact` merges them \
              into `p.d.orders`"
+        );
+        let idle = load::CdcLoadReport {
+            rows_appended: 0,
+            ..buffered.clone()
+        };
+        assert_eq!(
+            cdc_ok_line(&idle),
+            "no changes buffered by this load into `p.d.orders__changes`; `rivet compact` has \
+             nothing new for `p.d.orders`",
+            "an idle drain must not promise a merge of nothing"
         );
 
         let cleaned = load::CdcLoadReport {
