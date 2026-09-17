@@ -126,8 +126,10 @@ impl StateStore {
     }
 
     /// The spec `run_id` recorded for one unit — `None` for a run that predates the
-    /// per-run table or recorded nothing.
-    pub fn load_spec_of_run(
+    /// per-run table or recorded nothing. Private: the one reader is
+    /// [`Self::load_spec_of_run_with_init_key`], which also borrows the init-origin
+    /// key — a caller reaching for this one would skip that (ADR-0034 D1).
+    fn load_spec_of_run(
         &self,
         export_name: &str,
         unit: Option<&str>,
