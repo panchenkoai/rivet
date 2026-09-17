@@ -47,6 +47,10 @@ exports:
 load: { target: bigquery, project: my-proj, dataset: my_ds, pk: auto }
 ```
 
+- `rivet init --source-env SOURCE_URL --mode cdc` scaffolds exactly this shape
+  for every table it discovers (MySQL, PostgreSQL `public`): one recipe per table
+  — keyset where the table has a single-column key, range or `full` otherwise —
+  and one `tables:` stream with `backfill: auto`. Add the `load:` block and run.
 - `orders` is a **read recipe**: a whole-config `rivet run` (and `rivet apply`)
   skips it — at `warn` — and the CDC export runs it after the anchor into its
   own `exports/stream/orders/snapshot/`. `rivet run -e orders` still exports it

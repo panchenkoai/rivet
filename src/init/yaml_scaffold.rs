@@ -39,7 +39,7 @@ pub(super) fn generate_config(
     let unbounded = table_has_unbounded_decimal_columns(info);
     let mut lines = config_header_lines(st, &header, unbounded, provenance, tls);
     lines.push("exports:".to_string());
-    lines.extend(export_block_lines(info, st, dest, mode_override));
+    lines.extend(export_block_lines(info, st, dest, mode_override, false));
     Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
 
@@ -72,7 +72,23 @@ pub(super) fn generate_schema_config(
             "# One CDC stream over ALL tables (one slot / one server_id) — review before running."
                 .to_string(),
         );
+        lines.push(
+            "# The batch exports are the stream's baseline RECIPES (`backfill: auto` pairs each by \
+             table): they say HOW to read a table — keyset / range / full, as a batch export \
+             would — and the stream runs them once, after the anchor, into its own `snapshot/`. \
+             `rivet run` skips them on its own; `rivet run -e <table>` exports one alone."
+                .to_string(),
+        );
         lines.push("exports:".to_string());
+        for info in infos {
+            lines.extend(export_block_lines(
+                info,
+                st,
+                dest,
+                Some(recipe_mode(info)),
+                true,
+            ));
+        }
         lines.extend(cdc_multiplex_export_lines(infos, st, dest));
         return Ok(wrap_comments(&(lines.join("\n") + "\n")));
     }
@@ -85,7 +101,7 @@ pub(super) fn generate_schema_config(
     lines.push(dest_note.to_string());
     lines.push("exports:".to_string());
     for info in infos {
-        lines.extend(export_block_lines(info, st, dest, mode_override));
+        lines.extend(export_block_lines(info, st, dest, mode_override, false));
     }
     Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
@@ -457,11 +473,23 @@ fn init_default_decimal_yaml_line(col_name: &str) -> String {
     )
 }
 
+/// The read strategy a table's backfill RECIPE gets: paged when it can be, `full` otherwise.
+fn recipe_mode(info: &TableInfo) -> &'static str {
+    if info.keysettable_pk_column().is_some() || info.best_chunk_column().is_some() {
+        "chunked"
+    } else {
+        "full"
+    }
+}
+
+/// `force_table` emits the `table:` shortcut whatever the engine's default form —
+/// a backfill recipe must name the relation it reads (`query:` cannot be paired).
 fn export_block_lines(
     info: &TableInfo,
     source_type: &str,
     dest: &InitYamlDestination,
     mode_override: Option<&str>,
+    force_table: bool,
 ) -> Vec<String> {
     let mode = mode_override.unwrap_or_else(|| info.suggest_mode());
     let columns: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
@@ -536,6 +564,7 @@ fn export_block_lines(
         "mongo" => shortcut_shape_ok,
         _ => shortcut_shape_ok,
     };
+    let table_form_safe = table_form_safe || force_table;
     let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
     if source_type == "mongo" && !table_form_safe {
         // Unexportable in ANY form today: `table:` is Mongo's only export form
@@ -551,8 +580,10 @@ fn export_block_lines(
             "  #   collection or export it with another tool.".to_string(),
         ];
     }
-    if table_form_safe
-        && (is_keyset || (mode == "full" && (source_type == "postgres" || source_type == "mongo")))
+    if force_table
+        || table_form_safe
+            && (is_keyset
+                || (mode == "full" && (source_type == "postgres" || source_type == "mongo")))
         || source_type == "mongo"
     {
         // MongoDB has no SQL: the `table:` shortcut (→ collection scan) is the
@@ -840,15 +871,15 @@ fn cdc_multiplex_export_lines(
         "    mode: cdc".to_string(),
         "    format: parquet".to_string(),
         "    cdc:".to_string(),
-        "      initial: snapshot  # snapshot every table first, then stream changes (no gap)"
+        "      backfill: auto  # baseline through the batch exports above (a table's recipe = the export reading it), after the anchor — no gap"
             .to_string(),
         "      until_current: true  # drain to the current log end and exit (good for a scheduler)"
             .to_string(),
     ];
     match source_type {
         // MySQL has no server-side anchor — the checkpoint IS the resume anchor
-        // (required with `initial: snapshot`), and ONE `server_id` serves the
-        // whole stream (the same id on two exports is the collision this avoids).
+        // (required with a baseline), and ONE `server_id` serves the whole
+        // stream (the same id on two exports is the collision this avoids).
         "mysql" => {
             lines.push(format!(
                 "      checkpoint: ./cdc/{name}.ckpt  # one resume position for the whole stream"
@@ -1599,6 +1630,79 @@ mod tests {
         assert!(
             yaml.contains("\"invoices.total\": decimal(20,4)"),
             "qualified override for invoices:\n{yaml}"
+        );
+    }
+
+    /// The consolidated stream's baseline is `backfill: auto` over one batch
+    /// RECIPE per table — not `initial: snapshot`, whose leg is a single-stream
+    /// full scan with no `parallel:` (the partner's 313M-row tables made that the
+    /// reason to hand-roll a three-step runbook). The oracle is the config the
+    /// product PARSES: every captured table must resolve to a recipe that reads
+    /// it by `table:` with the strategy init would pick for a batch export.
+    #[test]
+    fn whole_db_cdc_scaffolds_a_backfill_recipe_per_table_not_a_snapshot_leg() {
+        let pk = |name: &str, ty: &str| ColumnInfo {
+            is_primary_key: true,
+            ..col(name, ty)
+        };
+        let orders = TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: "orders".into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![pk("id", "bigint"), decimal_col("amount", 18, 2)],
+        };
+        // No primary key at all: the recipe must still read by `table:` (a
+        // `query:` export can never be a baseline) and fall back to `full`.
+        let audit = TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: "audit".into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![col("note", "text")],
+        };
+        let dest = InitYamlDestination::default();
+        let yaml = generate_schema_config(
+            &[orders, audit],
+            "mysql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            "MySQL database \"app\"",
+            &dest,
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !yaml.contains("initial: snapshot"),
+            "the baseline is the recipes, not the single-stream snapshot leg:\n{yaml}"
+        );
+        assert!(yaml.contains("backfill: auto"), "{yaml}");
+        assert_eq!(yaml.matches("mode: cdc").count(), 1, "one stream:\n{yaml}");
+
+        let cfg = crate::config::Config::from_yaml(&yaml)
+            .expect("the scaffold must be a config rivet accepts");
+        let stream = cfg
+            .exports
+            .iter()
+            .find(|e| e.mode == crate::config::ExportMode::Cdc)
+            .expect("the cdc export");
+        let pairs = crate::config::resolve_backfill(stream, &cfg.exports)
+            .expect("every captured table pairs with exactly one recipe");
+        let mut paired: Vec<&str> = pairs.iter().map(|(t, _)| t.as_str()).collect();
+        paired.sort();
+        assert_eq!(paired, vec!["audit", "orders"]);
+        let recipe = |t: &str| crate::config::backfill_recipe_for(&pairs, t).expect("paired above");
+        assert_eq!(
+            recipe("orders").chunk_by_key.as_deref(),
+            Some("id"),
+            "a single-column PK reads by keyset, as init would scaffold the batch export"
+        );
+        assert_eq!(recipe("audit").mode, crate::config::ExportMode::Full);
+        assert!(
+            recipe("audit").table.is_some() && recipe("audit").query.is_none(),
+            "a recipe reads by `table:`, never `query:`:\n{yaml}"
         );
     }
 

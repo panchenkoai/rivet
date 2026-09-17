@@ -611,7 +611,7 @@ pub fn init(
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block(path, provenance));
+                eprint!("{}", next_steps_block(path, provenance, mode_override));
             }
         }
         None => {
@@ -619,7 +619,10 @@ pub fn init(
             // on stderr so `rivet init | tee rivet.yaml` isn't a dead end.
             print!("{text}");
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block("rivet.yaml", provenance));
+                eprint!(
+                    "{}",
+                    next_steps_block("rivet.yaml", provenance, mode_override)
+                );
             }
         }
     }
@@ -631,7 +634,7 @@ pub fn init(
 /// inline `--source` URL it leads with a step-0 export reminder, because the
 /// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
 /// literal URL) and would otherwise fail on an unset variable.
-fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
+fn next_steps_block(path: &str, provenance: &SourceProvenance, mode: Option<&str>) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
         s.push_str(
@@ -643,12 +646,22 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
          2. rivet check  -c {path}            # column-type & schema report\n  \
          3. rivet run    -c {path} --validate # export, then verify row counts\n"
     ));
-    s.push_str(&format!(
-        "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
-         rivet plan  -c {path}                    # review the schedule (read-only)\n  \
-         rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
-         rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
-    ));
+    // A CDC scaffold has no batch plan: `rivet plan` skips every export in it and
+    // stops with "nothing to plan". Its schedule is the run itself.
+    if mode == Some("cdc") {
+        s.push_str(&format!(
+            "\nThe first run anchors the stream and reads every table's baseline through its \
+             recipe; each later run captures only the changes since. Put it on a schedule:\n  \
+             rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
+             rivet plan  -c {path}                    # review the schedule (read-only)\n  \
+             rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
+             rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
+        ));
+    }
     s
 }
 
@@ -1229,9 +1242,33 @@ mod tests {
     /// content directly — including the read-only-vs-annotate distinction the
     /// 2026-08-20 plan change added — so the stubs die at the lib gate and the
     /// help text can't silently drift back to "plan writes waves".
+    /// A CDC scaffold's next steps end in `rivet run`, never `rivet plan`: plan
+    /// skips every export in such a config and stops with "nothing to plan".
+    #[test]
+    fn next_steps_block_for_cdc_schedules_the_run_not_a_plan() {
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+        );
+        assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
+        assert!(
+            !s.contains("--annotate-waves") && !s.contains("rivet apply"),
+            "a cdc config has no batch plan to seal; block:\n{s}"
+        );
+        assert!(
+            s.contains("rivet run   -c rivet.yaml") && s.contains("anchors the stream"),
+            "block:\n{s}"
+        );
+    }
+
     #[test]
     fn next_steps_block_shows_read_only_plan_then_annotate() {
-        let s = super::next_steps_block("rivet.yaml", &super::SourceProvenance::Env("X".into()));
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            None,
+        );
         // The core three-step path is always present.
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
