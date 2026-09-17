@@ -1240,6 +1240,21 @@ mod compact_tests {
             stepped[1]
         );
 
+        // A monthly key steps 4,000 × 28 days: 400 years span two windows, not one
+        // and not hundreds.
+        let long_month = plan(Some(&month), &probe(4, "1600-01-01", "2000-01-01", 0));
+        assert_eq!(long_month.len(), 2, "146,000 days at 112,000 per window");
+        // A range key without NULL keys plans no NULL pass; one whose every key is
+        // NULL (no range to read) merges once, unbounded.
+        assert_eq!(plan(Some(&range), &probe(5, "0", "45000", 0)).len(), 2);
+        let range_nulls = plan(Some(&range), &probe(2, "", "", 2));
+        assert_eq!(range_nulls.len(), 1);
+        assert!(
+            range_nulls[0].contains("ON T.`id` = S.`id`\n"),
+            "{}",
+            range_nulls[0]
+        );
+
         let err = plan_compact_merges(
             "p.d.t",
             "p.d.t__changes",

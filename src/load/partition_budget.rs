@@ -398,6 +398,37 @@ mod tests {
         assert!(err.contains("use `granularity: day` (about 196)"), "{err}");
     }
 
+    /// The cap is inclusive: a file (or a batch) touching EXACTLY 4,000 partitions is
+    /// one job; one more partition splits or refuses.
+    #[test]
+    fn exactly_the_cap_is_one_job_and_one_more_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        ts_file(
+            dir.path(),
+            "cap.parquet",
+            &[start, start + 3999 * DAY],
+            true,
+        );
+        ts_file(
+            dir.path(),
+            "over.parquet",
+            &[start, start + 4000 * DAY],
+            true,
+        );
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let key = time("ts", Granularity::Day);
+        assert_eq!(
+            plan_load_batches(&store, &["gs://b/cap.parquet".to_string()], &key).unwrap(),
+            vec![vec!["gs://b/cap.parquet".to_string()]],
+            "4,000 day partitions fit one job"
+        );
+        let err = plan_load_batches(&store, &["gs://b/over.parquet".to_string()], &key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("alone spans about 4001"), "{err}");
+    }
+
     /// Files that are each narrow but together wide load in BATCHES: packed by their
     /// low end, a batch closed the moment the next file would push its span past the
     /// cap. Three files over 6000 days → two jobs, never one refusal.

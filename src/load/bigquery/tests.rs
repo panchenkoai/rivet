@@ -16,6 +16,16 @@ fn uris() -> Vec<String> {
     vec!["gs://b/a.parquet".into(), "gs://b/b.parquet".into()]
 }
 
+/// The batched whole-table load ends with the target REPLACED by a clone of the
+/// staging table — one statement, the table names in the right roles.
+#[test]
+fn the_clone_replaces_the_target_with_the_staging_table() {
+    assert_eq!(
+        build_clone_sql("p.d.t", "p.d.t__staging"),
+        "CREATE OR REPLACE TABLE `p.d.t` CLONE `p.d.t__staging`;"
+    );
+}
+
 #[test]
 fn object_kind_probe_reads_the_dataset_catalog() {
     let sql = build_object_kind_sql("p", "d", "orders");

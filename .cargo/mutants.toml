@@ -660,4 +660,14 @@ exclude_re = [
     # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
     # filtering and the redacting line are graded (`redact::logger_tests`).
     "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",
+    # `run_cdc_export` (pipeline/cdc_job.rs) is the CDC run's live-only script:
+    # a run-status row in the state DB, the anchor + backfill + drain against a
+    # real source, manifests in a real destination, the summary card. Every
+    # decision it makes is a named predicate or a pure builder next door
+    # (`cdc_metric_row`, `cdc_summary`, `initial_snapshot_pending`, …), and its
+    # stub is caught by every live CDC test (the run captures nothing and the
+    # independent readback reads zero rows). Entered the in-diff scope for the
+    # peak-RSS bracket (graded live: the backfill cycle test reads
+    # `export_metrics.peak_rss_mb` back).
+    "replace run_cdc_export -> \\(Result<\\(\\)>, RunSummary\\)",
 ]

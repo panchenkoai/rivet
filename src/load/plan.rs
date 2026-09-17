@@ -2304,4 +2304,30 @@ load:
         assert_eq!(Granularity::parse_sql("MONTH"), Some(Granularity::Month));
         assert_eq!(Granularity::parse_sql("WEEK"), None);
     }
+
+    /// Only a CDC load of a stream WITH `backfill:` takes the base-and-buffer
+    /// layout; the same stream without a baseline, and any batch load, keep the
+    /// changelog + view.
+    #[test]
+    fn a_cdc_export_with_a_backfill_lands_as_base_and_buffer_only() {
+        let parse = |yaml: &str| {
+            serde_yaml_ng::from_str::<crate::config::ExportConfig>(yaml).expect("an export")
+        };
+        let with = parse(
+            "name: t\ntable: t\nmode: cdc\nformat: parquet\n\
+             cdc: { backfill: auto, checkpoint: ./t.ckpt }\n\
+             destination: { type: local, path: /tmp/t }\n",
+        );
+        let without = parse(
+            "name: t\ntable: t\nmode: cdc\nformat: parquet\ncdc: { checkpoint: ./t.ckpt }\n\
+             destination: { type: local, path: /tmp/t }\n",
+        );
+        assert_eq!(cdc_layout(&with, LoadMode::Cdc), CdcLayout::BaseAndBuffer);
+        assert_eq!(cdc_layout(&without, LoadMode::Cdc), CdcLayout::LogAndView);
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Full),
+            CdcLayout::LogAndView,
+            "a batch load of the same export is no CDC layout"
+        );
+    }
 }
