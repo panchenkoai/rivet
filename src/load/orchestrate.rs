@@ -79,7 +79,11 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // every other table, every cycle, indefinitely. The CLI reference already
     // promised "loads every export into the shared target, one after another".
     let mut failures: Vec<anyhow::Error> = Vec::new();
+    let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
     for plan in &plans {
+        // Typed from the spec of the run this load consumes, not the by-name row.
+        let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg);
+        let plan = &pinned;
         let load_id = format!("{run_id}:{}", plan.table);
         let drift = plan.load.allow_source_drift;
         let outcome = (|| -> Result<()> {
@@ -170,6 +174,79 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     match aggregate_load_failures(failures) {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// `plan` retyped from the spec of the NEWEST loadable run under its own prefix.
+///
+/// `plan_loads` types every table from `export_load_spec`, one row per export
+/// NAME — last writer wins. On a state DB shared by two configs whose exports
+/// share a name, the other config's run retypes this table between the run and
+/// its load (the release gate's engine matrix does exactly this with `users`:
+/// a `_id` key on a PostgreSQL table, another engine's DDL). The per-run table
+/// (`export_load_spec_run`) is written only by the run that produced the parts,
+/// so pinning the plan to that run's spec removes the race by construction.
+///
+/// Glue: one extra manifest listing per table, then `retype_plan`. Every path
+/// that cannot pin — no state, no store, no manifest, a run older than the
+/// per-run table — keeps the plan as typed and says so; it never fails the load.
+fn pin_plan_to_its_run(
+    plan: &load::plan::LoadPlan,
+    state: Option<&StateStore>,
+    cfg: &crate::config::Config,
+) -> load::plan::LoadPlan {
+    let Some(s) = state else {
+        return plan.clone();
+    };
+    let newest = load::open_store(&plan.destination)
+        .and_then(|store| load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix))
+        .and_then(|keyed| {
+            load::reconcile::select_runs(keyed, &std::collections::HashSet::new(), plan.mode)
+        })
+        .map(|runs| {
+            runs.into_iter()
+                .map(|(_, m)| (m.finished_at.clone(), m.run_id))
+                .max()
+                .map(|(_, run_id)| run_id)
+        });
+    let run_id = match newest {
+        Ok(Some(r)) => r,
+        Ok(None) => return plan.clone(),
+        Err(e) => {
+            eprintln!(
+                "  load [{}]: typed from the by-name load spec — could not list its runs to \
+                 pin the plan ({e:#})",
+                plan.table
+            );
+            return plan.clone();
+        }
+    };
+    let spec = match s.load_spec_of_run(&plan.export_name, plan.unit.as_deref(), &run_id) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return plan.clone(), // a run older than the per-run table
+        Err(e) => {
+            eprintln!(
+                "  load [{}]: typed from the by-name load spec — run {run_id}'s own spec is \
+                 unreadable ({e:#})",
+                plan.table
+            );
+            return plan.clone();
+        }
+    };
+    let target = match crate::types::target::ExportTarget::parse(plan.load.target.name()) {
+        Some(t) => t,
+        None => return plan.clone(),
+    };
+    match load::plan::retype_plan(cfg, plan, &spec, target) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "  load [{}]: typed from the by-name load spec — retyping from run {run_id} \
+                 failed ({e:#})",
+                plan.table
+            );
+            plan.clone()
+        }
     }
 }
 
@@ -1657,6 +1734,7 @@ mod load_ledger_tests {
         use load::plan::{LoadMode, LoadPlan, LoadSection, LoadTarget};
         let plan = LoadPlan {
             export_name: "c1".into(),
+            unit: None,
             table: "content_items".into(),
             partition: None,
             specs: vec![],
@@ -2061,6 +2139,7 @@ mod live_only_decisions {
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         LoadPlan {
             export_name: "orders".into(),
+            unit: None,
             table: "orders".into(),
             partition: None,
             specs: vec![],

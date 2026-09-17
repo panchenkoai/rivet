@@ -487,6 +487,21 @@ const MIGRATIONS: &[(i64, &str)] = &[
              PRIMARY KEY (export_name, unit)
          );",
     ),
+    // The spec EACH RUN recorded, keyed by run — `export_load_spec` is one row per
+    // export (last writer wins), so on a shared state two configs with a same-named
+    // export overwrite each other's; the load pins its plan to the run it consumes.
+    (
+        28,
+        "CREATE TABLE IF NOT EXISTS export_load_spec_run (
+             export_name TEXT NOT NULL,
+             unit TEXT NOT NULL DEFAULT '',
+             run_id TEXT NOT NULL,
+             columns_json TEXT NOT NULL,
+             primary_key_json TEXT,
+             captured_at TEXT NOT NULL,
+             PRIMARY KEY (export_name, unit, run_id)
+         );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -883,6 +898,18 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
              origin TEXT NOT NULL,
              captured_at TEXT NOT NULL,
              PRIMARY KEY (export_name, unit)
+         );",
+    ),
+    (
+        28,
+        "CREATE TABLE IF NOT EXISTS export_load_spec_run (
+             export_name TEXT NOT NULL,
+             unit TEXT NOT NULL DEFAULT '',
+             run_id TEXT NOT NULL,
+             columns_json TEXT NOT NULL,
+             primary_key_json TEXT,
+             captured_at TEXT NOT NULL,
+             PRIMARY KEY (export_name, unit, run_id)
          );",
     ),
 ];

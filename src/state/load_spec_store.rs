@@ -96,14 +96,70 @@ impl StateStore {
             &[
                 export_name.into(),
                 unit.unwrap_or("").into(),
-                columns_json.into(),
-                primary_key_json.into(),
+                columns_json.clone().into(),
+                primary_key_json.clone().into(),
                 key_origin.into(),
                 run_id.into(),
+                now.clone().into(),
+            ],
+        )?;
+        // The same spec under ITS run: what `rivet load` pins a plan to, so a
+        // same-named export of another config sharing this state DB cannot type it.
+        self.execute(
+            "INSERT INTO export_load_spec_run
+                 (export_name, unit, run_id, columns_json, primary_key_json, captured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (export_name, unit, run_id) DO UPDATE SET
+                 columns_json     = excluded.columns_json,
+                 primary_key_json = excluded.primary_key_json,
+                 captured_at      = excluded.captured_at",
+            &[
+                export_name.into(),
+                unit.unwrap_or("").into(),
+                run_id.into(),
+                columns_json.into(),
+                primary_key_json.into(),
                 now.into(),
             ],
         )?;
         Ok(())
+    }
+
+    /// The spec `run_id` recorded for one unit — `None` for a run that predates the
+    /// per-run table or recorded nothing.
+    pub fn load_spec_of_run(
+        &self,
+        export_name: &str,
+        unit: Option<&str>,
+        run_id: &str,
+    ) -> Result<Option<LoadSpec>> {
+        let row = self.query_opt(
+            "SELECT columns_json, primary_key_json, captured_at FROM export_load_spec_run
+             WHERE export_name = ?1 AND unit = ?2 AND run_id = ?3",
+            &[export_name.into(), unit.unwrap_or("").into(), run_id.into()],
+            |r| (r.text(0), r.opt_text(1), r.text(2)),
+        )?;
+        let Some((columns_json, primary_key_json, captured_at)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(LoadSpec {
+            export_name: export_name.to_string(),
+            unit: unit.map(str::to_string),
+            columns: serde_json::from_str(&columns_json).with_context(|| {
+                format!("export '{export_name}' run '{run_id}': unreadable load spec columns")
+            })?,
+            primary_key: primary_key_json
+                .map(|p| serde_json::from_str(&p))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "export '{export_name}' run '{run_id}': unreadable load spec primary key"
+                    )
+                })?,
+            run_id: Some(run_id.to_string()),
+            origin: "run".to_string(),
+            captured_at,
+        }))
     }
 
     /// Record the source primary key `rivet init` read for an export it scaffolded,
@@ -227,6 +283,65 @@ mod tests {
         assert_eq!(spec.primary_key, Some(pk));
         assert_eq!(spec.run_id.as_deref(), Some("run_1"));
         assert_eq!(spec.origin, "run");
+    }
+
+    /// Two runs of one export name — in practice two CONFIGS sharing a state DB,
+    /// each with an export called `users` over a different source — must each keep
+    /// the spec THEIR run recorded: the by-name row is last-writer-wins, the
+    /// by-run row is what the load pins to.
+    #[test]
+    fn each_run_keeps_its_own_spec_while_the_by_name_row_follows_the_last_writer() {
+        let s = StateStore::open_in_memory().unwrap();
+        let mine = vec![col("id", RivetType::Int64), col("v", RivetType::Int64)];
+        let theirs = vec![col("_id", RivetType::Int32)];
+        s.record_load_spec("users", None, &mine, Some(&["id".to_string()]), "run_pg")
+            .unwrap();
+        s.record_load_spec(
+            "users",
+            None,
+            &theirs,
+            Some(&["_id".to_string()]),
+            "run_mongo",
+        )
+        .unwrap();
+
+        let by_name = s.load_spec("users", None).unwrap().unwrap();
+        assert_eq!(by_name.run_id.as_deref(), Some("run_mongo"), "last writer");
+
+        let pg = s
+            .load_spec_of_run("users", None, "run_pg")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pg.columns, mine);
+        assert_eq!(pg.primary_key, Some(vec!["id".to_string()]));
+        let mongo = s
+            .load_spec_of_run("users", None, "run_mongo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mongo.columns, theirs);
+        assert!(
+            s.load_spec_of_run("users", None, "run_never")
+                .unwrap()
+                .is_none(),
+            "a run that recorded nothing pins nothing"
+        );
+        // A keyless re-record of the SAME run replaces that run's row only.
+        s.record_load_spec("users", None, &mine, None, "run_pg")
+            .unwrap();
+        assert_eq!(
+            s.load_spec_of_run("users", None, "run_pg")
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            None
+        );
+        assert_eq!(
+            s.load_spec_of_run("users", None, "run_mongo")
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            Some(vec!["_id".to_string()])
+        );
     }
 
     /// `pk: auto` reads the recorded key, so a key a RUN captured from `table: orders`

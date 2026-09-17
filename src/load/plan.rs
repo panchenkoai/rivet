@@ -198,6 +198,9 @@ pub struct LoadPlan {
     /// table it resolves to (dogfood LOW: require_pk labelled the table as the
     /// export).
     pub export_name: String,
+    /// The captured source table for a multiplex `tables:` export, `None` for a
+    /// single-relation one — the `unit` the state DB keys its load specs by.
+    pub unit: Option<String>,
     pub table: String,
     /// The resolved `load.partition` of the table the load writes.
     pub partition: Option<TablePartition>,
@@ -552,6 +555,7 @@ fn build_plans_keyed(
         };
         plans.push(LoadPlan {
             export_name: export.name.clone(),
+            unit: report.table.clone(),
             table,
             partition,
             specs,
@@ -571,6 +575,46 @@ fn build_plans_keyed(
             .collect::<Vec<_>>(),
     )?;
     Ok(plans)
+}
+
+/// `plan` rebuilt from `spec` — the columns and key ONE run recorded — instead of
+/// the by-name spec [`plan_loads`] typed it from.
+///
+/// The by-name row (`export_load_spec`) is last-writer-wins: on a state DB shared
+/// by two configs whose exports share a NAME, the other config's run can retype
+/// this table between the run and its load — a `_id` key on a PostgreSQL table,
+/// another engine's column types in the DDL. The load therefore pins each plan to
+/// the spec of the run it is about to consume, which only that run wrote.
+pub fn retype_plan(
+    cfg: &crate::config::Config,
+    plan: &LoadPlan,
+    spec: &crate::state::LoadSpec,
+    target: crate::types::target::ExportTarget,
+) -> Result<LoadPlan> {
+    let export = cfg
+        .exports
+        .iter()
+        .find(|e| e.name == plan.export_name)
+        .with_context(|| format!("export `{}` not found in config", plan.export_name))?;
+    let load = cfg
+        .load
+        .clone()
+        .context("config has no top-level `load:` block")?;
+    let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
+    let report = crate::preflight::type_report::report_from_mappings(
+        export,
+        plan.unit.clone(),
+        mappings,
+        &crate::types::policy::TypePolicy::warn_only(),
+        Some(target),
+    );
+    let mut keys = RecordedKeys::new();
+    if let Some(pk) = &spec.primary_key {
+        keys.insert((export.name.clone(), plan.unit.clone()), pk.clone());
+    }
+    build_plans_keyed(cfg, &load, vec![report], &keys)?
+        .pop()
+        .context("one report yields one plan")
 }
 
 /// [`build_plans_keyed`] with no recorded keys.
@@ -1037,6 +1081,52 @@ load:
 
         let plans = build_plans(&cfg, &load, reports).unwrap();
         assert_eq!(plans.len(), 2);
+
+        // A plan retyped from ONE run's recorded spec carries that run's columns
+        // and key — not the by-name spec it was planned from. This is the seam the
+        // shared-state race crosses: another config's same-named export can retype
+        // the by-name row between the run and its load; the per-run spec cannot.
+        {
+            use crate::state::{LoadSpec, LoadSpecColumn};
+            use crate::types::{RivetType, TypeFidelity};
+            let alpha = plans.iter().find(|p| p.table == "alpha_tbl").unwrap();
+            assert_eq!(
+                alpha.pk,
+                Vec::<String>::new(),
+                "planned with no recorded key"
+            );
+            let column = |name: &str| LoadSpecColumn {
+                name: name.into(),
+                source_type: "int8".into(),
+                rivet_type: RivetType::Int64,
+                fidelity: TypeFidelity::Exact,
+                nullable: false,
+                warnings: Vec::new(),
+            };
+            let spec = LoadSpec {
+                export_name: "alpha".into(),
+                unit: None,
+                columns: vec![column("tenant"), column("id")],
+                primary_key: Some(vec!["tenant".into(), "id".into()]),
+                run_id: Some("alpha_run_7".into()),
+                origin: "run".into(),
+                captured_at: "2026-09-17T00:00:00Z".into(),
+            };
+            let target = crate::types::target::ExportTarget::parse("bigquery").unwrap();
+            let retyped = retype_plan(&cfg, alpha, &spec, target).unwrap();
+            assert_eq!(retyped.table, "alpha_tbl");
+            assert_eq!(retyped.gcs_prefix, alpha.gcs_prefix);
+            assert_eq!(
+                retyped
+                    .specs
+                    .iter()
+                    .map(|s| s.column_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["tenant", "id"],
+                "the run's columns, in the run's order"
+            );
+            assert_eq!(retyped.pk, vec!["tenant".to_string(), "id".to_string()]);
+        }
 
         // reports[0] = beta → matched by name to the 2nd export (kills `==`→`!=`,
         // which would resolve the first NON-matching export instead).

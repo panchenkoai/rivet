@@ -601,4 +601,10 @@ exclude_re = [
     # never closes a transaction and the arm deletion captures no rows (full cycle).
     "replace MysqlChangeStream::close_transaction_at -> bool",
     "delete match arm Some\\(EventData::RowsEvent\\(re\\)\\) in MysqlChangeStream::fill",
+    # `pin_plan_to_its_run` (load/orchestrate.rs) lists a real store's manifests
+    # and reads the state DB; the decision it feeds — rebuilding the plan from one
+    # run's spec — is `retype_plan` (unit-tested). Stubbed to `plan.clone()` it
+    # is the pre-fix behaviour, which the release gate's parallel engine matrix
+    # grades LIVE (a PostgreSQL `users` typed with Mongo's `_id` key).
+    "replace pin_plan_to_its_run -> load::plan::LoadPlan",
 ]
