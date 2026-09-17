@@ -52,11 +52,22 @@ pub struct CompactReport {
 pub struct CdcLoadReport {
     pub rows_appended: u64,
     pub changes_table: String,
-    pub view: String,
+    /// The table consumers read, named by the driver that built it: the dedup VIEW
+    /// over the changelog, or the physical BASE the buffer is compacted into.
+    pub target: String,
+    pub target_kind: ChangelogTarget,
     /// Whether `cleanup_source` wiped the staged Parquet after this load — mirrors
     /// [`LoadReport::source_cleaned`] so the report + logs reflect it for CDC/
     /// incremental too, instead of discarding it.
     pub source_cleaned: bool,
+}
+
+/// What `CdcLoadReport::target` is: the dedup view of the changelog + view layout,
+/// or the physical base of the base-and-buffer layout (compacted from the buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogTarget {
+    View,
+    Base,
 }
 
 /// What a name currently is in the warehouse.
@@ -635,7 +646,8 @@ fn append_and_view(
     Ok(CdcLoadReport {
         rows_appended,
         changes_table: loader.fqtn(&format!("{table}__changes")),
-        view: loader.fqtn(table),
+        target: loader.fqtn(table),
+        target_kind: ChangelogTarget::View,
         source_cleaned,
     })
 }
@@ -849,7 +861,8 @@ pub fn run_load_buffer(
     Ok(CdcLoadReport {
         rows_appended,
         changes_table: loader.fqtn(&format!("{table}__changes")),
-        view: loader.fqtn(table),
+        target: loader.fqtn(table),
+        target_kind: ChangelogTarget::Base,
         source_cleaned,
     })
 }

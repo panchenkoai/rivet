@@ -110,11 +110,9 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                         ledger_errored,
                         &load_id,
                     )? {
-                        Some(report) => println!(
-                            "CDC LOAD OK [{}]: {}",
-                            plan.table,
-                            cdc_ok_line(plan.layout, &report)
-                        ),
+                        Some(report) => {
+                            println!("CDC LOAD OK [{}]: {}", plan.table, cdc_ok_line(&report))
+                        }
                         None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
                     }
                 }
@@ -1202,45 +1200,30 @@ fn load_one_cdc_base(
             let report = report.unwrap_or_else(|| load::CdcLoadReport {
                 rows_appended: 0,
                 changes_table: loader.fqtn(&format!("{}__changes", plan.table)),
-                view: loader.fqtn(&plan.table),
+                target: loader.fqtn(&plan.table),
+                target_kind: load::ChangelogTarget::Base,
                 source_cleaned: false,
             });
             Ok((landed.iter().sum(), report))
         },
-        |inputs, report| eprintln!("{}", base_done_line(&inputs.integrity, report)),
+        |inputs, report| eprintln!("{}", cdc_done_line(&inputs.integrity, report)),
     )
 }
 
-/// The one-line `CDC LOAD OK` verdict, by layout: what landed where and what the
-/// operator does next — never a struct dump.
-fn cdc_ok_line(layout: load::plan::CdcLayout, report: &load::CdcLoadReport) -> String {
+/// The one-line `CDC LOAD OK` verdict: what landed where and what the operator
+/// does next — never a struct dump. The report says which target it produced.
+fn cdc_ok_line(report: &load::CdcLoadReport) -> String {
     let cleaned = cleaned_suffix(report.source_cleaned);
-    match layout {
-        load::plan::CdcLayout::BaseAndBuffer => format!(
+    match report.target_kind {
+        load::ChangelogTarget::Base => format!(
             "{} change row(s) buffered into `{}` — `rivet compact` merges them into `{}`{cleaned}",
-            report.rows_appended, report.changes_table, report.view
+            report.rows_appended, report.changes_table, report.target
         ),
-        load::plan::CdcLayout::LogAndView => format!(
+        load::ChangelogTarget::View => format!(
             "{} row(s) appended to `{}` | current-state view `{}`{cleaned}",
-            report.rows_appended, report.changes_table, report.view
+            report.rows_appended, report.changes_table, report.target
         ),
     }
-}
-
-/// The base-and-buffer sibling of [`append_done_line`]: the base the legs
-/// overwrote and the rows the stream buffered (the baseline line printed its own).
-fn base_done_line(
-    integrity: &load::reconcile::LoadIntegrity,
-    report: &load::CdcLoadReport,
-) -> String {
-    format!(
-        "  integrity ✓ {} → base {} | buffered {} row(s) into {}{}",
-        integrity.chain_prefix(),
-        report.view,
-        report.rows_appended,
-        report.changes_table,
-        cleaned_suffix(report.source_cleaned),
-    )
 }
 
 /// The buffer's Parquet, or `None` when the stream's runs produced no parts (an
@@ -1442,29 +1425,39 @@ fn cleaned_suffix(source_cleaned: bool) -> &'static str {
     }
 }
 
-/// The success trace shared by the CDC + incremental loads (byte-identical): the
-/// integrity chain, the appended rows, the change-log table, and the view.
+/// The success trace shared by the CDC + incremental loads: the integrity chain,
+/// the appended rows, the change-log table, and the target the report names — the
+/// dedup view, or the base a buffer is compacted into.
 ///
 /// Renders rather than prints, so the ONE end-to-end integrity line each append
 /// load emits has an offline test with a hand-written expected string. It used
 /// to be an `eprintln!`-only `fn`, and its whole-function `-> ()` stub was one of
 /// the in-diff gate's misses: stubbed, every append load goes quiet about what it
 /// appended and where, and nothing fails.
-fn append_done_line(
+fn cdc_done_line(
     integrity: &load::reconcile::LoadIntegrity,
     report: &load::CdcLoadReport,
 ) -> String {
-    format!(
-        "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
-        integrity.chain_prefix(),
-        report.rows_appended,
-        report.changes_table,
-        report.view,
-        cleaned_suffix(report.source_cleaned),
-    )
+    let cleaned = cleaned_suffix(report.source_cleaned);
+    match report.target_kind {
+        load::ChangelogTarget::View => format!(
+            "  integrity ✓ {} → appended {} to {} | current-state view {}{cleaned}",
+            integrity.chain_prefix(),
+            report.rows_appended,
+            report.changes_table,
+            report.target,
+        ),
+        load::ChangelogTarget::Base => format!(
+            "  integrity ✓ {} → base {} | buffered {} row(s) into {}{cleaned}",
+            integrity.chain_prefix(),
+            report.target,
+            report.rows_appended,
+            report.changes_table,
+        ),
+    }
 }
 
-/// The full-load sibling of [`append_done_line`] — the whole chain, now that the
+/// The full-load sibling of [`cdc_done_line`] — the whole chain, now that the
 /// warehouse leg is known. The loader already proved `warehouse == file` (its
 /// count gate) before returning, so this is an all-green trace, not an assertion.
 fn full_done_line(integrity: &load::reconcile::LoadIntegrity, report: &load::LoadReport) -> String {
@@ -1745,7 +1738,7 @@ fn load_one_cdc(
             )?;
             Ok((report.rows_appended, report))
         },
-        |inputs, report| eprintln!("{}", append_done_line(&inputs.integrity, report)),
+        |inputs, report| eprintln!("{}", cdc_done_line(&inputs.integrity, report)),
     )
 }
 
@@ -1771,7 +1764,7 @@ impl IncrementalReport {
                 "{} rows appended to {} | current-state view {}{}",
                 r.rows_appended,
                 r.changes_table,
-                r.view,
+                r.target,
                 cleaned_suffix(r.source_cleaned)
             ),
         }
@@ -1984,7 +1977,7 @@ fn load_one_incremental(
                     ownership,
                     rebuild_changelog,
                 )?;
-                eprintln!("{}", append_done_line(&integrity, &r));
+                eprintln!("{}", cdc_done_line(&integrity, &r));
                 rows += r.rows_appended;
                 report = Some(IncrementalReport::Changelog(r));
             }
@@ -3261,29 +3254,35 @@ mod live_only_decisions {
         let appended = load::CdcLoadReport {
             rows_appended: 40,
             changes_table: "p.d.orders__changes".into(),
-            view: "p.d.orders".into(),
+            target: "p.d.orders".into(),
+            target_kind: load::ChangelogTarget::View,
             source_cleaned: false,
         };
         assert_eq!(
-            append_done_line(&inputs.integrity, &appended),
+            cdc_done_line(&inputs.integrity, &appended),
             "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
              current-state view p.d.orders"
         );
-
         assert_eq!(
-            base_done_line(&inputs.integrity, &appended),
+            cdc_ok_line(&appended),
+            "40 row(s) appended to `p.d.orders__changes` | current-state view `p.d.orders`"
+        );
+
+        // The report says what it produced; the renderers ask it, not the plan.
+        let buffered = load::CdcLoadReport {
+            target_kind: load::ChangelogTarget::Base,
+            ..appended.clone()
+        };
+        assert_eq!(
+            cdc_done_line(&inputs.integrity, &buffered),
             "  integrity ✓ source 100 → files 100 → base p.d.orders | buffered 40 row(s) into \
              p.d.orders__changes",
             "the base layout names the base, never a view"
         );
         assert_eq!(
-            cdc_ok_line(load::plan::CdcLayout::BaseAndBuffer, &appended),
+            cdc_ok_line(&buffered),
             "40 change row(s) buffered into `p.d.orders__changes` — `rivet compact` merges them \
              into `p.d.orders`"
-        );
-        assert_eq!(
-            cdc_ok_line(load::plan::CdcLayout::LogAndView, &appended),
-            "40 row(s) appended to `p.d.orders__changes` | current-state view `p.d.orders`"
         );
 
         let cleaned = load::CdcLoadReport {
@@ -3291,7 +3290,7 @@ mod live_only_decisions {
             ..appended
         };
         assert_eq!(
-            append_done_line(&inputs.integrity, &cleaned),
+            cdc_done_line(&inputs.integrity, &cleaned),
             "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
              current-state view p.d.orders (source cleaned)",
             "a load that deleted the staged Parquet must SAY so — the prefix is empty now"

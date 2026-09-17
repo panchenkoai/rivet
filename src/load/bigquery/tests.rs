@@ -1099,7 +1099,7 @@ fn bigquery_live_cdc_view_dedups_at_least_once() {
         .api()
         .unwrap()
         .run_query_scalar(
-            &format!("SELECT COUNT(*) AS n FROM `{}`", second.view),
+            &format!("SELECT COUNT(*) AS n FROM `{}`", second.target),
             &loader.labels("count", table),
         )
         .expect("counting the dedup view should succeed");
