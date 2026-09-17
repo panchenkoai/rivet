@@ -365,16 +365,10 @@ pub(super) fn initial_snapshot_pending(
     let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
 
     // The pairing, resolved by the same function config load already admitted — so
-    // a reference the run would reject cannot have reached this point.
+    // a reference the run would reject cannot have reached this point, and the
+    // recipe-vs-stream type conflict was refused there too (`Config::validate`).
     let recipes = crate::config::resolve_backfill(export, &config.exports)
         .map_err(|why| anyhow::anyhow!(why))?;
-    // EVERY pair, on EVERY run — not only the tables still pending a baseline.
-    // Checked inside the leg builder, a conflict added after the baseline landed
-    // was never seen, and the stream wrote the second type into the log the
-    // baseline had written with the first.
-    for (table, recipe) in &recipes {
-        refuse_backfill_type_conflict(export, table, recipe)?;
-    }
 
     // The anchor — one entry point; the engine's AnchorModel decides the
     // mechanism (idempotent: a present anchor is never moved). After the refusal
@@ -436,40 +430,8 @@ pub(super) fn initial_snapshot_pending(
 ///
 /// Types MERGE rather than replace: the recipe's bare keys describe its one table,
 /// and a qualified `"table.column"` key on the CDC export still wins at resolution
-/// (`types::overrides_for_table`). A column both sides declare DIFFERENTLY is a
-/// refusal — the two legs write into one `<table>__changes`, so two types for one
-/// column is two truths, and the one that loses would be silent.
-/// Refuse a column `table`'s recipe and the CDC export type DIFFERENTLY — parsed types, so two
-/// spellings of one type (`decimal(11,4)` / `numeric(11,4)`) are not a conflict.
-fn refuse_backfill_type_conflict(
-    cdc_export: &ExportConfig,
-    table: &str,
-    recipe: &ExportConfig,
-) -> Result<()> {
-    let parsed =
-        |e: &ExportConfig| crate::plan::build::parse_column_overrides_pub(&e.columns, &e.name);
-    let (recipe_types, cdc_types) = (parsed(recipe)?, parsed(cdc_export)?);
-    let cdc_for_table = crate::types::overrides_for_unit(&cdc_types, Some(table));
-    // BOTH sides narrowed: a qualified recipe key (`orders.price`) against a bare
-    // CDC key (`price`) is the same column, and compared raw it was never seen.
-    let recipe_for_table = crate::types::overrides_for_unit(&recipe_types, Some(table));
-    for (col, mine) in &recipe_for_table {
-        if let Some(theirs) = cdc_for_table.get(col)
-            && theirs != mine
-        {
-            anyhow::bail!(
-                "export '{}': column '{col}' of table '{table}' is declared `{mine:?}` by its \
-                 backfill export '{}' and `{theirs:?}` by the CDC export — the baseline and the \
-                 stream write into one `<table>__changes`, so one column cannot have two types. \
-                 Keep the declaration on the batch export and drop the other.",
-                cdc_export.name,
-                recipe.name
-            );
-        }
-    }
-    Ok(())
-}
-
+/// (`types::overrides_for_table`). A column both sides declare DIFFERENTLY was
+/// refused at config load (`config::refuse_backfill_type_conflict`).
 fn apply_backfill_recipe(
     leg: &mut ExportConfig,
     recipe: &ExportConfig,
@@ -1183,7 +1145,7 @@ mod tests {
             std::collections::HashMap::from([("orders.price".into(), "decimal(12,4)".into())]);
         let err = format!(
             "{:#}",
-            refuse_backfill_type_conflict(&conflicting, "orders", &recipe)
+            crate::config::refuse_backfill_type_conflict(&conflicting, "orders", &recipe)
                 .expect_err("the baseline and the stream disagree about `price`")
         );
         assert!(err.contains("price") && err.contains("two types"), "{err}");
@@ -1192,7 +1154,7 @@ mod tests {
         let mut agreeing = stream.clone();
         agreeing.columns =
             std::collections::HashMap::from([("orders.price".into(), "decimal(10,2)".into())]);
-        refuse_backfill_type_conflict(&agreeing, "orders", &recipe)
+        crate::config::refuse_backfill_type_conflict(&agreeing, "orders", &recipe)
             .expect("agreement is not a conflict");
     }
 
@@ -1254,14 +1216,15 @@ mod tests {
             std::collections::HashMap::from([("orders.price".into(), "decimal(12,4)".into())]);
         let err = format!(
             "{:#}",
-            refuse_backfill_type_conflict(&stream, "orders", &recipe)
+            crate::config::refuse_backfill_type_conflict(&stream, "orders", &recipe)
                 .expect_err("one column, two types")
         );
         assert!(err.contains("price") && err.contains("two types"), "{err}");
         // The same type both ways is not a conflict.
         recipe.columns =
             std::collections::HashMap::from([("orders.price".into(), "decimal(14,6)".into())]);
-        refuse_backfill_type_conflict(&stream, "orders", &recipe).expect("agreement");
+        crate::config::refuse_backfill_type_conflict(&stream, "orders", &recipe)
+            .expect("agreement");
     }
 
     #[test]

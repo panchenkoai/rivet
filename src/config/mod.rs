@@ -1639,13 +1639,17 @@ impl Config {
             // The recipe's READ is validated here, not at the leg: `plan`/`check`
             // skip a recipe, so its table shortcut and `columns:` were first parsed
             // by the leg — after the anchor had been taken.
-            for (_, recipe) in &pairs {
+            for (table, recipe) in &pairs {
                 if self.source.source_type.is_sql()
                     && let Some(t) = recipe.table.as_deref()
                 {
                     export::validate_table_shortcut_ident(&recipe.name, t)?;
                 }
                 crate::plan::build::parse_column_overrides_pub(&recipe.columns, &recipe.name)?;
+                // One column, one type across the recipe and the stream — decided
+                // here, for every pair, so a conflict added after the baseline
+                // refuses the next run at config load, not after its anchor.
+                export::refuse_backfill_type_conflict(export, table, recipe)?;
             }
             // A `table.column` type key is narrowed by LEAF, so two captured tables
             // with one leaf cannot be typed apart: a recipe's `columns:` on either
@@ -2249,6 +2253,37 @@ mod reserved_load_extension {
             err.contains("share the leaf name")
                 && err.contains("sales.orders")
                 && err.contains("archive.orders"),
+            "{err}"
+        );
+    }
+
+    /// A column typed one way by the recipe and another by the stream is refused
+    /// at CONFIG LOAD — not on the next run, after its anchor. Same spelling in
+    /// two dialects (`decimal` / `numeric`) is one type, not a conflict.
+    #[test]
+    fn a_recipe_and_its_stream_typing_one_column_apart_is_refused_at_load() {
+        let cfg = |stream_cols: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                 \x20 - name: orders_baseline\n    table: orders\n    mode: full\n    format: parquet\n    \
+                 columns: {{ amount: \"decimal(18,2)\" }}\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: base/ }}\n\
+                 \x20 - name: stream\n    tables: [orders]\n    mode: cdc\n    format: parquet\n{stream_cols}    \
+                 cdc: {{ backfill: auto }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("")).expect("a recipe typing alone is fine");
+        Config::from_yaml(&cfg(
+            "    columns: { \"orders.amount\": \"numeric(18,2)\" }\n",
+        ))
+        .expect("the same type in another spelling is no conflict");
+        let err = Config::from_yaml(&cfg(
+            "    columns: { \"orders.amount\": \"decimal(11,4)\" }\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("one column cannot have two types") && err.contains("'amount'"),
             "{err}"
         );
     }

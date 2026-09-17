@@ -1169,6 +1169,41 @@ pub fn same_leaf_typed_pair(pairs: &[(String, &ExportConfig)]) -> Option<(String
     None
 }
 
+/// Refuse a column `table`'s recipe and the CDC export type DIFFERENTLY — parsed
+/// types, so two spellings of one type (`decimal(11,4)` / `numeric(11,4)`) are
+/// not a conflict. The two legs write into one warehouse table, so one column
+/// cannot have two types; a pure config decision, so it is made at config load
+/// (every pair, not only the tables still pending a baseline — a conflict added
+/// after the baseline landed must refuse the next run too).
+pub fn refuse_backfill_type_conflict(
+    cdc_export: &ExportConfig,
+    table: &str,
+    recipe: &ExportConfig,
+) -> anyhow::Result<()> {
+    let parsed =
+        |e: &ExportConfig| crate::plan::build::parse_column_overrides_pub(&e.columns, &e.name);
+    let (recipe_types, cdc_types) = (parsed(recipe)?, parsed(cdc_export)?);
+    // BOTH sides narrowed: a qualified recipe key (`orders.price`) against a bare
+    // CDC key (`price`) is the same column, and compared raw it was never seen.
+    let cdc_for_table = crate::types::overrides_for_unit(&cdc_types, Some(table));
+    let recipe_for_table = crate::types::overrides_for_unit(&recipe_types, Some(table));
+    for (col, mine) in &recipe_for_table {
+        if let Some(theirs) = cdc_for_table.get(col)
+            && theirs != mine
+        {
+            anyhow::bail!(
+                "export '{}': column '{col}' of table '{table}' is declared `{mine:?}` by its \
+                 backfill export '{}' and `{theirs:?}` by the CDC export — the baseline and the \
+                 stream write into one `<table>__changes`, so one column cannot have two types. \
+                 Keep the declaration on the batch export and drop the other.",
+                cdc_export.name,
+                recipe.name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The recipe [`resolve_backfill`] paired with `table`, if any.
 pub fn backfill_recipe_for<'a>(
     pairs: &[(String, &'a ExportConfig)],
