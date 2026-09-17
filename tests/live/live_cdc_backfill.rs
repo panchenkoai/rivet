@@ -510,14 +510,15 @@ fn count(text: String) -> i64 {
     text.parse().expect("a count")
 }
 
-/// Rows the warehouse has ACCUMULATED for this export: the changelog once it
-/// exists, the plain table before the first delta renames it into one.
+/// Rows the warehouse has ACCUMULATED for this export: the base table plus the
+/// `__changes` buffer once a delta created it (nothing compacts it in this test).
 fn loaded_rows(bq: &BqLive, table: &str, changes: &str) -> i64 {
-    if bq.read_bq_table_type(changes).is_some() {
+    let buffered = if bq.read_bq_table_type(changes).is_some() {
         count(bq.read_bq_count(changes))
     } else {
-        count(bq.read_bq_count(table))
-    }
+        0
+    };
+    count(bq.read_bq_count(table)) + buffered
 }
 
 /// Repeated runs of ONE config against a real warehouse: every run after the
@@ -568,8 +569,8 @@ fn repeated_runs_of_one_config_append_only_the_delta_to_the_changelog() {
     );
     assert_eq!(
         count(bq.read_bq_count(&tbl)),
-        8,
-        "the current-state view is one row per key"
+        5,
+        "the base is untouched until `rivet compact`; the delta sits in the buffer"
     );
 
     // Run 3 — nothing changed since run 2.
@@ -602,8 +603,8 @@ fn repeated_runs_of_one_config_append_only_the_delta_to_the_changelog() {
         "only the two new rows are appended"
     );
     assert_eq!(
-        count(bq.read_bq_count(&tbl)),
-        10,
-        "the view follows the new keys"
+        count(bq.read_bq_count(&changes)),
+        6,
+        "the buffer holds every change since the baseline, nothing twice"
     );
 }

@@ -210,6 +210,19 @@ pub enum Commands {
         #[arg(long)]
         rebuild_changelog: bool,
     },
+    /// Merge each base-and-buffer CDC table's `<table>__changes` buffer into its
+    /// base table (`MERGE` by primary key: updates, inserts, deletes flagged as
+    /// `__is_deleted`) and drop the buffer — the billed step of the cycle
+    /// `run → load → compact`, labelled `rivet_op:merge` per table.
+    Compact {
+        /// Path to YAML config file — the same one `rivet load` reads.
+        #[arg(short = 'c', long)]
+        config: String,
+        /// Correlation id stamped on every warehouse job of this compaction
+        /// (BigQuery `rivet_run` label). Defaults to a generated id.
+        #[arg(long, env = "RIVET_RUN_ID")]
+        run_id: Option<String>,
+    },
     /// Manage export state
     State {
         #[command(subcommand)]

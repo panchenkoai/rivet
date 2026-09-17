@@ -133,6 +133,18 @@ scenarios:
     incremental: { na: "shared seam: plan_loads builds every mode's plan with the same fit" }
     cdc:         { na: "shared seam (plan_loads / pin_plan_to_its_run)" }
 
+  - id: base_and_buffer_layout
+    what: "a `backfill:` stream's baseline OVERWRITES a physical base (`<table>`: source columns + `__is_deleted` written as data by the leg — BigQuery fills an absent column with NULL, never its DEFAULT, measured) and its changes APPEND into a partition-less buffer `<table>__changes`; no view, no MT7 adoption, no re-baseline refusal (a new baseline replaces the base). Live: run → load → base TABLE of 5 rows, no NULL flag; the changes land in the buffer while the base waits"
+    full:        { na: "a batch export has no baseline leg / change stream" }
+    incremental: { na: "incremental keeps the changelog + view layout" }
+    cdc:         { test: base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags }
+
+  - id: compact_merges_the_buffer_and_drops_it
+    what: "`rivet compact`: one MERGE per table (per ≤4,000-partition window) upserts the latest change per key into the base, flags a tombstone instead of deleting, un-flags a re-insert, then DROPs the buffer; both MERGE sides are bounded by the same constants so the base prunes; a crash between MERGE and DROP re-merges idempotently. Live: 8 rows / 7 live / 1 flagged with its last values, buffer gone, second compact a no-op, crash-and-retry merges once"
+    full:        { na: "nothing to compact" }
+    incremental: { na: "nothing to compact — the view dedups at read time" }
+    cdc:         { test: compact_merge_flags_deletes_and_prunes_both_sides_by_constants }
+
   - id: pin_listing_consistency
     what: "the pin lists the prefix and types the plan from the newest run WITH a spec; `prepare_load` lists again — a run that finishes between the two listings would be loaded with the older spec's columns. A run in the load's listing that finished AFTER the pinned run is refused for this cycle (`late_runs_refusal`, pure) and named; the next load pins it."
     full:        { test: a_run_that_finished_after_the_pinned_one_is_refused_this_cycle }

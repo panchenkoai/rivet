@@ -9,8 +9,9 @@
 //!     jobs (files 1–4 span exactly 4,000 days), DAY partitions, no staging left;
 //!   * the same table with the dates PERMUTED (every file spans all 5,000 days) →
 //!     refused BEFORE any job, naming the file; the ledger says `refused`;
-//!   * the CDC shape (`backfill: auto` with the keyset recipe) → `<table>__changes`
-//!     appended in two jobs, DAY partitions.
+//!   * the CDC shape (`backfill: auto` with the keyset recipe) → the baseline lands in
+//!     the BASE `<table>` via staging + CLONE in two jobs, DAY partitions, every row
+//!     `__is_deleted = false`; no buffer yet.
 //!
 //! Oracles: `bq` (count, distinct partitions, SUM(id), the table's partitioning), the
 //! SQLite ledger beside the config, the loader's own stderr only for the job count it
@@ -177,7 +178,7 @@ fn a_file_spanning_the_whole_history_is_refused_by_name_before_any_job() {
 
 #[test]
 #[ignore = "live: requires mysql-cdc + BigQuery creds"]
-fn a_cdc_baseline_over_a_wide_history_appends_the_changelog_in_batches() {
+fn a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches() {
     let Some(bq) = BqLive::from_env("pcdc") else {
         return;
     };
@@ -216,22 +217,26 @@ fn a_cdc_baseline_over_a_wide_history_appends_the_changelog_in_batches() {
     );
     assert!(
         out.status.success(),
-        "the CDC load must append in batches:\n{said}"
+        "the CDC baseline must land in the base in batches:\n{said}"
     );
-    assert!(said.contains("in 2 append jobs"), "{said}");
+    assert!(
+        said.contains("5 files in 2 load jobs") && said.contains("layout=base+buffer"),
+        "{said}"
+    );
 
-    let (n, partitions, sum) = warehouse_profile(&bq, &changes, "");
-    assert_eq!(n, ROWS, "the changelog holds the baseline once");
-    assert_eq!(partitions, ROWS, "DAY partitions on the changelog too");
-    assert_eq!(sum, expected_sum());
-    assert_eq!(
-        bq.read_bq_time_partitioning(&changes),
-        Some(("DAY".to_string(), Some("created_at".to_string())))
-    );
-    let (live, _, live_sum) = warehouse_profile(&bq, &table, "WHERE NOT __is_deleted");
+    let (live, partitions, live_sum) = warehouse_profile(&bq, &table, "WHERE NOT __is_deleted");
     assert_eq!(
         (live, live_sum),
         (ROWS, expected_sum()),
-        "the view equals the source"
+        "the base holds the baseline once, every row live"
+    );
+    assert_eq!(partitions, ROWS, "DAY partitions on the base");
+    assert_eq!(
+        bq.read_bq_time_partitioning(&table),
+        Some(("DAY".to_string(), Some("created_at".to_string())))
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "no buffer until the stream captures a change"
     );
 }

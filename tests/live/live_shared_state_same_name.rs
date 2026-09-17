@@ -7,7 +7,9 @@
 //! Two cycles, both blessed then crashed:
 //!   * CDC — anchor + backfill (a `full` recipe) → load → a delta → load → every
 //!     stream crashes AT ONCE on the CDC leg → plain run → load → then the streams
-//!     crash ONE AFTER ANOTHER while the others run clean → run → load.
+//!     crash ONE AFTER ANOTHER while the others run clean → run → load. Each check
+//!     of the warehouse first runs `rivet compact` when a buffer exists — the
+//!     cycle the partner runs (`run → load → compact`).
 //!   * batch (`mode: full`) — run → load → more rows → run → load → all crash at
 //!     once after a part is written → run → load.
 //!
@@ -251,16 +253,40 @@ fn remember_runs(legs: &mut [Leg]) {
 
 /// The live state of one leg's warehouse table equals its source: count, one row
 /// per key, SUM(id) — the last catches a row routed under another leg's prefix.
+/// A CDC leg's cycle ends with `rivet compact` (the buffer merged into the base),
+/// so this compacts whenever a buffer exists before reading.
 fn assert_leg_is_source(leg: &mut Leg, step: &str) {
     let source = leg.scn.count();
     let pk = leg.scn.pk();
     // The warehouse table carries the SOURCE table's name (`users` is the export).
     let wh = leg.scn.table.clone();
-    let live = if leg
+    if leg
         .bq
         .read_bq_table_type(&format!("{wh}__changes"))
         .is_some()
     {
+        // The same shared state every other step of the leg runs against.
+        let state = state_url().expect("the shared state URL that admitted this test");
+        let out = leg
+            .scn
+            .rig
+            .cli_env(&["compact"], &[("RIVET_STATE_URL", &state)]);
+        assert!(
+            out.status.success(),
+            "{step}: {}: rivet compact failed:\n{}",
+            leg.engine,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let flagged = !leg
+        .bq
+        .read_bq_rows(&format!(
+            "SELECT column_name FROM `{}.{}.INFORMATION_SCHEMA.COLUMNS` \
+             WHERE table_name = '{wh}' AND column_name = '__is_deleted'",
+            leg.bq.project, leg.bq.dataset
+        ))
+        .is_empty();
+    let live = if flagged {
         "WHERE NOT __is_deleted"
     } else {
         ""

@@ -124,6 +124,10 @@ pub struct BigQueryLoader {
     /// Where the staged Parquet lives, for the footer reads that pack a load into
     /// jobs of at most 4,000 partitions each; `None` loads everything in one job.
     pub footer_source: Option<crate::config::DestinationConfig>,
+    /// Base-and-buffer layout: `<table>__changes` is a per-cycle buffer — created
+    /// without a partition (whole-scanned by one MERGE, then dropped), never shape-
+    /// settled — and `compact` merges it into the base.
+    pub buffer_layout: bool,
     /// The REST client, built on first use and shared by every clone — so one
     /// access token serves a whole load instead of one per statement. Not part
     /// of the loader's identity: constructing a loader must stay free of I/O
@@ -140,6 +144,7 @@ impl BigQueryLoader {
             partition: None,
             clustering: Clustering::Auto(Vec::new()),
             run_id: None,
+            buffer_layout: false,
             footer_source: None,
             api: Arc::new(OnceLock::new()),
         }
@@ -161,6 +166,12 @@ impl BigQueryLoader {
     /// column's range from each file's Parquet footer under `dest`.
     pub fn batched_by_footers(mut self, dest: crate::config::DestinationConfig) -> Self {
         self.footer_source = Some(dest);
+        self
+    }
+
+    /// Lay `<table>__changes` out as the compaction BUFFER (see the field).
+    pub fn buffer_layout(mut self, on: bool) -> Self {
+        self.buffer_layout = on;
         self
     }
 
@@ -260,7 +271,7 @@ impl TargetLoader for BigQueryLoader {
         );
         match self
             .api()?
-            .run_query_scalar(&sql, &self.labels("probe", table))
+            .run_query_scalar(&sql, &self.labels("load", table))
         {
             Ok(n) => Ok(n > 0),
             // A missing __changes table is the FIRST cycle, not an error.
@@ -277,13 +288,13 @@ impl TargetLoader for BigQueryLoader {
         let sql = build_object_kind_sql(&self.project, &self.dataset, table);
         super::ObjectKind::from_probe(
             self.api()?
-                .run_query_scalar(&sql, &self.labels("probe", table))?,
+                .run_query_scalar(&sql, &self.labels("load", table))?,
         )
     }
 
     fn column_overlap(&self, table: &str, names: &[&str]) -> Result<(u64, u64)> {
         let (total, matched) = build_column_overlap_sql(&self.project, &self.dataset, table, names);
-        let (api, labels) = (self.api()?, self.labels("probe", table));
+        let (api, labels) = (self.api()?, self.labels("load", table));
         Ok((
             api.run_query_scalar(&total, &labels)?,
             api.run_query_scalar(&matched, &labels)?,
@@ -424,11 +435,17 @@ impl TargetLoader for BigQueryLoader {
         let changes_fqtn = self.fqtn(&changes);
 
         // Ensure the append-only log exists, partitioned and clustered as the load
-        // declares. Idempotent: created once, appended forever.
+        // declares. Idempotent: created once, appended forever. A BUFFER takes no
+        // partition: one MERGE reads all of it and `compact` drops it.
+        let log_partition_decl = if self.buffer_layout {
+            None
+        } else {
+            self.partition.as_ref()
+        };
         let create = build_create_changes_sql(
             &changes_fqtn,
             &schema,
-            self.partition.as_ref(),
+            log_partition_decl,
             self.cluster_by(),
         );
         self.run_sql(&create, "load", &changes)?;
@@ -443,11 +460,13 @@ impl TargetLoader for BigQueryLoader {
         }
         // …and its partition options, as the log takes them (no filter, no load-date expiry).
         let log_partition = self.partition.as_ref().map(changelog_partition);
-        if let Some(alter) = options_drift(
-            &changes_fqtn,
-            self.existing_shape(&changes)?.as_ref(),
-            log_partition.as_ref(),
-        ) {
+        if !self.buffer_layout
+            && let Some(alter) = options_drift(
+                &changes_fqtn,
+                self.existing_shape(&changes)?.as_ref(),
+                log_partition.as_ref(),
+            )
+        {
             self.run_sql(&alter, "load", &changes)?;
             eprintln!("  note: `{changes_fqtn}` partition options changed: {alter}");
         }
@@ -474,6 +493,160 @@ impl TargetLoader for BigQueryLoader {
 
     fn warehouse(&self) -> crate::load::cdc::Warehouse {
         crate::load::cdc::Warehouse::BigQuery
+    }
+
+    fn compact(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        pk: &[String],
+        engine: crate::load::cdc::SourceEngine,
+    ) -> Result<crate::load::CompactReport> {
+        use crate::load::cdc::{
+            DELETE_FLAG_COLUMN, RangeBound, compact_merge_sql, compact_probe_sql, day_windows,
+            is_meta_column, time_literal,
+        };
+        let base = self.fqtn(table);
+        let changes = format!("{table}__changes");
+        let changes_fqtn = self.fqtn(&changes);
+        if !matches!(self.object_kind(&changes)?, super::ObjectKind::Table) {
+            return Ok(crate::load::CompactReport {
+                base,
+                changes_rows: 0,
+                merge_jobs: 0,
+                had_buffer: false,
+            });
+        }
+        // The pruning bound comes from the buffer's own partition-column range; a
+        // time key is normalised to dates, an integer range key read as is.
+        let key = self.partition.as_ref().map(|p| &p.key);
+        let part_col = key.and_then(PartitionKey::column);
+        let time_key = matches!(key, Some(PartitionKey::Time { .. }));
+        let probe = compact_probe_sql(&changes_fqtn, part_col, time_key);
+        let row = self
+            .api()?
+            .run_query_first_row(&probe, &self.labels("merge", table))?;
+        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let changes_rows: u64 = cell(0).parse().unwrap_or(0);
+        let (lo, hi) = (cell(1), cell(2));
+        let nulls: u64 = cell(3).parse().unwrap_or(0);
+
+        let columns: Vec<&str> = specs
+            .iter()
+            .map(|s| s.column_name.as_str())
+            .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
+            .collect();
+        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+        let mut merges: Vec<String> = Vec::new();
+        if changes_rows > 0 {
+            match (key, part_col) {
+                (Some(PartitionKey::Time { granularity, .. }), Some(col)) if !lo.is_empty() => {
+                    let ty = specs
+                        .iter()
+                        .find(|s| s.column_name == col)
+                        .map(|s| s.target_type.as_str())
+                        .unwrap_or("TIMESTAMP");
+                    let step = match granularity {
+                        crate::load::plan::Granularity::Hour => 166,
+                        crate::load::plan::Granularity::Day => 4000,
+                        _ => i64::MAX / 4,
+                    };
+                    let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d");
+                    let (Ok(lo_d), Ok(hi_d)) = (parse(&lo), parse(&hi)) else {
+                        anyhow::bail!(
+                            "compact `{base}`: cannot read the buffer's `{col}` range ({lo:?}..{hi:?})"
+                        );
+                    };
+                    for (from, to) in day_windows(lo_d, hi_d, step) {
+                        let bound = RangeBound {
+                            column: col.to_string(),
+                            lo: time_literal(ty, from),
+                            hi_exclusive: time_literal(ty, to),
+                        };
+                        merges.push(compact_merge_sql(
+                            &base,
+                            &changes_fqtn,
+                            &columns,
+                            &pk_refs,
+                            engine,
+                            Some(&bound),
+                            None,
+                        ));
+                    }
+                    if nulls > 0 {
+                        merges.push(compact_merge_sql(
+                            &base,
+                            &changes_fqtn,
+                            &columns,
+                            &pk_refs,
+                            engine,
+                            None,
+                            Some(col),
+                        ));
+                    }
+                }
+                (Some(PartitionKey::Range { interval, .. }), Some(col)) if !lo.is_empty() => {
+                    let (Ok(lo_i), Ok(hi_i)) = (lo.parse::<i64>(), hi.parse::<i64>()) else {
+                        anyhow::bail!(
+                            "compact `{base}`: cannot read the buffer's `{col}` range ({lo:?}..{hi:?})"
+                        );
+                    };
+                    let step = interval.saturating_mul(4000).max(1);
+                    let mut from = lo_i;
+                    while from <= hi_i {
+                        let to = from.saturating_add(step);
+                        merges.push(compact_merge_sql(
+                            &base,
+                            &changes_fqtn,
+                            &columns,
+                            &pk_refs,
+                            engine,
+                            Some(&RangeBound {
+                                column: col.to_string(),
+                                lo: from.to_string(),
+                                hi_exclusive: to.to_string(),
+                            }),
+                            None,
+                        ));
+                        from = to;
+                    }
+                    if nulls > 0 {
+                        merges.push(compact_merge_sql(
+                            &base,
+                            &changes_fqtn,
+                            &columns,
+                            &pk_refs,
+                            engine,
+                            None,
+                            Some(col),
+                        ));
+                    }
+                }
+                _ => merges.push(compact_merge_sql(
+                    &base,
+                    &changes_fqtn,
+                    &columns,
+                    &pk_refs,
+                    engine,
+                    None,
+                    None,
+                )),
+            }
+        }
+        for sql in &merges {
+            self.run_sql(sql, "merge", table)?;
+        }
+        // The buffer is spent: the next load creates it anew from its run's spec. A
+        // crash between the MERGE and this DROP re-merges the same rows next time —
+        // the upsert is idempotent, so nothing is applied twice.
+        crate::test_hook::maybe_panic_at("compact_after_merge");
+        self.run_sql(&format!("DROP TABLE `{changes_fqtn}`;"), "merge", table)?;
+        Ok(crate::load::CompactReport {
+            base,
+            changes_rows,
+            merge_jobs: merges.len(),
+            had_buffer: true,
+        })
     }
 
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {
@@ -582,7 +755,7 @@ impl super::ShapeControl for BigQueryLoader {
         let sql = build_leftovers_sql(&self.project, &self.dataset, &names);
         let code = self
             .api()?
-            .run_query_scalar(&sql, &self.labels("probe", table))?;
+            .run_query_scalar(&sql, &self.labels("load", table))?;
         Ok(leftover_names(code, &names)
             .iter()
             .map(|n| self.fqtn(n))

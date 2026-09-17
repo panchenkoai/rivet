@@ -81,7 +81,11 @@ impl RowHashContract {
 /// Fallible because `row_hash` may name a column this export does not project;
 /// that refusal belongs at schema time, before a single row is read.
 pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef> {
-    if !meta.exported_at && !meta.row_hash.enabled() && meta.cdc_snapshot_pos.is_none() {
+    if !meta.exported_at
+        && !meta.row_hash.enabled()
+        && meta.cdc_snapshot_pos.is_none()
+        && !meta.deleted_flag
+    {
         return Ok(schema.clone());
     }
     // Resolved for its refusal, not its result: a name outside the projection
@@ -101,6 +105,15 @@ pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef
         fields.push(Arc::new(Field::new("__pos", DataType::Utf8, false)));
         fields.push(Arc::new(Field::new("__seq", DataType::Int64, false)));
     }
+    if meta.deleted_flag {
+        // The base table's delete flag, written as data: constant `false` on a
+        // baseline row. Same reserved name the changelog view projects.
+        fields.push(Arc::new(Field::new(
+            crate::load::cdc::DELETE_FLAG_COLUMN,
+            DataType::Boolean,
+            false,
+        )));
+    }
     if meta.row_hash.enabled() {
         fields.push(Arc::new(Field::new(COL_ROW_HASH, DataType::Int64, false)));
     }
@@ -115,7 +128,11 @@ pub fn enrich_batch(
     enriched_schema: &SchemaRef,
     exported_at_us: i64,
 ) -> Result<RecordBatch> {
-    if !meta.exported_at && !meta.row_hash.enabled() && meta.cdc_snapshot_pos.is_none() {
+    if !meta.exported_at
+        && !meta.row_hash.enabled()
+        && meta.cdc_snapshot_pos.is_none()
+        && !meta.deleted_flag
+    {
         return Ok(batch.clone());
     }
 
@@ -135,6 +152,10 @@ pub fn enrich_batch(
             n
         ])));
         columns.push(Arc::new(arrow::array::Int64Array::from(vec![-1i64; n])));
+    }
+
+    if meta.deleted_flag {
+        columns.push(Arc::new(arrow::array::BooleanArray::from(vec![false; n])));
     }
 
     if meta.row_hash.enabled() {
@@ -453,6 +474,43 @@ fn hash_column(batch: &RecordBatch, n: usize, cols: &[usize]) -> Result<Int64Arr
 mod tests {
     use super::*;
     use arrow::array::StringArray;
+
+    /// A base-and-buffer baseline leg carries its delete flag as DATA: a
+    /// `__is_deleted` column of constant `false`, so the base table's flag is
+    /// populated by the load itself (BigQuery fills an absent column with NULL,
+    /// not its DEFAULT — measured 2026-09-17).
+    #[test]
+    fn a_deleted_flag_leg_writes_a_constant_false_column() {
+        use arrow::array::{Array as _, BooleanArray, Int64Array};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let meta = MetaColumns {
+            deleted_flag: true,
+            ..MetaColumns::default()
+        };
+        let enriched = enrich_schema(&schema, &meta).unwrap();
+        assert_eq!(enriched.fields().len(), 2);
+        assert_eq!(
+            enriched.field(1).name(),
+            crate::load::cdc::DELETE_FLAG_COLUMN
+        );
+        assert_eq!(enriched.field(1).data_type(), &DataType::Boolean);
+        let out = enrich_batch(&batch, &meta, &enriched, 0).unwrap();
+        let flags = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("bool column");
+        assert_eq!(flags.len(), 3);
+        assert!(
+            (0..3).all(|i| !flags.value(i)),
+            "every baseline row is live"
+        );
+    }
     use arrow::datatypes::Field;
 
     /// A timestamp whose timezone is a NAME must hash, not refuse.
@@ -538,6 +596,7 @@ mod tests {
             exported_at: true,
             row_hash: RowHash::All(true),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(
@@ -564,6 +623,7 @@ mod tests {
                 exported_at: false,
                 row_hash: RowHash::All(true),
                 cdc_snapshot_pos: None,
+                deleted_flag: false,
             },
             &batch,
         );
@@ -572,6 +632,7 @@ mod tests {
                 exported_at: true,
                 row_hash: RowHash::All(true),
                 cdc_snapshot_pos: None,
+                deleted_flag: false,
             },
             &batch,
         );
@@ -618,6 +679,7 @@ mod tests {
             exported_at: false,
             row_hash: spec,
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         }
     }
 
@@ -632,6 +694,7 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(false),
             cdc_snapshot_pos: Some(r#"{"file":"binlog.000007","pos":42}"#.into()),
+            deleted_flag: false,
         };
         let enriched = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(
@@ -826,6 +889,7 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(false),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 2);
@@ -840,6 +904,7 @@ mod tests {
             exported_at: true,
             row_hash: RowHash::All(false),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 3);
@@ -866,6 +931,7 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(true),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.field(2).name(), COL_ROW_HASH);
@@ -890,6 +956,7 @@ mod tests {
             exported_at: true,
             row_hash: RowHash::All(true),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 4);
@@ -908,6 +975,7 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(true),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
 
@@ -938,6 +1006,7 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(true),
             cdc_snapshot_pos: None,
+            deleted_flag: false,
         };
         let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();

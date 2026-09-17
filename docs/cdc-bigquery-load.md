@@ -82,6 +82,34 @@ but clustering on `<pk>` keeps it cheap; if current state is read hot, add an
 SELECT * FROM <table>`) — one billed scan per day, not per read. This is the
 classic *log + periodic compaction*.
 
+## The base-and-buffer layout (`backfill:` streams) and `rivet compact`
+
+A stream whose baseline comes from `cdc.backfill:` does NOT use the view above.
+Its baseline legs overwrite a **physical base table** `<table>` — the source
+columns plus one service column, `__is_deleted BOOL` (written as `false` inside
+the baseline Parquet, so no NULL ever appears) — and the stream's runs append
+into `<table>__changes`, a **per-cycle buffer** without a partition. The cycle is
+
+```sh
+rivet run     -c cfg.yaml   # anchor once, baseline once, then only the changes
+rivet load    -c cfg.yaml   # baseline → <table> (batched, staging + CLONE); changes → <table>__changes
+rivet compact -c cfg.yaml   # MERGE <table>__changes into <table>; DROP the buffer
+```
+
+`compact` runs one `MERGE` per table: the latest change per key (the same
+`__pos` order the view uses) is upserted; a **delete flags** the base row
+(`__is_deleted = TRUE`, last values kept — the warehouse deletes nothing) and a
+later insert un-flags it. Both sides of the MERGE are bounded by the same
+constant range of the partition column, read from the buffer first, so the base
+scans only the touched partitions; a buffer spanning more than 4,000 partitions
+merges in windows. Afterwards the buffer is dropped and the next `load` creates
+it again from its run's spec. A crash between the MERGE and the DROP is harmless:
+the next compact merges the same rows again and the upsert is idempotent.
+
+Consumers read `<table>` directly, `WHERE NOT __is_deleted` for live rows. The
+buffer holds no history — `__is_deleted` in the base is the record that a row
+was deleted. BigQuery only in this release; Snowflake keeps the view layout.
+
 ## Every billed step carries its own label
 
 The whole point of the loader's job labels (`managed_by:rivet` /

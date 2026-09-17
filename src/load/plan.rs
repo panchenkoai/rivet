@@ -146,6 +146,18 @@ pub enum LoadMode {
     Cdc,
 }
 
+/// How a CDC export's tables are laid out in the warehouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdcLayout {
+    /// Baseline and changes in one `<table>__changes` log; `<table>` is the dedup
+    /// view over it (`initial: snapshot`, and every stream without a baseline).
+    LogAndView,
+    /// `<table>` is a physical base (source schema + `__is_deleted`) the baseline
+    /// legs overwrite; `<table>__changes` is a per-cycle buffer `rivet compact`
+    /// merges into the base and drops (`backfill:` streams).
+    BaseAndBuffer,
+}
+
 impl LoadMode {
     /// The ledger's `mode` discriminator (the `load_run.mode` column) — the single
     /// source of truth for the string that names each strategy in the state DB, so
@@ -225,6 +237,9 @@ pub struct LoadPlan {
     /// The run this plan was typed from — `(run_id, finished_at)` — once the load
     /// pinned it; a run that finishes after it is refused for this cycle.
     pub pinned_run: Option<(String, String)>,
+    /// Where a CDC table's baseline lives (see [`CdcLayout`]); `LogAndView` for
+    /// every non-CDC mode.
+    pub layout: CdcLayout,
 }
 
 /// The clustering columns of the table a load writes, and where they came from: a
@@ -365,6 +380,15 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
     // this table's. The fit is checked strictly after the pin, or by
     // `check_spec_fit` when no pin is possible.
     build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)
+}
+
+/// The warehouse layout of one export: a `backfill:` stream keeps a physical base
+/// and a disposable change buffer; everything else is the changelog + view.
+fn cdc_layout(export: &crate::config::ExportConfig, mode: LoadMode) -> CdcLayout {
+    match (mode, export.cdc.as_ref().and_then(|c| c.backfill.as_ref())) {
+        (LoadMode::Cdc, Some(_)) => CdcLayout::BaseAndBuffer,
+        _ => CdcLayout::LogAndView,
+    }
 }
 
 /// Whether a plan's `pk` / `cluster_by` / `partition` must name columns of the
@@ -622,6 +646,7 @@ fn build_plans_keyed(
             pk,
             clustering,
             pinned_run: None,
+            layout: cdc_layout(export, mode),
         });
     }
     reject_duplicate_target_tables(

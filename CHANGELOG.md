@@ -49,6 +49,23 @@
   stream no longer share one partition column and one key. Names must be captured tables.
 - **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
   it used to abort the whole config on the first `mode: cdc` export.
+- **A `backfill:` stream lands as a BASE TABLE plus a per-cycle buffer, and `rivet compact`
+  merges the buffer.** The baseline legs now OVERWRITE a physical `<table>` — the source
+  columns plus one service column, `__is_deleted BOOL`, written as `false` inside the baseline
+  Parquet itself — and the stream's runs append into `<table>__changes`, a buffer with no
+  partition. The new command `rivet compact -c cfg` runs one `MERGE` per table: the latest
+  change per key is upserted into the base, a tombstone flags the row (`__is_deleted = TRUE`,
+  values kept — the warehouse deletes nothing), a later insert un-flags it; the base's
+  partitions are pruned by constant bounds read from the buffer, a buffer touching more than
+  4,000 partitions merges in windows, and the buffer is DROPPED afterwards, so the next load
+  creates it fresh from its run's spec. There is no view in this layout; consumers read
+  `<table>` and filter `WHERE NOT __is_deleted`. A crash between the MERGE and the DROP is
+  re-merged idempotently by the next compact. Every compaction job carries `rivet_op:merge`;
+  the ledger records it as `mode: compact`. `initial: snapshot` streams keep the changelog +
+  view layout. BigQuery only in this release. The cycle (`run → load → compact`, the crash
+  between MERGE and DROP included) and the batched loads are a release-gate cell
+  (`warehouse_layout`) over `tests/live/live_cdc_compact.rs` and
+  `tests/live/live_load_partition_batches.rs`.
 - **A wide history loads in daily partitions, in batches — never coarsened to `month`.**
   BigQuery writes at most 4,000 partitions per job; a 317M-row table with eleven years of
   `created_at` days refused to load under `granularity: day`. `rivet load` now packs the

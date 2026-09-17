@@ -757,6 +757,13 @@ pub struct MetaColumns {
     #[serde(skip)]
     #[schemars(skip)]
     pub cdc_snapshot_pos: Option<String>,
+    /// INTERNAL (never user-config): the baseline leg of a base-and-buffer CDC
+    /// stream writes a constant `__is_deleted = false` into every row, so the base
+    /// table's delete flag is populated by the Parquet itself — `LOAD DATA` fills a
+    /// column the file lacks with NULL, never with the column's DEFAULT (measured).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub deleted_flag: bool,
 }
 
 // `any_enabled()` lived here to answer "does the CDC path need to warn that

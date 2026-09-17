@@ -69,6 +69,8 @@ mod live_catalog_hints;
 mod live_cdc;
 #[path = "live/live_cdc_backfill.rs"]
 mod live_cdc_backfill;
+#[path = "live/live_cdc_compact.rs"]
+mod live_cdc_compact;
 #[path = "live/live_cdc_full_cycle.rs"]
 mod live_cdc_full_cycle;
 #[path = "live/live_cdc_golden.rs"]

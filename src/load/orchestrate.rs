@@ -24,6 +24,12 @@ pub struct LoadArgs {
     pub rebuild_changelog: bool,
 }
 
+/// `rivet compact` arguments.
+pub struct CompactArgs {
+    pub config: String,
+    pub run_id: Option<String>,
+}
+
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
 /// declares the target once, and each export resolves to a table. A multi-table
 /// config loads every export into the shared target, one after another.
@@ -1101,6 +1107,228 @@ fn execute_load<R>(
     Ok(Some(report))
 }
 
+/// The base-and-buffer CDC load: the baseline legs OVERWRITE the physical base
+/// (`<table>`, source columns + `__is_deleted`), the stream's runs APPEND into the
+/// per-cycle buffer `<table>__changes` that `rivet compact` merges and drops. No
+/// view, no adoption, no re-baseline refusal — a new baseline replaces the base.
+fn load_one_cdc_base(
+    job: LoadJob<'_>,
+    pk: &[String],
+    allow_source_drift: bool,
+    state: Option<&StateStore>,
+) -> Result<Option<load::CdcLoadReport>> {
+    let plan = job.plan;
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  cdc load {} → {} | layout=base+buffer pk={} manifests={} parquet_files={} rows={}",
+                plan.table,
+                plan.load.target.name(),
+                pk.join(","),
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
+        },
+        |loader, store, inputs, legs| {
+            let (baseline, stream): (Vec<_>, Vec<_>) = inputs
+                .runs
+                .iter()
+                .cloned()
+                .partition(|(_, m)| is_baseline_leg(m));
+            let mut rows = 0u64;
+            let mut report: Option<load::CdcLoadReport> = None;
+            if !baseline.is_empty() {
+                let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
+                let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
+                let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+                let mut specs = plan.specs.clone();
+                specs.push(load::cdc::flag_spec(loader.warehouse()));
+                let r = load::run_load(
+                    loader,
+                    &plan.table,
+                    &specs,
+                    &uris,
+                    Some(integrity.file_rows),
+                    None,
+                    inputs.ownership,
+                )?;
+                eprintln!(
+                    "  baseline → `{}`: {} rows from {} leg(s) (source columns + `__is_deleted`)",
+                    r.target_table,
+                    r.rows_loaded,
+                    baseline.len()
+                );
+                let ids: Vec<String> = baseline.iter().map(|(_, m)| m.run_id.clone()).collect();
+                legs.landed(&ids, r.rows_loaded);
+                rows += r.rows_loaded;
+            }
+            let stream_uris = if stream.is_empty() {
+                Vec::new()
+            } else {
+                load::reconcile::select_load_uris(store, &plan.gcs_prefix, &stream)?
+            };
+            // An idle drain writes a Success manifest with no parts: nothing to
+            // buffer, and the run is still recorded consumed by the closing record.
+            if let Some(uris) = buffer_uris(stream_uris) {
+                let manifests: Vec<_> = stream.iter().map(|(_, m)| m.clone()).collect();
+                let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+                let cleanup = cleanup_target(plan, store, state);
+                let r = load::run_load_buffer(
+                    loader,
+                    &plan.table,
+                    &plan.specs,
+                    &uris,
+                    pk,
+                    Some(integrity.file_rows),
+                    cleanup,
+                )?;
+                rows += r.rows_appended;
+                report = Some(r);
+            }
+            let report = report.unwrap_or_else(|| load::CdcLoadReport {
+                rows_appended: 0,
+                changes_table: loader.fqtn(&format!("{}__changes", plan.table)),
+                view: loader.fqtn(&plan.table),
+                source_cleaned: false,
+            });
+            Ok((rows, report))
+        },
+        |inputs, report| eprintln!("{}", base_done_line(&inputs.integrity, report)),
+    )
+}
+
+/// The base-and-buffer sibling of [`append_done_line`]: the base the legs
+/// overwrote and the rows the stream buffered (the baseline line printed its own).
+fn base_done_line(
+    integrity: &load::reconcile::LoadIntegrity,
+    report: &load::CdcLoadReport,
+) -> String {
+    format!(
+        "  integrity ✓ {} → base {} | buffered {} row(s) into {}{}",
+        integrity.chain_prefix(),
+        report.view,
+        report.rows_appended,
+        report.changes_table,
+        cleaned_suffix(report.source_cleaned),
+    )
+}
+
+/// The buffer's Parquet, or `None` when the stream's runs produced no parts (an
+/// idle drain) — pure, so the live-only load body decides through it.
+fn buffer_uris(uris: Vec<String>) -> Option<Vec<String>> {
+    (!uris.is_empty()).then_some(uris)
+}
+
+/// A baseline leg is a BATCH run under the stream's prefix; the stream's own
+/// drains are `mode: cdc`. Names are no tell — a stream named `users` over table
+/// `t` writes `export_name = t`, exactly what a leg's family/name pair looks like.
+fn is_baseline_leg(m: &crate::manifest::RunManifest) -> bool {
+    m.mode != "cdc"
+}
+
+/// `rivet compact`: merge every base-and-buffer table's buffer into its base and
+/// drop the buffer. One MERGE per table (per partition window), labelled
+/// `rivet_op:merge`; a table without a buffer is a no-op, said so.
+pub fn run_compacts(args: CompactArgs) -> Result<()> {
+    let plans = load::plan::plan_loads(&args.config)?;
+    let run_id = resolve_run_id(args.run_id.clone());
+    let state = match StateStore::open(&args.config) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("  warning: state store unavailable ({e:#}); compacting without a ledger");
+            None
+        }
+    };
+    let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
+    let engine = if needs_source_engine(&plans) {
+        Some(load::plan::source_engine(&args.config)?)
+    } else {
+        None
+    };
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    for plan in &plans {
+        if plan.mode != load::plan::LoadMode::Cdc
+            || plan.layout != load::plan::CdcLayout::BaseAndBuffer
+        {
+            eprintln!(
+                "  compact [{}]: skipped — not a base-and-buffer CDC table (nothing to merge)",
+                plan.table
+            );
+            continue;
+        }
+        let load_id = format!("{run_id}:{}", plan.table);
+        let outcome = (|| -> Result<()> {
+            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg)?;
+            let loader = load::build_loader(&pinned, &run_id);
+            let target_fqtn = loader.fqtn(&pinned.table);
+            let _lease = match state
+                .as_ref()
+                .map(|s| s.try_load_lease(&target_fqtn))
+                .transpose()?
+            {
+                Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
+                held => held.flatten(),
+            };
+            let pk = require_pk(&pinned, "cdc")?;
+            let report = loader.compact(
+                &pinned.table,
+                &pinned.specs,
+                pk,
+                engine.expect("engine resolved above for a cdc plan"),
+            );
+            if let Some(s) = state.as_ref() {
+                let rec = LoadRecord {
+                    load_id: load_id.clone(),
+                    export_name: pinned.table.clone(),
+                    target_table: target_fqtn.clone(),
+                    warehouse: pinned.load.target.name().to_string(),
+                    mode: "compact".to_string(),
+                    source_run_ids: Vec::new(),
+                    source_ident: String::new(),
+                    rows_loaded: report.as_ref().map_or(0, |r| r.changes_rows as i64),
+                    status: if report.is_ok() { "success" } else { "failed" }.to_string(),
+                    finished_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(e) = s.store_load(&rec) {
+                    eprintln!("  warning: compact ledger write failed for `{target_fqtn}`: {e:#}");
+                }
+            }
+            let report = report?;
+            if report.had_buffer {
+                println!(
+                    "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE job(s); buffer dropped",
+                    plan.table, report.changes_rows, report.base, report.merge_jobs
+                );
+            } else {
+                println!(
+                    "COMPACT SKIP [{}]: no `{}__changes` buffer — nothing to merge",
+                    plan.table, plan.table
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            eprintln!("  COMPACT FAILED [{}]: {e:#}", plan.table);
+            failures.push(e.context(format!("compact '{}'", plan.table)));
+        }
+    }
+    match failures.len() {
+        0 => Ok(()),
+        1 => Err(failures.pop().unwrap()),
+        n => anyhow::bail!(
+            "{n} of {} table(s) failed to compact: {}",
+            plans.len(),
+            failures
+                .iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
+    }
+}
+
 /// How the ledger records a load that did not complete: `refused` when it stopped before
 /// any warehouse write (the target is not rivet's own for having been refused), `failed`
 /// otherwise.
@@ -1394,6 +1622,9 @@ fn load_one_cdc(
         allow_source_drift,
         mode: plan.mode,
     };
+    if let load::plan::CdcLayout::BaseAndBuffer = plan.layout {
+        return load_one_cdc_base(job, pk, allow_source_drift, state);
+    }
     execute_load(
         job,
         |inputs| {
@@ -1832,7 +2063,7 @@ mod load_ledger_tests {
     fn require_pk_error_names_the_export_not_the_table() {
         // #dogfood LOW: the require_pk message labelled the TABLE as the export
         // (`export content_items` for an export named `c1`).
-        use load::plan::{LoadMode, LoadPlan, LoadSection, LoadTarget};
+        use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
         let plan = LoadPlan {
             export_name: "c1".into(),
             unit: None,
@@ -1858,6 +2089,7 @@ mod load_ledger_tests {
             pk: vec![],
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
+            layout: CdcLayout::LogAndView,
         };
         let err = require_pk(&plan, "cdc").unwrap_err().to_string();
         assert!(err.contains("export `c1`"), "must name the export: {err}");
@@ -2104,7 +2336,7 @@ mod load_ledger_tests {
 mod live_only_decisions {
     use super::*;
     use crate::destination::gcs::GcsStore;
-    use load::plan::{LoadMode, LoadPlan, LoadSection, LoadTarget};
+    use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
 
     /// `ledger_status`: a `Refused` stop, however deep under context, is `refused`;
     /// anything else is `failed`.
@@ -2189,6 +2421,32 @@ mod live_only_decisions {
     /// run's `Running` marker carries no schema/table and renders as the bare
     /// engine; when it sorted first in the listing it WAS `mine`, so one crashed
     /// run's leftover marker refused every later load of the table, forever.
+    #[test]
+    fn an_idle_drain_leaves_nothing_to_buffer() {
+        assert_eq!(super::buffer_uris(Vec::new()), None);
+        assert_eq!(
+            super::buffer_uris(vec!["gs://b/p/a.parquet".to_string()]),
+            Some(vec!["gs://b/p/a.parquet".to_string()])
+        );
+    }
+
+    /// A stream named `users` over table `t` writes `export_name = t` under family
+    /// `users` — the SAME name/family shape as a baseline leg. Classifying by names
+    /// overwrote the base with the cycle's delta (live: 0 of 7 rows); the mode tells.
+    #[test]
+    fn a_stream_drain_is_never_taken_for_a_baseline_leg() {
+        let mut drain = success_manifest("r1", "cdc-000.parquet");
+        drain.export_name = "t".into();
+        drain.export_family = "users".into();
+        assert!(!super::is_baseline_leg(&drain), "mode: cdc is the stream");
+        let mut leg = drain.clone();
+        leg.mode = "batch".into();
+        assert!(
+            super::is_baseline_leg(&leg),
+            "a batch run under the prefix is a leg"
+        );
+    }
+
     #[test]
     fn the_pin_names_the_newer_runs_it_passed_over_and_stays_quiet_otherwise() {
         assert_eq!(super::skipped_runs_note("orders", "r1", &[]), None);
@@ -2275,6 +2533,7 @@ mod live_only_decisions {
             pk: vec!["id".into()],
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
+            layout: CdcLayout::LogAndView,
         }
     }
 
@@ -2949,6 +3208,13 @@ mod live_only_decisions {
             append_done_line(&inputs.integrity, &appended),
             "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
              current-state view p.d.orders"
+        );
+
+        assert_eq!(
+            base_done_line(&inputs.integrity, &appended),
+            "  integrity ✓ source 100 → files 100 → base p.d.orders | buffered 40 row(s) into \
+             p.d.orders__changes",
+            "the base layout names the base, never a view"
         );
 
         let cleaned = load::CdcLoadReport {

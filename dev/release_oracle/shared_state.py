@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 
 from .core import Ledger, ROOT, have, rivet_bin, run
 
@@ -38,8 +39,9 @@ def _verdict(out: str, name: str) -> str | None:
     return m.group(1) if m else None
 
 
-def verify_shared_state_same_name(led: Ledger) -> None:
-    led.phase("Shared state, same-named configs — four engines at once, blessed + crashed (CDC and batch)")
+def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
+                  cell: Callable[[str], str], msg: Callable[[str], str]) -> None:
+    """Run live Rig tests against the gate binary; grade each by cargo's own verdict line."""
     state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL") or ""
     proj = os.environ.get("BQ_ORACLE_PROJECT") or run(["gcloud", "config", "get-value", "project"]).stdout.strip()
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
@@ -48,8 +50,8 @@ def verify_shared_state_same_name(led: Ledger) -> None:
         ("Postgres state URL", state.startswith("postgres")), ("BigQuery project", bool(proj)),
     ) if not ok]
     if missing:
-        led.skipped("-", "shared", "same_name", "postgres",
-                    f"shared-state: cannot run — missing {', '.join(missing)}", "prereq")
+        led.skipped("-", scenario, "rig", "postgres",
+                    f"{scenario}: cannot run — missing {', '.join(missing)}", "prereq")
         return
     env = {
         "RIVET_TEST_STATE_URL": state,
@@ -57,19 +59,30 @@ def verify_shared_state_same_name(led: Ledger) -> None:
         "RIVET_TEST_GCS_BUCKET": bucket,
         "RIVET_BIN_OVERRIDE": str(rivet_bin()),
     }
-    p = run(["cargo", "test", "--test", "live_suite", "--", "--ignored", "--test-threads=1", *TESTS],
+    p = run(["cargo", "test", "--test", "live_suite", "--", "--ignored", "--test-threads=1", *tests],
             cwd=ROOT, env=env, timeout=None)
     out = (p.stdout or "") + (p.stderr or "")
-    for name in TESTS:
-        cycle = "cdc" if name.endswith("cdc_cycle") else "batch"
+    for name in tests:
         v = _verdict(out, name)
-        msg = f"shared-state[{cycle}] · 4 same-named configs, one Postgres state, parallel + crashes"
         if v == "ok":
-            led.passed("all", "shared", f"same_name:{cycle}", "postgres", msg, "ok")
+            led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
         elif v is None:
-            led.failed("all", "shared", f"same_name:{cycle}", "postgres",
-                       f"{msg} — no verdict line for {name} (build failure or wrong filter)",
+            led.failed("all", scenario, cell(name), "postgres",
+                       f"{msg(name)} — no verdict line for {name} (build failure or wrong filter)",
                        out[-400:])
         else:
             tail = out[out.find(name):][:1200] if name in out else out[-600:]
-            led.failed("all", "shared", f"same_name:{cycle}", "postgres", f"{msg} — {v}", tail)
+            led.failed("all", scenario, cell(name), "postgres", f"{msg(name)} — {v}", tail)
+
+
+def _cycle(name: str) -> str:
+    return "cdc" if name.endswith("cdc_cycle") else "batch"
+
+
+def verify_shared_state_same_name(led: Ledger) -> None:
+    led.phase("Shared state, same-named configs — four engines at once, blessed + crashed (CDC and batch)")
+    run_rig_tests(
+        led, "shared", TESTS,
+        cell=lambda n: f"same_name:{_cycle(n)}",
+        msg=lambda n: f"shared-state[{_cycle(n)}] · 4 same-named configs, one Postgres state, parallel + crashes",
+    )

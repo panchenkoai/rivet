@@ -19,8 +19,9 @@ init consolidates into one stream):
 4. run 1 = anchor + every table's baseline → load 1 → per table: BigQuery
    COUNT == source COUNT == 5;
 5. a delta in every table (3 inserts, 1 update, 1 delete) → run 2 → load 2 →
-   per table: the changelog holds baseline + 5, the live view (`WHERE NOT
-   __is_deleted`) == source == 7.
+   per table: the `__changes` buffer holds exactly the 5 changes, the base still
+   the 5-row baseline → `compact` → per table: live rows (`WHERE NOT
+   __is_deleted`) == source == 7, one flagged tombstone, the buffer dropped.
 
 Oracles: the `bq` CLI (never rivet) and a re-query of the source. SKIP — never a
 silent pass — without the engine URL, the `bq` CLI or a project. Cleans up the
@@ -80,6 +81,11 @@ def _bq_scalar(proj: str, dset: str, expr: str, table: str, where: str = "") -> 
 
 def _bq_count(proj: str, dset: str, table: str, where: str = "") -> int:
     return _bq_scalar(proj, dset, "COUNT(*)", table, where)
+
+
+def _bq_table_exists(proj: str, dset: str, table: str) -> bool:
+    return _bq_scalar(proj, dset, "COUNT(*)", "INFORMATION_SCHEMA.TABLES",
+                      f"WHERE table_name = '{table}'") > 0
 
 
 def _seed(engine: str, url: str) -> bool:
@@ -209,7 +215,8 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
                     "; ".join(f"{t}: bigquery={b} source={s} sum(id) bq={bs} src={ss}" for t, (b, s, bs, ss) in got.items())):
             return
 
-        # delta in every table → run 2 → load 2: live == source, changelog == baseline + 5.
+        # delta in every table → run 2 → load 2: the buffer holds exactly the 5 changes,
+        # the base still the baseline; → compact: live == source, buffer dropped.
         _delta(engine, url)
         r2 = rivet("run", "-c", str(cfg), env=env, timeout=NO_TIMEOUT)
         if not _row(led, engine, "run2", r2.ok, f"exit={r2.returncode}" + ("" if r2.ok else f" {(r2.stderr or '')[-240:]}")):
@@ -217,16 +224,24 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
         l2 = rivet("load", "-c", str(cfg), "--run-id", f"partner-{engine}-{slug}-2", env=env, timeout=NO_TIMEOUT)
         if not _row(led, engine, "load2", l2.ok, f"exit={l2.returncode}" + ("" if l2.ok else f" {(l2.stderr or '')[-240:]}")):
             return
+        buffered = {t: (_bq_count(proj, dset, f"{t}__changes"), _bq_count(proj, dset, t)) for t in TABLES}
+        if not _row(led, engine, "buffer", all(b == 5 and base == SEED for b, base in buffered.values()),
+                    "; ".join(f"{t}: changes={b} base={base}" for t, (b, base) in buffered.items())):
+            return
+        c2 = rivet("compact", "-c", str(cfg), "--run-id", f"partner-{engine}-{slug}-c2", env=env, timeout=NO_TIMEOUT)
+        if not _row(led, engine, "compact", c2.ok, f"exit={c2.returncode}" + ("" if c2.ok else f" {(c2.stderr or '')[-240:]}")):
+            return
         got2 = {t: (_bq_count(proj, dset, t, "WHERE NOT __is_deleted"),
-                    _bq_count(proj, dset, f"{t}__changes"),
+                    _bq_count(proj, dset, t, "WHERE __is_deleted"),
                     _count(engine, url, t),
                     _bq_scalar(proj, dset, "IFNULL(SUM(id), 0)", t, "WHERE NOT __is_deleted"),
-                    _sum_id(engine, url, t)) for t in TABLES}
-        ok2 = all(live == src == DELTA_LIVE and log == SEED + 5 and bs == ss
-                  for live, log, src, bs, ss in got2.values())
+                    _sum_id(engine, url, t),
+                    _bq_table_exists(proj, dset, f"{t}__changes")) for t in TABLES}
+        ok2 = all(live == src == DELTA_LIVE and gone == 1 and bs == ss and not buf
+                  for live, gone, src, bs, ss, buf in got2.values())
         _row(led, engine, "delta", ok2,
-             "; ".join(f"{t}: live={live} changelog={log} source={src} sum(id) bq={bs} src={ss}"
-                       for t, (live, log, src, bs, ss) in got2.items()))
+             "; ".join(f"{t}: live={live} flagged={gone} source={src} sum(id) bq={bs} src={ss} buffer_left={buf}"
+                       for t, (live, gone, src, bs, ss, buf) in got2.items()))
     finally:
         for t in TABLES:
             run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{proj}:{dset}.{t}"])

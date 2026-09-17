@@ -36,6 +36,18 @@ pub struct LoadReport {
 
 /// Outcome of a CDC change-log load: rows appended to the `<table>__changes`
 /// log plus the current-state dedup view rebuilt over it.
+/// What one `rivet compact` did to one table.
+#[derive(Debug, Clone)]
+pub struct CompactReport {
+    pub base: String,
+    /// Rows the buffer held before the merge.
+    pub changes_rows: u64,
+    /// MERGE statements run (one per partition window).
+    pub merge_jobs: usize,
+    /// Whether a buffer existed to compact at all.
+    pub had_buffer: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CdcLoadReport {
     pub rows_appended: u64,
@@ -96,6 +108,23 @@ pub trait TargetLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64>;
+
+    /// Merge `<table>__changes` (the base-and-buffer layout's per-cycle buffer)
+    /// into the base `table` and drop the buffer. `specs` are the base's source
+    /// columns, `pk` the merge key, `engine` how `__pos` orders the changes.
+    fn compact(
+        &self,
+        table: &str,
+        _specs: &[TargetColumnSpec],
+        _pk: &[String],
+        _engine: cdc::SourceEngine,
+    ) -> Result<CompactReport> {
+        bail!(
+            "`rivet compact` is BigQuery-only in this release — `{}` targets {:?}",
+            self.fqtn(table),
+            self.warehouse()
+        )
+    }
 
     /// The warehouse this adapter targets — lets the shared driver build the
     /// current-state view SQL (dialect keyword + identifier quoting) in ONE place
@@ -791,6 +820,40 @@ pub fn run_load_cdc(
     )
 }
 
+/// Append a base-and-buffer stream's change Parquet into `<table>__changes` — the
+/// per-cycle BUFFER `rivet compact` merges into the base and drops. No view, no
+/// adoption of an earlier full table (the base IS a table, by design), no shape
+/// settling: the buffer is created fresh each cycle from the run's own spec.
+#[allow(clippy::too_many_arguments, private_interfaces)]
+pub fn run_load_buffer(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    uris: &[String],
+    pk: &[String],
+    expected_delta: Option<u64>,
+    cleanup: Option<(&GcsStore, &str)>,
+) -> Result<CdcLoadReport> {
+    before_write(append_preflight(loader, table, specs, uris, pk, "CDC"))?;
+    let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
+    if let Some(expected) = expected_delta
+        && rows_appended != expected
+    {
+        bail!(
+            "CDC count validation failed for `{}__changes`: appended {rows_appended} rows, \
+             expected {expected} from the run manifests — investigate before compacting",
+            table
+        );
+    }
+    let source_cleaned = maybe_cleanup(cleanup);
+    Ok(CdcLoadReport {
+        rows_appended,
+        changes_table: loader.fqtn(&format!("{table}__changes")),
+        view: loader.fqtn(table),
+        source_cleaned,
+    })
+}
+
 /// Load an INCREMENTAL export's delta: APPEND the parquet into `<table>__changes`
 /// (reusing the CDC changelog append — the delta's rows land with NULL `__op`/
 /// `__pos`/`__seq`, which the view drops) and (re)build a current-state view
@@ -928,7 +991,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
                 &plan.clustering,
                 run_id,
             )
-            .batched_by_footers(plan.destination.clone()),
+            .batched_by_footers(plan.destination.clone())
+            .buffer_layout(matches!(plan.layout, plan::CdcLayout::BaseAndBuffer)),
         ),
         LoadTarget::Snowflake {
             connection,

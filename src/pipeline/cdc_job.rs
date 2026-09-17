@@ -401,7 +401,16 @@ pub(super) fn initial_snapshot_pending(
         if let Some(recipe) = crate::config::backfill_recipe_for(&recipes, label) {
             apply_backfill_recipe(&mut synth, recipe, export, label)?;
         }
-        synth.meta_columns.cdc_snapshot_pos = anchor_pos.clone();
+        // Base-and-buffer layout (`backfill:`): the leg's rows become the BASE
+        // table, so they carry the delete flag as data and no `__pos` stamp — the
+        // stamp orders rows inside a changelog the base never joins.
+        let base_layout = cdc.backfill.is_some();
+        synth.meta_columns.deleted_flag = base_layout;
+        synth.meta_columns.cdc_snapshot_pos = if base_layout {
+            None
+        } else {
+            anchor_pos.clone()
+        };
         pending.push(synth);
     }
     Ok(pending)
