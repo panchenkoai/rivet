@@ -1202,3 +1202,42 @@ fn bigquery_live_adopts_a_full_load_table_as_the_changelog_baseline() {
     assert_eq!(copied.unwrap(), 3);
     assert_eq!(viewed.unwrap(), 3);
 }
+
+/// The partition cap is the TARGET table's: a disposable buffer is never
+/// partitioned, so its append packs into one job without opening the footer
+/// store — whatever the base declares. The `Some` arm proves the fixture is not
+/// inert: the same loader, asked to pack under the base's partition, does reach
+/// for the footers (and fails on the bogus store).
+#[test]
+fn an_unpartitioned_target_packs_into_one_job_without_reading_footers() {
+    let dest: crate::config::DestinationConfig =
+        serde_yaml_ng::from_str("type: gcs\nbucket: nonexistent-bughunt\nprefix: x").unwrap();
+    let partition = partition_at(time_key(Some("ts"), Granularity::Day), None, false);
+    let loader = BigQueryLoader::new("p", "d")
+        .partition(partition.clone())
+        .batched_by_footers(dest);
+    let uris = uris();
+    assert_eq!(loader.batches(&uris, None).unwrap(), vec![uris.clone()]);
+    assert!(loader.batches(&uris, Some(&partition)).is_err());
+}
+
+/// The compaction script ends with `(changes_rows, merge_jobs)`; a row that does
+/// not read as that pair is an error, never a report identical to an empty
+/// buffer's.
+#[test]
+fn an_unreadable_compaction_summary_is_an_error_not_an_empty_report() {
+    let ok = compact_summary(&[Some("12".into()), Some("2".into())]).unwrap();
+    assert_eq!(ok, (12, 2));
+    for row in [
+        vec![],
+        vec![Some("12".into())],
+        vec![None, Some("2".into())],
+        vec![Some("many".into()), Some("2".into())],
+    ] {
+        let e = compact_summary(&row).unwrap_err().to_string();
+        assert!(
+            e.contains("buffer dropped") && e.contains("summary row"),
+            "{e}"
+        );
+    }
+}

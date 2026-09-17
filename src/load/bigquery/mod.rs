@@ -88,7 +88,7 @@ use super::TargetLoader;
 use super::bq_rest::BigQueryApi;
 use crate::load::plan::{Clustering, Granularity, PartitionForm, PartitionKey, TablePartition};
 use crate::types::target::TargetColumnSpec;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 // ── BigQuery ─────────────────────────────────────────────────────────────────
@@ -175,10 +175,16 @@ impl BigQueryLoader {
         self
     }
 
-    /// The load jobs `uris` need under the declared partition: one when nothing bounds
-    /// them (no partition column or no footer source), else footer-packed batches.
-    fn batches(&self, uris: &[String]) -> Result<Vec<Vec<String>>> {
-        let keyed = self.partition.as_ref().filter(|p| p.key.column().is_some());
+    /// The load jobs `uris` need under the TARGET's partition: one when nothing bounds
+    /// them (an unpartitioned target, no partition column, or no footer source), else
+    /// footer-packed batches. The partition cap is the target table's, so a
+    /// disposable buffer (never partitioned) passes `None` whatever the base declares.
+    fn batches(
+        &self,
+        uris: &[String],
+        partition: Option<&TablePartition>,
+    ) -> Result<Vec<Vec<String>>> {
+        let keyed = partition.filter(|p| p.key.column().is_some());
         match self.footer_source.as_ref().zip(keyed) {
             Some((dest, partition)) => {
                 let store = crate::load::open_store(dest)?;
@@ -353,7 +359,7 @@ impl TargetLoader for BigQueryLoader {
         let options = creation_options(existing.is_none(), self.partition.as_ref());
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
-        let batches = self.batches(uris)?;
+        let batches = self.batches(uris, self.partition.as_ref())?;
         // One job (or nothing to pack) OVERWRITES the target directly; several go
         // through staging below. A pattern, not a count compare: this body is
         // live-only and its decisions are graded here by shape, not by mutation.
@@ -496,7 +502,7 @@ impl TargetLoader for BigQueryLoader {
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes)?;
-        let batches = self.batches(uris)?;
+        let batches = self.batches(uris, log_partition_decl)?;
         if let [_, _, ..] = batches.as_slice() {
             eprintln!(
                 "  {changes_fqtn}: {} files in {} append jobs (≤ {} partitions each)",
@@ -569,14 +575,14 @@ impl TargetLoader for BigQueryLoader {
         if let Some(day_column) = day_column {
             let script = compact_script_sql(&base, &changes_fqtn, specs, pk, engine, day_column);
             let row = api.run_query_first_row(&script, &self.labels("merge", table))?;
-            let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+            let (changes_rows, merge_jobs) = compact_summary(&row)?;
             // The buffer is gone with the script; a crash HERE loses nothing — the
             // next compact finds no buffer and says so.
             crate::test_hook::maybe_panic_at("compact_after_merge");
             return Ok(crate::load::CompactReport {
                 base,
-                changes_rows: cell(0).parse().unwrap_or(0),
-                merge_jobs: cell(1).parse().unwrap_or(0),
+                changes_rows,
+                merge_jobs,
                 had_buffer: true,
             });
         }
@@ -827,6 +833,24 @@ pub(crate) fn clusterable(target_type: &str) -> bool {
 /// Whether a column name is one of rivet's CDC meta columns — filtered out of
 /// the data specs before the meta columns are prepended, so a schema can never
 /// declare `__op`/`__pos`/`__seq` twice.
+/// The `(changes_rows, merge_jobs)` row the compaction script ends with; an
+/// unreadable row is an error, never a report that reads like an empty buffer.
+fn compact_summary(row: &[Option<String>]) -> Result<(u64, usize)> {
+    let cell = |i: usize, what: &str| -> Result<u64> {
+        row.get(i)
+            .cloned()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .with_context(|| {
+                format!(
+                    "compaction ran (buffer dropped) but its summary row had no readable \
+                     {what}: {row:?}"
+                )
+            })
+    };
+    Ok((cell(0, "changes_rows")?, cell(1, "merge_jobs")? as usize))
+}
+
 fn is_meta_column(name: &str) -> bool {
     crate::load::cdc::is_meta_column(name)
 }
