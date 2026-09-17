@@ -197,11 +197,14 @@ fn pin_plan_to_its_run(
     state: Option<&StateStore>,
     cfg: &crate::config::Config,
 ) -> Result<load::plan::LoadPlan> {
+    // The by-name plan was built with its fit DEFERRED (`SpecFit::Deferred`), so
+    // a path that keeps it owes the strict check the pin would have done.
     let unpinned = |why: &str| {
         eprintln!(
             "  load [{}]: typed from the by-name load spec — {why}",
             plan.table
         );
+        load::plan::check_spec_fit(plan)?;
         Ok(plan.clone())
     };
     let Some(s) = state else {
@@ -237,18 +240,18 @@ fn pin_plan_to_its_run(
             b.1.cmp(&a.1)
         }
     });
-    let mut pinned: Option<(String, crate::state::LoadSpec)> = None;
+    let mut pinned: Option<(String, String, crate::state::LoadSpec)> = None;
     // Newer Success runs that recorded no spec (a crash after the manifest and
     // before the spec write; a drain that acked parts then failed) are typed from
     // the older pinned run — said so, since a column added between them is
     // exactly what the pin exists to type.
     let mut skipped: Vec<&str> = Vec::new();
-    for (_, run_id) in &newest_first {
+    for (finished_at, run_id) in &newest_first {
         // With the init-recorded key when the run recorded none (a `query:` export
         // has no key to read) — never with a key another run wrote by name.
         match s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), run_id) {
             Ok(Some(spec)) => {
-                pinned = Some((run_id.clone(), spec));
+                pinned = Some((run_id.clone(), finished_at.clone(), spec));
                 break;
             }
             Ok(None) => {
@@ -260,7 +263,7 @@ fn pin_plan_to_its_run(
             }
         }
     }
-    let Some((run_id, spec)) = pinned else {
+    let Some((run_id, finished_at, spec)) = pinned else {
         return unpinned(&format!(
             "none of its {} loadable run(s) recorded a per-run spec (runs older than this \
              release, baseline legs only, a run that crashed after its manifest and before \
@@ -277,14 +280,48 @@ fn pin_plan_to_its_run(
     };
     // A readable spec the config does not fit is a REFUSAL, not a fallback: the
     // by-name spec is exactly what this pin exists to distrust.
-    load::plan::retype_plan(cfg, plan, &spec, target).with_context(|| {
+    let mut retyped = load::plan::retype_plan(cfg, plan, &spec, target).with_context(|| {
         format!(
             "load [{}]: the config does not fit the columns run {run_id} recorded — if the \
              config changed after that run (a new `pk:` / `partition.column`), run `rivet run \
              -e {}` once so a run records the column, then load again",
             plan.table, plan.export_name
         )
+    })?;
+    retyped.pinned_run = Some((run_id, finished_at));
+    Ok(retyped)
+}
+
+/// Runs in this listing that finished AFTER the run the plan was typed from: a
+/// run landing between the pin's listing and the load's would be loaded with an
+/// older spec's columns. Refused for this cycle; the next load pins it.
+fn late_runs_refusal(
+    table: &str,
+    runs: &[(String, crate::manifest::RunManifest)],
+    pin: Option<&(String, String)>,
+) -> Option<String> {
+    let (pinned_id, pinned_at) = pin?;
+    let late: Vec<&str> = runs
+        .iter()
+        .filter(|(_, m)| crate::manifest::census::finished_after(&m.finished_at, pinned_at))
+        .map(|(_, m)| m.run_id.as_str())
+        .collect();
+    (!late.is_empty()).then(|| {
+        format!(
+            "load [{table}]: run(s) {} finished after run {pinned_id}, which this load was \
+             typed from — a run landed between typing and listing. Run `rivet load` again to \
+             type from the newest run.",
+            late.join(", ")
+        )
     })
+}
+
+/// The refusal when another `rivet load` holds the table's lease.
+fn lease_busy_message(target_fqtn: &str) -> String {
+    format!(
+        "load: another `rivet load` is writing `{target_fqtn}` right now (the lease is held; \
+         it is released when that process ends, crash included). Wait for it, then retry."
+    )
 }
 
 /// The stderr line naming the newer runs the pin passed over, or `None` when the
@@ -701,6 +738,9 @@ fn prepare_load(
     if new.is_empty() {
         return Ok(None);
     }
+    if let Some(why) = late_runs_refusal(&plan.table, &new, plan.pinned_run.as_ref()) {
+        anyhow::bail!(why);
+    }
     // THE WAREHOUSE TABLE BELONGS TO ONE SOURCE.
     //
     // `ensure_single_export` above refuses two sources sharing a PREFIX. Two
@@ -993,6 +1033,16 @@ fn execute_load<R>(
     let store = load::open_store(&job.plan.destination)?;
     let loader = load::build_loader(job.plan, job.run_id);
     let target_fqtn = loader.fqtn(&job.plan.table);
+    // One load per table at a time: two concurrent loads both read the ledger
+    // before either writes it and append the same runs twice.
+    let _lease = match job
+        .state
+        .map(|s| s.try_load_lease(&target_fqtn))
+        .transpose()?
+    {
+        Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
+        held => held.flatten(),
+    };
     let mut ctx = LoadCtx {
         state: job.state,
         load_id: job.load_id,
@@ -1807,6 +1857,7 @@ mod load_ledger_tests {
             cursor_column: None,
             pk: vec![],
             clustering: load::plan::Clustering::Auto(vec![]),
+            pinned_run: None,
         };
         let err = require_pk(&plan, "cdc").unwrap_err().to_string();
         assert!(err.contains("export `c1`"), "must name the export: {err}");
@@ -2223,6 +2274,7 @@ mod live_only_decisions {
             cursor_column: None,
             pk: vec!["id".into()],
             clustering: load::plan::Clustering::Auto(vec![]),
+            pinned_run: None,
         }
     }
 
@@ -2401,6 +2453,42 @@ mod live_only_decisions {
 
     /// A minimal Success manifest whose one part exists in the store — enough for
     /// `prepare_load` to fetch, select and integrity-check it.
+    /// A run that finished after the one the plan was typed from is refused this
+    /// cycle; the pinned run itself and older runs pass, and an unpinned plan
+    /// (stateless load) refuses nothing.
+    #[test]
+    fn a_run_that_finished_after_the_pinned_one_is_refused_this_cycle() {
+        let mut older = success_manifest("r1", "p1.parquet");
+        older.finished_at = "2026-08-21T00:00:30Z".into();
+        let pinned = success_manifest("r2", "p2.parquet"); // 00:01:00Z
+        let mut late = success_manifest("r3", "p3.parquet");
+        late.finished_at = "2026-08-21T00:01:00.250Z".into();
+        let pin = ("r2".to_string(), "2026-08-21T00:01:00Z".to_string());
+        let runs = |ms: Vec<crate::manifest::RunManifest>| {
+            ms.into_iter()
+                .map(|m| (m.run_id.clone(), m))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            super::late_runs_refusal(
+                "orders",
+                &runs(vec![older.clone(), pinned.clone()]),
+                Some(&pin)
+            ),
+            None
+        );
+        let why = super::late_runs_refusal("orders", &runs(vec![pinned, late]), Some(&pin))
+            .expect("r3 is late");
+        assert!(
+            why.contains("r3") && why.contains("r2") && why.contains("orders"),
+            "{why}"
+        );
+        assert_eq!(
+            super::late_runs_refusal("orders", &runs(vec![older]), None),
+            None
+        );
+    }
+
     fn success_manifest(run: &str, part: &str) -> crate::manifest::RunManifest {
         use crate::manifest::*;
         RunManifest {

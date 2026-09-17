@@ -54,6 +54,7 @@ from . import (
     regression,
     release_path,
     scenarios,
+    shared_state,
     state_parity,
 )
 
@@ -395,6 +396,9 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
             "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
         ),
     )
+    # Four SAME-NAMED configs on one shared Postgres state, at once — the
+    # deployment shape the shared-state docs recommend; blessed and crashed.
+    shared_state.verify_shared_state_same_name(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),

@@ -120,3 +120,21 @@ scenarios:
     full:        { na: "a batch export has one table; its per-table block IS the export's `load:`" }
     incremental: { na: "one table per export, as full" }
     cdc:         { test: a_multiplex_export_takes_per_table_load_overrides }
+
+  - id: load_lease
+    what: "ONE `rivet load` per warehouse table at a time: two concurrent loads both read the ledger before either wrote it and appended the same runs twice. The lease is a Postgres session advisory lock on a shared state, an `flock` sidecar beside a SQLite state — released by the OS when the holder dies, no clock, no cleanup command. Taken in `execute_load` before `prepare_load`, so every mode passes through it."
+    full:        { test: a_second_load_of_the_same_table_waits_for_the_first_to_release }
+    incremental: { na: "shared seam (execute_load), one lease call for every mode" }
+    cdc:         { na: "shared seam (execute_load)" }
+
+  - id: by_name_plan_fit_deferred_until_pin
+    what: "the plan `rivet load` builds from the BY-NAME spec is provisional: on a shared state DB that row may be another config's same-named export (measured live: MySQL's `users` load refused `pk: id` against Mongo's `_id` spec before the pin could run). `pk` / `cluster_by` / `partition` column existence is DEFERRED at plan time (`SpecFit::Deferred`), checked strictly by the pin's rebuild from the run's own spec, and by `check_spec_fit` on every path that keeps the by-name plan."
+    full:        { test: a_by_name_plan_defers_its_key_fit_to_the_pin_and_still_owes_it }
+    incremental: { na: "shared seam: plan_loads builds every mode's plan with the same fit" }
+    cdc:         { na: "shared seam (plan_loads / pin_plan_to_its_run)" }
+
+  - id: pin_listing_consistency
+    what: "the pin lists the prefix and types the plan from the newest run WITH a spec; `prepare_load` lists again — a run that finishes between the two listings would be loaded with the older spec's columns. A run in the load's listing that finished AFTER the pinned run is refused for this cycle (`late_runs_refusal`, pure) and named; the next load pins it."
+    full:        { test: a_run_that_finished_after_the_pinned_one_is_refused_this_cycle }
+    incremental: { na: "shared seam: the check runs in prepare_load on the selected runs of every mode" }
+    cdc:         { na: "shared seam (prepare_load)" }

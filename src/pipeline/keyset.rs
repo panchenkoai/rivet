@@ -469,13 +469,14 @@ fn run_keyset_parallel(
         (Some(rid), Some(st)) => {
             summary.run_id = rid.clone();
             summary.resumed = true;
-            let rows = st.load_keyset_ranges(&plan.export_name, rid)?;
+            let rows = st.load_keyset_ranges(&plan.export_name, rid, &key)?;
             if rows.is_empty() {
                 // Anchor set but no persisted ranges (a crash between set_resume_
-                // run_id and persist_keyset_ranges — nothing committed): re-sample
-                // + persist under this run_id and start over. No skip.
+                // run_id and persist_keyset_ranges — nothing committed), or ranges
+                // sampled on ANOTHER key column (the recipe changed): re-sample +
+                // persist under this run_id and start over. No skip.
                 let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
-                st.persist_keyset_ranges(&plan.export_name, rid, &lo_hi_pairs(&fresh))?;
+                st.persist_keyset_ranges(&plan.export_name, rid, &key, &lo_hi_pairs(&fresh))?;
                 fresh
             } else {
                 rows.into_iter()
@@ -489,7 +490,12 @@ fn run_keyset_parallel(
             // sees no resume_run_id and does a fresh full pass (persist replaces the
             // orphaned rows) — safe, never a skip.
             let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
-            st.persist_keyset_ranges(&plan.export_name, &summary.run_id, &lo_hi_pairs(&fresh))?;
+            st.persist_keyset_ranges(
+                &plan.export_name,
+                &summary.run_id,
+                &key,
+                &lo_hi_pairs(&fresh),
+            )?;
             st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
             fresh
         }

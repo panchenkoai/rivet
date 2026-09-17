@@ -9,6 +9,7 @@ mod file_log;
 mod journal_store;
 mod keyset_range;
 mod load_journal_store;
+mod load_lease;
 mod load_spec_store;
 mod metrics;
 mod progression;
@@ -502,6 +503,27 @@ const MIGRATIONS: &[(i64, &str)] = &[
              PRIMARY KEY (export_name, unit, run_id)
          );",
     ),
+    // v29: a baseline is keyed by its DESTINATION as well — two configs sharing a
+    // state DB and an export name kept one `cdc_snapshot` row and skipped each
+    // other's baseline. Legacy rows keep prefix '' and count for every prefix.
+    // `keyset_range` records the key column its ranges were sampled on, so a
+    // resume after the key changed re-samples instead of skipping done ranges.
+    (
+        29,
+        "ALTER TABLE cdc_snapshot RENAME TO cdc_snapshot_v28;
+        CREATE TABLE cdc_snapshot (
+            export_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            prefix TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, table_name, prefix)
+        );
+        INSERT INTO cdc_snapshot (export_name, table_name, prefix, run_id, completed_at)
+            SELECT export_name, table_name, '', run_id, completed_at FROM cdc_snapshot_v28;
+        DROP TABLE cdc_snapshot_v28;
+        ALTER TABLE keyset_range ADD COLUMN key_column TEXT;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -911,6 +933,15 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
              captured_at TEXT NOT NULL,
              PRIMARY KEY (export_name, unit, run_id)
          );",
+    ),
+    // v29: see the SQLite ladder. Postgres alters in place; the unnamed primary
+    // key of a `CREATE TABLE` is `<table>_pkey`.
+    (
+        29,
+        "ALTER TABLE cdc_snapshot ADD COLUMN IF NOT EXISTS prefix TEXT NOT NULL DEFAULT '';
+         ALTER TABLE cdc_snapshot DROP CONSTRAINT IF EXISTS cdc_snapshot_pkey;
+         ALTER TABLE cdc_snapshot ADD PRIMARY KEY (export_name, table_name, prefix);
+         ALTER TABLE keyset_range ADD COLUMN IF NOT EXISTS key_column TEXT;",
     ),
 ];
 
@@ -1620,11 +1651,20 @@ mod tests {
         for &(v, sql) in PG_MIGRATIONS {
             pg.entry(v).or_default().extend(table_names(sql));
         }
+        // SQLite cannot ALTER a primary key, so a key change REBUILDS the table
+        // (CREATE + copy) where Postgres alters in place: the one sanctioned
+        // asymmetry, listed by version and table.
+        const REBUILT_ON_SQLITE_ONLY: &[(i64, &str)] = &[(29, "cdc_snapshot")];
         for &(v, sql) in MIGRATIONS {
             if let Some(pg_tables) = pg.get(&v) {
+                let mut sqlite_tables = table_names(sql);
+                for (rv, t) in REBUILT_ON_SQLITE_ONLY {
+                    if *rv == v {
+                        sqlite_tables.remove(*t);
+                    }
+                }
                 assert_eq!(
-                    &table_names(sql),
-                    pg_tables,
+                    &sqlite_tables, pg_tables,
                     "migration v{v}: SQLite and Postgres define different tables"
                 );
             }
@@ -1691,6 +1731,50 @@ mod tests {
             }
             StateConn::Postgres(_) => unreachable!(),
         }
+    }
+
+    /// v29 rebuilds `cdc_snapshot` with the prefix in its key: a row written
+    /// before it keeps prefix '' (done for every prefix), and two prefixes for one
+    /// `(export, table)` are two rows. `keyset_range` gains `key_column`.
+    #[test]
+    fn v29_keeps_legacy_snapshot_rows_and_keys_baselines_by_prefix() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= 28 {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute(
+            "INSERT INTO cdc_snapshot (export_name, table_name, run_id, completed_at) \
+             VALUES ('users', 'users', 'r1', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let legacy_prefix: String = conn
+            .query_row(
+                "SELECT prefix FROM cdc_snapshot WHERE run_id = 'r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_prefix, "", "a pre-v29 row keeps the empty prefix");
+        conn.execute(
+            "INSERT INTO cdc_snapshot (export_name, table_name, prefix, run_id, completed_at) \
+             VALUES ('users', 'users', 'gs://b/pb/', 'r2', '2026-01-02T00:00:00Z')",
+            [],
+        )
+        .expect("a second prefix for the same export/table is its own row");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cdc_snapshot", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        conn.execute("SELECT key_column FROM keyset_range", [])
+            .unwrap();
     }
 
     #[test]

@@ -231,6 +231,16 @@ impl Rig {
         self
     }
 
+    /// The same source and table as a plain `mode: full` batch export — the CDC
+    /// block dropped (a `cdc:` block is refused outside `mode: cdc`), everything
+    /// else (URL, destination, config dir) kept.
+    pub fn into_full_batch(mut self) -> Self {
+        self.mode = "full".to_string();
+        self.cdc_lines.clear();
+        self.ckpt_override = None;
+        self
+    }
+
     /// Switch to another mode and export lines, keeping this rig's config dir and state DB.
     pub fn restage(mut self, mode: &str, lines: &[&str]) -> Self {
         self.mode = mode.to_string();

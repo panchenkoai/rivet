@@ -123,3 +123,10 @@ scenarios:
     chunked:     { na: "no anchor step" }
     keyset:      { na: "no anchor step" }
     cdc:         { test: a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run }
+
+  - id: keyset_ranges_bound_to_their_key_column
+    what: "a parallel keyset run persists its sampled ranges and a resume reloads them with their `done` flags — but the ranges bound the KEY they were sampled on; `chunk_by_key` changed between the crash and the resume (a backfill recipe edited) made a `done` range skip rows of the new key, `status: success`. v29 records `key_column` with the ranges; a resume asking with another key gets none and re-samples. A pre-v29 set (no key recorded) still loads."
+    incremental: { na: "no persisted ranges" }
+    chunked:     { na: "range chunks are fingerprinted with their column (chunk_plan_fingerprint)" }
+    keyset:      { test: persisted_ranges_are_not_reloaded_for_a_different_key_column }
+    cdc:         { na: "the CDC leg borrows the recipe's keyset path — same store, same test" }

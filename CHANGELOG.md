@@ -48,6 +48,25 @@
   stream no longer share one partition column and one key. Names must be captured tables.
 - **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
   it used to abort the whole config on the first `mode: cdc` export.
+- **A shared state DB with same-named configs, made safe (state schema v29).** Four configs each
+  exporting `users` — one per engine — on one Postgres state, run at once, is the deployment
+  shape the shared-state docs recommend; three things broke under it. The baseline marker
+  (`cdc_snapshot`) was keyed by export name, so config B skipped its baseline because config A
+  had one: v29 keys it by the table's destination too (a pre-v29 row counts for every prefix, so
+  an upgrade never re-baselines). A parallel keyset run resumed after its `chunk_by_key` changed
+  reused ranges sampled on the OLD key and skipped rows of the new one: v29 records the key with
+  the ranges and a resume asking with another key re-samples. A run id was `<export>_<ms>`, so
+  two configs on one scheduler tick could share one `run_status` and per-run spec row: the pid
+  is part of it now. Two concurrent `rivet load`s of one table both appended the same runs: a
+  per-table lease (a Postgres advisory lock on a shared state, an `flock` sidecar beside a
+  SQLite one, released when the holder dies) admits one at a time and refuses the other by
+  name. And a run landing between the load's two prefix listings is refused for that cycle
+  instead of being loaded with an older run's columns. The plan `rivet load` first builds
+  from the by-name spec is provisional: its `pk` / `cluster_by` / `partition` columns are
+  checked against the pinned run's spec, not the last writer's — MySQL's `users` was refused
+  on MongoDB's `_id` before the pin could run. The whole shape — blessed, crashed at
+  once, crashed in turn — is a release-gate cell (`shared_state_same_name`) over
+  `tests/live/live_shared_state_same_name.rs`, CDC and batch cycles.
 - **`rivet doctor` keeps the CDC verdicts it already reached when a later probe fails.** Each
   engine's health probes appended to one list; a probe that died half-way (MySQL `SHOW BINARY
   LOGS` with `log_bin = 0`) replaced "log_bin is OFF — enable binary logging" with one generic

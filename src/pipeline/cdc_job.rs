@@ -85,11 +85,7 @@ pub(super) fn run_cdc_export(
         log::warn!("{msg}");
     }
     let started = std::time::Instant::now();
-    let run_id = format!(
-        "{}_{}",
-        export.name,
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
-    );
+    let run_id = super::summary::fresh_run_id(&export.name);
 
     // Resolve `{date}`/`{export}`/… ONCE, here, before anything reads a prefix.
     //
@@ -333,7 +329,8 @@ pub(super) fn initial_snapshot_pending(
         // The state DB is authoritative (survives `cleanup_source` wiping the
         // bucket); the GCS `snapshot/_SUCCESS` marker stays a legacy co-signal so
         // pre-v14 runs and setups without state still skip correctly.
-        let done = state.snapshot_done(&export.name, t)? || dest.head("_SUCCESS")?.is_some();
+        let done = state.snapshot_done(&export.name, t, &snapshot_key(&snap_dcfg))?
+            || dest.head("_SUCCESS")?.is_some();
         table_dests.push((
             t.clone(),
             catalog_read.clone().unwrap_or_else(|| t.clone()),
@@ -597,6 +594,16 @@ fn snapshot_plan(done_flags: &[bool], ckpt_resume: bool) -> (Vec<usize>, bool) {
 /// export's destination (`<base>/<table>/`), so every table's prefix is
 /// self-describing (its own parts + `manifest.json` + `_SUCCESS`), exactly like
 /// N single-table exports — minus the N−1 extra slots/connections.
+/// The state key of a table's baseline: its snapshot destination, so two configs
+/// sharing a state DB and an export name keep separate baselines.
+pub(crate) fn snapshot_key(d: &crate::config::DestinationConfig) -> String {
+    format!(
+        "{}/{}",
+        d.bucket.as_deref().unwrap_or(""),
+        d.path.as_deref().or(d.prefix.as_deref()).unwrap_or("")
+    )
+}
+
 pub(crate) fn dest_for_table(
     base: &crate::config::DestinationConfig,
     table: &str,

@@ -65,9 +65,10 @@ fn pg_keyset_range_round_trips_and_commits() {
         (Some("k0500".to_string()), None),
     ];
     // Binds range_index (i64) into the range_index column — WrongType on int4.
-    s.persist_keyset_ranges(export, "run-1", &ranges).unwrap();
+    s.persist_keyset_ranges(export, "run-1", "id", &ranges)
+        .unwrap();
     // Reads range_index/done (i64) back — panics on int4.
-    let loaded = s.load_keyset_ranges(export, "run-1").unwrap();
+    let loaded = s.load_keyset_ranges(export, "run-1", "id").unwrap();
     assert_eq!(loaded.len(), 2);
     assert!(loaded.iter().all(|r| !r.done), "fresh ranges are not done");
 
@@ -86,7 +87,7 @@ fn pg_keyset_range_round_trips_and_commits() {
         None,
     )
     .unwrap();
-    let after = s.load_keyset_ranges(export, "run-1").unwrap();
+    let after = s.load_keyset_ranges(export, "run-1", "id").unwrap();
     assert!(!after[0].done, "range 0 untouched");
     assert!(after[1].done, "range 1 committed → done");
 
@@ -302,18 +303,23 @@ fn pg_cdc_snapshot_completion_round_trip() {
     let Some(s) = pg_store() else { return };
     let export = format!("pg_snap_{}", chrono::Utc::now().timestamp_micros());
     assert!(
-        !s.snapshot_done(&export, "t1").unwrap(),
+        !s.snapshot_done(&export, "t1", "gs://b/p/").unwrap(),
         "not done before mark"
     );
-    s.mark_snapshot_done(&export, "t1", "run_pg_1").unwrap();
-    assert!(s.snapshot_done(&export, "t1").unwrap(), "done after mark");
+    s.mark_snapshot_done(&export, "t1", "gs://b/p/", "run_pg_1")
+        .unwrap();
     assert!(
-        !s.snapshot_done(&export, "t2").unwrap(),
+        s.snapshot_done(&export, "t1", "gs://b/p/").unwrap(),
+        "done after mark"
+    );
+    assert!(
+        !s.snapshot_done(&export, "t2", "gs://b/p/").unwrap(),
         "a different table is still not done"
     );
     // Idempotent upsert on (export, table).
-    s.mark_snapshot_done(&export, "t1", "run_pg_2").unwrap();
-    assert!(s.snapshot_done(&export, "t1").unwrap());
+    s.mark_snapshot_done(&export, "t1", "gs://b/p/", "run_pg_2")
+        .unwrap();
+    assert!(s.snapshot_done(&export, "t1", "gs://b/p/").unwrap());
 }
 
 /// The load spec round-trips on a Postgres state backend (RED on a CASE-bound parameter).

@@ -799,11 +799,7 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> O
 /// Aggregation needs every export accounted for, even those that never reached
 /// `RunSummary::new`.
 pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -> RunSummary {
-    let run_id = format!(
-        "{}_{}",
-        export_name,
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
-    );
+    let run_id = super::summary::fresh_run_id(export_name);
     let journal = crate::journal::RunJournal::new(&run_id, export_name);
     RunSummary {
         bytes_read: 0,
@@ -1457,8 +1453,12 @@ fn run_export_job_inner(
             // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
             // the two are the same string anyway.
             if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
-                && let Err(e) =
-                    state.mark_snapshot_done(&export.name, table, &summary.journal.run_id)
+                && let Err(e) = state.mark_snapshot_done(
+                    &export.name,
+                    table,
+                    &super::cdc_job::snapshot_key(&synth.destination),
+                    &summary.journal.run_id,
+                )
             {
                 log::warn!(
                     "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",

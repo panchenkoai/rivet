@@ -375,6 +375,18 @@ pub enum PartitionForm {
     Ingestion(Granularity),
 }
 
+impl PartitionForm {
+    /// The source column the form partitions by, `None` for ingestion time.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            PartitionForm::Column { column, .. } | PartitionForm::Range { column, .. } => {
+                Some(column)
+            }
+            PartitionForm::Ingestion(_) => None,
+        }
+    }
+}
+
 /// The schema of a `partition:` value: `none`, or a block.
 #[derive(JsonSchema)]
 #[schemars(untagged)]

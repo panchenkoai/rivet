@@ -222,6 +222,9 @@ pub struct LoadPlan {
     pub pk: Vec<String>,
     /// The clustering of the table the load writes.
     pub clustering: Clustering,
+    /// The run this plan was typed from — `(run_id, finished_at)` — once the load
+    /// pinned it; a run that finishes after it is refused for this cycle.
+    pub pinned_run: Option<(String, String)>,
 }
 
 /// The clustering columns of the table a load writes, and where they came from: a
@@ -356,7 +359,49 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
         .context("opening the state DB, which holds the column types `rivet run` recorded")?;
     let (reports, keys) = crate::preflight::load_type_reports(&cfg, &state, target)?;
 
-    build_plans_keyed(&cfg, &load, reports, &keys)
+    // Deferred: this plan is typed from the BY-NAME spec, which the load then pins
+    // to the run it consumes (`orchestrate::pin_plan_to_its_run`) — a same-named
+    // export of another config may have written that row, and its columns are not
+    // this table's. The fit is checked strictly after the pin, or by
+    // `check_spec_fit` when no pin is possible.
+    build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)
+}
+
+/// Whether a plan's `pk` / `cluster_by` / `partition` must name columns of the
+/// spec it is built from now, or may be checked later against the pinned run's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecFit {
+    Strict,
+    Deferred,
+}
+
+const NOT_A_COLUMN: &str = "is not a column of the export";
+
+/// The strict fit check a deferred plan still owes: every key, clustering and
+/// partition column is a column of the spec it is typed from.
+pub fn check_spec_fit(plan: &LoadPlan) -> Result<()> {
+    let has = |c: &str| plan.specs.iter().any(|s| s.column_name == c);
+    if let Some(m) = plan.pk.iter().find(|c| !has(c)) {
+        bail!(
+            "export `{}`: primary-key column `{m}` {NOT_A_COLUMN} — the dedup view partitions \
+             by it. fix `pk` in the export's `load:` block",
+            plan.export_name
+        );
+    }
+    if let Some(m) = plan.clustering.columns().iter().find(|c| !has(c)) {
+        bail!(
+            "export `{}`: `cluster_by` column `{m}` {NOT_A_COLUMN}",
+            plan.export_name
+        );
+    }
+    resolve_partition(
+        &plan.export_name,
+        &plan.load,
+        plan.mode,
+        &plan.specs,
+        SpecFit::Strict,
+    )?;
+    Ok(())
 }
 
 /// The **pure core** of [`plan_loads`]: map the resolver's type reports onto
@@ -378,6 +423,7 @@ fn build_plans_keyed(
     load: &LoadSection,
     reports: Vec<crate::preflight::type_report::ExportTypeReport>,
     keys: &RecordedKeys,
+    fit: SpecFit,
 ) -> Result<Vec<LoadPlan>> {
     let mut plans = Vec::with_capacity(reports.len());
     for report in reports {
@@ -555,8 +601,9 @@ fn build_plans_keyed(
             &eff_load,
             keys.get(&(export.name.clone(), unit)).map(Vec::as_slice),
             &specs,
+            fit,
         )?;
-        let partition = resolve_partition(&export.name, &eff_load, mode, &specs)?;
+        let partition = resolve_partition(&export.name, &eff_load, mode, &specs, fit)?;
         let clustering = match eff_load.cluster_by {
             KeyColumns::Auto => Clustering::Auto(cluster_by),
             _ => Clustering::Written(cluster_by),
@@ -574,6 +621,7 @@ fn build_plans_keyed(
             cursor_column: export.cursor_column.clone(),
             pk,
             clustering,
+            pinned_run: None,
         });
     }
     reject_duplicate_target_tables(
@@ -620,7 +668,7 @@ pub fn retype_plan(
     if let Some(pk) = &spec.primary_key {
         keys.insert((export.name.clone(), plan.unit.clone()), pk.clone());
     }
-    build_plans_keyed(cfg, &load, vec![report], &keys)?
+    build_plans_keyed(cfg, &load, vec![report], &keys, SpecFit::Strict)?
         .pop()
         .context("one report yields one plan")
 }
@@ -632,7 +680,7 @@ fn build_plans(
     load: &LoadSection,
     reports: Vec<crate::preflight::type_report::ExportTypeReport>,
 ) -> Result<Vec<LoadPlan>> {
-    build_plans_keyed(cfg, load, reports, &RecordedKeys::new())
+    build_plans_keyed(cfg, load, reports, &RecordedKeys::new(), SpecFit::Strict)
 }
 
 /// Resolve `pk` and `cluster_by` for one export from its `load:` block, the key
@@ -642,6 +690,7 @@ fn resolve_keys(
     load: &LoadSection,
     recorded: Option<&[String]>,
     specs: &[TargetColumnSpec],
+    fit: SpecFit,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let pk = match &load.pk {
         KeyColumns::Columns(cols) => cols.clone(),
@@ -656,7 +705,9 @@ fn resolve_keys(
             .find(|s| s.column_name == c)
             .map(|s| s.target_type.as_str())
     };
-    if let Some(missing) = pk.iter().find(|c| type_of(c).is_none()) {
+    if fit == SpecFit::Strict
+        && let Some(missing) = pk.iter().find(|c| type_of(c).is_none())
+    {
         let fix = match &load.pk {
             KeyColumns::Auto => {
                 "`rivet run` recorded it as the source table's key; name the export's own key \
@@ -665,7 +716,7 @@ fn resolve_keys(
             _ => "fix `pk` in the export's `load:` block",
         };
         bail!(
-            "export `{export}`: primary-key column `{missing}` is not a column of the export — \
+            "export `{export}`: primary-key column `{missing}` {NOT_A_COLUMN} — \
              the dedup view partitions by it. {fix}"
         );
     }
@@ -680,9 +731,8 @@ fn resolve_keys(
             }
             for c in cols {
                 match type_of(c) {
-                    None => bail!(
-                        "export `{export}`: `cluster_by` column `{c}` is not a column of the export"
-                    ),
+                    None if fit == SpecFit::Deferred => {}
+                    None => bail!("export `{export}`: `cluster_by` column `{c}` {NOT_A_COLUMN}"),
                     Some(t) if bigquery && !super::bigquery::clusterable(t) => bail!(
                         "export `{export}`: BigQuery cannot cluster on `{c}` ({t}); clusterable \
                          types are INT64, NUMERIC, BIGNUMERIC, STRING, BOOL, DATE, DATETIME, \
@@ -724,10 +774,19 @@ fn resolve_partition(
     load: &LoadSection,
     mode: LoadMode,
     specs: &[TargetColumnSpec],
+    fit: SpecFit,
 ) -> Result<Option<TablePartition>> {
     let Some(spec) = &load.partition else {
         return Ok(None);
     };
+    // Deferred: a partition column the BY-NAME spec lacks is not yet a refusal —
+    // the pinned run's spec decides, or `check_spec_fit` refuses.
+    if fit == SpecFit::Deferred
+        && let Some(col) = spec.form.column()
+        && !specs.iter().any(|s| s.column_name == col)
+    {
+        return Ok(None);
+    }
     let column_type = |c: &str| -> Result<String> {
         if !super::is_safe_load_ident(c) {
             bail!(
@@ -740,9 +799,7 @@ fn resolve_partition(
             .iter()
             .find(|s| s.column_name == c)
             .map(|s| base_type(&s.target_type))
-            .with_context(|| {
-                format!("export `{export}`: partition column `{c}` is not a column of the export")
-            })
+            .with_context(|| format!("export `{export}`: partition column `{c}` {NOT_A_COLUMN}"))
     };
     let (key, expr) = match &load.target {
         LoadTarget::Bigquery { .. } => {
@@ -1049,6 +1106,80 @@ load:
             err.contains("type: s3") && err.contains("load"),
             "must name the mismatch and the block: {err}"
         );
+    }
+
+    /// The by-name spec may belong to ANOTHER config's same-named export (a shared
+    /// state DB, last writer wins): `pk: [id]` against a spec holding `_id` is not
+    /// a refusal at plan time — the pin retypes from the run's own spec — but the
+    /// strict check still refuses the plan if no pin happens. Measured live: four
+    /// `users` exports on one Postgres state, MySQL's load refused on Mongo's `_id`.
+    #[test]
+    fn a_by_name_plan_defers_its_key_fit_to_the_pin_and_still_owes_it() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: users
+    table: users
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: pa/ }
+    load: { pk: [id], cluster_by: [id], partition: { column: created_at, granularity: day } }
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .unwrap();
+        let load = cfg.load.clone().unwrap();
+        // The by-name row another config wrote: `_id` and `v`, none of ours.
+        let foreign = || {
+            vec![report(
+                "users",
+                vec![col("_id", TargetStatus::Ok), col("v", TargetStatus::Ok)],
+            )]
+        };
+        let strict = build_plans_keyed(
+            &cfg,
+            &load,
+            foreign(),
+            &RecordedKeys::new(),
+            SpecFit::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(strict.contains("primary-key column `id`"), "{strict}");
+        let deferred = build_plans_keyed(
+            &cfg,
+            &load,
+            foreign(),
+            &RecordedKeys::new(),
+            SpecFit::Deferred,
+        )
+        .expect("deferred: the pin decides")
+        .pop()
+        .unwrap();
+        assert_eq!(deferred.pk, vec!["id".to_string()]);
+        assert_eq!(
+            deferred.partition, None,
+            "a partition column the spec lacks waits for the pin"
+        );
+        let owed = check_spec_fit(&deferred).unwrap_err().to_string();
+        assert!(owed.contains("primary-key column `id`"), "{owed}");
+        // The run's own spec fits: the strict rebuild (what `retype_plan` does) passes.
+        let own = vec![report(
+            "users",
+            vec![col("id", TargetStatus::Ok), ts_col("created_at")],
+        )];
+        let fitted = build_plans_keyed(&cfg, &load, own, &RecordedKeys::new(), SpecFit::Strict)
+            .expect("the run's own columns fit")
+            .pop()
+            .unwrap();
+        check_spec_fit(&fitted).expect("nothing owed");
     }
 
     #[test]
@@ -1827,6 +1958,7 @@ load:
             &load_with("bigquery", serde_json::json!({})),
             Some(&recorded),
             &specs,
+            SpecFit::Strict,
         )
         .unwrap();
         assert_eq!(pk, recorded);
@@ -1843,6 +1975,7 @@ load:
                 &load_with(target, serde_json::json!({})),
                 Some(&cols(&names)),
                 &specs,
+                SpecFit::Strict,
             )
             .unwrap()
             .1
@@ -1855,9 +1988,15 @@ load:
     fn explicit_clustering_is_refused_when_bigquery_cannot_hold_it() {
         let specs = [typed("id", "INT64"), typed("score", "FLOAT64")];
         let err = |extra| {
-            resolve_keys("e", &load_with("bigquery", extra), None, &specs)
-                .unwrap_err()
-                .to_string()
+            resolve_keys(
+                "e",
+                &load_with("bigquery", extra),
+                None,
+                &specs,
+                SpecFit::Strict,
+            )
+            .unwrap_err()
+            .to_string()
         };
         let e = err(serde_json::json!({ "cluster_by": ["score"] }));
         assert!(e.contains("cannot cluster on `score` (FLOAT64)"), "{e}");
@@ -1877,6 +2016,7 @@ load:
             &load_with("bigquery", serde_json::json!({ "pk": ["idd"] })),
             None,
             &specs,
+            SpecFit::Strict,
         )
         .unwrap_err()
         .to_string();
@@ -1891,6 +2031,7 @@ load:
             &load_with("bigquery", serde_json::json!({})),
             Some(&cols(&["id", "missing"])),
             &specs,
+            SpecFit::Strict,
         )
         .unwrap_err()
         .to_string();
@@ -1903,7 +2044,14 @@ load:
         let specs = [typed("id", "INT64"), typed("ext", "INT64")];
         let recorded = cols(&["id"]);
         let resolve = |extra| {
-            resolve_keys("e", &load_with("bigquery", extra), Some(&recorded), &specs).unwrap()
+            resolve_keys(
+                "e",
+                &load_with("bigquery", extra),
+                Some(&recorded),
+                &specs,
+                SpecFit::Strict,
+            )
+            .unwrap()
         };
         assert_eq!(
             resolve(serde_json::json!({ "pk": ["ext"] })),
@@ -1922,6 +2070,7 @@ load:
             &load_with("bigquery", serde_json::json!({})),
             None,
             &[typed("id", "INT64")],
+            SpecFit::Strict,
         )
         .unwrap();
         assert!(pk.is_empty() && cluster.is_empty());
@@ -1936,6 +2085,7 @@ load:
             &load_with("bigquery", serde_json::json!({ "partition": block })),
             LoadMode::Full,
             specs,
+            SpecFit::Strict,
         )
     }
 
@@ -2045,6 +2195,7 @@ load:
                 &load_with("snowflake", serde_json::json!({ "partition": block })),
                 LoadMode::Full,
                 &specs,
+                SpecFit::Strict,
             )
         };
         let p = resolve(serde_json::json!({ "column": "ts", "granularity": "month" }))

@@ -69,7 +69,10 @@ config_fields:
       name the collection literally (a dot is not a qualifier there), and on SQL
       Server the leg's `columns:` are narrowed by the configured LABEL before the
       catalog spelling is read, or a label-cased key typed the stream and not the
-      leg.
+      leg. The baseline marker is keyed by the table's DESTINATION as well as its
+      name (`cdc_snapshot.prefix`, state v29): on a shared state DB two configs
+      exporting `users` kept one row and the second skipped its baseline —
+      measured with four same-named streams on one Postgres state, run at once.
     also: resolve_backfill_pairs_tables_with_their_recipe_exports,
       full_cdc_cycle_mysql, full_cdc_cycle_postgres, full_cdc_cycle_mssql,
       full_cdc_cycle_mongo, partner_shape_three_tables_one_stream_mysql,
@@ -77,6 +80,9 @@ config_fields:
       a_mongo_backfill_recipe_must_name_the_collection_exactly,
       backfill_leg_keeps_a_label_cased_column_type_when_the_catalog_read_differs,
       two_captured_tables_with_one_leaf_cannot_carry_recipe_column_types,
+      a_same_named_export_on_another_prefix_has_its_own_baseline,
+      same_named_configs_share_a_postgres_state_cdc_cycle,
+      same_named_configs_share_a_postgres_state_batch_cycle,
       resolve_backfill_refuses_every_pairing_that_would_look_like_success,
       a_table_named_snapshot_is_refused_under_backfill_as_under_initial,
       a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named,
