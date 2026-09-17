@@ -287,6 +287,66 @@ pub fn compact_merge_sql(
     bound: Option<&RangeBound>,
     nulls_only: Option<&str>,
 ) -> String {
+    let filter = match (bound, nulls_only) {
+        (Some(b), _) => MergeFilter::Range(b.clone()),
+        (None, Some(c)) => MergeFilter::NullKeys(c.to_string()),
+        (None, None) => MergeFilter::All,
+    };
+    compact_merge_filtered_sql(base_fqtn, changes_fqtn, columns, pk, engine, &filter)
+}
+
+/// Which of the buffer's WINNERS one MERGE takes, and the matching constant
+/// predicate on the base so BigQuery prunes it. `Days` names a script variable
+/// (`ARRAY<DATE>`) — measured: `DATE(T.col) IN UNNEST(var)` reads only the listed
+/// partitions (172 bytes against 48 KB for the MIN..MAX range on the same buffer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeFilter {
+    All,
+    Range(RangeBound),
+    /// `DATE(column) IN UNNEST(variable)` — a day-partitioned base.
+    Days {
+        column: String,
+        variable: String,
+    },
+    NullKeys(String),
+}
+
+impl MergeFilter {
+    /// The predicate on a row of `alias` (no alias for the buffer's own columns).
+    fn predicate(&self, alias: &str) -> String {
+        let q = |c: &str| {
+            if alias.is_empty() {
+                format!("`{c}`")
+            } else {
+                format!("{alias}.`{c}`")
+            }
+        };
+        match self {
+            MergeFilter::All => String::new(),
+            MergeFilter::Range(b) => format!(
+                " AND {c} >= {lo} AND {c} < {hi}",
+                c = q(&b.column),
+                lo = b.lo,
+                hi = b.hi_exclusive
+            ),
+            MergeFilter::Days { column, variable } => {
+                format!(" AND DATE({}) IN UNNEST({variable})", q(column))
+            }
+            MergeFilter::NullKeys(c) => format!(" AND {} IS NULL", q(c)),
+        }
+    }
+}
+
+/// [`compact_merge_sql`] over a [`MergeFilter`]: the filter is applied to the
+/// buffer's winners AND, for a partition filter, to the base in `ON`.
+pub fn compact_merge_filtered_sql(
+    base_fqtn: &str,
+    changes_fqtn: &str,
+    columns: &[&str],
+    pk: &[&str],
+    engine: SourceEngine,
+    filter: &MergeFilter,
+) -> String {
     let wh = Warehouse::BigQuery;
     let partition = quote_partition(wh, pk);
     let order = engine
@@ -295,29 +355,17 @@ pub fn compact_merge_sql(
         .map(|e| format!("{e} DESC"))
         .collect::<Vec<_>>()
         .join(", ");
-    let source_filter = match (bound, nulls_only) {
-        (Some(b), _) => format!(
-            " AND `{c}` >= {lo} AND `{c}` < {hi}",
-            c = b.column,
-            lo = b.lo,
-            hi = b.hi_exclusive
-        ),
-        (None, Some(c)) => format!(" AND `{c}` IS NULL"),
-        (None, None) => String::new(),
-    };
+    let source_filter = filter.predicate("");
     let on_keys = pk
         .iter()
         .map(|k| format!("T.`{k}` = S.`{k}`"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let on_bound = bound.map_or(String::new(), |b| {
-        format!(
-            " AND T.`{c}` >= {lo} AND T.`{c}` < {hi}",
-            c = b.column,
-            lo = b.lo,
-            hi = b.hi_exclusive
-        )
-    });
+    // NULL-keyed winners match the base by key alone: their partition is unknown.
+    let on_bound = match filter {
+        MergeFilter::NullKeys(_) => String::new(),
+        other => other.predicate("T"),
+    };
     let set = columns
         .iter()
         .map(|c| format!("`{c}` = S.`{c}`"))
@@ -921,10 +969,136 @@ pub fn plan_compact_merges(
     Ok(merges)
 }
 
+/// Partitions one MERGE statement may touch (BigQuery's cap per DML statement).
+pub const MERGE_PARTITION_CAP: usize = 4000;
+
+/// ONE multi-statement job that compacts a base whose partition key is a DAY
+/// column — or no key at all — and drops the buffer: the probe, the MERGEs and
+/// the DROP are statements of one script, so a cycle costs one round trip and one
+/// labelled job (its children inherit the labels). The buffer's distinct days are
+/// collected into a script variable and the MERGE prunes the base with
+/// `DATE(col) IN UNNEST(<variable>)` — exactly the touched partitions, in chunks of
+/// [`MERGE_PARTITION_CAP`]; NULL-keyed winners merge on their own, unpruned. The
+/// last statement returns `(changes_rows, merge_jobs)` for the report.
+pub fn compact_script_sql(
+    base_fqtn: &str,
+    changes_fqtn: &str,
+    specs: &[TargetColumnSpec],
+    pk: &[String],
+    engine: SourceEngine,
+    day_column: Option<&str>,
+) -> String {
+    let columns: Vec<&str> = specs
+        .iter()
+        .map(|s| s.column_name.as_str())
+        .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
+        .collect();
+    let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    let merge = |filter: &MergeFilter| {
+        compact_merge_filtered_sql(base_fqtn, changes_fqtn, &columns, &pk_refs, engine, filter)
+    };
+    let Some(col) = day_column else {
+        return format!(
+            "DECLARE n INT64 DEFAULT 0;\n\
+             SET n = (SELECT COUNT(*) FROM `{changes_fqtn}`);\n\
+             IF n > 0 THEN\n{merge_all}\nEND IF;\n\
+             DROP TABLE `{changes_fqtn}`;\n\
+             SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;",
+            merge_all = merge(&MergeFilter::All)
+        );
+    };
+    let by_days = merge(&MergeFilter::Days {
+        column: col.to_string(),
+        variable: "chunk".to_string(),
+    });
+    let null_keys = merge(&MergeFilter::NullKeys(col.to_string()));
+    format!(
+        "DECLARE n INT64 DEFAULT 0;\n\
+         DECLARE null_keys INT64 DEFAULT 0;\n\
+         DECLARE days ARRAY<DATE> DEFAULT [];\n\
+         DECLARE chunk ARRAY<DATE>;\n\
+         DECLARE i INT64 DEFAULT 0;\n\
+         DECLARE jobs INT64 DEFAULT 0;\n\
+         SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL) FROM `{changes_fqtn}`);\n\
+         SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT DATE(`{col}`) IGNORE NULLS), []) FROM `{changes_fqtn}`);\n\
+         WHILE i < ARRAY_LENGTH(days) DO\n\
+         \x20 SET chunk = ARRAY(SELECT d FROM UNNEST(days) AS d WITH OFFSET AS o WHERE o >= i AND o < i + {cap});\n\
+         {by_days}\n\
+         \x20 SET i = i + {cap};\n\
+         \x20 SET jobs = jobs + 1;\n\
+         END WHILE;\n\
+         IF null_keys > 0 THEN\n{null_keys_merge}\n\x20 SET jobs = jobs + 1;\nEND IF;\n\
+         DROP TABLE `{changes_fqtn}`;\n\
+         SELECT n AS changes_rows, jobs AS merge_jobs;",
+        cap = MERGE_PARTITION_CAP,
+        null_keys_merge = null_keys,
+    )
+}
+
 #[cfg(test)]
 mod compact_tests {
     use super::*;
     use crate::load::plan::{Granularity, PartitionKey};
+
+    /// The day-key script: one job — probe, chunked `IN UNNEST(chunk)` MERGEs (≤ 4,000
+    /// days each, the base pruned to exactly those days), the NULL-keyed pass, the
+    /// DROP, and the `(changes_rows, merge_jobs)` row last. No key: one unbounded
+    /// MERGE guarded by the row count, then the DROP.
+    #[test]
+    fn the_compaction_script_probes_merges_by_day_list_and_drops_in_one_job() {
+        let s = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some("created_at"),
+        );
+        assert!(
+            s.contains("ARRAY_AGG(DISTINCT DATE(`created_at`) IGNORE NULLS)"),
+            "{s}"
+        );
+        assert!(s.contains("WHILE i < ARRAY_LENGTH(days) DO"), "{s}");
+        assert!(s.contains("WHERE o >= i AND o < i + 4000"), "{s}");
+        assert!(
+            s.contains(") WHERE __rn = 1 AND DATE(`created_at`) IN UNNEST(chunk)")
+                && s.contains("ON T.`id` = S.`id` AND DATE(T.`created_at`) IN UNNEST(chunk)"),
+            "winners filtered by the chunk, the base pruned by the same variable: {s}"
+        );
+        assert!(
+            s.contains("IF null_keys > 0 THEN")
+                && s.contains(") WHERE __rn = 1 AND `created_at` IS NULL")
+                && s.contains("ON T.`id` = S.`id`\nWHEN MATCHED AND S.__op = 'delete'"),
+            "NULL-keyed winners merge by key alone: {s}"
+        );
+        let drop = s.find("DROP TABLE `p.d.t__changes`;").expect("the drop");
+        let last_merge = s.rfind("MERGE `p.d.t`").expect("a merge");
+        assert!(last_merge < drop, "every MERGE precedes the DROP: {s}");
+        assert!(
+            s.trim_end()
+                .ends_with("SELECT n AS changes_rows, jobs AS merge_jobs;"),
+            "{s}"
+        );
+
+        let plain = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            None,
+        );
+        assert!(
+            plain.contains("IF n > 0 THEN\nMERGE `p.d.t` AS T"),
+            "{plain}"
+        );
+        assert!(plain.contains("ON T.`id` = S.`id`\n"), "unbounded: {plain}");
+        assert!(!plain.contains("UNNEST"), "{plain}");
+        assert!(
+            plain.ends_with("SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;"),
+            "{plain}"
+        );
+    }
 
     fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
         CompactProbe {

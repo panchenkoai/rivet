@@ -13,9 +13,9 @@
 //!      key flagged with its last values kept, the updated key refreshed; the
 //!      buffer is DROPPED;
 //!   5. a second compact → no-op; the base unchanged;
-//!   6. changes → run → load → compact that CRASHES between the MERGE and the
-//!      DROP → the next compact re-merges the same buffer idempotently and drops
-//!      it; the base equals the source's live rows exactly once.
+//!   6. changes → run → load → compact whose process CRASHES right after the one
+//!      scripted job (MERGEs + DROP) returned → the buffer is already gone, the
+//!      next compact is a no-op, the base equals the source's live rows once.
 //!
 //! Oracles: the source (`COUNT`/`SUM`) and `bq` — never rivet's own report. Needs
 //! the MySQL CDC stand and the warehouse env; SKIPS without them.
@@ -158,8 +158,10 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     assert!(ok && said.contains("COMPACT SKIP"), "{said}");
     assert_eq!(base_profile(&bq, &table).0, 8);
 
-    // 6. A crash between MERGE and DROP: the re-run merges the same rows again,
-    //    idempotently, and drops the buffer.
+    // 6. rivet crashes right after the compaction job returned: the MERGEs and the
+    //    DROP were ONE scripted job, so the warehouse is already consistent — the
+    //    next compact finds no buffer, merges nothing twice, and the base equals
+    //    the source.
     scn.insert(9);
     scn.update(3);
     scn.settle();
@@ -167,13 +169,12 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     load_ok(&scn.rig);
     let (ok, said) = compact(&scn.rig, &[("RIVET_TEST_PANIC_AT", "compact_after_merge")]);
     assert!(!ok, "the injected crash must fail the compact:\n{said}");
-    assert_eq!(
-        bq.read_bq_table_type(&changes).as_deref(),
-        Some("BASE TABLE"),
-        "the buffer survives a crash before the DROP"
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the buffer went with the script, before rivet crashed"
     );
     let (ok, said) = compact(&scn.rig, &[]);
-    assert!(ok && said.contains("COMPACT OK"), "{said}");
+    assert!(ok && said.contains("COMPACT SKIP"), "{said}");
     let (n, live, gone, _, sum) = base_profile(&bq, &table);
     assert_eq!(
         (n, live, gone),
@@ -183,7 +184,6 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     assert_eq!(live, scn.count());
     assert_eq!(sum, 1 + 3 + 4 + 5 + 6 + 7 + 8 + 9);
     assert_eq!(v_of(&bq, &table, 3), Some(99), "merged once, not twice");
-    assert!(bq.read_bq_table_type(&changes).is_none());
 }
 
 /// `(v, created_at as text)` of one key in the base.

@@ -93,7 +93,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
             // Typed from the spec of the run this load consumes, not the by-name
             // row. Inside the per-table closure: a spec the config does not fit is
             // THIS table's failure, and the others still load.
-            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg)?;
+            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "load")?;
             let plan = &pinned;
             match plan.mode {
                 // CDC: APPEND the change log + rebuild the current-state dedup view.
@@ -110,7 +110,11 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                         ledger_errored,
                         &load_id,
                     )? {
-                        Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
+                        Some(report) => println!(
+                            "CDC LOAD OK [{}]: {}",
+                            plan.table,
+                            cdc_ok_line(plan.layout, &report)
+                        ),
                         None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
                     }
                 }
@@ -143,7 +147,13 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                 // has to be routed deliberately instead of inheriting this one.
                 load::plan::LoadMode::Full => {
                     match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
-                        Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
+                        Some(report) => println!(
+                            "LOAD OK [{}]: {} row(s) in `{}`{}",
+                            plan.table,
+                            report.rows_loaded,
+                            report.target_table,
+                            cleaned_suffix(report.source_cleaned)
+                        ),
                         None => println!("LOAD SKIP [{}]: up to date", plan.table),
                     }
                 }
@@ -202,12 +212,13 @@ fn pin_plan_to_its_run(
     plan: &load::plan::LoadPlan,
     state: Option<&StateStore>,
     cfg: &crate::config::Config,
+    op: &str,
 ) -> Result<load::plan::LoadPlan> {
     // The by-name plan was built with its fit DEFERRED (`SpecFit::Deferred`), so
     // a path that keeps it owes the strict check the pin would have done.
     let unpinned = |why: &str| {
         eprintln!(
-            "  load [{}]: typed from the by-name load spec — {why}",
+            "  {op} [{}]: typed from the by-name load spec — {why}",
             plan.table
         );
         load::plan::check_spec_fit(plan)?;
@@ -232,7 +243,7 @@ fn pin_plan_to_its_run(
         .map(|(_, m)| (m.finished_at.clone(), m.run_id))
         .collect();
     if newest_first.is_empty() {
-        return unpinned("no loadable run under its prefix yet");
+        return unpinned("no run left to load under its prefix");
     }
     // ONE definition of "newer" — the census's instant compare, not a byte compare
     // that mis-orders mixed RFC3339 precision; ties fall to the run id.
@@ -1200,6 +1211,22 @@ fn load_one_cdc_base(
     )
 }
 
+/// The one-line `CDC LOAD OK` verdict, by layout: what landed where and what the
+/// operator does next — never a struct dump.
+fn cdc_ok_line(layout: load::plan::CdcLayout, report: &load::CdcLoadReport) -> String {
+    let cleaned = cleaned_suffix(report.source_cleaned);
+    match layout {
+        load::plan::CdcLayout::BaseAndBuffer => format!(
+            "{} change row(s) buffered into `{}` — `rivet compact` merges them into `{}`{cleaned}",
+            report.rows_appended, report.changes_table, report.view
+        ),
+        load::plan::CdcLayout::LogAndView => format!(
+            "{} row(s) appended to `{}` | current-state view `{}`{cleaned}",
+            report.rows_appended, report.changes_table, report.view
+        ),
+    }
+}
+
 /// The base-and-buffer sibling of [`append_done_line`]: the base the legs
 /// overwrote and the rows the stream buffered (the baseline line printed its own).
 fn base_done_line(
@@ -1270,7 +1297,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         }
         let load_id = format!("{run_id}:{}", plan.table);
         let outcome = (|| -> Result<()> {
-            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg)?;
+            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
             let loader = load::build_loader(&pinned, &run_id);
             let target_fqtn = loader.fqtn(&pinned.table);
             let _lease = match state
@@ -3248,6 +3275,15 @@ mod live_only_decisions {
             "  integrity ✓ source 100 → files 100 → base p.d.orders | buffered 40 row(s) into \
              p.d.orders__changes",
             "the base layout names the base, never a view"
+        );
+        assert_eq!(
+            cdc_ok_line(load::plan::CdcLayout::BaseAndBuffer, &appended),
+            "40 change row(s) buffered into `p.d.orders__changes` — `rivet compact` merges them \
+             into `p.d.orders`"
+        );
+        assert_eq!(
+            cdc_ok_line(load::plan::CdcLayout::LogAndView, &appended),
+            "40 row(s) appended to `p.d.orders__changes` | current-state view `p.d.orders`"
         );
 
         let cleaned = load::CdcLoadReport {

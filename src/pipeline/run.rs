@@ -2316,8 +2316,10 @@ pub(crate) fn run_pool(
 /// run.
 fn backfill_recipes_to_skip(exports: &[ExportConfig]) -> std::collections::HashSet<String> {
     let recipes = crate::config::backfill_recipe_names(exports);
+    // Info, not warn: this is the partner shape working as designed (every run of
+    // an init'd CDC config would otherwise open with one WARN per table).
     for e in exports.iter().filter(|e| recipes.contains(&e.name)) {
-        log::warn!(
+        log::info!(
             "export '{}': skipped — it is the backfill recipe of a `mode: cdc` export, \
              which runs it after the anchor (run it alone with `-e {}` to export it on \
              its own)",

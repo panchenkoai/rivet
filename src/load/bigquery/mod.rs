@@ -449,6 +449,10 @@ impl TargetLoader for BigQueryLoader {
         } else {
             self.partition.as_ref()
         };
+        let existed = self
+            .api()?
+            .table_metadata(&self.dataset, &changes)?
+            .is_some();
         let create = build_create_changes_sql(
             &changes_fqtn,
             &schema,
@@ -462,7 +466,14 @@ impl TargetLoader for BigQueryLoader {
         // table, so without this a log rivet did not create — or one that predates a new
         // meta column — fails the LOAD below on a schema mismatch. ALTER ADD,
         // never a replace: the table may hold the customer's history.
-        if let Some(alter) = build_alter_add_columns_sql(&changes_fqtn, &full) {
+        // A log that did not exist a moment ago was just created from this very
+        // spec: nothing to add (metadata, not a query, says which).
+        let alter = if existed {
+            build_alter_add_columns_sql(&changes_fqtn, &full)
+        } else {
+            None
+        };
+        if let Some(alter) = alter {
             self.run_sql(&alter, "load", &changes)?;
         }
         // …and its partition options, as the log takes them (no filter, no load-date expiry).
@@ -513,12 +524,16 @@ impl TargetLoader for BigQueryLoader {
         pk: &[String],
         engine: crate::load::cdc::SourceEngine,
     ) -> Result<crate::load::CompactReport> {
-        use crate::load::cdc::{CompactProbe, compact_probe_sql, plan_compact_merges};
+        use crate::load::cdc::{
+            CompactProbe, compact_probe_sql, compact_script_sql, plan_compact_merges,
+        };
         let base = self.fqtn(table);
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
-        // No buffer table → nothing to merge, said so by the report.
-        let super::ObjectKind::Table = self.object_kind(&changes)? else {
+        let api = self.api()?;
+        // No buffer table → nothing to merge, said so by the report. Metadata, not
+        // a query job: `tables.get` is free and answers the same question.
+        let Some(_buffer) = api.table_metadata(&self.dataset, &changes)? else {
             return Ok(crate::load::CompactReport {
                 base,
                 changes_rows: 0,
@@ -526,9 +541,35 @@ impl TargetLoader for BigQueryLoader {
                 had_buffer: false,
             });
         };
-        // The pruning bound comes from the buffer's own partition-column range; a
-        // time key is normalised to dates, an integer range key read as is.
         let key = self.partition.as_ref().map(|p| &p.key);
+        // A day-partitioned base (the partner shape, init's default) or an
+        // unpartitioned one compacts in ONE scripted job: the buffer's distinct days
+        // become a script variable and every MERGE prunes to exactly those partitions.
+        let day_column = match key {
+            None => Some(None),
+            Some(PartitionKey::Time {
+                column,
+                granularity: Granularity::Day,
+            }) => Some(column.as_deref()),
+            Some(PartitionKey::Time { column: None, .. }) => Some(None),
+            Some(_) => None,
+        };
+        if let Some(day_column) = day_column {
+            let script = compact_script_sql(&base, &changes_fqtn, specs, pk, engine, day_column);
+            let row = api.run_query_first_row(&script, &self.labels("merge", table))?;
+            let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+            // The buffer is gone with the script; a crash HERE loses nothing — the
+            // next compact finds no buffer and says so.
+            crate::test_hook::maybe_panic_at("compact_after_merge");
+            return Ok(crate::load::CompactReport {
+                base,
+                changes_rows: cell(0).parse().unwrap_or(0),
+                merge_jobs: cell(1).parse().unwrap_or(0),
+                had_buffer: true,
+            });
+        }
+        // Other keys (hour/month/year, integer ranges): the range probe, then one
+        // MERGE per window of constant bounds, then the DROP — separate jobs.
         let part_col = key.and_then(PartitionKey::column);
         let time_key = matches!(key, Some(PartitionKey::Time { .. }));
         let probe = compact_probe_sql(&changes_fqtn, part_col, time_key);
@@ -661,6 +702,11 @@ impl super::ShapeControl for BigQueryLoader {
     }
 
     fn rebuild_leftovers(&self, table: &str) -> Result<Vec<String>> {
+        // A buffer is never rebuilt in place (`compact` drops it), so it can leave
+        // no `__rebuild` / `__old` behind: nothing to look for, no query job.
+        if self.buffer_layout {
+            return Ok(Vec::new());
+        }
         let changes = format!("{table}__changes");
         let names = [format!("{changes}__rebuild"), format!("{changes}__old")];
         let sql = build_leftovers_sql(&self.project, &self.dataset, &names);
