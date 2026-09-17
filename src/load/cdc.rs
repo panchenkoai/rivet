@@ -1019,8 +1019,7 @@ pub fn compact_script_sql(
          DECLARE chunk ARRAY<DATE>;\n\
          DECLARE i INT64 DEFAULT 0;\n\
          DECLARE jobs INT64 DEFAULT 0;\n\
-         SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL) FROM `{changes_fqtn}`);\n\
-         SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT DATE(`{col}`) IGNORE NULLS), []) FROM `{changes_fqtn}`);\n\
+         SET (n, null_keys, days) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL), IFNULL(ARRAY_AGG(DISTINCT DATE(`{col}`) IGNORE NULLS), []) FROM `{changes_fqtn}`);\n\
          WHILE i < ARRAY_LENGTH(days) DO\n\
          \x20 SET chunk = ARRAY(SELECT d FROM UNNEST(days) AS d WITH OFFSET AS o WHERE o >= i AND o < i + {cap});\n\
          {by_days}\n\
@@ -1055,8 +1054,17 @@ mod compact_tests {
             Some("created_at"),
         );
         assert!(
-            s.contains("ARRAY_AGG(DISTINCT DATE(`created_at`) IGNORE NULLS)"),
-            "{s}"
+            s.contains(
+                "SET (n, null_keys, days) = (SELECT AS STRUCT COUNT(*), COUNTIF(`created_at` IS NULL), \
+                 IFNULL(ARRAY_AGG(DISTINCT DATE(`created_at`) IGNORE NULLS), []) FROM `p.d.t__changes`);"
+            ),
+            "ONE probe statement over the buffer — every statement that reads a table is \
+             billed a 10 MB floor: {s}"
+        );
+        assert_eq!(
+            s.matches("FROM `p.d.t__changes`").count(),
+            3,
+            "the buffer is read by the probe and the two MERGEs, nowhere else: {s}"
         );
         assert!(s.contains("WHILE i < ARRAY_LENGTH(days) DO"), "{s}");
         assert!(s.contains("WHERE o >= i AND o < i + 4000"), "{s}");

@@ -96,15 +96,24 @@ rivet load    -c cfg.yaml   # baseline → <table> (batched, staging + CLONE); c
 rivet compact -c cfg.yaml   # MERGE <table>__changes into <table>; DROP the buffer
 ```
 
-`compact` runs one `MERGE` per table: the latest change per key (the same
-`__pos` order the view uses) is upserted; a **delete flags** the base row
+`compact` is **one scripted job per table**: the latest change per key (the
+same `__pos` order the view uses) is upserted; a **delete flags** the base row
 (`__is_deleted = TRUE`, last values kept — the warehouse deletes nothing) and a
-later insert un-flags it. Both sides of the MERGE are bounded by the same
-constant range of the partition column, read from the buffer first, so the base
-scans only the touched partitions; a buffer spanning more than 4,000 partitions
-merges in windows. Afterwards the buffer is dropped and the next `load` creates
-it again from its run's spec. A crash between the MERGE and the DROP is harmless:
-the next compact merges the same rows again and the upsert is idempotent.
+later insert un-flags it. For a day-partitioned base (init's default) the script
+collects the buffer's distinct days into a variable and every `MERGE` filters
+both sides with `DATE(col) IN UNNEST(days)` — measured: 172 bytes read against
+48 KB for a `MIN..MAX` range on the same buffer, i.e. exactly the touched
+partitions; more than 4,000 days merge in chunks of 4,000 inside the same
+script. Then the script drops the buffer and the next `load` creates it again
+from its run's spec. Other partition keys (hour, month, year, integer ranges)
+keep a constant `MIN..MAX` range per window in separate jobs — the truncation
+forms did not prune when measured. An empty buffer is just dropped.
+
+What a cycle bills: BigQuery charges every statement that reads a table at
+least 10 MB per table, so a compaction with changes bills a 30 MB floor (the
+probe, and the MERGE over two tables); one without changes bills nothing. The
+`load` side is free (`CREATE`, `LOAD DATA`). The script's child statements
+appear in `INFORMATION_SCHEMA.JOBS` under `parent_job_id` with the same labels.
 
 Consumers read `<table>` directly, `WHERE NOT __is_deleted` for live rows. The
 buffer holds no history — `__is_deleted` in the base is the record that a row

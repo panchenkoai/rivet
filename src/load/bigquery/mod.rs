@@ -533,7 +533,7 @@ impl TargetLoader for BigQueryLoader {
         let api = self.api()?;
         // No buffer table → nothing to merge, said so by the report. Metadata, not
         // a query job: `tables.get` is free and answers the same question.
-        let Some(_buffer) = api.table_metadata(&self.dataset, &changes)? else {
+        let Some(buffer) = api.table_metadata(&self.dataset, &changes)? else {
             return Ok(crate::load::CompactReport {
                 base,
                 changes_rows: 0,
@@ -541,6 +541,18 @@ impl TargetLoader for BigQueryLoader {
                 had_buffer: false,
             });
         };
+        // An EMPTY buffer (the metadata row count is exact after a load job) needs
+        // no probe and no MERGE — every statement that touches a table is billed a
+        // 10 MB floor; the DROP alone is free.
+        if buffer.get("numRows").and_then(serde_json::Value::as_str) == Some("0") {
+            self.run_sql(&format!("DROP TABLE `{changes_fqtn}`;"), "merge", table)?;
+            return Ok(crate::load::CompactReport {
+                base,
+                changes_rows: 0,
+                merge_jobs: 0,
+                had_buffer: true,
+            });
+        }
         let key = self.partition.as_ref().map(|p| &p.key);
         // A day-partitioned base (the partner shape, init's default) or an
         // unpartitioned one compacts in ONE scripted job: the buffer's distinct days

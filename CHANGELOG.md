@@ -53,12 +53,13 @@
   merges the buffer.** The baseline legs now OVERWRITE a physical `<table>` — the source
   columns plus one service column, `__is_deleted BOOL`, written as `false` inside the baseline
   Parquet itself — and the stream's runs append into `<table>__changes`, a buffer with no
-  partition. The new command `rivet compact -c cfg` runs one `MERGE` per table: the latest
+  partition. The new command `rivet compact -c cfg` runs ONE scripted job per table: the latest
   change per key is upserted into the base, a tombstone flags the row (`__is_deleted = TRUE`,
-  values kept — the warehouse deletes nothing), a later insert un-flags it; the base's
-  partitions are pruned by constant bounds read from the buffer, a buffer touching more than
-  4,000 partitions merges in windows, and the buffer is DROPPED afterwards, so the next load
-  creates it fresh from its run's spec. There is no view in this layout; consumers read
+  values kept — the warehouse deletes nothing), a later insert un-flags it; on a
+  day-partitioned base the MERGE prunes to exactly the days the buffer touched
+  (`DATE(col) IN UNNEST(<days>)`, measured 172 bytes against 48 KB for a MIN..MAX range), in
+  chunks of 4,000 days, and the script drops the buffer, so the next load creates it fresh
+  from its run's spec. A cycle bills a 30 MB floor with changes and nothing without. There is no view in this layout; consumers read
   `<table>` and filter `WHERE NOT __is_deleted`. A crash between the MERGE and the DROP is
   re-merged idempotently by the next compact. Every compaction job carries `rivet_op:merge`;
   the ledger records it as `mode: compact`. The winner per key is ranked over the WHOLE
