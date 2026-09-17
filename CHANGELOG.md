@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- **`cdc.backfill: auto | [exports]` — a CDC export's baseline, declared by reference.**
+  Instead of `initial: snapshot` (one single-stream full scan per table, no `parallel:`), a
+  `mode: cdc` export names the ordinary batch exports that already describe how to read its
+  tables — keyset, range-chunked, `full`, with their `columns:` and tuning — and runs each once,
+  after the anchor, into its own `snapshot/` prefix. `auto` pairs each captured table with the
+  one export reading it (qualified names whole, bare names by table; ambiguity and a missing
+  recipe are refused at config load); `[names]` pairs explicitly. A recipe is a READ recipe,
+  never a second load target: whole-config `rivet run` / `apply` / `plan` skip it at `warn`
+  (`rivet run -e <recipe>` still exports it alone), `rivet load` never types it, and a column
+  the recipe and the stream type differently is refused before an anchor exists — on every
+  run, not only the first. An `incremental` / `time_window` recipe reads a slice and is
+  refused. A crashed range-chunked baseline leg resumes on the next plain run. MySQL needs
+  `cdc.checkpoint:` for any baseline (the file is the anchor); PostgreSQL does not (the slot
+  is). The step-by-step operator cycle — anchor → backfill → load → delta → load, with the
+  interruption points — is `docs/cdc-full-cycle.md`.
+- **`rivet init --mode cdc` over several tables scaffolds that shape**: one batch recipe per
+  table (keyset where the table has a single-column key, range or `full` otherwise, always in
+  the `table:` form) and one `tables:` stream with `backfill: auto`, on MySQL and
+  PostgreSQL `public`. Its next-steps epilogue ends in `rivet run`, not `rivet plan` (a CDC
+  config has no batch plan to seal).
+- **A load is typed from the spec of the run it consumes.** `rivet run` now records each
+  run's columns and key under its run id as well as under the export name; `rivet load` pins
+  every table's plan to the newest loadable run under its own prefix and rebuilds the DDL and
+  `pk: auto` key from that run's spec. On a state DB shared by two configs whose exports share
+  a NAME (`users` from PostgreSQL and `users` from MongoDB), the by-name row is last-writer-
+  wins and the other config's run could retype this table between the run and its load — a
+  `_id` key on a PostgreSQL table, another engine's column types in the DDL. Runs older than
+  this release, or a load that cannot list its prefix, keep the by-name spec and say so.
+- **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
+  it used to abort the whole config on the first `mode: cdc` export.
+- Fixes: a MySQL CDC checkpoint kept `server_uuid` / `gtid_executed` only until the first
+  captured transaction, disarming the wrong-server guard afterwards; `rivet check` graded a
+  `mode: cdc` export as a table scan; a MySQL primary key wider than 1024 bytes was silently
+  truncated by `GROUP_CONCAT` (one row per key column now); a load carrying a bare engine
+  identity (`mysql`) was refused against its own qualified prior (`mysql:app.orders`) and vice
+  versa — a bare identity is "table unrecorded", two qualified tables of one engine are still
+  two sources; `rivet apply` no longer drops the recorded `pk`; a `<table>__changes` log now
+  counts as occupying its warehouse table in duplicate-target detection; a full load onto a
+  table with a different partition is refused BEFORE the rename, not after.
+
 ## 0.26.0 — 2026-09-14
 
 - **`load: { partition }` — the warehouse table's partitioning, per table**
