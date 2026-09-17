@@ -79,6 +79,8 @@ mod live_cdc_mbt;
 mod live_cdc_mongo;
 #[path = "live/live_cdc_mssql.rs"]
 mod live_cdc_mssql;
+#[path = "live/live_cdc_multi_table_cycle.rs"]
+mod live_cdc_multi_table_cycle;
 #[path = "live/live_cdc_oracle.rs"]
 mod live_cdc_oracle;
 #[path = "live/live_cdc_property.rs"]
