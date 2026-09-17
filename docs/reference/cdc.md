@@ -171,9 +171,9 @@ and one column cannot have two types.
 The run loop skips an export that is named as a backfill recipe, so a full
 `rivet run` reads each table once — `rivet run -e orders` still exports it on its
 own. An interrupted baseline resumes on the next plain `rivet run` from its chunk
-checkpoints (a range-chunked leg, live-proven; a keyset leg through its own run
-anchor — no `--resume`, no synthesized name; a leg whose recipe changed after the
-crash names `rivet state reset-chunks -e <leg>`) and
+checkpoints (range-chunked and keyset legs alike, both live-proven against a crash
+after the first page — no `--resume`, no synthesized name; a leg whose recipe
+changed after the crash names `rivet state reset-chunks -e <leg>`) and
 leaves the anchor alone; once a table's baseline is recorded (per table, in the
 state DB), later runs go straight to the drain. `cdc.initial:` and `cdc.backfill:`
 both describe the first run's baseline, so config load refuses the pair.

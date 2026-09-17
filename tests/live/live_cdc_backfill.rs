@@ -316,6 +316,55 @@ fn a_crashed_chunked_baseline_finishes_on_the_next_plain_run() {
     );
 }
 
+/// The KEYSET leg — the recipe `rivet init` scaffolds for every table with a
+/// single-column key, and the shape a 317M-row partner table gets — crashed after
+/// its first page is durable must finish on the next plain run, complete and
+/// without duplicates. Its resume is a different mechanism from the range leg's
+/// (`resume_run_id` + the per-page cursor, not `chunk_task`), so the range test
+/// above proves nothing about it.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mysql-cdc"]
+fn a_crashed_keyset_baseline_finishes_on_the_next_plain_run() {
+    let (tbl, _guard) = seeded("rivet_bf_kcrash", 150);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("backfill: auto")
+        .also_batch_export("baseline", &tbl, "chunked")
+        .also_export_line("chunk_by_key: id")
+        .also_export_line("chunk_size: 50")
+        .also_export_line("chunk_checkpoint: true");
+
+    // Run 1 dies right after the first page's part is on disk.
+    let crash = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "after_file_write")]);
+    assert!(!crash.status.success(), "the crash run must not exit 0");
+    let landed = total_parquet_rows(&snapshot_dir(&rig));
+    assert!(
+        landed > 0 && landed < 150,
+        "inert fixture: expected a PARTIAL baseline, got {landed} rows"
+    );
+
+    // Run 2: the operator's plain re-run.
+    let out = rig.run_args(&[]);
+    assert!(
+        out.status.success(),
+        "a plain re-run must finish the keyset baseline:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // DuckDB over the manifest-DECLARED parts (the loader's view), never a glob:
+    // every id exactly once — a re-read page must overwrite, not append.
+    let ids = duckdb_declared_dir_id_set(&snapshot_dir(&rig));
+    assert_eq!(ids.len(), 150, "every id once, none missing");
+    assert_eq!(
+        duckdb_declared_dir_scalar(&snapshot_dir(&rig), "COUNT(*)"),
+        150,
+        "no duplicate rows across the crashed and the resumed page"
+    );
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        0,
+        "nothing changed, so no delta"
+    );
+}
+
 /// The type-conflict refusal must hold on EVERY run, not only the one that
 /// builds the leg.
 ///

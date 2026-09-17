@@ -464,5 +464,5 @@ scenarios:
     single:         { test: full_cdc_cycle_mysql }
     chunked:        { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
     chunked_checkpoint: { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
-    keyset:         { test: partner_shape_three_tables_one_stream_mysql }
+    keyset:         { test: a_crashed_keyset_baseline_finishes_on_the_next_plain_run }
     mongo_parallel: { na: "the leg is the recipe dispatched as a batch export (shared seam); a Mongo recipe is proven live with a full-scan recipe (full_cdc_cycle_mongo), a parallel-Mongo recipe borrows the same fields (backfill_leg_borrows_the_recipe_read_and_keeps_its_own_identity)" }

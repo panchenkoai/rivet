@@ -13,8 +13,9 @@
   (`rivet run -e <recipe>` still exports it alone), `rivet load` never types it, and a column
   the recipe and the stream type differently is refused at the start of every run, before
   that run's anchor step (not at config load). An `incremental` / `time_window` recipe reads
-  a slice and is refused. A crashed range-chunked baseline leg resumes on the next plain run
-  (live-proven; a keyset leg resumes through its own run anchor, unproven live). A recipe's
+  a slice and is refused. A crashed baseline leg — range-chunked or keyset, the shape init
+  scaffolds — resumes on the next plain run, complete and without duplicates (both live-proven
+  against a crash after the first page). A recipe's
   table shortcut and `columns:` are validated at config load, and `backfill:` written with no
   value is refused rather than read as "no baseline". A bare recipe name pairs only with the
   default schema's spelling (`orders` is `public.orders` / `dbo.orders`, never `sales.orders`). MySQL needs

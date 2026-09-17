@@ -764,7 +764,9 @@ fn oracle_class_census_is_pinned() {
 // +2 tests: the recipe-types test (`parquet_column_type`, shared_codec) and the
 // mixed-config `plan` test (reads `plan.json` — presence, its subject is the
 // planner's skip, not data).
-const PIN_INDEPENDENT: usize = 71;
+// 2026-09-17, v29: +1 independent — the crashed KEYSET baseline leg, graded by
+// DuckDB over the manifest-declared parts (`duckdb_declared_dir_id_set`).
+const PIN_INDEPENDENT: usize = 72;
 const PIN_SHARED_CODEC: usize = 73;
 const PIN_SELF_COUNTER: usize = 6;
 const PIN_PRESENCE: usize = 63;
