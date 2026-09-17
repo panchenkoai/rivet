@@ -557,7 +557,10 @@ impl ExportConfig {
 /// The bound on identifier shape keeps generated SQL safe to interpolate
 /// without quoting and ensures the generated `SELECT * FROM <ident>` form is
 /// recognised by the PG catalog-hint parser ([src/source/postgres.rs]).
-fn validate_table_shortcut_ident(export_name: &str, raw: &str) -> crate::error::Result<()> {
+pub(crate) fn validate_table_shortcut_ident(
+    export_name: &str,
+    raw: &str,
+) -> crate::error::Result<()> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         anyhow::bail!("export '{export_name}': 'table' is empty");
@@ -920,7 +923,7 @@ pub struct CdcExportConfig {
     /// Which EXPORTS supply the baseline read (see [`CdcBackfill`]). Absent ⇒ no
     /// baseline: the stream captures changes only, and the operator owns the
     /// initial load.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "backfill_written_means_a_value")]
     pub backfill: Option<CdcBackfill>,
 }
 
@@ -948,6 +951,19 @@ pub enum CdcBackfill {
     /// An explicit list of export names, for a config where the pairing is not
     /// one-to-one by name.
     Exports(Vec<String>),
+}
+
+/// `backfill:` written with no value (YAML null) is refused, not read as absent —
+/// absent means "no baseline", and a key the operator typed must say which one.
+fn backfill_written_means_a_value<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<CdcBackfill>, D::Error> {
+    CdcBackfill::deserialize(d).map(Some).map_err(|_| {
+        serde::de::Error::custom(
+            "`cdc.backfill` must be `auto` or a list of export names (`[orders, customers]`); \
+             leave the key out for a stream with no baseline",
+        )
+    })
 }
 
 /// The literal `auto`, as its own type so the untagged enum cannot swallow a
@@ -998,14 +1014,21 @@ fn bare(name: &str) -> &str {
 ///
 /// Both QUALIFIED: they must agree in full — `sales.orders` is not `public.orders`,
 /// and a MongoDB collection named `audit.events` is not `app.events` (a dot is a
-/// legal character there, not a qualifier). A BARE side pairs with the other's
-/// last segment: `orders` is `public.orders` to whoever left the schema off.
-/// ponytail: a bare Mongo name against a dotted collection still folds; the
-/// engine-aware rule needs the source type here, which the pairing does not carry.
+/// legal character there, not a qualifier). A BARE side pairs only with the
+/// DEFAULT schema's spelling: `orders` is `public.orders` (`dbo.orders`) to whoever
+/// left the schema off, and is NOT `sales.orders` — pairing those made an unrelated
+/// export the recipe and the run loop stopped running it.
+/// ponytail: the default-schema list is `public`/`dbo`; MySQL's `db.table` needs
+/// the qualified spelling on both sides.
 fn same_relation(a: &str, b: &str) -> bool {
     match (a.contains('.'), b.contains('.')) {
         (true, true) => a == b,
-        _ => bare(a) == bare(b),
+        (false, false) => a == b,
+        _ => {
+            let (qualified, plain) = if a.contains('.') { (a, b) } else { (b, a) };
+            let (schema, leaf) = qualified.rsplit_once('.').unwrap_or(("", qualified));
+            matches!(schema, "public" | "dbo") && leaf == plain
+        }
     }
 }
 
@@ -1070,15 +1093,15 @@ pub fn effective_columns(
 ) -> std::collections::HashMap<String, String> {
     let mut merged = std::collections::HashMap::new();
     for (table, recipe) in resolve_backfill(export, all).unwrap_or_default() {
-        for (k, v) in &recipe.columns {
+        // Bare keys first, qualified second: a recipe naming both `price` and
+        // `orders.price` resolves to the qualified one, whatever the map order.
+        for (k, v) in recipe.columns.iter().filter(|(k, _)| !k.contains('.')) {
             // BARE table: `overrides_for_unit` narrows a `table.column` key by its
             // first dot, so `dbo.orders.price` would never reach unit `dbo.orders`.
-            let key = if k.contains('.') {
-                k.clone()
-            } else {
-                format!("{}.{k}", bare(&table))
-            };
-            merged.insert(key, v.clone());
+            merged.insert(format!("{}.{k}", bare(&table)), v.clone());
+        }
+        for (k, v) in recipe.columns.iter().filter(|(k, _)| k.contains('.')) {
+            merged.insert(k.clone(), v.clone());
         }
     }
     merged.extend(export.columns.clone());
@@ -1849,6 +1872,16 @@ mod tests {
         let e = err(&auto1, &all);
         assert!(e.contains("ambiguous") && e.contains("orders_copy"), "{e}");
 
+        // Named explicitly, two exports for ONE table: both would be claimed as
+        // recipes (`orders_copy` silently stops running) and the leg takes the first.
+        let listed_twice = stream(
+            &["orders"],
+            CdcBackfill::Exports(vec!["orders".into(), "orders_copy".into()]),
+        );
+        let all = vec![orders.clone(), twin.clone(), listed_twice.clone()];
+        let e = err(&listed_twice, &all);
+        assert!(e.contains("two exports for table 'orders'"), "{e}");
+
         // A `query:` export describes rows, not a relation.
         let mut q = recipe("q", "orders");
         q.table = None;
@@ -1908,6 +1941,13 @@ mod tests {
             e.contains("whole table") && e.contains("Incremental"),
             "{e}"
         );
+        // …and a time-window recipe is the same slice-read class.
+        let mut win = recipe("orders_win", "orders");
+        win.mode = ExportMode::TimeWindow;
+        let listed = stream(&["orders"], CdcBackfill::Exports(vec!["orders_win".into()]));
+        let all = vec![win.clone(), listed.clone()];
+        let e = err(&listed, &all);
+        assert!(e.contains("whole table") && e.contains("TimeWindow"), "{e}");
 
         // Two QUALIFIED names that differ are two relations, whatever their last
         // segment says: `sales.orders` is not `public.orders`. Pairing them bound
@@ -1932,6 +1972,13 @@ mod tests {
                 .len(),
             1
         );
+        // …but only with the DEFAULT schema's: a bare `orders` reads `public.orders`,
+        // so it is not the recipe of `sales.orders` — pairing them silently stopped
+        // running the unrelated `orders` export.
+        let sales = stream(&["sales.orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![bare_recipe.clone(), sales.clone()];
+        let e = resolve_backfill(&sales, &all).expect_err("bare does not fold onto sales");
+        assert!(e.contains("sales.orders") && e.contains("no export"), "{e}");
     }
 
     /// A schema-qualified capture (`dbo.orders` — what init writes on SQL Server
@@ -2016,6 +2063,25 @@ mod tests {
         let mut plain = auto.clone();
         plain.cdc = None;
         assert_eq!(effective_columns(&plain, &all), plain.columns);
+
+        // A recipe naming BOTH `price` and `orders.price`: the qualified key wins
+        // deterministically (a HashMap walk made it a coin toss per process).
+        let mut twin = orders.clone();
+        twin.columns = std::collections::HashMap::from([
+            ("price".to_string(), "decimal(8,2)".to_string()),
+            ("orders.price".to_string(), "decimal(12,4)".to_string()),
+        ]);
+        let mut auto_twin = auto.clone();
+        auto_twin.columns.clear();
+        let all = vec![twin, history.clone(), auto_twin.clone()];
+        for _ in 0..20 {
+            assert_eq!(
+                effective_columns(&auto_twin, &all)
+                    .get("orders.price")
+                    .map(String::as_str),
+                Some("decimal(12,4)")
+            );
+        }
     }
 
     /// One predicate for "a baseline on this engine needs a checkpoint": both ways to

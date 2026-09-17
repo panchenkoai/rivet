@@ -167,7 +167,8 @@ impl StateStore {
     /// `query:` export cannot read a key at run time, so its runs record none and
     /// the scaffold's declaration is the only one there is. A key another RUN wrote
     /// into the by-name row is never borrowed: that is the last-writer race the
-    /// per-run spec exists to escape.
+    /// per-run spec exists to escape. The init key itself is per NAME: on a state DB
+    /// shared by two configs, the last `rivet init` of that export name wins.
     pub fn load_spec_of_run_with_init_key(
         &self,
         export_name: &str,
@@ -417,6 +418,20 @@ mod tests {
                 .primary_key,
             None,
             "a run-recorded by-name key is the last-writer race, never borrowed"
+        );
+        // The race in the order it happens: MY keyless run first, then a same-named
+        // export of another config writes `_id` by name. Without the `key_origin =
+        // 'init'` filter the by-name key is borrowed — the exact pin escape.
+        s.record_load_spec("u", None, &cols, None, "mine").unwrap();
+        s.record_load_spec("u", None, &cols, Some(&["_id".to_string()]), "theirs")
+            .unwrap();
+        assert_eq!(
+            s.load_spec_of_run_with_init_key("u", None, "mine")
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            None,
+            "a key another RUN wrote by name AFTER mine is never borrowed"
         );
     }
 

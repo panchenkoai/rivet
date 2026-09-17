@@ -358,8 +358,21 @@ pub(super) fn initial_snapshot_pending(
     };
     let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
 
+    // The pairing, resolved by the same function config load already admitted — so
+    // a reference the run would reject cannot have reached this point.
+    let recipes = crate::config::resolve_backfill(export, &config.exports)
+        .map_err(|why| anyhow::anyhow!(why))?;
+    // EVERY pair, on EVERY run — not only the tables still pending a baseline.
+    // Checked inside the leg builder, a conflict added after the baseline landed
+    // was never seen, and the stream wrote the second type into the log the
+    // baseline had written with the first.
+    for (table, recipe) in &recipes {
+        refuse_backfill_type_conflict(export, table, recipe)?;
+    }
+
     // The anchor — one entry point; the engine's AnchorModel decides the
-    // mechanism (idempotent: a present anchor is never moved).
+    // mechanism (idempotent: a present anchor is never moved). After the refusal
+    // above, so a refused config leaves no slot or checkpoint behind.
     CdcEngine::from_url(&url)?.ensure_anchor(
         &url,
         &slot,
@@ -384,18 +397,6 @@ pub(super) fn initial_snapshot_pending(
         .as_deref()
         .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
         .map(|p| p.0.to_string());
-    // The pairing, resolved by the same function config load already admitted — so
-    // a reference the run would reject cannot have reached this point.
-    let recipes = crate::config::resolve_backfill(export, &config.exports)
-        .map_err(|why| anyhow::anyhow!(why))?;
-    // EVERY pair, on EVERY run — not only the tables still pending a baseline.
-    // Checked inside the leg builder, a conflict added after the baseline landed
-    // was never seen, and the stream wrote the second type into the log the
-    // baseline had written with the first.
-    for (table, recipe) in &recipes {
-        refuse_backfill_type_conflict(export, table, recipe)?;
-    }
-
     let mut pending = Vec::new();
     for idx in pending_idx {
         let (label, read, snap_dcfg) = &table_dests[idx];
@@ -434,7 +435,10 @@ fn refuse_backfill_type_conflict(
         |e: &ExportConfig| crate::plan::build::parse_column_overrides_pub(&e.columns, &e.name);
     let (recipe_types, cdc_types) = (parsed(recipe)?, parsed(cdc_export)?);
     let cdc_for_table = crate::types::overrides_for_unit(&cdc_types, Some(table));
-    for (col, mine) in &recipe_types {
+    // BOTH sides narrowed: a qualified recipe key (`orders.price`) against a bare
+    // CDC key (`price`) is the same column, and compared raw it was never seen.
+    let recipe_for_table = crate::types::overrides_for_unit(&recipe_types, Some(table));
+    for (col, mine) in &recipe_for_table {
         if let Some(theirs) = cdc_for_table.get(col)
             && theirs != mine
         {
@@ -1109,6 +1113,25 @@ mod tests {
             Some("decimal(10,2)")
         );
 
+        // The RANGE read fields too — a recipe chunked by column, not by key.
+        let mut range = recipe.clone();
+        range.chunk_by_key = None;
+        range.chunk_column = Some("ref_id".into());
+        range.chunk_count = Some(7);
+        range.chunk_dense = true;
+        range.chunk_by_days = Some(3);
+        range.chunk_size_memory_mb = Some(64);
+        range.chunk_max_attempts = Some(9);
+        let mut range_leg = synth_snapshot_export(&stream, "orders", "orders", &dcfg);
+        apply_backfill_recipe(&mut range_leg, &range, &stream, "orders").expect("no conflict");
+        assert_eq!(range_leg.chunk_by_key, None);
+        assert_eq!(range_leg.chunk_column.as_deref(), Some("ref_id"));
+        assert_eq!(range_leg.chunk_count, Some(7));
+        assert!(range_leg.chunk_dense);
+        assert_eq!(range_leg.chunk_by_days, Some(3));
+        assert_eq!(range_leg.chunk_size_memory_mb, Some(64));
+        assert_eq!(range_leg.chunk_max_attempts, Some(9));
+
         // WHO it is and WHERE it writes — its own.
         assert_eq!(leg.snapshot_parent.as_deref(), Some("stand_cdc"));
         assert_eq!(leg.snapshot_label.as_deref(), Some("orders"));
@@ -1185,6 +1208,35 @@ mod tests {
             })
         );
         assert_eq!(kept.get("qty"), Some(&crate::types::RivetType::Int32));
+    }
+
+    /// A qualified recipe key and a bare CDC key name ONE column; compared raw
+    /// they never met, and the leg took the CDC type while the stream took the
+    /// recipe's — the exact two-types-in-one-changelog the refusal exists for.
+    #[test]
+    fn backfill_type_conflict_is_refused_when_the_recipe_key_is_qualified_and_the_cdc_key_bare() {
+        let mut stream = crate::config::sample_export("stand_cdc");
+        stream.mode = crate::config::ExportMode::Cdc;
+        stream.table = None;
+        stream.tables = Some(vec!["orders".into()]);
+        stream.columns =
+            std::collections::HashMap::from([("price".into(), "decimal(14,6)".into())]);
+        let mut recipe = crate::config::sample_export("orders");
+        recipe.table = Some("orders".into());
+        recipe.tables = None;
+        recipe.cdc = None;
+        recipe.columns =
+            std::collections::HashMap::from([("orders.price".into(), "decimal(12,4)".into())]);
+        let err = format!(
+            "{:#}",
+            refuse_backfill_type_conflict(&stream, "orders", &recipe)
+                .expect_err("one column, two types")
+        );
+        assert!(err.contains("price") && err.contains("two types"), "{err}");
+        // The same type both ways is not a conflict.
+        recipe.columns =
+            std::collections::HashMap::from([("orders.price".into(), "decimal(14,6)".into())]);
+        refuse_backfill_type_conflict(&stream, "orders", &recipe).expect("agreement");
     }
 
     #[test]

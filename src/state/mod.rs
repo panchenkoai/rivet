@@ -1667,6 +1667,32 @@ mod tests {
         assert_eq!(ver, SCHEMA_VERSION);
     }
 
+    /// A state DB a NEWER rivet migrated is refused by name, before the generic
+    /// "migration incomplete" — the ladder applies nothing and rewrites nothing.
+    #[test]
+    fn a_state_db_from_a_newer_rivet_is_refused_by_name() {
+        let s = StateStore::open_in_memory().unwrap();
+        match &s.conn {
+            StateConn::Sqlite(c) => {
+                migrate(c).unwrap();
+                c.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [SCHEMA_VERSION + 1],
+                )
+                .unwrap();
+                let err = format!("{:#}", migrate(c).unwrap_err());
+                assert!(err.contains("newer than this rivet knows"), "{err}");
+                assert!(!err.contains("migration incomplete"), "{err}");
+                assert_eq!(
+                    get_current_version(c),
+                    SCHEMA_VERSION + 1,
+                    "nothing rewritten"
+                );
+            }
+            StateConn::Postgres(_) => unreachable!(),
+        }
+    }
+
     #[test]
     fn migration_is_idempotent() {
         let s = StateStore::open_in_memory().unwrap();

@@ -19,7 +19,10 @@ The same sequence runs unattended as
 | SQL Server | SQL Server Agent running, `sys.sp_cdc_enable_db`, `sys.sp_cdc_enable_table` per table (one `cdc:` export per table — `tables:` is refused) | from-LSN floored at `fn_cdc_get_min_lsn` | required for a baseline |
 | MongoDB | a replica set (change streams), `directConnection` if port-mapped | resume token | **required** for any `mode: cdc` |
 
-`rivet doctor --config cfg.yaml` checks all of it and prints the fix per line.
+`rivet doctor --config cfg.yaml` checks the log-side state it can read (PostgreSQL: the slot;
+MySQL: binlog mode and whether the checkpoint is still retained; SQL Server: the Agent and
+retention; MongoDB: the replica set) and prints the fix per line. Grants, `wal_level`,
+`max_replication_slots` and RDS retention are not probed — check them by hand.
 
 ## 1. The config: one CDC export, one recipe, one `load:`
 
@@ -78,8 +81,8 @@ rivet plan   --config cfg.yaml     # plans the batch exports; skips the stream a
 
 Expect: no DEGRADED/UNSAFE on the CDC export; every doctor line green. `plan`
 skips the stream and the recipe, saying so — on the §1 config that leaves nothing
-to plan and it stops with "nothing to plan" (expected, not a failure of the
-config); with a plain batch export alongside it plans that one and exits 0.
+to plan and it exits non-zero with "nothing to plan" (expected — not a fault in
+the config); with a plain batch export alongside it plans that one and exits 0.
 
 ## 3. Run 1 — anchor, then baseline — then load 1
 
@@ -163,9 +166,14 @@ Check: `orders__changes` did not grow; the view still equals the source.
 ## Recovery orders that matter
 
 - **Log gone** (slot invalidated, binlog purged — ERROR 1236, MSSQL below
-  retention): re-anchor FIRST (delete the checkpoint / accept a fresh slot),
-  THEN re-baseline. Re-baselining first leaves every change in between in
-  neither.
+  retention): re-baseline in ONE run, in the product's own order — the run pins
+  the anchor first, then re-reads the baseline. To make it do that: delete the
+  checkpoint (MySQL / SQL Server / MongoDB) or let the slot be recreated
+  (PostgreSQL), AND clear the export's `cdc_snapshot` row and the table's
+  `snapshot/_SUCCESS`, AND truncate `<table>__changes` before the next load (a
+  re-read baseline has no `__pos`, so the log cannot be deduplicated across it;
+  the load refuses without the truncate). Deleting the checkpoint alone is
+  refused: prior-run evidence exists and the run would re-anchor over a gap.
 - **MySQL checkpoint used against another server**: refused on purpose; same
   order on the new host.
 - **`rivet validate --config cfg.yaml`** certifies both legs — the baseline under

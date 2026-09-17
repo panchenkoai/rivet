@@ -261,9 +261,10 @@ pub enum Commands {
         discover: bool,
         /// Override the suggested extraction mode for every scaffolded export.
         /// `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block
-        /// with engine-specific stream params) instead of a batch query; on MySQL
-        /// and PostgreSQL over two or more tables it writes one batch recipe per
-        /// table plus one `tables:` stream with `backfill: auto`. Other values
+        /// with engine-specific stream params) instead of a batch query; on MySQL,
+        /// and on PostgreSQL when every table is in `public`, over two or more
+        /// tables it writes one batch recipe per table plus one `tables:` stream
+        /// with `backfill: auto` (one export per table otherwise). Other values
         /// (full / incremental / chunked / time_window) just override the
         /// auto-suggested mode.
         #[arg(long, value_name = "MODE")]

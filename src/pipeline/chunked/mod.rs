@@ -311,7 +311,9 @@ pub(super) fn ensure_chunk_checkpoint_plan(
             Some((rid, stored_hash)) => {
                 if stored_hash != plan_hash {
                     anyhow::bail!(
-                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume",
+                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume — \
+                         to abandon the interrupted run and start over: `rivet state reset-chunks -c {config_path} -e {}`",
+                        plan.export_name,
                         plan.export_name
                     );
                 }

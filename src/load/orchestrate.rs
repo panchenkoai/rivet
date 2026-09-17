@@ -238,6 +238,11 @@ fn pin_plan_to_its_run(
         }
     });
     let mut pinned: Option<(String, crate::state::LoadSpec)> = None;
+    // Newer Success runs that recorded no spec (a crash after the manifest and
+    // before the spec write; a drain that acked parts then failed) are typed from
+    // the older pinned run — said so, since a column added between them is
+    // exactly what the pin exists to type.
+    let mut skipped: Vec<&str> = Vec::new();
     for (_, run_id) in &newest_first {
         // With the init-recorded key when the run recorded none (a `query:` export
         // has no key to read) — never with a key another run wrote by name.
@@ -246,7 +251,10 @@ fn pin_plan_to_its_run(
                 pinned = Some((run_id.clone(), spec));
                 break;
             }
-            Ok(None) => continue,
+            Ok(None) => {
+                skipped.push(run_id);
+                continue;
+            }
             Err(e) => {
                 return unpinned(&format!("run {run_id}'s own spec is unreadable ({e:#})"));
             }
@@ -255,11 +263,15 @@ fn pin_plan_to_its_run(
     let Some((run_id, spec)) = pinned else {
         return unpinned(&format!(
             "none of its {} loadable run(s) recorded a per-run spec (runs older than this \
-             release, baseline legs only, or a continuous stream — `until_current: false` — \
-             that was stopped rather than finished, which records nothing)",
+             release, baseline legs only, a run that crashed after its manifest and before \
+             its spec write, or a continuous stream — `until_current: false` — that was \
+             stopped rather than finished, which records nothing)",
             newest_first.len()
         ));
     };
+    if let Some(note) = skipped_runs_note(&plan.table, &run_id, &skipped) {
+        eprintln!("{note}");
+    }
     let Some(target) = crate::types::target::ExportTarget::parse(plan.load.target.name()) else {
         return unpinned("unknown load target");
     };
@@ -271,6 +283,19 @@ fn pin_plan_to_its_run(
              config changed after that run (a new `pk:` / `partition.column`), run `rivet run \
              -e {}` once so a run records the column, then load again",
             plan.table, plan.export_name
+        )
+    })
+}
+
+/// The stderr line naming the newer runs the pin passed over, or `None` when the
+/// pinned run is the newest. Pure: the live-only pin decides through it.
+fn skipped_runs_note(table: &str, pinned: &str, skipped: &[&str]) -> Option<String> {
+    (!skipped.is_empty()).then(|| {
+        format!(
+            "  load [{table}]: typed from run {pinned}; {} newer run(s) recorded no spec and \
+             are loaded with its columns: {}",
+            skipped.len(),
+            skipped.join(", ")
         )
     })
 }
@@ -2113,6 +2138,17 @@ mod live_only_decisions {
     /// run's `Running` marker carries no schema/table and renders as the bare
     /// engine; when it sorted first in the listing it WAS `mine`, so one crashed
     /// run's leftover marker refused every later load of the table, forever.
+    #[test]
+    fn the_pin_names_the_newer_runs_it_passed_over_and_stays_quiet_otherwise() {
+        assert_eq!(super::skipped_runs_note("orders", "r1", &[]), None);
+        let note = super::skipped_runs_note("orders", "r1", &["r3", "r2"]).expect("named");
+        assert!(note.contains("orders") && note.contains("r1"), "{note}");
+        assert!(
+            note.contains("2 newer run(s)") && note.contains("r3, r2"),
+            "{note}"
+        );
+    }
+
     #[test]
     fn a_running_marker_does_not_impersonate_the_source_identity() {
         let dir = tempfile::tempdir().unwrap();

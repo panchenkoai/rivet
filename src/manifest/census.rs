@@ -410,6 +410,36 @@ pub fn ensure_single_generation(selected: &[&CensusRun<'_>]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Ties are not "after" in either direction (a `>=` would make the pin's
+    /// comparator an inconsistent order), mixed precision compares as an instant,
+    /// and the malformed fallback is lexical in the SAME direction.
+    #[test]
+    fn finished_after_is_a_strict_instant_order_with_a_lexical_fallback() {
+        use super::finished_after;
+        assert!(!finished_after(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(!finished_after(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.000Z"
+        ));
+        assert!(finished_after(
+            "2026-01-01T00:00:00.5Z",
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(!finished_after(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.5Z"
+        ));
+        assert!(finished_after(
+            "2026-01-01T00:00:01+00:00",
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(finished_after("junk-b", "junk-a"));
+        assert!(!finished_after("junk-a", "junk-b"));
+    }
+
     use super::*;
     use crate::manifest::{
         MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource, SplitWindow,

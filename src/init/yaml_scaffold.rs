@@ -625,7 +625,10 @@ fn export_block_lines(
         // MongoDB has no SQL: the `table:` shortcut (→ collection scan) is the
         // ONLY export form it accepts, and it is schemaless so there is no
         // column list to spell out. Always emit `table:` for a Mongo source.
-        lines.push(format!("    table: {qualified_table}"));
+        lines.push(format!(
+            "    table: {}",
+            yaml_quote_if_needed(&qualified_table)
+        ));
     } else {
         // QUOTED relation (round-7) AND quoted columns (round-9): the catalog
         // names are case-exact; interpolating either raw case-folds to a
@@ -818,7 +821,7 @@ fn cdc_export_lines(
         format!("  - name: {}", yaml_quote_if_needed(&info.table)),
         "    # change data capture — reads the transaction log (grants: docs/reference/cdc.md)"
             .to_string(),
-        format!("    table: {qualified_table}"),
+        format!("    table: {}", yaml_quote_if_needed(qualified_table)),
         "    mode: cdc".to_string(),
         "    format: parquet".to_string(),
         "    cdc:".to_string(),
@@ -897,7 +900,7 @@ fn cdc_multiplex_export_lines(
     };
     let table_list = infos
         .iter()
-        .map(|i| i.table.clone())
+        .map(|i| yaml_quote_if_needed(&i.table))
         .collect::<Vec<_>>()
         .join(", ");
     let mut lines = vec![
@@ -1675,6 +1678,53 @@ mod tests {
     /// reason to hand-roll a three-step runbook). The oracle is the config the
     /// product PARSES: every captured table must resolve to a recipe that reads
     /// it by `table:` with the strategy init would pick for a batch export.
+    /// A table named `null` (or `yes`, `on`, `1e3`) written bare into `table:` /
+    /// `tables:` is a YAML scalar of another type — the scaffold was dead on load.
+    #[test]
+    fn whole_db_cdc_scaffold_quotes_a_table_named_like_a_yaml_scalar() {
+        let pk = |name: &str, ty: &str| ColumnInfo {
+            is_primary_key: true,
+            ..col(name, ty)
+        };
+        let t = |name: &str| TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: name.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![pk("id", "bigint")],
+        };
+        let dest = InitYamlDestination::default();
+        let yaml = generate_schema_config(
+            &[t("null"), t("orders")],
+            "mysql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            "MySQL database \"app\"",
+            &dest,
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::from_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("the scaffold must load: {e}\n{yaml}"));
+        let stream = cfg
+            .exports
+            .iter()
+            .find(|e| e.mode == crate::config::ExportMode::Cdc)
+            .expect("one stream");
+        assert_eq!(
+            stream.tables.as_deref(),
+            Some(&["null".to_string(), "orders".to_string()][..]),
+            "{yaml}"
+        );
+        assert!(
+            cfg.exports
+                .iter()
+                .any(|e| e.table.as_deref() == Some("null")),
+            "the recipe reads the table literally named `null`:\n{yaml}"
+        );
+    }
+
     #[test]
     fn whole_db_cdc_scaffolds_a_backfill_recipe_per_table_not_a_snapshot_leg() {
         let pk = |name: &str, ty: &str| ColumnInfo {

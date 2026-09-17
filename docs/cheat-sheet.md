@@ -293,7 +293,7 @@ Recovery:
 | Symptom | Action |
 |---|---|
 | Run failed | Re-run. The checkpoint did not advance, so the data is re-read, not lost |
-| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-anchor FIRST (delete the checkpoint / accept a fresh slot, so the next run pins the current position), THEN re-snapshot (`initial: snapshot` or `mode: full`). Snapshotting first leaves every change in between in neither |
+| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-baseline in ONE run (the run anchors first, then re-reads the baseline): delete the checkpoint (MySQL/MSSQL/Mongo) or let the slot be recreated (PG), AND clear the export's `cdc_snapshot` row + `snapshot/_SUCCESS`, AND truncate `<table>__changes` before the next load. Deleting the checkpoint alone is refused (prior-run evidence exists) |
 | MySQL checkpoint used against another server | Refused on purpose. Same order on the new host: fresh checkpoint first, then re-snapshot |
 
 ---

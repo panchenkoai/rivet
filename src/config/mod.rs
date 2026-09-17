@@ -1636,6 +1636,17 @@ impl Config {
                     }
                 }
             }
+            // The recipe's READ is validated here, not at the leg: `plan`/`check`
+            // skip a recipe, so its table shortcut and `columns:` were first parsed
+            // by the leg — after the anchor had been taken.
+            for (_, recipe) in &pairs {
+                if self.source.source_type.is_sql()
+                    && let Some(t) = recipe.table.as_deref()
+                {
+                    export::validate_table_shortcut_ident(&recipe.name, t)?;
+                }
+                crate::plan::build::parse_column_overrides_pub(&recipe.columns, &recipe.name)?;
+            }
             // A `table.column` type key is narrowed by LEAF, so two captured tables
             // with one leaf cannot be typed apart: a recipe's `columns:` on either
             // would type both. Refuse rather than let the later recipe win silently.
@@ -2150,8 +2161,65 @@ mod reserved_load_extension {
         let err = Config::from_yaml(&cfg("audit.events"))
             .unwrap_err()
             .to_string();
+        // `audit.events` is not `events` on any engine now (a bare name folds only
+        // onto `public`/`dbo`), so the pairing never forms and the refusal is the
+        // missing-recipe one; the literal-name refusal below covers `public.events`.
+        assert!(err.contains("no export reading table 'events'"), "{err}");
+        let err = Config::from_yaml(
+            &cfg("public.events")
+                .replace("table: events", "table: public.events")
+                .replace(
+                    "table: public.events\n    mode: full",
+                    "table: events\n    mode: full",
+                ),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
-            err.contains("collection name is literal") && err.contains("audit.events"),
+            err.contains("collection name is literal") && err.contains("public.events"),
+            "{err}"
+        );
+    }
+
+    /// A recipe is skipped by `plan` and `check`, so a bad `columns:` type or table
+    /// shortcut on it used to surface only when the leg ran — after the anchor.
+    #[test]
+    fn a_backfill_recipes_read_is_validated_at_config_load() {
+        let cfg = |cols: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                 \x20 - name: base\n    table: orders\n    mode: full\n    format: parquet\n{cols}    \
+                 destination: {{ type: gcs, bucket: b, prefix: base/ }}\n\
+                 \x20 - name: stream\n    table: orders\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ backfill: auto }}\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("    columns: { qty: int32 }\n")).expect("a valid recipe");
+        let err = Config::from_yaml(&cfg("    columns: { qty: \"decimal (10, 2)\" }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("base") && err.contains("qty"), "{err}");
+    }
+
+    /// `backfill:` with no value is a typed key with nothing said — refused, never
+    /// read as "no baseline" (the silent-success shape every message here warns of).
+    #[test]
+    fn an_empty_backfill_key_is_refused_not_read_as_absent() {
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                    \x20 - name: stream\n    table: orders\n    mode: cdc\n    format: parquet\n    \
+                    cdc:\n      backfill:\n    \
+                    destination: { type: gcs, bucket: b, prefix: cdc/ }\n";
+        let err = Config::from_yaml(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("`cdc.backfill` must be `auto` or a list"),
+            "{err}"
+        );
+        let err = Config::from_yaml(&yaml.replace("backfill:\n", "backfill: atuo\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`cdc.backfill` must be `auto` or a list"),
             "{err}"
         );
     }
@@ -2174,7 +2242,7 @@ mod reserved_load_extension {
             )
         };
         Config::from_yaml(&cfg("")).expect("untyped recipes over two same-leaf tables pair fine");
-        let err = Config::from_yaml(&cfg("    columns: { amount: decimal(18,2) }\n"))
+        let err = Config::from_yaml(&cfg("    columns: { amount: \"decimal(18,2)\" }\n"))
             .unwrap_err()
             .to_string();
         assert!(

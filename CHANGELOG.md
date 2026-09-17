@@ -13,8 +13,11 @@
   (`rivet run -e <recipe>` still exports it alone), `rivet load` never types it, and a column
   the recipe and the stream type differently is refused at the start of every run, before
   that run's anchor step (not at config load). An `incremental` / `time_window` recipe reads
-  a slice and is refused. A crashed chunked baseline leg (range or keyset) resumes on the
-  next plain run. MySQL needs
+  a slice and is refused. A crashed range-chunked baseline leg resumes on the next plain run
+  (live-proven; a keyset leg resumes through its own run anchor, unproven live). A recipe's
+  table shortcut and `columns:` are validated at config load, and `backfill:` written with no
+  value is refused rather than read as "no baseline". A bare recipe name pairs only with the
+  default schema's spelling (`orders` is `public.orders` / `dbo.orders`, never `sales.orders`). MySQL needs
   `cdc.checkpoint:` for any baseline (the file is the anchor); PostgreSQL does not (the slot
   is). The step-by-step operator cycle — anchor → backfill → load → delta → load, with the
   interruption points — is `docs/cdc-full-cycle.md`.
@@ -31,8 +34,13 @@
   `pk: auto` key from that run's spec. On a state DB shared by two configs whose exports share
   a NAME (`users` from PostgreSQL and `users` from MongoDB), the by-name row is last-writer-
   wins and the other config's run could retype this table between the run and its load — a
-  `_id` key on a PostgreSQL table, another engine's column types in the DDL. Runs older than
-  this release, or a load that cannot list its prefix, keep the by-name spec and say so.
+  `_id` key on a PostgreSQL table, another engine's column types in the DDL. "Newest" is the
+  newest successful run that recorded a spec; a newer run that recorded none (a crash between
+  its manifest and its spec write) is named on stderr. Runs older than this release, or a load
+  that cannot list its prefix, keep the by-name spec and say so. On the same shared state DB,
+  a live run of one config's `users` is no longer declared dead by the other config's finished
+  `users` run: supersession of a `running` row now needs a newer success under the same
+  prefix, so `gc_orphans` keeps sparing the live writer's in-flight parts.
 - **A multiplex `tables:` stream's `load:` takes per-table overrides** — `load: { partition:
   { column: created_at, granularity: day }, tables: { customers: { partition: none },
   line_items: { pk: [id, line_no] } } }` on the export: each captured table's block is
@@ -52,15 +60,20 @@
   identity (`mysql`) was refused against its own qualified prior (`mysql:app.orders`) and vice
   versa — a bare identity is "table unrecorded", two qualified tables of one engine are still
   two sources; `rivet apply` no longer drops the recorded `pk`; a `<table>__changes` log now
-  counts as occupying its warehouse table in duplicate-target detection; a full load onto a
-  table with a different partition is refused BEFORE the rename, not after; on SQL Server a
+  counts as occupying its warehouse table in duplicate-target detection; an incremental or
+  CDC load that would adopt an earlier full-load table with a different partition as its
+  change log is refused BEFORE the rename, not after; on SQL Server a
   label-cased `columns:` key (`Orders.price` on a `dbo.orders` catalog) typed the CDC stream
   but not its backfill leg — both are now narrowed by the configured table label; two captured
   tables sharing a leaf name (`sales.orders`, `archive.orders`) with a typed recipe are refused
   rather than sharing one table's `columns:`; a MongoDB backfill recipe must name the
   collection literally (`audit.events` is a name, not a schema); a state DB migrated by a
   newer rivet is refused by name ("schema v29, newer than this rivet knows") instead of
-  "migration incomplete".
+  "migration incomplete"; a qualified recipe key (`orders.price`) and a bare stream key
+  (`price`) for one column are now seen as the same column by the type-conflict refusal, and
+  a recipe declaring both spellings resolves to the qualified one deterministically; a chunked
+  baseline leg whose recipe changed after a crash names `rivet state reset-chunks -e <leg>`,
+  which now accepts the leg's name.
 
 ## 0.26.0 — 2026-09-14
 
