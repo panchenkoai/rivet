@@ -412,6 +412,39 @@ impl Config {
 
     /// A per-export `load:` override needs the top-level block it overrides.
     fn validate_load_overrides(&self) -> crate::error::Result<()> {
+        // `load.tables:` names captured tables of a multiplex stream — nothing else
+        // has per-table units, and a name that is not captured would be an override
+        // silently applied to nothing.
+        for e in &self.exports {
+            let Some(o) = &e.load else { continue };
+            if o.tables.is_empty() {
+                continue;
+            }
+            let Some(captured) = e.multiplex_tables() else {
+                anyhow::bail!(
+                    "export '{}': `load.tables:` is for a `mode: cdc` export with `tables:` — \
+                     this export has one unit, so its `load:` block already IS the table's",
+                    e.name
+                );
+            };
+            for (t, sub) in &o.tables {
+                if !captured.iter().any(|c| c == t) {
+                    anyhow::bail!(
+                        "export '{}': `load.tables.{t}` names a table this export does not \
+                         capture (tables: [{}])",
+                        e.name,
+                        captured.join(", ")
+                    );
+                }
+                if !sub.tables.is_empty() {
+                    anyhow::bail!(
+                        "export '{}': `load.tables.{t}.tables` — a per-table block takes no \
+                         `tables:` of its own",
+                        e.name
+                    );
+                }
+            }
+        }
         if self.load.is_some() {
             return Ok(());
         }
@@ -2022,6 +2055,47 @@ mod reserved_load_extension {
             err.contains("no top-level `load:` block"),
             "an override with nothing to override: {err}"
         );
+    }
+
+    /// `load.tables:` is a per-table layer of a multiplex stream: a name the stream
+    /// does not capture, a single-unit export, or a nested `tables:` is refused at
+    /// load — never an override silently applied to nothing.
+    #[test]
+    fn per_table_load_overrides_name_captured_tables_of_a_multiplex_stream() {
+        let cfg = |export_body: &str| {
+            format!(
+                "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n{export_body}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n"
+            )
+        };
+        let stream = |load: &str| {
+            cfg(&format!(
+                "  - name: cdc\n    tables: [orders, customers]\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ checkpoint: ./c.ckpt }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n    \
+                 load: {load}\n"
+            ))
+        };
+        Config::from_yaml(&stream("{ tables: { customers: { partition: none } } }"))
+            .expect("a captured table may carry its own block");
+        let err = Config::from_yaml(&stream("{ tables: { payments: { partition: none } } }"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not capture") && err.contains("payments"),
+            "{err}"
+        );
+        let err = Config::from_yaml(&stream(
+            "{ tables: { customers: { tables: { orders: { pk: [id] } } } } }",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("takes no `tables:` of its own"), "{err}");
+        let single = cfg(
+            "  - name: t\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination: { type: gcs, bucket: b, prefix: t/ }\n    load: { tables: { t: { pk: [id] } } }\n",
+        );
+        let err = Config::from_yaml(&single).unwrap_err().to_string();
+        assert!(err.contains("has one unit"), "{err}");
     }
 }
 

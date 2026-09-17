@@ -538,10 +538,18 @@ fn build_plans_keyed(
         // Effective load config: the shared top-level `load:`, with this export's
         // own `load:` block overriding the table-specific fields (pk, cleanup, …).
         // The warehouse `target` is shared and cannot be re-targeted per export.
-        let eff_load = match &export.load {
+        let mut eff_load = match &export.load {
             Some(o) => load.with_override(o),
             None => load.clone(),
         };
+        // A multiplex stream's `load.tables: { <table>: … }` — this table's own
+        // layer over the export's, over the top level (`validate_load_overrides`
+        // has already checked every name is a captured table).
+        if let (Some(o), Some(t)) = (&export.load, &unit)
+            && let Some(per_table) = o.tables.get(t)
+        {
+            eff_load = eff_load.with_override(per_table);
+        }
         let (pk, cluster_by) = resolve_keys(
             &export.name,
             &eff_load,
@@ -966,6 +974,18 @@ mod tests {
         })
     }
 
+    /// A TIMESTAMP column — the shape a `partition.column` needs.
+    fn ts_col(name: &str) -> TypeReportRow {
+        row_from_spec(&TargetColumnSpec {
+            column_name: name.into(),
+            target_type: "TIMESTAMP".into(),
+            autoload_type: "TIMESTAMP".into(),
+            status: TargetStatus::Ok,
+            note: None,
+            cast_sql: None,
+        })
+    }
+
     /// One export's report, as the resolver returns it.
     fn report(export: &str, columns: Vec<TypeReportRow>) -> ExportTypeReport {
         ExportTypeReport {
@@ -1340,6 +1360,86 @@ load:
             );
             assert_eq!(p.pk, vec!["id"], "the shared `load:` applies to each");
         }
+    }
+
+    /// One `load:` on a six-table stream is one partition column, one key, for six
+    /// tables that do not share a schema. The stream's `load:` therefore takes a
+    /// `tables:` map — a per-TABLE override layered over the export's, layered
+    /// over the top level — so `created_at` partitions the tables that have it
+    /// and `none` clears it where they do not, without splitting the stream.
+    #[test]
+    fn a_multiplex_export_takes_per_table_load_overrides() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: cdc
+    tables: [orders, customers, line_items]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      initial: snapshot
+    destination:
+      type: gcs
+      bucket: b
+      prefix: cdc/
+    load:
+      partition: { column: created_at, granularity: day }   # the stream's default
+      tables:
+        customers: { partition: none }                       # has no created_at
+        line_items: { pk: [id, line_no], cluster_by: none }  # a composite key
+load:
+  target: bigquery
+  project: p
+  dataset: d
+  pk: [id]
+"#,
+        )
+        .unwrap();
+        let load = cfg.load.clone().unwrap();
+        let reports = vec![
+            table_report(
+                "cdc",
+                "orders",
+                vec![col("id", TargetStatus::Ok), ts_col("created_at")],
+            ),
+            table_report("cdc", "customers", vec![col("id", TargetStatus::Ok)]),
+            table_report(
+                "cdc",
+                "line_items",
+                vec![
+                    col("id", TargetStatus::Ok),
+                    col("line_no", TargetStatus::Ok),
+                    ts_col("created_at"),
+                ],
+            ),
+        ];
+        let plans = build_plans(&cfg, &load, reports).unwrap();
+        let by_table = |t: &str| plans.iter().find(|p| p.table == t).expect(t);
+
+        assert!(
+            by_table("orders").partition.is_some(),
+            "the stream's default applies"
+        );
+        assert_eq!(by_table("orders").pk, vec!["id"]);
+        assert!(
+            by_table("customers").partition.is_none(),
+            "`partition: none` on the table clears the stream's default"
+        );
+        assert_eq!(
+            by_table("customers").pk,
+            vec!["id"],
+            "the rest is inherited"
+        );
+        assert!(by_table("line_items").partition.is_some());
+        assert_eq!(
+            by_table("line_items").pk,
+            vec!["id", "line_no"],
+            "the table's own key over the top-level one"
+        );
     }
 
     /// The multiplex sub-prefix rule itself: the table becomes ONE path segment

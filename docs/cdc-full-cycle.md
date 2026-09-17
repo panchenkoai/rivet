@@ -51,6 +51,11 @@ load: { target: bigquery, project: my-proj, dataset: my_ds, pk: auto }
   for every table it discovers (MySQL, PostgreSQL `public`): one recipe per table
   — keyset where the table has a single-column key, range or `full` otherwise —
   and one `tables:` stream with `backfill: auto`. Add the `load:` block and run.
+- A stream over several tables rarely shares one partition column or one key.
+  Put the per-table layer on the stream's own `load:` block:
+  `load: { partition: { column: created_at, granularity: day }, tables: { customers:
+  { partition: none }, line_items: { pk: [id, line_no] } } }` — each table's block
+  overrides the export's, which overrides the top-level `load:`.
 - `orders` is a **read recipe**: a whole-config `rivet run` (and `rivet apply`)
   skips it — at `warn` — and the CDC export runs it after the anchor into its
   own `exports/stream/orders/snapshot/`. `rivet run -e orders` still exports it

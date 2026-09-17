@@ -240,6 +240,12 @@ pub struct LoadOverride {
     #[serde(default, deserialize_with = "partition_override")]
     #[schemars(with = "Option<PartitionSetting>")]
     pub partition: Option<Option<PartitionSpec>>,
+    /// On a multiplex `tables:` CDC export: the override for ONE captured table,
+    /// keyed by its name, layered over this block — six tables through one stream
+    /// rarely share a partition column or a key. Every name must be one of the
+    /// export's `tables:`; a nested `tables:` is refused.
+    #[serde(default)]
+    pub tables: std::collections::BTreeMap<String, LoadOverride>,
 }
 
 /// A column list in a `load:` block: `auto` (from the recorded source primary key),

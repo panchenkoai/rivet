@@ -30,6 +30,11 @@
   wins and the other config's run could retype this table between the run and its load — a
   `_id` key on a PostgreSQL table, another engine's column types in the DDL. Runs older than
   this release, or a load that cannot list its prefix, keep the by-name spec and say so.
+- **A multiplex `tables:` stream's `load:` takes per-table overrides** — `load: { partition:
+  { column: created_at, granularity: day }, tables: { customers: { partition: none },
+  line_items: { pk: [id, line_no] } } }` on the export: each captured table's block is
+  layered over the export's, over the top-level `load:`, so six tables through one binlog
+  stream no longer share one partition column and one key. Names must be captured tables.
 - **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
   it used to abort the whole config on the first `mode: cdc` export.
 - Fixes: a MySQL CDC checkpoint kept `server_uuid` / `gtid_executed` only until the first
