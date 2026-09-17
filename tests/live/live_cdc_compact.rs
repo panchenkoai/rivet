@@ -185,3 +185,88 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     assert_eq!(v_of(&bq, &table, 3), Some(99), "merged once, not twice");
     assert!(bq.read_bq_table_type(&changes).is_none());
 }
+
+/// `(v, created_at as text)` of one key in the base.
+fn row_of(bq: &BqLive, table: &str, id: i64) -> (Option<i64>, Option<String>) {
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT v, CAST(created_at AS STRING) AS c FROM `{}.{}.{table}` WHERE id = {id}",
+        bq.project, bq.dataset
+    ));
+    let r = &rows[0];
+    (
+        r["v"].as_str().map(|s| s.parse().expect("v")),
+        r["c"].as_str().map(str::to_string),
+    )
+}
+
+/// A partitioned base prunes its MERGE by the buffer's partition-column range, and
+/// rows whose partition column is NULL merge on their own. A key with changes on
+/// BOTH sides of that split (its `created_at` set to NULL and back within one
+/// cycle) must still end at its LATEST change — the winner is chosen over the whole
+/// buffer, never per subset, or the order of the MERGE jobs decides the row.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
+    let Some(bq) = BqLive::from_env("compact_split") else {
+        return;
+    };
+    let mut scn =
+        CdcScenario::mysql_with(
+            "compact_split",
+            "id BIGINT PRIMARY KEY, v INT, created_at DATETIME NULL",
+            |r, t| {
+                r.cdc("backfill: auto")
+                    .also_batch_export("baseline", t, "full")
+                    .dest_gcs_live(&bq.bucket, &bq.prefix)
+                    .top_line(&bq.load_line(
+                        ", pk: [id], partition: { column: created_at, granularity: day }",
+                    ))
+            },
+        );
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    scn.sql(&format!(
+        "INSERT INTO {table} (id, v, created_at) VALUES (1, 1, '2024-01-01 00:00:00'), (2, 2, '2024-01-01 00:00:00')"
+    ));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(base_profile(&bq, &table).0, 2);
+
+    // Key 1: NULL first, dated last. Key 2: dated first, NULL last.
+    scn.sql(&format!(
+        "UPDATE {table} SET created_at = NULL, v = 20 WHERE id = 1"
+    ));
+    scn.sql(&format!(
+        "UPDATE {table} SET created_at = '2024-01-01 00:00:00', v = 30 WHERE id = 1"
+    ));
+    scn.sql(&format!(
+        "UPDATE {table} SET created_at = '2024-01-02 00:00:00', v = 200 WHERE id = 2"
+    ));
+    scn.sql(&format!(
+        "UPDATE {table} SET created_at = NULL, v = 300 WHERE id = 2"
+    ));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(bq.read_bq_count(&changes), "4", "four changes buffered");
+
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("COMPACT OK"), "{said}");
+    assert_eq!(
+        row_of(&bq, &table, 1),
+        (Some(30), Some("2024-01-01 00:00:00".to_string())),
+        "key 1 ends at its latest change (dated), not at the older NULL one"
+    );
+    assert_eq!(
+        row_of(&bq, &table, 2),
+        (Some(300), None),
+        "key 2 ends at its latest change (NULL), not at the older dated one"
+    );
+    assert_eq!(
+        base_profile(&bq, &table),
+        (2, 2, 0, 0, 3),
+        "still two live rows"
+    );
+}

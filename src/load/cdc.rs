@@ -272,6 +272,12 @@ pub fn time_literal(target_type: &str, date: chrono::NaiveDate) -> String {
 /// applied to the buffer AND to the base in `ON`, so the base's partitions prune.
 /// `nulls_only` selects the buffer rows whose partition column is NULL (a
 /// tombstone with a minimal before-image) — merged unpruned, on their own.
+///
+/// The winner per key is ranked over the WHOLE buffer and only then filtered by
+/// the bound, so a key with changes on both sides of a split (a window and the
+/// NULL set, or two windows) lands in exactly ONE job — the one its latest change
+/// belongs to. Ranking inside the filter picked a stale winner per subset and let
+/// the job order decide the row (RED: `a_key_changed_across_the_partition_split…`).
 pub fn compact_merge_sql(
     base_fqtn: &str,
     changes_fqtn: &str,
@@ -291,12 +297,12 @@ pub fn compact_merge_sql(
         .join(", ");
     let source_filter = match (bound, nulls_only) {
         (Some(b), _) => format!(
-            "\n    WHERE `{c}` >= {lo} AND `{c}` < {hi}",
+            " AND `{c}` >= {lo} AND `{c}` < {hi}",
             c = b.column,
             lo = b.lo,
             hi = b.hi_exclusive
         ),
-        (None, Some(c)) => format!("\n    WHERE `{c}` IS NULL"),
+        (None, Some(c)) => format!(" AND `{c}` IS NULL"),
         (None, None) => String::new(),
     };
     let on_keys = pk
@@ -335,8 +341,8 @@ pub fn compact_merge_sql(
          USING (\n\
          \x20 SELECT * EXCEPT (__rn) FROM (\n\
          \x20   SELECT *, ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order}) AS __rn\n\
-         \x20   FROM `{changes_fqtn}`{source_filter}\n\
-         \x20 ) WHERE __rn = 1\n\
+         \x20   FROM `{changes_fqtn}`\n\
+         \x20 ) WHERE __rn = 1{source_filter}\n\
          ) AS S\n\
          ON {on_keys}{on_bound}\n\
          WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n\
@@ -831,8 +837,8 @@ mod compact_tests {
         assert!(sql.starts_with("MERGE `p.d.orders` AS T"), "{sql}");
         assert!(sql.contains("PARTITION BY `id` ORDER BY"), "{sql}");
         assert!(
-            sql.contains("FROM `p.d.orders__changes`\n    WHERE `created_at` >= DATE '2000-01-01' AND `created_at` < DATE '2010-12-14'"),
-            "the buffer side is bounded: {sql}"
+            sql.contains("FROM `p.d.orders__changes`\n  ) WHERE __rn = 1 AND `created_at` >= DATE '2000-01-01' AND `created_at` < DATE '2010-12-14'"),
+            "the buffer side is bounded AFTER ranking, on the winner: {sql}"
         );
         assert!(
             sql.contains("ON T.`id` = S.`id` AND T.`created_at` >= DATE '2000-01-01' AND T.`created_at` < DATE '2010-12-14'"),
@@ -876,7 +882,11 @@ mod compact_tests {
             None,
             Some("created_at"),
         );
-        assert!(sql.contains("WHERE `created_at` IS NULL"), "{sql}");
+        assert!(
+            sql.contains("WHERE __rn = 1 AND `created_at` IS NULL"),
+            "the NULL set is chosen among the WINNERS, so a key whose latest change is \
+             dated never merges here as well: {sql}"
+        );
         assert!(
             sql.contains("ON T.`id` = S.`id`\n"),
             "no bound on the base: {sql}"

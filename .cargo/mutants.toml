@@ -618,4 +618,21 @@ exclude_re = [
     # DDL, not a refusal; the test reads INFORMATION_SCHEMA, never rivet's exit.
     # The release gate's parallel engine matrix races exactly that.
     "replace pin_plan_to_its_run -> Result<load::plan::LoadPlan>",
+    # The base-and-buffer siblings of `load_one_cdc` / `run_loads` (2026-09-17):
+    # the same live-only script (state DB, bucket listing, a BigQuery loader), so
+    # their body stubs are born MISSED for the documented reason above. Their
+    # decisions are named predicates next door, each unit-tested: `is_baseline_leg`
+    # (RED against the name-based classifier that overwrote the base with a delta),
+    # `buffer_uris`, `base_done_line`; `run_compacts` decides through the loader's
+    # `compact_*_sql` builders (unit-tested) and `lease_busy_message`. Live:
+    # tests/live/live_cdc_compact.rs (both cells) and the `warehouse_layout` gate cell.
+    "replace load_one_cdc_base ->",
+    "replace run_compacts ->",
+    # `redact::install_logger` installs the PROCESS logger (`log::set_boxed_logger`,
+    # once per process). Its stub leaves the `log` facade unset — a unit test cannot
+    # observe that without hijacking the test binary's own logger for every other
+    # test. What it wires IS graded: `UiRoutedLogger` (routing, filtering, the
+    # redacting line) has an offline oracle over a piped stderr + the in-process
+    # channel (`redact::logger_tests`).
+    "replace install_logger with ()",
 ]

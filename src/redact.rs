@@ -265,7 +265,9 @@ pub fn install_logger() {
             })
             .build();
     log::set_max_level(stderr_logger.filter());
-    log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger))).expect("logger set once");
+    // A second install (a test process that already has a logger) keeps the
+    // first; `main` calls this exactly once.
+    let _ = log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger)));
 }
 
 struct UiRoutedLogger(env_logger::Logger);
@@ -292,6 +294,92 @@ impl log::Log for UiRoutedLogger {
 
     fn flush(&self) {
         self.0.flush();
+    }
+}
+
+#[cfg(test)]
+mod logger_tests {
+    use super::*;
+    use log::Log as _;
+    use std::sync::{Arc, Mutex};
+
+    /// An `env_logger` at `warn` whose stderr is this buffer.
+    fn logger(sink: Arc<Mutex<Vec<u8>>>) -> UiRoutedLogger {
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let inner = env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .target(env_logger::Target::Pipe(Box::new(Sink(sink))))
+            .build();
+        UiRoutedLogger(inner)
+    }
+
+    fn record<'a>(level: log::Level, args: std::fmt::Arguments<'a>) -> log::Record<'a> {
+        log::Record::builder()
+            .level(level)
+            .target("rivet::t")
+            .args(args)
+            .build()
+    }
+
+    /// The renderer's channel gets the line (formatted + redacted) while one is
+    /// installed and stderr stays silent; with none, stderr gets it. A record
+    /// under the filter reaches neither.
+    #[test]
+    fn a_log_line_goes_to_the_renderer_when_one_owns_the_screen_else_to_stderr() {
+        // The in-process tx is one global; every test that installs one holds this.
+        let _serial = crate::pipeline::parent_ui::retry_counter_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let lg = logger(sink.clone());
+        assert!(lg.enabled(&log::Metadata::builder().level(log::Level::Warn).build()));
+        assert!(!lg.enabled(&log::Metadata::builder().level(log::Level::Info).build()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::pipeline::ipc::install_in_process_tx(tx);
+        lg.log(&record(
+            log::Level::Warn,
+            format_args!("slow mysql://u:pw@h/db"),
+        ));
+        lg.log(&record(log::Level::Info, format_args!("chatter")));
+        crate::pipeline::ipc::clear_in_process_tx();
+        let routed: Vec<String> = rx
+            .try_iter()
+            .map(|m| match m {
+                crate::pipeline::parent_ui::UiMessage::Log(l) => l,
+                other => panic!("not a log line: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            routed.len(),
+            1,
+            "the WARN routed, the INFO filtered: {routed:?}"
+        );
+        assert!(
+            routed[0].contains("WARN rivet::t] slow") && !routed[0].contains("pw@"),
+            "formatted through the redacting line: {}",
+            routed[0]
+        );
+        assert!(
+            sink.lock().unwrap().is_empty(),
+            "nothing reached stderr while the renderer owned the screen"
+        );
+
+        lg.log(&record(
+            log::Level::Warn,
+            format_args!("after the renderer"),
+        ));
+        let stderr = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(stderr.contains("after the renderer"), "{stderr:?}");
     }
 }
 

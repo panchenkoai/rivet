@@ -753,7 +753,7 @@ fn fmt_duration_ms(ms: i64) -> String {
 /// is folded. `destination::cloud`'s own interceptor test still adds 2 outside
 /// this lock, so the assertions stay delta-based with room for that.
 #[cfg(test)]
-pub(super) fn retry_counter_test_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn retry_counter_test_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK
 }

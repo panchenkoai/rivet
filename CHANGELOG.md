@@ -61,7 +61,10 @@
   creates it fresh from its run's spec. There is no view in this layout; consumers read
   `<table>` and filter `WHERE NOT __is_deleted`. A crash between the MERGE and the DROP is
   re-merged idempotently by the next compact. Every compaction job carries `rivet_op:merge`;
-  the ledger records it as `mode: compact`. `initial: snapshot` streams keep the changelog +
+  the ledger records it as `mode: compact`. The winner per key is ranked over the WHOLE
+  buffer before the partition bound is applied, so a key with changes on both sides of a
+  split (a window and the NULL set) lands in exactly one MERGE — the one its latest change
+  belongs to. `initial: snapshot` streams keep the changelog +
   view layout. BigQuery only in this release. The cycle (`run → load → compact`, the crash
   between MERGE and DROP included) and the batched loads are a release-gate cell
   (`warehouse_layout`) over `tests/live/live_cdc_compact.rs` and

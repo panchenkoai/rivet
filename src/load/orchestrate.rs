@@ -1139,7 +1139,7 @@ fn load_one_cdc_base(
                 .partition(|(_, m)| is_baseline_leg(m));
             let mut rows = 0u64;
             let mut report: Option<load::CdcLoadReport> = None;
-            if !baseline.is_empty() {
+            if let [_, ..] = baseline.as_slice() {
                 let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
                 let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
@@ -1228,6 +1228,20 @@ fn is_baseline_leg(m: &crate::manifest::RunManifest) -> bool {
     m.mode != "cdc"
 }
 
+/// Why `rivet compact` passes a table by, or `None` for a base-and-buffer CDC table.
+fn compact_skip_reason(
+    mode: &load::plan::LoadMode,
+    layout: &load::plan::CdcLayout,
+) -> Option<&'static str> {
+    match (mode, layout) {
+        (load::plan::LoadMode::Cdc, load::plan::CdcLayout::BaseAndBuffer) => None,
+        (load::plan::LoadMode::Cdc, _) => {
+            Some("a changelog + view table (`initial: snapshot`); nothing to merge")
+        }
+        _ => Some("not a CDC table; nothing to merge"),
+    }
+}
+
 /// `rivet compact`: merge every base-and-buffer table's buffer into its base and
 /// drop the buffer. One MERGE per table (per partition window), labelled
 /// `rivet_op:merge`; a table without a buffer is a no-op, said so.
@@ -1249,13 +1263,8 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     };
     let mut failures: Vec<anyhow::Error> = Vec::new();
     for plan in &plans {
-        if plan.mode != load::plan::LoadMode::Cdc
-            || plan.layout != load::plan::CdcLayout::BaseAndBuffer
-        {
-            eprintln!(
-                "  compact [{}]: skipped — not a base-and-buffer CDC table (nothing to merge)",
-                plan.table
-            );
+        if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
+            eprintln!("  compact [{}]: skipped — {why}", plan.table);
             continue;
         }
         let load_id = format!("{run_id}:{}", plan.table);
@@ -2444,6 +2453,29 @@ mod live_only_decisions {
         assert!(
             super::is_baseline_leg(&leg),
             "a batch run under the prefix is a leg"
+        );
+    }
+
+    /// `rivet compact` merges base-and-buffer CDC tables only; every other plan is
+    /// passed by with a reason that names what it is, never silently.
+    #[test]
+    fn compact_passes_by_everything_but_a_base_and_buffer_cdc_table() {
+        use crate::load::plan::{CdcLayout, LoadMode};
+        assert_eq!(
+            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::BaseAndBuffer),
+            None
+        );
+        assert!(
+            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::LogAndView)
+                .is_some_and(|w| w.contains("initial: snapshot"))
+        );
+        assert!(
+            super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView)
+                .is_some_and(|w| w.contains("not a CDC table"))
+        );
+        assert!(
+            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::BaseAndBuffer)
+                .is_some_and(|w| w.contains("not a CDC table"))
         );
     }
 

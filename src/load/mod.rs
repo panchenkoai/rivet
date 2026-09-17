@@ -1882,6 +1882,51 @@ mod tests {
         );
     }
 
+    /// The buffer append has the same count gate as the changelog append: a short
+    /// buffer fails BEFORE cleanup and before `compact` can merge a partial cycle;
+    /// an exact one reports what it buffered.
+    #[test]
+    fn buffer_delta_mismatch_bails_and_an_exact_delta_reports() {
+        let f = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
+        let err = run_load_buffer(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".into()],
+            Some(5),
+            Some((&store, PREFIX)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CDC count validation failed"), "{err}");
+        assert!(
+            prefix_populated(&store, REL),
+            "cleanup must not run on a failed gate"
+        );
+
+        let ok = run_load_buffer(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".into()],
+            Some(3),
+            None,
+        )
+        .expect("an exact delta passes the gate");
+        assert_eq!(ok.rows_appended, 3);
+        assert!(
+            f.views.borrow().is_empty(),
+            "the buffer layout builds no view"
+        );
+    }
+
     #[test]
     fn cdc_match_builds_view_then_cleans() {
         let f = FakeLoader {
