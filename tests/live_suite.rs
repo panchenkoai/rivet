@@ -123,6 +123,8 @@ mod live_keyset;
 mod live_keyset_metrics;
 #[path = "live/live_keyset_parallel.rs"]
 mod live_keyset_parallel;
+#[path = "live/live_load_partition_batches.rs"]
+mod live_load_partition_batches;
 #[path = "live/live_load_spec.rs"]
 mod live_load_spec;
 #[path = "live/live_load_spec_pin.rs"]

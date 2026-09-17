@@ -49,6 +49,17 @@
   stream no longer share one partition column and one key. Names must be captured tables.
 - **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
   it used to abort the whole config on the first `mode: cdc` export.
+- **A wide history loads in daily partitions, in batches — never coarsened to `month`.**
+  BigQuery writes at most 4,000 partitions per job; a 317M-row table with eleven years of
+  `created_at` days refused to load under `granularity: day`. `rivet load` now packs the
+  Parquet files, by the partition column's range in each footer, into as many `LOAD DATA`
+  jobs as the span needs (files from a keyset export over an autoincrement key are date-local
+  without anything being chunked by date), appends them in turn to `__changes`, and for a
+  whole-table load fills `<table>__staging` and swaps it in with one zero-copy `CLONE`. The one
+  shape no batching splits — a single file wider than 4,000 partitions, dates uncorrelated with
+  the read key — is refused before any job, naming the file. Every BigQuery job of a load now
+  carries `rivet_op:load` (DDL, counts, staging and clone included) beside `rivet_table`, so
+  cost sums per table per operation; `rivet_op:merge` is reserved for compaction.
 - **A shared state DB with same-named configs, made safe (state schema v29).** Four configs each
   exporting `users` — one per engine — on one Postgres state, run at once, is the deployment
   shape the shared-state docs recommend; three things broke under it. The baseline marker

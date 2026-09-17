@@ -920,13 +920,16 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
-        LoadTarget::Bigquery { project, dataset } => Box::new(build_bigquery_loader(
-            project,
-            dataset,
-            plan.partition.as_ref(),
-            &plan.clustering,
-            run_id,
-        )),
+        LoadTarget::Bigquery { project, dataset } => Box::new(
+            build_bigquery_loader(
+                project,
+                dataset,
+                plan.partition.as_ref(),
+                &plan.clustering,
+                run_id,
+            )
+            .batched_by_footers(plan.destination.clone()),
+        ),
         LoadTarget::Snowflake {
             connection,
             warehouse,

@@ -34,38 +34,85 @@ struct Span {
     unit: Unit,
 }
 
-/// Refuse a load whose Parquet spans more partitions than one BigQuery job may write.
-/// A file without statistics for the column adds nothing to the span; the others still
-/// count, and BigQuery is the backstop.
+/// Refuse a load one of whose files alone spans more partitions than one BigQuery job
+/// may write — the shape no batching can split. Everything else is loadable in batches
+/// (see [`plan_load_batches`]).
 pub(crate) fn check_partition_budget(
     store: &GcsStore,
     uris: &[String],
     partition: &TablePartition,
 ) -> Result<()> {
+    plan_load_batches(store, uris, partition).map(|_| ())
+}
+
+/// The load jobs this Parquet needs: files packed, in order of their lowest value, into
+/// batches whose combined span stays within BigQuery's per-job partition cap. Files are
+/// date-local when the extraction key grows with time (an autoincrement key over a
+/// `created_at` history), so a history far wider than one job may write still loads
+/// under its declared granularity. A file without statistics for the column rides in
+/// the first batch — BigQuery is its backstop, as before. One file wider than the cap
+/// is refused, by name: nothing splits it.
+pub(crate) fn plan_load_batches(
+    store: &GcsStore,
+    uris: &[String],
+    partition: &TablePartition,
+) -> Result<Vec<Vec<String>>> {
     let Some(column) = partition.key.column() else {
-        return Ok(());
+        return Ok(vec![uris.to_vec()]);
     };
-    let mut span: Option<Span> = None;
+    let mut spanned: Vec<(String, Span)> = Vec::new();
+    let mut blind: Vec<String> = Vec::new();
     for uri in uris {
         let (_, key) = crate::load::split_gs_uri(uri)?;
         let meta = read_footer(store, key)
             .with_context(|| format!("reading the Parquet footer of {uri}"))?;
-        let Some(file) = column_span(&meta, column) else {
-            continue;
-        };
-        span = Some(match span {
-            None => file,
-            Some(s) => merge(s, file),
+        match column_span(&meta, column) {
+            Some(span) => spanned.push((uri.clone(), span)),
+            None => blind.push(uri.clone()),
+        }
+    }
+    let mut batches = pack_batches(&partition.key, spanned)?;
+    if !blind.is_empty() {
+        match batches.first_mut() {
+            Some(first) => first.extend(blind),
+            None => batches.push(blind),
+        }
+    }
+    Ok(batches)
+}
+
+/// Pure packing: sort by the low end, then extend the current batch while its merged
+/// span stays within the cap. Refuses a single file over the cap, naming it.
+fn pack_batches(key: &PartitionKey, mut files: Vec<(String, Span)>) -> Result<Vec<Vec<String>>> {
+    files.sort_by_key(|(_, s)| s.lo);
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Option<(Vec<String>, Span)> = None;
+    for (uri, span) in files {
+        let alone = partitions_touched(key, span);
+        if alone > MAX_PARTITIONS_PER_JOB {
+            bail!(
+                "{uri} alone {} — no batching splits one file",
+                over_budget_message(key, span, alone)
+            );
+        }
+        current = Some(match current {
+            None => (vec![uri], span),
+            Some((mut uris, cur)) => {
+                let merged = merge(cur, span);
+                if partitions_touched(key, merged) > MAX_PARTITIONS_PER_JOB {
+                    batches.push(uris);
+                    (vec![uri], span)
+                } else {
+                    uris.push(uri);
+                    (uris, merged)
+                }
+            }
         });
     }
-    let Some(span) = span else {
-        return Ok(());
-    };
-    let touched = partitions_touched(&partition.key, span);
-    if touched > MAX_PARTITIONS_PER_JOB {
-        bail!("{}", over_budget_message(&partition.key, span, touched));
+    if let Some((uris, _)) = current {
+        batches.push(uris);
     }
-    Ok(())
+    Ok(batches)
 }
 
 /// The footer of the Parquet object at the bucket-relative `key`: its last 8 bytes name
@@ -231,7 +278,7 @@ fn over_budget_message(key: &PartitionKey, span: Span, touched: i64) -> String {
                 },
             );
             format!(
-                "the load spans about {touched} {} partitions of `{column}` ({lo} to {hi}); \
+                "spans about {touched} {} partitions of `{column}` ({lo} to {hi}); \
                  BigQuery writes at most {MAX_PARTITIONS_PER_JOB} partitions per job — {coarser}",
                 granularity.as_str()
             )
@@ -239,7 +286,7 @@ fn over_budget_message(key: &PartitionKey, span: Span, touched: i64) -> String {
         PartitionKey::Range {
             column, interval, ..
         } => format!(
-            "the load spans about {touched} ranges of `{column}` ({lo} to {hi}, {interval} wide); \
+            "spans about {touched} ranges of `{column}` ({lo} to {hi}, {interval} wide); \
              BigQuery writes at most {MAX_PARTITIONS_PER_JOB} partitions per job — widen \
              `range.interval` or load a narrower range"
         ),
@@ -336,16 +383,100 @@ mod tests {
         );
         let files = ["a.parquet", "b.parquet"];
         assert!(check(dir.path(), &files, &time("ts", Granularity::Day)).is_ok());
+        // `b` ALONE spans 4681 hours: no batching splits one file, so it is named.
         let err = check(dir.path(), &files, &time("ts", Granularity::Hour))
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains(
-                "about 4801 hour partitions of `ts` (2026-01-01 00:00 to 2026-07-20 00:00)"
-            ),
+            err.contains("gs://b/b.parquet alone spans about 4681 hour partitions of `ts`"),
             "{err}"
         );
-        assert!(err.contains("use `granularity: day` (about 201)"), "{err}");
+        assert!(
+            err.contains("(2026-01-06 00:00 to 2026-07-20 00:00)"),
+            "{err}"
+        );
+        assert!(err.contains("use `granularity: day` (about 196)"), "{err}");
+    }
+
+    /// Files that are each narrow but together wide load in BATCHES: packed by their
+    /// low end, a batch closed the moment the next file would push its span past the
+    /// cap. Three files over 6000 days → two jobs, never one refusal.
+    #[test]
+    fn narrow_files_over_a_wide_history_are_packed_into_batches_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        // Written out of order on purpose: packing sorts by the low end.
+        ts_file(
+            dir.path(),
+            "c.parquet",
+            &[start + 4200 * DAY, start + 6000 * DAY],
+            true,
+        );
+        ts_file(dir.path(), "a.parquet", &[start, start + 2000 * DAY], true);
+        ts_file(
+            dir.path(),
+            "b.parquet",
+            &[start + 2001 * DAY, start + 3999 * DAY],
+            true,
+        );
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let uris: Vec<String> = ["c.parquet", "a.parquet", "b.parquet"]
+            .iter()
+            .map(|n| format!("gs://b/{n}"))
+            .collect();
+        let batches = plan_load_batches(&store, &uris, &time("ts", Granularity::Day)).unwrap();
+        assert_eq!(
+            batches,
+            vec![
+                vec![
+                    "gs://b/a.parquet".to_string(),
+                    "gs://b/b.parquet".to_string()
+                ],
+                vec!["gs://b/c.parquet".to_string()],
+            ],
+            "a+b span exactly 4000 days and fit one job; c starts the next"
+        );
+        // A month granularity fits everything in one job.
+        let one = plan_load_batches(&store, &uris, &time("ts", Granularity::Month)).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), 3);
+    }
+
+    /// A file with no statistics cannot be placed; it rides in the first batch and
+    /// BigQuery remains its backstop — it is never dropped from the load.
+    #[test]
+    fn a_stats_less_file_rides_in_the_first_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        ts_file(dir.path(), "a.parquet", &[start, start + 10 * DAY], true);
+        ts_file(
+            dir.path(),
+            "blind.parquet",
+            &[start, start + 9000 * DAY],
+            false,
+        );
+        ts_file(
+            dir.path(),
+            "z.parquet",
+            &[start + 5000 * DAY, start + 5010 * DAY],
+            true,
+        );
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let uris: Vec<String> = ["a.parquet", "blind.parquet", "z.parquet"]
+            .iter()
+            .map(|n| format!("gs://b/{n}"))
+            .collect();
+        let batches = plan_load_batches(&store, &uris, &time("ts", Granularity::Day)).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(
+            batches[0].contains(&"gs://b/blind.parquet".to_string()),
+            "{batches:?}"
+        );
+        assert_eq!(
+            batches.concat().len(),
+            3,
+            "every file is loaded exactly once"
+        );
     }
 
     #[test]

@@ -121,6 +121,9 @@ pub struct BigQueryLoader {
     /// cost slices per run (across tables) as well as per table. `None` omits
     /// the label entirely.
     pub run_id: Option<String>,
+    /// Where the staged Parquet lives, for the footer reads that pack a load into
+    /// jobs of at most 4,000 partitions each; `None` loads everything in one job.
+    pub footer_source: Option<crate::config::DestinationConfig>,
     /// The REST client, built on first use and shared by every clone — so one
     /// access token serves a whole load instead of one per statement. Not part
     /// of the loader's identity: constructing a loader must stay free of I/O
@@ -137,6 +140,7 @@ impl BigQueryLoader {
             partition: None,
             clustering: Clustering::Auto(Vec::new()),
             run_id: None,
+            footer_source: None,
             api: Arc::new(OnceLock::new()),
         }
     }
@@ -153,6 +157,25 @@ impl BigQueryLoader {
     }
 
     /// Set the load-run correlation id, emitted as the `rivet_run` job label.
+    /// Pack every load into jobs within BigQuery's partition cap, reading the partition
+    /// column's range from each file's Parquet footer under `dest`.
+    pub fn batched_by_footers(mut self, dest: crate::config::DestinationConfig) -> Self {
+        self.footer_source = Some(dest);
+        self
+    }
+
+    /// The load jobs `uris` need under the declared partition: one when nothing bounds
+    /// them (no partition column or no footer source), else footer-packed batches.
+    fn batches(&self, uris: &[String]) -> Result<Vec<Vec<String>>> {
+        match (&self.footer_source, &self.partition) {
+            (Some(dest), Some(partition)) if partition.key.column().is_some() => {
+                let store = crate::load::open_store(dest)?;
+                crate::load::partition_budget::plan_load_batches(&store, uris, partition)
+            }
+            _ => Ok(vec![uris.to_vec()]),
+        }
+    }
+
     pub fn run_id(mut self, id: impl Into<String>) -> Self {
         self.run_id = Some(id.into());
         self
@@ -191,6 +214,8 @@ impl BigQueryLoader {
 
     /// Run a SQL statement (free `LOAD DATA` load job or a billed CTAS/query),
     /// tagged with `rivet_op:<op>` + `rivet_table:<table>` for cost attribution.
+    /// Two operations exist, `load` and `merge`; every DDL, count, clone or view
+    /// statement carries the operation it serves, so cost sums per table per op.
     fn run_sql(&self, sql: &str, op: &str, table: &str) -> Result<()> {
         self.api()?
             .run_query(sql, &self.labels(op, table))
@@ -205,7 +230,7 @@ impl BigQueryLoader {
             Some(rows) => Ok(rows),
             None => api.run_query_scalar(
                 &format!("SELECT COUNT(*) AS n FROM `{}`", self.fqtn(table)),
-                &self.labels("count", table),
+                &self.labels("load", table),
             ),
         }
     }
@@ -274,7 +299,7 @@ impl TargetLoader for BigQueryLoader {
         let changes = self.fqtn(&format!("{table}__changes"));
         let shape = self.existing_shape(table)?.unwrap_or_default();
         for sql in build_adoption_sql(&src, table, &changes, &shape) {
-            self.run_sql(&sql, "baseline", table)?;
+            self.run_sql(&sql, "load", table)?;
         }
         if shape.require_partition_filter {
             eprintln!(
@@ -316,20 +341,62 @@ impl TargetLoader for BigQueryLoader {
         let options = creation_options(existing.is_none(), self.partition.as_ref());
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
-        let sql = build_load_data_sql(
-            &target,
-            true,
-            &schema,
-            self.partition_expr(),
-            cluster,
-            options.as_deref(),
-            uris,
-        );
-        self.run_sql(&sql, "load", table)?;
-        if let Some(alter) = options_drift(&target, existing.as_ref(), self.partition.as_ref()) {
-            self.run_sql(&alter, "alter", table)?;
-            eprintln!("  note: `{target}` partition options changed: {alter}");
+        let batches = self.batches(uris)?;
+        if batches.len() <= 1 {
+            let sql = build_load_data_sql(
+                &target,
+                true,
+                &schema,
+                self.partition_expr(),
+                cluster,
+                options.as_deref(),
+                uris,
+            );
+            self.run_sql(&sql, "load", table)?;
+            if let Some(alter) = options_drift(&target, existing.as_ref(), self.partition.as_ref())
+            {
+                self.run_sql(&alter, "load", table)?;
+                eprintln!("  note: `{target}` partition options changed: {alter}");
+            }
+            return self.count_rows(table);
         }
+        // Several jobs cannot OVERWRITE one table: they fill a fresh staging table,
+        // created with the declared shape by the first job, and the target becomes a
+        // zero-copy CLONE of it in one statement. The shape conflict of an existing
+        // target was refused before this point (`ensure_overwritable`), so the CLONE
+        // never changes a partitioning D5 forbids changing.
+        let staging = format!("{table}__staging");
+        let staging_fqtn = self.fqtn(&staging);
+        eprintln!(
+            "  {target}: {} files in {} load jobs (≤ {} partitions each) via `{staging_fqtn}`",
+            uris.len(),
+            batches.len(),
+            crate::load::partition_budget::MAX_PARTITIONS_PER_JOB
+        );
+        self.run_sql(
+            &format!("DROP TABLE IF EXISTS `{staging_fqtn}`;"),
+            "load",
+            table,
+        )?;
+        let fresh = creation_options(true, self.partition.as_ref());
+        for (i, batch) in batches.iter().enumerate() {
+            let sql = if i == 0 {
+                build_load_data_sql(
+                    &staging_fqtn,
+                    true,
+                    &schema,
+                    self.partition_expr(),
+                    cluster,
+                    fresh.as_deref(),
+                    batch,
+                )
+            } else {
+                build_load_data_sql(&staging_fqtn, false, &schema, None, &[], None, batch)
+            };
+            self.run_sql(&sql, "load", table)?;
+        }
+        self.run_sql(&build_clone_sql(&target, &staging_fqtn), "load", table)?;
+        self.run_sql(&format!("DROP TABLE `{staging_fqtn}`;"), "load", table)?;
         self.count_rows(table)
     }
 
@@ -364,7 +431,7 @@ impl TargetLoader for BigQueryLoader {
             self.partition.as_ref(),
             self.cluster_by(),
         );
-        self.run_sql(&create, "create", &changes)?;
+        self.run_sql(&create, "load", &changes)?;
 
         // …and, for a log that ALREADY existed, add whatever the declared
         // schema has and it does not. The CREATE above is a no-op on such a
@@ -372,7 +439,7 @@ impl TargetLoader for BigQueryLoader {
         // meta column — fails the LOAD below on a schema mismatch. ALTER ADD,
         // never a replace: the table may hold the customer's history.
         if let Some(alter) = build_alter_add_columns_sql(&changes_fqtn, &full) {
-            self.run_sql(&alter, "alter", &changes)?;
+            self.run_sql(&alter, "load", &changes)?;
         }
         // …and its partition options, as the log takes them (no filter, no load-date expiry).
         let log_partition = self.partition.as_ref().map(changelog_partition);
@@ -381,15 +448,26 @@ impl TargetLoader for BigQueryLoader {
             self.existing_shape(&changes)?.as_ref(),
             log_partition.as_ref(),
         ) {
-            self.run_sql(&alter, "alter", &changes)?;
+            self.run_sql(&alter, "load", &changes)?;
             eprintln!("  note: `{changes_fqtn}` partition options changed: {alter}");
         }
 
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes)?;
-        let load = build_load_data_sql(&changes_fqtn, false, &schema, None, &[], None, uris);
-        self.run_sql(&load, "load", &changes)?;
+        let batches = self.batches(uris)?;
+        if batches.len() > 1 {
+            eprintln!(
+                "  {changes_fqtn}: {} files in {} append jobs (≤ {} partitions each)",
+                uris.len(),
+                batches.len(),
+                crate::load::partition_budget::MAX_PARTITIONS_PER_JOB
+            );
+        }
+        for batch in &batches {
+            let load = build_load_data_sql(&changes_fqtn, false, &schema, None, &[], None, batch);
+            self.run_sql(&load, "load", &changes)?;
+        }
         let after = self.count_rows(&changes)?;
         Ok(after.saturating_sub(before))
     }
@@ -399,7 +477,7 @@ impl TargetLoader for BigQueryLoader {
     }
 
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {
-        self.run_sql(view_sql, "view", table)?;
+        self.run_sql(view_sql, "load", table)?;
         Ok(())
     }
 }
@@ -476,7 +554,7 @@ impl super::ShapeControl for BigQueryLoader {
             self.cluster_by(),
             &props,
         );
-        self.run_sql(&copy, "rebuild", table)?;
+        self.run_sql(&copy, "load", table)?;
         let after = self.count_rows(&rebuild)?;
         if after != before {
             bail!(
@@ -493,7 +571,7 @@ impl super::ShapeControl for BigQueryLoader {
             &changes,
             &old,
         ) {
-            self.run_sql(&sql, "rebuild", table)?;
+            self.run_sql(&sql, "load", table)?;
         }
         Ok(())
     }
