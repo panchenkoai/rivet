@@ -1106,6 +1106,34 @@ mod compact_tests {
             plain.ends_with("SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;"),
             "{plain}"
         );
+
+        // Hostile names: a reserved-word key and a dashed table id are quoted
+        // everywhere they appear — the ON clause, the window, the buffer filter.
+        let hostile = compact_script_sql(
+            "p.d.my-orders",
+            "p.d.my-orders__changes",
+            &[meta_spec("order", "INT64"), meta_spec("created_at", "DATE")],
+            &["order".to_string()],
+            SourceEngine::Postgres,
+            Some("created_at"),
+        );
+        assert!(hostile.contains("MERGE `p.d.my-orders` AS T"), "{hostile}");
+        assert!(
+            hostile.contains("PARTITION BY `order` ORDER BY"),
+            "{hostile}"
+        );
+        assert!(
+            hostile.contains("ON T.`order` = S.`order` AND DATE(T.`created_at`)"),
+            "{hostile}"
+        );
+        assert!(
+            hostile.contains("DROP TABLE `p.d.my-orders__changes`;"),
+            "{hostile}"
+        );
+        assert!(
+            !hostile.contains(" order "),
+            "never a bare reserved word: {hostile}"
+        );
     }
 
     fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {

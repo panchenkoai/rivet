@@ -299,3 +299,86 @@ fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
         "still two live rows"
     );
 }
+
+/// Two `rivet compact` of one table AT ONCE (a scheduler double-fire): the lease
+/// admits one; the other is refused by name — or, arriving after the winner's
+/// DROP, finds no buffer. Either way the base ends with each change applied
+/// exactly once: never a MERGE racing a MERGE.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn two_compacts_at_once_admit_one_and_apply_each_change_once() {
+    let Some(bq) = BqLive::from_env("compact_race") else {
+        return;
+    };
+    let mut scn =
+        CdcScenario::mysql_with("compact_race", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+            r.cdc("backfill: auto")
+                .also_batch_export("baseline", t, "full")
+                .dest_gcs_live(&bq.bucket, &bq.prefix)
+                .top_line(&bq.load_line(", pk: [id]"))
+        });
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    for id in 1..=3 {
+        scn.insert(id);
+    }
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    for id in 4..=6 {
+        scn.insert(id);
+    }
+    scn.update(1);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(bq.read_bq_count(&changes), "4");
+
+    let cfg = scn.rig.config_path().to_string_lossy().to_string();
+    let outs: Vec<std::process::Output> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let cfg = cfg.clone();
+                s.spawn(move || run_rivet_env(&["compact", "-c", &cfg], &[]))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("compact thread"))
+            .collect()
+    });
+    let said: Vec<String> = outs
+        .iter()
+        .map(|o| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
+        .collect();
+    let all = said.join("\n---\n");
+    let merged = said.iter().filter(|s| s.contains("COMPACT OK")).count();
+    let refused = said
+        .iter()
+        .filter(|s| s.contains("is writing") && s.contains("lease is held"))
+        .count();
+    let skipped = said.iter().filter(|s| s.contains("COMPACT SKIP")).count();
+    assert_eq!(merged, 1, "exactly one compaction merged:\n{all}");
+    assert_eq!(
+        refused + skipped,
+        1,
+        "the other was refused by the lease or found no buffer:\n{all}"
+    );
+    let (n, live, gone, _, sum) = base_profile(&bq, &table);
+    assert_eq!((n, live, gone), (6, 6, 0), "{all}");
+    assert_eq!(live, scn.count());
+    assert_eq!(sum, 1 + 2 + 3 + 4 + 5 + 6);
+    assert_eq!(
+        v_of(&bq, &table, 1),
+        Some(99),
+        "applied once, at the latest value"
+    );
+    assert!(bq.read_bq_table_type(&changes).is_none());
+}
