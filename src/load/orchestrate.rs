@@ -1322,7 +1322,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             let report = report?;
             if report.had_buffer {
                 println!(
-                    "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE job(s); buffer dropped",
+                    "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE statement(s); buffer dropped",
                     plan.table, report.changes_rows, report.base, report.merge_jobs
                 );
             } else {
