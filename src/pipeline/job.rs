@@ -585,8 +585,15 @@ pub(super) fn run_diagnosis(
                  if it tracks this export, {remedy}"
             ));
         } else {
+            // Solo too the counter is server-global: a partner's production
+            // source logged ~1 tmp-disk table per SECOND of its own traffic on
+            // two baselines of very different size (45 in 42 s, 995 in 17 min),
+            // while ten keyset pages on a quiet stand log none
+            // (`mysql_keyset_pages_create_no_tmp_disk_tables`). Say so.
             flags.push(format!(
-                "{spills} {spill_unit} — the source spilled to disk; {remedy}"
+                "{spills} {spill_unit} server-wide during this export's window — the counter \
+                 is server-global, so other sessions' work counts too; if the source is \
+                 otherwise quiet this export spilled it: {remedy}"
             ));
         }
     }
@@ -2095,8 +2102,10 @@ mod tests {
         let spills = [("Created_tmp_disk_tables".to_string(), 240_i64)];
         let solo = run_diagnosis(&s(), &spills, false).expect("spills must diagnose");
         assert!(
-            solo.contains("the source spilled to disk"),
-            "solo attribution stays direct: {solo}"
+            solo.contains("server-global")
+                && solo.contains("otherwise quiet")
+                && solo.contains("lower `chunk_size`"),
+            "solo attribution names the counter scope and keeps the lever: {solo}"
         );
         let pooled = run_diagnosis(&s(), &spills, true).expect("spills must diagnose");
         assert!(

@@ -96,6 +96,23 @@
   on MongoDB's `_id` before the pin could run. The whole shape — blessed, crashed at
   once, crashed in turn — is a release-gate cell (`shared_state_same_name`) over
   `tests/live/live_shared_state_same_name.rs`, CDC and batch cycles.
+- **A CDC run records its peak RSS.** `export_metrics.peak_rss_mb` was 0 for every CDC run
+  (the partner's whole e2e ledger); the stream now keeps the same RSS bracket the batch tail
+  does. Oracle: `a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run` reads
+  the row back (RED at 0 before the fix).
+- **`rivet --version` names the commit** — `rivet 0.27.0 (9d4a662d5)`. A bug report names a
+  version, and one version ships from many pre-release builds. `RIVET_GIT_SHA` overrides for
+  a build without `.git` (Docker); `unknown` is the honest fallback, never a build failure.
+- **Log lines no longer duplicate the card block.** An interactive `rivet run` repaints its
+  cards in place by walking the cursor up; a `WARN` written straight to stderr between two
+  frames put the count off by one and the block was printed again into scrollback (seen as
+  "three rows for one leg" on the partner's run — the data was never read twice). While a
+  renderer owns the screen, `log` lines go through its channel and land above the block.
+- **The tmp-disk spill diagnosis says the counter is server-global.** `Created_tmp_disk_tables`
+  counts every session on the server: the partner's baselines logged about one per SECOND of
+  the production source's own traffic (45 in 42 s, 995 in 17 min), while ten keyset pages on a
+  quiet stand log none (`mysql_keyset_pages_create_no_tmp_disk_tables`). The solo line no
+  longer says "the source spilled to disk" as if the export did it.
 - **`rivet doctor` keeps the CDC verdicts it already reached when a later probe fails.** Each
   engine's health probes appended to one list; a probe that died half-way (MySQL `SHOW BINARY
   LOGS` with `log_bin = 0`) replaced "log_bin is OFF — enable binary logging" with one generic

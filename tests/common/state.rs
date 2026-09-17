@@ -35,6 +35,7 @@ pub struct MetricsRow {
     pub quality_passed: Option<bool>,
     pub batch_size_memory_mb: Option<i64>,
     pub skip_reason: Option<String>,
+    pub peak_rss_mb: Option<i64>,
 }
 
 /// A handle to one run's state DB. Open once, query many.
@@ -202,7 +203,8 @@ impl StateDb {
                 "SELECT run_id, status, total_rows, source_type, destination_type, \
                         rivet_version, batch_size, chunk_size, parallel, files_committed, \
                         longest_chunk_ms, pg_temp_bytes_delta, source_count, reconciled, validated, \
-                        schema_fingerprint, quality_passed, batch_size_memory_mb, skip_reason \
+                        schema_fingerprint, quality_passed, batch_size_memory_mb, skip_reason, \
+                        peak_rss_mb \
                  FROM export_metrics WHERE run_id = ?1",
                 [run_id],
                 |r| {
@@ -226,6 +228,7 @@ impl StateDb {
                         quality_passed: r.get(16)?,
                         batch_size_memory_mb: r.get(17)?,
                         skip_reason: r.get(18)?,
+                        peak_rss_mb: r.get(19)?,
                     })
                 },
             )

@@ -266,6 +266,15 @@ fn a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run() {
         4,
         "only the delta: three inserts and one update"
     );
+    // The stream's own metrics row (the export is named after the table; the
+    // leg's row sits under `baseline`): a CDC run records its peak RSS like a
+    // batch run does — the partner's e2e ledger showed 0 for every CDC run.
+    let db = StateDb::next_to_config(&rig.config_path());
+    let row = db.metrics_row(&db.latest_run_id(&tbl));
+    assert!(
+        row.peak_rss_mb.unwrap_or(0) > 0,
+        "a CDC run must record its peak RSS: {row:?}"
+    );
 }
 
 /// A baseline leg that CRASHED mid-way must finish on the next plain run.

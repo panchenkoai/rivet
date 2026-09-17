@@ -246,6 +246,55 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
     redact_secrets(&format!("[{timestamp} {level} {target}] {message}"))
 }
 
+/// Install the process logger: `env_logger` on stderr (default `warn`), every
+/// line through [`redacted_log_line`], and — while an in-process card renderer
+/// owns the screen — routed through its channel so the line lands above the
+/// card block instead of between two frames (which duplicated the block).
+pub fn install_logger() {
+    use std::io::Write as _;
+    let stderr_logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .format(|buf, record| {
+                let line = redacted_log_line(
+                    &buf.timestamp().to_string(),
+                    record.level().as_str(),
+                    record.target(),
+                    &record.args().to_string(),
+                );
+                writeln!(buf, "{line}")
+            })
+            .build();
+    log::set_max_level(stderr_logger.filter());
+    log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger))).expect("logger set once");
+}
+
+struct UiRoutedLogger(env_logger::Logger);
+
+impl log::Log for UiRoutedLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.0.matches(record) {
+            return;
+        }
+        let line = redacted_log_line(
+            &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            record.level().as_str(),
+            record.target(),
+            &record.args().to_string(),
+        );
+        if !crate::pipeline::ipc::route_log_line(line) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

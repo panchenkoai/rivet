@@ -19,7 +19,7 @@ pub use crate::pipeline::ValidateDepth;
 #[derive(Parser)]
 #[command(
     name = "rivet",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RIVET_GIT_SHA"), ")"),
     about = "Export data from databases to files",
     after_help = "Getting started (the happy path):\n  \
         1. rivet init     scaffold a config from your database\n  \

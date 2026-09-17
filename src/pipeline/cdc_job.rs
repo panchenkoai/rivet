@@ -147,8 +147,16 @@ pub(super) fn run_cdc_export(
     let config_dir = std::path::Path::new(config_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
+    // The same peak-RSS bracket the batch tail keeps (`job.rs`): a stream's
+    // memory is the rollover buffer + the spill, and the ledger recorded 0.
+    let rss_before = crate::resource::get_rss_mb();
+    let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let result = run_cdc_inner(config, export, &run_id, state, &read_bytes, config_dir);
     let duration_ms = started.elapsed().as_millis() as i64;
+    let peak_rss_mb = rss_sampler
+        .stop()
+        .max(crate::resource::get_rss_mb())
+        .max(rss_before) as i64;
 
     // The manifests describe what was made DURABLE; `outcome` says whether the
     // run finished. They are independent, and the totals come from the
@@ -180,6 +188,7 @@ pub(super) fn run_cdc_export(
         duration_ms,
         outcome.as_ref().err().map(crate::redact::redact_error),
     );
+    summary.peak_rss_mb = peak_rss_mb;
 
     // Transition the ledger to the CDC run's terminal status (mirrors the batch
     // path). A crash before here leaves the row `running`; the next CDC run

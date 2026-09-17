@@ -287,6 +287,47 @@ fn mssql_run_persists_source_harm_rows() {
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// One shape for every engine's harm test: the seeded table read back by a
+/// The partner's ledger showed `mysql_created_tmp_disk_tables` deltas of 45 and
+/// 995 on two keyset baselines — about one per SECOND on both (42 s and 17 min),
+/// not one per page. The counter is server-global, so a busy source inflates it
+/// with its own traffic; this pins that rivet's OWN keyset pages add none: ten
+/// pages over a quiet stand, the delta stays at the probe's own footprint.
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn mysql_keyset_pages_create_no_tmp_disk_tables() {
+    require_alive(LiveService::Mysql);
+
+    let table = seed_mysql_numeric_table(5000);
+    let export = unique_name("metrics_tmp_mysql");
+    let rig = Rig::mysql_batch(table.name())
+        .mode("chunked")
+        .export_named(&export)
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 500")
+        .export_line("compression: none");
+    let run_id = run_and_latest_run_id(&rig, &export);
+
+    let pages = std::fs::read_dir(rig.out_dir())
+        .expect("out dir")
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+        })
+        .count();
+    assert!(pages >= 10, "the fixture must page: {pages} parquet files");
+
+    let rows = StateDb::next_to_config(&rig.config_path()).harm_rows(&run_id);
+    let tmp_disk = rows
+        .iter()
+        .find(|(m, _)| m == "mysql_created_tmp_disk_tables")
+        .map(|(_, d)| *d)
+        .expect("the tmp-disk counter is recorded");
+    assert!(
+        tmp_disk <= 2,
+        "ten keyset pages must not create temp disk tables (got {tmp_disk}); {rows:?}"
+    );
+}
+
 /// simple query, full mode, no compression — through the canonical Rig rather
 /// than the per-file YAML builder + raw binary invocation pair this file
 /// carried (the exact smell the rig replaced; rig-adoption ratchet, 2026-08-19).
