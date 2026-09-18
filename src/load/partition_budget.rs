@@ -60,14 +60,15 @@ pub(crate) fn plan_load_batches(
     let Some(column) = partition.key.column() else {
         return Ok(vec![uris.to_vec()]);
     };
-    let mut spanned: Vec<(String, Span)> = Vec::new();
+    let mut spanned: Vec<(String, Span, i64)> = Vec::new();
     let mut blind: Vec<String> = Vec::new();
     for uri in uris {
         let (_, key) = crate::load::split_gs_uri(uri)?;
         let meta = read_footer(store, key)
             .with_context(|| format!("reading the Parquet footer of {uri}"))?;
+        let rows = meta.file_metadata().num_rows();
         match column_span(&meta, column) {
-            Some(span) => spanned.push((uri.clone(), span)),
+            Some(span) => spanned.push((uri.clone(), span, rows)),
             None => blind.push(uri.clone()),
         }
     }
@@ -81,14 +82,29 @@ pub(crate) fn plan_load_batches(
     Ok(batches)
 }
 
-/// Pure packing: sort by the low end, then extend the current batch while its merged
-/// span stays within the cap. Refuses a single file over the cap, naming it.
-fn pack_batches(key: &PartitionKey, mut files: Vec<(String, Span)>) -> Result<Vec<Vec<String>>> {
-    files.sort_by_key(|(_, s)| s.lo);
+/// Pure packing: sort by the low end, then extend the current batch while the partitions
+/// it would write stay within the cap. Refuses a single file over the cap, naming it.
+///
+/// A file's partitions are bounded BOTH by the span of its values and by its ROW COUNT —
+/// N rows cannot occupy more than N partitions, whatever they span. The footer carries
+/// min/max but no distinct count, so the span alone badly over-counts a scattered file:
+/// measured on a live export, a 1,001-row part spanning 9,758 days occupies exactly 1,001
+/// partitions and BigQuery loaded it, while this check refused it by name.
+///
+/// The REFUSAL takes the smaller bound, because that is where a wrong answer costs the
+/// operator a load they cannot perform. The batch packing deliberately stays on the span
+/// alone: being conservative there can only cost one more load job than strictly needed,
+/// never a rejection, so the extra bound would buy nothing and change how every existing
+/// load is split.
+fn pack_batches(
+    key: &PartitionKey,
+    mut files: Vec<(String, Span, i64)>,
+) -> Result<Vec<Vec<String>>> {
+    files.sort_by_key(|(_, s, _)| s.lo);
     let mut batches: Vec<Vec<String>> = Vec::new();
     let mut current: Option<(Vec<String>, Span)> = None;
-    for (uri, span) in files {
-        let alone = partitions_touched(key, span);
+    for (uri, span, rows) in files {
+        let alone = partitions_touched(key, span).min(rows);
         if alone > MAX_PARTITIONS_PER_JOB {
             bail!(
                 "{uri} alone {} — no batching splits one file",
@@ -375,12 +391,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let start = at(2026, 1, 1, 0);
         ts_file(dir.path(), "a.parquet", &[start, start + 3 * DAY], true);
-        ts_file(
-            dir.path(),
-            "b.parquet",
-            &[start + 5 * DAY, start + 200 * DAY],
-            true,
-        );
+        // One row per hour across the span: the row count must not be the binding bound
+        // here, or this would assert the refusal for the wrong reason (a two-row file
+        // cannot occupy 4,681 partitions and is accepted on its row count alone).
+        let hourly: Vec<i64> = (0..=4680).map(|h| start + 5 * DAY + h * HOUR).collect();
+        ts_file(dir.path(), "b.parquet", &hourly, true);
         let files = ["a.parquet", "b.parquet"];
         assert!(check(dir.path(), &files, &time("ts", Granularity::Day)).is_ok());
         // `b` ALONE spans 4681 hours: no batching splits one file, so it is named.
@@ -404,18 +419,11 @@ mod tests {
     fn exactly_the_cap_is_one_job_and_one_more_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let start = at(2000, 1, 1, 0);
-        ts_file(
-            dir.path(),
-            "cap.parquet",
-            &[start, start + 3999 * DAY],
-            true,
-        );
-        ts_file(
-            dir.path(),
-            "over.parquet",
-            &[start, start + 4000 * DAY],
-            true,
-        );
+        // One row per day, so the row count is never the binding bound and the boundary
+        // under test is the partition count itself.
+        let daily = |n: i64| -> Vec<i64> { (0..n).map(|d| start + d * DAY).collect() };
+        ts_file(dir.path(), "cap.parquet", &daily(4000), true);
+        ts_file(dir.path(), "over.parquet", &daily(4001), true);
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         let key = time("ts", Granularity::Day);
         assert_eq!(
@@ -427,6 +435,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("alone spans about 4001"), "{err}");
+    }
+
+    /// A file whose values are SCATTERED over a huge range occupies one partition per
+    /// distinct value, not one per day of its range — and a file of N rows can never
+    /// occupy more than N partitions. Refusing it on the span alone rejects a file the
+    /// warehouse loads happily.
+    ///
+    /// Measured 2026-09-18 on a live export: a 1,001-row part spanning 9,758 days was
+    /// refused here, while `bq load` of the same file into a DAY-partitioned table
+    /// succeeded and `INFORMATION_SCHEMA.PARTITIONS` reported exactly 1,001 partitions.
+    /// An incremental export orders rows by its CURSOR, so its parts are scattered over
+    /// the date column by construction — this is the normal shape, not a corner case.
+    ///
+    /// RED against taking the span alone: "alone spans about 9758 day partitions".
+    #[test]
+    fn a_scattered_file_is_bounded_by_its_rows_not_its_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        // 1,001 rows spread every ~9 days across 26 years: a 9,758-day span, 1,001
+        // partitions. Under the cap by rows, far over it by span.
+        let scattered: Vec<i64> = (0..1001).map(|i| start + i * 9 * DAY).collect();
+        ts_file(dir.path(), "scattered.parquet", &scattered, true);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let key = time("ts", Granularity::Day);
+        assert_eq!(
+            plan_load_batches(&store, &["gs://b/scattered.parquet".to_string()], &key).unwrap(),
+            vec![vec!["gs://b/scattered.parquet".to_string()]],
+            "1,001 rows can touch at most 1,001 partitions, whatever they span"
+        );
     }
 
     /// Files that are each narrow but together wide load in BATCHES: packed by their
@@ -544,7 +581,10 @@ mod tests {
     fn a_date_column_counts_days_from_its_day_numbers() {
         let dir = tempfile::tempdir().unwrap();
         let field = Field::new("d", DataType::Date32, false);
-        let days: Vec<i32> = vec![20_000, 20_000 + 4_500];
+        // One row per day across the span: the subject here is the day-number arithmetic,
+        // so the ROW COUNT must not be the binding bound (a two-row file can occupy at
+        // most two partitions and is accepted on that alone).
+        let days: Vec<i32> = (20_000..=20_000 + 4_500).collect();
         let column: ArrayRef = Arc::new(Date32Array::from(days));
         write(dir.path(), "d.parquet", field, column, true);
         let err = check(dir.path(), &["d.parquet"], &time("d", Granularity::Day))
@@ -562,7 +602,11 @@ mod tests {
     fn a_range_counts_its_buckets_plus_one_for_values_outside() {
         let dir = tempfile::tempdir().unwrap();
         let field = Field::new("n", DataType::Int64, false);
-        let column: ArrayRef = Arc::new(Int64Array::from(vec![-5_i64, 6_000]));
+        // The bounds under test, padded to more rows than the cap so the row count is not
+        // the binding bound — the subject is the range-bucket arithmetic.
+        let mut values: Vec<i64> = vec![-5_i64, 6_000];
+        values.extend(0..5_000);
+        let column: ArrayRef = Arc::new(Int64Array::from(values));
         write(dir.path(), "n.parquet", field, column, true);
         let range = |interval: i64| TablePartition {
             key: PartitionKey::Range {
@@ -589,7 +633,11 @@ mod tests {
     #[test]
     fn a_range_on_an_int32_column_is_budgeted_like_int64() {
         let dir = tempfile::tempdir().unwrap();
-        let i32_col: ArrayRef = Arc::new(Int32Array::from(vec![-5_i32, 6_000]));
+        // Padded past the cap for the same reason as the INT64 case: the row count must
+        // not stand in for the bucket arithmetic this test is about.
+        let mut i32_values: Vec<i32> = vec![-5_i32, 6_000];
+        i32_values.extend(0..5_000);
+        let i32_col: ArrayRef = Arc::new(Int32Array::from(i32_values));
         write(
             dir.path(),
             "i32.parquet",
@@ -597,7 +645,9 @@ mod tests {
             i32_col,
             true,
         );
-        let i16_col: ArrayRef = Arc::new(Int16Array::from(vec![-5_i16, 6_000]));
+        let mut i16_values: Vec<i16> = vec![-5_i16, 6_000];
+        i16_values.extend(0..5_000);
+        let i16_col: ArrayRef = Arc::new(Int16Array::from(i16_values));
         write(
             dir.path(),
             "i16.parquet",
@@ -629,7 +679,10 @@ mod tests {
     fn a_stats_less_file_does_not_hide_the_other_files_span() {
         let dir = tempfile::tempdir().unwrap();
         let start = at(2026, 1, 1, 0);
-        ts_file(dir.path(), "a.parquet", &[start, start + 200 * DAY], true);
+        // One row per hour over the span, so `a`'s refusal rests on its 4,801 partitions
+        // rather than on a two-row file that could never occupy them.
+        let hourly: Vec<i64> = (0..=4800).map(|h| start + h * HOUR).collect();
+        ts_file(dir.path(), "a.parquet", &hourly, true);
         ts_file(dir.path(), "b.parquet", &[start], false);
         for files in [["a.parquet", "b.parquet"], ["b.parquet", "a.parquet"]] {
             let err = check(dir.path(), &files, &time("ts", Granularity::Hour))
