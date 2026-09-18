@@ -40,7 +40,11 @@ pub(super) fn generate_config(
     let mut lines = config_header_lines(st, &header, unbounded, provenance, tls);
     lines.push("exports:".to_string());
     lines.extend(export_block_lines(info, st, dest, mode_override, false));
-    lines.extend(load_block_lines(dest));
+    let compactable = matches!(
+        mode_override.unwrap_or_else(|| info.suggest_mode()),
+        "incremental" | "cdc"
+    );
+    lines.extend(load_block_lines(dest, compactable));
     Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
 
@@ -113,7 +117,7 @@ pub(super) fn generate_schema_config(
         }
         let readable: Vec<TableInfo> = readable.into_iter().cloned().collect();
         lines.extend(cdc_multiplex_export_lines(&readable, st, dest));
-        lines.extend(load_block_lines(dest));
+        lines.extend(load_block_lines(dest, true));
         return Ok(wrap_comments(&(lines.join("\n") + "\n")));
     }
 
@@ -127,7 +131,13 @@ pub(super) fn generate_schema_config(
     for info in infos {
         lines.extend(export_block_lines(info, st, dest, mode_override, false));
     }
-    lines.extend(load_block_lines(dest));
+    let compactable = infos.iter().any(|i| {
+        matches!(
+            mode_override.unwrap_or_else(|| i.suggest_mode()),
+            "incremental" | "cdc"
+        )
+    });
+    lines.extend(load_block_lines(dest, compactable));
     Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
 
@@ -540,14 +550,14 @@ fn recipe_mode(info: &TableInfo) -> &'static str {
 /// schema whose tables name their business date differently needs no hand-merge.
 /// `day` is right until the history passes ~4,000 days, which no catalog field
 /// here can tell us — so it is said in a comment rather than silently coarsened.
-fn load_block_lines(dest: &InitYamlDestination) -> Vec<String> {
+fn load_block_lines(dest: &InitYamlDestination, compactable: bool) -> Vec<String> {
     let (Some(project), Some(dataset)) = (
         dest.bigquery_project.as_deref(),
         dest.bigquery_dataset.as_deref(),
     ) else {
         return Vec::new();
     };
-    vec![
+    let mut lines: Vec<String> = vec![
         String::new(),
         "# The warehouse half of the cycle: `rivet load` fills it, `rivet compact` merges.".into(),
         "# Review every value below — they are guesses from the catalog, not decisions.".into(),
@@ -557,12 +567,31 @@ fn load_block_lines(dest: &InitYamlDestination) -> Vec<String> {
         format!("  dataset: {dataset}"),
         "  pk: auto  # the source primary key `rivet run` recorded".into(),
         "  cluster_by: auto".into(),
-        "  # base_buffer: `<table>` is a physical table and `<table>__changes` a".into(),
-        "  # disposable buffer `rivet compact` merges into it. Drop this key to keep".into(),
-        "  # a changelog plus a dedup view instead (no compaction, full scan per read).".into(),
-        "  layout: base_buffer".into(),
-        "  cleanup_source: true".into(),
-    ]
+    ];
+    // `layout: base_buffer` is only meaningful for a mode that carries DELTAS.
+    // A `full` / `chunked` export overwrites its table every pass, so promising a
+    // base and a buffer here would put a key in the file that `rivet compact`
+    // openly skips ("a full load overwrites its table; nothing to merge").
+    if compactable {
+        lines.extend([
+            "  # base_buffer: `<table>` is a physical table and `<table>__changes` a".to_string(),
+            "  # disposable buffer `rivet compact` merges into it. Drop this key to keep"
+                .to_string(),
+            "  # a changelog plus a dedup view instead (no compaction, full scan per read)."
+                .to_string(),
+            "  layout: base_buffer".to_string(),
+        ]);
+    } else {
+        lines.extend([
+            "  # No export here takes deltas, so there is nothing to compact: each load"
+                .to_string(),
+            "  # OVERWRITES the table. Re-run init with `--mode incremental` (a cursor".to_string(),
+            "  # column is required) for the base + buffer cycle `rivet compact` merges."
+                .to_string(),
+        ]);
+    }
+    lines.push("  cleanup_source: true".to_string());
+    lines
 }
 
 fn export_block_lines(
@@ -2265,7 +2294,7 @@ mod load_block_tests {
             bigquery_dataset: None,
         };
         assert!(
-            load_block_lines(&bare).is_empty(),
+            load_block_lines(&bare, true).is_empty(),
             "no warehouse named, no load block"
         );
 
@@ -2274,7 +2303,7 @@ mod load_block_tests {
             bigquery_dataset: Some("d".into()),
             ..bare
         };
-        let block = load_block_lines(&named).join("\n");
+        let block = load_block_lines(&named, true).join("\n");
         for want in [
             "load:",
             "  target: bigquery",
@@ -2288,6 +2317,18 @@ mod load_block_tests {
         assert!(
             block.contains("Review every value"),
             "the block says it is a guess: {block}"
+        );
+
+        // A scaffold whose exports OVERWRITE their tables must not promise a
+        // layout `rivet compact` openly skips — it names the way to get one.
+        let overwriting = load_block_lines(&named, false).join("\n");
+        assert!(
+            !overwriting.contains("layout:"),
+            "no delta, no layout key: {overwriting}"
+        );
+        assert!(
+            overwriting.contains("--mode incremental"),
+            "it names the way to the compaction cycle: {overwriting}"
         );
     }
 }
