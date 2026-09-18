@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A base-and-buffer load no longer budgets the BUFFER against the base's partitions.**
+  The pre-load partition budget measured EVERY file of the load against the target's
+  granularity, so a change file spanning more days than one BigQuery job may write
+  (4,000 partitions) was refused by name — although the buffer takes no partition at
+  all and is read whole by one MERGE. Found by dogfooding a 5,000-day history: the
+  baseline landed in two jobs as designed, then the stream's own file was refused and
+  the cycle could not proceed. The budget now measures the baseline leg only, which is
+  what lands in the partitioned base; a stream-only cycle budgets nothing. The live
+  wide-history cell grew the missing half: changes 500 days apart, a ~4,500-day buffer
+  file loading in one job, and its compaction chunking the day list inside one job.
+
 - **`rivet compact` checks the base before it merges.** A buffer whose base table is
   ABSENT surfaced as BigQuery's own `Not found: Table … in location US`, and a base
   this state DB's ledger has no record of rivet loading was not checked at all — a

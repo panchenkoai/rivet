@@ -241,4 +241,56 @@ fn a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches() {
         bq.read_bq_table_type(&changes).is_none(),
         "no buffer until the stream captures a change"
     );
+
+    // The stream now carries changes across the WHOLE history: ten rows, 500 days
+    // apart, so the ONE buffer file spans ~4,500 days — wider than the 4,000
+    // partitions a job may write. The buffer takes NO partition, so this must load
+    // in one job. Found by dogfooding (2026-09-18): the pre-load budget measured
+    // the buffer against the base's day granularity and refused by name, although
+    // no job would ever write those partitions.
+    scn.sql(&format!("UPDATE {table} SET v = v + 1 WHERE id % 500 = 0"));
+    scn.settle();
+    scn.rig.run_ok();
+    let out = scn.rig.cli(&["load"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a buffer spanning the whole history must load in one job:\n{said}"
+    );
+    assert!(
+        !said.contains("no batching splits one file"),
+        "the buffer is not partitioned — it must not be budgeted: {said}"
+    );
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "10",
+        "the buffer holds exactly this cycle's changes"
+    );
+
+    // And the compaction of a buffer wider than one MERGE may modify: the day list
+    // is chunked inside ONE scripted job, never refused.
+    let out = scn.rig.cli(&["compact"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && said.contains("10 change row(s)"),
+        "a 4,500-day buffer compacts in one job:\n{said}"
+    );
+    let (live, partitions, _) = warehouse_profile(&bq, &table, "WHERE NOT __is_deleted");
+    assert_eq!(
+        (live, partitions),
+        (ROWS, ROWS),
+        "every row still live, still one partition per day"
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the buffer is dropped with the script"
+    );
 }

@@ -1097,17 +1097,19 @@ fn execute_load<R>(
         ctx: &ctx,
         consumed: Vec::new(),
     };
-    let (rows, report) =
-        match load::before_write(partition_budget_ok(&store, job.plan, &inputs.uris))
-            .and_then(|()| run(&*loader, &store, &inputs, &mut legs))
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
-                ctx.record(&remaining, 0, ledger_status(&e));
-                return Err(e);
-            }
-        };
+    // The budget measures what lands in the PARTITIONED target only: a
+    // disposable buffer takes no partition, so its files are not its business.
+    let budgeted = budgeted_uris(job.plan.layout, &inputs.runs, &inputs.uris);
+    let (rows, report) = match load::before_write(partition_budget_ok(&store, job.plan, &budgeted))
+        .and_then(|()| run(&*loader, &store, &inputs, &mut legs))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
+            ctx.record(&remaining, 0, ledger_status(&e));
+            return Err(e);
+        }
+    };
     let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
     if closing_record_applies(&remaining, &legs.consumed) {
         ctx.record_success(&remaining, rows as i64);
@@ -1441,6 +1443,48 @@ fn closing_record_applies(remaining: &[String], consumed: &[String]) -> bool {
 fn remaining_run_ids(all: &[String], consumed: &[String]) -> Vec<String> {
     all.iter()
         .filter(|id| !consumed.contains(id))
+        .cloned()
+        .collect()
+}
+
+/// The URIs the partition budget applies to: the files that land in the
+/// PARTITIONED target. Under `BaseAndBuffer` the stream's files land in the
+/// BUFFER, which is created WITHOUT a partition and read whole by one MERGE, so
+/// budgeting them against the base's granularity refuses a load that would have
+/// worked. Found by dogfooding (2026-09-18): a 5,000-day buffer file on a
+/// day-partitioned base was refused by name, although no job would ever write
+/// those partitions — the adapter had already stopped packing the buffer, but
+/// this preflight still measured it.
+///
+/// A baseline manifest that resolves to no present part makes `select_load_keys`
+/// fall back to the whole listing; the check then covers everything again, which
+/// is the conservative direction.
+fn budgeted_uris(
+    layout: load::plan::CdcLayout,
+    runs: &[(String, crate::manifest::RunManifest)],
+    uris: &[String],
+) -> Vec<String> {
+    if !layout.log_is_disposable() {
+        return uris.to_vec();
+    }
+    let baseline: Vec<(String, crate::manifest::RunManifest)> = runs
+        .iter()
+        .filter(|(_, m)| is_baseline_leg(m))
+        .cloned()
+        .collect();
+    if baseline.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<String> = uris
+        .iter()
+        .filter_map(|u| load::split_gs_uri(u).ok().map(|(_, k)| k.to_string()))
+        .collect();
+    let want: std::collections::HashSet<String> =
+        load::reconcile::select_load_keys(&baseline, &keys)
+            .into_iter()
+            .collect();
+    uris.iter()
+        .filter(|u| load::split_gs_uri(u).is_ok_and(|(_, k)| want.contains(k)))
         .cloned()
         .collect()
 }
@@ -2851,6 +2895,42 @@ mod live_only_decisions {
         assert_eq!(
             super::late_runs_refusal("orders", &runs(vec![older]), None),
             None
+        );
+    }
+
+    /// The partition budget measures the files that land in the PARTITIONED
+    /// target. Under base+buffer the stream's file goes into the buffer, which
+    /// takes no partition — measuring it refused a load nothing would have
+    /// written (a 5,000-day buffer file on a day-partitioned base, found by
+    /// dogfooding). RED against returning every uri for a disposable log.
+    #[test]
+    fn the_partition_budget_measures_the_base_leg_only_under_base_and_buffer() {
+        let mut baseline = success_manifest("r1", "r1-000.parquet");
+        baseline.mode = "chunked".into();
+        let stream = success_manifest("r2", "cdc-000.parquet");
+        let runs = vec![
+            ("base/manifest-r1.json".to_string(), baseline),
+            ("base/manifest-r2.json".to_string(), stream.clone()),
+        ];
+        let uris = vec![
+            "gs://b/base/r1-000.parquet".to_string(),
+            "gs://b/base/cdc-000.parquet".to_string(),
+        ];
+
+        assert_eq!(
+            budgeted_uris(CdcLayout::BaseAndBuffer, &runs, &uris),
+            vec!["gs://b/base/r1-000.parquet".to_string()],
+            "the buffer's file is never partitioned, so it is not budgeted"
+        );
+        assert_eq!(
+            budgeted_uris(CdcLayout::LogAndView, &runs, &uris),
+            uris,
+            "a changelog IS partitioned like its table — every file is budgeted"
+        );
+        let stream_only = vec![("base/manifest-r2.json".to_string(), stream)];
+        assert!(
+            budgeted_uris(CdcLayout::BaseAndBuffer, &stream_only, &uris).is_empty(),
+            "a cycle with no baseline leg writes nothing partitioned"
         );
     }
 
