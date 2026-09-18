@@ -301,6 +301,23 @@ pub enum Commands {
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
+        /// Scaffold a `load:` block for this BigQuery project. With
+        /// `--bigquery-dataset` the generated config carries the warehouse target,
+        /// a per-table partition guess and the base+buffer layout, so `rivet load`
+        /// and `rivet compact` work from it after a review.
+        #[arg(
+            long = "bigquery-project",
+            value_name = "PROJECT",
+            requires = "bigquery_dataset"
+        )]
+        bigquery_project: Option<String>,
+        /// The dataset the load creates its tables in (with `--bigquery-project`).
+        #[arg(
+            long = "bigquery-dataset",
+            value_name = "DATASET",
+            requires = "bigquery_project"
+        )]
+        bigquery_dataset: Option<String>,
         /// TLS posture for BOTH the introspection connection init opens AND the
         /// `source.tls:` block written into the scaffold. Required (or `disable`,
         /// explicitly) for any non-loopback host — without it the TLS gate

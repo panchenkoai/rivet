@@ -40,6 +40,7 @@ pub(super) fn generate_config(
     let mut lines = config_header_lines(st, &header, unbounded, provenance, tls);
     lines.push("exports:".to_string());
     lines.extend(export_block_lines(info, st, dest, mode_override, false));
+    lines.extend(load_block_lines(dest));
     Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
 
@@ -112,6 +113,7 @@ pub(super) fn generate_schema_config(
         }
         let readable: Vec<TableInfo> = readable.into_iter().cloned().collect();
         lines.extend(cdc_multiplex_export_lines(&readable, st, dest));
+        lines.extend(load_block_lines(dest));
         return Ok(wrap_comments(&(lines.join("\n") + "\n")));
     }
 
@@ -125,6 +127,7 @@ pub(super) fn generate_schema_config(
     for info in infos {
         lines.extend(export_block_lines(info, st, dest, mode_override, false));
     }
+    lines.extend(load_block_lines(dest));
     Ok(wrap_comments(&(lines.join("\n") + "\n")))
 }
 
@@ -530,6 +533,38 @@ fn recipe_mode(info: &TableInfo) -> &'static str {
 
 /// `force_table` emits the `table:` shortcut whatever the engine's default form —
 /// a backfill recipe must name the relation it reads (`query:` cannot be paired).
+/// The `load:` block `rivet init` writes when a warehouse was named — the
+/// defaults an operator is expected to READ and adjust, not a contract.
+///
+/// The partition column is guessed per TABLE (each export carries its own), so a
+/// schema whose tables name their business date differently needs no hand-merge.
+/// `day` is right until the history passes ~4,000 days, which no catalog field
+/// here can tell us — so it is said in a comment rather than silently coarsened.
+fn load_block_lines(dest: &InitYamlDestination) -> Vec<String> {
+    let (Some(project), Some(dataset)) = (
+        dest.bigquery_project.as_deref(),
+        dest.bigquery_dataset.as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    vec![
+        String::new(),
+        "# The warehouse half of the cycle: `rivet load` fills it, `rivet compact` merges.".into(),
+        "# Review every value below — they are guesses from the catalog, not decisions.".into(),
+        "load:".into(),
+        "  target: bigquery".into(),
+        format!("  project: {project}"),
+        format!("  dataset: {dataset}"),
+        "  pk: auto  # the source primary key `rivet run` recorded".into(),
+        "  cluster_by: auto".into(),
+        "  # base_buffer: `<table>` is a physical table and `<table>__changes` a".into(),
+        "  # disposable buffer `rivet compact` merges into it. Drop this key to keep".into(),
+        "  # a changelog plus a dedup view instead (no compaction, full scan per read).".into(),
+        "  layout: base_buffer".into(),
+        "  cleanup_source: true".into(),
+    ]
+}
+
 fn export_block_lines(
     info: &TableInfo,
     source_type: &str,
@@ -804,6 +839,18 @@ fn export_block_lines(
     lines.extend(destination_scaffold(info, source_type, dest, mode));
 
     lines.extend(decimal_override_lines(info));
+
+    // The warehouse partition, guessed from THIS table's own columns so a schema
+    // whose tables name their business date differently needs no hand-merge. A
+    // guess, said as one: the operator reviews it before the first load.
+    if dest.bigquery_project.is_some()
+        && let Some(col) = info.best_partition_column()
+    {
+        lines.push("    load:".to_string());
+        lines.push(format!(
+            "      partition: {{ column: {col}, granularity: day }}  # day holds ~4,000 partitions (11 years); use month for a longer history"
+        ));
+    }
 
     lines
 }
@@ -2198,5 +2245,49 @@ pub(crate) fn decided_strategy(
             chunk_size: None,
             mode,
         },
+    }
+}
+
+#[cfg(test)]
+mod load_block_tests {
+    use super::*;
+
+    /// The `load:` block appears only when a warehouse was NAMED, and it carries
+    /// the values an operator is expected to review rather than a silent default.
+    #[test]
+    fn the_load_block_is_written_only_when_a_warehouse_is_named() {
+        let bare = InitYamlDestination {
+            gcs_bucket: Some("b".into()),
+            gcs_credentials_file: None,
+            s3_bucket: None,
+            s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
+        };
+        assert!(
+            load_block_lines(&bare).is_empty(),
+            "no warehouse named, no load block"
+        );
+
+        let named = InitYamlDestination {
+            bigquery_project: Some("p".into()),
+            bigquery_dataset: Some("d".into()),
+            ..bare
+        };
+        let block = load_block_lines(&named).join("\n");
+        for want in [
+            "load:",
+            "  target: bigquery",
+            "  project: p",
+            "  dataset: d",
+            "  pk: auto",
+            "  layout: base_buffer",
+        ] {
+            assert!(block.contains(want), "missing `{want}` in:\n{block}");
+        }
+        assert!(
+            block.contains("Review every value"),
+            "the block says it is a guess: {block}"
+        );
     }
 }

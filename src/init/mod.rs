@@ -146,6 +146,26 @@ impl TableInfo {
             .map(|c| c.column)
     }
 
+    /// Best candidate for the warehouse PARTITION column: the business date the
+    /// rows are ABOUT, not the stamp that moves when a row changes. The mirror of
+    /// [`best_cursor_column`], which wants the opposite — partitioning by a
+    /// mutation stamp would move a row between partitions on every update.
+    pub(crate) fn best_partition_column(&self) -> Option<&str> {
+        let ts: Vec<&ColumnInfo> = self
+            .columns
+            .iter()
+            .filter(|c| is_timestamp_type(&c.data_type))
+            .collect();
+        ts.iter()
+            .find(|c| c.name == "created_at" || c.name == "made_at" || c.name == "occurred_at")
+            .or_else(|| {
+                ts.iter()
+                    .find(|c| c.name != "updated_at" && c.name != "modified_at")
+            })
+            .or_else(|| ts.first())
+            .map(|c| c.name.as_str())
+    }
+
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
@@ -497,6 +517,11 @@ pub struct InitYamlDestination {
     pub gcs_credentials_file: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_region: Option<String>,
+    /// `--bigquery-project` / `--bigquery-dataset`: when both are given the
+    /// scaffold carries a `load:` block, so the generated config drives the
+    /// warehouse half of the cycle too.
+    pub bigquery_project: Option<String>,
+    pub bigquery_dataset: Option<String>,
 }
 
 impl InitYamlDestination {
@@ -617,7 +642,8 @@ pub fn init(
                         path,
                         provenance,
                         mode_override,
-                        text.contains("      backfill: auto")
+                        text.contains("      backfill: auto"),
+                        text.contains("\nload:")
                     )
                 );
             }
@@ -633,7 +659,8 @@ pub fn init(
                         "rivet.yaml",
                         provenance,
                         mode_override,
-                        text.contains("      backfill: auto")
+                        text.contains("      backfill: auto"),
+                        text.contains("\nload:")
                     )
                 );
             }
@@ -655,6 +682,7 @@ fn next_steps_block(
     provenance: &SourceProvenance,
     mode: Option<&str>,
     has_backfill: bool,
+    has_load: bool,
 ) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
@@ -688,6 +716,16 @@ fn next_steps_block(
              rivet plan  -c {path}                    # review the schedule (read-only)\n  \
              rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
              rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
+        ));
+    }
+    // A scaffold that names a warehouse has two more steps: the extract alone
+    // leaves Parquet in a bucket, and the cycle an operator repeats is
+    // run -> load -> compact.
+    if has_load {
+        s.push_str(&format!(
+            "\nThen the warehouse half of the cycle (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # Parquet -> the base, or the buffer on later runs\n  \
+             rivet compact -c {path}                  # merge the buffer into the base and drop it\n"
         ));
     }
     s
@@ -1279,6 +1317,7 @@ mod tests {
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
             true,
+            false,
         );
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1297,6 +1336,7 @@ mod tests {
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
             false,
+            false,
         );
         assert!(
             s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
@@ -1311,6 +1351,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             None,
+            false,
             false,
         );
         // The core three-step path is always present.
@@ -1958,6 +1999,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: None,
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1985,6 +2028,8 @@ mod tests {
             gcs_credentials_file: Some("/path/sa.json".to_string()),
             s3_bucket: None,
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2012,6 +2057,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("my-s3-bucket".to_string()),
             s3_region: Some("eu-central-1".to_string()),
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2044,6 +2091,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("b".to_string()),
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2065,6 +2114,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("s".into()),
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");
