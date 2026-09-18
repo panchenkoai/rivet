@@ -1305,6 +1305,17 @@
           ],
           "default": null
         },
+        "layout": {
+          "description": "Where this table's current state lives; inherits when absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LayoutChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "partition": {
           "description": "This table's partitioning; `none` clears an inherited one.",
           "anyOf": [
@@ -1341,6 +1352,21 @@
           "items": {
             "type": "string"
           }
+        }
+      ]
+    },
+    "LayoutChoice": {
+      "description": "Where an incremental or CDC table's CURRENT STATE lives in the warehouse.\n\nAbsent keeps today's rule: a CDC stream with a `backfill:` gets the base and\nbuffer, everything else the changelog and its view. Written, it decides —\nwhich is how an ordinary query-based `incremental` export gets a PHYSICAL\nbase that `rivet compact` merges into, instead of a view that re-ranks the\nwhole log on every read.",
+      "oneOf": [
+        {
+          "description": "`<table>` is the dedup VIEW over `<table>__changes`.",
+          "type": "string",
+          "const": "log_view"
+        },
+        {
+          "description": "`<table>` is a physical base; `<table>__changes` is a disposable buffer\n`rivet compact` merges into it and drops.",
+          "type": "string",
+          "const": "base_buffer"
         }
       ]
     },
@@ -1667,6 +1693,17 @@
         "pk": {
           "description": "Dedup key of the incremental/CDC current-state view: `auto` (the source primary\nkey `rivet run` recorded), `none`, or explicit columns; ignored for `full`.",
           "$ref": "#/$defs/KeyColumns"
+        },
+        "layout": {
+          "description": "`log_view` or `base_buffer` — where the current state lives. Absent derives\nit from the mode: a CDC stream with a `backfill:` is base+buffer, the rest\nchangelog+view.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LayoutChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "allow_source_drift": {
           "description": "Load even when a run manifest's source count disagrees with what it extracted\n(source→file drift): warn instead of blocking.",

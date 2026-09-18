@@ -400,9 +400,24 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
 
 /// The warehouse layout of one export: a `backfill:` stream keeps a physical base
 /// and a disposable change buffer; everything else is the changelog + view.
-fn cdc_layout(export: &crate::config::ExportConfig, mode: LoadMode) -> CdcLayout {
-    match (mode, export.cdc.as_ref().and_then(|c| c.backfill.as_ref())) {
-        (LoadMode::Cdc, Some(_)) => CdcLayout::BaseAndBuffer,
+fn cdc_layout(
+    export: &crate::config::ExportConfig,
+    mode: LoadMode,
+    choice: Option<crate::config::load::LayoutChoice>,
+) -> CdcLayout {
+    use crate::config::load::LayoutChoice;
+    match (mode, choice) {
+        // A `full` load overwrites the whole table on every pass: there is no
+        // accumulated current state to lay out, so the key means nothing here.
+        (LoadMode::Full, _) => CdcLayout::LogAndView,
+        (_, Some(LayoutChoice::BaseBuffer)) => CdcLayout::BaseAndBuffer,
+        (_, Some(LayoutChoice::LogView)) => CdcLayout::LogAndView,
+        // Unwritten: the rule that shipped — a stream with a baseline keeps a
+        // physical base, everything else the changelog and its view.
+        (LoadMode::Cdc, None) => match export.cdc.as_ref().and_then(|c| c.backfill.as_ref()) {
+            Some(_) => CdcLayout::BaseAndBuffer,
+            None => CdcLayout::LogAndView,
+        },
         _ => CdcLayout::LogAndView,
     }
 }
@@ -656,13 +671,13 @@ fn build_plans_keyed(
             specs,
             gcs_prefix,
             destination: export.destination.clone(),
+            layout: cdc_layout(export, mode, eff_load.layout),
             load: eff_load,
             mode,
             cursor_column: export.cursor_column.clone(),
             pk,
             clustering,
             pinned_run: None,
-            layout: cdc_layout(export, mode),
         });
     }
     reject_duplicate_target_tables(
@@ -2338,12 +2353,45 @@ load:
             "name: t\ntable: t\nmode: cdc\nformat: parquet\ncdc: { checkpoint: ./t.ckpt }\n\
              destination: { type: local, path: /tmp/t }\n",
         );
-        assert_eq!(cdc_layout(&with, LoadMode::Cdc), CdcLayout::BaseAndBuffer);
-        assert_eq!(cdc_layout(&without, LoadMode::Cdc), CdcLayout::LogAndView);
         assert_eq!(
-            cdc_layout(&with, LoadMode::Full),
+            cdc_layout(&with, LoadMode::Cdc, None),
+            CdcLayout::BaseAndBuffer
+        );
+        assert_eq!(
+            cdc_layout(&without, LoadMode::Cdc, None),
+            CdcLayout::LogAndView
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Full, None),
             CdcLayout::LogAndView,
             "a batch load of the same export is no CDC layout"
+        );
+        // WRITTEN, the key decides — which is how an ordinary query-based
+        // incremental export gets a physical base to compact into.
+        use crate::config::load::LayoutChoice;
+        assert_eq!(
+            cdc_layout(
+                &without,
+                LoadMode::Incremental,
+                Some(LayoutChoice::BaseBuffer)
+            ),
+            CdcLayout::BaseAndBuffer,
+            "an incremental export asks for a base by name"
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Cdc, Some(LayoutChoice::LogView)),
+            CdcLayout::LogAndView,
+            "written wins over the backfill-derived default"
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Full, Some(LayoutChoice::BaseBuffer)),
+            CdcLayout::LogAndView,
+            "a full load overwrites the whole table; the key means nothing there"
+        );
+        assert_eq!(
+            cdc_layout(&without, LoadMode::Incremental, None),
+            CdcLayout::LogAndView,
+            "unwritten keeps what shipped"
         );
         // The two properties every site depends on, as a truth table.
         assert!(CdcLayout::BaseAndBuffer.log_is_disposable());

@@ -128,7 +128,7 @@ pub trait TargetLoader {
         table: &str,
         _specs: &[TargetColumnSpec],
         _pk: &[String],
-        _engine: cdc::SourceEngine,
+        _order: cdc::CompactOrder,
     ) -> Result<CompactReport> {
         bail!(
             "`rivet compact` is BigQuery-only in this release — `{}` targets {:?}",

@@ -1251,11 +1251,44 @@ fn compact_skip_reason(
     layout: &load::plan::CdcLayout,
 ) -> Option<&'static str> {
     match mode {
-        load::plan::LoadMode::Cdc if layout.compacts() => None,
+        // A full load OVERWRITES the whole table on every pass, so there is never
+        // an accumulated buffer to merge — whatever a layout says.
+        load::plan::LoadMode::Full => Some("a full load overwrites its table; nothing to merge"),
+        // Otherwise compaction belongs to the LAYOUT, not the mode: any table kept
+        // as a physical base with a disposable buffer has something to merge. An
+        // incremental export asks for that with `load.layout: base_buffer`.
+        _ if layout.compacts() => None,
         load::plan::LoadMode::Cdc => {
             Some("a changelog + view table (`initial: snapshot`); nothing to merge")
         }
-        _ => Some("not a CDC table; nothing to merge"),
+        load::plan::LoadMode::Incremental => Some(
+            "a changelog + view table; `load.layout: base_buffer` gives it a base to merge into",
+        ),
+    }
+}
+
+/// What decides the WINNER in this table's compaction: a CDC stream ranks by its
+/// log position, an incremental export by the cursor its current state is ordered
+/// on. One resolver so a mode that gains compaction cannot forget to say.
+fn compact_order_of(
+    plan: &load::plan::LoadPlan,
+    engine: Option<load::cdc::SourceEngine>,
+) -> Result<load::cdc::CompactOrder> {
+    match plan.mode {
+        load::plan::LoadMode::Cdc => Ok(load::cdc::CompactOrder::Cdc(
+            engine.context("a cdc plan needs its source engine to rank the buffer")?,
+        )),
+        _ => plan
+            .cursor_column
+            .clone()
+            .map(load::cdc::CompactOrder::Cursor)
+            .with_context(|| {
+                format!(
+                    "compacting `{}` needs the export's `cursor_column:` — the buffer's \
+                     latest-per-key ordering",
+                    plan.table
+                )
+            }),
     }
 }
 
@@ -1340,12 +1373,8 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             // base rivet never loaded was not checked at all. Metadata, no job.
             let report = match compact_gate_of(loader.as_ref(), &pinned.table, state.as_ref()) {
                 Err(e) => Err(e),
-                Ok(()) => loader.compact(
-                    &pinned.table,
-                    &pinned.specs,
-                    pk,
-                    engine.expect("engine resolved above for a cdc plan"),
-                ),
+                Ok(()) => compact_order_of(&pinned, engine)
+                    .and_then(|order| loader.compact(&pinned.table, &pinned.specs, pk, order)),
             };
             if let Some(s) = state.as_ref() {
                 let rec = LoadRecord {
@@ -1994,8 +2023,15 @@ fn load_one_incremental(
             );
         },
         |loader, store, inputs, legs| {
+            // Under base+buffer the first pass IS the base: it lands as a table
+            // (`run_load` refuses one that is not rivet's own) and the deltas go to
+            // the buffer. Folding a whole pass into the log is the view layout's
+            // answer, where the name is a view and cannot be overwritten.
+            let base_and_buffer = plan.layout.log_is_disposable();
             let mut split = split_runs(&inputs.runs);
-            if let Some((_, first)) = &split.first_pass {
+            if let Some((_, first)) = &split.first_pass
+                && !base_and_buffer
+            {
                 let kind = load::before_write(loader.object_kind(&plan.table))?;
                 if whole_table_run_joins_the_log(kind) {
                     eprintln!(
@@ -2038,10 +2074,17 @@ fn load_one_incremental(
                 } else {
                     cleanup_target(plan, store, state)
                 };
+                // The base carries the delete flag as DATA, like a CDC baseline:
+                // the buffer's tombstones flip it, and the column must exist from
+                // the first pass or the MERGE has nothing to set.
+                let mut base_specs = plan.specs.clone();
+                if base_and_buffer {
+                    base_specs.push(load::cdc::flag_spec(loader.warehouse()));
+                }
                 let r = load::run_load(
                     loader,
                     &plan.table,
-                    &plan.specs,
+                    &base_specs,
                     &uris,
                     Some(integrity.file_rows),
                     cleanup,
@@ -2062,18 +2105,30 @@ fn load_one_incremental(
                     inputs.ownership
                 };
                 let cleanup = cleanup_target(plan, store, state);
-                let r = load::run_load_incremental(
-                    loader,
-                    &plan.table,
-                    &plan.specs,
-                    &uris,
-                    pk,
-                    &cursor,
-                    Some(integrity.file_rows),
-                    cleanup,
-                    ownership,
-                    rebuild_changelog,
-                )?;
+                let r = if base_and_buffer {
+                    load::run_load_buffer(
+                        loader,
+                        &plan.table,
+                        &plan.specs,
+                        &uris,
+                        pk,
+                        Some(integrity.file_rows),
+                        cleanup,
+                    )?
+                } else {
+                    load::run_load_incremental(
+                        loader,
+                        &plan.table,
+                        &plan.specs,
+                        &uris,
+                        pk,
+                        &cursor,
+                        Some(integrity.file_rows),
+                        cleanup,
+                        ownership,
+                        rebuild_changelog,
+                    )?
+                };
                 eprintln!("{}", cdc_done_line(&integrity, &r));
                 rows += r.rows_appended;
                 report = Some(IncrementalReport::Changelog(r));
@@ -2200,6 +2255,7 @@ mod load_ledger_tests {
             gcs_prefix: String::new(),
             destination: crate::config::DestinationConfig::default(),
             load: LoadSection {
+                layout: None,
                 target: LoadTarget::Bigquery {
                     project: "p".into(),
                     dataset: "d".into(),
@@ -2574,8 +2630,8 @@ mod live_only_decisions {
         );
     }
 
-    /// `rivet compact` merges base-and-buffer CDC tables only; every other plan is
-    /// passed by with a reason that names what it is, never silently.
+    /// `rivet compact` merges every base-and-buffer table, CDC or incremental; every
+    /// other plan is passed by with a reason that names what it is, never silently.
     #[test]
     fn compact_passes_by_everything_but_a_base_and_buffer_cdc_table() {
         use crate::load::plan::{CdcLayout, LoadMode};
@@ -2589,11 +2645,18 @@ mod live_only_decisions {
         );
         assert!(
             super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView)
-                .is_some_and(|w| w.contains("not a CDC table"))
+                .is_some_and(|w| w.contains("overwrites its table"))
+        );
+        // The LAYOUT decides, not the mode: an ordinary incremental export that
+        // asked for `load.layout: base_buffer` has a buffer to merge, and one that
+        // did not is skipped with the key that would give it one.
+        assert_eq!(
+            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::BaseAndBuffer),
+            None
         );
         assert!(
-            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::BaseAndBuffer)
-                .is_some_and(|w| w.contains("not a CDC table"))
+            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::LogAndView)
+                .is_some_and(|w| w.contains("base_buffer"))
         );
     }
 
@@ -2667,6 +2730,7 @@ mod live_only_decisions {
             gcs_prefix: gcs_prefix.into(),
             destination: crate::config::DestinationConfig::default(),
             load: LoadSection {
+                layout: None,
                 target: LoadTarget::Bigquery {
                     project: "p".into(),
                     dataset: "d".into(),

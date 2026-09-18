@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **`load.layout: base_buffer` — a physical base and `rivet compact` for an ORDINARY
+  incremental export.** Compaction used to be a property of the MODE: only a `mode: cdc`
+  stream with a `backfill:` kept a physical base plus a disposable buffer, and every
+  query-based `incremental` export got the changelog and a dedup view instead — a view
+  that re-ranks the whole log on every read, with no partition pruning (measured: a
+  full-table scan per read against 19 MiB for the same question on a pruned base). The
+  layout is now a written choice, honored for `incremental` as well as `cdc`: the first
+  pass lands as the base (source columns plus `__is_deleted`), every later delta lands
+  in the buffer, and `rivet compact` merges and drops it. Absent, the key keeps exactly
+  what shipped, so no existing deployment changes shape; `full` ignores it, since a full
+  load overwrites the whole table and has no accumulated state to lay out.
+  The winner per key is picked by `CompactOrder`: a stream ranks by its log position, an
+  incremental export by its `cursor_column` — rendered by the same builder the
+  current-state view ranks with, so a compacted base and a view over the same rows can
+  never disagree about which row is latest.
+
 - **A base-and-buffer load no longer budgets the BUFFER against the base's partitions.**
   The pre-load partition budget measured EVERY file of the load against the target's
   granularity, so a change file spanning more days than one BigQuery job may write

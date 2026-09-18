@@ -98,6 +98,40 @@ impl Warehouse {
     }
 }
 
+/// What decides the WINNER when a key appears more than once in a compaction
+/// buffer: a CDC stream's log position, or an incremental export's cursor.
+///
+/// One type so the two cannot drift: the cursor arm renders the SAME order the
+/// incremental current-state view ranks by (`inc_dedup_view_sql`), including the
+/// NULL-baseline guard — a first pass has no cursor bound, so its rows carry a
+/// NULL cursor and must lose to any later value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactOrder {
+    Cdc(SourceEngine),
+    Cursor(String),
+}
+
+impl From<SourceEngine> for CompactOrder {
+    fn from(e: SourceEngine) -> Self {
+        CompactOrder::Cdc(e)
+    }
+}
+
+impl CompactOrder {
+    /// The complete `ORDER BY` clause of the winner-picking `ROW_NUMBER`.
+    pub(crate) fn order_by(&self, warehouse: Warehouse) -> String {
+        match self {
+            CompactOrder::Cdc(engine) => engine
+                .order_exprs(warehouse)
+                .into_iter()
+                .map(|e| format!("{e} DESC"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            CompactOrder::Cursor(column) => cursor_order_by(warehouse, column),
+        }
+    }
+}
+
 impl SourceEngine {
     /// The `ORDER BY` expressions (most-significant first) that totally-order
     /// the change log for this engine in `warehouse`'s SQL dialect: the parsed
@@ -283,7 +317,7 @@ pub fn compact_merge_sql(
     changes_fqtn: &str,
     columns: &[&str],
     pk: &[&str],
-    engine: SourceEngine,
+    order: impl Into<CompactOrder>,
     bound: Option<&RangeBound>,
     nulls_only: Option<&str>,
 ) -> String {
@@ -292,7 +326,7 @@ pub fn compact_merge_sql(
         (None, Some(c)) => MergeFilter::NullKeys(c.to_string()),
         (None, None) => MergeFilter::All,
     };
-    compact_merge_filtered_sql(base_fqtn, changes_fqtn, columns, pk, engine, &filter)
+    compact_merge_filtered_sql(base_fqtn, changes_fqtn, columns, pk, &order.into(), &filter)
 }
 
 /// Which of the buffer's WINNERS one MERGE takes, and the matching constant
@@ -344,17 +378,12 @@ pub fn compact_merge_filtered_sql(
     changes_fqtn: &str,
     columns: &[&str],
     pk: &[&str],
-    engine: SourceEngine,
+    order: &CompactOrder,
     filter: &MergeFilter,
 ) -> String {
     let wh = Warehouse::BigQuery;
     let partition = quote_partition(wh, pk);
-    let order = engine
-        .order_exprs(wh)
-        .into_iter()
-        .map(|e| format!("{e} DESC"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let order = order.order_by(wh);
     let source_filter = filter.predicate("");
     let on_keys = pk
         .iter()
@@ -516,6 +545,15 @@ fn build_dedup_view(
 /// PK. Incremental can't observe deletes, so [`DELETE_FLAG_COLUMN`] is a constant
 /// `FALSE` — the view SHAPE matches CDC so downstream reads `WHERE NOT
 /// __is_deleted` uniformly across both modes.
+/// The order an incremental key's latest row wins by: real cursor values above
+/// NULL — a first pass has no cursor bound, so its rows carry a NULL cursor and
+/// must lose to any later value — then newest first. Shared by the current-state
+/// view and the compaction merge so the two can never rank one key differently.
+fn cursor_order_by(warehouse: Warehouse, cursor_column: &str) -> String {
+    let cur = warehouse.quote_ident(cursor_column);
+    format!("{cur} IS NOT NULL DESC, {cur} DESC")
+}
+
 pub fn inc_dedup_view_sql(
     warehouse: Warehouse,
     view_fqtn: &str,
@@ -533,8 +571,7 @@ pub fn inc_dedup_view_sql(
     // non-NULL-cursor update (stale current state; BigQuery sorts NULLs last, so
     // it was correct only by luck). Ranking real cursor values above NULL makes
     // the dedup deterministic across both dialects.
-    let cur = warehouse.quote_ident(cursor_column);
-    let order = format!("{cur} IS NOT NULL DESC, {cur} DESC");
+    let order = cursor_order_by(warehouse, cursor_column);
     build_dedup_view(
         warehouse,
         view_fqtn,
@@ -877,11 +914,12 @@ pub fn plan_compact_merges(
     changes_fqtn: &str,
     specs: &[TargetColumnSpec],
     pk: &[String],
-    engine: SourceEngine,
+    order: impl Into<CompactOrder>,
     key: Option<&crate::load::plan::PartitionKey>,
     probe: &CompactProbe,
 ) -> anyhow::Result<Vec<String>> {
     use crate::load::plan::{Granularity, PartitionKey};
+    let order = order.into();
     if probe.rows == 0 {
         return Ok(Vec::new());
     }
@@ -897,7 +935,7 @@ pub fn plan_compact_merges(
             changes_fqtn,
             &columns,
             &pk_refs,
-            engine,
+            order.clone(),
             bound,
             nulls_only,
         )
@@ -985,9 +1023,10 @@ pub fn compact_script_sql(
     changes_fqtn: &str,
     specs: &[TargetColumnSpec],
     pk: &[String],
-    engine: SourceEngine,
+    order: impl Into<CompactOrder>,
     day_column: Option<&str>,
 ) -> String {
+    let order = order.into();
     let columns: Vec<&str> = specs
         .iter()
         .map(|s| s.column_name.as_str())
@@ -995,7 +1034,7 @@ pub fn compact_script_sql(
         .collect();
     let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
     let merge = |filter: &MergeFilter| {
-        compact_merge_filtered_sql(base_fqtn, changes_fqtn, &columns, &pk_refs, engine, filter)
+        compact_merge_filtered_sql(base_fqtn, changes_fqtn, &columns, &pk_refs, &order, filter)
     };
     let Some(col) = day_column else {
         return format!(
@@ -1515,6 +1554,40 @@ mod compact_column_tests {
         assert!(
             !s.contains("`__is_deleted` = S.`__is_deleted`"),
             "the flag is the merge's decision, not a copied column: {s}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_order_tests {
+    use super::*;
+
+    /// The compaction and the current-state view must rank ONE key the same way,
+    /// or a compacted base and a view over the same rows disagree about which is
+    /// latest. The cursor arm renders the view's own order, NULL guard included.
+    #[test]
+    fn the_cursor_order_is_the_one_the_incremental_view_ranks_by() {
+        let order = CompactOrder::Cursor("updated_at".into()).order_by(Warehouse::BigQuery);
+        assert_eq!(order, "`updated_at` IS NOT NULL DESC, `updated_at` DESC");
+        let view = inc_dedup_view_sql(
+            Warehouse::BigQuery,
+            "p.d.t",
+            "p.d.t__changes",
+            &["id"],
+            "updated_at",
+        );
+        assert!(
+            view.contains(&order),
+            "the view must rank by the same order: {view}"
+        );
+        let cdc = CompactOrder::Cdc(SourceEngine::MySql).order_by(Warehouse::BigQuery);
+        assert!(
+            cdc.contains("__pos") && cdc.ends_with("DESC"),
+            "a stream ranks by its log position: {cdc}"
+        );
+        assert_eq!(
+            CompactOrder::from(SourceEngine::MySql).order_by(Warehouse::BigQuery),
+            cdc
         );
     }
 }

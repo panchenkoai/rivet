@@ -528,7 +528,7 @@ impl TargetLoader for BigQueryLoader {
         table: &str,
         specs: &[TargetColumnSpec],
         pk: &[String],
-        engine: crate::load::cdc::SourceEngine,
+        order: crate::load::cdc::CompactOrder,
     ) -> Result<crate::load::CompactReport> {
         use crate::load::cdc::{
             CompactProbe, compact_probe_sql, compact_script_sql, plan_compact_merges,
@@ -577,7 +577,7 @@ impl TargetLoader for BigQueryLoader {
             Some(_) => None,
         };
         if let Some(day_column) = day_column {
-            let script = compact_script_sql(&base, &changes_fqtn, specs, pk, engine, day_column);
+            let script = compact_script_sql(&base, &changes_fqtn, specs, pk, order, day_column);
             let row = api.run_query_first_row(&script, &self.labels("merge", table))?;
             let (changes_rows, merge_jobs) = compact_summary(&row)?;
             // The buffer is gone with the script; a crash HERE loses nothing — the
@@ -606,7 +606,7 @@ impl TargetLoader for BigQueryLoader {
             nulls: cell(3).parse().unwrap_or(0),
         };
         let changes_rows = probe.rows;
-        let merges = plan_compact_merges(&base, &changes_fqtn, specs, pk, engine, key, &probe)?;
+        let merges = plan_compact_merges(&base, &changes_fqtn, specs, pk, order, key, &probe)?;
         for sql in &merges {
             self.run_sql(sql, "merge", table)?;
         }

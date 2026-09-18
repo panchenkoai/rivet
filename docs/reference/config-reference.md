@@ -193,6 +193,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `storage_integration` | `string` |  | Snowflake: a pre-created GCS `STORAGE INTEGRATION`. |
 | `cleanup_source` | `boolean` |  | After a successful load, delete the staged Parquet under the export prefix. |
 | `pk` | `auto` \| `none` |  | Dedup key of the incremental/CDC current-state view: `auto` (the source primary key `rivet run` recorded), `none`, or explicit columns; ignored for `full`. |
+| `layout` | `log_view` \| `base_buffer` |  | `log_view` or `base_buffer` — where the current state lives. Absent derives it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest changelog+view. |
 | `allow_source_drift` | `boolean` |  | Load even when a run manifest's source count disagrees with what it extracted (source→file drift): warn instead of blocking. |
 | `gc_orphans` | `boolean` |  | After a successful load, delete staged Parquet under the export prefix that no `Success` manifest references — crash leftovers. Only when no extract writes the prefix concurrently. |
 | `cluster_by` | `auto` \| `none` |  | `CLUSTER BY` of the table the load writes: `auto` (the primary key), `none`, or explicit columns (at most 4 on BigQuery). |
@@ -207,6 +208,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `gc_orphans` | `boolean` |  |  |
 | `cluster_by` | `auto` \| `none` |  | `CLUSTER BY` of this table. |
 | `allow_source_drift` | `boolean` |  |  |
+| `layout` | `log_view` \| `base_buffer` |  | Where this table's current state lives; inherits when absent. |
 | `partition` | `none` |  | This table's partitioning; `none` clears an inherited one. |
 | `tables` | `object` |  | On a multiplex `tables:` CDC export: the override for ONE captured table, keyed by its name, layered over this block — six tables through one stream rarely share a partition column or a key. Every name must be one of the export's `tables:`; a nested `tables:` is refused. |
 

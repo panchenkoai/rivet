@@ -31,6 +31,8 @@ pub struct LoadSection {
     pub cluster_by: KeyColumns,
     /// How the table the load writes is partitioned; `None` leaves it flat.
     pub partition: Option<PartitionSpec>,
+    /// Where the current state lives; `None` = derive it from the export's mode.
+    pub layout: Option<LayoutChoice>,
 }
 
 impl JsonSchema for LoadSection {
@@ -77,6 +79,11 @@ struct RawLoadSection {
     /// key `rivet run` recorded), `none`, or explicit columns; ignored for `full`.
     #[serde(default)]
     pk: KeyColumns,
+    /// `log_view` or `base_buffer` — where the current state lives. Absent derives
+    /// it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest
+    /// changelog+view.
+    #[serde(default)]
+    layout: Option<LayoutChoice>,
     /// Load even when a run manifest's source count disagrees with what it extracted
     /// (source→file drift): warn instead of blocking.
     #[serde(default)]
@@ -162,6 +169,7 @@ impl TryFrom<RawLoadSection> for LoadSection {
             gc_orphans: r.gc_orphans,
             cluster_by: r.cluster_by,
             partition: r.partition,
+            layout: r.layout,
         })
     }
 }
@@ -188,6 +196,9 @@ impl LoadSection {
         }
         if let Some(p) = &o.partition {
             eff.partition = p.clone();
+        }
+        if let Some(l) = o.layout {
+            eff.layout = Some(l);
         }
         eff
     }
@@ -236,6 +247,9 @@ pub struct LoadOverride {
     pub cluster_by: Option<KeyColumns>,
     #[serde(default)]
     pub allow_source_drift: Option<bool>,
+    /// Where this table's current state lives; inherits when absent.
+    #[serde(default)]
+    pub layout: Option<LayoutChoice>,
     /// This table's partitioning; `none` clears an inherited one.
     #[serde(default, deserialize_with = "partition_override")]
     #[schemars(with = "Option<PartitionSetting>")]
@@ -246,6 +260,23 @@ pub struct LoadOverride {
     /// export's `tables:`; a nested `tables:` is refused.
     #[serde(default)]
     pub tables: std::collections::BTreeMap<String, LoadOverride>,
+}
+
+/// Where an incremental or CDC table's CURRENT STATE lives in the warehouse.
+///
+/// Absent keeps today's rule: a CDC stream with a `backfill:` gets the base and
+/// buffer, everything else the changelog and its view. Written, it decides —
+/// which is how an ordinary query-based `incremental` export gets a PHYSICAL
+/// base that `rivet compact` merges into, instead of a view that re-ranks the
+/// whole log on every read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutChoice {
+    /// `<table>` is the dedup VIEW over `<table>__changes`.
+    LogView,
+    /// `<table>` is a physical base; `<table>__changes` is a disposable buffer
+    /// `rivet compact` merges into it and drops.
+    BaseBuffer,
 }
 
 /// A column list in a `load:` block: `auto` (from the recorded source primary key),
