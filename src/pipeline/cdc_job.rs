@@ -408,8 +408,10 @@ pub(super) fn initial_snapshot_pending(
         // table, so they carry the delete flag as data and no `__pos` stamp — the
         // stamp orders rows inside a changelog the base never joins.
         let base_layout = cdc.backfill.is_some();
-        synth.meta_columns.deleted_flag =
-            base_layout && crate::load::plan::resolved_deleted_flag(config, export);
+        synth.meta_columns.deleted_flag = crate::load::plan::base_carries_delete_flag(
+            base_layout,
+            crate::load::plan::resolved_deleted_flag(config, export),
+        );
         synth.meta_columns.cdc_snapshot_pos = if base_layout {
             None
         } else {

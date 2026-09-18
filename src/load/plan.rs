@@ -439,6 +439,29 @@ pub fn resolved_deleted_flag(
         .unwrap_or(matches!(load_mode_of(export.mode), LoadMode::Cdc))
 }
 
+/// Whether the BASE table this export lands carries `__is_deleted` as data.
+///
+/// Only a base-and-buffer layout has a base to carry it: under the log-and-view layout the
+/// flag lives in the changelog, and a base that is really a view cannot hold a column at
+/// all. Named and offline-graded because both callers are live-only bodies, where an
+/// inline `&&` is a decision the mutation corpus excludes with nothing asked in return.
+pub fn base_carries_delete_flag(base_and_buffer: bool, deleted_flag: bool) -> bool {
+    base_and_buffer && deleted_flag
+}
+
+/// Whether a whole-table pass may be folded into the changelog instead of landing as the
+/// base table.
+///
+/// Folding is the log-and-view layout's answer, where the name is a view and cannot be
+/// overwritten. Under base-and-buffer the first pass IS the base, so it must land as a
+/// table and never join the log.
+///
+/// Takes only the layout: whether a first pass EXISTS is carried by the `Option` the
+/// caller filters, so asking for it again here would put the same decision in two places.
+pub fn whole_table_pass_may_join_the_log(base_and_buffer: bool) -> bool {
+    !base_and_buffer
+}
+
 /// This export's effective warehouse partition, from the config alone — the section's
 /// `partition:` with the export's own block layered over it. The EXTRACT asks, because
 /// nothing splits one Parquet file at load time: only the writer can keep a part inside
@@ -1073,6 +1096,50 @@ mod tests {
     }
 
     use super::*;
+
+    /// The delete flag is DATA on a base table, so only a layout that HAS a physical base
+    /// can carry it. Under log-and-view the name is a view, which holds no column of its
+    /// own — declaring the flag there must not put one in the file.
+    ///
+    /// Extracted from two live-only bodies (`load_one_incremental`, the CDC job's snapshot
+    /// synthesis) where the same `&&` sat inline and the mutation corpus excluded it.
+    #[test]
+    fn a_base_carries_the_delete_flag_only_when_there_is_a_base_and_it_was_declared() {
+        assert!(
+            base_carries_delete_flag(true, true),
+            "base-and-buffer with the flag declared: the column must exist from the first \
+             pass, or the buffer's tombstones have nothing to flip"
+        );
+        assert!(
+            !base_carries_delete_flag(true, false),
+            "a base whose export did not declare the flag pays no column for it"
+        );
+        assert!(
+            !base_carries_delete_flag(false, true),
+            "log-and-view has no physical base — the flag lives in the changelog, and a \
+             view cannot hold a column of its own"
+        );
+        assert!(!base_carries_delete_flag(false, false));
+    }
+
+    /// Folding a whole-table pass into the changelog is the log-and-view answer, where the
+    /// target name is a view and cannot be overwritten. Under base-and-buffer that same
+    /// pass IS the base and must land as a table, so it may never join the log.
+    ///
+    /// Only the layout is graded here. Whether a first pass EXISTS is carried by the
+    /// `Option` the caller filters, so it is the caller's `if let` — not this predicate —
+    /// and duplicating it as a parameter would put one decision in two places.
+    #[test]
+    fn a_whole_table_pass_joins_the_log_only_under_the_view_layout() {
+        assert!(
+            whole_table_pass_may_join_the_log(false),
+            "log-and-view: a whole-table pass folds into the changelog"
+        );
+        assert!(
+            !whole_table_pass_may_join_the_log(true),
+            "base-and-buffer: the first pass IS the base and must land as a table"
+        );
+    }
 
     #[test]
     fn ledger_str_names_each_mode_stably() {

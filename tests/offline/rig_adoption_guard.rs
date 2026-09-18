@@ -24,9 +24,13 @@ const BASELINE: &[(&str, usize)] = &[
     // subject. Raw invocations of `rivet init <flags>` ARE these files' subject,
     // so their ceilings hold them at today's counts rather than at zero.
     ("audit_init_deferred.rs", 4),
-    // live_init_extended: all six sites are `rivet init <flags>` invocations
-    // (schema/discover/source-env/table variants) — the subject itself.
-    ("live_init_extended.rs", 6),
+    // live_init_extended: all seven sites are `rivet init <flags>` invocations
+    // (schema/discover/source-env/table variants, plus the BigQuery `load:` pair) —
+    // the subject itself. The seventh arrived 2026-09-18 with the flag-coverage
+    // sweep's `--bigquery-project`/`--bigquery-dataset` test, and cannot go through
+    // `Rig::cli` for the reason above, concretely: `cli_argv` appends
+    // `--config <path>` to every invocation, and `init` takes no config.
+    ("live_init_extended.rs", 7),
     // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),

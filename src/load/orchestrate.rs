@@ -2043,9 +2043,14 @@ fn load_one_incremental(
             // answer, where the name is a view and cannot be overwritten.
             let base_and_buffer = plan.layout.log_is_disposable();
             let mut split = split_runs(&inputs.runs);
-            if let Some((_, first)) = &split.first_pass
-                && !base_and_buffer
-            {
+            // `filter` rather than a nested `if`: the layout question has a named, graded
+            // home, and expressing "there is a first pass" through the Option keeps this
+            // body free of the inline decision the mutation corpus cannot reach.
+            let joins_the_log = split
+                .first_pass
+                .as_ref()
+                .filter(|_| load::plan::whole_table_pass_may_join_the_log(base_and_buffer));
+            if let Some((_, first)) = joins_the_log {
                 let kind = load::before_write(loader.object_kind(&plan.table))?;
                 if whole_table_run_joins_the_log(kind) {
                     eprintln!(
@@ -2092,7 +2097,7 @@ fn load_one_incremental(
                 // the buffer's tombstones flip it, and the column must exist from
                 // the first pass or the MERGE has nothing to set.
                 let mut base_specs = plan.specs.clone();
-                if base_and_buffer && plan.deleted_flag {
+                if load::plan::base_carries_delete_flag(base_and_buffer, plan.deleted_flag) {
                     base_specs.push(load::cdc::flag_spec(loader.warehouse()));
                 }
                 let r = load::run_load(
