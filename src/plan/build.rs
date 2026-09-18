@@ -144,7 +144,7 @@ pub fn build_plan(
         // that can keep a part inside a load job's partition budget. Only a COLUMN
         // partition can be counted while writing: ingestion time is one partition by
         // construction, and a range key buckets integers this path does not resolve.
-        partition_rollover: crate::load::plan::resolved_partition(config, export).and_then(
+        partition_rollover: crate::load::plan::resolved_partition(config, export, None).and_then(
             |spec| match spec.form {
                 crate::config::load::PartitionForm::Column {
                     column,

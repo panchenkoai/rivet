@@ -407,10 +407,14 @@ pub(super) fn initial_snapshot_pending(
         // Base-and-buffer layout (`backfill:`): the leg's rows become the BASE
         // table, so they carry the delete flag as data and no `__pos` stamp — the
         // stamp orders rows inside a changelog the base never joins.
+        // `label` is THIS captured table: a multiplex stream's `load.tables.<name>` block
+        // decides per table, and the load plan already honours it. Answering from the
+        // export level here stamped one value into every table's files while the warehouse
+        // expected the per-table one.
         let base_layout = cdc.backfill.is_some();
         synth.meta_columns.deleted_flag = crate::load::plan::base_carries_delete_flag(
             base_layout,
-            crate::load::plan::resolved_deleted_flag(config, export),
+            crate::load::plan::resolved_deleted_flag(config, export, Some(label)),
         );
         synth.meta_columns.cdc_snapshot_pos = if base_layout {
             None

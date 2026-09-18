@@ -418,23 +418,50 @@ pub fn load_mode_of(mode: crate::config::ExportMode) -> LoadMode {
     }
 }
 
-/// Where THIS export's current state will live, from the config alone — the
-/// section's `layout:` with the export's own block layered over it. The EXTRACT
-/// asks too: a base-and-buffer table's rows carry the delete flag as data, and
-/// only the writer can put it in the file.
-/// Whether THIS export's base carries the delete flag, from the config alone —
-/// the extract asks, because only the writer can put a constant column in the file.
+/// One export's effective load settings: the shared section, the export's own `load:`
+/// block layered over it, then — for a captured table of a multiplex stream — that
+/// table's `load.tables.<name>` block over both.
+///
+/// THE overlay. It was written out four times (three `resolved_*` readers and the plan
+/// builder), and only the builder's copy applied the third layer, so the load honoured a
+/// per-table override the extract never saw.
+pub(crate) fn overlay(
+    section: &LoadSection,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> LoadSection {
+    let mut eff = match &export.load {
+        Some(o) => section.with_override(o),
+        None => section.clone(),
+    };
+    if let (Some(o), Some(t)) = (&export.load, table)
+        && let Some(per_table) = o.tables.get(t)
+    {
+        eff = eff.with_override(per_table);
+    }
+    eff
+}
+
+/// [`overlay`] against the config's shared `load:` block; `None` when there is none.
+pub fn effective_load(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> Option<LoadSection> {
+    config.load.as_ref().map(|s| overlay(s, export, table))
+}
+
+/// Whether THIS export's base carries the delete flag, from the config alone — the extract
+/// asks, because only the writer can put a constant column in the file.
+///
+/// `table` names the captured table when the caller has one (a multiplex stream stamps per
+/// table); `None` answers for the export as a whole.
 pub fn resolved_deleted_flag(
     config: &crate::config::Config,
     export: &crate::config::ExportConfig,
+    table: Option<&str>,
 ) -> bool {
-    config
-        .load
-        .as_ref()
-        .map(|l| match &export.load {
-            Some(o) => l.with_override(o),
-            None => l.clone(),
-        })
+    effective_load(config, export, table)
         .and_then(|eff| eff.deleted_flag)
         .unwrap_or(matches!(load_mode_of(export.mode), LoadMode::Cdc))
 }
@@ -462,37 +489,27 @@ pub fn whole_table_pass_may_join_the_log(base_and_buffer: bool) -> bool {
     !base_and_buffer
 }
 
-/// This export's effective warehouse partition, from the config alone — the section's
-/// `partition:` with the export's own block layered over it. The EXTRACT asks, because
-/// nothing splits one Parquet file at load time: only the writer can keep a part inside
-/// a load job's partition budget. A multiplex `tables:` CDC export partitions per
-/// captured table, so this answers for the export-level block only.
+/// This export's effective warehouse partition. The EXTRACT asks, because nothing splits
+/// one Parquet file at load time: only the writer can keep a part inside a load job's
+/// partition budget. `table` names the captured table when the caller has one.
 pub fn resolved_partition(
     config: &crate::config::Config,
     export: &crate::config::ExportConfig,
+    table: Option<&str>,
 ) -> Option<PartitionSpec> {
-    config
-        .load
-        .as_ref()
-        .map(|l| match &export.load {
-            Some(o) => l.with_override(o),
-            None => l.clone(),
-        })
-        .and_then(|eff| eff.partition)
+    effective_load(config, export, table).and_then(|eff| eff.partition)
 }
 
+/// Where THIS export's current state will live — the section's `layout:` with the export's
+/// block, and a captured table's block, layered over it. The EXTRACT asks too: a
+/// base-and-buffer table's rows carry the delete flag as data, and only the writer can put
+/// it in the file.
 pub fn resolved_layout(
     config: &crate::config::Config,
     export: &crate::config::ExportConfig,
+    table: Option<&str>,
 ) -> CdcLayout {
-    let choice = config
-        .load
-        .as_ref()
-        .map(|l| match &export.load {
-            Some(o) => l.with_override(o),
-            None => l.clone(),
-        })
-        .and_then(|eff| eff.layout);
+    let choice = effective_load(config, export, table).and_then(|eff| eff.layout);
     cdc_layout(export, load_mode_of(export.mode), choice)
 }
 
@@ -726,21 +743,10 @@ fn build_plans_keyed(
                 export.name
             );
         }
-        // Effective load config: the shared top-level `load:`, with this export's
-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).
-        // The warehouse `target` is shared and cannot be re-targeted per export.
-        let mut eff_load = match &export.load {
-            Some(o) => load.with_override(o),
-            None => load.clone(),
-        };
-        // A multiplex stream's `load.tables: { <table>: … }` — this table's own
-        // layer over the export's, over the top level (`validate_load_overrides`
-        // has already checked every name is a captured table).
-        if let (Some(o), Some(t)) = (&export.load, &unit)
-            && let Some(per_table) = o.tables.get(t)
-        {
-            eff_load = eff_load.with_override(per_table);
-        }
+        // The shared `load:`, this export's block, and — for a captured table of a
+        // multiplex stream — that table's block. One overlay, shared with the readers the
+        // extract calls, so both sides answer the same question the same way.
+        let eff_load = overlay(load, export, unit.as_deref());
         let (pk, cluster_by) = resolve_keys(
             &export.name,
             &eff_load,
@@ -2493,14 +2499,14 @@ load:
 
         let written = cfg("  layout: base_buffer\n", "", "incremental");
         assert_eq!(
-            resolved_layout(&written, &written.exports[0]),
+            resolved_layout(&written, &written.exports[0], None),
             CdcLayout::BaseAndBuffer,
             "an ordinary incremental export asks for a base by name"
         );
 
         let unwritten = cfg("", "", "incremental");
         assert_eq!(
-            resolved_layout(&unwritten, &unwritten.exports[0]),
+            resolved_layout(&unwritten, &unwritten.exports[0], None),
             CdcLayout::LogAndView,
             "unwritten keeps the changelog and its view"
         );
@@ -2511,14 +2517,14 @@ load:
             "incremental",
         );
         assert_eq!(
-            resolved_layout(&overridden, &overridden.exports[0]),
+            resolved_layout(&overridden, &overridden.exports[0], None),
             CdcLayout::LogAndView,
             "the export's own block layers over the section"
         );
 
         let full = cfg("  layout: base_buffer\n", "", "full");
         assert_eq!(
-            resolved_layout(&full, &full.exports[0]),
+            resolved_layout(&full, &full.exports[0], None),
             CdcLayout::LogAndView,
             "a full load overwrites its table; the key means nothing there"
         );
@@ -2540,23 +2546,136 @@ load:
         };
         let q = cfg("", "incremental");
         assert!(
-            !resolved_deleted_flag(&q, &q.exports[0]),
+            !resolved_deleted_flag(&q, &q.exports[0], None),
             "a query cannot express a delete — no column by default"
         );
         let s = cfg("", "cdc");
         assert!(
-            resolved_deleted_flag(&s, &s.exports[0]),
+            resolved_deleted_flag(&s, &s.exports[0], None),
             "a stream can, and its base keeps the flag"
         );
         let asked = cfg("  deleted_flag: true\n", "incremental");
         assert!(
-            resolved_deleted_flag(&asked, &asked.exports[0]),
+            resolved_deleted_flag(&asked, &asked.exports[0], None),
             "written, the key decides"
         );
         let refused = cfg("  deleted_flag: false\n", "cdc");
         assert!(
-            !resolved_deleted_flag(&refused, &refused.exports[0]),
+            !resolved_deleted_flag(&refused, &refused.exports[0], None),
             "and it decides against a stream too"
+        );
+    }
+
+    /// A multiplex stream's `load.tables.<name>` block must reach the EXTRACT, not only
+    /// the load plan.
+    ///
+    /// The plan builder applied all three layers while the extract-side readers stopped at
+    /// the export block, so the warehouse expected a per-table answer and the snapshot leg
+    /// stamped one export-level value into every captured table's files. The leg has the
+    /// table name in hand (`cdc_job.rs`, the `pending_idx` loop), so the fix is the
+    /// argument, not a new mechanism.
+    ///
+    /// RED against passing the export level: `customers` reads `true` with the override
+    /// ignored.
+    #[test]
+    fn a_per_table_override_reaches_the_extract_not_only_the_load_plan() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: cdc
+    tables: [orders, customers]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      initial: snapshot
+    destination:
+      type: gcs
+      bucket: b
+      prefix: cdc/
+    load:
+      deleted_flag: true
+      partition: { column: created_at, granularity: day }
+      tables:
+        customers: { deleted_flag: false, partition: none }
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .expect("a multiplex config");
+        let export = &cfg.exports[0];
+
+        assert!(
+            resolved_deleted_flag(&cfg, export, Some("orders")),
+            "a table with no block of its own keeps the export's answer"
+        );
+        assert!(
+            !resolved_deleted_flag(&cfg, export, Some("customers")),
+            "its own block decides — this is what the load plan already honoured"
+        );
+        assert!(
+            resolved_deleted_flag(&cfg, export, None),
+            "asked for the export as a whole, the export-level answer stands"
+        );
+
+        assert!(
+            resolved_partition(&cfg, export, Some("orders")).is_some(),
+            "the stream's default partition applies to a table without a block"
+        );
+        assert!(
+            resolved_partition(&cfg, export, Some("customers")).is_none(),
+            "`partition: none` clears the inherited one for that table only"
+        );
+    }
+
+    /// The partition the WRITER budgets each part against, resolved from the config alone.
+    /// Shipped on this branch with no test of its own while both its siblings had one.
+    #[test]
+    fn the_resolved_partition_composes_the_section_and_the_export_override() {
+        let cfg = |load: &str, export_extra: &str| {
+            let yaml = format!(
+                "source:\n  type: mysql\n  url_env: DB_URL\nexports:\n  - name: t\n    \
+                 table: t\n    mode: incremental\n    cursor_column: updated_at\n    \
+                 format: parquet\n    destination: {{ type: local, path: /tmp/t }}\n{export_extra}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n{load}"
+            );
+            serde_yaml_ng::from_str::<crate::config::Config>(&yaml).expect("a config")
+        };
+
+        let none = cfg("", "");
+        assert!(
+            resolved_partition(&none, &none.exports[0], None).is_none(),
+            "no `partition:` anywhere leaves the part sizing to max_file_size alone"
+        );
+
+        let shared = cfg(
+            "  partition: { column: created_at, granularity: day }\n",
+            "",
+        );
+        let spec = resolved_partition(&shared, &shared.exports[0], None)
+            .expect("the section's partition applies to every export");
+        assert_eq!(spec.form.column(), Some("created_at"));
+
+        let overridden = cfg(
+            "  partition: { column: created_at, granularity: day }\n",
+            "    load:\n      partition: { column: made_at, granularity: month }\n",
+        );
+        let spec = resolved_partition(&overridden, &overridden.exports[0], None)
+            .expect("the export's own block layers over the section");
+        assert_eq!(spec.form.column(), Some("made_at"));
+
+        let cleared = cfg(
+            "  partition: { column: created_at, granularity: day }\n",
+            "    load:\n      partition: none\n",
+        );
+        assert!(
+            resolved_partition(&cleared, &cleared.exports[0], None).is_none(),
+            "`none` clears an inherited partition rather than inheriting it"
         );
     }
 

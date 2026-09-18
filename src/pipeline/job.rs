@@ -1483,9 +1483,11 @@ fn run_export_job_inner(
     // left every row's `__is_deleted` NULL and `WHERE NOT __is_deleted` returned
     // nothing at all (found by dogfooding the batch cycle). The CDC baseline leg
     // sets the same flag from `cdc_job`; this is the batch half of one rule.
+    // `None` for the captured table: a multiplex `tables:` export is CDC, and CDC returned
+    // above — the batch half never has one to answer for.
     let owned_export;
-    let export = if crate::load::plan::resolved_layout(config, export).log_is_disposable()
-        && crate::load::plan::resolved_deleted_flag(config, export)
+    let export = if crate::load::plan::resolved_layout(config, export, None).log_is_disposable()
+        && crate::load::plan::resolved_deleted_flag(config, export, None)
     {
         let mut e = export.clone();
         e.meta_columns.deleted_flag = true;
