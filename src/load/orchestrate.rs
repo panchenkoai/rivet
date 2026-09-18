@@ -851,11 +851,20 @@ fn prepare_load(
 /// [`LoadMode::ledger_str`] is the ledger's `mode` discriminator.
 struct LoadJob<'a> {
     plan: &'a load::plan::LoadPlan,
-    run_id: &'a str,
     state: Option<&'a StateStore>,
     load_id: &'a str,
     allow_source_drift: bool,
     mode: load::plan::LoadMode,
+    /// The warehouse adapter this load drives. Built by the caller rather than inside
+    /// [`execute_load`], which is what lets the envelope — the lease, the skip record, the
+    /// budget gate, the exactly-once ledger row — be asserted offline against a fake.
+    /// Every production caller passes [`load::build_loader`].
+    loader: Box<dyn load::TargetLoader>,
+    /// The object store this load reads its manifests and parts from. Opened by the caller
+    /// for the same reason as `loader`: production passes [`load::open_store`], an offline
+    /// test passes a filesystem-backed store, and the envelope itself needs no test-only
+    /// branch to tell them apart.
+    store: crate::destination::gcs::GcsStore,
 }
 
 /// The audit + skip-ledger writer for one load. A struct (not a bare closure) so
@@ -1045,8 +1054,8 @@ fn execute_load<R>(
     ) -> Result<(u64, R)>,
     done: impl FnOnce(&LoadInputs, &R),
 ) -> Result<Option<R>> {
-    let store = load::open_store(&job.plan.destination)?;
-    let loader = load::build_loader(job.plan, job.run_id);
+    let store = &job.store;
+    let loader = &job.loader;
     let target_fqtn = loader.fqtn(&job.plan.table);
     // One load per table at a time: two concurrent loads both read the ledger
     // before either writes it and append the same runs twice.
@@ -1070,7 +1079,7 @@ fn execute_load<R>(
         active_at_fetch: None,
     };
     let inputs = match prepare_load(
-        &store,
+        store,
         job.plan,
         job.state,
         &target_fqtn,
@@ -1100,8 +1109,8 @@ fn execute_load<R>(
     // The budget measures what lands in the PARTITIONED target only: a
     // disposable buffer takes no partition, so its files are not its business.
     let budgeted = budgeted_uris(job.plan.layout, &inputs.runs, &inputs.uris);
-    let (rows, report) = match load::before_write(partition_budget_ok(&store, job.plan, &budgeted))
-        .and_then(|()| run(&*loader, &store, &inputs, &mut legs))
+    let (rows, report) = match load::before_write(partition_budget_ok(store, job.plan, &budgeted))
+        .and_then(|()| run(&**loader, store, &inputs, &mut legs))
     {
         Ok(v) => v,
         Err(e) => {
@@ -1774,11 +1783,12 @@ fn load_one_cdc(
 ) -> Result<Option<load::CdcLoadReport>> {
     let job = LoadJob {
         plan,
-        run_id,
         state,
         load_id,
         allow_source_drift,
         mode: plan.mode,
+        loader: load::build_loader(plan, run_id),
+        store: load::open_store(&plan.destination)?,
     };
     if plan.layout.compacts() {
         return load_one_cdc_base(job, pk, allow_source_drift, state);
@@ -2016,11 +2026,12 @@ fn load_one_incremental(
     })?;
     let job = LoadJob {
         plan,
-        run_id,
         state,
         load_id,
         allow_source_drift,
         mode: plan.mode,
+        loader: load::build_loader(plan, run_id),
+        store: load::open_store(&plan.destination)?,
     };
     execute_load(
         job,
@@ -2180,11 +2191,12 @@ fn load_one(
     // safe. `state = None` ⇒ the stateless fallback (reconcile + load all).
     let job = LoadJob {
         plan,
-        run_id,
         state,
         load_id,
         allow_source_drift,
         mode: plan.mode,
+        loader: load::build_loader(plan, run_id),
+        store: load::open_store(&plan.destination)?,
     };
     execute_load(
         job,
@@ -2427,6 +2439,94 @@ mod load_ledger_tests {
         assert_eq!(loads[0].rows_loaded, 0);
         assert!(
             s.loaded_source_run_ids(TARGET).unwrap().is_empty(),
+            "an up-to-date no-op consumes no runs"
+        );
+    }
+
+    /// The load ENVELOPE, driven offline for the first time.
+    ///
+    /// `execute_load` used to build its own warehouse adapter, so nothing below the CLI
+    /// could be exercised without credentials — `.cargo/mutants.toml` records the
+    /// measurement: with `run_loads` stubbed to `Ok(())` all twelve live tests matching
+    /// `load` stay GREEN, because not one of them invokes the subcommand. The adapter now
+    /// arrives on the job and a local destination resolves to a real filesystem store, so
+    /// the envelope's invariants are assertable here.
+    ///
+    /// This pins the up-to-date path: an empty prefix reaches no run, records exactly ONE
+    /// ledger row (`success`/0), and consumes nothing — the "every extraction run already
+    /// loaded" exit. RED against dropping `ctx.record_skip()`, which leaves a load that
+    /// silently wrote no audit row at all.
+    #[test]
+    fn the_load_envelope_records_one_skip_row_for_an_empty_prefix() {
+        use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
+        let dir = tempfile::tempdir().expect("a temp prefix");
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = LoadPlan {
+            deleted_flag: false,
+            export_name: "orders".into(),
+            unit: None,
+            table: "orders".into(),
+            partition: None,
+            specs: vec![],
+            // The load addresses its parts by `gs://bucket/key` whatever backs the store:
+            // the fs-backed store is ROOTED at the temp dir and the key half is the path.
+            // Same shape the partition-budget tests use.
+            gcs_prefix: "gs://b/p/".to_string(),
+            destination: crate::config::DestinationConfig {
+                destination_type: crate::config::DestinationType::Local,
+                path: Some(dir.path().display().to_string()),
+                ..Default::default()
+            },
+            load: LoadSection {
+                deleted_flag: None,
+                layout: None,
+                target: LoadTarget::Bigquery {
+                    project: "p".into(),
+                    dataset: "d".into(),
+                },
+                cleanup_source: false,
+                pk: load::plan::KeyColumns::Auto,
+                allow_source_drift: false,
+                gc_orphans: false,
+                cluster_by: load::plan::KeyColumns::Auto,
+                partition: None,
+            },
+            mode: LoadMode::Cdc,
+            cursor_column: None,
+            pk: vec![],
+            clustering: load::plan::Clustering::Auto(vec![]),
+            pinned_run: None,
+            layout: CdcLayout::LogAndView,
+        };
+        let job = LoadJob {
+            plan: &plan,
+            state: Some(&state),
+            load_id: "L1",
+            allow_source_drift: false,
+            mode: LoadMode::Cdc,
+            loader: Box::new(load::tests::fake_loader(0)),
+            store: crate::destination::gcs::GcsStore::open_fs(&dir.path().display().to_string())
+                .expect("a filesystem-backed store"),
+        };
+
+        let out = execute_load(
+            job,
+            |_| {},
+            |_, _, _, _| -> Result<(u64, ())> {
+                panic!("nothing is staged under the prefix — the run closure must not run")
+            },
+            |_, _| {},
+        )
+        .expect("an up-to-date load is not an error");
+        assert!(out.is_none(), "an up-to-date load reports no work");
+
+        // `FakeLoader::fqtn` renders `db.<table>`, which is the name the ledger is keyed on.
+        let loads = state.recent_loads(Some("db.orders"), 10).unwrap();
+        assert_eq!(loads.len(), 1, "exactly one audit row per load, always");
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 0);
+        assert!(
+            state.loaded_source_run_ids("db.orders").unwrap().is_empty(),
             "an up-to-date no-op consumes no runs"
         );
     }

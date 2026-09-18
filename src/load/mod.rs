@@ -1107,14 +1107,14 @@ fn build_bigquery_loader(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
     /// Records every call and returns a canned row count — the seam the driver's
     /// invariants are asserted through, offline.
     #[derive(Default)]
-    struct FakeLoader {
+    pub(crate) struct FakeLoader {
         rows: u64,
         materialized: RefCell<Vec<String>>,
         appended: RefCell<Vec<String>>,
@@ -1255,8 +1255,18 @@ mod tests {
         )
     }
 
-    fn calls(f: &FakeLoader) -> Vec<String> {
+    pub(crate) fn calls(f: &FakeLoader) -> Vec<String> {
         f.calls.borrow().clone()
+    }
+
+    /// A fake for a driver-level test in a SIBLING module (`orchestrate` drives the load
+    /// envelope). The fields stay private — the adapter is reached through this seam, the
+    /// way a test in this module reaches it through the literal.
+    pub(crate) fn fake_loader(rows: u64) -> FakeLoader {
+        FakeLoader {
+            rows,
+            ..Default::default()
+        }
     }
 
     fn changelog_with(drift: ChangelogDrift) -> FakeLoader {
