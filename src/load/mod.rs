@@ -382,6 +382,59 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
     }
 }
 
+/// What `rivet compact` may do with the base it is about to MERGE into.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompactGate {
+    Go,
+    /// Proceed, saying why the check could not be made.
+    Note(String),
+    Refuse(String),
+}
+
+/// Whether the buffer may be merged into `base_fqtn`, from the two facts the
+/// glue can cheaply fetch: what the base currently IS, and whether the ledger
+/// knows rivet loaded it.
+///
+/// The load path checks both before it overwrites a table; compaction wrote
+/// through BigQuery's own error message instead — `Not found: Table ... in
+/// location US` for an absent base, and NOTHING at all for a base rivet never
+/// loaded, which a MERGE would happily rewrite.
+pub(crate) fn compact_gate(
+    base: ObjectKind,
+    ownership: Ownership,
+    base_fqtn: &str,
+    buffer_fqtn: &str,
+) -> CompactGate {
+    match (base, ownership) {
+        (ObjectKind::Absent, _) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the base table does not \
+             exist. The buffer holds changes for a table that was never loaded — load the \
+             backfill first (the `cdc.backfill:` export builds the base), or drop the buffer \
+             to discard this cycle. Nothing was merged and the buffer is untouched"
+        )),
+        (ObjectKind::View, _) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
+             current-state view of the changelog+view layout, which has no base to merge into. \
+             To move to base+buffer, drop the view and `{buffer_fqtn}`; to stay on the view, \
+             remove `cdc.backfill:` from the export"
+        )),
+        (ObjectKind::Other, _) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
+             table nor a view"
+        )),
+        (ObjectKind::Table, Ownership::Foreign) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
+             DB's load ledger has no record of rivet loading it — a MERGE would rewrite someone \
+             else's rows. Drop or rename it, or point the export at another table"
+        )),
+        (ObjectKind::Table, Ownership::Unknown) => CompactGate::Note(format!(
+            "  note: `{base_fqtn}` exists and there is no load ledger to confirm rivet loaded it \
+             — compacting on its shape alone"
+        )),
+        (ObjectKind::Table, Ownership::Own) => CompactGate::Go,
+    }
+}
+
 /// Refuse a whole-table load onto a table that is not rivet's own, differs in shape, or is a view.
 fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Ownership) -> Result<()> {
     let fqtn = loader.fqtn(table);
@@ -2188,5 +2241,60 @@ mod tests {
             f.appended.borrow().is_empty() && f.views.borrow().is_empty(),
             "must bail before appending or building the view"
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_gate_tests {
+    use super::*;
+
+    /// Every shape the base can be in when `rivet compact` reaches it. The two
+    /// silent ones are why this exists: an ABSENT base used to surface as
+    /// BigQuery's `Not found: Table`, and a FOREIGN one was not checked at all —
+    /// the MERGE would have rewritten rows rivet never loaded.
+    #[test]
+    fn the_compact_gate_refuses_every_base_that_is_not_rivets_own_table() {
+        let go = compact_gate(ObjectKind::Table, Ownership::Own, "p.d.t", "p.d.t__changes");
+        assert_eq!(go, CompactGate::Go);
+
+        let unknown = compact_gate(
+            ObjectKind::Table,
+            Ownership::Unknown,
+            "p.d.t",
+            "p.d.t__changes",
+        );
+        let CompactGate::Note(note) = unknown else {
+            panic!("a stateless compact proceeds with a note: {unknown:?}")
+        };
+        assert!(note.contains("no load ledger"), "{note}");
+
+        for (kind, ownership, wanted) in [
+            (
+                ObjectKind::Absent,
+                Ownership::Own,
+                "the base table does not exist",
+            ),
+            (ObjectKind::View, Ownership::Own, "that name is a VIEW"),
+            (
+                ObjectKind::Other,
+                Ownership::Own,
+                "neither a table nor a view",
+            ),
+            (
+                ObjectKind::Table,
+                Ownership::Foreign,
+                "no record of rivet loading it",
+            ),
+        ] {
+            let gate = compact_gate(kind, ownership, "p.d.t", "p.d.t__changes");
+            let CompactGate::Refuse(msg) = gate else {
+                panic!("{kind:?}/{ownership:?} must refuse: {gate:?}")
+            };
+            assert!(msg.contains(wanted), "{kind:?}/{ownership:?}: {msg}");
+            assert!(
+                msg.contains("`p.d.t__changes`") && msg.contains("`p.d.t`"),
+                "the refusal names both tables: {msg}"
+            );
+        }
     }
 }

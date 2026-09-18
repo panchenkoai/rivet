@@ -1257,6 +1257,43 @@ fn compact_skip_reason(
     }
 }
 
+/// The two metadata reads [`load::compact_gate`] decides on, and the note it may
+/// print. Glue: it fetches the facts, the decision itself is the pure predicate.
+fn compact_gate_of(
+    loader: &dyn load::TargetLoader,
+    table: &str,
+    state: Option<&StateStore>,
+) -> Result<()> {
+    let buffer = format!("{table}__changes");
+    if !matches!(loader.object_kind(&buffer)?, load::ObjectKind::Table) {
+        // No buffer: `compact` says that no-op itself, and a missing base is not a
+        // problem when there is nothing to merge into it.
+        return Ok(());
+    }
+    let base_fqtn = loader.fqtn(table);
+    let ownership = match state {
+        Some(s) => match s.has_load_attempt(&base_fqtn) {
+            Ok(true) => load::Ownership::Own,
+            Ok(false) => load::Ownership::Foreign,
+            Err(_) => load::Ownership::Unknown,
+        },
+        None => load::Ownership::Unknown,
+    };
+    match load::compact_gate(
+        loader.object_kind(table)?,
+        ownership,
+        &base_fqtn,
+        &loader.fqtn(&buffer),
+    ) {
+        load::CompactGate::Go => Ok(()),
+        load::CompactGate::Note(note) => {
+            eprintln!("{note}");
+            Ok(())
+        }
+        load::CompactGate::Refuse(msg) => Err(load::refused(msg)),
+    }
+}
+
 /// `rivet compact`: merge every base-and-buffer table's buffer into its base and
 /// drop the buffer. One MERGE per table (per partition window), labelled
 /// `rivet_op:merge`; a table without a buffer is a no-op, said so.
@@ -1296,12 +1333,18 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 held => held.flatten(),
             };
             let pk = require_pk(&pinned, "cdc")?;
-            let report = loader.compact(
-                &pinned.table,
-                &pinned.specs,
-                pk,
-                engine.expect("engine resolved above for a cdc plan"),
-            );
+            // The base is checked BEFORE the MERGE, and only when a buffer exists:
+            // an absent base surfaced as BigQuery's own `Not found: Table`, and a
+            // base rivet never loaded was not checked at all. Metadata, no job.
+            let report = match compact_gate_of(loader.as_ref(), &pinned.table, state.as_ref()) {
+                Err(e) => Err(e),
+                Ok(()) => loader.compact(
+                    &pinned.table,
+                    &pinned.specs,
+                    pk,
+                    engine.expect("engine resolved above for a cdc plan"),
+                ),
+            };
             if let Some(s) = state.as_ref() {
                 let rec = LoadRecord {
                     load_id: load_id.clone(),
@@ -1312,7 +1355,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                     source_run_ids: Vec::new(),
                     source_ident: String::new(),
                     rows_loaded: report.as_ref().map_or(0, |r| r.changes_rows as i64),
-                    status: if report.is_ok() { "success" } else { "failed" }.to_string(),
+                    status: match &report {
+                        Ok(_) => "success".to_string(),
+                        // A refusal is a stop before the write, exactly as on the
+                        // load path — never a `failed` row that makes the target
+                        // look like rivet's own on the next attempt.
+                        Err(e) => ledger_status(e).to_string(),
+                    },
                     finished_at: chrono::Utc::now().to_rfc3339(),
                 };
                 if let Err(e) = s.store_load(&rec) {
@@ -3354,6 +3403,45 @@ mod live_only_decisions {
         assert!(
             id.len() > 8,
             "a pid alone is not a per-invocation id — the microsecond stamp is missing: {id}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_message_tests {
+    use super::*;
+
+    /// The lease refusal names the table AND the remedy: an operator who reads it
+    /// must know which load is blocked and that waiting is the whole fix.
+    #[test]
+    fn the_lease_refusal_names_the_table_and_the_remedy() {
+        let m = lease_busy_message("p.d.orders");
+        assert!(m.contains("`p.d.orders`"), "{m}");
+        assert!(m.contains("another `rivet load`"), "{m}");
+        assert!(m.contains("Wait for it, then retry."), "{m}");
+    }
+
+    /// Both incremental outcomes say what landed where: a whole table names the
+    /// table, a delta names the changelog and the view it feeds, and a cleaned
+    /// source is stated rather than silent.
+    #[test]
+    fn the_incremental_summary_says_what_landed_where() {
+        let table = IncrementalReport::Table(load::LoadReport {
+            rows_loaded: 7,
+            target_table: "p.d.orders".into(),
+            source_cleaned: false,
+        });
+        assert_eq!(table.summary(), "7 rows landed as table p.d.orders");
+        let delta = IncrementalReport::Changelog(load::CdcLoadReport {
+            rows_appended: 3,
+            changes_table: "p.d.orders__changes".into(),
+            target: "p.d.orders".into(),
+            target_kind: load::ChangelogTarget::View,
+            source_cleaned: true,
+        });
+        assert_eq!(
+            delta.summary(),
+            "3 rows appended to p.d.orders__changes | current-state view p.d.orders (source cleaned)"
         );
     }
 }

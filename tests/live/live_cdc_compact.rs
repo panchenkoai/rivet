@@ -382,3 +382,186 @@ fn two_compacts_at_once_admit_one_and_apply_each_change_once() {
     );
     assert!(bq.read_bq_table_type(&changes).is_none());
 }
+
+/// An old table under the name the export wants, which THIS state DB's ledger
+/// has no record of rivet loading: the load refuses before writing anything, and
+/// the stranger's rows stay exactly as they were. The buffer is never created, so
+/// `compact` has nothing to merge into a table that is not ours.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_base_table_rivet_never_loaded_is_refused_before_any_write() {
+    let Some(bq) = BqLive::from_env("compact_foreign") else {
+        return;
+    };
+    let mut scn =
+        CdcScenario::mysql_with("compact_foreign", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+            r.cdc("backfill: auto")
+                .also_batch_export("baseline", t, "full")
+                .dest_gcs_live(&bq.bucket, &bq.prefix)
+                .top_line(&bq.load_line(", pk: [id]"))
+        });
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    let fqtn = format!("{}.{}.{table}", bq.project, bq.dataset);
+    bq.exec(&format!(
+        "CREATE TABLE `{fqtn}` (id INT64, v INT64, note STRING) AS SELECT 1, 1, 'someone else'"
+    ));
+
+    scn.insert(1);
+    scn.settle();
+    scn.rig.run_ok();
+    let out = scn.rig.cli(&["load"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "a foreign base must refuse:\n{said}");
+    assert!(said.contains("no record of rivet loading it"), "{said}");
+    assert_eq!(
+        bq.read_bq_count(&table),
+        "1",
+        "the stranger's row is untouched"
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "no buffer was created for a table we may not write"
+    );
+    assert_eq!(
+        ledger_load_statuses(&scn.rig.config_path(), &fqtn),
+        ["refused"],
+        "a stop before the write, never a `failed` row that would make the target ours"
+    );
+}
+
+/// The base is dropped out from under a live stream (a hand-run DROP, a rebuilt
+/// dataset). The next cycle still buffers its changes, and `compact` REFUSES by
+/// name instead of passing BigQuery's `Not found: Table` through — with the buffer
+/// left whole, so nothing of the cycle is lost.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_missing_base_refuses_the_compaction_and_keeps_the_buffer() {
+    let Some(bq) = BqLive::from_env("compact_nobase") else {
+        return;
+    };
+    let mut scn =
+        CdcScenario::mysql_with("compact_nobase", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+            r.cdc("backfill: auto")
+                .also_batch_export("baseline", t, "full")
+                .dest_gcs_live(&bq.bucket, &bq.prefix)
+                .top_line(&bq.load_line(", pk: [id]"))
+        });
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    let fqtn = format!("{}.{}.{table}", bq.project, bq.dataset);
+
+    scn.insert(1);
+    scn.insert(2);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(base_profile(&bq, &table).0, 2, "the base landed");
+
+    bq.exec(&format!("DROP TABLE `{fqtn}`"));
+    scn.insert(3);
+    scn.update(1);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "2",
+        "the cycle's changes are buffered whatever the base is doing"
+    );
+
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(!ok, "a missing base must refuse the merge:\n{said}");
+    assert!(said.contains("the base table does not exist"), "{said}");
+    assert!(
+        !said.contains("Not found: Table"),
+        "rivet names the cause, it does not pass BigQuery's error through: {said}"
+    );
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "2",
+        "the buffer survives the refusal — the cycle is deferred, not dropped"
+    );
+    assert_eq!(
+        ledger_load_statuses(&scn.rig.config_path(), &fqtn)
+            .last()
+            .map(String::as_str),
+        Some("refused"),
+        "recorded as a stop before the write"
+    );
+}
+
+/// A compaction whose process dies BEFORE its merge job: the buffer must survive
+/// whole, and the next compact applies every change exactly once. The sibling of
+/// the crash-after-merge case — there the script had already dropped the buffer.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_compaction_that_dies_before_its_merge_leaves_the_buffer_whole() {
+    let Some(bq) = BqLive::from_env("compact_precrash") else {
+        return;
+    };
+    let mut scn = CdcScenario::mysql_with(
+        "compact_precrash",
+        "id BIGINT PRIMARY KEY, v INT",
+        |r, t| {
+            r.cdc("backfill: auto")
+                .also_batch_export("baseline", t, "full")
+                .dest_gcs_live(&bq.bucket, &bq.prefix)
+                .top_line(&bq.load_line(", pk: [id]"))
+        },
+    );
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+
+    for id in 1..=3 {
+        scn.insert(id);
+    }
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(base_profile(&bq, &table).0, 3, "the baseline landed");
+
+    scn.update(2);
+    scn.delete(3);
+    scn.insert(4);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(bq.read_bq_count(&changes), "3", "three changes buffered");
+
+    let (ok, said) = compact(&scn.rig, &[("RIVET_TEST_PANIC_AT", "compact_before_merge")]);
+    assert!(!ok, "the injected crash must fail the compact:\n{said}");
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "3",
+        "nothing merged, nothing dropped: the buffer is whole"
+    );
+    assert_eq!(
+        base_profile(&bq, &table).0,
+        3,
+        "the base is exactly as the crash found it"
+    );
+
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("3 change row(s)"), "{said}");
+    let (n, live, gone, unflagged, sum) = base_profile(&bq, &table);
+    assert_eq!(
+        (n, live, gone, unflagged),
+        (4, 3, 1, 0),
+        "one insert, one tombstone, the update in place"
+    );
+    assert_eq!(live, scn.count());
+    assert_eq!(sum, 1 + 2 + 4);
+    assert_eq!(
+        v_of(&bq, &table, 2),
+        Some(99),
+        "applied once, at its latest value"
+    );
+}

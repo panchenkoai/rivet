@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`rivet compact` checks the base before it merges.** A buffer whose base table is
+  ABSENT surfaced as BigQuery's own `Not found: Table … in location US`, and a base
+  this state DB's ledger has no record of rivet loading was not checked at all — a
+  MERGE would have rewritten someone else's rows. Both are now refusals by name,
+  taken from two metadata reads before any job, with the buffer left whole so the
+  cycle is deferred rather than lost; a view under the base's name (the changelog+view
+  layout) and a non-table object are refused the same way. The refusal is recorded
+  `refused` in the load ledger, as a stop before the write, never `failed`.
+
 - **`cdc.backfill: auto | [exports]` — a CDC export's baseline, declared by reference.**
   Instead of `initial: snapshot` (one single-stream full scan per table, no `parallel:`), a
   `mode: cdc` export names the ordinary batch exports that already describe how to read its

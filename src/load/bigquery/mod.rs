@@ -559,6 +559,10 @@ impl TargetLoader for BigQueryLoader {
                 had_buffer: true,
             });
         }
+        // A crash BEFORE any MERGE: the buffer must survive whole, so the next
+        // compact applies every change exactly once (the sibling of
+        // `compact_after_merge`, where the script already dropped it).
+        crate::test_hook::maybe_panic_at("compact_before_merge");
         let key = self.partition.as_ref().map(|p| &p.key);
         // A day-partitioned base (the partner shape, init's default) or an
         // unpartitioned one compacts in ONE scripted job: the buffer's distinct days
