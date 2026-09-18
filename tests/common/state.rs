@@ -121,8 +121,10 @@ impl StateDb {
             .flatten()
     }
 
-    /// The `load_run.status` of every load into `target_table`, oldest first.
-    pub fn load_statuses(&self, target_table: &str) -> Vec<String> {
+    /// The `load_run.status` of every load into `target_table`, oldest first — in
+    /// the SQLite file this handle opened. Tests call [`ledger_load_statuses`],
+    /// which reads the backend the binary actually wrote.
+    fn load_statuses(&self, target_table: &str) -> Vec<String> {
         let mut stmt = self
             .conn
             .prepare("SELECT status FROM load_run WHERE target_table = ?1 ORDER BY finished_at")
@@ -317,5 +319,33 @@ impl StateDb {
             })
             .expect("query export_metrics");
         rows.filter_map(|r| r.ok()).collect()
+    }
+}
+
+/// `load_run.status` for `target_table`, oldest first, from the backend the run
+/// USED: Postgres when `RIVET_STATE_URL` names one (the gate's Postgres pass sets
+/// it for every cell), else the SQLite file beside `cfg`. Reading the SQLite file
+/// under a Postgres pass opens an EMPTY database and panics on the missing table —
+/// two gates lost the `batches:refusal` cell to exactly that.
+pub fn ledger_load_statuses(cfg: &std::path::Path, target_table: &str) -> Vec<String> {
+    let pg = std::env::var("RIVET_STATE_URL")
+        .ok()
+        .filter(|u| u.starts_with("postgres"));
+    match pg {
+        Some(url) => {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_STATE_URL: {e}")
+            });
+            client
+                .query(
+                    "SELECT status FROM load_run WHERE target_table = $1 ORDER BY finished_at",
+                    &[&target_table],
+                )
+                .expect("query load_run")
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect()
+        }
+        None => StateDb::next_to_config(cfg).load_statuses(target_table),
     }
 }

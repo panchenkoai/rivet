@@ -168,9 +168,11 @@ fn a_file_spanning_the_whole_history_is_refused_by_name_before_any_job() {
                 .is_none(),
         "refused BEFORE any job: nothing in the warehouse"
     );
-    let ledger = StateDb::next_to_config(&rig.config_path());
     assert_eq!(
-        ledger.load_statuses(&format!("{}.{}.{table}", bq.project, bq.dataset)),
+        ledger_load_statuses(
+            &rig.config_path(),
+            &format!("{}.{}.{table}", bq.project, bq.dataset)
+        ),
         vec!["refused".to_string()],
         "the ledger records a refusal, never a failure that makes the target rivet's own"
     );

@@ -564,8 +564,10 @@ fn bigquery_load_refuses_a_table_it_did_not_load_on_every_attempt() {
             "attempt {attempt}: nothing adopted"
         );
     }
-    let loads = StateDb::next_to_config(&rig.config_path())
-        .load_statuses(&format!("{}.{}.{table}", bq.project, bq.dataset));
+    let loads = ledger_load_statuses(
+        &rig.config_path(),
+        &format!("{}.{}.{table}", bq.project, bq.dataset),
+    );
     assert_eq!(
         loads,
         ["refused", "refused"],
@@ -1110,8 +1112,10 @@ fn bigquery_incremental_onto_a_table_already_in_the_dataset_is_refused_every_tim
             "attempt {attempt}: nothing adopted"
         );
     }
-    let loads = StateDb::next_to_config(&rig.config_path())
-        .load_statuses(&format!("{}.{}.{table}", bq.project, bq.dataset));
+    let loads = ledger_load_statuses(
+        &rig.config_path(),
+        &format!("{}.{}.{table}", bq.project, bq.dataset),
+    );
     assert_eq!(
         loads,
         ["refused", "refused"],
