@@ -146,7 +146,7 @@ fn track_quality_counts_nulls() {
     let mut sink = minimal_sink_with_quality(vec!["name".into()], vec![]);
     sink.on_schema(schema).unwrap();
     sink.track_quality(&batch);
-    assert_eq!(sink.quality_null_counts.get("name"), Some(&2));
+    assert_eq!(sink.quality.null_counts.get("name"), Some(&2));
 }
 
 #[test]
@@ -162,13 +162,13 @@ fn track_quality_counts_uniques() {
     let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
     sink.on_schema(schema).unwrap();
     sink.track_quality(&batch);
-    assert_eq!(sink.quality_unique_sets.get("id").unwrap().len(), 3);
+    assert_eq!(sink.quality.unique_sets.get("id").unwrap().len(), 3);
 }
 
 #[test]
 fn run_quality_checks_no_config_returns_empty() {
     let sink = ExportSink {
-        quality_columns: None,
+        quality: QualityTracker::default(),
         total_rows: 100,
         ..minimal_sink()
     };
@@ -178,13 +178,14 @@ fn run_quality_checks_no_config_returns_empty() {
 #[test]
 fn run_quality_checks_detects_excess_nulls() {
     let mut sink = minimal_sink_with_quality(vec!["col".into()], vec![]);
-    sink.quality_columns
+    sink.quality
+        .columns
         .as_mut()
         .unwrap()
         .null_ratio_max
         .insert("col".into(), 0.1);
     sink.total_rows = 100;
-    sink.quality_null_counts.insert("col".into(), 50);
+    sink.quality.null_counts.insert("col".into(), 50);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert!(issues[0].message.contains("null ratio"));
@@ -198,8 +199,8 @@ fn run_quality_checks_detects_duplicates() {
     set.insert(0u64);
     set.insert(1u64);
     set.insert(2u64);
-    sink.quality_unique_sets.insert("id".into(), set);
-    sink.quality_unique_non_null_counts.insert("id".into(), 5);
+    sink.quality.unique_sets.insert("id".into(), set);
+    sink.quality.unique_non_null_counts.insert("id".into(), 5);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert!(issues[0].message.contains("duplicate"));
@@ -209,13 +210,13 @@ fn run_quality_checks_detects_duplicates() {
 
 fn sink_with_unique_cap(unique_cols: Vec<String>, cap: usize) -> ExportSink {
     ExportSink {
-        quality_columns: Some(crate::config::QualityConfig {
+        quality: QualityTracker::new(Some(crate::config::QualityConfig {
             row_count_min: None,
             row_count_max: None,
             null_ratio_max: std::collections::HashMap::new(),
             unique_columns: unique_cols,
             unique_max_entries: Some(cap),
-        }),
+        })),
         ..minimal_sink()
     }
 }
@@ -230,16 +231,17 @@ fn unique_cap_stops_inserting_at_limit() {
     )
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch);
     let set_len = sink
-        .quality_unique_sets
+        .quality
+        .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
     assert!(set_len <= 3, "set must not grow past cap; got {set_len}");
     assert!(
-        sink.quality_unique_capped.contains("id"),
+        sink.quality.unique_capped.contains("id"),
         "id must be flagged as capped"
     );
 }
@@ -248,11 +250,11 @@ fn unique_cap_stops_inserting_at_limit() {
 fn unique_cap_emits_warn_issue_not_fail() {
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
     sink.total_rows = 5;
-    sink.quality_unique_capped.insert("id".into());
+    sink.quality.unique_capped.insert("id".into());
     let mut set = std::collections::HashSet::new();
     set.insert(0u64);
     set.insert(1u64);
-    sink.quality_unique_sets.insert("id".into(), set);
+    sink.quality.unique_sets.insert("id".into(), set);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].severity, crate::quality::Severity::Warn);
@@ -277,12 +279,12 @@ fn unique_no_cap_grows_unbounded() {
     sink.on_schema(schema).unwrap();
     sink.track_quality(&batch);
     assert_eq!(
-        sink.quality_unique_sets.get("id").unwrap().len(),
+        sink.quality.unique_sets.get("id").unwrap().len(),
         10,
         "without cap all distinct values must be tracked"
     );
     assert!(
-        sink.quality_unique_capped.is_empty(),
+        sink.quality.unique_capped.is_empty(),
         "no cap → no column should be flagged"
     );
 }
@@ -302,16 +304,18 @@ fn unique_cap_column_skipped_in_subsequent_batches() {
     )
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch1); // cap hit here
     let len_after_first = sink
-        .quality_unique_sets
+        .quality
+        .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
     sink.track_quality(&batch2); // must be a no-op
     let len_after_second = sink
-        .quality_unique_sets
+        .quality
+        .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
@@ -395,13 +399,7 @@ fn minimal_sink() -> ExportSink {
         meta: crate::config::MetaColumns::default(),
         enriched_schema: None,
         exported_at_us: 0,
-        quality_null_counts: std::collections::HashMap::new(),
-        quality_unique_sets: std::collections::HashMap::new(),
-        quality_unique_non_null_counts: std::collections::HashMap::new(),
-        quality_unique_capped: std::collections::HashSet::new(),
-        quality_columns: None,
-        quality_null_indices: Vec::new(),
-        quality_unique_indices: Vec::new(),
+        quality: QualityTracker::default(),
         max_file_size: None,
         completed_parts: Vec::new(),
         strip_internal_column: None,
@@ -427,13 +425,13 @@ fn minimal_sink_with_quality(null_cols: Vec<String>, unique_cols: Vec<String>) -
         null_ratio_max.insert(col.clone(), 0.5);
     }
     ExportSink {
-        quality_columns: Some(crate::config::QualityConfig {
+        quality: QualityTracker::new(Some(crate::config::QualityConfig {
             row_count_min: None,
             row_count_max: None,
             null_ratio_max,
             unique_columns: unique_cols,
             unique_max_entries: None,
-        }),
+        })),
         ..minimal_sink()
     }
 }
@@ -764,7 +762,7 @@ fn row_count_min_fires_when_total_rows_is_zero() {
     // total_rows == 0 early return in single.rs, silently bypassing the gate.
     // The check itself is correct — the bug was in the call site.
     let mut sink = minimal_sink();
-    sink.quality_columns = Some(crate::config::QualityConfig {
+    sink.quality.columns = Some(crate::config::QualityConfig {
         row_count_min: Some(100),
         row_count_max: None,
         null_ratio_max: std::collections::HashMap::new(),
@@ -785,7 +783,7 @@ fn row_count_min_fires_when_total_rows_is_zero() {
 #[test]
 fn row_count_min_passes_when_row_count_meets_threshold() {
     let mut sink = minimal_sink();
-    sink.quality_columns = Some(crate::config::QualityConfig {
+    sink.quality.columns = Some(crate::config::QualityConfig {
         row_count_min: Some(5),
         row_count_max: None,
         null_ratio_max: std::collections::HashMap::new(),
@@ -951,15 +949,15 @@ fn gremlin_unique_cap_exact_boundary_no_false_capped_flag() {
     )
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 5);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&exact_batch);
 
     assert!(
-        !sink.quality_unique_capped.contains("id"),
+        !sink.quality.unique_capped.contains("id"),
         "exactly cap distinct values must NOT set the capped flag"
     );
     assert_eq!(
-        sink.quality_unique_sets.get("id").unwrap().len(),
+        sink.quality.unique_sets.get("id").unwrap().len(),
         5,
         "all 5 distinct values must be tracked"
     );
@@ -970,7 +968,7 @@ fn gremlin_unique_cap_exact_boundary_no_false_capped_flag() {
     sink.track_quality(&overflow_batch);
 
     assert!(
-        sink.quality_unique_capped.contains("id"),
+        sink.quality.unique_capped.contains("id"),
         "cap+1 distinct values must set the capped flag"
     );
 }
@@ -1253,12 +1251,12 @@ fn unique_cap_with_nulls_emits_warn_only_no_false_duplicate_fail() {
     .unwrap();
 
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch);
     sink.total_rows = 5;
 
     assert!(
-        sink.quality_unique_capped.contains("id"),
+        sink.quality.unique_capped.contains("id"),
         "third distinct value past cap=2 must flag the column as capped"
     );
     let issues = sink.run_quality_checks();
@@ -1297,12 +1295,12 @@ fn unique_cap_exact_boundary_trailing_nulls_do_not_trip_cap() {
     .unwrap();
 
     let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch);
     sink.total_rows = 5;
 
     assert!(
-        !sink.quality_unique_capped.contains("id"),
+        !sink.quality.unique_capped.contains("id"),
         "NULL rows after exactly cap distinct values must not trip the cap"
     );
     let issues = sink.run_quality_checks();
