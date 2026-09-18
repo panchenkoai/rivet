@@ -425,7 +425,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         super::super::commit::part_indexed_name(&base, idx, count)
                                     },
                                 )?;
-                                let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+                                let key = sink.checksum_key();
                                 Ok((
                                     sink.total_rows,
                                     recs,

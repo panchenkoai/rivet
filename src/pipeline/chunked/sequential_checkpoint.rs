@@ -115,7 +115,7 @@ fn export_one_chunk_range(
         summary.validated = Some(true);
     }
 
-    let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+    let key = sink.checksum_key();
     let rows = sink.total_rows;
     Ok((rows, recs, std::mem::take(&mut sink.column_checksums), key))
 }

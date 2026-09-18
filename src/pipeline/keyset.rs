@@ -190,7 +190,7 @@ pub(crate) fn read_keyset_page_bounded(
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
     )?;
-    let checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
+    let checksum_key_column = sink.checksum_key();
     Ok(Some(KeysetPage {
         parts,
         rows,

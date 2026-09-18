@@ -177,7 +177,7 @@ pub(crate) fn run_chunked_sequential(
         summary.ledger.contribute_checksums(
             super::super::commit::UnitId::Chunk(i as i64),
             &std::mem::take(&mut sink.column_checksums),
-            sink.checksum_key_col.and(sink.cursor_column.clone()),
+            sink.checksum_key(),
         );
     }
 
@@ -409,7 +409,7 @@ pub(crate) fn run_chunked_parallel(
                         }
                         drop(records);
                         // Form B: hand this chunk's checksums to the parent to XOR-combine.
-                        let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+                        let key = sink.checksum_key();
                         // ADR-0029: tagged with the chunk — the same unit the
                         // parent's `record_part` drain records these parts under.
                         poison::lock_recover(checksums_shared).push((

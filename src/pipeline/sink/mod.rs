@@ -211,11 +211,20 @@ impl ExportSink {
         unit: crate::pipeline::commit::UnitId,
         ledger: &mut crate::pipeline::commit::CommitLedger,
     ) {
-        // Same keying rule the single tail used: the checksums are keyed only
-        // when the key column is present in the dest batch (`checksum_key_col`
-        // is its index there).
-        let key = self.checksum_key_col.and(self.cursor_column.clone());
+        let key = self.checksum_key();
         ledger.contribute_checksums(unit, &std::mem::take(&mut self.column_checksums), key);
+    }
+
+    /// The column this sink's Form-B checksums are keyed to, or `None` when they are
+    /// un-keyed.
+    ///
+    /// Keyed only when the key column survived into the DEST batch — `checksum_key_col` is
+    /// its index there, so its absence means a full export with no cursor, or a
+    /// stripped/synthetic one. Every runner needs this answer when it hands its checksums
+    /// on, and each used to spell it out by reaching into both private fields; one name
+    /// instead of six copies of the rule.
+    pub(in crate::pipeline) fn checksum_key(&self) -> Option<String> {
+        self.checksum_key_col.and(self.cursor_column.clone())
     }
 
     pub fn new(plan: &ResolvedRunPlan) -> Result<Self> {
