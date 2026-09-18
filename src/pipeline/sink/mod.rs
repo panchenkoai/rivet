@@ -633,25 +633,50 @@ impl ExportSink {
         issues
     }
 
-    /// Core batch processing: track quality/shape, enrich, write. Called after memory check.
+    /// Core batch processing: keep the part inside the load's partition budget, then
+    /// track quality/shape, enrich and write. Called after the memory check.
+    ///
+    /// Nothing splits one Parquet file at load time, so a part written past the budget
+    /// cannot be loaded at any granularity the operator wants — the writer is the only
+    /// place that can prevent it. The part is closed BEFORE the rows that would overspend
+    /// it, slicing the batch when the boundary falls inside. A bucket the part already
+    /// holds costs nothing, so a wide batch over a narrow range never rotates.
+    ///
+    /// Iterative, not recursive: the number of rotations one batch needs is data-driven
+    /// (its distinct partitions over the budget) and unbounded, so a frame per rotation
+    /// overflows the stack on a batch that is merely wide — measured, as an abort rather
+    /// than a test failure, which is a far worse way to learn it.
     fn on_batch_inner(&mut self, dest_batch: &RecordBatch) -> Result<()> {
-        // Keep this part inside the load's partition budget. Nothing splits one Parquet
-        // file at load time, so a part written past the budget cannot be loaded at any
-        // granularity the operator wants — the writer is the only place that can prevent
-        // it. Rotate BEFORE the rows that would overspend, slicing the batch when the
-        // boundary falls inside it. A bucket the part already holds costs nothing, so a
-        // wide batch over a narrow range never rotates.
-        if let Some((buckets, cap)) = self.batch_buckets(dest_batch) {
-            let fit = crate::plan::rollover::rows_that_fit(&self.part_buckets, &buckets, cap);
-            if fit < buckets.len() {
-                if fit > 0 {
-                    self.on_batch_inner(&dest_batch.slice(0, fit))?;
-                }
-                self.split_now()?;
-                return self.on_batch_inner(&dest_batch.slice(fit, buckets.len() - fit));
-            }
-            self.part_buckets.extend(buckets);
+        let Some((buckets, cap)) = self.batch_buckets(dest_batch) else {
+            return self.write_batch_part(dest_batch);
+        };
+        if buckets.is_empty() {
+            return self.write_batch_part(dest_batch);
         }
+        let mut offset = 0;
+        while offset < buckets.len() {
+            let fit =
+                crate::plan::rollover::rows_that_fit(&self.part_buckets, &buckets[offset..], cap);
+            if fit == 0 {
+                // The part is full. Closing it frees the whole budget, and `cap` is never
+                // zero here (`rows_that_fit` treats a zero budget as unbudgeted), so the
+                // next pass takes at least one row — the loop cannot spin.
+                self.split_now()?;
+                continue;
+            }
+            self.part_buckets
+                .extend(buckets[offset..offset + fit].iter().copied());
+            self.write_batch_part(&dest_batch.slice(offset, fit))?;
+            offset += fit;
+            if offset < buckets.len() {
+                self.split_now()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write one slice that is known to fit the current part's partition budget.
+    fn write_batch_part(&mut self, dest_batch: &RecordBatch) -> Result<()> {
         self.total_rows += dest_batch.num_rows();
         // Feed the running row count to the progress bar *during* the read, not
         // only when the chunk completes (throttled to ~8/s).

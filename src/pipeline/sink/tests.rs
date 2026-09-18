@@ -462,8 +462,11 @@ fn day_batch(schema: &Arc<Schema>, days: Vec<Option<i32>>) -> RecordBatch {
 /// partition budget cannot be loaded at all. The sink must close the part on the row
 /// that would overspend it, mid-batch, and carry the rest into the next one.
 ///
-/// RED against a sink that only rotates on `max_file_size`: no part is ever completed
-/// and all five days land in one file.
+/// RED-proven against deleting the rotation from `on_batch_inner`: no part is completed
+/// and all five days land in one file. It also caught the shipping bug it was written
+/// for — a rotation that did not clear `part_buckets` re-rotated on the same rows for
+/// ever, which surfaced here as a stack overflow. It does NOT grade distinctness (it
+/// stays green when every row is counted as its own partition); the two tests below do.
 #[test]
 fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
     let (mut sink, schema) = sink_with_partition_budget(3);
@@ -499,7 +502,10 @@ fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
 }
 
 /// The budget counts DISTINCT partitions, not rows: a wide batch that all lands in one
-/// day costs one partition and must never rotate. RED against counting rows.
+/// day costs one partition and must never rotate.
+///
+/// RED-proven against dropping the already-held check in `rows_that_fit`, which makes
+/// every row spend budget: 5,000 rows then demand 5,000 rotations.
 #[test]
 fn a_wide_batch_inside_one_partition_never_rotates() {
     let (mut sink, schema) = sink_with_partition_budget(1);
@@ -517,6 +523,9 @@ fn a_wide_batch_inside_one_partition_never_rotates() {
 
 /// Rows with a NULL key share the warehouse's one NULL partition, so they cost one
 /// bucket between them — not one each, which would rotate on every row.
+///
+/// RED-proven against the same mutant as the test above: with every row spending budget,
+/// three NULLs rotate twice instead of never.
 #[test]
 fn null_keys_cost_a_single_partition() {
     let (mut sink, schema) = sink_with_partition_budget(1);
@@ -531,6 +540,12 @@ fn null_keys_cost_a_single_partition() {
 
 /// An export the load does not partition is sized by `max_file_size` alone — the
 /// counting path must stay off rather than rotate on some default.
+///
+/// This one pins the OFF switch and nothing else: it stays green against every mutant
+/// tried on the budget (the rotation deleted, the distinctness check dropped, the
+/// boundary loosened), because with no partition declared the code under test never
+/// runs. Kept as a guard against a default creeping in, not offered as evidence that
+/// the budget works.
 #[test]
 fn an_unpartitioned_export_is_never_rotated_by_the_budget() {
     let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
