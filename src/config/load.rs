@@ -780,3 +780,32 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod partition_form_tests {
+    use super::*;
+
+    /// The column each `partition:` form keys on. Both the compaction plan and
+    /// `rivet check` resolve the partition column through here, so a wrong name
+    /// prunes the wrong thing — or nothing.
+    #[test]
+    fn a_partition_form_names_the_column_it_keys_on() {
+        let column = PartitionForm::Column {
+            column: "created_at".into(),
+            granularity: Granularity::Day,
+        };
+        assert_eq!(column.column(), Some("created_at"));
+        let range = PartitionForm::Range {
+            column: "bucket".into(),
+            start: 0,
+            end: 1000,
+            interval: 10,
+        };
+        assert_eq!(range.column(), Some("bucket"));
+        assert_eq!(
+            PartitionForm::Ingestion(Granularity::Day).column(),
+            None,
+            "ingestion time is not a source column"
+        );
+    }
+}

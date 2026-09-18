@@ -98,3 +98,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lease_path_tests {
+    use super::*;
+
+    /// Where the SQLite lease sidecar lives: BESIDE the state DB for a real file,
+    /// in the temp dir (per process) only for `:memory:`. Flipping the two gives
+    /// every file-backed store a per-process path, so two rivets sharing one state
+    /// DB would each "hold" the same table's lease.
+    #[test]
+    fn the_lease_sidecar_sits_beside_the_state_db() {
+        let beside = lease_path(
+            std::path::Path::new("/tmp/rivet-x/.rivet_state.db"),
+            "p.d.orders",
+        );
+        assert_eq!(
+            beside,
+            std::path::Path::new("/tmp/rivet-x/.rivet_state.db.lease-p.d.orders")
+        );
+        let mem = lease_path(std::path::Path::new(":memory:"), "p.d.orders");
+        assert!(mem.starts_with(std::env::temp_dir()), "{mem:?}");
+        assert!(
+            mem.to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "an in-memory store leases per process: {mem:?}"
+        );
+    }
+}

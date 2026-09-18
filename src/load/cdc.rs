@@ -1433,3 +1433,88 @@ mod compact_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod compact_column_tests {
+    use super::*;
+    use crate::load::plan::{Granularity, PartitionKey};
+
+    fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
+        CompactProbe {
+            rows,
+            lo: lo.into(),
+            hi: hi.into(),
+            nulls,
+        }
+    }
+
+    /// A YEAR key steps 4,000 x 365 days, so four centuries are ONE window. RED
+    /// against `4000 + 365` (34 windows) and `4000 / 365` (13,000 of them) — the
+    /// arm the day/hour/month cases never reach.
+    #[test]
+    fn a_yearly_key_plans_one_window_for_four_centuries() {
+        let year = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Year,
+        };
+        let specs = vec![
+            meta_spec("id", "INT64"),
+            meta_spec("created_at", "DATETIME"),
+            flag_spec(Warehouse::BigQuery),
+        ];
+        let plans = plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs,
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some(&year),
+            &probe(4, "1600-01-01", "2000-01-01", 0),
+        )
+        .expect("a plan");
+        assert_eq!(plans.len(), 1, "146,098 days at 1,460,000 per window");
+        assert!(
+            plans[0].contains("T.`created_at` >= DATETIME '1600-01-01T00:00:00'")
+                && plans[0].contains("T.`created_at` < DATETIME '2000-01-02T00:00:00'"),
+            "the one window covers the whole span: {}",
+            plans[0]
+        );
+    }
+
+    /// The scripted MERGE carries the DATA columns only. The buffer's `__op` /
+    /// `__pos` / `__seq` are its own bookkeeping, and `__is_deleted` is DECIDED by
+    /// the merge, never copied from a buffer row that has no such column.
+    #[test]
+    fn the_compaction_script_merges_data_columns_only() {
+        let mut specs = meta_column_specs(Warehouse::BigQuery);
+        specs.push(meta_spec("id", "INT64"));
+        specs.push(meta_spec("v", "INT64"));
+        specs.push(flag_spec(Warehouse::BigQuery));
+        let s = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs,
+            &["id".to_string()],
+            SourceEngine::MySql,
+            None,
+        );
+        assert!(
+            s.contains("SET `id` = S.`id`, `v` = S.`v`, `__is_deleted` = FALSE"),
+            "data columns, then the flag the merge sets: {s}"
+        );
+        assert!(
+            s.contains("INSERT (`id`, `v`, `__is_deleted`) VALUES (S.`id`, S.`v`, FALSE)"),
+            "{s}"
+        );
+        for meta in ["__op", "__pos", "__seq"] {
+            assert!(
+                !s.contains(&format!("`{meta}` = S.`{meta}`")),
+                "the buffer's {meta} must not land in the base: {s}"
+            );
+        }
+        assert!(
+            !s.contains("`__is_deleted` = S.`__is_deleted`"),
+            "the flag is the merge's decision, not a copied column: {s}"
+        );
+    }
+}

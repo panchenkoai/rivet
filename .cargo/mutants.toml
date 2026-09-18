@@ -655,6 +655,13 @@ exclude_re = [
     # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
     # filtering and the redacting line are graded (`redact::logger_tests`).
     "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",
+    # `flock(fd, LOCK_EX | LOCK_NB)`: EQUIVALENT, by the constants. The two flags
+    # are disjoint bits (LOCK_EX = 2, LOCK_NB = 4), so `|` and `^` both evaluate to
+    # 6 and NO input can tell them apart. The lock itself is graded: the lease's
+    # own unit test takes it twice in one process, and the live
+    # `two_compacts_at_once_admit_one_and_apply_each_change_once` proves it across
+    # two.
+    "replace \\| with \\^ in StateStore::try_load_lease",
     # `run_cdc_export` (pipeline/cdc_job.rs) is the CDC run's live-only script:
     # a run-status row in the state DB, the anchor + backfill + drain against a
     # real source, manifests in a real destination, the summary card. Every
