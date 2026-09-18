@@ -1316,6 +1316,14 @@
             }
           ]
         },
+        "deleted_flag": {
+          "description": "Whether this table's base carries `__is_deleted`; inherits when absent.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "partition": {
           "description": "This table's partitioning; `none` clears an inherited one.",
           "anyOf": [
@@ -1704,6 +1712,14 @@
               "type": "null"
             }
           ]
+        },
+        "deleted_flag": {
+          "description": "Whether the base carries a `__is_deleted` column. Absent derives it from the\nmode: a CDC stream expresses deletes and gets the flag, a query-based export\ncannot express one and does not — an extra column per row otherwise.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "allow_source_drift": {
           "description": "Load even when a run manifest's source count disagrees with what it extracted\n(source→file drift): warn instead of blocking.",

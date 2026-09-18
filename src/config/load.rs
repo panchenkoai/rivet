@@ -33,6 +33,9 @@ pub struct LoadSection {
     pub partition: Option<PartitionSpec>,
     /// Where the current state lives; `None` = derive it from the export's mode.
     pub layout: Option<LayoutChoice>,
+    /// Whether a base-and-buffer table carries `__is_deleted`; `None` = derive it
+    /// from the export's mode.
+    pub deleted_flag: Option<bool>,
 }
 
 impl JsonSchema for LoadSection {
@@ -84,6 +87,11 @@ struct RawLoadSection {
     /// changelog+view.
     #[serde(default)]
     layout: Option<LayoutChoice>,
+    /// Whether the base carries a `__is_deleted` column. Absent derives it from the
+    /// mode: a CDC stream expresses deletes and gets the flag, a query-based export
+    /// cannot express one and does not — an extra column per row otherwise.
+    #[serde(default)]
+    deleted_flag: Option<bool>,
     /// Load even when a run manifest's source count disagrees with what it extracted
     /// (source→file drift): warn instead of blocking.
     #[serde(default)]
@@ -170,6 +178,7 @@ impl TryFrom<RawLoadSection> for LoadSection {
             cluster_by: r.cluster_by,
             partition: r.partition,
             layout: r.layout,
+            deleted_flag: r.deleted_flag,
         })
     }
 }
@@ -199,6 +208,9 @@ impl LoadSection {
         }
         if let Some(l) = o.layout {
             eff.layout = Some(l);
+        }
+        if let Some(d) = o.deleted_flag {
+            eff.deleted_flag = Some(d);
         }
         eff
     }
@@ -250,6 +262,9 @@ pub struct LoadOverride {
     /// Where this table's current state lives; inherits when absent.
     #[serde(default)]
     pub layout: Option<LayoutChoice>,
+    /// Whether this table's base carries `__is_deleted`; inherits when absent.
+    #[serde(default)]
+    pub deleted_flag: Option<bool>,
     /// This table's partitioning; `none` clears an inherited one.
     #[serde(default, deserialize_with = "partition_override")]
     #[schemars(with = "Option<PartitionSetting>")]

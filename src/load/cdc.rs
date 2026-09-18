@@ -312,6 +312,10 @@ pub fn time_literal(target_type: &str, date: chrono::NaiveDate) -> String {
 /// NULL set, or two windows) lands in exactly ONE job — the one its latest change
 /// belongs to. Ranking inside the filter picked a stale winner per subset and let
 /// the job order decide the row (RED: `a_key_changed_across_the_partition_split…`).
+// The arity IS the statement: two tables, the shared columns, the dedup key, what
+// ranks the winner, the bound, the NULL-key pass, and whether the base carries the
+// delete flag. Bundling them would only move the same seven facts elsewhere.
+#[allow(clippy::too_many_arguments)]
 pub fn compact_merge_sql(
     base_fqtn: &str,
     changes_fqtn: &str,
@@ -320,13 +324,22 @@ pub fn compact_merge_sql(
     order: impl Into<CompactOrder>,
     bound: Option<&RangeBound>,
     nulls_only: Option<&str>,
+    deleted_flag: bool,
 ) -> String {
     let filter = match (bound, nulls_only) {
         (Some(b), _) => MergeFilter::Range(b.clone()),
         (None, Some(c)) => MergeFilter::NullKeys(c.to_string()),
         (None, None) => MergeFilter::All,
     };
-    compact_merge_filtered_sql(base_fqtn, changes_fqtn, columns, pk, &order.into(), &filter)
+    compact_merge_filtered_sql(
+        base_fqtn,
+        changes_fqtn,
+        columns,
+        pk,
+        &order.into(),
+        &filter,
+        deleted_flag,
+    )
 }
 
 /// Which of the buffer's WINNERS one MERGE takes, and the matching constant
@@ -380,6 +393,7 @@ pub fn compact_merge_filtered_sql(
     pk: &[&str],
     order: &CompactOrder,
     filter: &MergeFilter,
+    deleted_flag: bool,
 ) -> String {
     let wh = Warehouse::BigQuery;
     let partition = quote_partition(wh, pk);
@@ -395,24 +409,35 @@ pub fn compact_merge_filtered_sql(
         MergeFilter::NullKeys(_) => String::new(),
         other => other.predicate("T"),
     };
+    let flag = |rendered: String| deleted_flag.then_some(rendered);
     let set = columns
         .iter()
         .map(|c| format!("`{c}` = S.`{c}`"))
-        .chain(std::iter::once(format!("`{DELETE_FLAG_COLUMN}` = FALSE")))
+        .chain(flag(format!("`{DELETE_FLAG_COLUMN}` = FALSE")))
         .collect::<Vec<_>>()
         .join(", ");
     let insert_cols = columns
         .iter()
         .map(|c| format!("`{c}`"))
-        .chain(std::iter::once(format!("`{DELETE_FLAG_COLUMN}`")))
+        .chain(flag(format!("`{DELETE_FLAG_COLUMN}`")))
         .collect::<Vec<_>>()
         .join(", ");
     let insert_vals = columns
         .iter()
         .map(|c| format!("S.`{c}`"))
-        .chain(std::iter::once("FALSE".to_string()))
+        .chain(flag("FALSE".to_string()))
         .collect::<Vec<_>>()
         .join(", ");
+    // Without the flag column there is no tombstone to write: a query-based
+    // export cannot express a delete, and naming the column would break a MERGE
+    // into a base that does not have it.
+    let tombstone = if deleted_flag {
+        format!(
+            "WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "MERGE `{base_fqtn}` AS T\n\
          USING (\n\
@@ -422,8 +447,7 @@ pub fn compact_merge_filtered_sql(
          \x20 ) WHERE __rn = 1{source_filter}\n\
          ) AS S\n\
          ON {on_keys}{on_bound}\n\
-         WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n\
-         WHEN MATCHED THEN UPDATE SET {set}\n\
+         {tombstone}WHEN MATCHED THEN UPDATE SET {set}\n\
          WHEN NOT MATCHED AND COALESCE(S.__op, '') != 'delete' THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
     )
 }
@@ -929,6 +953,7 @@ pub fn plan_compact_merges(
         .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
         .collect();
     let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    let deleted_flag = specs.iter().any(|s| s.column_name == DELETE_FLAG_COLUMN);
     let merge = |bound: Option<&RangeBound>, nulls_only: Option<&str>| {
         compact_merge_sql(
             base,
@@ -938,6 +963,7 @@ pub fn plan_compact_merges(
             order.clone(),
             bound,
             nulls_only,
+            deleted_flag,
         )
     };
     let part_col = key.and_then(PartitionKey::column);
@@ -1033,8 +1059,17 @@ pub fn compact_script_sql(
         .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
         .collect();
     let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    let deleted_flag = specs.iter().any(|s| s.column_name == DELETE_FLAG_COLUMN);
     let merge = |filter: &MergeFilter| {
-        compact_merge_filtered_sql(base_fqtn, changes_fqtn, &columns, &pk_refs, &order, filter)
+        compact_merge_filtered_sql(
+            base_fqtn,
+            changes_fqtn,
+            &columns,
+            &pk_refs,
+            &order,
+            filter,
+            deleted_flag,
+        )
     };
     let Some(col) = day_column else {
         return format!(
@@ -1360,6 +1395,7 @@ mod compact_tests {
             SourceEngine::MySql,
             Some(&bound("DATE '2000-01-01'", "DATE '2010-12-14'")),
             None,
+            true,
         );
         assert!(sql.starts_with("MERGE `p.d.orders` AS T"), "{sql}");
         assert!(sql.contains("PARTITION BY `id` ORDER BY"), "{sql}");
@@ -1408,6 +1444,7 @@ mod compact_tests {
             SourceEngine::Postgres,
             None,
             Some("created_at"),
+            true,
         );
         assert!(
             sql.contains("WHERE __rn = 1 AND `created_at` IS NULL"),
@@ -1588,6 +1625,54 @@ mod compact_order_tests {
         assert_eq!(
             CompactOrder::from(SourceEngine::MySql).order_by(Warehouse::BigQuery),
             cdc
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_flag_tests {
+    use super::*;
+
+    /// A query-based export cannot express a DELETE, so its base need not carry
+    /// `__is_deleted` — an extra column per row on the warehouse side. With the
+    /// column absent the MERGE must not name it ANYWHERE: not in the SET list, not
+    /// among the inserted columns, and not as a tombstone arm, or it would fail
+    /// against a base that does not have it.
+    #[test]
+    fn a_base_without_the_delete_flag_merges_without_naming_it() {
+        let data = vec![meta_spec("id", "INT64"), meta_spec("v", "INT64")];
+        let mut flagged = data.clone();
+        flagged.push(flag_spec(Warehouse::BigQuery));
+        let build = |specs: &[TargetColumnSpec]| {
+            compact_script_sql(
+                "p.d.t",
+                "p.d.t__changes",
+                specs,
+                &["id".to_string()],
+                SourceEngine::MySql,
+                None,
+            )
+        };
+
+        let with = build(&flagged);
+        assert!(
+            with.contains("`__is_deleted` = FALSE") && with.contains("`__is_deleted` = TRUE"),
+            "a stream's base keeps the flag and its tombstone arm: {with}"
+        );
+
+        let without = build(&data);
+        assert!(
+            !without.contains("__is_deleted"),
+            "the column is named nowhere when the base has none: {without}"
+        );
+        assert!(
+            !without.contains("WHEN MATCHED AND S.__op = 'delete'"),
+            "no flag, no tombstone to write: {without}"
+        );
+        assert!(
+            without.contains("WHEN MATCHED THEN UPDATE SET `id` = S.`id`, `v` = S.`v`\n")
+                && without.contains("INSERT (`id`, `v`) VALUES (S.`id`, S.`v`)"),
+            "the data columns still upsert: {without}"
         );
     }
 }

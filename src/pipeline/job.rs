@@ -1484,7 +1484,9 @@ fn run_export_job_inner(
     // nothing at all (found by dogfooding the batch cycle). The CDC baseline leg
     // sets the same flag from `cdc_job`; this is the batch half of one rule.
     let owned_export;
-    let export = if crate::load::plan::resolved_layout(config, export).log_is_disposable() {
+    let export = if crate::load::plan::resolved_layout(config, export).log_is_disposable()
+        && crate::load::plan::resolved_deleted_flag(config, export)
+    {
         let mut e = export.clone();
         e.meta_columns.deleted_flag = true;
         owned_export = e;

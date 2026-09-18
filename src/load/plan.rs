@@ -256,6 +256,10 @@ pub struct LoadPlan {
     /// Where a CDC table's baseline lives (see [`CdcLayout`]); `LogAndView` for
     /// every non-CDC mode.
     pub layout: CdcLayout,
+    /// Whether the base carries `__is_deleted`. A stream expresses deletes, so it
+    /// defaults ON there and OFF for a query-based export; `load.deleted_flag`
+    /// decides when written.
+    pub deleted_flag: bool,
 }
 
 /// The clustering columns of the table a load writes, and where they came from: a
@@ -418,6 +422,23 @@ pub fn load_mode_of(mode: crate::config::ExportMode) -> LoadMode {
 /// section's `layout:` with the export's own block layered over it. The EXTRACT
 /// asks too: a base-and-buffer table's rows carry the delete flag as data, and
 /// only the writer can put it in the file.
+/// Whether THIS export's base carries the delete flag, from the config alone —
+/// the extract asks, because only the writer can put a constant column in the file.
+pub fn resolved_deleted_flag(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+) -> bool {
+    config
+        .load
+        .as_ref()
+        .map(|l| match &export.load {
+            Some(o) => l.with_override(o),
+            None => l.clone(),
+        })
+        .and_then(|eff| eff.deleted_flag)
+        .unwrap_or(matches!(load_mode_of(export.mode), LoadMode::Cdc))
+}
+
 pub fn resolved_layout(
     config: &crate::config::Config,
     export: &crate::config::ExportConfig,
@@ -699,6 +720,11 @@ fn build_plans_keyed(
             gcs_prefix,
             destination: export.destination.clone(),
             layout: cdc_layout(export, mode, eff_load.layout),
+            // A CDC stream can express a delete, a query cannot — so the flag is a
+            // column a batch base does not pay for unless its operator asks.
+            deleted_flag: eff_load
+                .deleted_flag
+                .unwrap_or(matches!(mode, LoadMode::Cdc)),
             load: eff_load,
             mode,
             cursor_column: export.cursor_column.clone(),
@@ -2409,6 +2435,42 @@ load:
             resolved_layout(&full, &full.exports[0]),
             CdcLayout::LogAndView,
             "a full load overwrites its table; the key means nothing there"
+        );
+    }
+
+    /// Whether the base carries `__is_deleted`. A stream expresses deletes, so it
+    /// defaults ON there; a query-based export cannot, so it defaults OFF and does
+    /// not pay for the column. Written, the key decides either way.
+    #[test]
+    fn the_delete_flag_defaults_on_for_a_stream_and_off_for_a_query() {
+        let cfg = |load: &str, mode: &str| {
+            let yaml = format!(
+                "source:\n  type: mysql\n  url_env: DB_URL\nexports:\n  - name: t\n    \
+                 table: t\n    mode: {mode}\n    cursor_column: updated_at\n    \
+                 format: parquet\n    destination: {{ type: local, path: /tmp/t }}\n\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n{load}"
+            );
+            serde_yaml_ng::from_str::<crate::config::Config>(&yaml).expect("a config")
+        };
+        let q = cfg("", "incremental");
+        assert!(
+            !resolved_deleted_flag(&q, &q.exports[0]),
+            "a query cannot express a delete — no column by default"
+        );
+        let s = cfg("", "cdc");
+        assert!(
+            resolved_deleted_flag(&s, &s.exports[0]),
+            "a stream can, and its base keeps the flag"
+        );
+        let asked = cfg("  deleted_flag: true\n", "incremental");
+        assert!(
+            resolved_deleted_flag(&asked, &asked.exports[0]),
+            "written, the key decides"
+        );
+        let refused = cfg("  deleted_flag: false\n", "cdc");
+        assert!(
+            !resolved_deleted_flag(&refused, &refused.exports[0]),
+            "and it decides against a stream too"
         );
     }
 

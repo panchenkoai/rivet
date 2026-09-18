@@ -1156,7 +1156,9 @@ fn load_one_cdc_base(
                 let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
                 let mut specs = plan.specs.clone();
-                specs.push(load::cdc::flag_spec(loader.warehouse()));
+                if plan.deleted_flag {
+                    specs.push(load::cdc::flag_spec(loader.warehouse()));
+                }
                 let r = load::run_load(
                     loader,
                     &plan.table,
@@ -2090,7 +2092,7 @@ fn load_one_incremental(
                 // the buffer's tombstones flip it, and the column must exist from
                 // the first pass or the MERGE has nothing to set.
                 let mut base_specs = plan.specs.clone();
-                if base_and_buffer {
+                if base_and_buffer && plan.deleted_flag {
                     base_specs.push(load::cdc::flag_spec(loader.warehouse()));
                 }
                 let r = load::run_load(
@@ -2259,6 +2261,7 @@ mod load_ledger_tests {
         // (`export content_items` for an export named `c1`).
         use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
         let plan = LoadPlan {
+            deleted_flag: false,
             export_name: "c1".into(),
             unit: None,
             table: "content_items".into(),
@@ -2267,6 +2270,7 @@ mod load_ledger_tests {
             gcs_prefix: String::new(),
             destination: crate::config::DestinationConfig::default(),
             load: LoadSection {
+                deleted_flag: None,
                 layout: None,
                 target: LoadTarget::Bigquery {
                     project: "p".into(),
@@ -2734,6 +2738,7 @@ mod live_only_decisions {
     /// A resolved plan, so a test can vary the ONE field it is about.
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         LoadPlan {
+            deleted_flag: false,
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),
@@ -2742,6 +2747,7 @@ mod live_only_decisions {
             gcs_prefix: gcs_prefix.into(),
             destination: crate::config::DestinationConfig::default(),
             load: LoadSection {
+                deleted_flag: None,
                 layout: None,
                 target: LoadTarget::Bigquery {
                     project: "p".into(),
