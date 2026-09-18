@@ -114,6 +114,17 @@ pub struct ResolvedRunPlan {
     /// synthesized by the pool, never a released artifact).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_window: Option<crate::manifest::SplitWindow>,
+    /// The warehouse partition this export's rows will land in, when the load declares
+    /// one on a column. The sink counts the distinct partitions the current part would
+    /// touch and starts a new part before a load job's budget is spent — nothing splits
+    /// one Parquet file at load time, so a part written past the budget cannot be loaded
+    /// at all. `None` leaves part sizing to `max_file_size_bytes` alone.
+    ///
+    /// `serde(default)` + `skip_serializing_if`: an unpartitioned plan serializes
+    /// byte-identically to before this field existed, so `plan.json` artifacts written by
+    /// older versions still load and their integrity hash is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_rollover: Option<crate::plan::rollover::PartitionRollover>,
     pub strategy: ExtractionStrategy,
     pub format: FormatType,
     pub compression: CompressionType,

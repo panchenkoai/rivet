@@ -439,6 +439,25 @@ pub fn resolved_deleted_flag(
         .unwrap_or(matches!(load_mode_of(export.mode), LoadMode::Cdc))
 }
 
+/// This export's effective warehouse partition, from the config alone — the section's
+/// `partition:` with the export's own block layered over it. The EXTRACT asks, because
+/// nothing splits one Parquet file at load time: only the writer can keep a part inside
+/// a load job's partition budget. A multiplex `tables:` CDC export partitions per
+/// captured table, so this answers for the export-level block only.
+pub fn resolved_partition(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+) -> Option<PartitionSpec> {
+    config
+        .load
+        .as_ref()
+        .map(|l| match &export.load {
+            Some(o) => l.with_override(o),
+            None => l.clone(),
+        })
+        .and_then(|eff| eff.partition)
+}
+
 pub fn resolved_layout(
     config: &crate::config::Config,
     export: &crate::config::ExportConfig,

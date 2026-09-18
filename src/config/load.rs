@@ -340,7 +340,7 @@ impl JsonSchema for KeyColumns {
 }
 
 /// A partition granularity: `hour`, `day`, `month` or `year`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Granularity {
     Hour,

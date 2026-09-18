@@ -140,6 +140,23 @@ pub fn build_plan(
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),
+        // Nothing splits one Parquet file at load time, so the writer is the only place
+        // that can keep a part inside a load job's partition budget. Only a COLUMN
+        // partition can be counted while writing: ingestion time is one partition by
+        // construction, and a range key buckets integers this path does not resolve.
+        partition_rollover: crate::load::plan::resolved_partition(config, export).and_then(
+            |spec| match spec.form {
+                crate::config::load::PartitionForm::Column {
+                    column,
+                    granularity,
+                } => Some(crate::plan::rollover::PartitionRollover {
+                    column,
+                    granularity,
+                    cap: crate::load::partition_budget::MAX_PARTITIONS_PER_JOB as usize,
+                }),
+                _ => None,
+            },
+        ),
         // The LABEL, where the two differ. `plan.source_table` has exactly one
         // consumer — the manifest's recorded identity in `finalize` — and the two
         // legs of one `initial: snapshot` export must record the SAME source or

@@ -1417,7 +1417,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "range": {
           "description": "Integer-range partitioning of an INT64 column.",
@@ -1439,7 +1440,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "expiration_days": {
           "description": "`partition_expiration_days`.",

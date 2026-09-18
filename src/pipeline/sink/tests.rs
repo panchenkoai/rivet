@@ -415,6 +415,9 @@ fn minimal_sink() -> ExportSink {
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_col: None,
         row_progress: None,
+        partition_rollover: None,
+        partition_col: None,
+        part_buckets: std::collections::HashSet::new(),
     }
 }
 
@@ -433,6 +436,113 @@ fn minimal_sink_with_quality(null_cols: Vec<String>, unique_cols: Vec<String>) -
         }),
         ..minimal_sink()
     }
+}
+
+// ── partition budget rollover ────────────────────────────────────────────
+
+/// A sink budgeted to `cap` partitions of a `Date32` column named `d`.
+fn sink_with_partition_budget(cap: usize) -> (ExportSink, Arc<Schema>) {
+    let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+    let sink = ExportSink {
+        partition_rollover: Some(crate::plan::rollover::PartitionRollover {
+            column: "d".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap,
+        }),
+        ..minimal_sink()
+    };
+    (sink, schema)
+}
+
+fn day_batch(schema: &Arc<Schema>, days: Vec<Option<i32>>) -> RecordBatch {
+    RecordBatch::try_new(schema.clone(), vec![Arc::new(Date32Array::from(days))]).unwrap()
+}
+
+/// Nothing splits one Parquet file at load time, so a part that outgrows the load job's
+/// partition budget cannot be loaded at all. The sink must close the part on the row
+/// that would overspend it, mid-batch, and carry the rest into the next one.
+///
+/// RED against a sink that only rotates on `max_file_size`: no part is ever completed
+/// and all five days land in one file.
+#[test]
+fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
+    let (mut sink, schema) = sink_with_partition_budget(3);
+    sink.on_schema(schema.clone()).unwrap();
+    assert!(
+        sink.partition_col.is_some(),
+        "the fixture must resolve the partition column, or it grades nothing"
+    );
+
+    // Five distinct days against a budget of three: days 0,1,2 fill the first part and
+    // day 3 opens the second.
+    sink.on_batch_inner(&day_batch(
+        &schema,
+        vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        sink.completed_parts.len(),
+        1,
+        "the part must be closed before the fourth partition is written"
+    );
+    assert_eq!(
+        sink.completed_parts[0].rows, 3,
+        "the closed part holds exactly the rows that fit its budget"
+    );
+    assert_eq!(
+        sink.part_buckets.len(),
+        2,
+        "the open part carries the remaining two days"
+    );
+    assert_eq!(sink.total_rows, 5, "no row is dropped by the rotation");
+}
+
+/// The budget counts DISTINCT partitions, not rows: a wide batch that all lands in one
+/// day costs one partition and must never rotate. RED against counting rows.
+#[test]
+fn a_wide_batch_inside_one_partition_never_rotates() {
+    let (mut sink, schema) = sink_with_partition_budget(1);
+    sink.on_schema(schema.clone()).unwrap();
+
+    sink.on_batch_inner(&day_batch(&schema, vec![Some(7); 5_000]))
+        .unwrap();
+
+    assert!(
+        sink.completed_parts.is_empty(),
+        "one partition, whatever the row count — nothing to rotate"
+    );
+    assert_eq!(sink.total_rows, 5_000);
+}
+
+/// Rows with a NULL key share the warehouse's one NULL partition, so they cost one
+/// bucket between them — not one each, which would rotate on every row.
+#[test]
+fn null_keys_cost_a_single_partition() {
+    let (mut sink, schema) = sink_with_partition_budget(1);
+    sink.on_schema(schema.clone()).unwrap();
+
+    sink.on_batch_inner(&day_batch(&schema, vec![None, None, None]))
+        .unwrap();
+
+    assert!(sink.completed_parts.is_empty(), "one NULL partition in all");
+    assert_eq!(sink.total_rows, 3);
+}
+
+/// An export the load does not partition is sized by `max_file_size` alone — the
+/// counting path must stay off rather than rotate on some default.
+#[test]
+fn an_unpartitioned_export_is_never_rotated_by_the_budget() {
+    let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+    let mut sink = minimal_sink();
+    sink.on_schema(schema.clone()).unwrap();
+    assert!(sink.partition_col.is_none());
+
+    sink.on_batch_inner(&day_batch(&schema, (0..500).map(Some).collect()))
+        .unwrap();
+
+    assert!(sink.completed_parts.is_empty());
+    assert_eq!(sink.total_rows, 500);
 }
 
 // ── batch memory cap ─────────────────────────────────────────────────────

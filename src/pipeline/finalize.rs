@@ -1311,6 +1311,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             export_name: "public.orders".into(),
+            partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
             is_split_unit: false,

@@ -20,6 +20,7 @@ use crate::config::IncrementalCursorMode;
 use crate::enrich;
 use crate::error::Result;
 use crate::format::{self, FormatWriter};
+use crate::plan::rollover::PartitionUnit;
 use crate::plan::{
     CompressionType, ExtractionStrategy, FormatType, IncrementalCursorPlan, MetaColumns,
     ResolvedRunPlan,
@@ -114,6 +115,61 @@ pub(crate) struct ExportSink {
     /// Per-batch row-progress feed (chunked exports). `None` for paths that
     /// don't drive a progress bar.
     pub(in crate::pipeline) row_progress: Option<RowProgress>,
+    /// The warehouse partition budget this part is kept inside, when the load declares a
+    /// column partition. `None` leaves part sizing to `max_file_size` alone.
+    pub(in crate::pipeline) partition_rollover: Option<crate::plan::rollover::PartitionRollover>,
+    /// The partition column's index in the DEST batch and the unit its Arrow type stores,
+    /// resolved in `on_schema`. `None` when the export does not carry that column.
+    pub(in crate::pipeline) partition_col: Option<(usize, PartitionUnit)>,
+    /// Distinct partitions the CURRENT part already holds — the budget spent so far.
+    /// Cleared on every rotation, because the budget is per load job, hence per file.
+    pub(in crate::pipeline) part_buckets: std::collections::HashSet<i64>,
+}
+
+/// The unit an Arrow date/timestamp type stores, or `None` for a type no warehouse
+/// partitions by — the signal `on_schema` turns into a warning rather than silence.
+fn partition_unit_of(data_type: &arrow::datatypes::DataType) -> Option<PartitionUnit> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    match data_type {
+        DataType::Date32 => Some(PartitionUnit::Days),
+        DataType::Date64 => Some(PartitionUnit::Millis),
+        DataType::Timestamp(TimeUnit::Second, _) => Some(PartitionUnit::Seconds),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(PartitionUnit::Millis),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Some(PartitionUnit::Micros),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(PartitionUnit::Nanos),
+        _ => None,
+    }
+}
+
+/// The partition column's raw stored values, widened to `i64`. `None` when the array is
+/// not one of the date/timestamp arrays `partition_unit_of` admits.
+fn partition_values(col: &dyn arrow::array::Array) -> Option<Vec<i64>> {
+    use arrow::array::{
+        Date32Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    let any = col.as_any();
+    if let Some(a) = any.downcast_ref::<Date32Array>() {
+        return Some(a.values().iter().map(|v| i64::from(*v)).collect());
+    }
+    any.downcast_ref::<Date64Array>()
+        .map(|a| a.values().to_vec())
+        .or_else(|| {
+            any.downcast_ref::<TimestampSecondArray>()
+                .map(|a| a.values().to_vec())
+        })
+        .or_else(|| {
+            any.downcast_ref::<TimestampMillisecondArray>()
+                .map(|a| a.values().to_vec())
+        })
+        .or_else(|| {
+            any.downcast_ref::<TimestampMicrosecondArray>()
+                .map(|a| a.values().to_vec())
+        })
+        .or_else(|| {
+            any.downcast_ref::<TimestampNanosecondArray>()
+                .map(|a| a.values().to_vec())
+        })
 }
 
 /// Per-batch progress feed for chunked exports: ticks the export's shared
@@ -216,6 +272,9 @@ impl ExportSink {
             column_checksums: std::collections::BTreeMap::new(),
             checksum_key_col: None,
             row_progress: None,
+            partition_rollover: plan.partition_rollover.clone(),
+            partition_col: None,
+            part_buckets: std::collections::HashSet::new(),
         })
     }
 
@@ -264,7 +323,12 @@ impl ExportSink {
         if written < max || self.part_rows == 0 {
             return Ok(());
         }
+        self.split_now()
+    }
 
+    /// Close the current part and open the next one, whatever asked for it — the byte
+    /// cap or the partition budget.
+    pub(in crate::pipeline) fn split_now(&mut self) -> Result<()> {
         if let Some(w) = self.writer.take() {
             w.finish()?;
         }
@@ -275,6 +339,12 @@ impl ExportSink {
             rows: self.part_rows,
         });
         self.part_rows = 0;
+        // The partition budget is per load job, hence per FILE: the new part starts with
+        // its whole budget. Carrying the closed part's partitions over leaves the rows
+        // that forced this rotation still not fitting, which rotates again on the same
+        // rows and never terminates (caught as a stack overflow by
+        // `a_batch_past_the_partition_budget_closes_the_part_mid_batch`).
+        self.part_buckets.clear();
 
         if let Some(schema) = &self.enriched_schema {
             let fmt = format::create_format(
@@ -293,6 +363,28 @@ impl ExportSink {
             self.completed_parts.len() + 1
         );
         Ok(())
+    }
+
+    /// The partition bucket of every row of `batch`, with the budget they are counted
+    /// against. `None` when this export is not budgeted (no column partition, or the
+    /// column is absent / not a date) — the caller then writes the batch unchanged.
+    fn batch_buckets(&self, batch: &RecordBatch) -> Option<(Vec<i64>, usize)> {
+        use crate::plan::rollover::{NULL_BUCKET, bucket_of, to_epoch_seconds};
+        let (idx, unit) = self.partition_col?;
+        let granularity = self.partition_rollover.as_ref()?.granularity;
+        let cap = self.partition_rollover.as_ref()?.cap;
+        let col = batch.column(idx);
+        let raw = partition_values(col.as_ref())?;
+        let buckets = (0..batch.num_rows())
+            .map(|row| {
+                if col.is_null(row) {
+                    NULL_BUCKET
+                } else {
+                    bucket_of(to_epoch_seconds(raw[row], unit), granularity)
+                }
+            })
+            .collect();
+        Some((buckets, cap))
     }
 
     pub fn track_quality(&mut self, batch: &RecordBatch) {
@@ -543,6 +635,23 @@ impl ExportSink {
 
     /// Core batch processing: track quality/shape, enrich, write. Called after memory check.
     fn on_batch_inner(&mut self, dest_batch: &RecordBatch) -> Result<()> {
+        // Keep this part inside the load's partition budget. Nothing splits one Parquet
+        // file at load time, so a part written past the budget cannot be loaded at any
+        // granularity the operator wants — the writer is the only place that can prevent
+        // it. Rotate BEFORE the rows that would overspend, slicing the batch when the
+        // boundary falls inside it. A bucket the part already holds costs nothing, so a
+        // wide batch over a narrow range never rotates.
+        if let Some((buckets, cap)) = self.batch_buckets(dest_batch) {
+            let fit = crate::plan::rollover::rows_that_fit(&self.part_buckets, &buckets, cap);
+            if fit < buckets.len() {
+                if fit > 0 {
+                    self.on_batch_inner(&dest_batch.slice(0, fit))?;
+                }
+                self.split_now()?;
+                return self.on_batch_inner(&dest_batch.slice(fit, buckets.len() - fit));
+            }
+            self.part_buckets.extend(buckets);
+        }
         self.total_rows += dest_batch.num_rows();
         // Feed the running row count to the progress bar *during* the read, not
         // only when the chunk completes (throttled to ~8/s).
@@ -747,6 +856,34 @@ impl BatchSink for ExportSink {
             .cursor_column
             .as_ref()
             .and_then(|c| dest_schema.index_of(c).ok());
+        // The partition column each part is budgeted against. Both failures WARN rather
+        // than disable quietly (#6/#29): an uncounted part is one the warehouse may
+        // refuse to load outright, and that must not first be discovered at load time.
+        self.partition_col = None;
+        if let Some(r) = self.partition_rollover.clone() {
+            match dest_schema.field_with_name(&r.column) {
+                Ok(field) => match partition_unit_of(field.data_type()) {
+                    Some(unit) => {
+                        self.partition_col =
+                            dest_schema.index_of(&r.column).ok().map(|i| (i, unit));
+                    }
+                    None => log::warn!(
+                        "the load partitions by `{}`, which this export writes as {} — not a \
+                         date or timestamp, so parts cannot be kept within the {}-partition \
+                         load budget and a wide history will be refused at load time",
+                        r.column,
+                        field.data_type(),
+                        r.cap
+                    ),
+                },
+                Err(_) => log::warn!(
+                    "the load partitions by `{}`, which this export does not produce — parts \
+                     cannot be kept within the {}-partition load budget",
+                    r.column,
+                    r.cap
+                ),
+            }
+        }
         // Coverage is visible, not silent: warn once per export about any column the
         // value checksum does NOT cover (UUID / List / Decimal256 / ns-timestamp),
         // so its 0 contribution can't read as "verified".
