@@ -158,10 +158,7 @@ impl TableInfo {
             .collect();
         ts.iter()
             .find(|c| c.name == "created_at" || c.name == "made_at" || c.name == "occurred_at")
-            .or_else(|| {
-                ts.iter()
-                    .find(|c| c.name != "updated_at" && c.name != "modified_at")
-            })
+            .or_else(|| ts.iter().find(|c| !is_mutation_stamp(&c.name)))
             .or_else(|| ts.first())
             .map(|c| c.name.as_str())
     }
@@ -174,7 +171,7 @@ impl TableInfo {
             .collect();
         ts_cols
             .iter()
-            .find(|c| c.name == "updated_at" || c.name == "modified_at")
+            .find(|c| is_mutation_stamp(&c.name))
             .or_else(|| ts_cols.iter().find(|c| c.name == "created_at"))
             .or_else(|| ts_cols.first())
             .map(|c| c.name.as_str())
@@ -382,6 +379,28 @@ fn is_integer_type(t: &str) -> bool {
 fn is_timestamp_type(t: &str) -> bool {
     let t = t.to_lowercase();
     t.contains("timestamp") || t == "datetime" || t == "date"
+}
+
+/// Whether the column name means "this stamp moves when the row CHANGES". The
+/// cursor picker wants one (only a mutation stamp catches updates); the warehouse
+/// partition key must avoid one (a row would hop partitions on every update). One
+/// predicate, because the same two literals were repeated at three sites and the
+/// partition mirror had already drifted from the cursor one.
+fn is_mutation_stamp(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "updated_at"
+            | "modified_at"
+            | "changed_at"
+            | "last_updated"
+            | "last_modified"
+            | "last_changed"
+            | "updated_on"
+            | "modified_on"
+            | "changed_on"
+            | "update_date"
+            | "modified_date"
+    )
 }
 
 /// Whether a column of this type can be a KEYSET (seek) key — i.e. the keyset
@@ -1674,6 +1693,22 @@ mod tests {
             ],
         );
         assert_eq!(info.best_cursor_column(), Some("updated_at"));
+    }
+
+    /// The partition key is the date the rows are ABOUT, so it must skip EVERY
+    /// mutation stamp, not just the two spelled `updated_at`/`modified_at` — a row
+    /// partitioned by `changed_at` hops partitions on every update. RED against the
+    /// old two-literal exclusion, which took `changed_at` because it came first.
+    #[test]
+    fn partition_column_skips_a_mutation_stamp_spelled_otherwise() {
+        let info = make_table(
+            0,
+            vec![
+                col("changed_at", "timestamp", false),
+                col("event_date", "date", false),
+            ],
+        );
+        assert_eq!(info.best_partition_column(), Some("event_date"));
     }
 
     #[test]
