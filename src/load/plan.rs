@@ -400,6 +400,39 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
 
 /// The warehouse layout of one export: a `backfill:` stream keeps a physical base
 /// and a disposable change buffer; everything else is the changelog + view.
+/// An export mode's load strategy. Exhaustive (no `_`) on purpose: a future
+/// delta-style mode fails to COMPILE here until someone picks its load
+/// semantics, instead of silently defaulting to OVERWRITE (the
+/// incremental-overwrite data-loss class).
+pub fn load_mode_of(mode: crate::config::ExportMode) -> LoadMode {
+    match mode {
+        crate::config::ExportMode::Cdc => LoadMode::Cdc,
+        crate::config::ExportMode::Incremental => LoadMode::Incremental,
+        crate::config::ExportMode::Full => LoadMode::Full, // whole result set
+        crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
+        crate::config::ExportMode::TimeWindow => LoadMode::Full, // the current window, whole
+    }
+}
+
+/// Where THIS export's current state will live, from the config alone — the
+/// section's `layout:` with the export's own block layered over it. The EXTRACT
+/// asks too: a base-and-buffer table's rows carry the delete flag as data, and
+/// only the writer can put it in the file.
+pub fn resolved_layout(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+) -> CdcLayout {
+    let choice = config
+        .load
+        .as_ref()
+        .map(|l| match &export.load {
+            Some(o) => l.with_override(o),
+            None => l.clone(),
+        })
+        .and_then(|eff| eff.layout);
+    cdc_layout(export, load_mode_of(export.mode), choice)
+}
+
 fn cdc_layout(
     export: &crate::config::ExportConfig,
     mode: LoadMode,
@@ -616,26 +649,20 @@ fn build_plans_keyed(
         // ExportMode then fails to COMPILE here until someone picks its load
         // semantics, instead of silently defaulting to OVERWRITE (the
         // incremental-overwrite data-loss class).
-        let mode = match export.mode {
-            crate::config::ExportMode::Cdc => LoadMode::Cdc,
-            crate::config::ExportMode::Incremental => LoadMode::Incremental,
-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set
-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
-            crate::config::ExportMode::TimeWindow => {
-                // Full OVERWRITE by design — and said out loud (round-6): each
-                // load replaces the warehouse table with the CURRENT window, so
-                // history past `days_window` is capped, not accumulated. An
-                // accumulation-minded operator loses history silently otherwise.
-                eprintln!(
-                    "  note: export `{}` is mode: time_window — each load OVERWRITES the \
-                     warehouse table with the current window; rows older than the window \
-                     are dropped from the warehouse (append-history needs mode: \
-                     incremental).",
-                    export.name
-                );
-                LoadMode::Full
-            }
-        };
+        let mode = load_mode_of(export.mode);
+        if matches!(export.mode, crate::config::ExportMode::TimeWindow) {
+            // Full OVERWRITE by design — and said out loud (round-6): each
+            // load replaces the warehouse table with the CURRENT window, so
+            // history past `days_window` is capped, not accumulated. An
+            // accumulation-minded operator loses history silently otherwise.
+            eprintln!(
+                "  note: export `{}` is mode: time_window — each load OVERWRITES the \
+                 warehouse table with the current window; rows older than the window \
+                 are dropped from the warehouse (append-history needs mode: \
+                 incremental).",
+                export.name
+            );
+        }
         // Effective load config: the shared top-level `load:`, with this export's
         // own `load:` block overriding the table-specific fields (pk, cleanup, …).
         // The warehouse `target` is shared and cannot be re-targeted per export.
@@ -2334,6 +2361,55 @@ load:
         assert_eq!(Granularity::Year.coarser(), None);
         assert_eq!(Granularity::parse_sql("MONTH"), Some(Granularity::Month));
         assert_eq!(Granularity::parse_sql("WEEK"), None);
+    }
+
+    /// Where the current state will live, resolved from the CONFIG alone: the
+    /// section's key with the export's own block layered over it. The EXTRACT asks
+    /// this too — a base-and-buffer table's rows carry the delete flag as data, and
+    /// a wrong answer here lands a base whose flag is NULL on every row.
+    #[test]
+    fn the_resolved_layout_composes_the_section_and_the_export_override() {
+        let cfg = |load: &str, export_extra: &str, mode: &str| {
+            let yaml = format!(
+                "source:\n  type: mysql\n  url_env: DB_URL\nexports:\n  - name: t\n    \
+                 table: t\n    mode: {mode}\n    cursor_column: updated_at\n    \
+                 format: parquet\n    destination: {{ type: local, path: /tmp/t }}\n{export_extra}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n{load}"
+            );
+            serde_yaml_ng::from_str::<crate::config::Config>(&yaml).expect("a config")
+        };
+
+        let written = cfg("  layout: base_buffer\n", "", "incremental");
+        assert_eq!(
+            resolved_layout(&written, &written.exports[0]),
+            CdcLayout::BaseAndBuffer,
+            "an ordinary incremental export asks for a base by name"
+        );
+
+        let unwritten = cfg("", "", "incremental");
+        assert_eq!(
+            resolved_layout(&unwritten, &unwritten.exports[0]),
+            CdcLayout::LogAndView,
+            "unwritten keeps the changelog and its view"
+        );
+
+        let overridden = cfg(
+            "  layout: base_buffer\n",
+            "    load:\n      layout: log_view\n",
+            "incremental",
+        );
+        assert_eq!(
+            resolved_layout(&overridden, &overridden.exports[0]),
+            CdcLayout::LogAndView,
+            "the export's own block layers over the section"
+        );
+
+        let full = cfg("  layout: base_buffer\n", "", "full");
+        assert_eq!(
+            resolved_layout(&full, &full.exports[0]),
+            CdcLayout::LogAndView,
+            "a full load overwrites its table; the key means nothing there"
+        );
     }
 
     /// Only a CDC load of a stream WITH `backfill:` takes the base-and-buffer

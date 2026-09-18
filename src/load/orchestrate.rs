@@ -1886,13 +1886,25 @@ impl IncrementalReport {
                 r.target_table,
                 cleaned_suffix(r.source_cleaned)
             ),
-            IncrementalReport::Changelog(r) => format!(
-                "{} rows appended to {} | current-state view {}{}",
-                r.rows_appended,
-                r.changes_table,
-                r.target,
-                cleaned_suffix(r.source_cleaned)
-            ),
+            // The report says which target it produced: under base+buffer there is
+            // no view to name, and telling an operator to read one would send them
+            // to an object that does not exist (found by dogfooding the batch cycle).
+            IncrementalReport::Changelog(r) => match r.target_kind {
+                load::ChangelogTarget::View => format!(
+                    "{} rows appended to {} | current-state view {}{}",
+                    r.rows_appended,
+                    r.changes_table,
+                    r.target,
+                    cleaned_suffix(r.source_cleaned)
+                ),
+                load::ChangelogTarget::Base => format!(
+                    "{} rows buffered into {} | `rivet compact` merges them into {}{}",
+                    r.rows_appended,
+                    r.changes_table,
+                    r.target,
+                    cleaned_suffix(r.source_cleaned)
+                ),
+            },
         }
     }
 }
@@ -3586,6 +3598,19 @@ mod load_message_tests {
         assert_eq!(
             delta.summary(),
             "3 rows appended to p.d.orders__changes | current-state view p.d.orders (source cleaned)"
+        );
+        // Under base+buffer the same delta lands in a BUFFER and there is no view
+        // to send the operator to — the line must say what actually happened.
+        let buffered = IncrementalReport::Changelog(load::CdcLoadReport {
+            rows_appended: 3,
+            changes_table: "p.d.orders__changes".into(),
+            target: "p.d.orders".into(),
+            target_kind: load::ChangelogTarget::Base,
+            source_cleaned: false,
+        });
+        assert_eq!(
+            buffered.summary(),
+            "3 rows buffered into p.d.orders__changes | `rivet compact` merges them into p.d.orders"
         );
     }
 }

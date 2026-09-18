@@ -1477,6 +1477,21 @@ fn run_export_job_inner(
         }
         return super::cdc_job::run_cdc_export(config_path, config, export, state);
     }
+    // A base-and-buffer table's rows carry the delete flag as DATA. `LOAD DATA`
+    // fills a column the FILE lacks with NULL — never with the column's DEFAULT,
+    // measured twice on a live BigQuery — so a first pass that did not write it
+    // left every row's `__is_deleted` NULL and `WHERE NOT __is_deleted` returned
+    // nothing at all (found by dogfooding the batch cycle). The CDC baseline leg
+    // sets the same flag from `cdc_job`; this is the batch half of one rule.
+    let owned_export;
+    let export = if crate::load::plan::resolved_layout(config, export).log_is_disposable() {
+        let mut e = export.clone();
+        e.meta_columns.deleted_flag = true;
+        owned_export = e;
+        &owned_export
+    } else {
+        export
+    };
     let plan = match build_plan(
         config,
         export,
