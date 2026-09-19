@@ -378,7 +378,10 @@ fn is_integer_type(t: &str) -> bool {
 
 fn is_timestamp_type(t: &str) -> bool {
     let t = t.to_lowercase();
-    t.contains("timestamp") || t == "datetime" || t == "date"
+    // `contains("datetime")`, not `== "datetime"`: SQL Server reports `datetime2`,
+    // `datetimeoffset` and `smalldatetime`, none of which the equality admitted —
+    // so the mutation stamp scored zero and the integer PK became the cursor.
+    t.contains("timestamp") || t.contains("datetime") || t == "date"
 }
 
 /// Whether the column name means "this stamp moves when the row CHANGES". The
@@ -1321,6 +1324,33 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+    /// SQL Server's temporal types are `datetime2`, `datetimeoffset` and
+    /// `smalldatetime` — none EQUAL to `datetime`, which is all the predicate
+    /// admitted. A `changed_at DATETIME2(6)` therefore scored zero as a cursor
+    /// candidate and the integer PK won: an incremental scaffold blind to every
+    /// UPDATE. Caught live by the generated-config chain on MSSQL (2026-09-20).
+    #[test]
+    fn every_sql_server_temporal_type_is_a_timestamp_type() {
+        for t in [
+            "datetime2",
+            "DATETIME2",
+            "datetimeoffset",
+            "smalldatetime",
+            "datetime",
+            "timestamp",
+            "timestamptz",
+            "date",
+        ] {
+            assert!(
+                super::is_timestamp_type(t),
+                "{t} must be a cursor candidate"
+            );
+        }
+        for t in ["bigint", "int", "varchar", "uniqueidentifier", "time"] {
+            assert!(!super::is_timestamp_type(t), "{t} must not be");
+        }
+    }
+
     /// `next_steps_block` is a pure string builder reached only via the init
     /// command's `eprint!` (live/CLI-only), so its `-> String::new()` /
     /// `"xyzzy"` stubs survive `cargo mutants -- --lib --bins`. This pins the

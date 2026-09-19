@@ -215,6 +215,184 @@ fn base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags() {
     assert_eq!(v_of(&bq, &table, 3), Some(99), "merged once, not twice");
 }
 
+// ── the same cycle on every engine ────────────────────────────────────────
+//
+// The tombstone fix (`f1ca6adc`) was measured on MySQL and PostgreSQL only; the
+// contract it restores — a delete becomes `__is_deleted = TRUE`, an insert never
+// lands with a NULL flag — is the base-and-buffer layout's, not one engine's.
+// One body, the key column as a parameter (MongoDB's is `_id`), so SQL Server
+// and MongoDB are graded by the same assertions rather than a paraphrase.
+
+/// [`base_profile`] over an arbitrary key column.
+fn base_profile_by(bq: &BqLive, table: &str, key: &str) -> (i64, i64, i64, i64, i64) {
+    let row = &bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNTIF(NOT __is_deleted) AS live, COUNTIF(__is_deleted) AS gone, \
+         COUNTIF(__is_deleted IS NULL) AS unflagged, IFNULL(SUM(IF(__is_deleted, 0, {key})), 0) AS s \
+         FROM `{}.{}.{table}`",
+        bq.project, bq.dataset
+    ))[0];
+    let g = |k: &str| -> i64 { row[k].as_str().expect(k).parse().expect("a number") };
+    (g("n"), g("live"), g("gone"), g("unflagged"), g("s"))
+}
+
+/// The `v` of one key, with both sides as SQL expressions: `key` is the key column
+/// (or a cast of it) and `value` the expression that yields `v` — a column on the
+/// SQL engines, a path into the `document` blob on MongoDB.
+fn v_by(bq: &BqLive, table: &str, key: &str, value: &str, id: i64) -> Option<i64> {
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT {value} AS v FROM `{}.{}.{table}` WHERE {key} = {id}",
+        bq.project, bq.dataset
+    ));
+    rows.first()
+        .and_then(|r| r["v"].as_str())
+        .map(|s| s.parse().expect("v"))
+}
+
+/// The rig shape every engine shares: a stream with a whole-table baseline recipe,
+/// landing base-and-buffer with `pk` as the merge key — the proven
+/// `live_cdc_full_cycle` shape, so a red here is the compaction, not the recipe.
+fn tombstone_shape(rig: Rig, table: &str, pk: &str, bq: &BqLive) -> Rig {
+    rig.cdc("backfill: auto")
+        .also_batch_export("baseline", table, "full")
+        .dest_gcs_live(&bq.bucket, &bq.prefix)
+        .top_line(&bq.load_line(&format!(", pk: [{pk}]")))
+}
+
+/// Steps 1–4 of the MySQL cycle above: the baseline lands with every flag `false`,
+/// a delta (three inserts, one update, one delete) is buffered and not merged,
+/// then compact flags the delete, refreshes the update and drops the buffer.
+/// `key` and `value` are the oracle's SQL for the key column and the `v` value.
+fn tombstone_cycle(mut scn: CdcScenario, key: &str, value: &str, bq: &BqLive) {
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    for id in 1..=5 {
+        scn.insert(id);
+    }
+    scn.settle();
+
+    scn.rig.run_ok();
+    let said = load_ok(&scn.rig);
+    assert!(said.contains("layout=base+buffer"), "{said}");
+    assert_eq!(
+        base_profile_by(bq, &table, key),
+        (5, 5, 0, 0, 15),
+        "five live rows, no NULL flag — the flag came in the Parquet"
+    );
+    // Whether this first compact has anything to merge is the ANCHOR model's, not
+    // the layout's: MySQL and SQL Server anchor at the first run, so the seed is
+    // baseline-only and compact says SKIP; PostgreSQL pins its slot at creation,
+    // BEFORE the seed, so the stream re-captures those five rows and the load
+    // buffers them again — at-least-once by design (ADR-0034), merged
+    // idempotently. What every engine must agree on is the base AFTERWARDS.
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok, "{said}");
+    assert_eq!(
+        base_profile_by(bq, &table, key),
+        (5, 5, 0, 0, 15),
+        "a baseline re-captured by the stream merges into the same five keys — no \
+         duplicate, no phantom tombstone: {said}"
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "no buffer survives the first compact, whether it merged or skipped"
+    );
+
+    for id in 6..=8 {
+        scn.insert(id);
+    }
+    scn.update(1);
+    scn.delete(2);
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "5",
+        "the buffer holds the five changes"
+    );
+    assert_eq!(
+        base_profile_by(bq, &table, key).0,
+        5,
+        "the base waits for compact"
+    );
+
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(ok && said.contains("COMPACT OK"), "{said}");
+    let (n, live, gone, nulls, sum) = base_profile_by(bq, &table, key);
+    assert_eq!(
+        (n, gone, nulls),
+        (8, 1, 0),
+        "nothing physically deleted, the deleted key flagged, no NULL flag"
+    );
+    assert_eq!(live, scn.count(), "live rows == source");
+    assert_eq!(
+        sum,
+        1 + 3 + 4 + 5 + 6 + 7 + 8,
+        "the live keys are the source's"
+    );
+    assert_eq!(
+        v_by(bq, &table, key, value, 1),
+        Some(99),
+        "the update reached the base"
+    );
+    assert_eq!(
+        v_by(bq, &table, key, value, 2),
+        Some(2),
+        "the tombstone keeps its last values"
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the buffer is dropped after the merge"
+    );
+}
+
+#[test]
+#[ignore = "live: requires postgres-cdc + BigQuery creds"]
+fn base_and_buffer_cycle_keeps_deletes_as_flags_postgres() {
+    let Some(bq) = BqLive::from_env("compact_pg") else {
+        return;
+    };
+    let scn = CdcScenario::pg_with("compact_pg", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+        tombstone_shape(r, t, "id", &bq)
+    });
+    tombstone_cycle(scn, "id", "v", &bq);
+}
+
+#[test]
+#[ignore = "live: requires mssql-cdc + BigQuery creds"]
+fn base_and_buffer_cycle_keeps_deletes_as_flags_mssql() {
+    let Some(bq) = BqLive::from_env("compact_ms") else {
+        return;
+    };
+    let scn = CdcScenario::mssql_with("compact_ms", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+        tombstone_shape(r, t, "id", &bq)
+    });
+    tombstone_cycle(scn, "id", "v", &bq);
+}
+
+#[test]
+#[ignore = "live: requires mongo-rs + BigQuery creds"]
+fn base_and_buffer_cycle_keeps_deletes_as_flags_mongo() {
+    let Some(bq) = BqLive::from_env("compact_mg") else {
+        return;
+    };
+    require_alive(LiveService::MongoRs);
+    let scn = CdcScenario::mongo_with("compact_mg", |r, t| tombstone_shape(r, t, "_id", &bq));
+    // The merge KEY stays `_id`; the ORACLE adapts to the Mongo shape, measured on
+    // the first two runs: `_id` lands as STRING (a BSON id is polymorphic, so the
+    // exporter canonicalises it), and there is no `v` column at all — both the
+    // baseline recipe and the stream ship `_id` + a `document` JSON blob, so the
+    // value is read out of the blob. The tombstone assertions passed before either
+    // of these; only the value oracle was SQL-shaped.
+    tombstone_cycle(
+        scn,
+        "CAST(_id AS INT64)",
+        "CAST(JSON_VALUE(document, '$.v') AS INT64)",
+        &bq,
+    );
+}
+
 /// `(v, created_at as text)` of one key in the base.
 fn row_of(bq: &BqLive, table: &str, id: i64) -> (Option<i64>, Option<String>) {
     let rows = bq.read_bq_rows(&format!(

@@ -99,45 +99,84 @@ impl Drop for GcsPrefix {
     }
 }
 
-// ── the warehouse half: init → run → load → compact ──────────────────────
+// ── the warehouse half: init → run → load → compact, per engine ──────────
+
+fn source_url(e: SqlEngine) -> &'static str {
+    match e {
+        SqlEngine::Pg => POSTGRES_URL,
+        SqlEngine::Mysql => MYSQL_URL,
+        SqlEngine::Mssql => MSSQL_URL,
+    }
+}
+
+/// A timestamp type init scores as a cursor candidate, spelled per engine.
+fn ts_type(e: SqlEngine) -> &'static str {
+    match e {
+        SqlEngine::Pg => "TIMESTAMP",
+        SqlEngine::Mysql => "DATETIME(6)",
+        SqlEngine::Mssql => "DATETIME2(6)",
+    }
+}
+
+/// `ids` as rows `(id, 'r<id>', id*10, now, now)` — a VALUES list, since only
+/// PostgreSQL has `generate_series`.
+fn insert_rows(e: SqlEngine, table: &str, ids: std::ops::RangeInclusive<i64>) {
+    let now = e.ago(0);
+    let rows: Vec<String> = ids
+        .map(|i| format!("({i}, 'r{i}', {}, {now}, {now})", i * 10))
+        .collect();
+    e.exec(&format!(
+        "INSERT INTO {table} (id, name, amount, created_at, changed_at) VALUES {}",
+        rows.join(", ")
+    ));
+}
+
+/// The export name init chose — the warehouse table and the bucket prefix both
+/// follow it, so the test reads it back rather than re-deriving init's rule.
+fn scaffolded_export(generated: &str) -> String {
+    generated
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("- name:"))
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .expect("a single-table scaffold names one export")
+}
 
 /// The cycle init's own next-steps prescribes, driven end to end on the config it
 /// generated: `run` stages Parquet, `load` lands it, `compact` merges the buffer.
 ///
-/// Locked down because the chain had no live test through `compact` on the batch
-/// side, and the one defect this branch shipped there — the MERGE handed specs
-/// without `__is_deleted`, so no tombstone was ever written — was found by running
-/// it by hand, not by the suite.
-#[test]
-#[ignore = "live: requires docker compose postgres + BigQuery creds"]
-fn a_generated_config_drives_run_then_load_then_compact_into_the_warehouse() {
-    let Some(bq) = BqLive::from_env("init_chain") else {
+/// Locked down per engine because the chain had no live test through `compact` on
+/// the batch side, and the one defect this branch shipped there — the MERGE handed
+/// specs without `__is_deleted`, so no tombstone was ever written — was found by
+/// running it by hand, not by the suite. The scaffold's `--table` is `dbo.`-qualified
+/// on SQL Server: init's bare-name default is `public`, which that engine lacks.
+fn warehouse_chain(e: SqlEngine, label: &str) {
+    let Some(bq) = BqLive::from_env(label) else {
         return;
     };
-    require_alive(LiveService::Postgres);
-    let e = SqlEngine::Pg;
+    e.alive();
+    let ts = ts_type(e);
     let (table, _table_guard) = e.create(
-        "init_chain",
-        "id BIGINT PRIMARY KEY, name TEXT NOT NULL, amount INT NOT NULL, \
-         created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-         changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+        label,
+        &format!(
+            "id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL, amount INT NOT NULL, \
+             created_at {ts} NOT NULL, changed_at {ts} NOT NULL"
+        ),
     );
-    let changes = format!("{table}__changes");
-    let _bq_guard = bq.cleanup(&[&table, &changes]);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{table}/**", bq.bucket));
-    e.exec(&format!(
-        "INSERT INTO {table} (id, name, amount) SELECT g, 'r'||g, g*10 FROM generate_series(1,10) g"
-    ));
+    insert_rows(e, &table, 1..=10);
 
     let dir = tempfile::tempdir().expect("config dir");
     let cfg_path = dir.path().join("rivet.yaml");
     let cfg = cfg_path.to_str().unwrap();
+    let init_table = match e {
+        SqlEngine::Mssql => format!("dbo.{table}"),
+        _ => table.clone(),
+    };
     init_ok(&[
         "init",
         "--source",
-        POSTGRES_URL,
+        source_url(e),
         "--table",
-        &table,
+        &init_table,
         "--mode",
         "incremental",
         "--bigquery-project",
@@ -149,27 +188,34 @@ fn a_generated_config_drives_run_then_load_then_compact_into_the_warehouse() {
         "--output",
         cfg,
     ]);
-    let db = [("DATABASE_URL", POSTGRES_URL)];
+    let generated = std::fs::read_to_string(cfg).expect("generated config");
+    let export = scaffolded_export(&generated);
+    let changes = format!("{export}__changes");
+    // Guards before the first write: `run` stages into the bucket, `load` into
+    // the dataset, and a panic between them must still tear both down.
+    let _bq_guard = bq.cleanup(&[&export, &changes]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", source_url(e))];
+    let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
 
     // 1. First pass: the whole table lands as a plain base, and there is no
     //    buffer for compact to merge — said so rather than silently doing work.
     rivet_ok(&["run", "-c", cfg], &db);
     rivet_ok(&["load", "-c", cfg], &[]);
     assert_eq!(
-        bq.read_bq_table_type(&table).as_deref(),
+        bq.read_bq_table_type(&export).as_deref(),
         Some("BASE TABLE"),
         "the first incremental pass lands a table, not a view"
     );
-    assert_eq!(bq.read_bq_count(&table), "10");
+    assert_eq!(bq.read_bq_count(&export), "10");
     let said = rivet_ok(&["compact", "-c", cfg], &[]);
     assert!(said.contains("COMPACT SKIP"), "no buffer yet: {said}");
 
     // 2. A delta of five inserts and one UPDATE — the cursor must carry both.
+    insert_rows(e, &table, 11..=15);
     e.exec(&format!(
-        "INSERT INTO {table} (id, name, amount) SELECT g, 'r'||g, g*10 FROM generate_series(11,15) g"
-    ));
-    e.exec(&format!(
-        "UPDATE {table} SET amount = 999, changed_at = now() WHERE id = 3"
+        "UPDATE {table} SET amount = 999, changed_at = {} WHERE id = 3",
+        e.ago(0)
     ));
     rivet_ok(&["run", "-c", cfg], &db);
     rivet_ok(&["load", "-c", cfg], &[]);
@@ -179,7 +225,7 @@ fn a_generated_config_drives_run_then_load_then_compact_into_the_warehouse() {
         "five inserts and the update are buffered, not merged"
     );
     assert_eq!(
-        bq.read_bq_count(&table),
+        bq.read_bq_count(&export),
         "10",
         "the base waits for compact — a load never merges"
     );
@@ -187,15 +233,14 @@ fn a_generated_config_drives_run_then_load_then_compact_into_the_warehouse() {
     // 3. Compact merges the buffer and drops it; the base equals the source.
     let said = rivet_ok(&["compact", "-c", cfg], &[]);
     assert!(said.contains("COMPACT OK"), "{said}");
-    assert_eq!(bq.read_bq_count(&table), "15");
+    assert_eq!(bq.read_bq_count(&export), "15");
     assert!(
         bq.read_bq_table_type(&changes).is_none(),
         "the buffer is dropped after the merge"
     );
     let rows = bq.read_bq_rows(&format!(
-        "SELECT COUNT(DISTINCT id) AS d, COUNTIF(id = 3 AND amount = 999) AS updated \
-         FROM `{}.{}.{table}`",
-        bq.project, bq.dataset
+        "SELECT COUNT(DISTINCT id) AS d, COUNTIF(id = 3 AND amount = 999) AS updated FROM {}",
+        fq(&export)
     ));
     assert_eq!(rows[0]["d"].as_str(), Some("15"), "one row per key");
     assert_eq!(
@@ -203,6 +248,24 @@ fn a_generated_config_drives_run_then_load_then_compact_into_the_warehouse() {
         Some("1"),
         "the UPDATE reached the base through the buffer"
     );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_generated_config_drives_run_load_compact_into_the_warehouse_postgres() {
+    warehouse_chain(SqlEngine::Pg, "init_chain_pg");
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + BigQuery creds"]
+fn a_generated_config_drives_run_load_compact_into_the_warehouse_mysql() {
+    warehouse_chain(SqlEngine::Mysql, "init_chain_my");
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql + BigQuery creds"]
+fn a_generated_config_drives_run_load_compact_into_the_warehouse_mssql() {
+    warehouse_chain(SqlEngine::Mssql, "init_chain_ms");
 }
 
 // ── batch: incremental ────────────────────────────────────────────────────
