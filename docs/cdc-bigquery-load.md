@@ -82,28 +82,62 @@ but clustering on `<pk>` keeps it cheap; if current state is read hot, add an
 SELECT * FROM <table>`) — one billed scan per day, not per read. This is the
 classic *log + periodic compaction*.
 
+## The base-and-buffer layout (`backfill:` streams) and `rivet compact`
+
+A stream whose baseline comes from `cdc.backfill:` does NOT use the view above.
+Its baseline legs overwrite a **physical base table** `<table>` — the source
+columns plus one service column, `__is_deleted BOOL` (written as `false` inside
+the baseline Parquet, so no NULL ever appears) — and the stream's runs append
+into `<table>__changes`, a **per-cycle buffer** without a partition. The cycle is
+
+```sh
+rivet run     -c cfg.yaml   # anchor once, baseline once, then only the changes
+rivet load    -c cfg.yaml   # baseline → <table> (batched, staging + CLONE); changes → <table>__changes
+rivet compact -c cfg.yaml   # MERGE <table>__changes into <table>; DROP the buffer
+```
+
+`compact` is **one scripted job per table**: the latest change per key (the
+same `__pos` order the view uses) is upserted; a **delete flags** the base row
+(`__is_deleted = TRUE`, last values kept — the warehouse deletes nothing) and a
+later insert un-flags it. For a day-partitioned base (init's default) the script
+collects the buffer's distinct days into a variable and every `MERGE` filters
+both sides with `DATE(col) IN UNNEST(days)` — measured: 172 bytes read against
+48 KB for a `MIN..MAX` range on the same buffer, i.e. exactly the touched
+partitions; more than 4,000 days merge in chunks of 4,000 inside the same
+script. Then the script drops the buffer and the next `load` creates it again
+from its run's spec. Other partition keys (hour, month, year, integer ranges)
+keep a constant `MIN..MAX` range per window in separate jobs — the truncation
+forms did not prune when measured. An empty buffer is just dropped.
+
+What a cycle bills: BigQuery charges every statement that reads a table at
+least 10 MB per table, so a compaction with changes bills a 30 MB floor (the
+probe, and the MERGE over two tables); one without changes bills nothing. The
+`load` side is free (`CREATE`, `LOAD DATA`). The script's child statements
+appear in `INFORMATION_SCHEMA.JOBS` under `parent_job_id` with the same labels.
+
+Consumers read `<table>` directly, `WHERE NOT __is_deleted` for live rows. The
+buffer holds no history — `__is_deleted` in the base is the record that a row
+was deleted. BigQuery only in this release; Snowflake keeps the view layout.
+
 ## Every billed step carries its own label
 
 The whole point of the loader's job labels (`managed_by:rivet` /
-`rivet_op:<op>` / `rivet_table:<table>`) is that you can see cost **per step**.
-So the CDC steps use distinct ops:
+`rivet_op:<op>` / `rivet_table:<table>` / `rivet_run:<load run id>`) is that
+you can price **each table's update, per operation**. There are two operations:
 
-- `rivet_op:load` — the free `LOAD DATA` of the change log (`bytes_billed = 0`);
-- `rivet_op:count` — the free `SELECT COUNT(*)` row-count gate (a 0-bytes-billed
-  metadata read), run before and after the load so the delta can be checked
-  against the manifest total;
-- `rivet_op:create` / `rivet_op:alter` — the changes-table DDL;
-- `rivet_op:view` — the free `CREATE OR REPLACE VIEW` dedup step.
+- `rivet_op:load` — everything `rivet load` runs for a table: the free `LOAD DATA`
+  jobs (one per batch of at most 4,000 partitions), the `COUNT(*)` gate, the
+  table DDL, the staging `CLONE` of a batched whole-table load, the view;
+- `rivet_op:merge` — everything `rivet compact` runs for a table (the billed
+  `MERGE` and its partition-range probe).
 
-rivet performs no `MERGE` or compaction step. If you materialize with option 2
-or add a daily compaction, run and label those jobs yourself (e.g. your own
-`rivet_op:merge` / `rivet_op:compact` labels) so they appear on the
-cost-attribution query (`GROUP BY rivet_op`) on their **own line**, separate
-from the free load — you can price exactly what the dedup step costs per table:
+`rivet_table` is the base table's short name for both the table and its
+`__changes`, so `GROUP BY op, tbl` answers "what does keeping this table current
+cost" in one row per table per operation:
 
 ```sql
 SELECT
-  (SELECT value FROM UNNEST(labels) WHERE key='rivet_op')    AS op,      -- load | count | create | alter | view
+  (SELECT value FROM UNNEST(labels) WHERE key='rivet_op')    AS op,      -- load | merge
   (SELECT value FROM UNNEST(labels) WHERE key='rivet_table') AS tbl,
   COUNT(*) AS jobs, SUM(total_bytes_billed) AS bytes_billed
 FROM `region-us`.INFORMATION_SCHEMA.JOBS
@@ -111,9 +145,9 @@ WHERE EXISTS (SELECT 1 FROM UNNEST(labels) WHERE key='managed_by' AND value='riv
 GROUP BY op, tbl ORDER BY bytes_billed DESC;
 ```
 
-The loader's labeling is already op-parameterized (`run_sql(sql, op, table)`),
-and every rivet-driven step (`load` / `count` / `create` / `alter` / `view`)
-passes its own op — only jobs you run yourself need labels of your own.
+Every rivet-driven job passes through one labelled seam (`run_sql(sql, op,
+table)`), so nothing rivet runs is unlabelled — only jobs you run yourself need
+labels of your own.
 
 ## The one command: `rivet load`
 
@@ -175,12 +209,31 @@ load:
   dataset: analytics
 ```
 
+**Loads are batched by partition span.** BigQuery writes at most 4,000
+partitions per job. Before any job, `rivet load` reads the partition column's
+range from every Parquet footer and packs the files, in order of their lowest
+value, into jobs whose combined span fits — so a keyset export over an
+autoincrement key (whose files are date-local because `id` grows with time)
+loads eleven years of daily partitions in three or four jobs, never coarsened
+to `month`. A whole-table (`OVERWRITE`) load that needs several jobs fills a
+`<table>__staging` table and swaps it in with one zero-copy `CLONE`. The one
+shape nothing splits is a single file wider than 4,000 partitions (dates
+uncorrelated with the read key): that is refused before any job, naming the
+file and the granularity that fits.
+
 The capture fans each table out under `<prefix>/<table>/` (its own
 `manifest.json` + `_SUCCESS`, with `initial: snapshot` nested a level below as
 `<prefix>/<table>/snapshot/`), and `rivet load` follows that layout: **one
 `<table>__changes` + one dedup view per SOURCE table**, each loaded from its own
 sub-prefix only. Each table is keyed on its own recorded primary key; the rest of
-the `load:` block is shared by every table of the stream; `rivet check --target bigquery` prints one resolver document
+the `load:` block is shared by every table of the stream unless the export's
+`load:` carries `tables: { orders: { partition: { column: created_at,
+granularity: day } }, customers: { partition: none } }` — one block per captured
+table, layered over the export's and the top-level `load:`. With
+`cdc: { backfill: auto, … }` in place of `initial: snapshot`, each table's
+baseline is read by the batch export that names it (keyset, chunked, with its
+`columns:`) into the same `<prefix>/<table>/snapshot/`, so the load is unchanged
+(`rivet init --mode cdc` scaffolds that shape on MySQL and PostgreSQL); `rivet check --target bigquery` prints one resolver document
 per table (`Export: cdc/orders`), so you see each table's native schema before
 loading it. Live-verified against BigQuery over a 3-table PostgreSQL stream
 (#252).

@@ -122,6 +122,20 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // triaged as separate entries: this ledger is the list of such entries
     // waiting to be written.
     ("src/pipeline/run.rs::run_pool", 7, 1, 6, 2),
+    // The CDC job's baseline pairing (2026-09-17). Its one remaining `||` is
+    // `state.snapshot_done(..)? || dest.head("_SUCCESS")?.is_some()` — two I/O
+    // reads whose SHORT-CIRCUIT is the point (the object-store HEAD is skipped
+    // when the state DB already says done), so a pure predicate over both values
+    // would have to perform the second read unconditionally. The other three
+    // decisions it carried were extracted (`captures_changes_only`,
+    // `backfill_recipe_for`, an inverted `table_matches` guard).
+    (
+        "src/pipeline/cdc_job.rs::initial_snapshot_pending",
+        0,
+        1,
+        0,
+        0,
+    ),
     (
         "src/pipeline/parallel_children.rs::run_exports_as_child_processes",
         0,

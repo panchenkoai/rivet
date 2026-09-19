@@ -104,6 +104,8 @@ def main():
         ("DestinationConfig", "`exports[].destination`"),
         ("QualityConfig", "`exports[].quality`"),
         ("ParquetConfig", "`exports[].parquet`"),
+        ("LoadSection", "`load` (the warehouse target, consumed by `rivet load`)"),
+        ("LoadOverride", "`exports[].load` and `exports[].load.tables.<table>`"),
     ]:
         node = defs.get(name)
         if node:

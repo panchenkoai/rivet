@@ -231,6 +231,16 @@ impl Rig {
         self
     }
 
+    /// The same source and table as a plain `mode: full` batch export — the CDC
+    /// block dropped (a `cdc:` block is refused outside `mode: cdc`), everything
+    /// else (URL, destination, config dir) kept.
+    pub fn into_full_batch(mut self) -> Self {
+        self.mode = "full".to_string();
+        self.cdc_lines.clear();
+        self.ckpt_override = None;
+        self
+    }
+
     /// Switch to another mode and export lines, keeping this rig's config dir and state DB.
     pub fn restage(mut self, mode: &str, lines: &[&str]) -> Self {
         self.mode = mode.to_string();
@@ -419,6 +429,28 @@ impl Rig {
             table: None,
             cdc_lines: Vec::new(),
             mode: "full".to_string(),
+            lines: Vec::new(),
+        });
+        self
+    }
+
+    /// A second BATCH export over its OWN table — the shape a `cdc.backfill`
+    /// recipe has to take.
+    ///
+    /// [`Rig::also_export`] renders a `query:` export, which `resolve_backfill`
+    /// refuses BY CONSTRUCTION ("a `query:` export describes rows, not a table,
+    /// so it can never be the baseline of a captured table"), so the backfill
+    /// pairing could not be expressed with it at all. Chunking lines
+    /// (`chunk_column:`, `chunk_by_key:`, `parallel:`, …) go on with
+    /// [`Rig::also_export_line`] — the recipe's read strategy is exactly what
+    /// the backfill leg borrows.
+    pub fn also_batch_export(mut self, name: &str, table: &str, mode: &str) -> Self {
+        self.extra_exports.push(SecondaryExport {
+            name: name.to_string(),
+            query: String::new(),
+            table: Some(table.to_string()),
+            cdc_lines: Vec::new(),
+            mode: mode.to_string(),
             lines: Vec::new(),
         });
         self
@@ -646,12 +678,19 @@ pub struct CdcScenario {
     _guards: Vec<Box<dyn std::any::Any>>,
 }
 
-/// Engine-specific SQL executors for [`CdcScenario`].
+/// Engine-specific executors for [`CdcScenario`].
 enum ScnExec {
     MySql(mysql::PooledConn),
     Pg(Box<postgres::Client>),
-    /// SQL Server churns through the shared sqlcmd helper.
-    Mssql,
+    /// SQL Server churns through the shared sqlcmd helper. The capture job is
+    /// ASYNC, so the scenario counts the changes it made and `settle` waits for
+    /// the change table to hold that many before a run reads it.
+    Mssql {
+        ci: String,
+        changes: i64,
+    },
+    /// MongoDB (replica set) through the driver-backed helper — no SQL at all.
+    Mongo(super::mongo::MongoTest),
 }
 
 /// Drops a SQL Server capture instance + table on teardown (a CDC-tracked
@@ -708,6 +747,15 @@ impl Drop for MssqlCdcTable {
 impl CdcScenario {
     /// `cols` is the column spec, e.g. `"id INT PRIMARY KEY, v BIGINT"`.
     pub fn mysql(label: &str, cols: &str) -> Self {
+        let s = Self::mysql_with(label, cols, |r, _| r);
+        s.rig.run_ok(); // pin: the checkpoint anchors BEFORE any churn
+        s
+    }
+
+    /// [`Self::mysql`] with the rig SHAPED before anything runs (`backfill:`, a
+    /// recipe, a live destination, a `load:` line) and NO pin — the caller's first
+    /// run is the anchor. For scenarios whose subject is that first run.
+    pub fn mysql_with(label: &str, cols: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
         use mysql::prelude::Queryable as _;
         let table = super::unique_name(label);
         let mut conn = cdc_conn();
@@ -716,10 +764,8 @@ impl CdcScenario {
         conn.query_drop(format!("CREATE TABLE {table} ({cols})"))
             .unwrap();
         let guard = super::mysql::MysqlCdcTable(table.clone());
-        let rig = Rig::mysql_cdc(&table);
-        rig.run_ok(); // pin: the checkpoint anchors BEFORE any churn
         Self {
-            rig,
+            rig: shape(Rig::mysql_cdc(&table), &table),
             table,
             exec: ScnExec::MySql(conn),
             _guards: vec![Box::new(guard)],
@@ -728,6 +774,13 @@ impl CdcScenario {
 
     /// PostgreSQL: table + logical slot (both guarded) + pin.
     pub fn pg(label: &str, cols: &str) -> Self {
+        let s = Self::pg_with(label, cols, |r, _| r);
+        s.rig.run_ok(); // pin (PG anchors server-side at slot creation)
+        s
+    }
+
+    /// [`Self::pg`] shaped before the first run, unpinned — see [`Self::mysql_with`].
+    pub fn pg_with(label: &str, cols: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
         let table = super::unique_name(label);
         let slot = super::unique_name(&format!("{label}_slot"));
         let mut client = postgres::Client::connect(super::env::POSTGRES_CDC_URL, postgres::NoTls)
@@ -745,18 +798,44 @@ impl CdcScenario {
             )
             .unwrap();
         let sguard = super::pg::Slot(slot.clone());
-        let rig = Rig::pg_cdc(&table, &slot);
-        rig.run_ok(); // pin (PG anchors server-side at slot creation)
         Self {
-            rig,
+            rig: shape(Rig::pg_cdc(&table, &slot), &table),
             table,
             exec: ScnExec::Pg(Box::new(client)),
             _guards: vec![Box::new(tguard), Box::new(sguard)],
         }
     }
 
+    /// MongoDB (replica set :27018): a fresh database, one collection, unpinned and
+    /// shaped — see [`Self::mysql_with`]. The scenario's `_id`s are `i64`.
+    pub fn mongo_with(label: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
+        const PORT: u16 = 27018;
+        let db = super::unique_name(label);
+        let table = "t".to_string();
+        let m = super::mongo::MongoTest::connect(PORT, &db);
+        m.drop_collection(&table);
+        let rig = Rig::mongo_cdc(&table).source_url(&super::mongo::MongoTest::url(PORT, &db));
+        let guard = super::mongo::MongoDbGuard {
+            port: PORT,
+            db: db.clone(),
+        };
+        Self {
+            rig: shape(rig, &table),
+            table,
+            exec: ScnExec::Mongo(m),
+            _guards: vec![Box::new(guard)],
+        }
+    }
+
     /// SQL Server: table + capture instance (guarded) + pin at max LSN.
     pub fn mssql(label: &str, cols: &str) -> Self {
+        let s = Self::mssql_with(label, cols, |r, _| r);
+        s.rig.run_ok(); // pin
+        s
+    }
+
+    /// [`Self::mssql`] shaped before the first run, unpinned — see [`Self::mysql_with`].
+    pub fn mssql_with(label: &str, cols: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
         let table = super::unique_name(label);
         let ci = format!("dbo_{table}");
         super::mssql::mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} ({cols})"));
@@ -777,12 +856,10 @@ impl CdcScenario {
             "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
              @source_name=N'{table}', @role_name=NULL, @capture_instance=N'{ci}';"
         ));
-        let rig = Rig::mssql_cdc(&table, &ci);
-        rig.run_ok(); // pin
         Self {
-            rig,
+            rig: shape(Rig::mssql_cdc(&table, &ci), &table),
             table,
-            exec: ScnExec::Mssql,
+            exec: ScnExec::Mssql { ci, changes: 0 },
             _guards: vec![Box::new(guard)],
         }
     }
@@ -795,7 +872,100 @@ impl CdcScenario {
                 conn.query_drop(q).expect("scenario sql (mysql)");
             }
             ScnExec::Pg(client) => client.batch_execute(q).expect("scenario sql (pg)"),
-            ScnExec::Mssql => super::mssql::mssql_cdc_exec(q),
+            ScnExec::Mssql { changes, .. } => {
+                *changes += 1;
+                super::mssql::mssql_cdc_exec(q)
+            }
+            ScnExec::Mongo(_) => panic!("a MongoDB scenario has no SQL — use insert/update/delete"),
+        }
+    }
+
+    /// The table as the engine's SQL names it (`dbo.` on SQL Server).
+    fn qualified(&self) -> String {
+        match self.exec {
+            ScnExec::Mssql { .. } => format!("dbo.{}", self.table),
+            _ => self.table.clone(),
+        }
+    }
+
+    /// The dedup key a `load:` block names for this scenario's table.
+    pub fn pk(&self) -> &'static str {
+        match self.exec {
+            ScnExec::Mongo(_) => "_id",
+            _ => "id",
+        }
+    }
+
+    // ── engine-independent churn over the scenario's `(id, v)` shape ─────────
+    // One row per call, so a scenario reads the same on every engine and the
+    // MSSQL change counter stays exact.
+
+    pub fn insert(&mut self, id: i64) {
+        match &mut self.exec {
+            ScnExec::Mongo(m) => m.insert_many(
+                &self.table,
+                vec![mongodb::bson::doc! { "_id": id, "v": id }],
+            ),
+            _ => {
+                let t = self.qualified();
+                self.sql(&format!("INSERT INTO {t} (id, v) VALUES ({id}, {id})"))
+            }
+        }
+    }
+
+    pub fn update(&mut self, id: i64) {
+        match &mut self.exec {
+            ScnExec::Mongo(m) => m.upsert_set(&self.table, id, "v", "99"),
+            _ => {
+                let t = self.qualified();
+                self.sql(&format!("UPDATE {t} SET v = 99 WHERE id = {id}"));
+                // SQL Server's change table holds an UPDATE as TWO rows (the
+                // before and the after image), so `settle` must wait for both —
+                // counting one let a later insert slip past the wait unseen.
+                if let ScnExec::Mssql { changes, .. } = &mut self.exec {
+                    *changes += 1;
+                }
+            }
+        }
+    }
+
+    pub fn delete(&mut self, id: i64) {
+        match &mut self.exec {
+            ScnExec::Mongo(m) => m.delete_one(&self.table, id),
+            _ => {
+                let t = self.qualified();
+                self.sql(&format!("DELETE FROM {t} WHERE id = {id}"))
+            }
+        }
+    }
+
+    /// `COUNT(*)` of the source table — the re-query oracle, sharing nothing with
+    /// rivet's read or write path.
+    pub fn count(&mut self) -> i64 {
+        let t = self.qualified();
+        match &mut self.exec {
+            ScnExec::MySql(conn) => {
+                use mysql::prelude::Queryable as _;
+                conn.query_first::<i64, _>(format!("SELECT COUNT(*) FROM {t}"))
+                    .expect("count")
+                    .expect("one row")
+            }
+            ScnExec::Pg(client) => client
+                .query_one(&format!("SELECT COUNT(*) FROM {t}"), &[])
+                .expect("count")
+                .get(0),
+            ScnExec::Mssql { .. } => {
+                super::mssql::mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM {t}"))
+            }
+            ScnExec::Mongo(m) => m.count(&self.table) as i64,
+        }
+    }
+
+    /// Wait until every change made so far is visible to the stream. Only SQL
+    /// Server needs it (the Agent's capture job is asynchronous); a no-op elsewhere.
+    pub fn settle(&self) {
+        if let ScnExec::Mssql { ci, changes } = &self.exec {
+            super::mssql::wait_for_capture(ci, *changes);
         }
     }
 

@@ -1246,8 +1246,14 @@ def _drive_live_tests(
     log_path.write_text(res.out)
     # Each NAMED test must have its own PASS line — not a count that siblings
     # can satisfy. nextest prints `PASS [   1.234s] (1/6) <binary> <module>::<name>`.
+    # LEAK counts as passed: nextest labels a test LEAK when it PASSED but left a
+    # handle or child process open past its end, and its own summary says so
+    # ("6 tests run: 6 passed (2 leaky)"). Matching only `PASS` read a green run
+    # as "this named test never passed" and failed the row (gate #9, the gremlin
+    # binlog-cut cell, green in gate #8 and green in its own log here).
     passed = {
-        m.group(1) for m in re.finditer(r"PASS \[[^\]]*\] \([^)]*\) \S+ (\S+)", res.out)
+        m.group(1)
+        for m in re.finditer(r"(?:PASS|LEAK) \[[^\]]*\] \([^)]*\) \S+ (\S+)", res.out)
     }
     missing = [t for t in tests if not any(p.endswith(t) or p == t for p in passed)]
     skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]

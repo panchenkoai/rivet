@@ -1,0 +1,18 @@
+[project]
+name = "rivet-harness"
+version = "0.0.0"
+description = "Release-gate harness and independent oracles for rivet (not published)"
+requires-python = ">=3.12"
+# Pinned, not floated: the oracle's job is to disagree with rivet when rivet is
+# wrong, so the reader itself must not move under us between two runs of the
+# same gate. `duckdb` carries the postgres/mysql/sqlite scanners and — with
+# `INSTALL bigquery FROM community` — the BigQuery reader (see
+# dev/release_oracle/duck.py).
+dependencies = [
+    "duckdb==1.5.5",
+    "pymongo>=4,<5",
+    "pyyaml>=6,<7",
+]
+
+[tool.uv]
+package = false

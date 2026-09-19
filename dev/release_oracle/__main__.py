@@ -50,10 +50,13 @@ from . import (
     cdc,
     concurrency,
     gifs,
+    partner_shape,
     regression,
     release_path,
     scenarios,
+    shared_state,
     state_parity,
+    warehouse_layout,
 )
 
 
@@ -358,6 +361,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
+    partner_shape.verify_partner_shape(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
@@ -393,6 +397,12 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
             "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
         ),
     )
+    # Four SAME-NAMED configs on one shared Postgres state, at once — the
+    # deployment shape the shared-state docs recommend; blessed and crashed.
+    shared_state.verify_shared_state_same_name(led)
+    # The partner's warehouse layout: base + buffer + `compact`, and loads batched
+    # under BigQuery's per-job partition cap.
+    warehouse_layout.verify_warehouse_layout(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),

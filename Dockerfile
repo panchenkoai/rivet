@@ -22,6 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
+# `.git` is outside the build context; the commit for `--version` comes in here.
+ARG RIVET_GIT_SHA=unknown
+ENV RIVET_GIT_SHA=$RIVET_GIT_SHA
 RUN cargo build --release --locked
 
 # Stage 3: runtime

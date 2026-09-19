@@ -585,8 +585,15 @@ pub(super) fn run_diagnosis(
                  if it tracks this export, {remedy}"
             ));
         } else {
+            // Solo too the counter is server-global: a partner's production
+            // source logged ~1 tmp-disk table per SECOND of its own traffic on
+            // two baselines of very different size (45 in 42 s, 995 in 17 min),
+            // while ten keyset pages on a quiet stand log none
+            // (`mysql_keyset_pages_create_no_tmp_disk_tables`). Say so.
             flags.push(format!(
-                "{spills} {spill_unit} — the source spilled to disk; {remedy}"
+                "{spills} {spill_unit} server-wide during this export's window — the counter \
+                 is server-global, so other sessions' work counts too; if the source is \
+                 otherwise quiet this export spilled it: {remedy}"
             ));
         }
     }
@@ -799,11 +806,7 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> O
 /// Aggregation needs every export accounted for, even those that never reached
 /// `RunSummary::new`.
 pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -> RunSummary {
-    let run_id = format!(
-        "{}_{}",
-        export_name,
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%3f"),
-    );
+    let run_id = super::summary::fresh_run_id(export_name);
     let journal = crate::journal::RunJournal::new(&run_id, export_name);
     RunSummary {
         bytes_read: 0,
@@ -1457,8 +1460,12 @@ fn run_export_job_inner(
             // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
             // the two are the same string anyway.
             if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
-                && let Err(e) =
-                    state.mark_snapshot_done(&export.name, table, &summary.journal.run_id)
+                && let Err(e) = state.mark_snapshot_done(
+                    &export.name,
+                    table,
+                    &super::cdc_job::snapshot_key(&synth.destination),
+                    &summary.journal.run_id,
+                )
             {
                 log::warn!(
                     "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",
@@ -1470,6 +1477,25 @@ fn run_export_job_inner(
         }
         return super::cdc_job::run_cdc_export(config_path, config, export, state);
     }
+    // A base-and-buffer table's rows carry the delete flag as DATA. `LOAD DATA`
+    // fills a column the FILE lacks with NULL — never with the column's DEFAULT,
+    // measured twice on a live BigQuery — so a first pass that did not write it
+    // left every row's `__is_deleted` NULL and `WHERE NOT __is_deleted` returned
+    // nothing at all (found by dogfooding the batch cycle). The CDC baseline leg
+    // sets the same flag from `cdc_job`; this is the batch half of one rule.
+    // `None` for the captured table: a multiplex `tables:` export is CDC, and CDC returned
+    // above — the batch half never has one to answer for.
+    let owned_export;
+    let export = if crate::load::plan::resolved_layout(config, export, None).log_is_disposable()
+        && crate::load::plan::resolved_deleted_flag(config, export, None)
+    {
+        let mut e = export.clone();
+        e.meta_columns.deleted_flag = true;
+        owned_export = e;
+        &owned_export
+    } else {
+        export
+    };
     let plan = match build_plan(
         config,
         export,
@@ -1609,6 +1635,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     chunk_source: chunked::ChunkSource,
     config_path: &str,
     apply_context: Option<crate::pipeline::summary::ApplyContext>,
+    record_load_spec: bool,
 ) -> (Result<()>, RunSummary) {
     // Re-validate the plan from the artifact (fast, no DB queries).
     let diags = validate_plan(plan);
@@ -1657,7 +1684,10 @@ pub(crate) fn run_export_job_with_chunk_source(
             apply_context,
             allow_reconcile: false,
             notifications: None,
-            record_load_spec: false,
+            // The caller's config decides, exactly as on the run path: apply
+            // records the load spec afterwards, and a spec recorded WITHOUT the
+            // key it never asked for wiped the key `rivet run` had recorded.
+            record_load_spec,
             plan_warnings: Vec::new(),
         },
     )
@@ -2091,8 +2121,10 @@ mod tests {
         let spills = [("Created_tmp_disk_tables".to_string(), 240_i64)];
         let solo = run_diagnosis(&s(), &spills, false).expect("spills must diagnose");
         assert!(
-            solo.contains("the source spilled to disk"),
-            "solo attribution stays direct: {solo}"
+            solo.contains("server-global")
+                && solo.contains("otherwise quiet")
+                && solo.contains("lower `chunk_size`"),
+            "solo attribution names the counter scope and keeps the lever: {solo}"
         );
         let pooled = run_diagnosis(&s(), &spills, true).expect("spills must diagnose");
         assert!(
@@ -2391,6 +2423,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
+            partition_rollover: None,
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
             is_split_unit: false,

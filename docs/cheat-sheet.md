@@ -130,7 +130,7 @@ Source prerequisites:
 | Engine | Server config |
 |---|---|
 | **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1` |
-| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended) |
+| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended), binlog retention ≫ the run interval |
 | **SQL Server** | SQL Server Agent running; Enterprise / Standard / Developer (not Express/Web) |
 | **MongoDB** | Replica set required (`?directConnection=true` for a port-mapped single node) |
 
@@ -143,6 +143,15 @@ Grants for the selected engine:
 Rules of thumb:
 
 - MySQL: connect **directly**, not through ProxySQL/MaxScale. Give rivet a unique `server_id`.
+- **MySQL on RDS / Aurora: two settings that are not in `my.cnf`.** Binary logging
+  follows automated backups — with retention at 0 the instance runs `log_bin = 0`
+  and every binlog query answers `ERROR 1381`, whatever the parameter group says.
+  And retention is *not* `binlog_expire_logs_seconds`: RDS purges a binlog as soon
+  as the engine no longer needs it, so the next run's resume dies with `ERROR 1236`
+  (measured: a checkpoint taken at 13:42 was already past retention at 13:59).
+  Set it explicitly, well above the run interval:
+  `CALL mysql.rds_set_configuration('binlog retention hours', 72);`
+  A read replica also needs `log_replica_updates = 1`.
 - PostgreSQL: an abandoned slot pins WAL and fills the disk. Drop it with
   `SELECT pg_drop_replication_slot('{{SLOT}}');`. Set `max_slot_wal_keep_size` to cap it.
 - SQL Server: change-table retention defaults to about 3 days. A run that falls
@@ -164,7 +173,7 @@ exports:
     format: parquet
     cdc:
       initial: snapshot            # first run: anchor → full snapshot → drain stream
-      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for MySQL/MSSQL with initial: snapshot
+      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for a baseline (initial:/backfill:) on every engine but PostgreSQL; MySQL/MongoDB need it for any mode: cdc
       until_current: true          # default: drain to the log end as of open, then exit
       {{CDC_PARAM}}
       # rollover: 100000           # rows per part (≈ drain memory)
@@ -284,8 +293,8 @@ Recovery:
 | Symptom | Action |
 |---|---|
 | Run failed | Re-run. The checkpoint did not advance, so the data is re-read, not lost |
-| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-snapshot (`initial: snapshot` or `mode: full`), then start from a fresh checkpoint |
-| MySQL checkpoint used against another server | Refused on purpose. Re-snapshot on the new host |
+| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-baseline in ONE run (the run anchors first, then re-reads the baseline): delete the checkpoint (MySQL/MSSQL/Mongo) or let the slot be recreated (PG), AND clear the export's `cdc_snapshot` row + `snapshot/_SUCCESS`, AND truncate `<table>__changes` before the next load. Deleting the checkpoint alone is refused (prior-run evidence exists) |
+| MySQL checkpoint used against another server | Refused on purpose. Same order on the new host: fresh checkpoint first, then re-snapshot |
 
 ---
 
@@ -312,7 +321,8 @@ load:
 exports:
   - name: {{NAME}}
     # ...
-    load: { pk: [{{PK}}], partition: none }   # per-export override (every field except target)
+    load: { pk: [{{PK}}], partition: none }   # per-export override: pk, cluster_by, partition, cleanup_source, gc_orphans, allow_source_drift
+    # a multiplex `tables:` stream adds `tables: { <table>: { pk: [...], partition: none } }` — one block per captured table
 ```
 
 Required target fields: BigQuery takes `project` and `dataset`. Snowflake takes

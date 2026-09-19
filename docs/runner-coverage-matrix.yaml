@@ -458,3 +458,11 @@ scenarios:
     chunked_checkpoint: { na: "shared seam (run_export_job wrapper)" }
     keyset:         { na: "shared seam (run_export_job wrapper)" }
     mongo_parallel: { na: "shared seam (run_export_job wrapper); the Mongo capture itself is proven by run_records_the_load_spec_of_a_mongo_collection" }
+
+  - id: cdc_backfill_leg
+    what: "the CDC baseline leg under `cdc.backfill:` BORROWS its recipe's read (mode, key, workers, page size, resume, tuning, column types narrowed by the table label) and keeps its own identity and prefix — built once in `apply_backfill_recipe` and dispatched through the ordinary `run_export_job`, so WHICH runner runs is the recipe's mode, and no runner re-applies anything the leg could bypass. The cells name the recipe mode each is proven with."
+    single:         { test: full_cdc_cycle_mysql }
+    chunked:        { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
+    chunked_checkpoint: { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
+    keyset:         { test: a_crashed_keyset_baseline_finishes_on_the_next_plain_run }
+    mongo_parallel: { na: "the leg is the recipe dispatched as a batch export (shared seam); a Mongo recipe is proven live with a full-scan recipe (full_cdc_cycle_mongo), a parallel-Mongo recipe borrows the same fields (backfill_leg_borrows_the_recipe_read_and_keeps_its_own_identity)" }

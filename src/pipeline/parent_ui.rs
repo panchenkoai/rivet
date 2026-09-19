@@ -106,6 +106,11 @@ pub(crate) fn sanitize_terminal(text: &str) -> String {
 #[derive(Debug)]
 pub(crate) enum UiMessage {
     Event(ChildEvent),
+    /// A formatted `log` line from this process while the renderer owns the
+    /// screen: printed ABOVE the card block, which is then repainted below it.
+    /// Written straight to stderr it lands between two frames, the cursor-up
+    /// count is off by one, and the block is duplicated into scrollback.
+    Log(String),
     /// Child's stdout closed without a `Finished` event.  Carries the export
     /// name and an optional terminal verdict from `wait()`.
     ChildClosed {
@@ -331,6 +336,15 @@ impl Renderer {
     fn process_message(&mut self, msg: UiMessage) {
         match msg {
             UiMessage::Event(ev) => self.handle_event(ev),
+            UiMessage::Log(line) => {
+                let out = log_frame(self.last_drawn_lines, &line);
+                let mut handle = std::io::stderr().lock();
+                let _ = handle.write_all(out.as_bytes());
+                let _ = handle.flush();
+                // The block below the line is stale now; the next redraw
+                // repaints it from the fresh anchor instead of walking up.
+                self.last_drawn_lines = 0;
+            }
             UiMessage::ChildClosed {
                 export_name,
                 wait_status,
@@ -655,6 +669,21 @@ fn render_final_line(
     )
 }
 
+/// The bytes that put one log line ABOVE a card block of `last_drawn_lines`
+/// lines: walk up to the block's anchor, print the line there, and leave the
+/// cursor where the next `redraw()` (from a zero anchor) repaints the block.
+fn log_frame(last_drawn_lines: usize, line: &str) -> String {
+    let mut out = String::new();
+    // Cursor control only when there IS a block to walk over: the linear renderer
+    // (piped stderr) must stay free of escape bytes — a capture grades that.
+    if last_drawn_lines > 0 {
+        out.push_str(&format!("\x1b[{last_drawn_lines}A\r\x1b[2K"));
+    }
+    out.push_str(&sanitize_terminal(line));
+    out.push('\n');
+    out
+}
+
 fn pick_width() -> usize {
     // `console::Term::stderr().size()` returns `(rows, cols)` if attached to a
     // tty, otherwise falls back to `(24, 80)` — that fallback is fine.
@@ -725,7 +754,7 @@ fn fmt_duration_ms(ms: i64) -> String {
 /// is folded. `destination::cloud`'s own interceptor test still adds 2 outside
 /// this lock, so the assertions stay delta-based with room for that.
 #[cfg(test)]
-pub(super) fn retry_counter_test_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn retry_counter_test_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK
 }
@@ -733,6 +762,39 @@ pub(super) fn retry_counter_test_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `log` line during an interactive run lands ABOVE the block (cursor up
+    /// to the anchor, print, newline) and resets the anchor, so the next redraw
+    /// repaints below it instead of walking up past a line it did not draw —
+    /// the off-by-one that duplicated a partner's card into scrollback.
+    #[test]
+    fn a_log_line_is_printed_above_the_block_and_resets_the_anchor() {
+        assert_eq!(
+            log_frame(3, "[WARN rivet] slow"),
+            "\x1b[3A\r\x1b[2K[WARN rivet] slow\n"
+        );
+        assert_eq!(
+            log_frame(0, "x"),
+            "x\n",
+            "no block (linear renderer, or before the first frame): the bare line, no escape bytes"
+        );
+        assert_eq!(
+            log_frame(3, "y"),
+            "\x1b[3A\r\x1b[2Ky\n",
+            "over a block: walk up, erase, print"
+        );
+        assert!(
+            !log_frame(0, "\x1b]0;evil\x07").contains("\x1b]0;"),
+            "control bytes inside the line are neutralised before they reach the tty"
+        );
+        let mut r = Renderer::new(80, 4);
+        r.last_drawn_lines = 3;
+        r.process_message(UiMessage::Log("x".into()));
+        assert_eq!(
+            r.last_drawn_lines, 0,
+            "the anchor is reset for the next redraw"
+        );
+    }
 
     /// The renderer must NOT fold a retry counter that arrived over the
     /// IN-PROCESS channel — that counter is this process's own.

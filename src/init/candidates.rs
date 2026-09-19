@@ -5,7 +5,7 @@
 
 use super::{
     ChunkCandidate, CursorCandidate, CursorCandidateReason, TableInfo, is_integer_type,
-    is_timestamp_type,
+    is_mutation_stamp, is_timestamp_type,
 };
 
 /// Rank every plausible cursor candidate.
@@ -31,16 +31,12 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
             continue;
         }
 
-        match col.name.as_str() {
-            "updated_at" | "modified_at" => {
-                reasons.push(CursorCandidateReason::NameSuggestsUpdated);
-                score += 40;
-            }
-            "created_at" => {
-                reasons.push(CursorCandidateReason::NameSuggestsCreated);
-                score += 20;
-            }
-            _ => {}
+        if is_mutation_stamp(&col.name) {
+            reasons.push(CursorCandidateReason::NameSuggestsUpdated);
+            score += 40;
+        } else if col.name == "created_at" {
+            reasons.push(CursorCandidateReason::NameSuggestsCreated);
+            score += 20;
         }
 
         if col.is_nullable {
@@ -146,6 +142,28 @@ mod tests {
             c.reasons
                 .contains(&CursorCandidateReason::NameSuggestsUpdated)
         }));
+    }
+
+    /// A mutation stamp that is not spelled `updated_at` must still outrank the
+    /// create-only column. Measured on a dogfood stand 2026-09-18: the scorer knew
+    /// exactly two literals, so `created_at` (+20 name) beat `changed_at` (+0) and
+    /// init wrote the create-only column as `cursor_column` — on a table where all
+    /// 1000 rows had `changed_at > created_at`, an incremental export that misses
+    /// 100% of updates. RED against the old `"updated_at" | "modified_at"` arm.
+    #[test]
+    fn a_mutation_stamp_spelled_otherwise_still_outranks_created_at() {
+        for stamp in ["changed_at", "last_modified", "update_date"] {
+            let t = table(vec![
+                col("id", "bigint", true, false),
+                col("created_at", "timestamp", false, false),
+                col(stamp, "timestamp", false, false),
+            ]);
+            let cands = cursor_candidates(&t);
+            assert_eq!(
+                cands[0].column, stamp,
+                "'{stamp}' moves on update, 'created_at' does not — it must lead"
+            );
+        }
     }
 
     #[test]

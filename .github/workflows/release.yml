@@ -323,6 +323,8 @@ jobs:
           # the final multi-arch tag.  `push-by-digest=true` is the
           # canonical knob for this two-step flow.
           outputs: type=image,name=ghcr.io/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # `.git` is not in the context; `rivet --version` gets the commit from here.
+          build-args: RIVET_GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.arch_tag }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch_tag }}
 

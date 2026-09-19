@@ -95,6 +95,28 @@ impl MongoTest {
         });
     }
 
+    /// Drop the whole test database this helper is connected to.
+    pub fn drop_database(&self) {
+        self.rt.block_on(async {
+            let _ = self.client.database(&self.db).drop().await;
+        });
+    }
+}
+
+/// Drops a per-test MongoDB database when it goes out of scope — a scenario that
+/// names a fresh `unique_name` database per run must not leave one behind per run.
+pub struct MongoDbGuard {
+    pub port: u16,
+    pub db: String,
+}
+
+impl Drop for MongoDbGuard {
+    fn drop(&mut self) {
+        MongoTest::connect(self.port, &self.db).drop_database();
+    }
+}
+
+impl MongoTest {
     pub fn insert_many(&self, name: &str, docs: Vec<Document>) {
         self.rt.block_on(async {
             self.coll(name)

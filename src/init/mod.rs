@@ -146,6 +146,23 @@ impl TableInfo {
             .map(|c| c.column)
     }
 
+    /// Best candidate for the warehouse PARTITION column: the business date the
+    /// rows are ABOUT, not the stamp that moves when a row changes. The mirror of
+    /// [`best_cursor_column`], which wants the opposite — partitioning by a
+    /// mutation stamp would move a row between partitions on every update.
+    pub(crate) fn best_partition_column(&self) -> Option<&str> {
+        let ts: Vec<&ColumnInfo> = self
+            .columns
+            .iter()
+            .filter(|c| is_timestamp_type(&c.data_type))
+            .collect();
+        ts.iter()
+            .find(|c| c.name == "created_at" || c.name == "made_at" || c.name == "occurred_at")
+            .or_else(|| ts.iter().find(|c| !is_mutation_stamp(&c.name)))
+            .or_else(|| ts.first())
+            .map(|c| c.name.as_str())
+    }
+
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
@@ -154,7 +171,7 @@ impl TableInfo {
             .collect();
         ts_cols
             .iter()
-            .find(|c| c.name == "updated_at" || c.name == "modified_at")
+            .find(|c| is_mutation_stamp(&c.name))
             .or_else(|| ts_cols.iter().find(|c| c.name == "created_at"))
             .or_else(|| ts_cols.first())
             .map(|c| c.name.as_str())
@@ -364,6 +381,28 @@ fn is_timestamp_type(t: &str) -> bool {
     t.contains("timestamp") || t == "datetime" || t == "date"
 }
 
+/// Whether the column name means "this stamp moves when the row CHANGES". The
+/// cursor picker wants one (only a mutation stamp catches updates); the warehouse
+/// partition key must avoid one (a row would hop partitions on every update). One
+/// predicate, because the same two literals were repeated at three sites and the
+/// partition mirror had already drifted from the cursor one.
+fn is_mutation_stamp(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "updated_at"
+            | "modified_at"
+            | "changed_at"
+            | "last_updated"
+            | "last_modified"
+            | "last_changed"
+            | "updated_on"
+            | "modified_on"
+            | "changed_on"
+            | "update_date"
+            | "modified_date"
+    )
+}
+
 /// Whether a column of this type can be a KEYSET (seek) key — i.e. the keyset
 /// cursor can read + compare it (`WHERE key > last ORDER BY key`). MUST mirror the
 /// planner's `keyset_keys` restriction (`source::TableIntrospection`): integer /
@@ -497,6 +536,11 @@ pub struct InitYamlDestination {
     pub gcs_credentials_file: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_region: Option<String>,
+    /// `--bigquery-project` / `--bigquery-dataset`: when both are given the
+    /// scaffold carries a `load:` block, so the generated config drives the
+    /// warehouse half of the cycle too.
+    pub bigquery_project: Option<String>,
+    pub bigquery_dataset: Option<String>,
 }
 
 impl InitYamlDestination {
@@ -611,7 +655,16 @@ pub fn init(
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block(path, provenance));
+                eprint!(
+                    "{}",
+                    next_steps_block(
+                        path,
+                        provenance,
+                        mode_override,
+                        text.contains("      backfill: auto"),
+                        text.contains("\nload:")
+                    )
+                );
             }
         }
         None => {
@@ -619,7 +672,16 @@ pub fn init(
             // on stderr so `rivet init | tee rivet.yaml` isn't a dead end.
             print!("{text}");
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block("rivet.yaml", provenance));
+                eprint!(
+                    "{}",
+                    next_steps_block(
+                        "rivet.yaml",
+                        provenance,
+                        mode_override,
+                        text.contains("      backfill: auto"),
+                        text.contains("\nload:")
+                    )
+                );
             }
         }
     }
@@ -631,7 +693,16 @@ pub fn init(
 /// inline `--source` URL it leads with a step-0 export reminder, because the
 /// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
 /// literal URL) and would otherwise fail on an unset variable.
-fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
+/// `has_backfill` is read off the scaffold itself (`backfill: auto` present): only the
+/// consolidated multi-table shape carries a baseline; the per-table CDC scaffold
+/// (SQL Server, MongoDB, a non-`public` schema, a single table) captures changes only.
+fn next_steps_block(
+    path: &str,
+    provenance: &SourceProvenance,
+    mode: Option<&str>,
+    has_backfill: bool,
+    has_load: bool,
+) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
         s.push_str(
@@ -643,12 +714,39 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
          2. rivet check  -c {path}            # column-type & schema report\n  \
          3. rivet run    -c {path} --validate # export, then verify row counts\n"
     ));
-    s.push_str(&format!(
-        "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
-         rivet plan  -c {path}                    # review the schedule (read-only)\n  \
-         rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
-         rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
-    ));
+    // A CDC scaffold has no batch plan: `rivet plan` skips every export in it and
+    // stops with "nothing to plan". Its schedule is the run itself.
+    if mode == Some("cdc") && has_backfill {
+        s.push_str(&format!(
+            "\nThe first run anchors the stream and reads every table's baseline through its \
+             recipe; each later run captures only the changes since. Put it on a schedule:\n  \
+             rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
+        ));
+    } else if mode == Some("cdc") {
+        s.push_str(&format!(
+            "\nThis stream captures CHANGES ONLY from its anchor on — the baseline is yours: add \
+             `cdc.initial: snapshot`, or a batch export of the table plus `cdc.backfill: auto`. \
+             Then put it on a schedule:\n  \
+             rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
+             rivet plan  -c {path}                    # review the schedule (read-only)\n  \
+             rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
+             rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
+        ));
+    }
+    // A scaffold that names a warehouse has two more steps: the extract alone
+    // leaves Parquet in a bucket, and the cycle an operator repeats is
+    // run -> load -> compact.
+    if has_load {
+        s.push_str(&format!(
+            "\nThen the warehouse half of the cycle (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # Parquet -> the base, or the buffer on later runs\n  \
+             rivet compact -c {path}                  # merge the buffer into the base and drop it\n"
+        ));
+    }
     s
 }
 
@@ -1229,9 +1327,52 @@ mod tests {
     /// content directly — including the read-only-vs-annotate distinction the
     /// 2026-08-20 plan change added — so the stubs die at the lib gate and the
     /// help text can't silently drift back to "plan writes waves".
+    /// A CDC scaffold's next steps end in `rivet run`, never `rivet plan`: plan
+    /// skips every export in such a config and stops with "nothing to plan".
+    #[test]
+    fn next_steps_block_for_cdc_schedules_the_run_not_a_plan() {
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            true,
+            false,
+        );
+        assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
+        assert!(
+            !s.contains("--annotate-waves") && !s.contains("rivet apply"),
+            "a cdc config has no batch plan to seal; block:\n{s}"
+        );
+        assert!(
+            s.contains("rivet run   -c rivet.yaml") && s.contains("through its recipe"),
+            "block:\n{s}"
+        );
+        // The per-table scaffold (SQL Server, Mongo, a single table) has NO baseline:
+        // promising one "through its recipe" would send the operator to capture
+        // changes over history nobody loaded.
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+            false,
+        );
+        assert!(
+            s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
+            "a capture-only scaffold must say so; block:\n{s}"
+        );
+        assert!(s.contains("cdc.backfill: auto") && s.contains("cdc.initial: snapshot"));
+    }
+
     #[test]
     fn next_steps_block_shows_read_only_plan_then_annotate() {
-        let s = super::next_steps_block("rivet.yaml", &super::SourceProvenance::Env("X".into()));
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            None,
+            false,
+            false,
+        );
         // The core three-step path is always present.
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1552,6 +1693,22 @@ mod tests {
             ],
         );
         assert_eq!(info.best_cursor_column(), Some("updated_at"));
+    }
+
+    /// The partition key is the date the rows are ABOUT, so it must skip EVERY
+    /// mutation stamp, not just the two spelled `updated_at`/`modified_at` — a row
+    /// partitioned by `changed_at` hops partitions on every update. RED against the
+    /// old two-literal exclusion, which took `changed_at` because it came first.
+    #[test]
+    fn partition_column_skips_a_mutation_stamp_spelled_otherwise() {
+        let info = make_table(
+            0,
+            vec![
+                col("changed_at", "timestamp", false),
+                col("event_date", "date", false),
+            ],
+        );
+        assert_eq!(info.best_partition_column(), Some("event_date"));
     }
 
     #[test]
@@ -1877,6 +2034,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: None,
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1904,6 +2063,8 @@ mod tests {
             gcs_credentials_file: Some("/path/sa.json".to_string()),
             s3_bucket: None,
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1931,6 +2092,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("my-s3-bucket".to_string()),
             s3_region: Some("eu-central-1".to_string()),
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1963,6 +2126,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("b".to_string()),
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1984,6 +2149,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("s".into()),
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

@@ -216,6 +216,12 @@ pub(super) fn table_shape_clauses(
     s
 }
 
+/// Replace `target` with a zero-copy clone of `staging` — the atomic hand-off of a
+/// whole-table load that arrived in several jobs.
+pub(super) fn build_clone_sql(target: &str, staging: &str) -> String {
+    format!("CREATE OR REPLACE TABLE `{target}` CLONE `{staging}`;")
+}
+
 /// A `FROM FILES(...)` Parquet source list.
 ///
 /// `enable_list_inference = true` collapses rivet's 3-level Parquet LIST

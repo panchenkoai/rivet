@@ -566,4 +566,110 @@ exclude_re = [
     # so `|`→`^` yields the identical value — no witness input exists.
     "replace \\| with \\^ in spill_is_held",
     "replace \\| with \\^ in SpillFile::create",
+
+    # ── cdc.backfill by reference (2026-09-17 in-diff triage, 222 mutants) ────
+    # Each entry below is a LIVE-ONLY body: it opens a real source, a BigQuery
+    # REST session or a binlog, so `--lib --bins` executes none of it and the
+    # whole-function stub is unkillable offline by construction. Every DECISION
+    # inside has been pulled into a named pure predicate with a unit test in the
+    # same triage (`batch_plan_skip_reason`, `without_backfill_recipes`,
+    # `classify_drift`, `split_key_list`); what stays is sequencing and I/O. Each
+    # is graded LIVE — the test named is the one that goes RED against the stub.
+    #
+    # BigQuery drift glue: `existing_shape` is a tables.get over REST; the verdict
+    # is `classify_drift` (bigquery/shape.rs, unit-tested in bigquery/tests.rs).
+    # Live: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild
+    # (changelog_drift) and bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step
+    # (adoption_drift — the refusal of a full load onto a differently partitioned table).
+    "replace BigQueryLoader::drift_of -> Result<Option<super::ChangelogDrift>>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::changelog_drift -> Result<Option<super::ChangelogDrift>>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::adoption_drift -> Result<Option<super::ChangelogDrift>>",
+    # The CDC job's two source-bound bodies: the baseline pairing (opens the source
+    # to type-check each recipe) and the drain itself. Live: full_cdc_cycle_{mysql,
+    # mssql,mongo} — a stubbed baseline leaves the warehouse short of the seed, a
+    # stubbed drain captures nothing. NOT the postgres variant for the baseline stub:
+    # `CdcScenario::pg_with` creates the slot BEFORE the seed, so the stream carries
+    # the seed rows and the warehouse is whole without any baseline — green, not
+    # evidence. partner_shape_three_tables_one_stream_postgres (slot created by the
+    # product at run 1, after the seed) is the PG oracle.
+    "replace initial_snapshot_pending -> Result<Vec<ExportConfig>>",
+    "replace run_cdc_inner -> \\(Vec<crate::manifest::RunManifest>, Result<\\(\\)>\\)",
+    # `capture_load_units` connects to the source to type the load spec. Live:
+    # the_recipe_column_types_reach_the_stream_and_the_recorded_spec (Decimal(12,4)
+    # from the recipe must land in the spec).
+    "replace capture_and_record -> Result<\\(\\)>",
+    # information_schema query; the empty/non-empty decision is `split_key_list`.
+    # Live: a_wide_composite_key_is_recorded_whole_mysql (the GROUP_CONCAT case).
+    "replace <impl super::Source for MysqlSource>::primary_key -> Result<Option<Vec<String>>>",
+    # Binlog framing inside the live-only `MysqlChangeStream::fill` (already
+    # excluded above): the commit-marker close and the rows-event arm. `true`
+    # never defers a past-bound commit (until_current open-bound tests), `false`
+    # never closes a transaction and the arm deletion captures no rows (full cycle).
+    "replace MysqlChangeStream::close_transaction_at -> bool",
+    "delete match arm Some\\(EventData::RowsEvent\\(re\\)\\) in MysqlChangeStream::fill",
+    # `pin_plan_to_its_run` (load/orchestrate.rs) lists a real store's manifests
+    # and reads the state DB; the decision it feeds — rebuilding the plan from one
+    # run's spec — is `retype_plan` (unit-tested). Stubbed to `Ok(plan.clone())` it
+    # is the pre-fix behaviour. Live:
+    # a_load_is_typed_from_its_own_run_not_from_the_last_writer_of_its_name
+    # (two `users` exports on one Postgres state). MEASURED under the stub
+    # (2026-09-17): the mysql load SUCCEEDS and BigQuery's catalog shows the
+    # postgres export's columns `["_id", "w"]` on the mysql table — a silent wrong
+    # DDL, not a refusal; the test reads INFORMATION_SCHEMA, never rivet's exit.
+    # The release gate's parallel engine matrix races exactly that.
+    "replace pin_plan_to_its_run -> Result<load::plan::LoadPlan>",
+    # The base-and-buffer siblings of `load_one_cdc` / `run_loads` (2026-09-17):
+    # the same live-only script (state DB, bucket listing, a BigQuery loader), so
+    # their body stubs are born MISSED for the documented reason above. Their
+    # decisions are named predicates next door, each unit-tested: `is_baseline_leg`
+    # (RED against the name-based classifier that overwrote the base with a delta),
+    # `buffer_uris`, `base_done_line`; `run_compacts` decides through the loader's
+    # `compact_*_sql` builders (unit-tested) and `lease_busy_message`. Live:
+    # tests/live/live_cdc_compact.rs (both cells) and the `warehouse_layout` gate cell.
+    "replace load_one_cdc_base ->",
+    "replace run_compacts ->",
+    # (`redact::install_logger` is NOT excluded: the gate's offline coverage shows
+    # the CLI tests execute it through the binary — `--lib --bins` grades its stub.)
+    # The BigQuery loader's REST methods (load/bigquery/mod.rs, load/bq_rest.rs):
+    # each is ONE call to the BigQuery API (a query job, a table GET, a DDL
+    # statement) wrapped in the labelled `run_sql` seam — no offline test can run
+    # them, so their body stubs are born MISSED (2026-09-17: they entered the
+    # in-diff scope because every method took the `rivet_op` label). What each one
+    # DECIDES is next door and graded: the SQL it sends (`ddl.rs`, `cdc.rs`
+    # builders incl. `plan_compact_merges`), the batches it packs
+    # (`partition_budget::plan_load_batches`), the row it parses
+    # (`bq_rest::parse_first_row`). Live: live_load_spec, live_cdc_compact,
+    # live_load_partition_batches, the `warehouse_layout` / `partner_shape` gate cells.
+    "replace BigQueryLoader::batches -> Result<Vec<Vec<String>>>",
+    "replace BigQueryLoader::count_rows -> Result<u64>",
+    "replace <impl TargetLoader for BigQueryLoader>::materialize -> Result<u64>",
+    "replace <impl TargetLoader for BigQueryLoader>::append_changelog -> Result<u64>",
+    "replace <impl TargetLoader for BigQueryLoader>::changes_has_prior_changes -> Result<bool>",
+    "replace <impl TargetLoader for BigQueryLoader>::column_overlap -> Result<\\(u64, u64\\)>",
+    "replace <impl TargetLoader for BigQueryLoader>::adopt_as_changelog -> Result<\\(\\)>",
+    "replace <impl TargetLoader for BigQueryLoader>::create_view -> Result<\\(\\)>",
+    "replace <impl TargetLoader for BigQueryLoader>::compact -> Result<crate::load::CompactReport>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_changelog -> Result<\\(\\)>",
+    "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_leftovers -> Result<Vec<String>>",
+    "replace BigQueryApi::run_query_first_row -> Result<Vec<Option<String>>>",
+    # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
+    # filtering and the redacting line are graded (`redact::logger_tests`).
+    "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",
+    # `flock(fd, LOCK_EX | LOCK_NB)`: EQUIVALENT, by the constants. The two flags
+    # are disjoint bits (LOCK_EX = 2, LOCK_NB = 4), so `|` and `^` both evaluate to
+    # 6 and NO input can tell them apart. The lock itself is graded: the lease's
+    # own unit test takes it twice in one process, and the live
+    # `two_compacts_at_once_admit_one_and_apply_each_change_once` proves it across
+    # two.
+    "replace \\| with \\^ in StateStore::try_load_lease",
+    # `run_cdc_export` (pipeline/cdc_job.rs) is the CDC run's live-only script:
+    # a run-status row in the state DB, the anchor + backfill + drain against a
+    # real source, manifests in a real destination, the summary card. Every
+    # decision it makes is a named predicate or a pure builder next door
+    # (`cdc_metric_row`, `cdc_summary`, `initial_snapshot_pending`, …), and its
+    # stub is caught by every live CDC test (the run captures nothing and the
+    # independent readback reads zero rows). Entered the in-diff scope for the
+    # peak-RSS bracket (graded live: the backfill cycle test reads
+    # `export_metrics.peak_rss_mb` back).
+    "replace run_cdc_export -> \\(Result<\\(\\)>, RunSummary\\)",
 ]

@@ -31,6 +31,11 @@ pub struct LoadSection {
     pub cluster_by: KeyColumns,
     /// How the table the load writes is partitioned; `None` leaves it flat.
     pub partition: Option<PartitionSpec>,
+    /// Where the current state lives; `None` = derive it from the export's mode.
+    pub layout: Option<LayoutChoice>,
+    /// Whether a base-and-buffer table carries `__is_deleted`; `None` = derive it
+    /// from the export's mode.
+    pub deleted_flag: Option<bool>,
 }
 
 impl JsonSchema for LoadSection {
@@ -77,6 +82,16 @@ struct RawLoadSection {
     /// key `rivet run` recorded), `none`, or explicit columns; ignored for `full`.
     #[serde(default)]
     pk: KeyColumns,
+    /// `log_view` or `base_buffer` — where the current state lives. Absent derives
+    /// it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest
+    /// changelog+view.
+    #[serde(default)]
+    layout: Option<LayoutChoice>,
+    /// Whether the base carries a `__is_deleted` column. Absent derives it from the
+    /// mode: a CDC stream expresses deletes and gets the flag, a query-based export
+    /// cannot express one and does not — an extra column per row otherwise.
+    #[serde(default)]
+    deleted_flag: Option<bool>,
     /// Load even when a run manifest's source count disagrees with what it extracted
     /// (source→file drift): warn instead of blocking.
     #[serde(default)]
@@ -162,6 +177,8 @@ impl TryFrom<RawLoadSection> for LoadSection {
             gc_orphans: r.gc_orphans,
             cluster_by: r.cluster_by,
             partition: r.partition,
+            layout: r.layout,
+            deleted_flag: r.deleted_flag,
         })
     }
 }
@@ -188,6 +205,12 @@ impl LoadSection {
         }
         if let Some(p) = &o.partition {
             eff.partition = p.clone();
+        }
+        if let Some(l) = o.layout {
+            eff.layout = Some(l);
+        }
+        if let Some(d) = o.deleted_flag {
+            eff.deleted_flag = Some(d);
         }
         eff
     }
@@ -236,10 +259,39 @@ pub struct LoadOverride {
     pub cluster_by: Option<KeyColumns>,
     #[serde(default)]
     pub allow_source_drift: Option<bool>,
+    /// Where this table's current state lives; inherits when absent.
+    #[serde(default)]
+    pub layout: Option<LayoutChoice>,
+    /// Whether this table's base carries `__is_deleted`; inherits when absent.
+    #[serde(default)]
+    pub deleted_flag: Option<bool>,
     /// This table's partitioning; `none` clears an inherited one.
     #[serde(default, deserialize_with = "partition_override")]
     #[schemars(with = "Option<PartitionSetting>")]
     pub partition: Option<Option<PartitionSpec>>,
+    /// On a multiplex `tables:` CDC export: the override for ONE captured table,
+    /// keyed by its name, layered over this block — six tables through one stream
+    /// rarely share a partition column or a key. Every name must be one of the
+    /// export's `tables:`; a nested `tables:` is refused.
+    #[serde(default)]
+    pub tables: std::collections::BTreeMap<String, LoadOverride>,
+}
+
+/// Where an incremental or CDC table's CURRENT STATE lives in the warehouse.
+///
+/// Absent keeps today's rule: a CDC stream with a `backfill:` gets the base and
+/// buffer, everything else the changelog and its view. Written, it decides —
+/// which is how an ordinary query-based `incremental` export gets a PHYSICAL
+/// base that `rivet compact` merges into, instead of a view that re-ranks the
+/// whole log on every read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutChoice {
+    /// `<table>` is the dedup VIEW over `<table>__changes`.
+    LogView,
+    /// `<table>` is a physical base; `<table>__changes` is a disposable buffer
+    /// `rivet compact` merges into it and drops.
+    BaseBuffer,
 }
 
 /// A column list in a `load:` block: `auto` (from the recorded source primary key),
@@ -288,7 +340,7 @@ impl JsonSchema for KeyColumns {
 }
 
 /// A partition granularity: `hour`, `day`, `month` or `year`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Granularity {
     Hour,
@@ -367,6 +419,18 @@ pub enum PartitionForm {
     },
     /// The load time, at a granularity.
     Ingestion(Granularity),
+}
+
+impl PartitionForm {
+    /// The source column the form partitions by, `None` for ingestion time.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            PartitionForm::Column { column, .. } | PartitionForm::Range { column, .. } => {
+                Some(column)
+            }
+            PartitionForm::Ingestion(_) => None,
+        }
+    }
 }
 
 /// The schema of a `partition:` value: `none`, or a block.
@@ -759,6 +823,35 @@ mod tests {
         assert!(
             over.contains("\"partition\"") && !over.contains("\"target\""),
             "{over}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partition_form_tests {
+    use super::*;
+
+    /// The column each `partition:` form keys on. Both the compaction plan and
+    /// `rivet check` resolve the partition column through here, so a wrong name
+    /// prunes the wrong thing — or nothing.
+    #[test]
+    fn a_partition_form_names_the_column_it_keys_on() {
+        let column = PartitionForm::Column {
+            column: "created_at".into(),
+            granularity: Granularity::Day,
+        };
+        assert_eq!(column.column(), Some("created_at"));
+        let range = PartitionForm::Range {
+            column: "bucket".into(),
+            start: 0,
+            end: 1000,
+            interval: 10,
+        };
+        assert_eq!(range.column(), Some("bucket"));
+        assert_eq!(
+            PartitionForm::Ingestion(Granularity::Day).column(),
+            None,
+            "ingestion time is not a source column"
         );
     }
 }

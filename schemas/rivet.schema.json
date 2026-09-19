@@ -925,6 +925,18 @@
             "string",
             "null"
           ]
+        },
+        "backfill": {
+          "description": "Which EXPORTS supply the baseline read (see [`CdcBackfill`]). Absent ⇒ no\nbaseline: the stream captures changes only, and the operator owns the\ninitial load.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CdcBackfill"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -936,6 +948,23 @@
           "description": "Anchor-then-snapshot: create the resume anchor (PostgreSQL slot /\nMySQL binlog checkpoint / SQL Server LSN checkpoint) FIRST, then run a\nfull batch snapshot of each table into `<destination>[/<table>]/snapshot/`,\nthen drain CDC. Because the anchor predates the snapshot read, anything\nchanged during the snapshot also appears in the change stream — an\noverlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,\nenforced by construction instead of operator discipline.",
           "type": "string",
           "const": "snapshot"
+        }
+      ]
+    },
+    "CdcBackfill": {
+      "description": "`auto` (pair each captured table with the export that names it), or a list of export names",
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       ]
     },
@@ -1276,6 +1305,25 @@
           ],
           "default": null
         },
+        "layout": {
+          "description": "Where this table's current state lives; inherits when absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LayoutChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deleted_flag": {
+          "description": "Whether this table's base carries `__is_deleted`; inherits when absent.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "partition": {
           "description": "This table's partitioning; `none` clears an inherited one.",
           "anyOf": [
@@ -1286,6 +1334,13 @@
               "type": "null"
             }
           ]
+        },
+        "tables": {
+          "description": "On a multiplex `tables:` CDC export: the override for ONE captured table,\nkeyed by its name, layered over this block — six tables through one stream\nrarely share a partition column or a key. Every name must be one of the\nexport's `tables:`; a nested `tables:` is refused.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/LoadOverride"
+          }
         }
       },
       "additionalProperties": false
@@ -1305,6 +1360,21 @@
           "items": {
             "type": "string"
           }
+        }
+      ]
+    },
+    "LayoutChoice": {
+      "description": "Where an incremental or CDC table's CURRENT STATE lives in the warehouse.\n\nAbsent keeps today's rule: a CDC stream with a `backfill:` gets the base and\nbuffer, everything else the changelog and its view. Written, it decides —\nwhich is how an ordinary query-based `incremental` export gets a PHYSICAL\nbase that `rivet compact` merges into, instead of a view that re-ranks the\nwhole log on every read.",
+      "oneOf": [
+        {
+          "description": "`<table>` is the dedup VIEW over `<table>__changes`.",
+          "type": "string",
+          "const": "log_view"
+        },
+        {
+          "description": "`<table>` is a physical base; `<table>__changes` is a disposable buffer\n`rivet compact` merges into it and drops.",
+          "type": "string",
+          "const": "base_buffer"
         }
       ]
     },
@@ -1347,7 +1417,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "range": {
           "description": "Integer-range partitioning of an INT64 column.",
@@ -1369,7 +1440,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "expiration_days": {
           "description": "`partition_expiration_days`.",
@@ -1631,6 +1703,25 @@
         "pk": {
           "description": "Dedup key of the incremental/CDC current-state view: `auto` (the source primary\nkey `rivet run` recorded), `none`, or explicit columns; ignored for `full`.",
           "$ref": "#/$defs/KeyColumns"
+        },
+        "layout": {
+          "description": "`log_view` or `base_buffer` — where the current state lives. Absent derives\nit from the mode: a CDC stream with a `backfill:` is base+buffer, the rest\nchangelog+view.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LayoutChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deleted_flag": {
+          "description": "Whether the base carries a `__is_deleted` column. Absent derives it from the\nmode: a CDC stream expresses deletes and gets the flag, a query-based export\ncannot express one and does not — an extra column per row otherwise.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "allow_source_drift": {
           "description": "Load even when a run manifest's source count disagrees with what it extracted\n(source→file drift): warn instead of blocking.",

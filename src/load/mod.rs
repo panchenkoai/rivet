@@ -36,15 +36,38 @@ pub struct LoadReport {
 
 /// Outcome of a CDC change-log load: rows appended to the `<table>__changes`
 /// log plus the current-state dedup view rebuilt over it.
+/// What one `rivet compact` did to one table.
+#[derive(Debug, Clone)]
+pub struct CompactReport {
+    pub base: String,
+    /// Rows the buffer held before the merge.
+    pub changes_rows: u64,
+    /// MERGE statements run (one per partition window).
+    pub merge_jobs: usize,
+    /// Whether a buffer existed to compact at all.
+    pub had_buffer: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CdcLoadReport {
     pub rows_appended: u64,
     pub changes_table: String,
-    pub view: String,
+    /// The table consumers read, named by the driver that built it: the dedup VIEW
+    /// over the changelog, or the physical BASE the buffer is compacted into.
+    pub target: String,
+    pub target_kind: ChangelogTarget,
     /// Whether `cleanup_source` wiped the staged Parquet after this load — mirrors
     /// [`LoadReport::source_cleaned`] so the report + logs reflect it for CDC/
     /// incremental too, instead of discarding it.
     pub source_cleaned: bool,
+}
+
+/// What `CdcLoadReport::target` is: the dedup view of the changelog + view layout,
+/// or the physical base of the base-and-buffer layout (compacted from the buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangelogTarget {
+    View,
+    Base,
 }
 
 /// What a name currently is in the warehouse.
@@ -97,6 +120,23 @@ pub trait TargetLoader {
         pk: &[String],
     ) -> Result<u64>;
 
+    /// Merge `<table>__changes` (the base-and-buffer layout's per-cycle buffer)
+    /// into the base `table` and drop the buffer. `specs` are the base's source
+    /// columns, `pk` the merge key, `engine` how `__pos` orders the changes.
+    fn compact(
+        &self,
+        table: &str,
+        _specs: &[TargetColumnSpec],
+        _pk: &[String],
+        _order: cdc::CompactOrder,
+    ) -> Result<CompactReport> {
+        bail!(
+            "`rivet compact` is BigQuery-only in this release — `{}` targets {:?}",
+            self.fqtn(table),
+            self.warehouse()
+        )
+    }
+
     /// The warehouse this adapter targets — lets the shared driver build the
     /// current-state view SQL (dialect keyword + identifier quoting) in ONE place
     /// per mode instead of once per adapter.
@@ -146,6 +186,10 @@ pub trait ShapeControl {
     /// How `<table>__changes` differs from what the load DECLARES, or `None` when it
     /// matches, is absent, or nothing is declared.
     fn changelog_drift(&self, table: &str) -> Result<Option<ChangelogDrift>>;
+
+    /// The same question of the whole-table `<table>` an append is about to ADOPT as its
+    /// change log — asked BEFORE the rename, so a refusal here changes nothing.
+    fn adoption_drift(&self, table: &str) -> Result<Option<ChangelogDrift>>;
 
     /// Re-cluster `<table>__changes` in place to the load's `cluster_by`.
     fn recluster_changelog(&self, table: &str) -> Result<()>;
@@ -218,6 +262,26 @@ fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool)
             Ok(())
         }
     }
+}
+
+/// Why adopting a whole-table load with a different partition is refused before the rename.
+fn adoption_refusal(
+    table: &str,
+    changes: &str,
+    existing: &str,
+    declared: &str,
+    bytes: Option<u64>,
+) -> String {
+    let reads = bytes.map_or_else(
+        || "every row".to_string(),
+        |b| format!("every row ({})", crate::pipeline::format_bytes(b)),
+    );
+    format!(
+        "`{table}` (an earlier whole-table load) is partitioned by {existing}, the append declares \
+         {declared}; adopting it as `{changes}` cannot re-partition it in place. `rivet load \
+         --rebuild-changelog` adopts it and rebuilds the log with a billed query reading {reads} \
+         — nothing was changed"
+    )
 }
 
 /// Why a changed partition of the change log is refused: the rebuild, and what it reads.
@@ -315,6 +379,59 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+/// What `rivet compact` may do with the base it is about to MERGE into.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompactGate {
+    Go,
+    /// Proceed, saying why the check could not be made.
+    Note(String),
+    Refuse(String),
+}
+
+/// Whether the buffer may be merged into `base_fqtn`, from the two facts the
+/// glue can cheaply fetch: what the base currently IS, and whether the ledger
+/// knows rivet loaded it.
+///
+/// The load path checks both before it overwrites a table; compaction wrote
+/// through BigQuery's own error message instead — `Not found: Table ... in
+/// location US` for an absent base, and NOTHING at all for a base rivet never
+/// loaded, which a MERGE would happily rewrite.
+pub(crate) fn compact_gate(
+    base: ObjectKind,
+    ownership: Ownership,
+    base_fqtn: &str,
+    buffer_fqtn: &str,
+) -> CompactGate {
+    match (base, ownership) {
+        (ObjectKind::Absent, _) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the base table does not \
+             exist. The buffer holds changes for a table that was never loaded — load the \
+             backfill first (the `cdc.backfill:` export builds the base), or drop the buffer \
+             to discard this cycle. Nothing was merged and the buffer is untouched"
+        )),
+        (ObjectKind::View, _) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
+             current-state view of the changelog+view layout, which has no base to merge into. \
+             To move to base+buffer, drop the view and `{buffer_fqtn}`; to stay on the view, \
+             remove `cdc.backfill:` from the export"
+        )),
+        (ObjectKind::Other, _) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
+             table nor a view"
+        )),
+        (ObjectKind::Table, Ownership::Foreign) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
+             DB's load ledger has no record of rivet loading it — a MERGE would rewrite someone \
+             else's rows. Drop or rename it, or point the export at another table"
+        )),
+        (ObjectKind::Table, Ownership::Unknown) => CompactGate::Note(format!(
+            "  note: `{base_fqtn}` exists and there is no load ledger to confirm rivet loaded it \
+             — compacting on its shape alone"
+        )),
+        (ObjectKind::Table, Ownership::Own) => CompactGate::Go,
     }
 }
 
@@ -549,7 +666,7 @@ fn append_and_view(
 ) -> Result<CdcLoadReport> {
     before_write(append_preflight(loader, table, specs, uris, pk, label))?;
 
-    if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership)? {
+    if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership, rebuild_changelog)? {
         eprintln!(
             "  note: `{}` held {rows} rows from an earlier full load — it is now `{}`, the change \
              log this load appends to, and the name becomes the current-state view",
@@ -582,7 +699,8 @@ fn append_and_view(
     Ok(CdcLoadReport {
         rows_appended,
         changes_table: loader.fqtn(&format!("{table}__changes")),
-        view: loader.fqtn(table),
+        target: loader.fqtn(table),
+        target_kind: ChangelogTarget::View,
         source_cleaned,
     })
 }
@@ -640,14 +758,35 @@ fn append_preflight(
 
 /// Turn a table an earlier whole-table load left at the view's name into `<table>__changes`
 /// by renaming it; its rows become the change log's baseline. `None` when there is no such table.
+///
+/// A partition the load cannot re-shape in place is refused HERE, before the rename:
+/// refusing after it left the serving name gone and the view unbuilt, under an error
+/// that said "nothing was changed".
 pub(crate) fn adopt_full_load_table(
     loader: &dyn TargetLoader,
     table: &str,
     specs: &[TargetColumnSpec],
     ownership: Ownership,
+    rebuild: bool,
 ) -> Result<Option<u64>> {
     if !before_write(adoptable(loader, table, specs, ownership))? {
         return Ok(None);
+    }
+    if !rebuild
+        && let Some(shape) = loader.shape()
+        && let Some(ChangelogDrift::Partition {
+            existing,
+            declared,
+            bytes,
+        }) = before_write(shape.adoption_drift(table))?
+    {
+        return Err(refused(adoption_refusal(
+            &loader.fqtn(table),
+            &loader.fqtn(&format!("{table}__changes")),
+            &existing,
+            &declared,
+            bytes,
+        )));
     }
     let changes = format!("{table}__changes");
     let rows = before_write(loader.row_count(table))?;
@@ -744,6 +883,41 @@ pub fn run_load_cdc(
             l.create_view(table, &sql)
         },
     )
+}
+
+/// Append a base-and-buffer stream's change Parquet into `<table>__changes` — the
+/// per-cycle BUFFER `rivet compact` merges into the base and drops. No view, no
+/// adoption of an earlier full table (the base IS a table, by design), no shape
+/// settling: the buffer is created fresh each cycle from the run's own spec.
+#[allow(clippy::too_many_arguments, private_interfaces)]
+pub fn run_load_buffer(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    uris: &[String],
+    pk: &[String],
+    expected_delta: Option<u64>,
+    cleanup: Option<(&GcsStore, &str)>,
+) -> Result<CdcLoadReport> {
+    before_write(append_preflight(loader, table, specs, uris, pk, "CDC"))?;
+    let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
+    if let Some(expected) = expected_delta
+        && rows_appended != expected
+    {
+        bail!(
+            "CDC count validation failed for `{}__changes`: appended {rows_appended} rows, \
+             expected {expected} from the run manifests — investigate before compacting",
+            table
+        );
+    }
+    let source_cleaned = maybe_cleanup(cleanup);
+    Ok(CdcLoadReport {
+        rows_appended,
+        changes_table: loader.fqtn(&format!("{table}__changes")),
+        target: loader.fqtn(table),
+        target_kind: ChangelogTarget::Base,
+        source_cleaned,
+    })
 }
 
 /// Load an INCREMENTAL export's delta: APPEND the parquet into `<table>__changes`
@@ -875,13 +1049,17 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
-        LoadTarget::Bigquery { project, dataset } => Box::new(build_bigquery_loader(
-            project,
-            dataset,
-            plan.partition.as_ref(),
-            &plan.clustering,
-            run_id,
-        )),
+        LoadTarget::Bigquery { project, dataset } => Box::new(
+            build_bigquery_loader(
+                project,
+                dataset,
+                plan.partition.as_ref(),
+                &plan.clustering,
+                run_id,
+            )
+            .batched_by_footers(plan.destination.clone())
+            .layout(plan.layout),
+        ),
         LoadTarget::Snowflake {
             connection,
             warehouse,
@@ -929,14 +1107,14 @@ fn build_bigquery_loader(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
     /// Records every call and returns a canned row count — the seam the driver's
     /// invariants are asserted through, offline.
     #[derive(Default)]
-    struct FakeLoader {
+    pub(crate) struct FakeLoader {
         rows: u64,
         materialized: RefCell<Vec<String>>,
         appended: RefCell<Vec<String>>,
@@ -958,6 +1136,9 @@ mod tests {
             Ok(self.shape_conflict.clone())
         }
         fn changelog_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
+            Ok(self.drift.borrow().clone())
+        }
+        fn adoption_drift(&self, _table: &str) -> Result<Option<ChangelogDrift>> {
             Ok(self.drift.borrow().clone())
         }
         fn recluster_changelog(&self, table: &str) -> Result<()> {
@@ -1074,8 +1255,18 @@ mod tests {
         )
     }
 
-    fn calls(f: &FakeLoader) -> Vec<String> {
+    pub(crate) fn calls(f: &FakeLoader) -> Vec<String> {
         f.calls.borrow().clone()
+    }
+
+    /// A fake for a driver-level test in a SIBLING module (`orchestrate` drives the load
+    /// envelope). The fields stay private — the adapter is reached through this seam, the
+    /// way a test in this module reaches it through the literal.
+    pub(crate) fn fake_loader(rows: u64) -> FakeLoader {
+        FakeLoader {
+            rows,
+            ..Default::default()
+        }
     }
 
     fn changelog_with(drift: ChangelogDrift) -> FakeLoader {
@@ -1281,6 +1472,46 @@ mod tests {
         assert_eq!(f.object_kind("t__changes").unwrap(), ObjectKind::Table);
     }
 
+    /// A whole-table load whose partition the append cannot re-shape is refused
+    /// BEFORE the rename, so the table keeps its name and the operator's next
+    /// command starts from an unchanged warehouse. Refusing after the rename left
+    /// `t` gone and no view, under an error that said "nothing was changed".
+    #[test]
+    fn a_partition_drift_is_refused_before_the_full_load_table_is_adopted() {
+        let f = full_load_left(5);
+        *f.drift.borrow_mut() = Some(ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: None,
+        });
+        let err = format!("{:#}", load_incremental(&f).unwrap_err());
+        assert!(
+            err.contains("nothing was changed") && err.contains("--rebuild-changelog"),
+            "{err}"
+        );
+        assert!(
+            calls(&f).is_empty(),
+            "no rename, no append: {:?}",
+            calls(&f)
+        );
+        assert_eq!(
+            f.object_kind("t").unwrap(),
+            ObjectKind::Table,
+            "the table keeps its name"
+        );
+        assert_eq!(f.object_kind("t__changes").unwrap(), ObjectKind::Absent);
+
+        // Asked for, the rebuild adopts and then rebuilds — the same drift, resolved.
+        let f = full_load_left(5);
+        *f.drift.borrow_mut() = Some(ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: None,
+        });
+        load_incremental_with(&f, Ownership::Own, true).unwrap();
+        assert_eq!(calls(&f), ["adopt t", "rebuild t", "append t"]);
+    }
+
     #[test]
     fn a_table_rivet_did_not_load_is_not_taken_over() {
         let f = full_load_left(5);
@@ -1452,7 +1683,8 @@ mod tests {
         let f = ShortCopy(full_load_left(5));
         let err = format!(
             "{:#}",
-            adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own).unwrap_err()
+            adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own, false)
+                .unwrap_err()
         );
         assert!(err.contains("before the rename"), "{err}");
         assert_eq!(
@@ -1726,6 +1958,51 @@ mod tests {
         );
     }
 
+    /// The buffer append has the same count gate as the changelog append: a short
+    /// buffer fails BEFORE cleanup and before `compact` can merge a partial cycle;
+    /// an exact one reports what it buffered.
+    #[test]
+    fn buffer_delta_mismatch_bails_and_an_exact_delta_reports() {
+        let f = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store_with_prefix(&dir, REL);
+        let err = run_load_buffer(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".into()],
+            Some(5),
+            Some((&store, PREFIX)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CDC count validation failed"), "{err}");
+        assert!(
+            prefix_populated(&store, REL),
+            "cleanup must not run on a failed gate"
+        );
+
+        let ok = run_load_buffer(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".into()],
+            Some(3),
+            None,
+        )
+        .expect("an exact delta passes the gate");
+        assert_eq!(ok.rows_appended, 3);
+        assert!(
+            f.views.borrow().is_empty(),
+            "the buffer layout builds no view"
+        );
+    }
+
     #[test]
     fn cdc_match_builds_view_then_cleans() {
         let f = FakeLoader {
@@ -1974,5 +2251,60 @@ mod tests {
             f.appended.borrow().is_empty() && f.views.borrow().is_empty(),
             "must bail before appending or building the view"
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_gate_tests {
+    use super::*;
+
+    /// Every shape the base can be in when `rivet compact` reaches it. The two
+    /// silent ones are why this exists: an ABSENT base used to surface as
+    /// BigQuery's `Not found: Table`, and a FOREIGN one was not checked at all —
+    /// the MERGE would have rewritten rows rivet never loaded.
+    #[test]
+    fn the_compact_gate_refuses_every_base_that_is_not_rivets_own_table() {
+        let go = compact_gate(ObjectKind::Table, Ownership::Own, "p.d.t", "p.d.t__changes");
+        assert_eq!(go, CompactGate::Go);
+
+        let unknown = compact_gate(
+            ObjectKind::Table,
+            Ownership::Unknown,
+            "p.d.t",
+            "p.d.t__changes",
+        );
+        let CompactGate::Note(note) = unknown else {
+            panic!("a stateless compact proceeds with a note: {unknown:?}")
+        };
+        assert!(note.contains("no load ledger"), "{note}");
+
+        for (kind, ownership, wanted) in [
+            (
+                ObjectKind::Absent,
+                Ownership::Own,
+                "the base table does not exist",
+            ),
+            (ObjectKind::View, Ownership::Own, "that name is a VIEW"),
+            (
+                ObjectKind::Other,
+                Ownership::Own,
+                "neither a table nor a view",
+            ),
+            (
+                ObjectKind::Table,
+                Ownership::Foreign,
+                "no record of rivet loading it",
+            ),
+        ] {
+            let gate = compact_gate(kind, ownership, "p.d.t", "p.d.t__changes");
+            let CompactGate::Refuse(msg) = gate else {
+                panic!("{kind:?}/{ownership:?} must refuse: {gate:?}")
+            };
+            assert!(msg.contains(wanted), "{kind:?}/{ownership:?}: {msg}");
+            assert!(
+                msg.contains("`p.d.t__changes`") && msg.contains("`p.d.t`"),
+                "the refusal names both tables: {msg}"
+            );
+        }
     }
 }

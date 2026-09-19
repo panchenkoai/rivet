@@ -192,6 +192,18 @@ impl BigQueryApi {
         parse_scalar_u64(&results)
     }
 
+    /// Run a query job and read its first row as strings (`NULL` → `None`) — the
+    /// small-probe shape (`MIN` / `MAX` / `COUNT` in one statement).
+    pub(crate) fn run_query_first_row(
+        &self,
+        sql: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<Vec<Option<String>>> {
+        let job_ref = self.settle(self.insert_query_job(sql, labels)?)?;
+        let results = self.get_json(&self.query_results_url(&job_ref), "getQueryResults")?;
+        parse_first_row(&results)
+    }
+
     /// The `tables.get` resource of `dataset.table` when it is a table: metadata, no
     /// query job. `None` for a view, or when nothing has that name.
     pub(crate) fn table_metadata(&self, dataset: &str, table: &str) -> Result<Option<Value>> {
@@ -775,6 +787,26 @@ fn truncate(s: &str, max: usize) -> String {
 /// INT64 — so this parses text, and an absent row is an error rather than a
 /// silent zero (a `COUNT(*)` that returns nothing means the query did not run,
 /// not that the table is empty).
+/// Every cell of `rows[0]` as a string, `None` for a NULL cell.
+pub(crate) fn parse_first_row(results: &Value) -> Result<Vec<Option<String>>> {
+    let fields = results
+        .get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("f"))
+        .and_then(Value::as_array)
+        .context("BigQuery getQueryResults returned no rows[0].f")?;
+    Ok(fields
+        .iter()
+        .map(|f| match f.get("v") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            Some(Value::Bool(b)) => Some(b.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
 pub(crate) fn parse_scalar_u64(results: &Value) -> Result<u64> {
     let cell = results
         .get("rows")
@@ -821,6 +853,30 @@ fn is_transient_status(code: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compaction probe reads one row of mixed cells: text stays text, a
+    /// number renders as its digits, a NULL cell is `None`, and a response with
+    /// no row is an error — never an empty or all-NULL row that reads as "0".
+    #[test]
+    fn the_first_row_keeps_every_cell_and_a_missing_row_is_an_error() {
+        let results = serde_json::json!({
+            "rows": [{ "f": [ { "v": "35" }, { "v": "2024-01-01" }, { "v": null }, { "v": 7 }, { "v": true } ] }]
+        });
+        assert_eq!(
+            parse_first_row(&results).unwrap(),
+            vec![
+                Some("35".to_string()),
+                Some("2024-01-01".to_string()),
+                None,
+                Some("7".to_string()),
+                Some("true".to_string())
+            ]
+        );
+        let err = parse_first_row(&serde_json::json!({ "rows": [] }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no rows[0].f"), "{err}");
+    }
 
     /// The gcloud fallback must ask for the APPLICATION-DEFAULT token, not the
     /// logged-in user's.

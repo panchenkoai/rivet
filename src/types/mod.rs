@@ -62,8 +62,11 @@ pub type ColumnOverrides = std::collections::HashMap<String, RivetType>;
 /// excluded entirely. `table` is the bare table name (no schema part).
 /// This is what makes `columns:` safe on a schema-wide multi-table export —
 /// one table's override can never bleed into a same-named column elsewhere.
-pub fn overrides_for_table(all: &ColumnOverrides, table: &str) -> ColumnOverrides {
-    let mut out: ColumnOverrides = ColumnOverrides::new();
+pub fn overrides_for_table<V: Clone>(
+    all: &std::collections::HashMap<String, V>,
+    table: &str,
+) -> std::collections::HashMap<String, V> {
+    let mut out = std::collections::HashMap::new();
     // Bare keys first…
     for (k, v) in all {
         if !k.contains('.') {
@@ -100,7 +103,10 @@ pub fn overrides_for_table(all: &ColumnOverrides, table: &str) -> ColumnOverride
 ///
 /// `None` means the unit has no table at all (a `query:` export) — config-load
 /// already refuses a qualified key there, so the map passes through whole.
-pub fn overrides_for_unit(all: &ColumnOverrides, unit_table: Option<&str>) -> ColumnOverrides {
+pub fn overrides_for_unit<V: Clone>(
+    all: &std::collections::HashMap<String, V>,
+    unit_table: Option<&str>,
+) -> std::collections::HashMap<String, V> {
     match unit_table {
         Some(t) => overrides_for_table(all, t.rsplit('.').next().unwrap_or(t)),
         None => all.clone(),

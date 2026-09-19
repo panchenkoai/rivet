@@ -35,6 +35,62 @@ engines: [postgres, mysql, mssql, mongo]
 
 # ── the config surface: every field of CdcExportConfig ────────────────────────
 config_fields:
+  - id: backfill
+    coverage: test
+    detail: >-
+      The baseline by REFERENCE: each captured table names the ordinary batch
+      export that already describes how to read it, and the leg borrows that
+      strategy (mode, key, workers, page size, resume, tuning, column types)
+      while still writing where the snapshot leg always wrote — so every load
+      invariant is untouched and the referenced export is a recipe, not a second
+      load target. Absent — every config written before this field — keeps the
+      sweep's `initial_snapshot` path unchanged, and the two are mutually
+      exclusive by config refusal (one baseline per anchor).
+      Pinned offline: the pairing resolves by table name (`auto`) or by an
+      explicit list, and every case that would otherwise present as SUCCESS is a
+      refusal — no export for a captured table, an ambiguous pair, a `query:` or
+      `mode: cdc` export named as a baseline, a reference to a table the stream
+      does not capture, two exports for one table, and partial coverage. The leg
+      the job builds carries the recipe's read fields and the leg's own identity.
+      Proven live, which is where the recipe's OTHER half showed up: the run
+      loop skipped the recipe but the LOAD still demanded a recorded load spec
+      for it, so every config pairing `backfill:` with `load:` refused to load
+      at all until the reports were filtered the same way.
+      The bughunt over the branch then found the same rule missing from the
+      OTHER whole-config entry point (`rivet apply`), from `validate` (a
+      backfilled baseline went unverified and was reported as stray), and from
+      the reserved-`snapshot` name guard; each is pinned below.
+      Per engine: the anchor → baseline → load → delta → load cycle runs live on
+      all four (`full_cdc_cycle_*`, BigQuery as the second reader) and the
+      init-scaffolded three-table stream on MySQL and PostgreSQL
+      (`partner_shape_three_tables_one_stream_*`) — the two engines where init
+      consolidates into one stream; SQL Server and MongoDB keep one export per
+      table, so the multi-table shape has no live cell there. A Mongo recipe must
+      name the collection literally (a dot is not a qualifier there), and on SQL
+      Server the leg's `columns:` are narrowed by the configured LABEL before the
+      catalog spelling is read, or a label-cased key typed the stream and not the
+      leg. The baseline marker is keyed by the table's DESTINATION as well as its
+      name (`cdc_snapshot.prefix`, state v29): on a shared state DB two configs
+      exporting `users` kept one row and the second skipped its baseline —
+      measured with four same-named streams on one Postgres state, run at once.
+    also: resolve_backfill_pairs_tables_with_their_recipe_exports,
+      full_cdc_cycle_mysql, full_cdc_cycle_postgres, full_cdc_cycle_mssql,
+      full_cdc_cycle_mongo, partner_shape_three_tables_one_stream_mysql,
+      partner_shape_three_tables_one_stream_postgres,
+      a_mongo_backfill_recipe_must_name_the_collection_exactly,
+      backfill_leg_keeps_a_label_cased_column_type_when_the_catalog_read_differs,
+      two_captured_tables_with_one_leaf_cannot_carry_recipe_column_types,
+      a_same_named_export_on_another_prefix_has_its_own_baseline,
+      a_crashed_keyset_baseline_finishes_on_the_next_plain_run,
+      same_named_configs_share_a_postgres_state_cdc_cycle,
+      same_named_configs_share_a_postgres_state_batch_cycle,
+      resolve_backfill_refuses_every_pairing_that_would_look_like_success,
+      a_table_named_snapshot_is_refused_under_backfill_as_under_initial,
+      a_backfill_recipe_is_read_once_per_run_and_still_exports_when_named,
+      apply_skips_the_backfill_recipe_exactly_as_run_does,
+      a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run,
+      validate_certifies_the_backfilled_baseline_and_does_not_call_it_stray,
+      repeated_runs_of_one_config_append_only_the_delta_to_the_changelog
   - id: initial
     coverage: swept
     case: initial_snapshot

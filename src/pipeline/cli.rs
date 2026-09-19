@@ -387,7 +387,15 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
     // the declared names instead of silently "Removed 0 chunk run record(s)"
     // (rc=0) — which looked like the resume was abandoned when it was not.
     let config = require_config(config_path)?;
-    if !config.exports.iter().any(|e| e.name == export_name) {
+    // A CDC baseline leg (`<stream>__snapshot_<table>`) is rivet's own name: its
+    // PARENT is the export in the config, and its interrupted chunk run is the one
+    // a changed recipe leaves un-resumable.
+    let parent = crate::manifest::snapshot_family(export_name);
+    if !config
+        .exports
+        .iter()
+        .any(|e| e.name == export_name || e.name == parent)
+    {
         let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
         anyhow::bail!(
             "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state chunks -c {} -e <name>` to inspect a checkpoint.",

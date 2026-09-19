@@ -593,10 +593,19 @@ pub fn load_type_reports(
     crate::load::plan::RecordedKeys,
 )> {
     let policy = TypePolicy::warn_only();
+    // A `cdc.backfill` recipe is a READ recipe, never a load target: the run loop
+    // deliberately does not run it (the rows it describes land in the CDC export's
+    // own `snapshot/` prefix), so it has no recorded load spec and never will.
+    // Typing it here made EVERY config pairing `backfill:` with `load:` refuse to
+    // load at all — "no column types recorded … run `rivet run` for this export
+    // first", advice no run can satisfy. The skip rule the run loop applies has to
+    // hold on this side too; the load plans are built from these reports, so one
+    // filter here covers the typing and the plan set both.
+    let recipes = crate::config::backfill_recipe_names(&config.exports);
     let mut out = Vec::with_capacity(config.exports.len());
     let mut keys = crate::load::plan::RecordedKeys::new();
     let mut failures: Vec<String> = Vec::new();
-    for export in &config.exports {
+    for export in config.exports.iter().filter(|e| !recipes.contains(&e.name)) {
         let units: Vec<Option<String>> = match export.multiplex_tables() {
             Some(tables) => tables.iter().cloned().map(Some).collect(),
             None => vec![None],
@@ -1078,6 +1087,55 @@ mod tests {
         assert!(note.contains("bigquery"), "got: {note}");
         assert!(note.contains("--strict"), "got: {note}");
         assert!(note.contains("exit 0"), "got: {note}");
+    }
+
+    /// A `cdc.backfill` recipe must NOT be typed for the load. The run loop
+    /// deliberately never runs it — it is the READ recipe the CDC export runs
+    /// after the anchor, and its rows land in the CDC export's own `snapshot/`
+    /// prefix — so it has no recorded load spec and never will. Demanding one
+    /// refused EVERY config pairing `backfill:` with `load:`: "no column types
+    /// recorded … run `rivet run` for this export first", advice no run can
+    /// satisfy.
+    ///
+    /// Found by the live BigQuery cycle, pinned here where it costs no
+    /// warehouse: this goes RED the moment the recipe filter is dropped.
+    #[test]
+    fn a_backfill_recipe_is_not_typed_for_the_load() {
+        let yaml = "\nsource:\n  type: mysql\n  url: \"mysql://u:p@localhost:3306/db\"\n\
+             exports:\n  - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: \"/tmp/o\" }\n\
+             \x20 - name: stream\n    tables: [orders]\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: { checkpoint: /tmp/ck, backfill: auto }\n\
+             \x20   destination: { type: local, path: \"/tmp/x\" }\n";
+        let cfg = crate::config::Config::from_yaml(yaml).expect("the valid backfill shape parses");
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        // Only the CDC export ever records a spec; the recipe cannot have one.
+        state
+            .record_load_spec(
+                "stream",
+                Some("orders"),
+                &[crate::state::LoadSpecColumn {
+                    name: "id".into(),
+                    source_type: "bigint".into(),
+                    rivet_type: crate::types::RivetType::Int64,
+                    fidelity: crate::types::TypeFidelity::Exact,
+                    nullable: false,
+                    warnings: Vec::new(),
+                }],
+                Some(&["id".to_string()]),
+                "run-1",
+            )
+            .expect("record the cdc export's own spec");
+
+        let target = crate::types::target::ExportTarget::parse("bigquery").expect("bigquery");
+        let (reports, _keys) = load_type_reports(&cfg, &state, target)
+            .expect("the recipe must not be asked for a load spec it can never have");
+        let named: Vec<&str> = reports.iter().map(|r| r.export.as_str()).collect();
+        assert_eq!(
+            named,
+            ["stream"],
+            "only the CDC export is a load target — the recipe is a READ recipe"
+        );
     }
 
     #[test]

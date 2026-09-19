@@ -73,6 +73,41 @@ def _matrix_cfg(*args: str) -> str:
     return p.stdout.strip()
 
 
+def _duckdb_cross_read(led: Ledger, engine: str, dset: str, table: str, bq_json: str) -> None:
+    """Read the loaded table a SECOND way — DuckDB's bigquery extension — and compare.
+
+    `bq` (the CLI the read-back above uses) and DuckDB are two independent
+    readers of one warehouse table. Agreement is worth little by itself; a
+    DISAGREEMENT is the finding, because it says one of the two readers — or the
+    load beneath them — is wrong, and a single reader can never tell you that.
+
+    This leg ADDS a reader, it does not replace the grading `bq` already did:
+    an absent credential or a machine without the community extension is a SKIP
+    that names which, never a silent pass. The import is lazy on purpose — the
+    gate's `--self-test` runs on a bare interpreter and must not need duckdb.
+    """
+    from .duck import Oracle, bq_target  # lazy: --self-test imports no duckdb
+
+    if bq_target() is None:
+        return  # the caller already reported the missing credential
+    n_bq = len(json.loads(bq_json)) if bq_json.strip() else 0
+    try:
+        with Oracle(bigquery=True) as ora:
+            n_duck = ora.scalar(f"SELECT count(*) FROM bq.{dset}.{table}")
+    except Exception as e:  # noqa: BLE001 — a reader that cannot open is a SKIP, not a gate stop
+        led.skipped("bigquery", engine, "duckdb-cross-read", "-",
+                    f"BigQuery[{engine}]: DuckDB reader unavailable — {str(e).splitlines()[0][:120]}",
+                    "no duckdb")
+        return
+    if n_duck == n_bq:
+        led.passed("bigquery", engine, "duckdb-cross-read", "-",
+                   f"BigQuery[{engine}]: two independent readers agree on {n_bq} row(s)")
+    else:
+        led.failed("bigquery", engine, "duckdb-cross-read", "-",
+                   f"BigQuery[{engine}]: readers DISAGREE — bq says {n_bq} row(s), "
+                   f"DuckDB says {n_duck} on {dset}.{table}")
+
+
 def _work_dir() -> Path:
     """The driver exports `WORK` for the whole run; make our own if it did not."""
     env = os.environ.get("WORK")
@@ -440,6 +475,7 @@ def _bq_one_engine(
                      "--format=prettyjson",
                      f"SELECT * FROM `{proj}.{eng_dset}.{exp}` ORDER BY id"], timeout=None)
             got = run(["python3", str(_LIB / "normalize_bq.py")], stdin=q.stdout).stdout.strip()
+            _duckdb_cross_read(led, engine, eng_dset, exp, q.stdout)
     else:
         failed_proc = rp if not rp.ok else lp
         leg = "run" if not rp.ok else "load"

@@ -116,3 +116,17 @@ scenarios:
     chunked:     { na: "chunked has no keyset_incremental variant; its anchor is per-chunk-task state cleared at finalize" }
     keyset:      { test: keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest }
     cdc:         { na: "no keyset anchor" }
+
+  - id: cdc_anchor_before_backfill_baseline
+    what: "under `cdc.backfill:` the anchor (slot / checkpoint pin) is taken BEFORE the recipe reads the baseline, so the baseline overlaps the stream (duplicates, which at-least-once dedups) instead of leaving a gap between snapshot and anchor; the next run captures ONLY the delta, judged by the source's own COUNT/SUM, not rivet's summary"
+    incremental: { na: "no anchor step" }
+    chunked:     { na: "no anchor step" }
+    keyset:      { na: "no anchor step" }
+    cdc:         { test: a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run }
+
+  - id: keyset_ranges_bound_to_their_key_column
+    what: "a parallel keyset run persists its sampled ranges and a resume reloads them with their `done` flags — but the ranges bound the KEY they were sampled on; `chunk_by_key` changed between the crash and the resume (a backfill recipe edited) made a `done` range skip rows of the new key, `status: success`. v29 records `key_column` with the ranges; a resume asking with another key gets none and re-samples. A pre-v29 set (no key recorded) still loads."
+    incremental: { na: "no persisted ranges" }
+    chunked:     { na: "range chunks are fingerprinted with their column (chunk_plan_fingerprint)" }
+    keyset:      { test: persisted_ranges_are_not_reloaded_for_a_different_key_column }
+    cdc:         { na: "the CDC leg borrows the recipe's keyset path — same store, same test" }

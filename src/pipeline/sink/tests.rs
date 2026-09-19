@@ -146,7 +146,7 @@ fn track_quality_counts_nulls() {
     let mut sink = minimal_sink_with_quality(vec!["name".into()], vec![]);
     sink.on_schema(schema).unwrap();
     sink.track_quality(&batch);
-    assert_eq!(sink.quality_null_counts.get("name"), Some(&2));
+    assert_eq!(sink.quality.null_counts.get("name"), Some(&2));
 }
 
 #[test]
@@ -162,13 +162,13 @@ fn track_quality_counts_uniques() {
     let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
     sink.on_schema(schema).unwrap();
     sink.track_quality(&batch);
-    assert_eq!(sink.quality_unique_sets.get("id").unwrap().len(), 3);
+    assert_eq!(sink.quality.unique_sets.get("id").unwrap().len(), 3);
 }
 
 #[test]
 fn run_quality_checks_no_config_returns_empty() {
     let sink = ExportSink {
-        quality_columns: None,
+        quality: QualityTracker::default(),
         total_rows: 100,
         ..minimal_sink()
     };
@@ -178,13 +178,14 @@ fn run_quality_checks_no_config_returns_empty() {
 #[test]
 fn run_quality_checks_detects_excess_nulls() {
     let mut sink = minimal_sink_with_quality(vec!["col".into()], vec![]);
-    sink.quality_columns
+    sink.quality
+        .columns
         .as_mut()
         .unwrap()
         .null_ratio_max
         .insert("col".into(), 0.1);
     sink.total_rows = 100;
-    sink.quality_null_counts.insert("col".into(), 50);
+    sink.quality.null_counts.insert("col".into(), 50);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert!(issues[0].message.contains("null ratio"));
@@ -198,8 +199,8 @@ fn run_quality_checks_detects_duplicates() {
     set.insert(0u64);
     set.insert(1u64);
     set.insert(2u64);
-    sink.quality_unique_sets.insert("id".into(), set);
-    sink.quality_unique_non_null_counts.insert("id".into(), 5);
+    sink.quality.unique_sets.insert("id".into(), set);
+    sink.quality.unique_non_null_counts.insert("id".into(), 5);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert!(issues[0].message.contains("duplicate"));
@@ -209,13 +210,13 @@ fn run_quality_checks_detects_duplicates() {
 
 fn sink_with_unique_cap(unique_cols: Vec<String>, cap: usize) -> ExportSink {
     ExportSink {
-        quality_columns: Some(crate::config::QualityConfig {
+        quality: QualityTracker::new(Some(crate::config::QualityConfig {
             row_count_min: None,
             row_count_max: None,
             null_ratio_max: std::collections::HashMap::new(),
             unique_columns: unique_cols,
             unique_max_entries: Some(cap),
-        }),
+        })),
         ..minimal_sink()
     }
 }
@@ -230,16 +231,17 @@ fn unique_cap_stops_inserting_at_limit() {
     )
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch);
     let set_len = sink
-        .quality_unique_sets
+        .quality
+        .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
     assert!(set_len <= 3, "set must not grow past cap; got {set_len}");
     assert!(
-        sink.quality_unique_capped.contains("id"),
+        sink.quality.unique_capped.contains("id"),
         "id must be flagged as capped"
     );
 }
@@ -248,11 +250,11 @@ fn unique_cap_stops_inserting_at_limit() {
 fn unique_cap_emits_warn_issue_not_fail() {
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
     sink.total_rows = 5;
-    sink.quality_unique_capped.insert("id".into());
+    sink.quality.unique_capped.insert("id".into());
     let mut set = std::collections::HashSet::new();
     set.insert(0u64);
     set.insert(1u64);
-    sink.quality_unique_sets.insert("id".into(), set);
+    sink.quality.unique_sets.insert("id".into(), set);
     let issues = sink.run_quality_checks();
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].severity, crate::quality::Severity::Warn);
@@ -277,12 +279,12 @@ fn unique_no_cap_grows_unbounded() {
     sink.on_schema(schema).unwrap();
     sink.track_quality(&batch);
     assert_eq!(
-        sink.quality_unique_sets.get("id").unwrap().len(),
+        sink.quality.unique_sets.get("id").unwrap().len(),
         10,
         "without cap all distinct values must be tracked"
     );
     assert!(
-        sink.quality_unique_capped.is_empty(),
+        sink.quality.unique_capped.is_empty(),
         "no cap → no column should be flagged"
     );
 }
@@ -302,16 +304,18 @@ fn unique_cap_column_skipped_in_subsequent_batches() {
     )
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch1); // cap hit here
     let len_after_first = sink
-        .quality_unique_sets
+        .quality
+        .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
     sink.track_quality(&batch2); // must be a no-op
     let len_after_second = sink
-        .quality_unique_sets
+        .quality
+        .unique_sets
         .get("id")
         .map(|s| s.len())
         .unwrap_or(0);
@@ -395,13 +399,7 @@ fn minimal_sink() -> ExportSink {
         meta: crate::config::MetaColumns::default(),
         enriched_schema: None,
         exported_at_us: 0,
-        quality_null_counts: std::collections::HashMap::new(),
-        quality_unique_sets: std::collections::HashMap::new(),
-        quality_unique_non_null_counts: std::collections::HashMap::new(),
-        quality_unique_capped: std::collections::HashSet::new(),
-        quality_columns: None,
-        quality_null_indices: Vec::new(),
-        quality_unique_indices: Vec::new(),
+        quality: QualityTracker::default(),
         max_file_size: None,
         completed_parts: Vec::new(),
         strip_internal_column: None,
@@ -415,6 +413,9 @@ fn minimal_sink() -> ExportSink {
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_col: None,
         row_progress: None,
+        partition_rollover: None,
+        partition_col: None,
+        part_buckets: std::collections::HashSet::new(),
     }
 }
 
@@ -424,15 +425,137 @@ fn minimal_sink_with_quality(null_cols: Vec<String>, unique_cols: Vec<String>) -
         null_ratio_max.insert(col.clone(), 0.5);
     }
     ExportSink {
-        quality_columns: Some(crate::config::QualityConfig {
+        quality: QualityTracker::new(Some(crate::config::QualityConfig {
             row_count_min: None,
             row_count_max: None,
             null_ratio_max,
             unique_columns: unique_cols,
             unique_max_entries: None,
-        }),
+        })),
         ..minimal_sink()
     }
+}
+
+// ── partition budget rollover ────────────────────────────────────────────
+
+/// A sink budgeted to `cap` partitions of a `Date32` column named `d`.
+fn sink_with_partition_budget(cap: usize) -> (ExportSink, Arc<Schema>) {
+    let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+    let sink = ExportSink {
+        partition_rollover: Some(crate::plan::rollover::PartitionRollover {
+            column: "d".into(),
+            granularity: crate::config::load::Granularity::Day,
+            cap,
+        }),
+        ..minimal_sink()
+    };
+    (sink, schema)
+}
+
+fn day_batch(schema: &Arc<Schema>, days: Vec<Option<i32>>) -> RecordBatch {
+    RecordBatch::try_new(schema.clone(), vec![Arc::new(Date32Array::from(days))]).unwrap()
+}
+
+/// Nothing splits one Parquet file at load time, so a part that outgrows the load job's
+/// partition budget cannot be loaded at all. The sink must close the part on the row
+/// that would overspend it, mid-batch, and carry the rest into the next one.
+///
+/// RED-proven against deleting the rotation from `on_batch_inner`: no part is completed
+/// and all five days land in one file. It also caught the shipping bug it was written
+/// for — a rotation that did not clear `part_buckets` re-rotated on the same rows for
+/// ever, which surfaced here as a stack overflow. It does NOT grade distinctness (it
+/// stays green when every row is counted as its own partition); the two tests below do.
+#[test]
+fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
+    let (mut sink, schema) = sink_with_partition_budget(3);
+    sink.on_schema(schema.clone()).unwrap();
+    assert!(
+        sink.partition_col.is_some(),
+        "the fixture must resolve the partition column, or it grades nothing"
+    );
+
+    // Five distinct days against a budget of three: days 0,1,2 fill the first part and
+    // day 3 opens the second.
+    sink.on_batch_inner(&day_batch(
+        &schema,
+        vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        sink.completed_parts.len(),
+        1,
+        "the part must be closed before the fourth partition is written"
+    );
+    assert_eq!(
+        sink.completed_parts[0].rows, 3,
+        "the closed part holds exactly the rows that fit its budget"
+    );
+    assert_eq!(
+        sink.part_buckets.len(),
+        2,
+        "the open part carries the remaining two days"
+    );
+    assert_eq!(sink.total_rows, 5, "no row is dropped by the rotation");
+}
+
+/// The budget counts DISTINCT partitions, not rows: a wide batch that all lands in one
+/// day costs one partition and must never rotate.
+///
+/// RED-proven against dropping the already-held check in `rows_that_fit`, which makes
+/// every row spend budget: 5,000 rows then demand 5,000 rotations.
+#[test]
+fn a_wide_batch_inside_one_partition_never_rotates() {
+    let (mut sink, schema) = sink_with_partition_budget(1);
+    sink.on_schema(schema.clone()).unwrap();
+
+    sink.on_batch_inner(&day_batch(&schema, vec![Some(7); 5_000]))
+        .unwrap();
+
+    assert!(
+        sink.completed_parts.is_empty(),
+        "one partition, whatever the row count — nothing to rotate"
+    );
+    assert_eq!(sink.total_rows, 5_000);
+}
+
+/// Rows with a NULL key share the warehouse's one NULL partition, so they cost one
+/// bucket between them — not one each, which would rotate on every row.
+///
+/// RED-proven against the same mutant as the test above: with every row spending budget,
+/// three NULLs rotate twice instead of never.
+#[test]
+fn null_keys_cost_a_single_partition() {
+    let (mut sink, schema) = sink_with_partition_budget(1);
+    sink.on_schema(schema.clone()).unwrap();
+
+    sink.on_batch_inner(&day_batch(&schema, vec![None, None, None]))
+        .unwrap();
+
+    assert!(sink.completed_parts.is_empty(), "one NULL partition in all");
+    assert_eq!(sink.total_rows, 3);
+}
+
+/// An export the load does not partition is sized by `max_file_size` alone — the
+/// counting path must stay off rather than rotate on some default.
+///
+/// This one pins the OFF switch and nothing else: it stays green against every mutant
+/// tried on the budget (the rotation deleted, the distinctness check dropped, the
+/// boundary loosened), because with no partition declared the code under test never
+/// runs. Kept as a guard against a default creeping in, not offered as evidence that
+/// the budget works.
+#[test]
+fn an_unpartitioned_export_is_never_rotated_by_the_budget() {
+    let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+    let mut sink = minimal_sink();
+    sink.on_schema(schema.clone()).unwrap();
+    assert!(sink.partition_col.is_none());
+
+    sink.on_batch_inner(&day_batch(&schema, (0..500).map(Some).collect()))
+        .unwrap();
+
+    assert!(sink.completed_parts.is_empty());
+    assert_eq!(sink.total_rows, 500);
 }
 
 // ── batch memory cap ─────────────────────────────────────────────────────
@@ -639,7 +762,7 @@ fn row_count_min_fires_when_total_rows_is_zero() {
     // total_rows == 0 early return in single.rs, silently bypassing the gate.
     // The check itself is correct — the bug was in the call site.
     let mut sink = minimal_sink();
-    sink.quality_columns = Some(crate::config::QualityConfig {
+    sink.quality.columns = Some(crate::config::QualityConfig {
         row_count_min: Some(100),
         row_count_max: None,
         null_ratio_max: std::collections::HashMap::new(),
@@ -660,7 +783,7 @@ fn row_count_min_fires_when_total_rows_is_zero() {
 #[test]
 fn row_count_min_passes_when_row_count_meets_threshold() {
     let mut sink = minimal_sink();
-    sink.quality_columns = Some(crate::config::QualityConfig {
+    sink.quality.columns = Some(crate::config::QualityConfig {
         row_count_min: Some(5),
         row_count_max: None,
         null_ratio_max: std::collections::HashMap::new(),
@@ -826,15 +949,15 @@ fn gremlin_unique_cap_exact_boundary_no_false_capped_flag() {
     )
     .unwrap();
     let mut sink = sink_with_unique_cap(vec!["id".into()], 5);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&exact_batch);
 
     assert!(
-        !sink.quality_unique_capped.contains("id"),
+        !sink.quality.unique_capped.contains("id"),
         "exactly cap distinct values must NOT set the capped flag"
     );
     assert_eq!(
-        sink.quality_unique_sets.get("id").unwrap().len(),
+        sink.quality.unique_sets.get("id").unwrap().len(),
         5,
         "all 5 distinct values must be tracked"
     );
@@ -845,7 +968,7 @@ fn gremlin_unique_cap_exact_boundary_no_false_capped_flag() {
     sink.track_quality(&overflow_batch);
 
     assert!(
-        sink.quality_unique_capped.contains("id"),
+        sink.quality.unique_capped.contains("id"),
         "cap+1 distinct values must set the capped flag"
     );
 }
@@ -1128,12 +1251,12 @@ fn unique_cap_with_nulls_emits_warn_only_no_false_duplicate_fail() {
     .unwrap();
 
     let mut sink = sink_with_unique_cap(vec!["id".into()], 2);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch);
     sink.total_rows = 5;
 
     assert!(
-        sink.quality_unique_capped.contains("id"),
+        sink.quality.unique_capped.contains("id"),
         "third distinct value past cap=2 must flag the column as capped"
     );
     let issues = sink.run_quality_checks();
@@ -1172,12 +1295,12 @@ fn unique_cap_exact_boundary_trailing_nulls_do_not_trip_cap() {
     .unwrap();
 
     let mut sink = sink_with_unique_cap(vec!["id".into()], 3);
-    sink.quality_unique_indices = vec![(0, "id".into())];
+    sink.quality.unique_indices = vec![(0, "id".into())];
     sink.track_quality(&batch);
     sink.total_rows = 5;
 
     assert!(
-        !sink.quality_unique_capped.contains("id"),
+        !sink.quality.unique_capped.contains("id"),
         "NULL rows after exactly cap distinct values must not trip the cap"
     );
     let issues = sink.run_quality_checks();
@@ -1229,6 +1352,102 @@ fn bytes_read_accumulates_across_sinks_sharing_the_plan_counter() {
         counter.load(Ordering::Relaxed),
         expect_one * 2,
         "both sinks must sum into the ONE run-wide counter"
+    );
+}
+
+// ── Form B value checksums ───────────────────────────────────────────────
+//
+// `value_checksum.rs` grades the fold INSIDE a column and the cross-PART fold in
+// `validate_recorded_checksums`, but that test builds its `recorded` input by
+// summing the parts itself. The producer of that input — `track_checksum` — was
+// observed by nothing, so the sink's own cross-BATCH fold, its Parquet gate and
+// its keyed/un-keyed routing were all ungraded.
+
+/// Two Int64 columns and two rows: one column cannot express a `key ‖ value`
+/// boundary, and one row cannot distinguish `+` from `^` in the fold.
+fn checksum_batch(vs: [i64; 2]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(Int64Array::from(vs.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+fn parquet_sink(checksum_key_col: Option<usize>) -> ExportSink {
+    ExportSink {
+        format_type: crate::config::FormatType::Parquet,
+        checksum_key_col,
+        ..minimal_sink()
+    }
+}
+
+/// A part spanning more than one read batch must ACCUMULATE, not annihilate.
+/// The oracle is relational — two identical contributions must land on exactly
+/// twice one of them — so it grades the operator without re-deriving any hash.
+#[test]
+fn track_checksum_sums_across_batches_within_one_part() {
+    let batch = checksum_batch([10, 20]);
+    let mut sink = parquet_sink(None);
+
+    sink.track_checksum(&batch);
+    let after_one = sink.column_checksums.clone();
+    assert_eq!(after_one.len(), 2, "both columns must be recorded by name");
+    sink.track_checksum(&batch);
+
+    for (name, one) in &after_one {
+        assert_ne!(*one, 0, "column '{name}' must hash to something non-zero");
+        assert_eq!(
+            sink.column_checksums[name],
+            one.wrapping_add(*one),
+            "column '{name}': the second batch must be SUMMED into the accumulator. \
+             `^=` yields 0 here and `=`/`|=` yield the single-batch value — the bug \
+             that shipped, invisible below PROBE_BATCH_SIZE because one batch per \
+             part makes `0 ^ s == 0 + s`"
+        );
+    }
+}
+
+/// With a cursor column resolved the sink must hash `key ‖ value`. A row swap is
+/// invisible to the un-keyed fold by construction (the multiset is unchanged),
+/// which is exactly the corruption the keyed path exists to catch.
+#[test]
+fn track_checksum_routes_through_the_keyed_path_when_a_key_column_is_resolved() {
+    let recorded = |vs: [i64; 2], key: Option<usize>| {
+        let mut sink = parquet_sink(key);
+        sink.track_checksum(&checksum_batch(vs));
+        sink.column_checksums["v"]
+    };
+
+    assert_eq!(
+        recorded([10, 20], None),
+        recorded([20, 10], None),
+        "the un-keyed fold is order-independent — a swap between rows cannot move it"
+    );
+    assert_ne!(
+        recorded([10, 20], Some(0)),
+        recorded([20, 10], Some(0)),
+        "with `checksum_key_col` resolved each cell is hashed against its own key, so \
+         the swap must diverge — RED when the routing collapses to the un-keyed arm"
+    );
+}
+
+/// Only Parquet records Form B: a CSV→Arrow re-read is not byte-faithful, so a
+/// recorded checksum would make `validate --depth full` report phantom corruption.
+#[test]
+fn track_checksum_records_nothing_for_a_non_parquet_export() {
+    let mut sink = minimal_sink();
+    assert_eq!(sink.format_type, crate::config::FormatType::Csv);
+    sink.track_checksum(&checksum_batch([10, 20]));
+    assert!(
+        sink.column_checksums.is_empty(),
+        "a CSV export must record no Form-B checksum"
     );
 }
 

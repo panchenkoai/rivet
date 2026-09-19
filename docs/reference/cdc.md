@@ -117,6 +117,67 @@ then MERGE the CDC parts. MySQL / SQL Server require `cdc.checkpoint:` with
     destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders }
 ```
 
+**`cdc.backfill:` — the baseline by reference, for tables that disagree.**
+`initial: snapshot` synthesizes one single-connection `mode: full` scan per
+captured table. That is right for a small table and wrong for a large
+one — a 313M-row table read end to end on one statement runs into
+`tuning.statement_timeout_s` (300s under the `balanced` profile) long before it
+finishes, while the same table as a batch export, keyset-paged with `parallel: 4`,
+takes ~22 minutes. And a multiplex stream's tables do not agree on how they are
+read: one has a unique `id` and keysets, another has only a non-unique index and
+must range-chunk.
+
+So the baseline is declared by REFERENCE — each captured table names the ordinary
+batch export that already describes how to read it:
+
+```yaml
+exports:
+  - name: orders                 # an ordinary export; `rivet init` already writes it
+    table: orders
+    mode: chunked
+    chunk_by_key: id             # keyset
+    parallel: 4
+    chunk_checkpoint: true       # the baseline is resumable
+    format: parquet
+    destination: { type: gcs, bucket: my-bucket, prefix: exports/orders/ }
+    columns: { price: decimal(10,2) }
+
+  - name: app_cdc
+    tables: [orders]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: /var/lib/rivet/app.ckpt
+      backfill: auto             # or: [orders, …]
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/ }
+```
+
+`auto` pairs each entry of `tables:` with the export whose `table:` names it;
+a list names them explicitly. One `rivet run` then does anchor → baseline → drain,
+and the ordering is what makes it safe: the anchor is taken before the first row
+is read, so a row changed mid-baseline also arrives on the stream and the
+current-state view keeps the higher `(__pos, __seq)`.
+
+What the leg borrows and what stays its own is the whole design. **Borrowed:**
+mode, `chunk_by_key` / `chunk_column`, page size, `parallel`, `chunk_checkpoint`,
+`tuning` and the column types. **Its own:** the name, the `<destination>/<table>/snapshot/`
+prefix, the format and the meta columns — so the referenced export contributes a
+recipe, never a second load target, and every load invariant that holds for a
+synthesized leg holds unchanged here. Types MERGE (the recipe's, with a qualified
+`"table.column"` key on the CDC export still winning); a column both sides declare
+**differently** is refused, because the two legs write into one `<table>__changes`
+and one column cannot have two types.
+
+The run loop skips an export that is named as a backfill recipe, so a full
+`rivet run` reads each table once — `rivet run -e orders` still exports it on its
+own. An interrupted baseline resumes on the next plain `rivet run` from its chunk
+checkpoints (range-chunked and keyset legs alike, both live-proven against a crash
+after the first page — no `--resume`, no synthesized name; a leg whose recipe
+changed after the crash names `rivet state reset-chunks -e <leg>`) and
+leaves the anchor alone; once a table's baseline is recorded (per table, in the
+state DB), later runs go straight to the drain. `cdc.initial:` and `cdc.backfill:`
+both describe the first run's baseline, so config load refuses the pair.
+
 **Multiple CDC exports: each owns its stream resources.** A PostgreSQL slot has
 ONE consumer (a shared slot is advanced past changes the other export never
 read), a MySQL `server_id` has ONE connection (the server kills the older one),
@@ -199,7 +260,10 @@ config shape — see [mongodb.md](mongodb.md)):
   engine — **one** `tables:` export on MySQL (and on PostgreSQL when every table
   is in the `public` schema; mixed schemas fall back to per-table exports),
   **one export per table** (distinct `capture_instance`) on SQL Server — so you
-  never hand-list tables.
+  never hand-list tables. Over two or more tables on MySQL/PostgreSQL the stream
+  gets `backfill: auto` and one batch recipe per table (the baseline read), and
+  its `load:` may carry `tables: { <table>: { pk, partition, cluster_by, … } }`
+  so each captured table has its own warehouse shape.
 - `rivet run -c <config>` drains the whole set; add `--parallel-export-processes`
   to run SQL Server's per-table exports concurrently.
 - `rivet validate -c <config>` descends into every table's prefix **and** its
@@ -282,6 +346,29 @@ Notes:
 - `binlog_row_image = FULL` is MySQL's default; the risk is a source that has set
   it to `MINIMAL` to shrink the binlog — that path needs the column-mask MERGE,
   not the simple overwrite (see [Output shape](#output-shape)).
+- **Amazon RDS / Aurora MySQL: two managed-only settings, and neither is in
+  `my.cnf`.** Both were diagnosed the hard way on a customer replica, a day apart.
+  1. **Binary logging follows automated backups.** With backup retention at 0 the
+     instance runs `log_bin = 0` no matter what the parameter group says, and
+     `SHOW BINARY LOGS` answers `ERROR 1381 (HY000): You are not using binary
+     logging`. Set backup retention above zero (this restarts the instance), then
+     `binlog_format = ROW`, `binlog_row_image = FULL` and `binlog_row_metadata =
+     FULL` in the parameter group. A read replica also needs
+     `log_replica_updates = 1` to re-log what it applies.
+  2. **`binlog_expire_logs_seconds` does not govern retention here.** RDS purges a
+     binlog as soon as the engine itself no longer needs it — typically within
+     minutes — so a checkpoint written by one run is unreadable by the next and
+     the resume fails with **ERROR 1236**. Measured: a checkpoint taken at 13:42
+     was already past retention at 13:59. Set the managed knob instead, sized well
+     above the CDC cadence:
+
+     ```sql
+     CALL mysql.rds_set_configuration('binlog retention hours', 72);
+     CALL mysql.rds_show_configuration;   -- confirm
+     ```
+
+  The filenames are the tell: `mysql-bin-changelog.NNNNNN` is RDS's naming, so an
+  `ERROR 1236` naming one of those is this, not `PURGE BINARY LOGS`.
 
 ### PostgreSQL — the logical slot
 
