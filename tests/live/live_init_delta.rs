@@ -74,6 +74,137 @@ fn init_ok(args: &[&str]) {
     );
 }
 
+/// Run rivet and return what it said, asserting it exited 0.
+fn rivet_ok(args: &[&str], envs: &[(&str, &str)]) -> String {
+    let out = run_rivet_env(args, envs);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "rivet {:?} failed:\n{said}", args[0]);
+    said
+}
+
+/// Removes the GCS prefix a GENERATED config writes to. `BqLive::cleanup` cannot:
+/// it owns `rivet-live/<uniq>`, while init derives `exports/<table>/` and takes no
+/// prefix flag — so without this every run of this test leaks objects into the
+/// shared bucket.
+struct GcsPrefix(String);
+impl Drop for GcsPrefix {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("timeout")
+            .args(["300", "gcloud", "storage", "rm", "-r", "--quiet", &self.0])
+            .output();
+    }
+}
+
+// ── the warehouse half: init → run → load → compact ──────────────────────
+
+/// The cycle init's own next-steps prescribes, driven end to end on the config it
+/// generated: `run` stages Parquet, `load` lands it, `compact` merges the buffer.
+///
+/// Locked down because the chain had no live test through `compact` on the batch
+/// side, and the one defect this branch shipped there — the MERGE handed specs
+/// without `__is_deleted`, so no tombstone was ever written — was found by running
+/// it by hand, not by the suite.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_generated_config_drives_run_then_load_then_compact_into_the_warehouse() {
+    let Some(bq) = BqLive::from_env("init_chain") else {
+        return;
+    };
+    require_alive(LiveService::Postgres);
+    let e = SqlEngine::Pg;
+    let (table, _table_guard) = e.create(
+        "init_chain",
+        "id BIGINT PRIMARY KEY, name TEXT NOT NULL, amount INT NOT NULL, \
+         created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+         changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    let changes = format!("{table}__changes");
+    let _bq_guard = bq.cleanup(&[&table, &changes]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{table}/**", bq.bucket));
+    e.exec(&format!(
+        "INSERT INTO {table} (id, name, amount) SELECT g, 'r'||g, g*10 FROM generate_series(1,10) g"
+    ));
+
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "incremental",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+
+    // 1. First pass: the whole table lands as a plain base, and there is no
+    //    buffer for compact to merge — said so rather than silently doing work.
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(
+        bq.read_bq_table_type(&table).as_deref(),
+        Some("BASE TABLE"),
+        "the first incremental pass lands a table, not a view"
+    );
+    assert_eq!(bq.read_bq_count(&table), "10");
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("COMPACT SKIP"), "no buffer yet: {said}");
+
+    // 2. A delta of five inserts and one UPDATE — the cursor must carry both.
+    e.exec(&format!(
+        "INSERT INTO {table} (id, name, amount) SELECT g, 'r'||g, g*10 FROM generate_series(11,15) g"
+    ));
+    e.exec(&format!(
+        "UPDATE {table} SET amount = 999, changed_at = now() WHERE id = 3"
+    ));
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "6",
+        "five inserts and the update are buffered, not merged"
+    );
+    assert_eq!(
+        bq.read_bq_count(&table),
+        "10",
+        "the base waits for compact — a load never merges"
+    );
+
+    // 3. Compact merges the buffer and drops it; the base equals the source.
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("COMPACT OK"), "{said}");
+    assert_eq!(bq.read_bq_count(&table), "15");
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the buffer is dropped after the merge"
+    );
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(DISTINCT id) AS d, COUNTIF(id = 3 AND amount = 999) AS updated \
+         FROM `{}.{}.{table}`",
+        bq.project, bq.dataset
+    ));
+    assert_eq!(rows[0]["d"].as_str(), Some("15"), "one row per key");
+    assert_eq!(
+        rows[0]["updated"].as_str(),
+        Some("1"),
+        "the UPDATE reached the base through the buffer"
+    );
+}
+
 // ── batch: incremental ────────────────────────────────────────────────────
 
 #[test]
