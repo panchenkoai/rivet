@@ -413,9 +413,7 @@ fn minimal_sink() -> ExportSink {
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_col: None,
         row_progress: None,
-        partition_rollover: None,
-        partition_col: None,
-        part_buckets: std::collections::HashSet::new(),
+        partition: PartBudget::default(),
     }
 }
 
@@ -442,11 +440,11 @@ fn minimal_sink_with_quality(null_cols: Vec<String>, unique_cols: Vec<String>) -
 fn sink_with_partition_budget(cap: usize) -> (ExportSink, Arc<Schema>) {
     let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
     let sink = ExportSink {
-        partition_rollover: Some(crate::plan::rollover::PartitionRollover {
+        partition: PartBudget::new(Some(crate::plan::rollover::PartitionRollover {
             column: "d".into(),
             granularity: crate::config::load::Granularity::Day,
             cap,
-        }),
+        })),
         ..minimal_sink()
     };
     (sink, schema)
@@ -470,7 +468,7 @@ fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
     let (mut sink, schema) = sink_with_partition_budget(3);
     sink.on_schema(schema.clone()).unwrap();
     assert!(
-        sink.partition_col.is_some(),
+        sink.partition.col.is_some(),
         "the fixture must resolve the partition column, or it grades nothing"
     );
 
@@ -492,7 +490,7 @@ fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
         "the closed part holds exactly the rows that fit its budget"
     );
     assert_eq!(
-        sink.part_buckets.len(),
+        sink.partition.buckets.len(),
         2,
         "the open part carries the remaining two days"
     );
@@ -549,7 +547,7 @@ fn an_unpartitioned_export_is_never_rotated_by_the_budget() {
     let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
     let mut sink = minimal_sink();
     sink.on_schema(schema.clone()).unwrap();
-    assert!(sink.partition_col.is_none());
+    assert!(sink.partition.col.is_none());
 
     sink.on_batch_inner(&day_batch(&schema, (0..500).map(Some).collect()))
         .unwrap();
