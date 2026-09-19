@@ -470,8 +470,10 @@ pub fn resolved_deleted_flag(
 ///
 /// Only a base-and-buffer layout has a base to carry it: under the log-and-view layout the
 /// flag lives in the changelog, and a base that is really a view cannot hold a column at
-/// all. Named and offline-graded because both callers are live-only bodies, where an
-/// inline `&&` is a decision the mutation corpus excludes with nothing asked in return.
+/// all. Named and offline-graded because every caller — the CDC baseline leg, the
+/// incremental whole pass and the compaction — is a live-only body, where an inline
+/// `&&` is a decision the mutation corpus excludes with nothing asked in return. Two
+/// of the three know the layout statically and pass `true`; the third computes it.
 pub fn base_carries_delete_flag(base_and_buffer: bool, deleted_flag: bool) -> bool {
     base_and_buffer && deleted_flag
 }

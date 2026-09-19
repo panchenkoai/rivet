@@ -928,6 +928,24 @@ pub struct CompactProbe {
     pub nulls: u64,
 }
 
+/// What every compaction MERGE is built from: the data columns (meta columns and
+/// the delete flag excluded), the key columns, and whether the base carries the
+/// delete flag at all — the one fact that turns the tombstone arm on. One derivation
+/// for both builders, so the filter and the flag cannot drift between them.
+fn merge_inputs<'a>(
+    specs: &'a [TargetColumnSpec],
+    pk: &'a [String],
+) -> (Vec<&'a str>, Vec<&'a str>, bool) {
+    let columns = specs
+        .iter()
+        .map(|s| s.column_name.as_str())
+        .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
+        .collect();
+    let pk_refs = pk.iter().map(String::as_str).collect();
+    let deleted_flag = specs.iter().any(|s| s.column_name == DELETE_FLAG_COLUMN);
+    (columns, pk_refs, deleted_flag)
+}
+
 /// The MERGE statements one compaction runs, decided from the probe alone: none
 /// for an empty buffer; one unbounded MERGE when the base has no partition key
 /// (or the key is the load time); otherwise one per window of the key's range —
@@ -947,13 +965,7 @@ pub fn plan_compact_merges(
     if probe.rows == 0 {
         return Ok(Vec::new());
     }
-    let columns: Vec<&str> = specs
-        .iter()
-        .map(|s| s.column_name.as_str())
-        .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
-        .collect();
-    let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-    let deleted_flag = specs.iter().any(|s| s.column_name == DELETE_FLAG_COLUMN);
+    let (columns, pk_refs, deleted_flag) = merge_inputs(specs, pk);
     let merge = |bound: Option<&RangeBound>, nulls_only: Option<&str>| {
         compact_merge_sql(
             base,
@@ -1053,13 +1065,7 @@ pub fn compact_script_sql(
     day_column: Option<&str>,
 ) -> String {
     let order = order.into();
-    let columns: Vec<&str> = specs
-        .iter()
-        .map(|s| s.column_name.as_str())
-        .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
-        .collect();
-    let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-    let deleted_flag = specs.iter().any(|s| s.column_name == DELETE_FLAG_COLUMN);
+    let (columns, pk_refs, deleted_flag) = merge_inputs(specs, pk);
     let merge = |filter: &MergeFilter| {
         compact_merge_filtered_sql(
             base_fqtn,

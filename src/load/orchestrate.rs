@@ -1164,8 +1164,10 @@ fn load_one_cdc_base(
                 let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &baseline)?;
                 let manifests: Vec<_> = baseline.iter().map(|(_, m)| m.clone()).collect();
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+                // Reached only through `plan.layout.compacts()`, which is the `true`:
+                // the one predicate that owns "does the base carry the flag" is asked.
                 let mut specs = plan.specs.clone();
-                if plan.deleted_flag {
+                if load::plan::base_carries_delete_flag(true, plan.deleted_flag) {
                     specs.push(load::cdc::flag_spec(loader.warehouse()));
                 }
                 let r = load::run_load(
@@ -1390,9 +1392,10 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                     // appends the flag to its own copy. Compact must do the same or
                     // every delete merges as an ordinary upsert and every insert
                     // lands with a NULL flag. `compact_skip_reason` already kept
-                    // non-compacting layouts out, so the flag alone decides here.
+                    // non-compacting layouts out — that gate is the `true` here, so
+                    // the ONE predicate that owns this decision is the one asked.
                     let mut specs = pinned.specs.clone();
-                    if pinned.deleted_flag {
+                    if load::plan::base_carries_delete_flag(true, pinned.deleted_flag) {
                         specs.push(load::cdc::flag_spec(loader.warehouse()));
                     }
                     loader.compact(&pinned.table, &specs, pk, order)
