@@ -1355,6 +1355,102 @@ fn bytes_read_accumulates_across_sinks_sharing_the_plan_counter() {
     );
 }
 
+// ── Form B value checksums ───────────────────────────────────────────────
+//
+// `value_checksum.rs` grades the fold INSIDE a column and the cross-PART fold in
+// `validate_recorded_checksums`, but that test builds its `recorded` input by
+// summing the parts itself. The producer of that input — `track_checksum` — was
+// observed by nothing, so the sink's own cross-BATCH fold, its Parquet gate and
+// its keyed/un-keyed routing were all ungraded.
+
+/// Two Int64 columns and two rows: one column cannot express a `key ‖ value`
+/// boundary, and one row cannot distinguish `+` from `^` in the fold.
+fn checksum_batch(vs: [i64; 2]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(Int64Array::from(vs.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+fn parquet_sink(checksum_key_col: Option<usize>) -> ExportSink {
+    ExportSink {
+        format_type: crate::config::FormatType::Parquet,
+        checksum_key_col,
+        ..minimal_sink()
+    }
+}
+
+/// A part spanning more than one read batch must ACCUMULATE, not annihilate.
+/// The oracle is relational — two identical contributions must land on exactly
+/// twice one of them — so it grades the operator without re-deriving any hash.
+#[test]
+fn track_checksum_sums_across_batches_within_one_part() {
+    let batch = checksum_batch([10, 20]);
+    let mut sink = parquet_sink(None);
+
+    sink.track_checksum(&batch);
+    let after_one = sink.column_checksums.clone();
+    assert_eq!(after_one.len(), 2, "both columns must be recorded by name");
+    sink.track_checksum(&batch);
+
+    for (name, one) in &after_one {
+        assert_ne!(*one, 0, "column '{name}' must hash to something non-zero");
+        assert_eq!(
+            sink.column_checksums[name],
+            one.wrapping_add(*one),
+            "column '{name}': the second batch must be SUMMED into the accumulator. \
+             `^=` yields 0 here and `=`/`|=` yield the single-batch value — the bug \
+             that shipped, invisible below PROBE_BATCH_SIZE because one batch per \
+             part makes `0 ^ s == 0 + s`"
+        );
+    }
+}
+
+/// With a cursor column resolved the sink must hash `key ‖ value`. A row swap is
+/// invisible to the un-keyed fold by construction (the multiset is unchanged),
+/// which is exactly the corruption the keyed path exists to catch.
+#[test]
+fn track_checksum_routes_through_the_keyed_path_when_a_key_column_is_resolved() {
+    let recorded = |vs: [i64; 2], key: Option<usize>| {
+        let mut sink = parquet_sink(key);
+        sink.track_checksum(&checksum_batch(vs));
+        sink.column_checksums["v"]
+    };
+
+    assert_eq!(
+        recorded([10, 20], None),
+        recorded([20, 10], None),
+        "the un-keyed fold is order-independent — a swap between rows cannot move it"
+    );
+    assert_ne!(
+        recorded([10, 20], Some(0)),
+        recorded([20, 10], Some(0)),
+        "with `checksum_key_col` resolved each cell is hashed against its own key, so \
+         the swap must diverge — RED when the routing collapses to the un-keyed arm"
+    );
+}
+
+/// Only Parquet records Form B: a CSV→Arrow re-read is not byte-faithful, so a
+/// recorded checksum would make `validate --depth full` report phantom corruption.
+#[test]
+fn track_checksum_records_nothing_for_a_non_parquet_export() {
+    let mut sink = minimal_sink();
+    assert_eq!(sink.format_type, crate::config::FormatType::Csv);
+    sink.track_checksum(&checksum_batch([10, 20]));
+    assert!(
+        sink.column_checksums.is_empty(),
+        "a CSV export must record no Form-B checksum"
+    );
+}
+
 /// #173: PipelinedSink must FORWARD `set_source_cursor` — the trait's no-op
 /// default silently swallowed the source's lossless keyset token, a latent
 /// wrong-cursor bug the moment a cursor-reporting runner is pipelined. RED
