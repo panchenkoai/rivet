@@ -1392,6 +1392,124 @@ mod tests {
         }
     }
 
+    // ── the second run must be a DELTA, and the file init writes decides it ──
+    //
+    // The guarantee an operator is promised (init's own next-steps text: "each
+    // later run captures only the changes since") is a property of the RUN, but
+    // every mechanism it needs is a decision INIT MAKES: a cursor for
+    // incremental, a resume position for CDC, a base+buffer layout for the load.
+    // Nothing graded those, and the config is generated — so the generator is
+    // the only honest subject. Asserted through the real loader, never a grep of
+    // init's own rendering (same rule as the TLS scaffold test above).
+
+    fn pk(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            is_primary_key: true,
+            is_nullable: false,
+            ..col(name, ty)
+        }
+    }
+
+    fn scaffold(
+        mode: &str,
+        dest: &InitYamlDestination,
+        cols: Vec<ColumnInfo>,
+    ) -> crate::config::Config {
+        let yaml = generate_config(
+            &make_table(cols),
+            "postgresql://localhost/db",
+            &crate::init::SourceProvenance::Inline,
+            dest,
+            Some(mode),
+            None,
+        )
+        .expect("scaffold");
+        crate::config::Config::from_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("the generated config must load: {e:#}\n{yaml}"))
+    }
+
+    /// Without a `cursor_column` an incremental export has no delta mechanism at
+    /// all — every run re-reads the whole table. Init picks the column, so init
+    /// is what must be graded (the scorer already shipped choosing a create-only
+    /// stamp over a mutation stamp once).
+    #[test]
+    fn a_scaffolded_incremental_export_carries_the_cursor_its_second_run_needs() {
+        let cfg = scaffold(
+            "incremental",
+            &Default::default(),
+            vec![pk("id", "bigint"), col("updated_at", "timestamp")],
+        );
+        let e = &cfg.exports[0];
+        assert_eq!(e.mode, crate::config::ExportMode::Incremental);
+        assert_eq!(
+            e.cursor_column.as_deref(),
+            Some("updated_at"),
+            "the generated file must name the cursor the second run resumes from"
+        );
+    }
+
+    /// A CDC stream needs both halves to be repeatable: a `checkpoint:` (the
+    /// resume position — omitting it re-anchors, and on SQL Server re-reads the
+    /// whole change table) and `until_current` (run #1 must END, or there is no
+    /// run #2).
+    #[test]
+    fn a_scaffolded_cdc_export_carries_a_resume_position_and_a_bounded_run() {
+        let cfg = scaffold(
+            "cdc",
+            &Default::default(),
+            vec![pk("id", "bigint"), col("updated_at", "timestamp")],
+        );
+        let e = &cfg.exports[0];
+        assert_eq!(e.mode, crate::config::ExportMode::Cdc);
+        let cdc = e
+            .cdc
+            .as_ref()
+            .expect("a cdc scaffold must carry a cdc: block");
+        assert!(
+            cdc.checkpoint.is_some(),
+            "no checkpoint: the next run re-anchors instead of resuming"
+        );
+        assert!(
+            cdc.until_current,
+            "an unbounded first run never returns, so there is no second run to be a delta"
+        );
+    }
+
+    /// `--bigquery-project/--dataset` is what scaffolds the `load:` block, and a
+    /// DELTA mode must get the base+buffer layout — that is the half that makes
+    /// the second LOAD an append into the buffer rather than an overwrite. A
+    /// whole-table mode must NOT carry it: `rivet compact` openly skips a full
+    /// load, so the key would promise a cycle that never runs.
+    #[test]
+    fn only_a_delta_mode_scaffolds_the_base_and_buffer_load_layout() {
+        let dest = InitYamlDestination {
+            bigquery_project: Some("proj".into()),
+            bigquery_dataset: Some("ds".into()),
+            ..Default::default()
+        };
+        let cols = || vec![pk("id", "bigint"), col("updated_at", "timestamp")];
+
+        for mode in ["incremental", "cdc"] {
+            let cfg = scaffold(mode, &dest, cols());
+            let load = cfg
+                .load
+                .as_ref()
+                .unwrap_or_else(|| panic!("{mode}: --bigquery-* must scaffold a load: block"));
+            assert!(
+                load.layout.is_some(),
+                "{mode} carries deltas, so the load must land base+buffer for compact to merge"
+            );
+        }
+
+        let full = scaffold("full", &dest, cols());
+        let load = full.load.as_ref().expect("full still gets a load: block");
+        assert!(
+            load.layout.is_none(),
+            "a full load overwrites its table — a layout key here promises a compaction \
+             cycle that never runs"
+        );
+    }
+
     /// Bug hunt 2026-08-09: `time_window`'s `time_column` MUST be a timestamp.
     /// `chosen_cursor_column` scores an integer surrogate PK as an incremental
     /// cursor, so on a timestamp-less table it returns the PK — reusing it here
