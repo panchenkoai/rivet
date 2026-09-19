@@ -1384,8 +1384,19 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             // base rivet never loaded was not checked at all. Metadata, no job.
             let report = match compact_gate_of(loader.as_ref(), &pinned.table, state.as_ref()) {
                 Err(e) => Err(e),
-                Ok(()) => compact_order_of(&pinned, engine)
-                    .and_then(|order| loader.compact(&pinned.table, &pinned.specs, pk, order)),
+                Ok(()) => compact_order_of(&pinned, engine).and_then(|order| {
+                    // The MERGE reads its tombstone arm off the specs it is HANDED,
+                    // and the recorded spec holds source columns only — the load leg
+                    // appends the flag to its own copy. Compact must do the same or
+                    // every delete merges as an ordinary upsert and every insert
+                    // lands with a NULL flag. `compact_skip_reason` already kept
+                    // non-compacting layouts out, so the flag alone decides here.
+                    let mut specs = pinned.specs.clone();
+                    if pinned.deleted_flag {
+                        specs.push(load::cdc::flag_spec(loader.warehouse()));
+                    }
+                    loader.compact(&pinned.table, &specs, pk, order)
+                }),
             };
             if let Some(s) = state.as_ref() {
                 let rec = LoadRecord {
