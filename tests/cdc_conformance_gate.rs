@@ -401,6 +401,11 @@ fn derived_capture_marker_set_is_pinned() {
         "run_rivet_bounded(",
         "run_rivet_env(",
         "run_rivet_export(",
+        // `run_rivet_in_dir` — the runner-side twin of `Rig::run_in_dir`, for a
+        // config `rivet init` GENERATED: its relative `destination.path:` resolves
+        // against the process CWD, so running one needs the directory set. It
+        // spawns rivet, so it is a capture marker like its siblings.
+        "run_rivet_in_dir(",
         "run_rivet_ok(",
         "run_rivet_with_warn_log(",
         "run_with_env(",

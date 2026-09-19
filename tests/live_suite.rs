@@ -117,6 +117,8 @@ mod live_harness_canary;
 mod live_incremental_settle;
 #[path = "live/live_init.rs"]
 mod live_init;
+#[path = "live/live_init_delta.rs"]
+mod live_init_delta;
 #[path = "live/live_init_extended.rs"]
 mod live_init_extended;
 #[path = "live/live_keyset.rs"]
