@@ -8,6 +8,7 @@
 //! treats a CDC export like any other.
 
 use super::finalize::finalize_run_report;
+use super::job::classify_error_message;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
@@ -873,6 +874,17 @@ fn cdc_metric_row(
         destination_type,
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         longest_chunk_ms: summary.journal.longest_chunk_ms(),
+        // NOT batch-specific, unlike the chunk/cursor/quality fields above it:
+        // `classify_error_message` is pure, and `cdc_summary` already fills
+        // `error_message`, so a CDC failure can be grouped exactly like a batch
+        // one. Without this every CDC row's `error_class` was NULL and CDC
+        // failures grouped into nothing — the hand-grouping this column exists
+        // to replace (see job.rs, the 0.21.2 field post-mortem classes).
+        error_class: summary
+            .error_message
+            .as_deref()
+            .and_then(classify_error_message)
+            .map(str::to_string),
         ..Default::default()
     }
 }
@@ -983,6 +995,48 @@ mod tests {
         let s = super::cdc_summary("r1", &export, "success", 100, 2, 5_000, 12_345, 50, None);
         assert_eq!(s.bytes_read, 12_345, "read leg must reach the summary");
         assert_eq!(s.bytes_written, 5_000);
+    }
+
+    /// A CDC failure must GROUP like a batch one. `error_class` is not
+    /// batch-specific — `classify_error_message` is pure and `cdc_summary`
+    /// already fills `error_message` — yet every CDC row shipped it NULL, so CDC
+    /// failures grouped into nothing and had to be sorted by hand (the exact
+    /// cost this column was added to remove). RED against deleting the
+    /// `error_class` line in cdc_metric_row (defaults to None).
+    ///
+    /// Both directions, because "always None" and "always Some" are equally
+    /// wrong: a classifiable failure must classify, and a success must not
+    /// invent a class.
+    #[test]
+    fn cdc_metric_row_classifies_a_failure_the_way_the_batch_path_does() {
+        let export = crate::config::sample_export("t");
+        // The literal is one `classify_error_message` actually maps (its own
+        // tests pin this string), so the assertion grades the WIRING, not a
+        // guess about the classifier.
+        let failed = super::cdc_summary(
+            "r1",
+            &export,
+            "failed",
+            0,
+            0,
+            0,
+            0,
+            50,
+            Some("Deadlock found when trying to get lock".to_string()),
+        );
+        let row = super::cdc_metric_row(&failed, Some("mysql".into()), Some("local".into()));
+        assert_eq!(
+            row.error_class.as_deref(),
+            Some("deadlock"),
+            "a CDC failure must carry the same error_class a batch failure would"
+        );
+
+        let ok = super::cdc_summary("r2", &export, "success", 100, 2, 5_000, 12_345, 50, None);
+        let ok_row = super::cdc_metric_row(&ok, Some("mysql".into()), Some("local".into()));
+        assert_eq!(
+            ok_row.error_class, None,
+            "a run with no error message must not invent a class"
+        );
     }
 
     /// #196: the CDC metrics row must carry bytes_read from the summary. RED

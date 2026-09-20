@@ -132,17 +132,22 @@ impl StateStore {
         // row mapper's text() refuses NULL — the running rows are exactly the
         // ones this listing exists for (caught by the e2e test seeding through
         // the REAL begin_run; a hand-seeded '' fixture hid it).
+        // ONE column list for both branches, because the mapper below reads by
+        // POSITION (`r.text(0)`..`r.text(5)`): a column added to one arm and not
+        // the other shifts every field after it, silently and with no compile
+        // error to catch it. The arms may differ in their predicate, never in
+        // what they select.
+        const COLS: &str =
+            "run_id, export_name, prefix, status, started_at, COALESCE(finished_at, '')";
         let sql = if running_only {
-            "SELECT run_id, export_name, prefix, status, started_at,
-                    COALESCE(finished_at, '')
-             FROM run_status WHERE status = 'running'
-             ORDER BY started_at DESC LIMIT ?1"
+            format!(
+                "SELECT {COLS} FROM run_status WHERE status = 'running' \
+                 ORDER BY started_at DESC LIMIT ?1"
+            )
         } else {
-            "SELECT run_id, export_name, prefix, status, started_at,
-                    COALESCE(finished_at, '')
-             FROM run_status ORDER BY started_at DESC LIMIT ?1"
+            format!("SELECT {COLS} FROM run_status ORDER BY started_at DESC LIMIT ?1")
         };
-        self.query(sql, &[(last as i64).into()], |r| RunStatusRow {
+        self.query(&sql, &[(last as i64).into()], |r| RunStatusRow {
             run_id: r.text(0),
             export_name: r.text(1),
             prefix: r.text(2),

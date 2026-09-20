@@ -31,7 +31,7 @@ use crate::destination::Destination;
 use crate::error::Result;
 use crate::manifest::{
     MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource, ManifestStatus,
-    PartStatus, RunManifest,
+    PartStatus, RunManifest, file_token,
 };
 use crate::pipeline::commit::{PartRecord, write_part_file};
 use crate::pipeline::manifest_writer::{write_manifest, write_manifest_without_success_marker};
@@ -382,7 +382,10 @@ pub(crate) fn run_to_files(
     stream: &mut dyn ChangeStream,
     cfg: SinkConfig<'_>,
 ) -> (Vec<RunManifest>, Result<()>) {
-    let run_token = run_token(&cfg.run_id);
+    // `manifest::file_token`, not a local copy: part names (`cdc-<token>-NNNN`)
+    // and the manifest sidecar must sanitize identically, and two implementations
+    // agree only until one of them is edited.
+    let run_token = file_token(&cfg.run_id);
     let read_bytes = std::sync::Arc::clone(&cfg.read_bytes);
     let mut sinks: Vec<TableSink<'_>> = cfg
         .outputs
@@ -689,25 +692,21 @@ fn refine_decimal_scales(columns: &mut [TypeMapping], events: &[ChangeEvent]) {
     }
 }
 
-/// Build one `RecordBatch` from `events`, write it to a temp part, and upload it
-/// through the commit seam (destination write + content-MD5 + transit check).
-/// Filename-safe token from the run id. Part names must be unique per run — a
-/// later run into the same prefix has to append alongside prior parts, never
-/// overwrite them (mirrors the batch path's timestamp-named parts). The CLI path
-/// passes an RFC3339 run id (`:`/`+` — `:` is not even legal on Windows), so map
-/// anything outside `[A-Za-z0-9._-]` to `-`.
-fn run_token(run_id: &str) -> String {
-    run_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
+// The two lines above this note used to be a DOC comment ("Build one
+// `RecordBatch` from `events`, write it to a temp part, and upload it through
+// the commit seam") describing a function that is not in this file — nothing
+// sits between `refine_decimal_scales` and `image_cell`. It was inert only
+// because a second doc comment and `fn run_token` followed it; removing the
+// duplicate exposed it. Deleted rather than re-attached: prose describing code
+// that does not exist is the same defect class as a comment that has gone false.
+//
+// A local `run_token` lived here — byte-identical to `manifest::file_token` —
+// until 2026-09-21. Part names must be unique per run (a later run into the same
+// prefix appends alongside prior parts, never overwrites them) and an RFC3339 run
+// id carries `:`/`+`, illegal on Windows; that is the SAME rule the manifest copy
+// and the SQLite load lease follow, so it lives in one place now. Nothing graded
+// the pair: `file_token_is_the_one_sidecar_sanitizer` asserts file_token's own
+// output and is structurally blind to a second implementation in another file.
 
 /// One cell of a row image — resolved by NAME when the image carries names, by
 /// POSITION when it does not.

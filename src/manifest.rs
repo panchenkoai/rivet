@@ -65,8 +65,11 @@ pub fn run_unique_manifest_name(run_id: &str) -> String {
 
 /// `s` as one safe file-name segment: anything outside `[A-Za-z0-9._-]` becomes
 /// `-` (an RFC3339 run id carries `:`/`+`, a table FQTN carries `.`; Windows
-/// refuses the former). The ONE sanitizer for every per-run / per-table sidecar
-/// — the manifest copy and the SQLite load lease name their files through it.
+/// refuses the former). The ONE sanitizer for every per-run / per-table name —
+/// the manifest copy, the SQLite load lease, and the CDC sink's part names
+/// (`cdc-<token>-NNNN`), which called a byte-identical local copy until
+/// 2026-09-21. The claim is load-bearing: sidecar and part names must agree, so
+/// a second implementation is a divergence waiting for one of them to be edited.
 pub fn file_token(s: &str) -> String {
     s.chars()
         .map(|c| {
