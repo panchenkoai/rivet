@@ -674,7 +674,8 @@ pub fn init(
                         provenance,
                         mode_override,
                         text.contains("      backfill: auto"),
-                        text.contains("\nload:")
+                        text.contains("\nload:"),
+                        text.contains("\n  layout: base_buffer")
                     )
                 );
             }
@@ -691,7 +692,8 @@ pub fn init(
                         provenance,
                         mode_override,
                         text.contains("      backfill: auto"),
-                        text.contains("\nload:")
+                        text.contains("\nload:"),
+                        text.contains("\n  layout: base_buffer")
                     )
                 );
             }
@@ -714,6 +716,7 @@ fn next_steps_block(
     mode: Option<&str>,
     has_backfill: bool,
     has_load: bool,
+    has_compact: bool,
 ) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
@@ -749,14 +752,20 @@ fn next_steps_block(
              rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
         ));
     }
-    // A scaffold that names a warehouse has two more steps: the extract alone
-    // leaves Parquet in a bucket, and the cycle an operator repeats is
-    // run -> load -> compact.
-    if has_load {
+    // A scaffold that names a warehouse has more steps: the extract alone leaves
+    // Parquet in a bucket. The cycle is run -> load -> compact only where the file
+    // declares a base and a buffer (`layout: base_buffer`); a `full` scaffold's load
+    // OVERWRITES its table every pass and `rivet compact` would only say "skipped".
+    if has_load && has_compact {
         s.push_str(&format!(
             "\nThen the warehouse half of the cycle (review `load:` first — its values are guesses):\n  \
              rivet load    -c {path}                  # Parquet -> the base, or the buffer on later runs\n  \
              rivet compact -c {path}                  # merge the buffer into the base and drop it\n"
+        ));
+    } else if has_load {
+        s.push_str(&format!(
+            "\nThen the warehouse half (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # Parquet -> the table; each load OVERWRITES it\n"
         ));
     }
     s
@@ -1376,6 +1385,7 @@ mod tests {
             Some("cdc"),
             true,
             false,
+            false,
         );
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1395,6 +1405,7 @@ mod tests {
             Some("cdc"),
             false,
             false,
+            false,
         );
         assert!(
             s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
@@ -1403,12 +1414,44 @@ mod tests {
         assert!(s.contains("cdc.backfill: auto") && s.contains("cdc.initial: snapshot"));
     }
 
+    /// The terminal block must agree with the file it describes: `rivet compact` is a
+    /// step only where the scaffold declares a base and a buffer. A `full` scaffold
+    /// with a warehouse printed both lines while its own `load:` comment said every
+    /// load OVERWRITES the table and compact would only say "skipped".
+    #[test]
+    fn next_steps_block_prescribes_compact_only_for_a_base_and_buffer_scaffold() {
+        let block = |has_compact: bool| {
+            super::next_steps_block(
+                "rivet.yaml",
+                &super::SourceProvenance::Env("X".into()),
+                None,
+                false,
+                true,
+                has_compact,
+            )
+        };
+        let compacting = block(true);
+        assert!(
+            compacting.contains("rivet load    -c rivet.yaml")
+                && compacting.contains("rivet compact -c rivet.yaml"),
+            "block:\n{compacting}"
+        );
+        let overwriting = block(false);
+        assert!(
+            overwriting.contains("rivet load    -c rivet.yaml")
+                && overwriting.contains("OVERWRITES")
+                && !overwriting.contains("rivet compact"),
+            "block:\n{overwriting}"
+        );
+    }
+
     #[test]
     fn next_steps_block_shows_read_only_plan_then_annotate() {
         let s = super::next_steps_block(
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             None,
+            false,
             false,
             false,
         );

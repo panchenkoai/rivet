@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **A whole-table pass over a base whose buffer still holds rows is refused.** Under
+  `layout: base_buffer` a re-baseline (a re-snapshot after a gap, a fresh whole-table
+  incremental run) replaced the base but left `<table>__changes` as it was, so the next
+  `rivet compact` merged OLDER values over the new base — restoring exactly the pre-gap
+  rows the re-snapshot existed to fix, `COMPACT OK`. The load now refuses by name with
+  the two recoveries (compact first if the buffer belongs to the current base, drop it
+  if the pass re-snapshots past it); nothing is consumed.
+
+- **The baseline leg asks the load's own layout resolver.** `initial: snapshot` under a
+  written `load.layout: base_buffer` derived its layout from `backfill:` presence alone,
+  wrote the snapshot without `__is_deleted`, and `LOAD DATA` filled every row's flag
+  with NULL — the whole backfill invisible to `WHERE NOT __is_deleted`.
+
+- **`layout: base_buffer` needs a warehouse that compacts.** `rivet compact` is
+  BigQuery-only; on Snowflake a stream with a `backfill:` derived a base that froze at
+  the backfill while its buffer grew for ever, with no view and every load prescribing
+  a command that could only fail. A written `base_buffer` is refused at config load
+  outside BigQuery, and the `backfill:` derivation yields the changelog and its view.
+
+- **Messages:** init's next steps prescribe `rivet compact` only for a scaffold that
+  declares a base and a buffer (a `full` scaffold's load OVERWRITES its table); the
+  `COMPACT SKIP` reason names the levers that decide the layout (`cdc.backfill:`,
+  `load.layout:`), not `initial: snapshot`, which decides nothing; the pinned-run
+  refusal names the command that raised it (`compact`, not `load`); the lease refusal
+  names both holders; "drop the buffer" says it discards every change since the last
+  compaction; "N of M failed" counts the tables compaction attempted.
+
 - **`rivet compact` matches a base row under its OLD partition value.** The MERGE
   pruned the base to the days (or the range) found in the BUFFER, so a key whose
   partition column changed between two cycles — a corrected business date, a row

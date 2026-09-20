@@ -406,7 +406,43 @@ impl Config {
         self.validate_cdc_resource_conflicts()?;
         self.validate_csv_exports_are_not_loaded()?;
         self.validate_load_overrides()?;
+        self.validate_layout_has_a_compacting_warehouse()?;
         self.validate_non_sql_source_modes()?;
+        Ok(())
+    }
+
+    /// `layout: base_buffer` promises a `rivet compact`, which is BigQuery-only: on
+    /// another warehouse the base would freeze at the backfill while the buffer grew.
+    fn validate_layout_has_a_compacting_warehouse(&self) -> crate::error::Result<()> {
+        use crate::config::load::LayoutChoice;
+        let Some(load) = &self.load else {
+            return Ok(());
+        };
+        if crate::load::plan::warehouse_compacts(load) {
+            return Ok(());
+        }
+        let base = |l: Option<LayoutChoice>| l == Some(LayoutChoice::BaseBuffer);
+        let written = if base(load.layout) {
+            Some("`load.layout`".to_string())
+        } else {
+            self.exports.iter().find_map(|e| {
+                let o = e.load.as_ref()?;
+                if base(o.layout) {
+                    return Some(format!("export '{}': `load.layout`", e.name));
+                }
+                o.tables
+                    .iter()
+                    .find(|(_, t)| base(t.layout))
+                    .map(|(t, _)| format!("export '{}': `load.tables.{t}.layout`", e.name))
+            })
+        };
+        if let Some(site) = written {
+            anyhow::bail!(
+                "{site}: `base_buffer` needs `target: bigquery` — `rivet compact` is \
+                 BigQuery-only in this release, so the base would never take its buffer. \
+                 Drop the key to keep the changelog and its dedup view"
+            );
+        }
         Ok(())
     }
 

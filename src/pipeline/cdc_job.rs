@@ -404,14 +404,15 @@ pub(super) fn initial_snapshot_pending(
         if let Some(recipe) = crate::config::backfill_recipe_for(&recipes, label) {
             apply_backfill_recipe(&mut synth, recipe, export, label)?;
         }
-        // Base-and-buffer layout (`backfill:`): the leg's rows become the BASE
-        // table, so they carry the delete flag as data and no `__pos` stamp — the
-        // stamp orders rows inside a changelog the base never joins.
-        // `label` is THIS captured table: a multiplex stream's `load.tables.<name>` block
-        // decides per table, and the load plan already honours it. Answering from the
-        // export level here stamped one value into every table's files while the warehouse
-        // expected the per-table one.
-        let base_layout = cdc.backfill.is_some();
+        // Base-and-buffer layout: the leg's rows become the BASE table, so they carry
+        // the delete flag as data and no `__pos` stamp — the stamp orders rows inside
+        // a changelog the base never joins. Asked of the SAME resolver the load uses
+        // (`load.layout:` written, or derived from `backfill:`), for THIS captured
+        // table: deriving it here from `backfill.is_some()` alone wrote an
+        // `initial: snapshot` baseline under a written `layout: base_buffer` without
+        // the flag column, and `LOAD DATA` filled every row's `__is_deleted` with NULL.
+        let base_layout =
+            crate::load::plan::resolved_layout(config, export, Some(label)).compacts();
         synth.meta_columns.deleted_flag = crate::load::plan::base_carries_delete_flag(
             base_layout,
             crate::load::plan::resolved_deleted_flag(config, export, Some(label)),

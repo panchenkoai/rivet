@@ -805,11 +805,9 @@ impl ExportSink {
             self.partition.spend(&buckets[offset..offset + fit]);
             self.write_batch_part(&dest_batch.slice(offset, fit))?;
             offset += fit;
-            // The byte cap may have rotated inside `write_batch_part` already; closing
-            // the fresh part again would ship an empty file and a 0-row manifest entry.
-            if offset < buckets.len() && self.part_rows > 0 {
-                self.split_now()?;
-            }
+            // No rotation here: the `fit == 0` pass above closes a spent part, and the
+            // byte cap may already have rotated inside `write_batch_part` — a second
+            // close would ship an empty file and a 0-row manifest entry.
         }
         Ok(())
     }

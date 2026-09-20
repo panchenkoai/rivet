@@ -511,28 +511,41 @@ pub fn resolved_layout(
     export: &crate::config::ExportConfig,
     table: Option<&str>,
 ) -> CdcLayout {
-    let choice = effective_load(config, export, table).and_then(|eff| eff.layout);
-    cdc_layout(export, load_mode_of(export.mode), choice)
+    let eff = effective_load(config, export, table);
+    let choice = eff.as_ref().and_then(|eff| eff.layout);
+    let compacts = eff.as_ref().is_some_and(warehouse_compacts);
+    cdc_layout(export, load_mode_of(export.mode), choice, compacts)
+}
+
+/// Whether the warehouse can merge a buffer into a base: `rivet compact` is
+/// BigQuery-only, so only there does a base-and-buffer table ever complete a cycle.
+pub(crate) fn warehouse_compacts(section: &LoadSection) -> bool {
+    matches!(section.target, LoadTarget::Bigquery { .. })
 }
 
 fn cdc_layout(
     export: &crate::config::ExportConfig,
     mode: LoadMode,
     choice: Option<crate::config::load::LayoutChoice>,
+    warehouse_compacts: bool,
 ) -> CdcLayout {
     use crate::config::load::LayoutChoice;
     match (mode, choice) {
         // A `full` load overwrites the whole table on every pass: there is no
         // accumulated current state to lay out, so the key means nothing here.
         (LoadMode::Full, _) => CdcLayout::LogAndView,
-        (_, Some(LayoutChoice::BaseBuffer)) => CdcLayout::BaseAndBuffer,
-        (_, Some(LayoutChoice::LogView)) => CdcLayout::LogAndView,
-        // Unwritten: the rule that shipped — a stream with a baseline keeps a
-        // physical base, everything else the changelog and its view.
-        (LoadMode::Cdc, None) => match export.cdc.as_ref().and_then(|c| c.backfill.as_ref()) {
-            Some(_) => CdcLayout::BaseAndBuffer,
-            None => CdcLayout::LogAndView,
-        },
+        // A base without a compaction is a snapshot frozen at the backfill and a buffer
+        // that grows for ever (measured on Snowflake): only a compacting warehouse gets
+        // one — written, or derived from a stream's `backfill:`.
+        (_, Some(LayoutChoice::BaseBuffer)) if warehouse_compacts => CdcLayout::BaseAndBuffer,
+        (LoadMode::Cdc, None) if warehouse_compacts => {
+            match export.cdc.as_ref().and_then(|c| c.backfill.as_ref()) {
+                Some(_) => CdcLayout::BaseAndBuffer,
+                None => CdcLayout::LogAndView,
+            }
+        }
+        // A written `log_view`, an unwritten incremental, or a warehouse that cannot
+        // compact: the changelog and its view.
         _ => CdcLayout::LogAndView,
     }
 }
@@ -769,7 +782,7 @@ fn build_plans_keyed(
             specs,
             gcs_prefix,
             destination: export.destination.clone(),
-            layout: cdc_layout(export, mode, eff_load.layout),
+            layout: cdc_layout(export, mode, eff_load.layout, warehouse_compacts(&eff_load)),
             // A CDC stream can express a delete, a query cannot — so the flag is a
             // column a batch base does not pay for unless its operator asks.
             deleted_flag: eff_load
@@ -2532,6 +2545,27 @@ load:
         );
     }
 
+    /// A stream with a `backfill:` on a warehouse without `rivet compact` (Snowflake)
+    /// keeps the changelog and its view: a base there would freeze at the backfill
+    /// while its buffer grew for ever, with every load prescribing a command that can
+    /// only fail. RED against deriving the layout from the export alone.
+    #[test]
+    fn a_warehouse_without_compact_keeps_the_changelog_and_its_view() {
+        let cfg = serde_yaml_ng::from_str::<crate::config::Config>(
+            "source:\n  type: postgres\n  url: postgresql://localhost/db\nexports:\n\
+             \x20 - name: t\n    table: t\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: { backfill: auto, checkpoint: ./t.ckpt }\n\
+             \x20   destination: { type: gcs, bucket: b, prefix: t/ }\n\
+             load:\n  target: snowflake\n  connection: c\n  warehouse: w\n  database: d\n\
+             \x20 schema: s\n  storage_integration: i\n",
+        )
+        .expect("a config");
+        assert_eq!(
+            resolved_layout(&cfg, &cfg.exports[0], None),
+            CdcLayout::LogAndView
+        );
+    }
+
     /// Whether the base carries `__is_deleted`. A stream expresses deletes, so it
     /// defaults ON there; a query-based export cannot, so it defaults OFF and does
     /// not pay for the column. Written, the key decides either way.
@@ -2699,17 +2733,25 @@ load:
              destination: { type: local, path: /tmp/t }\n",
         );
         assert_eq!(
-            cdc_layout(&with, LoadMode::Cdc, None),
+            cdc_layout(&with, LoadMode::Cdc, None, true),
             CdcLayout::BaseAndBuffer
         );
         assert_eq!(
-            cdc_layout(&without, LoadMode::Cdc, None),
+            cdc_layout(&without, LoadMode::Cdc, None, true),
             CdcLayout::LogAndView
         );
         assert_eq!(
-            cdc_layout(&with, LoadMode::Full, None),
+            cdc_layout(&with, LoadMode::Full, None, true),
             CdcLayout::LogAndView,
             "a batch load of the same export is no CDC layout"
+        );
+        // A warehouse that cannot compact (Snowflake) never gets a base and a buffer:
+        // the base would freeze at the backfill and the buffer grow for ever, with no
+        // view either. RED against deriving the layout from the export alone.
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Cdc, None, false),
+            CdcLayout::LogAndView,
+            "no compaction, no base: the changelog and its view"
         );
         // WRITTEN, the key decides — which is how an ordinary query-based
         // incremental export gets a physical base to compact into.
@@ -2718,23 +2760,24 @@ load:
             cdc_layout(
                 &without,
                 LoadMode::Incremental,
-                Some(LayoutChoice::BaseBuffer)
+                Some(LayoutChoice::BaseBuffer),
+                true
             ),
             CdcLayout::BaseAndBuffer,
             "an incremental export asks for a base by name"
         );
         assert_eq!(
-            cdc_layout(&with, LoadMode::Cdc, Some(LayoutChoice::LogView)),
+            cdc_layout(&with, LoadMode::Cdc, Some(LayoutChoice::LogView), true),
             CdcLayout::LogAndView,
             "written wins over the backfill-derived default"
         );
         assert_eq!(
-            cdc_layout(&with, LoadMode::Full, Some(LayoutChoice::BaseBuffer)),
+            cdc_layout(&with, LoadMode::Full, Some(LayoutChoice::BaseBuffer), true),
             CdcLayout::LogAndView,
             "a full load overwrites the whole table; the key means nothing there"
         );
         assert_eq!(
-            cdc_layout(&without, LoadMode::Incremental, None),
+            cdc_layout(&without, LoadMode::Incremental, None, true),
             CdcLayout::LogAndView,
             "unwritten keeps what shipped"
         );

@@ -350,6 +350,34 @@ pub(crate) fn before_write<T>(r: Result<T>) -> Result<T> {
 }
 
 /// A stop before any warehouse write, with its reason.
+/// A whole-table pass REPLACES the base, but a buffer still holding rows from before
+/// it survives the replacement — and the next `rivet compact` would merge those OLDER
+/// values over the new base (a re-snapshot after a gap restores exactly the pre-gap
+/// rows it existed to fix). Refused by name, nothing consumed; the operator decides
+/// whether the buffer belongs to the current base (compact first) or to the past
+/// (drop it).
+pub(crate) fn stale_buffer_refusal(
+    loader: &dyn TargetLoader,
+    table: &str,
+) -> Result<Option<String>> {
+    let changes = format!("{table}__changes");
+    if loader.object_kind(&changes)? != ObjectKind::Table {
+        return Ok(None);
+    }
+    let rows = loader.row_count(&changes)?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    let (base, buffer) = (loader.fqtn(table), loader.fqtn(&changes));
+    Ok(Some(format!(
+        "refusing to land a whole-table pass of `{base}`: `{buffer}` still holds {rows} change \
+         row(s) from BEFORE it, and the next `rivet compact` would merge those older values \
+         over the new base. If they belong to the CURRENT base, run `rivet compact` first; if \
+         this pass re-snapshots past them, drop `{buffer}`. Then re-run this `rivet load` — \
+         nothing was consumed"
+    )))
+}
+
 pub(crate) fn refused(reason: String) -> anyhow::Error {
     anyhow::Error::new(Refused(anyhow::anyhow!(reason)))
 }
@@ -410,7 +438,8 @@ pub(crate) fn compact_gate(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the base table does not \
              exist. The buffer holds changes for a table that was never loaded — load the \
              backfill first (the `cdc.backfill:` export builds the base), or drop the buffer \
-             to discard this cycle. Nothing was merged and the buffer is untouched"
+             to discard EVERY change buffered since the last compaction (it accumulates \
+             across loads). Nothing was merged and the buffer is untouched"
         )),
         (ObjectKind::View, _) => CompactGate::Refuse(format!(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
@@ -1705,6 +1734,37 @@ pub(crate) mod tests {
             load_incremental(&f).unwrap();
             assert_eq!(calls(&f), ["append t"], "{kind:?}");
         }
+    }
+
+    /// A base replaced while its buffer still holds rows is refused by name; an absent
+    /// or empty buffer (the first cycle, or right after a compaction) lets the pass
+    /// through. RED against landing the whole-table pass regardless.
+    #[test]
+    fn a_whole_table_pass_over_a_buffered_base_is_refused_until_the_buffer_is_dealt_with() {
+        let first_cycle = FakeLoader::default();
+        assert_eq!(stale_buffer_refusal(&first_cycle, "t").unwrap(), None);
+
+        let compacted = FakeLoader {
+            kinds: RefCell::new([("t__changes".to_string(), ObjectKind::Table)].into()),
+            ..Default::default()
+        };
+        assert_eq!(stale_buffer_refusal(&compacted, "t").unwrap(), None);
+
+        let buffered = FakeLoader {
+            kinds: RefCell::new([("t__changes".to_string(), ObjectKind::Table)].into()),
+            counts: RefCell::new([("t__changes".to_string(), 7)].into()),
+            ..Default::default()
+        };
+        let why = stale_buffer_refusal(&buffered, "t")
+            .unwrap()
+            .expect("a buffered base refuses the pass");
+        assert!(
+            why.contains("`db.t__changes` still holds 7 change row(s) from BEFORE it")
+                && why.contains("run `rivet compact` first")
+                && why.contains("drop `db.t__changes`")
+                && why.contains("nothing was consumed"),
+            "{why}"
+        );
     }
 
     #[test]

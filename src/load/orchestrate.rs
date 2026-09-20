@@ -297,9 +297,9 @@ fn pin_plan_to_its_run(
     // by-name spec is exactly what this pin exists to distrust.
     let mut retyped = load::plan::retype_plan(cfg, plan, &spec, target).with_context(|| {
         format!(
-            "load [{}]: the config does not fit the columns run {run_id} recorded — if the \
+            "{op} [{}]: the config does not fit the columns run {run_id} recorded — if the \
              config changed after that run (a new `pk:` / `partition.column`), run `rivet run \
-             -e {}` once so a run records the column, then load again",
+             -e {}` once so a run records the column, then {op} again",
             plan.table, plan.export_name
         )
     })?;
@@ -331,11 +331,13 @@ fn late_runs_refusal(
     })
 }
 
-/// The refusal when another `rivet load` holds the table's lease.
+/// The refusal when another `rivet load` or `rivet compact` holds the table's lease —
+/// both take the same per-table lease, so either may be the holder.
 fn lease_busy_message(target_fqtn: &str) -> String {
     format!(
-        "load: another `rivet load` is writing `{target_fqtn}` right now (the lease is held; \
-         it is released when that process ends, crash included). Wait for it, then retry."
+        "another `rivet load` or `rivet compact` is writing `{target_fqtn}` right now (the \
+         lease is held; it is released when that process ends, crash included). Wait for it, \
+         then retry."
     )
 }
 
@@ -1166,6 +1168,9 @@ fn load_one_cdc_base(
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
                 // Reached only through `plan.layout.compacts()`, which is the `true`:
                 // the one predicate that owns "does the base carry the flag" is asked.
+                if let Some(why) = load::stale_buffer_refusal(loader, &plan.table)? {
+                    anyhow::bail!(why);
+                }
                 let mut specs = plan.specs.clone();
                 if load::plan::base_carries_delete_flag(true, plan.deleted_flag) {
                     specs.push(load::cdc::flag_spec(loader.warehouse()));
@@ -1271,9 +1276,10 @@ fn compact_skip_reason(
         // as a physical base with a disposable buffer has something to merge. An
         // incremental export asks for that with `load.layout: base_buffer`.
         _ if layout.compacts() => None,
-        load::plan::LoadMode::Cdc => {
-            Some("a changelog + view table (`initial: snapshot`); nothing to merge")
-        }
+        load::plan::LoadMode::Cdc => Some(
+            "a changelog + view table (no `cdc.backfill:` and no `load.layout: base_buffer`); \
+             nothing to merge",
+        ),
         load::plan::LoadMode::Incremental => Some(
             "a changelog + view table; `load.layout: base_buffer` gives it a base to merge into",
         ),
@@ -1362,11 +1368,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         None
     };
     let mut failures: Vec<anyhow::Error> = Vec::new();
+    let mut attempted = 0usize;
     for plan in &plans {
         if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
             eprintln!("  compact [{}]: skipped — {why}", plan.table);
             continue;
         }
+        attempted += 1;
         let load_id = format!("{run_id}:{}", plan.table);
         let outcome = (|| -> Result<()> {
             let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
@@ -1447,8 +1455,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         0 => Ok(()),
         1 => Err(failures.pop().unwrap()),
         n => anyhow::bail!(
-            "{n} of {} table(s) failed to compact: {}",
-            plans.len(),
+            "{n} of {attempted} compacted table(s) failed: {}",
             failures
                 .iter()
                 .map(|e| format!("{e:#}"))
@@ -2121,6 +2128,11 @@ fn load_one_incremental(
                 // The base carries the delete flag as DATA, like a CDC baseline:
                 // the buffer's tombstones flip it, and the column must exist from
                 // the first pass or the MERGE has nothing to set.
+                if base_and_buffer
+                    && let Some(why) = load::stale_buffer_refusal(loader, &plan.table)?
+                {
+                    anyhow::bail!(why);
+                }
                 let mut base_specs = plan.specs.clone();
                 if load::plan::base_carries_delete_flag(base_and_buffer, plan.deleted_flag) {
                     base_specs.push(load::cdc::flag_spec(loader.warehouse()));
@@ -2774,9 +2786,13 @@ mod live_only_decisions {
             super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::BaseAndBuffer),
             None
         );
+        // The layout is decided by `cdc.backfill:` / `load.layout:`, never by `initial:`
+        // — the reason must name the levers that exist, not one that changes nothing.
         assert!(
             super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::LogAndView)
-                .is_some_and(|w| w.contains("initial: snapshot"))
+                .is_some_and(|w| w.contains("cdc.backfill:")
+                    && w.contains("load.layout: base_buffer")
+                    && !w.contains("initial:"))
         );
         assert!(
             super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView)

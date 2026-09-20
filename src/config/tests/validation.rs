@@ -1597,3 +1597,39 @@ exports:
     );
     assert!(err.contains("allow_source_drfit"), "{err}");
 }
+
+/// `layout: base_buffer` promises `rivet compact`, which is BigQuery-only: on Snowflake
+/// the base would freeze at the backfill while the buffer grew, and every load would
+/// prescribe a command that can only fail. Refused where the key is written, at every
+/// layer; BigQuery takes it, and Snowflake without the key makes no promise.
+#[test]
+fn a_base_and_buffer_layout_needs_a_compacting_warehouse() {
+    let cfg = |target: &str, export_load: &str| {
+        format!(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n  - name: t\n    \
+             table: t\n    mode: incremental\n    cursor_column: updated_at\n    format: parquet\n    \
+             destination: {{ type: gcs, bucket: b, prefix: t/ }}\n{export_load}load:\n{target}"
+        )
+    };
+    let snowflake = "  target: snowflake\n  connection: c\n  warehouse: w\n  database: d\n  \
+                     schema: s\n  storage_integration: i\n";
+    let bigquery = "  target: bigquery\n  project: p\n  dataset: d\n";
+
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&cfg(&format!("{snowflake}  layout: base_buffer\n"), "")).unwrap_err()
+    );
+    assert!(
+        err.contains("`load.layout`") && err.contains("BigQuery-only"),
+        "{err}"
+    );
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&cfg(snowflake, "    load: { layout: base_buffer }\n")).unwrap_err()
+    );
+    assert!(err.contains("export 't': `load.layout`"), "{err}");
+
+    Config::from_yaml(&cfg(&format!("{bigquery}  layout: base_buffer\n"), ""))
+        .expect("BigQuery compacts, so it may promise a base and a buffer");
+    Config::from_yaml(&cfg(snowflake, "")).expect("no key written, no promise made");
+}
