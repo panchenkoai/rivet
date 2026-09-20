@@ -30,10 +30,13 @@ engines:
       - { tag: "16", image: "postgres:16", port: 55016 }
       - { tag: "18", image: "postgres:18", port: 55018 }
   mysql:
-    # 5.7 is IN as of 2026-08-30. The note here used to say the seed needed a
-    # recursive CTE and so was 8.0+ only — stale: seeds/common/mysql.sql says in
-    # its own header "no CTEs / window functions; numbers come from a digits
-    # cross-join". The blocker had been removed and the gap outlived it.
+    # 5.7 is NOT in the list below — this note claimed it was "IN as of
+    # 2026-08-30" and nothing ever added the row (corrected 2026-09-20). What
+    # 2026-08-30 actually established is that the BLOCKER is gone: the note used
+    # to say the seed needed a recursive CTE and so was 8.0+ only, which
+    # seeds/common/mysql.sql contradicts in its own header ("no CTEs / window
+    # functions; numbers come from a digits cross-join"). So 5.7 can be added —
+    # it is a supported version the gate does not exercise, not an impossible one.
     driver: mysql
     url: "mysql://rivet:rivet@127.0.0.1:%PORT%/rivet"
     seed: seeds/common/mysql.sql
@@ -41,10 +44,13 @@ engines:
       - { tag: "8.0", image: "mysql:8.0", port: 55080 }
       - { tag: "8.4", image: "mysql:8.4", port: 55084 }
   mssql:
-    # 2019 is IN as of 2026-08-30. The note here used to blame GENERATE_SERIES —
-    # stale: the seed fills through `ROW_NUMBER() OVER`, which SQL Server has had
-    # since 2005. The real blocker was a hardcoded `/opt/mssql-tools18` path in
-    # the harness (2019 ships plain `mssql-tools`), now probed per container.
+    # 2019 is NOT in the list below — this note claimed it was "IN as of
+    # 2026-08-30" and nothing ever added the row (corrected 2026-09-20). What
+    # 2026-08-30 established is that the BLOCKER is gone: not GENERATE_SERIES as
+    # an older note blamed (the seed fills through `ROW_NUMBER() OVER`, which SQL
+    # Server has had since 2005) but a hardcoded `/opt/mssql-tools18` path in the
+    # harness — 2019 ships plain `mssql-tools` — now probed per container. So
+    # 2019 can be added; docs/reference/compatibility.md does not claim it today.
     driver: mssql
     url: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:%PORT%/rivet"
     tls: accept_invalid_certs
