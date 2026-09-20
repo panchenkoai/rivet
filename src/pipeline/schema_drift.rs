@@ -31,6 +31,26 @@ pub(super) fn check_from_sink_schema(
     summary: &mut RunSummary,
 ) -> Result<()> {
     let columns = crate::state::arrow_schema_to_columns(sink_schema);
+    // A ZERO-ROW run resolves an EMPTY schema — the sink says so itself
+    // ("empty-schema fallbacks (zero-row runs)", sink/mod.rs::on_schema) — and an
+    // empty column set is not drift, it is the absence of evidence. Without this
+    // guard the run diffs [] against the baseline, reports EVERY column removed,
+    // and under `Warn` STORES the empty set as the new baseline; the next real
+    // run then reports every column ADDED. Under `Fail` it aborts an export that
+    // simply had nothing to export.
+    //
+    // MEASURED 2026-09-21 on a config `rivet init` wrote: all five exports ended
+    // with `export_schema.columns_json = '[]'`, each stamped at its first
+    // zero-row cycle, and the next run with two real rows logged
+    // "added: id, name, email, age, balance, is_active, bio, created_at,
+    // updated_at".
+    //
+    // The sibling adapter `check_from_type_mappings` has carried this guard all
+    // along; this one did not, and the asymmetry IS the defect.
+    if columns.is_empty() {
+        summary.schema_changed.get_or_insert(false);
+        return Ok(());
+    }
     check_and_persist(state, export_name, &columns, policy, summary)
 }
 
@@ -213,5 +233,82 @@ mod tests {
         let mut s3 = summary();
         check_and_persist(&st, "orders", &v2, SchemaDriftPolicy::Warn, &mut s3).unwrap();
         assert_eq!(s3.schema_changed, Some(false));
+    }
+
+    /// A zero-row run must not DESTROY the baseline. Measured before it was
+    /// written: three cycles of a generated incremental config left every one of
+    /// five exports at `columns_json = '[]'`, each stamped at that export's first
+    /// zero-row cycle, and the next run carrying two real rows then logged
+    /// "added: <every column>".
+    ///
+    /// Both halves, because either alone passes a broken build: the baseline must
+    /// SURVIVE, and the next real run must see NO drift.
+    /// RED against removing the `columns.is_empty()` guard in
+    /// `check_from_sink_schema`.
+    #[test]
+    fn a_zero_row_run_neither_wipes_the_baseline_nor_invents_drift() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let st = StateStore::open_in_memory().unwrap();
+        let real = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, true),
+        ]);
+        check_from_sink_schema(
+            &st,
+            "orders",
+            &real,
+            SchemaDriftPolicy::Warn,
+            &mut summary(),
+        )
+        .unwrap();
+
+        // The zero-row run: an empty resolved schema.
+        let empty = Schema::empty();
+        let mut s_empty = summary();
+        check_from_sink_schema(&st, "orders", &empty, SchemaDriftPolicy::Warn, &mut s_empty)
+            .unwrap();
+        assert_eq!(
+            s_empty.schema_changed,
+            Some(false),
+            "an empty schema is the absence of evidence, not drift"
+        );
+        assert_eq!(
+            st.get_stored_schema("orders").unwrap().map(|c| c.len()),
+            Some(2),
+            "the zero-row run must not overwrite the baseline with []"
+        );
+
+        // The next REAL run sees the unchanged schema and reports no drift.
+        let mut s_next = summary();
+        check_from_sink_schema(&st, "orders", &real, SchemaDriftPolicy::Warn, &mut s_next).unwrap();
+        assert_eq!(
+            s_next.schema_changed,
+            Some(false),
+            "the baseline survived, so the next real run is drift-free"
+        );
+    }
+
+    /// The same shape under `fail`: a scheduled run with nothing to export must
+    /// not ABORT the export. RED against removing the guard — without it this
+    /// returns `Err`, which is a legitimate no-op failing the run.
+    #[test]
+    fn a_zero_row_run_does_not_abort_under_on_schema_drift_fail() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let st = StateStore::open_in_memory().unwrap();
+        let real = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        check_from_sink_schema(
+            &st,
+            "orders",
+            &real,
+            SchemaDriftPolicy::Fail,
+            &mut summary(),
+        )
+        .unwrap();
+
+        let empty = Schema::empty();
+        let mut s = summary();
+        check_from_sink_schema(&st, "orders", &empty, SchemaDriftPolicy::Fail, &mut s)
+            .expect("a run with no rows is not schema drift and must not abort");
+        assert_eq!(s.schema_changed, Some(false));
     }
 }
