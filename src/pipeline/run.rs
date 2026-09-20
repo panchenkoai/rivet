@@ -1246,6 +1246,38 @@ fn degenerate_parallel_warning(wave: &str, batch_widths: &[usize]) -> Option<Str
     ))
 }
 
+/// The POOL's twin of [`degenerate_parallel_warning`]: `--pool N` over a queue
+/// where nothing is `parallel_safe` runs strictly one at a time, whatever N is.
+///
+/// The wave runner has said this for a while and the pool did not, which is how a
+/// GENERATED config reaches `apply --pool 4` and overlaps nothing, with the only
+/// evidence a `pool-serial` label printed after the fact. Measured 2026-09-21 on a
+/// config `rivet init` wrote: three cycles, wall 38.0 / 27.1 / 26.7s against
+/// per-export sums of 20.3 / 9.6 / 10.0s — the wall EXCEEDS the sum every time, so
+/// nothing overlapped at all.
+///
+/// `advise_split` cannot cover this case and should not: it returns `None` on an
+/// all-heavy queue deliberately, because splitting a heavy giant yields N heavy
+/// units that still serialize. That guard is right; it just leaves this shape
+/// silent, and silence is what this function ends.
+///
+/// `None` at one slot (the user asked for no concurrency — not a config problem),
+/// `None` the moment anything is safe (the pool can overlap it), and `None` at a
+/// single heavy export (nothing could have overlapped anyway), so a healthy pool
+/// stays quiet and the warning keeps its meaning.
+fn degenerate_pool_warning(safe: usize, heavy: usize, slots: usize) -> Option<String> {
+    if slots <= 1 || safe > 0 || heavy <= 1 {
+        return None;
+    }
+    Some(format!(
+        "apply --pool: all {heavy} export(s) are heavy, so the pool runs them ALONE, one after \
+         another — {slots} slots bought no concurrency here. Only exports marked \
+         `parallel_safe: true` overlap EACH OTHER (an export with no `parallel_safe:` counts as \
+         heavy, and `rivet init` writes none). Set `parallel_safe: true` on the cheap ones — or \
+         annotate the config with `rivet plan --annotate-waves` — to actually overlap them."
+    ))
+}
+
 /// The wave cost-gate's batching, pure so the SHAPE the run executes is
 /// observable without spawning child processes.
 ///
@@ -2018,6 +2050,15 @@ pub(crate) fn run_pool(
     }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
+    // Say it BEFORE the run, not with the `pool-serial` label afterwards: a pool
+    // that cannot overlap anything is a config fact the operator can act on, and
+    // the wave runner already says the equivalent.
+    {
+        let (safe_n, heavy_n) = pool_safe_heavy_split(&pending);
+        if let Some(line) = degenerate_pool_warning(safe_n, heavy_n, m) {
+            log::warn!("{line}");
+        }
+    }
     let by_name: std::collections::HashMap<&str, &ExportConfig> =
         pending.iter().map(|e| (e.name.as_str(), *e)).collect();
     let queue: std::sync::Mutex<std::collections::VecDeque<&ExportConfig>> = std::sync::Mutex::new(
@@ -2911,6 +2952,60 @@ mod pool_harm_tests {
     /// over exports built through the config deserializer, not from a hand-typed
     /// batch shape.
     ///
+    /// The POOL's twin of the wave warning below, from a MEASURED gap: three
+    /// cycles of `apply --pool 4` on a config `rivet init` wrote overlapped
+    /// nothing (wall > sum of per-export times every time) and said so only
+    /// through the after-the-fact `pool-serial` label.
+    ///
+    /// RED against returning `None` unconditionally (the shipped silence) and
+    /// against firing when the pool CAN overlap (noise on a healthy run is how a
+    /// real warning gets ignored). The census is taken with the PRODUCTION
+    /// function, not a hand-written pair, so the test grades the wiring too.
+    #[test]
+    fn a_degenerate_pool_apply_warns_instead_of_serialising_in_silence() {
+        use super::{degenerate_pool_warning, pool_safe_heavy_split};
+        use crate::config::{ExportConfig, sample_export};
+        let safe = |n: &str| {
+            let mut e = sample_export(n);
+            e.parallel_safe = Some(true);
+            e
+        };
+
+        // What `rivet init` actually writes: several exports, none annotated.
+        let generated = [
+            sample_export("orders"),
+            sample_export("events"),
+            sample_export("users"),
+        ];
+        let refs: Vec<&ExportConfig> = generated.iter().collect();
+        let (s, h) = pool_safe_heavy_split(&refs);
+        assert_eq!((s, h), (0, 3), "a generated config is all-heavy");
+        let line = degenerate_pool_warning(s, h, 4)
+            .expect("a `--pool` run that cannot overlap anything must say so");
+        assert!(
+            line.contains("no concurrency") && line.contains("3 export(s)"),
+            "the warning must name the symptom: {line}"
+        );
+        assert!(
+            line.contains("parallel_safe: true") && line.contains("--annotate-waves"),
+            "…and the lever, or it is a complaint rather than a diagnostic: {line}"
+        );
+
+        // A queue the pool CAN overlap: silence, this is the ordinary case.
+        let mixed = [sample_export("orders"), safe("dim_a"), safe("dim_b")];
+        let mrefs: Vec<&ExportConfig> = mixed.iter().collect();
+        let (ms, mh) = pool_safe_heavy_split(&mrefs);
+        assert_eq!(
+            degenerate_pool_warning(ms, mh, 4),
+            None,
+            "a pool with safe exports overlaps them — nothing to warn about"
+        );
+        // One slot: the user asked for no concurrency, so this is not a config fault.
+        assert_eq!(degenerate_pool_warning(0, 3, 1), None);
+        // One heavy export: nothing could have overlapped whatever the annotation.
+        assert_eq!(degenerate_pool_warning(0, 1, 4), None);
+    }
+
     /// RED against returning `None` unconditionally (the shipped silence) and
     /// against firing when the gate DID batch something (the noise failure — a
     /// warning on every healthy wave is how a real one gets ignored).
