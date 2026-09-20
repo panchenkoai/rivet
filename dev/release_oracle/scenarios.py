@@ -1098,10 +1098,35 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     state_url = os.environ.get("RIVET_GATE_STATE_URL", "") or os.environ.get(
         "RIVET_CDC_STATE_URL", ""
     )
-    with led.span(f"{engine}: blessed_path"):
-        blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
-    with led.span(f"{engine}: blessed_flow"):
-        blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
+    # The halves share no destructive state — path READS the golden tables and issues
+    # no DDL, flow owns its exports and its `orc_cdc_probe` behind a per-engine lock —
+    # and every cell already takes `cell_gate()`, so running them together cannot exceed
+    # the global cap. Sequential, they were a barrier that held the matrix at ~6x
+    # concurrency against a cap of 16. Own buffered child each, or the lines interleave.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _half(name, run):
+        child = led.buffered_child()
+        err = None
+        with child.span(f"{engine}: {name}"):
+            try:
+                run(child)
+            except BaseException as e:  # noqa: BLE001 — re-raised after the flush
+                err = e
+        return child, err
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        halves = list(ex.map(lambda a: _half(*a), (
+            ("blessed_path",
+             lambda l: blessed_path.verify_blessed_path(l, engine, tag, url, state_url=state_url)),
+            ("blessed_flow",
+             lambda l: blessed_flow.sc_blessed_flow(l, engine, tag, url, state_url=state_url)),
+        )))
+    for child, _ in halves:
+        child.flush_into(led)
+    for _, err in halves:
+        if err is not None:
+            raise err
     # Does the chain above have working oracles at all? Breaks each artifact
     # class and requires the matching stage to go RED — a green stage that was
     # never red is unverified, and this module's own first draft had one.

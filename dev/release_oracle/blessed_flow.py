@@ -70,6 +70,7 @@ from . import blessed_path, cdc, scenarios
 from .core import (
     run,
     Ledger,
+    ROOT,
     cell_gate,
     cell_parallel,
     container_for_port,
@@ -300,20 +301,57 @@ CHAIN = {
 
 
 def _why(p) -> str:
-    """The line that explains a non-zero exit.
+    """The line that explains a non-zero exit — and a path to the FULL output.
 
     `exit=1` in a 200-row report tells a reader to go re-run the cell by hand.
     rivet already prints the reason; carrying it into the ledger is the
     difference between a report and a to-do list.
+
+    But ONE line is not always the reason, and the gate kept no second copy.
+    `rivet doctor` ends with "one or more preflight checks failed (see output
+    above)" — truthful, and useless alone, because the checks it names are the
+    lines ABOVE it, which this helper dropped. Measured 2026-09-20: a `doctor`
+    cell failed that way, and the diagnosis could not be recovered at any price
+    — a two-hour re-run graded the same config green and said nothing about the
+    first failure. A gate that cannot say WHY a cell failed sends its reader to
+    re-run the whole thing and guess.
+
+    So the headline stays one line for the report, and the whole stdout+stderr
+    goes where it SURVIVES: `target/` (gitignored), never the run's work dir,
+    which `__main__` deletes at teardown — that deletion is what made the
+    output unrecoverable in the first place.
     """
+    head = ""
     for src in (p.stderr or "", p.stdout or ""):
         lines = [ln.strip() for ln in src.splitlines() if ln.strip()]
-        for ln in reversed(lines):
-            if ln.lower().startswith(("error", "caused by", "rivet: error")):
-                return ln[:220]
-        if lines:
-            return lines[-1][:220]
-    return ""
+        if not lines:
+            continue
+        head = next(
+            (
+                ln
+                for ln in reversed(lines)
+                if ln.lower().startswith(("error", "caused by", "rivet: error"))
+            ),
+            lines[-1],
+        )[:220]
+        break
+    if not (p.stdout or p.stderr):
+        return head
+    argv = " ".join(str(a) for a in (getattr(p, "argv", None) or []))
+    blob = (
+        f"$ {argv}\n\nexit={p.returncode}\n\n"
+        f"--- stdout ---\n{p.stdout or ''}\n--- stderr ---\n{p.stderr or ''}\n"
+    )
+    # Content-addressed: two cells failing the same way share one file rather
+    # than racing over a name, which matters at 16-way cell parallelism.
+    try:
+        d = ROOT / "target" / "gate-failures"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{os.getpid()}-{hashlib.sha1(blob.encode()).hexdigest()[:10]}.log"
+        f.write_text(blob)
+    except OSError:
+        return head
+    return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
 def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str) -> bool:

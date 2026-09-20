@@ -438,22 +438,41 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # run, so there is nothing in them worth keeping past teardown.
     docker("rm", "-fv", name)
 
+    # Every engine ran with NO memory limit, and each then sized itself off the
+    # WHOLE Docker VM rather than off what a 150k-row fixture needs. Measured on
+    # this stand: SQL Server held 4,226 MiB with `max server memory` unbounded
+    # (SQLOS target 9,954 MiB and climbing), and MongoDB's WiredTiger ceiling came
+    # out at 19,544 MiB — exactly its documented default of 50% of (RAM − 1 GiB),
+    # so the engine was obeying its own rule applied to a 39 GiB VM. PostgreSQL is
+    # the counter-case and the reason this is about POLICY, not weight: 7 MiB of
+    # its own plus reclaimable page cache, because `shared_buffers` is a fixed
+    # 128 MB and does not scale with RAM.
+    #
+    # So the ceiling goes on the CONTAINER (kernel-enforced) and, where the engine
+    # has its own knob, on the engine too — below the container limit, which is
+    # Microsoft's own guidance, so the OS keeps headroom. 2 GB is the documented
+    # minimum to START SQL Server on Linux; 4g/3072 clears it with room.
     args: list[str] = ["run", "-d", "--name", name]
+    cmd: list[str] = []
     if engine == "postgres":
-        args += ["-e", "POSTGRES_USER=rivet", "-e", "POSTGRES_PASSWORD=rivet",
+        args += ["--memory", "1g",
+                 "-e", "POSTGRES_USER=rivet", "-e", "POSTGRES_PASSWORD=rivet",
                  "-e", "POSTGRES_DB=rivet", "-p", f"{port}:5432"]
     elif engine == "mysql":
-        args += ["-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
+        args += ["--memory", "2g",
+                 "-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
                  "-e", "MYSQL_USER=rivet", "-e", "MYSQL_PASSWORD=rivet", "-p", f"{port}:3306"]
     elif engine == "mssql":
-        args += ["-e", "ACCEPT_EULA=Y", "-e", "MSSQL_SA_PASSWORD=Rivet_Passw0rd!", "-p", f"{port}:1433"]
+        args += ["--memory", "4g", "-e", "MSSQL_MEMORY_LIMIT_MB=3072",
+                 "-e", "ACCEPT_EULA=Y", "-e", "MSSQL_SA_PASSWORD=Rivet_Passw0rd!", "-p", f"{port}:1433"]
     elif engine == "mongo":
-        args += ["-p", f"{port}:27017"]
+        args += ["--memory", "2g", "-p", f"{port}:27017"]
+        cmd = ["--wiredTigerCacheSizeGB", "0.5"]
     else:
         led.skipped(engine, tag, "all", "-", f"{engine}:{tag} unknown engine kind")
         return None
 
-    if not docker(*args, image).ok:
+    if not docker(*args, image, *cmd).ok:
         led.skip(f"{engine}:{tag} could not start ({image})")
         return None
 
