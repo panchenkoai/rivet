@@ -19,13 +19,15 @@ engines:
     driver: postgres
     url: "postgresql://rivet:rivet@127.0.0.1:%PORT%/rivet"
     seed: seeds/common/postgres.sql
+    # Three versions, not seven: OLDEST supported, primary target, NEWEST. Seven
+    # postgres versions were ~57% of the matrix's cells and every one of them
+    # graded the same engine-level golden (docs/release-gate-matrix.yaml keys
+    # cells by ENGINE, never by version), so versions 13/15/17 bought repetition
+    # rather than coverage. NOT a support change — 12..18 stay supported; see
+    # docs/reference/compatibility.md, which now says which set the gate runs.
     versions:
-      - { tag: "12", image: "postgres:12", port: 55012 }
-      - { tag: "13", image: "postgres:13", port: 55013 }
       - { tag: "14", image: "postgres:14", port: 55014 }
-      - { tag: "15", image: "postgres:15", port: 55015 }
       - { tag: "16", image: "postgres:16", port: 55016 }
-      - { tag: "17", image: "postgres:17", port: 55017 }
       - { tag: "18", image: "postgres:18", port: 55018 }
   mysql:
     # 5.7 is IN as of 2026-08-30. The note here used to say the seed needed a
