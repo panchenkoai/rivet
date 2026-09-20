@@ -193,13 +193,19 @@ fn comment_split(line: &str) -> Option<(&str, &str)> {
         let prefix = &line[..line.len() - trimmed.len()];
         return Some((prefix, rest.trim_start()));
     }
-    let (mut in_s, mut in_d) = (false, false);
+    // Single, double AND the engines' identifier quotes: a MySQL `` `qty # ea` `` or a
+    // SQL Server `[qty # ea]` inside a generated `query:` is not a comment either.
+    let (mut in_s, mut in_d, mut in_bt, mut brackets) = (false, false, false, 0usize);
     let bytes = line.as_bytes();
     for i in 0..bytes.len() {
+        let quoted = in_s || in_d || in_bt || brackets > 0;
         match bytes[i] {
-            b'\'' if !in_d => in_s = !in_s,
-            b'"' if !in_s => in_d = !in_d,
-            b'#' if !in_s && !in_d && i > 0 && bytes[i - 1] == b' ' => {
+            b'\'' if !in_d && !in_bt => in_s = !in_s,
+            b'"' if !in_s && !in_bt => in_d = !in_d,
+            b'`' if !in_s && !in_d => in_bt = !in_bt,
+            b'[' if !in_s && !in_d && !in_bt => brackets += 1,
+            b']' if !in_s && !in_d && !in_bt => brackets = brackets.saturating_sub(1),
+            b'#' if !quoted && i > 0 && bytes[i - 1] == b' ' => {
                 return Some((&line[..i], line[i + 1..].trim_start()));
             }
             _ => {}
@@ -935,9 +941,11 @@ omitting differ per engine — see cdc.md)",
             "      server_id: {}  # unique replica id; source needs binlog_format=ROW + a REPLICATION SLAVE grant",
             4271 + ordinal
         )),
+        // PostgreSQL accepts only lowercase letters, digits and `_` in a slot name:
+        // `rivet_Orders` is refused by the server the moment the stream opens.
         "postgres" => lines.push(format!(
             "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
-            cdc_ident(&info.table)
+            cdc_ident(&info.table).to_lowercase()
         )),
         "mssql" => lines.push(format!(
             "      capture_instance: {}_{}  # sp_cdc_enable_table instance; needs CDC enabled + SQL Server Agent",
@@ -1023,7 +1031,7 @@ fn cdc_multiplex_export_lines(
         }
         "postgres" => lines.push(format!(
             "      slot: rivet_{}  # ONE logical slot for the whole stream; source needs wal_level=logical + a REPLICATION role",
-            cdc_ident(&name)
+            cdc_ident(&name).to_lowercase()
         )),
         _ => {}
     }
@@ -2179,6 +2187,59 @@ mod tests {
             yaml.contains("server_id: 4271") && yaml.contains("server_id: 4272"),
             "two exports, two replica ids:\n{yaml}"
         );
+    }
+
+    /// PostgreSQL accepts only lowercase letters, digits and `_` in a slot name: a
+    /// mixed-case table must not scaffold `slot: rivet_Orders`, which the server
+    /// refuses the moment the stream opens (and `rivet check` never sees — it compares
+    /// slot names for equality only). The checkpoint file keeps the table's spelling.
+    #[test]
+    fn a_mixed_case_table_scaffolds_a_lowercase_slot() {
+        let info = TableInfo {
+            density: None,
+            schema: "sales".into(),
+            table: "Orders".into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![ColumnInfo {
+                is_primary_key: true,
+                ..col("id", "bigint")
+            }],
+        };
+        let yaml = generate_config(
+            &info,
+            "postgresql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            &InitYamlDestination::default(),
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            yaml.contains("slot: rivet_orders") && !yaml.contains("rivet_Orders"),
+            "{yaml}"
+        );
+    }
+
+    /// The comment wrapper must not read a ` #` inside an engine's identifier quotes as
+    /// a YAML comment: a MySQL `` `qty # ea` `` or SQL Server `[qty # ea]` column in a
+    /// generated `query:` longer than the wrap width was split, and the columns after
+    /// it became comment lines — a scaffolded query silently missing columns.
+    #[test]
+    fn a_hash_inside_backticks_or_brackets_is_not_a_comment() {
+        let long = " ".repeat(40);
+        let mysql = format!("    query: SELECT `qty # ea`, `b`{long} FROM t");
+        assert_eq!(comment_split(&mysql), None, "{mysql}");
+        let mssql = format!("    query: SELECT [qty # ea], [b]{long} FROM t");
+        assert_eq!(comment_split(&mssql), None, "{mssql}");
+        let trailing = format!("    query: SELECT `qty # ea` FROM t{long} # a real comment");
+        let (prefix, comment) = comment_split(&trailing).expect("the trailing comment");
+        assert!(
+            prefix.ends_with("FROM t") || prefix.ends_with(' '),
+            "{prefix:?}"
+        );
+        assert_eq!(comment, "a real comment");
+        assert!(wrap_comments(&format!("{mysql}\n")).contains("`qty # ea`, `b`"));
     }
 
     /// A `public` schema with NO recipe-readable table (every name CamelCase on

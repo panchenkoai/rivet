@@ -600,7 +600,8 @@ impl Config {
 
         let mut slots: HashMap<String, &str> = HashMap::new();
         let mut server_ids: HashMap<u32, &str> = HashMap::new();
-        let mut checkpoints: HashMap<std::path::PathBuf, &str> = HashMap::new();
+        // Keyed by the NORMALISED, case-folded path (see the insert below).
+        let mut checkpoints: HashMap<String, &str> = HashMap::new();
 
         for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
             let cdc = e.cdc.as_ref();
@@ -701,18 +702,23 @@ impl Config {
                     // two), so CurDir is filtered explicitly. The resolver never
                     // sees it either: `config_dir.join(p)` makes every dot
                     // interior before ITS components() pass.
+                    // Case-folded as well: `Orders.ckpt` and `orders.ckpt` are ONE file
+                    // on macOS and Windows, and a config written on Linux is run there.
                     std::path::Path::new(ckpt)
                         .components()
                         .filter(|c| !matches!(c, std::path::Component::CurDir))
-                        .collect::<std::path::PathBuf>(),
+                        .collect::<std::path::PathBuf>()
+                        .to_string_lossy()
+                        .to_lowercase(),
                     &e.name,
                 )
             {
                 crate::config_bail!(
                     crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
-                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' — each export \
-                     must own its resume position or they overwrite each other's. Set a \
-                     distinct `cdc.checkpoint:` per export.",
+                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' (compared \
+                     case-insensitively: on macOS and Windows two spellings are one file) — \
+                     each export must own its resume position or they overwrite each \
+                     other's. Set a distinct `cdc.checkpoint:` per export.",
                     e.name
                 );
             }

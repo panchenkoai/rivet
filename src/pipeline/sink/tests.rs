@@ -231,10 +231,12 @@ fn the_byte_cap_splits_at_the_cap_and_never_an_empty_part() {
     assert!(!should_split(5000, None, 5), "no cap declared");
 }
 
-/// Every date/timestamp Arrow type an engine produces has a unit — MySQL `DATETIME(6)`
-/// and SQL Server `DATETIME2` arrive as microsecond timestamps, MongoDB dates as
-/// milliseconds, PostgreSQL `DATE` as `Date32`. A type mapped to `None` is a part the
-/// writer never budgets, and a wide history refused at load time.
+/// Every date/timestamp Arrow type has a unit — the engines produce `Date32` (a DATE)
+/// and microsecond `Timestamp` (PostgreSQL/MySQL/SQL Server date-times; nanoseconds
+/// under the `timestamp_ns` override); the other arms are the type's remaining units.
+/// A type mapped to `None` is a part the writer never budgets and a wide history
+/// refused at load time — which is what a non-temporal column named as the partition
+/// gets (SQL Server's `rowversion`, `BYTES` in the warehouse), by design, with a warning.
 #[test]
 fn every_date_and_timestamp_arrow_type_has_a_partition_unit() {
     use arrow::datatypes::TimeUnit;
@@ -261,11 +263,13 @@ fn every_date_and_timestamp_arrow_type_has_a_partition_unit() {
     for (ty, unit) in cases {
         assert_eq!(partition_unit_of(&ty), Some(unit), "{ty:?}");
     }
-    assert_eq!(
-        partition_unit_of(&DataType::Int64),
-        None,
-        "an integer is no time partition on this path"
-    );
+    for ty in [DataType::Int64, DataType::Binary, DataType::Utf8] {
+        assert_eq!(
+            partition_unit_of(&ty),
+            None,
+            "{ty:?} is no time partition on this path"
+        );
+    }
 }
 
 #[test]

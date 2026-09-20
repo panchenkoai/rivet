@@ -786,6 +786,26 @@ fn two_mysql_cdc_exports_defaulting_to_the_same_server_id_are_rejected() {
     );
 }
 
+/// `Orders.ckpt` and `orders.ckpt` are two strings and ONE file on macOS / Windows —
+/// case twins (legal on PostgreSQL, and on MySQL / SQL Server under a case-sensitive
+/// collation) scaffolded per-table wrote each other's resume position there. Refused
+/// wherever the config is loaded, since a config written on Linux is run elsewhere.
+/// RED against the byte-wise comparison.
+#[test]
+fn two_cdc_exports_whose_checkpoints_differ_only_by_case_are_rejected() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: slot_a, checkpoint: ./cdc/Orders.ckpt }",
+        "cdc: { slot: slot_b, checkpoint: ./cdc/orders.ckpt }",
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("checkpoint") && msg.contains("case-insensitively"),
+        "expected a case-folded checkpoint conflict: {msg}"
+    );
+}
+
 #[test]
 fn two_cdc_exports_sharing_a_checkpoint_path_are_rejected() {
     let yaml = cdc_pair_yaml(

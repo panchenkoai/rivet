@@ -857,6 +857,36 @@ fn mongo_checks(
 mod tests {
     use super::*;
 
+    /// `collect` is the doctor's CDC entry point: nothing for a config without a
+    /// stream, and — when the probe cannot even resolve the source — ONE failed
+    /// check that says so, never an empty list a reader takes for "all healthy".
+    /// RED against `collect` stubbed to `vec![]`. No network: the URL comes from an
+    /// environment variable that is not set.
+    #[test]
+    fn collect_reports_a_probe_that_cannot_start_and_nothing_for_a_batch_config() {
+        let cfg = |mode: &str| {
+            Config::from_yaml(&format!(
+                "source:\n  type: postgres\n  url_env: RIVET_DOCTOR_TEST_UNSET_URL\nexports:\n\
+                 \x20 - name: t\n    table: t\n    mode: {mode}\n    format: parquet\n\
+                 \x20   {}destination: {{ type: local, path: ./out }}\n",
+                if mode == "cdc" {
+                    "cdc: { checkpoint: ./t.ckpt }\n    "
+                } else {
+                    ""
+                }
+            ))
+            .expect("a config")
+        };
+        let dir = std::path::Path::new(".");
+        assert!(collect(&cfg("full"), dir).is_empty());
+        let checks = collect(&cfg("cdc"), dir);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(
+            !checks[0].ok && checks[0].name == "CDC health probe",
+            "{checks:?}"
+        );
+    }
+
     // ── PostgreSQL verdicts ──
 
     #[test]

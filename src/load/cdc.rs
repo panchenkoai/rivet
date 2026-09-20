@@ -408,19 +408,28 @@ impl MergeFilter {
                 format!("`{c}`")
             }
         };
+        // An empty upper bound is "no upper bound": the warehouse's last representable
+        // day has no successor to write `< …` against.
+        let upper = |c: &str, hi: &str| {
+            if hi.is_empty() {
+                String::new()
+            } else {
+                format!(" AND {c} < {hi}")
+            }
+        };
         match self {
             MergeFilter::All => String::new(),
             MergeFilter::Range(b) if base => format!(
-                " AND ({c} >= {lo} AND {c} < {hi} OR {c} IS NULL)",
+                " AND ({c} >= {lo}{hi} OR {c} IS NULL)",
                 c = q(&b.column),
                 lo = b.all_lo,
-                hi = b.all_hi_exclusive
+                hi = upper(&q(&b.column), &b.all_hi_exclusive)
             ),
             MergeFilter::Range(b) => format!(
-                " AND {c} >= {lo} AND {c} < {hi}",
+                " AND {c} >= {lo}{hi}",
                 c = q(&b.column),
                 lo = b.lo,
-                hi = b.hi_exclusive
+                hi = upper(&q(&b.column), &b.hi_exclusive)
             ),
             MergeFilter::Days { column, all, .. } if base => format!(
                 " AND (DATE({c}) IN UNNEST({all}) OR {c} IS NULL)",
@@ -1051,13 +1060,23 @@ pub fn plan_compact_merges(
                     probe.hi
                 );
             };
+            // The day AFTER `9999-12-31` (the SCD "end of time" sentinel, a legal
+            // value) is past the warehouse's range: `DATE '+10000-01-01'` was a hard
+            // error that wedged every compaction of the table. No successor, no bound.
+            let upper = |d: chrono::NaiveDate| {
+                if chrono::Datelike::year(&d) > 9999 {
+                    String::new()
+                } else {
+                    time_literal(ty, d)
+                }
+            };
             let all_lo = time_literal(ty, lo_d);
-            let all_hi = time_literal(ty, hi_d + chrono::Duration::days(1));
+            let all_hi = upper(hi_d + chrono::Duration::days(1));
             for (from, to) in day_windows(lo_d, hi_d, step) {
                 let bound = RangeBound {
                     column: col.to_string(),
                     lo: time_literal(ty, from),
-                    hi_exclusive: time_literal(ty, to),
+                    hi_exclusive: upper(to),
                     all_lo: all_lo.clone(),
                     all_hi_exclusive: all_hi.clone(),
                 };
@@ -1091,19 +1110,25 @@ pub fn plan_compact_merges(
                 return Ok(merges);
             }
             let step = interval.saturating_mul(4000).max(1);
-            let all_hi = hi_i.saturating_add(1).to_string();
+            // No successor past `i64::MAX`: an empty bound is "no upper bound".
+            let all_hi = hi_i
+                .checked_add(1)
+                .map_or_else(String::new, |h| h.to_string());
             let mut from = lo_i;
-            while from <= hi_i {
-                let to = from.saturating_add(step);
+            loop {
+                let to = from.checked_add(step);
                 let bound = RangeBound {
                     column: col.to_string(),
                     lo: from.to_string(),
-                    hi_exclusive: to.to_string(),
+                    hi_exclusive: to.map_or_else(String::new, |t| t.to_string()),
                     all_lo: lo_i.to_string(),
                     all_hi_exclusive: all_hi.clone(),
                 };
                 merges.push(merge(Some(&bound), None));
-                from = to;
+                match to {
+                    Some(t) if t <= hi_i => from = t,
+                    _ => break,
+                }
             }
             if probe.nulls > 0 {
                 merges.push(merge(None, Some(col)));
@@ -1448,6 +1473,19 @@ mod compact_tests {
         let stray = plan(Some(&range), &probe(5, "0", "4000000000", 0));
         assert_eq!(stray.len(), 1, "{stray:?}");
         assert!(stray[0].contains("ON T.`id` = S.`id`\n"), "{}", stray[0]);
+
+        // The warehouse's last day has no successor: a `9999-12-31` sentinel (the SCD
+        // "end of time", a legal value) must not render `DATE '+10000-01-01'` — a hard
+        // error that wedged every compaction of the table. RED against `hi + 1 day`.
+        let eot = plan(Some(&month), &probe(2, "9999-01-01", "9999-12-31", 0));
+        assert_eq!(eot.len(), 1, "{eot:?}");
+        assert!(
+            !eot[0].contains("10000")
+                && eot[0].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '9999-01-01T00:00:00'\n")
+                && eot[0].contains("ON T.`id` = S.`id` AND (T.`created_at` >= DATETIME '9999-01-01T00:00:00' OR T.`created_at` IS NULL)"),
+            "no upper bound past the last day: {}",
+            eot[0]
+        );
 
         // A monthly key steps 4,000 × 28 days: 400 years span two windows, not one
         // and not hundreds.

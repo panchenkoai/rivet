@@ -384,12 +384,30 @@ fn is_timestamp_type(t: &str) -> bool {
     t.contains("timestamp") || t.contains("datetime") || t == "date"
 }
 
+/// A column name folded for the stamp predicates — lowercase, separators dropped — so
+/// `ModifiedDate`, `modified_date` and `MODIFIED_DATE` are one spelling. SQL Server
+/// schemas are PascalCase by convention, and snake_case-only lists took `ModifiedDate`
+/// for a business date: the create-only column became the cursor there.
+fn stamp_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Whether the column name means "when the row came to BE" — the partition key's
 /// first choice, ahead of any other business date.
 fn is_creation_stamp(name: &str) -> bool {
     matches!(
-        name.to_lowercase().as_str(),
-        "created_at" | "made_at" | "occurred_at"
+        stamp_key(name).as_str(),
+        "createdat"
+            | "madeat"
+            | "occurredat"
+            | "createdon"
+            | "createddate"
+            | "creationdate"
+            | "datecreated"
+            | "createdtime"
     )
 }
 
@@ -400,18 +418,23 @@ fn is_creation_stamp(name: &str) -> bool {
 /// partition mirror had already drifted from the cursor one.
 fn is_mutation_stamp(name: &str) -> bool {
     matches!(
-        name.to_lowercase().as_str(),
-        "updated_at"
-            | "modified_at"
-            | "changed_at"
-            | "last_updated"
-            | "last_modified"
-            | "last_changed"
-            | "updated_on"
-            | "modified_on"
-            | "changed_on"
-            | "update_date"
-            | "modified_date"
+        stamp_key(name).as_str(),
+        "updatedat"
+            | "modifiedat"
+            | "changedat"
+            | "lastupdated"
+            | "lastmodified"
+            | "lastchanged"
+            | "lastupdate"
+            | "updatedon"
+            | "modifiedon"
+            | "changedon"
+            | "updatedate"
+            | "modifieddate"
+            | "datemodified"
+            | "dateupdated"
+            | "modifiedtime"
+            | "updatedtime"
     )
 }
 
@@ -1364,6 +1387,10 @@ mod tests {
                 "{t} must be a cursor candidate"
             );
         }
+        // SQL Server's `timestamp` is a row-version counter, not a time: the catalog
+        // reader renames it (`init::mssql::catalog_type`), so it never reaches here
+        // under the temporal spelling.
+        assert!(!super::is_timestamp_type("rowversion"));
         for t in ["bigint", "int", "varchar", "uniqueidentifier", "time"] {
             assert!(!super::is_timestamp_type(t), "{t} must not be");
         }
@@ -1791,6 +1818,28 @@ mod tests {
             ],
         );
         assert_eq!(info.best_partition_column(), Some("event_date"));
+    }
+
+    /// SQL Server's house convention is PascalCase: `CreatedDate` / `ModifiedDate`.
+    /// Folded to one spelling, the mutation stamp is the cursor and the creation
+    /// stamp the partition — snake_case-only lists saw neither, and the tie went to
+    /// the earlier column (create-only cursor, mutable partition). RED against the
+    /// unfolded lists.
+    #[test]
+    fn pascal_case_stamps_are_recognised() {
+        let info = make_table(
+            0,
+            vec![
+                col("BusinessEntityID", "bigint", true),
+                col("CreatedDate", "datetime2", false),
+                col("ModifiedDate", "datetime2", false),
+            ],
+        );
+        assert_eq!(info.best_cursor_column(), Some("ModifiedDate"));
+        assert_eq!(info.best_partition_column(), Some("CreatedDate"));
+        assert!(
+            super::is_mutation_stamp("LAST_UPDATED") && super::is_creation_stamp("DateCreated")
+        );
     }
 
     /// Among several business dates the creation stamp wins, whatever its position:

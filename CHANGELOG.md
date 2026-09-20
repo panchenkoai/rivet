@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **A `9999-12-31` partition value no longer wedges compaction.** On an hour / month /
+  year key the MERGE's upper bound was `hi + 1 day`, which for the SCD "end of time"
+  sentinel rendered `DATE '+10000-01-01'` — past the warehouse's range, a hard error on
+  every `rivet compact` of the table while the buffer grew. The last representable day
+  (and `i64::MAX` for a range key) has no successor: the bound is simply open above.
+
+- **`__is_deleted` is a reserved source column**, like `__op` / `__pos` / `__seq`: a
+  captured table carrying one is refused with the remedy. The compaction decides that
+  column and was silently overwriting the source's values, and its mere presence flipped
+  the tombstone arm on regardless of `deleted_flag:`.
+
+- **`rivet init` on SQL Server:** `DATA_TYPE = 'timestamp'` is `rowversion` (an 8-byte
+  binary counter), not a time — read back under its real name, so it is neither a cursor
+  candidate (it scored above the integer PK and never advanced) nor a partition guess (a
+  `BYTES` column BigQuery cannot partition by). Stamp names are folded (`ModifiedDate`,
+  `CreatedDate`, `LAST_UPDATED` …) so PascalCase schemas get the mutation stamp as cursor
+  and the creation stamp as partition, as snake_case ones do. A mixed-case PostgreSQL
+  table scaffolds a lowercase slot name (`rivet_orders`), the only spelling the server
+  accepts. The comment wrapper leaves a ` #` inside `` ` `` or `[ ]` identifier quotes
+  alone (a long generated `query:` lost its trailing columns to a "comment").
+
+- **Two CDC checkpoints that differ only by case are one file on macOS / Windows** — the
+  collision guard folds case, since a config written on Linux is run elsewhere.
+
 - **A whole-table pass over a base whose buffer still holds rows is refused.** Under
   `layout: base_buffer` a re-baseline (a re-snapshot after a gap, a fresh whole-table
   incremental run) replaced the base but left `<table>__changes` as it was, so the next

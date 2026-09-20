@@ -34,7 +34,7 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
         if is_mutation_stamp(&col.name) {
             reasons.push(CursorCandidateReason::NameSuggestsUpdated);
             score += 40;
-        } else if col.name == "created_at" {
+        } else if super::is_creation_stamp(&col.name) {
             reasons.push(CursorCandidateReason::NameSuggestsCreated);
             score += 20;
         }
@@ -164,6 +164,25 @@ mod tests {
                 "'{stamp}' moves on update, 'created_at' does not — it must lead"
             );
         }
+    }
+
+    /// PascalCase (SQL Server's convention): `ModifiedDate` is the mutation stamp and
+    /// must lead `CreatedDate`, whatever their order. RED against snake_case-only
+    /// name lists, under which both scored +0 and the earlier column won.
+    #[test]
+    fn pascal_case_mutation_stamp_leads_the_creation_stamp() {
+        let t = table(vec![
+            col("BusinessEntityID", "bigint", true, false),
+            col("CreatedDate", "datetime2", false, false),
+            col("ModifiedDate", "datetime2", false, false),
+        ]);
+        let cands = cursor_candidates(&t);
+        assert_eq!(cands[0].column, "ModifiedDate");
+        assert!(cands.iter().any(|c| {
+            c.column == "CreatedDate"
+                && c.reasons
+                    .contains(&CursorCandidateReason::NameSuggestsCreated)
+        }));
     }
 
     #[test]
