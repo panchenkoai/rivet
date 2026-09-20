@@ -12,6 +12,11 @@ dependencies = [
     "duckdb==1.5.5",
     "pymongo>=4,<5",
     "pyyaml>=6,<7",
+    # The independent row-hash oracle. Absent, `row_hash` SKIPs rather than
+    # comparing rivet against itself — 15 of 23 cells skipped it in the
+    # 2026-09-20 gate. Exact-pinned like duckdb: a hash that moves between two
+    # runs of the same gate is not an oracle.
+    "xxhash==4.0.1",
 ]
 
 [tool.uv]
