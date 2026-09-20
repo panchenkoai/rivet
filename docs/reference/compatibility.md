@@ -5,9 +5,13 @@ and **MongoDB** — every supported version of which is listed in the table belo
 PostgreSQL and MySQL run the **full end-to-end suite** on each release —
 `doctor`, `check`, every export mode (full / incremental / chunked / time_window),
 every output format (CSV / Parquet) with every compression codec, `reconcile`,
-recovery scenarios, state management, date-chunking, and `rivet init` — against
-each version. No version-specific code paths are skipped; the same Rust driver
-builds and the same YAML configs drive every target. **SQL Server** and
+recovery scenarios, state management, date-chunking, and `rivet init`. The
+release gate runs that suite against a **representative set** — PostgreSQL 14,
+16 and 18, MySQL 8.0 and 8.4 — chosen as oldest-supported, primary target and
+newest; the remaining supported versions share the same code paths and are
+spot-checked rather than gated on every release. No version-specific code paths
+exist to skip: the same Rust driver builds and the same YAML configs drive every
+target. **SQL Server** and
 **MongoDB** carry their own scope and CI coverage, detailed below.
 
 **MongoDB** (the OSS JSON-blob source — batch + CDC) rides its own dedicated CI
@@ -21,11 +25,14 @@ time_window modes). See [mongodb.md](mongodb.md).
 |------------|---------:|--------|
 | PostgreSQL |       12 | Supported |
 | PostgreSQL |       13 | Supported |
-| PostgreSQL |       14 | Supported |
+| PostgreSQL |       14 | Supported (release gate) |
 | PostgreSQL |       15 | Supported |
-| PostgreSQL |       16 | Supported (primary target) |
+| PostgreSQL |       16 | Supported (primary target, release gate) |
+| PostgreSQL |       17 | Supported |
+| PostgreSQL |       18 | Supported (release gate) |
 | MySQL      |      5.7 | Supported (EOL upstream Oct 2023) |
-| MySQL      |      8.0 | Supported (primary target) |
+| MySQL      |      8.0 | Supported (primary target, release gate) |
+| MySQL      |      8.4 | Supported (release gate) |
 | SQL Server |     2022 | **GA** (source engine; see scope below) |
 | MongoDB    |      4.4 | Supported |
 | MongoDB    |      5.0 | Supported |

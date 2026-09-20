@@ -363,22 +363,6 @@ def _why(p) -> str:
     return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
-_CDC_LOCKS: dict[str, threading.Lock] = {}
-_CDC_LOCKS_GUARD = threading.Lock()
-
-
-def _cdc_lock_for(engine: str) -> threading.Lock:
-    """The cdc probe lock for one ENGINE, shared by every version of that family.
-
-    Module scope on purpose: `sc_blessed_flow` is called per engine×VERSION under
-    --version-parallel, so a lock built inside it gives each version its own and
-    serialises nothing — which is how the RED-proven `orc_cdc_probe does not
-    exist` collision came back on 2026-09-20.
-    """
-    with _CDC_LOCKS_GUARD:
-        return _CDC_LOCKS.setdefault(engine, threading.Lock())
-
-
 def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str) -> bool:
     """Record one stage. Every stage is its own row — a chain that dies at `plan`
     must leave `apply` as SKIP "not reached", never absent: in a 200-row report an
@@ -1384,7 +1368,7 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
     # serialising anything — 2026-09-20 brought the same collision straight back
     # ("Table 'rivet.orc_cdc_probe' doesn't exist", mysql). cdc still overlaps
     # ACROSS the 4 engines; batch cells never take it.
-    cdc_lock = _cdc_lock_for(engine)
+    cdc_lock = cdc._cdc_lock_for(engine)
 
     def run_one(task: tuple[Cell, str, str]) -> None:
         cell, key, u = task

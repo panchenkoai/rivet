@@ -236,12 +236,27 @@ def _read_values(part: Path) -> str | None:
 
 def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) -> None:
     """Positive and negative for a CDC prefix: clean capture verifies, a flipped
-    byte in a captured part does not."""
+    byte in a captured part does not.
+
+    Serialised per ENGINE: this cell runs per engine×VERSION but drives the ONE
+    shared CDC stand, so N concurrent versions drop and recreate `orc_cdc_probe`
+    under each other — setup, capture and the `finally` cleanup all have to be
+    inside the lock. blessed_flow took the same lock and this cell did not, so
+    the lock protected its own cells from each other and nothing from this one
+    (2026-09-20 gate: postgres 3 of 7 versions FAILED "the capture wrote no
+    part", while mysql/mssql/mongo — whose fixtures do no DDL under an open
+    replication slot — were green).
+    """
     try:
         from . import cdc as cdc_mod
     except ImportError:  # pragma: no cover
         import cdc as cdc_mod  # type: ignore
 
+    with cdc_mod._cdc_lock_for(engine):
+        _cdc_corruption_locked(led, engine, tag, url, cdc_mod)
+
+
+def _cdc_corruption_locked(led: Ledger, engine: str, tag: str, url: str, cdc_mod) -> None:
     spec = cdc_mod._ENGINES.get(engine)
     uvar = f"RIVET_CDC_{engine.upper()}_URL"
     cdc_url = os.environ.get(uvar, "")

@@ -41,6 +41,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -226,6 +227,30 @@ def _mongosh(url: str, script: str) -> Proc:
 # $work/cdc.block, which always succeeds), so a failed DDL sailed through and
 # resurfaced later as a bogus `independent-readback[…]`. Here a setup failure is
 # reported as a setup failure.
+_CDC_LOCKS: dict[str, threading.Lock] = {}
+_CDC_LOCKS_GUARD = threading.Lock()
+
+
+def _cdc_lock_for(engine: str) -> threading.Lock:
+    """The cdc probe lock for one ENGINE, shared by every version of that family.
+
+    Lives HERE, beside the fixtures it protects, because `orc_cdc_probe` is ONE
+    table on ONE stand: `RIVET_CDC_<ENGINE>_URL` is a fixed env var, not a
+    per-version container, so every version of an engine drops and recreates the
+    same physical table. Two callers run per engine×VERSION and both must take
+    it — `blessed_flow.sc_blessed_flow` and
+    `corruption.verify_cdc_corruption_is_detected`; the preflight callers
+    (verify_cdc_e2e, verify_cdc_differential, partner_shape) run once, serially,
+    before any version container exists.
+
+    Module scope on purpose: a lock built inside a per-version call gives each
+    version its own and serialises nothing — which is how the RED-proven
+    `orc_cdc_probe does not exist` collision came back on 2026-09-20.
+    """
+    with _CDC_LOCKS_GUARD:
+        return _CDC_LOCKS.setdefault(engine, threading.Lock())
+
+
 def _slot_name(prefix: str, work: Path) -> str:
     """A run-unique, valid replication-slot identifier from the work dir name.
 
