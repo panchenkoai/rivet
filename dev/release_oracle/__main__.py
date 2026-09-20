@@ -694,6 +694,15 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
     # so each version runs into a BUFFERED sub-ledger, flushed in MATRIX order (not
     # completion order) after the join, exactly as `engine_loop` does for engines.
     workers = min(cap, len(version_lines))
+    # Say the setting OUT LOUD, the way the engine matrix phase does. Without it
+    # the only way to answer "is --version-parallel actually in force?" mid-run is
+    # to read the driver's argv out of the process table — which cost three failed
+    # attempts through three different broken readers on 2026-09-20. A run must be
+    # able to explain its own concurrency from its own log.
+    led.ok(
+        f"{engine}: {len(version_lines)} versions, up to {workers} concurrent "
+        f"(--version-parallel {cap})"
+    )
     subs = [led.buffered_child() for _ in version_lines]
     from concurrent.futures import ThreadPoolExecutor
 

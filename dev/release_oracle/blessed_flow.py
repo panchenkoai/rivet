@@ -363,6 +363,22 @@ def _why(p) -> str:
     return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
+_CDC_LOCKS: dict[str, threading.Lock] = {}
+_CDC_LOCKS_GUARD = threading.Lock()
+
+
+def _cdc_lock_for(engine: str) -> threading.Lock:
+    """The cdc probe lock for one ENGINE, shared by every version of that family.
+
+    Module scope on purpose: `sc_blessed_flow` is called per engine×VERSION under
+    --version-parallel, so a lock built inside it gives each version its own and
+    serialises nothing — which is how the RED-proven `orc_cdc_probe does not
+    exist` collision came back on 2026-09-20.
+    """
+    with _CDC_LOCKS_GUARD:
+        return _CDC_LOCKS.setdefault(engine, threading.Lock())
+
+
 def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str) -> bool:
     """Record one stage. Every stage is its own row — a chain that dies at `plan`
     must leave `apply` as SKIP "not reached", never absent: in a 200-row report an
@@ -478,16 +494,25 @@ def _state_sql(cell: Cell, work: Path, state_url: str, sql: str) -> int:
         db = work / ".rivet_state.db"
         if not db.is_file():
             return -1
-        tmp = db.with_name(".read_state.db")
-        # Read a COPY: `mode=ro` on a live WAL database fails to open, which
-        # reads as "no state DB" when the file is right there.
-        shutil.copy2(db, tmp)
-        for side in ("-wal", "-shm"):
-            sc = db.with_name(db.name + side)
-            if sc.is_file():
-                shutil.copy2(sc, tmp.with_name(tmp.name + side))
+        # Snapshot with sqlite's OWN backup API, not a file copy. `mode=ro` is
+        # still avoided — it cannot open a live WAL database, which is what the
+        # copy was working around — but `shutil.copy2` of a live WAL db is not
+        # atomic against a concurrent writer, and it only had to be once
+        # --version-parallel let sibling versions write while this reads. A torn
+        # copy surfaces as sqlite3.Error -> -1; a whole-but-stale one, missing the
+        # last commits, as 0 matching rows. BOTH appeared on 2026-09-20 across 8
+        # cells (postgres, mongo) while the real databases held every row —
+        # verified after the fact: export_metrics=2, file_log=2, run_status=2.
+        # `backup()` takes a consistent snapshot and retries under contention; a
+        # read-only connection that never writes takes no lock the writer minds.
         try:
-            row = sqlite3.connect(str(tmp)).execute(sql).fetchone()
+            src = sqlite3.connect(str(db))
+            try:
+                snap = sqlite3.connect(":memory:")
+                src.backup(snap)
+            finally:
+                src.close()
+            row = snap.execute(sql).fetchone()
             return int(row[0]) if row and row[0] is not None else 0
         except sqlite3.Error:
             return -1
@@ -1121,9 +1146,13 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # found: rivet_blessed_mssql.users"). A per-cell dataset gives each its own
     # `{dset}.users`. Only ~6 slugs × N engines distinct names, reused every run (bq
     # mk -f is idempotent), so this does not accumulate datasets.
+    # …and PER VERSION since 2026-09-20: --version-parallel runs two versions of a
+    # family at once, so a per-cell-per-engine name still collided — 4 cells hit
+    # rivet's lease guard on `rivet_blessed_postgres_repeat_gcs_postgres.users` and
+    # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
     dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
-            + f"_{cell.engine}_{_cell_slug}")
+            + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — the warehouse leg runs on the "
@@ -1349,9 +1378,13 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
     # cdc cells DESTRUCTIVELY set up the ONE shared source probe per engine
     # (drop/create/enable orc_cdc_probe), so they cannot run concurrently WITH EACH
     # OTHER on this engine — RED-proven: 12 "orc_cdc_probe does not exist" collisions.
-    # Each engine has its own lock (sc_blessed_flow is per-engine), so cdc still
-    # overlaps ACROSS the 4 engines; batch cells never take it.
-    cdc_lock = threading.Lock()
+    # The lock is keyed by ENGINE and lives at module scope, NOT created per call:
+    # `sc_blessed_flow` used to be per-engine, but --version-parallel makes it
+    # per-engine×VERSION, so a local lock gave each version its own and stopped
+    # serialising anything — 2026-09-20 brought the same collision straight back
+    # ("Table 'rivet.orc_cdc_probe' doesn't exist", mysql). cdc still overlaps
+    # ACROSS the 4 engines; batch cells never take it.
+    cdc_lock = _cdc_lock_for(engine)
 
     def run_one(task: tuple[Cell, str, str]) -> None:
         cell, key, u = task

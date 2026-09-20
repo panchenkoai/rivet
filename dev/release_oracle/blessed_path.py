@@ -700,7 +700,14 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # mongo 4.4/5/6/7/8, each after postgres had already claimed
     # `rivet_blessed.users`. The guard doing its job is not the same as the gate
     # being configured right.
-    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed") + "_" + engine
+    # PER SOURCE **and PER VERSION** since 2026-09-20: --version-parallel runs two
+    # versions of one family at once, and both loaded `rivet_blessed_postgres.users`
+    # — rivet's lease guard refused the second ("the lease is held; it is released
+    # when that process ends"), on 5 cells: postgres 13/14/17, mongo 5/6. The guard
+    # was right; the gate handed two concurrent processes one warehouse table. The
+    # work dir and bucket prefix below already carried the tag; this did not.
+    dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+            + f"_{engine}_{tag.replace('.', '_')}")
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",
