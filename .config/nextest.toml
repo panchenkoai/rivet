@@ -23,10 +23,18 @@ retries = 0
 #   230s  same_named_configs_share_a_postgres_state_batch_cycle
 #   217s  base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags
 # Three of the five are over the cap ALONE, so no amount of concurrency limiting
-# saves them. Run-to-run spread is ~10% (one of them clocked 233s under 7-way
-# contention and 258s solo), so the ceiling carries real margin rather than
-# hugging the worst measurement. 300s still WARNS early; 4 periods kills a true
-# hang at 20 minutes.
+# saves them.
+#
+# The SOLO numbers above are a floor, not the operating point. Measured in the
+# 2026-09-21 release gate, under the real load (four engines, cells racing on one
+# state backend), the same two tests ran CONCURRENTLY and finished between 763s
+# and 868s:
+#   batch_cycle  230s solo -> ~3.3-3.8x    cdc_cycle  584s solo -> ~1.5x
+# So contention is worth multiples, not the ~10% an earlier note here claimed —
+# and it is NOT uniform across tests, which is why one test's factor must never
+# be extrapolated onto another (doing exactly that mid-run predicted a kill that
+# did not happen). The 300s x 4 = 1200s ceiling held with >=330s to spare;
+# 300s still WARNS early, and 4 periods kills a true hang at 20 minutes.
 [[profile.default.overrides]]
 filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/)'
 slow-timeout = { period = "300s", terminate-after = 4 }

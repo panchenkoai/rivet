@@ -486,8 +486,10 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     #                                                      the 0.5 GiB cache pin
     #   mssql     1.67 GiB   (gate) / 2.91 GiB uncapped -> 3g/2048, still over
     #                                                      the documented floor
-    #   mysql     NOT MEASURED in the gate; the stand shows 861 MiB, well above
-    #             postgres and mongo, so 2g STAYS until there is a real number.
+    #   mysql     509 MiB (8.0) / 644 MiB (8.4), measured in the 2026-09-21
+    #             matrix — the "real number" the previous note said 2g was
+    #             waiting for. 1g keeps ~1.5x over the larger sample, the same
+    #             multiple the other three carry.
     #
     # Multiples, not tight fits: those samples are moments during the matrix, not
     # proven peaks, and a cap that OOM-kills a container mid-run surfaces as a
