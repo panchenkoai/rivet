@@ -729,12 +729,18 @@ def _export_local(
     non-zero with a specific message, e.g. CSV cannot serialize an array column) from a
     real export FAILURE — conflating the two let a broken CSV export read as the golden
     refusal. Callers that only need success use `.ok`."""
-    # `dest_dir.name` carries engine+version at every caller; without it two
-    # versions exporting the same table+format in ONE process shared this path
-    # (same class as corruption.py::_export). Strictly more unique than before.
+    # PARENT + name, not name alone. Every caller passes a SUBDIRECTORY of its
+    # version-keyed out dir — `out/"users"`, `out/tmt`, `out/f"{tmt}_csv"` — so
+    # `dest_dir.name` is a constant ("users", the table) and the version lives one
+    # level up (`it_<engine>_<tag>`, `kp_<engine>_<tag>`). A first cut used `.name`
+    # alone and claimed it "carries engine+version at every caller"; it carries it
+    # at NONE of them, and gate11 caught the survivor as
+    # `users-nothing-declared` (pg14) + `users src[150000]!=declared[300000]`
+    # (pg18) — two versions on one config, one overwriting the other.
     yaml_path = (
         work_dir()
-        / f"ex_{os.getpid()}_{dest_dir.name}_{table.replace('.', '_')}_{fmt}.yaml"
+        / f"ex_{os.getpid()}_{dest_dir.parent.name}_{dest_dir.name}"
+        f"_{table.replace('.', '_')}_{fmt}.yaml"
     )
     shutil.rmtree(dest_dir, ignore_errors=True)
     if engine == "mongo":
