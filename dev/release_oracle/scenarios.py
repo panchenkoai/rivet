@@ -729,7 +729,13 @@ def _export_local(
     non-zero with a specific message, e.g. CSV cannot serialize an array column) from a
     real export FAILURE — conflating the two let a broken CSV export read as the golden
     refusal. Callers that only need success use `.ok`."""
-    yaml_path = work_dir() / f"ex_{os.getpid()}_{table.replace('.', '_')}_{fmt}.yaml"
+    # `dest_dir.name` carries engine+version at every caller; without it two
+    # versions exporting the same table+format in ONE process shared this path
+    # (same class as corruption.py::_export). Strictly more unique than before.
+    yaml_path = (
+        work_dir()
+        / f"ex_{os.getpid()}_{dest_dir.name}_{table.replace('.', '_')}_{fmt}.yaml"
+    )
     shutil.rmtree(dest_dir, ignore_errors=True)
     if engine == "mongo":
         mode = "full"  # Mongo has no keyset/chunked — full scan only
