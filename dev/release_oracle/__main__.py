@@ -213,6 +213,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="release-oracle", add_help=True)
     ap.add_argument("--engines", default="", help="comma-separated subset, e.g. postgres,mysql")
     ap.add_argument(
+        "--versions",
+        default=os.environ.get("RIVET_ORACLE_VERSIONS", ""),
+        help="narrow THIS RUN to the named versions, as `engine=tag,tag` joined by "
+        "`;` (e.g. postgres=14,16,18). Engines not named run their whole grid. "
+        "This is deliberately a RUN filter, not a matrix edit: deleting versions "
+        "from matrix.yaml forces them into `gaps` in docs/release-gate-matrix.yaml, "
+        "whose guard asserts EQUALITY against a shrink-only ratchet — so the edit "
+        "would trade wall-clock for a false coverage claim. A tag the matrix does "
+        "not list FAILS that engine loudly; running zero versions green is the one "
+        "outcome this must never produce.",
+    )
+    ap.add_argument(
         "--latest-only",
         action="store_true",
         default=env_flag("RIVET_ORACLE_LATEST_ONLY"),
@@ -615,6 +627,15 @@ def sqlcmd_path(container: str) -> str:
     )
 
 
+def _wanted_versions(spec: str, engine: str) -> set[str] | None:
+    """Tags this run wants for `engine`, or None when the whole grid runs."""
+    for part in (p.strip() for p in spec.split(";") if p.strip()):
+        name, _, tags = part.partition("=")
+        if name.strip() == engine:
+            return {t.strip() for t in tags.split(",") if t.strip()} or None
+    return None
+
+
 def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
     """One engine's whole leg: every gridded version brought up, seeded, and run
     through the scenarios, then torn down. Takes `led` so a parallel caller can
@@ -622,6 +643,24 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
     version_lines = [
         l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
     ]
+    # --versions: narrow this RUN, never the declared grid (see the flag's help).
+    want = _wanted_versions(getattr(ns, "versions", ""), engine)
+    if want is not None:
+        have = {l.split()[0] for l in version_lines}
+        missing = sorted(want - have)
+        if missing:
+            # Loud, not a SKIP: a typo'd tag that silently ran nothing would be a
+            # green leg over zero versions — the exact vacuous pass this gate exists
+            # to refuse.
+            led.failed(engine, "-", "versions", "-",
+                       f"--versions named {', '.join(missing)} for {engine}, which the "
+                       f"matrix does not list (it has: {', '.join(sorted(have))})")
+            return
+        dropped = len(version_lines) - len(want)
+        version_lines = [l for l in version_lines if l.split()[0] in want]
+        if dropped:
+            led.add(engine, "-", "other-versions", "-", Status.SKIP,
+                    f"--versions: {dropped} other {engine} version(s) not run this pass")
     # --latest-only: keep just the last version of the family (the newest,
     # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
     # proportion to the version count (postgres 4→1, mongo 5→1) while every

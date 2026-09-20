@@ -321,6 +321,15 @@ def _why(p) -> str:
     which `__main__` deletes at teardown — that deletion is what made the
     output unrecoverable in the first place.
     """
+    # A SUCCESS has no "why". Two call sites embed `_why(p)` in an f-string built
+    # whether or not the stage passed, so without this the helper wrote a full
+    # output log for every GREEN cell: measured 2026-09-20, 274 files in
+    # target/gate-failures after one gate run, every one of them `exit=0`. The
+    # directory then reads as a collapsed run to anyone who opens it (it did to
+    # the author). Every call site passes a Proc from `rivet(...)` — including
+    # the one whose variable is named `e`, which is a Proc, not an exception.
+    if p.returncode == 0:
+        return ""
     head = ""
     for src in (p.stderr or "", p.stdout or ""):
         lines = [ln.strip() for ln in src.splitlines() if ln.strip()]
