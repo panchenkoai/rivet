@@ -659,8 +659,14 @@ def _fidelity_check(engine: str, key: str, got: str) -> bool:
 
 
 # ── config generation ────────────────────────────────────────────────────────
-def _init_cfg(engine: str, url: str, schema: str) -> Path | None:
-    """`rivet init` a config for the whole DB (or one --schema), returning its path.
+def _init_cfg(engine: str, tag: str, url: str, schema: str) -> Path | None:
+    """`rivet init` a config for ONE engine VERSION, returning its path.
+
+    The version is in the FILENAME because `work_dir()` is one directory for the
+    whole run and `rivet init` refuses to overwrite: a version-less name let the
+    first version of each family create the file and every later version fail
+    init, so its verdict cell SKIPped. Measured on two full-matrix runs — 4 of 15
+    cells graded, 11 silently skipped (postgres 13-18, mongo 5-8, mysql 8.4).
 
     The URL goes in as ORACLE_URL on the child's environment — the generated
     configs carry `url_env: ORACLE_URL`. Passing it per call is what the bash
@@ -674,7 +680,7 @@ def _init_cfg(engine: str, url: str, schema: str) -> Path | None:
     accepted; passing one aborts init with a usage error and yields an empty
     (0-table) verdict map.
     """
-    out = work_dir() / f"{engine}_{schema or 'all'}.yaml"
+    out = work_dir() / f"{engine}_{tag.replace('.', '_')}_{schema or 'all'}.yaml"
     argv = ["init", "--source-env", "ORACLE_URL"]
     if schema:
         argv += ["--schema", schema]
@@ -732,7 +738,7 @@ def sc_verdicts(led: Ledger, engine: str, tag: str, url: str) -> None:
     phantom = 0
     checks: list[Path] = []
     if engine == "mongo":
-        c = _init_cfg("mongo", url, "")
+        c = _init_cfg("mongo", tag, url, "")
         if c is None:
             _skipped(led, "mongo", tag, "verdicts", "-", "mongo init failed", "init")
             return
@@ -742,7 +748,7 @@ def sc_verdicts(led: Ledger, engine: str, tag: str, url: str) -> None:
         # (the DB comes from the URL). init WITHOUT --schema on PG scaffolds
         # nothing usable → an empty check.
         schema = {"postgres": "public", "mssql": "dbo"}.get(engine, "")
-        sc = _init_cfg(engine, url, schema)
+        sc = _init_cfg(engine, tag, url, schema)
         if sc is None:
             _skipped(led, engine, tag, "verdicts", "-", f"{engine} init failed", "init")
             return
@@ -750,7 +756,7 @@ def sc_verdicts(led: Ledger, engine: str, tag: str, url: str) -> None:
         # pg/mssql keep the garbage tables in schema `ext` (a separate init);
         # mysql has them in the same DB.
         if engine != "mysql":
-            gc = _init_cfg(engine, url, "ext")
+            gc = _init_cfg(engine, tag, url, "ext")
             if gc is not None:
                 checks.append(gc)
 
@@ -1198,9 +1204,12 @@ def verify_state_migrations(led: Ledger) -> None:
     # old data slips past the fresh-db parity otherwise).
     log_path = work_dir() / "state_parity.log"
     fresh = run(
-        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
-         "--", "--ignored", "--test-threads=1",
-         "state_parity_", "pg_keyset_range_round_trips_and_commits"],
+        # nextest (process-per-test). `state_parity_` is a PREFIX: the SUBSTRING
+        # form matches its 3 tests, while the `$`-anchored form matches NONE —
+        # which would leave this leg green over zero tests (measured, not argued).
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all",
+         "-E", "test(state_parity_) or test(/pg_keyset_range_round_trips_and_commits$/)"],
         env={"RIVET_BIN": str(rivet_bin()), "RIVET_TEST_STATE_URL": state_url},
         timeout=NO_TIMEOUT,
     )
@@ -1625,8 +1634,12 @@ def verify_replica_read(led: Ledger) -> None:
     )
     log_path = work_dir() / "replica.log"
     p = run(
-        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
-         "--", "--ignored", "--test-threads=1", "cdc_reads_changes_from_a_replica"],
+        # nextest (process-per-test): tests/live_suite.rs's own header says the
+        # consolidated suite loses that isolation under the default libtest
+        # harness, where `--test-threads=1` was the mitigation.
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all",
+         "-E", "test(/cdc_reads_changes_from_a_replica$/)"],
         env={"RIVET_BIN": str(rivet_bin())},
         timeout=NO_TIMEOUT,
     )
@@ -1717,20 +1730,36 @@ def _run_pool_module(
         # the live stand). The pass check is count-agnostic (0 failed AND at least
         # one passed) so adding a pool test never silently breaks the gate the way
         # pinning "N passed" did (roast 2026-08-10).
-        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
-         "--", "--ignored", "--test-threads=1", test_filter],
+        # nextest (process-per-test); `--run-ignored all` replaces `-- --ignored`,
+        # still REQUIRED because the pool e2e tests carry #[ignore]. The filter is
+        # the SUBSTRING form: `test_filter` is a `<module>::<prefix>`, which the
+        # `$`-anchored form would match NONE of (measured on `state_parity_`).
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all", "-E", f"test({test_filter})"],
         env={"RIVET_BIN": str(rivet_bin())},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
-    # Per-test visibility: one ledger row per matched case (`test <mod>::<name> ... ok`).
-    for m in re.finditer(r"test live_pool_toxiproxy::(\w+) \.\.\. (ok|FAILED)", p.out):
-        name, res = m.group(1), m.group(2)
-        if res == "ok":
-            led.add("pool", scenario, name[:16], "-", Status.PASS, name)
-        else:
+    # Per-test visibility: one row per case, pass AND fail — dropping the failed
+    # rows would quietly cut the report below what the libtest parser gave. LEAK is
+    # a PASS that left a handle open past the test's end; nextest counts it green.
+    # nextest prints a FAIL line TWICE (inline, then again in its failure summary),
+    # so dedupe by name or one failure would emit two rows.
+    seen: dict[str, str] = {}
+    for m in re.finditer(
+        r"(PASS|LEAK|FAIL) \[[^\]]*\] \([^)]*\) \S+ live_pool_toxiproxy::(\w+)", p.out
+    ):
+        seen.setdefault(m.group(2), m.group(1))
+    for name, res in sorted(seen.items()):
+        if res == "FAIL":
             led.failed("pool", scenario, name[:16], "-", f"pool {scenario}: {name} FAILED")
-    if p.ok and "0 failed" in p.out and "0 passed" not in p.out:
+        else:
+            led.add("pool", scenario, name[:16], "-", Status.PASS, name)
+    rows = len(seen)
+    # Exit code AND at least one green row: the old text check ("0 failed" present,
+    # "0 passed" absent) read libtest's summary, which nextest never prints, and a
+    # filter matching ZERO tests must not pass as green.
+    if p.ok and rows:
         _passed(led, "pool", scenario, "-", "-", ok_detail)
     else:
         _failed(

@@ -14,6 +14,23 @@
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = 0
 
+# The heavy live cells run FAR past the default 240s kill. Measured SOLO, on an
+# idle 12-core stand, with no contention at all (plain `cargo test`, which has no
+# timeout, is how they passed unnoticed for so long):
+#   584s  same_named_configs_share_a_postgres_state_cdc_cycle
+#   272s  a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches
+#   258s  a_wide_history_read_by_keyset_loads_daily_partitions_in_batches
+#   230s  same_named_configs_share_a_postgres_state_batch_cycle
+#   217s  base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags
+# Three of the five are over the cap ALONE, so no amount of concurrency limiting
+# saves them. Run-to-run spread is ~10% (one of them clocked 233s under 7-way
+# contention and 258s solo), so the ceiling carries real margin rather than
+# hugging the worst measurement. 300s still WARNS early; 4 periods kills a true
+# hang at 20 minutes.
+[[profile.default.overrides]]
+filter = 'test(/same_named_configs_share_a_postgres_state_cdc_cycle$/) or test(/same_named_configs_share_a_postgres_state_batch_cycle$/) or test(/a_cdc_baseline_over_a_wide_history_lands_in_the_base_in_batches$/) or test(/a_wide_history_read_by_keyset_loads_daily_partitions_in_batches$/) or test(/base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags$/)'
+slow-timeout = { period = "300s", terminate-after = 4 }
+
 [profile.ci]
 # CI tolerates a single flaky retry and reports every failure (no early bail),
 # so one flake doesn't mask the rest of the matrix.

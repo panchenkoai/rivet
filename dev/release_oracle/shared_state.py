@@ -33,12 +33,6 @@ TESTS = (
 )
 
 
-def _verdict(out: str, name: str) -> str | None:
-    """`ok` / `FAILED` / `ignored` for one test from cargo's listing, else None."""
-    m = re.search(rf"^test \S*{re.escape(name)} \.\.\. (\w+)", out, re.M)
-    return m.group(1) if m else None
-
-
 def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
                   cell: Callable[[str], str], msg: Callable[[str], str]) -> None:
     """Run live Rig tests against the gate binary; grade each by cargo's own verdict line."""
@@ -59,20 +53,28 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
         "RIVET_TEST_GCS_BUCKET": bucket,
         "RIVET_BIN_OVERRIDE": str(rivet_bin()),
     }
-    p = run(["cargo", "test", "--test", "live_suite", "--", "--ignored", "--test-threads=1", *tests],
+    # nextest, not plain `cargo test`: tests/live_suite.rs's own header says the
+    # per-test process isolation this consolidated suite depends on is GONE under
+    # the default libtest harness, where `--test-threads=1` was the mitigation.
+    # `test(=X)` matches the FULL `<module>::<fn>` name, so the bare fn name never
+    # matches — anchor the regex form at the end instead (same as _drive_live_tests).
+    expr = " or ".join(f"test(/{t}$/)" for t in tests)
+    p = run(["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+             "--test", "live_suite", "--run-ignored", "all", "-E", expr],
             cwd=ROOT, env=env, timeout=None)
     out = (p.stdout or "") + (p.stderr or "")
+    # LEAK is a test that PASSED but left a handle or child open past its end;
+    # nextest's own summary counts it green ("6 passed (2 leaky)").
+    passed = {m.group(1)
+              for m in re.finditer(r"(?:PASS|LEAK) \[[^\]]*\] \([^)]*\) \S+ (\S+)", out)}
     for name in tests:
-        v = _verdict(out, name)
-        if v == "ok":
+        if any(q.endswith(name) or q == name for q in passed):
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
-        elif v is None:
-            led.failed("all", scenario, cell(name), "postgres",
-                       f"{msg(name)} — no verdict line for {name} (build failure or wrong filter)",
-                       out[-400:])
         else:
             tail = out[out.find(name):][:1200] if name in out else out[-600:]
-            led.failed("all", scenario, cell(name), "postgres", f"{msg(name)} — {v}", tail)
+            led.failed("all", scenario, cell(name), "postgres",
+                       f"{msg(name)} — no PASS line for {name} (failed, renamed, or filtered out)",
+                       tail)
 
 
 def _cycle(name: str) -> str:
