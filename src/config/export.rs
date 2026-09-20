@@ -1835,6 +1835,22 @@ mod tests {
         e
     }
 
+    /// A candidate reads ONE table by `table:` and is not itself a stream: a second
+    /// `mode: cdc` export over the same table (a per-table capture kept beside the
+    /// multiplex) reads a log, so it must not make the pairing ambiguous. RED against
+    /// `e.name != cdc.name || …`, under which the other stream pairs too.
+    #[test]
+    fn resolve_backfill_never_pairs_a_table_with_another_stream() {
+        let orders = recipe("orders", "orders");
+        let mut other_stream = recipe("orders_cdc", "orders");
+        other_stream.mode = ExportMode::Cdc;
+        let auto = stream(&["orders"], CdcBackfill::Auto(AutoWord::Auto));
+        let all = vec![orders, other_stream, auto.clone()];
+        let pairs = resolve_backfill(&auto, &all).expect("the other stream is not a candidate");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1.name, "orders");
+    }
+
     /// The happy path both spellings must agree on: every captured table pairs
     /// with the export that reads it, and the recipes keep their own strategies —
     /// which is the whole point, since a multiplex stream's tables do not agree on

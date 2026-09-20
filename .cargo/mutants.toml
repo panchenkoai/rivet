@@ -672,4 +672,13 @@ exclude_re = [
     # peak-RSS bracket (graded live: the backfill cycle test reads
     # `export_metrics.peak_rss_mb` back).
     "replace run_cdc_export -> \\(Result<\\(\\)>, RunSummary\\)",
+    # `same_leaf_typed_pair` (config/export.rs) walks `pairs.iter().skip(i + 1)`
+    # inside `enumerate()`; `skip(i * 1)` = `skip(i)` adds the (i, i) pair to
+    # every walk, and the body's `a != b` guard rejects exactly that pair — the
+    # two versions compare the same set of DISTINCT pairs on every input (the
+    # only extra pairs a smaller skip adds are pairs of an element with itself,
+    # or pairs already compared in an earlier `i`). Witness search: none exists;
+    # the guard is what makes the branch equivalent, and it stays because `pairs`
+    # is built one entry per captured table (2026-09-20).
+    "replace \\+ with \\* in same_leaf_typed_pair",
 ]
