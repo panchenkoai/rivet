@@ -225,6 +225,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "outcome this must never produce.",
     )
     ap.add_argument(
+        "--version-parallel", type=int, default=1,
+        help="how many VERSIONS of one engine family to run concurrently "
+        "(default 1 = the serial behaviour). The family's versions are the "
+        "matrix's critical path — postgres alone is 22.5 of the 23.2-minute "
+        "matrix wall, seven versions back to back. Each version owns its own "
+        "container name and port, so the ceiling is MEMORY, not collisions: "
+        "measured 2026-09-20, the Docker VM caps at 39.2 GiB with ~10.5 GiB "
+        "free, while every family at full version parallelism wants ~25 GiB. "
+        "Raise it per run, deliberately; the global --cell-parallel cap still "
+        "bounds what the extra containers can actually do at once.",
+    )
+    ap.add_argument(
         "--latest-only",
         action="store_true",
         default=env_flag("RIVET_ORACLE_LATEST_ONLY"),
@@ -671,37 +683,63 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
         if skipped:
             led.add(engine, "-", "older-versions", "-", Status.SKIP,
                     f"--latest-only: {skipped} older {engine} version(s) not run")
-    for line in version_lines:
-        parts = line.split()
-        tag, image, port = parts[0], parts[1], int(parts[2])
-        led.phase(f"{engine} {tag} ({image})")
-        with led.span(f"{engine}: bring-up"):
-            url = bring_up(led, engine, tag, image, port)
-        if not url:
-            led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
-            continue
-        # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
-        # failure is retried: a fresh container under load can drop the seed
-        # connection mid-stream, and crying wolf on that is worse than a retry.
-        err = ""
-        with led.span(f"{engine}: seed"):
-          for attempt in range(3):
-            err = seed_engine(engine, tag, url)
-            if not err:
-                break
-            # Back off between attempts. Without this the three retries fire
-            # back-to-back and all land inside the SAME startup window, so a
-            # race the retry exists to absorb is retried three times in the
-            # few hundred ms during which it cannot possibly succeed — which
-            # is how a transient became a FAIL.
-            time.sleep(2.0 * (attempt + 1))
-        if err:
-            led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
-            continue
-        led.ok("seeded")
-        scenarios.run_scenarios(led, engine, tag, url)
-        if not ns.keep:
-            docker("rm", "-fv", engine_container(engine, tag))
+    cap = max(1, getattr(ns, "version_parallel", 1))
+    if cap == 1 or len(version_lines) <= 1:
+        for line in version_lines:
+            _run_one_version(led, ns, engine, line)
+        return
+    # Versions of one family in parallel: each owns its own container name
+    # (engine×tag) and its own port from matrix.yaml, so nothing is shared but the
+    # state backend — which the gate races on DELIBERATELY. Output would interleave,
+    # so each version runs into a BUFFERED sub-ledger, flushed in MATRIX order (not
+    # completion order) after the join, exactly as `engine_loop` does for engines.
+    workers = min(cap, len(version_lines))
+    subs = [led.buffered_child() for _ in version_lines]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(pair: tuple[Ledger, str]) -> None:
+        sub, line = pair
+        with sub.span(f"{engine} {line.split()[0]}: version-total"):
+            _run_one_version(sub, ns, engine, line)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_one, zip(subs, version_lines)))
+    for sub in subs:
+        sub.flush_into(led)
+
+
+def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str) -> None:
+    """One engine×version: brought up, seeded, run through the scenarios, torn down."""
+    parts = line.split()
+    tag, image, port = parts[0], parts[1], int(parts[2])
+    led.phase(f"{engine} {tag} ({image})")
+    with led.span(f"{engine}: bring-up"):
+        url = bring_up(led, engine, tag, image, port)
+    if not url:
+        led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
+        return
+    # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
+    # failure is retried: a fresh container under load can drop the seed
+    # connection mid-stream, and crying wolf on that is worse than a retry.
+    err = ""
+    with led.span(f"{engine}: seed"):
+      for attempt in range(3):
+        err = seed_engine(engine, tag, url)
+        if not err:
+            break
+        # Back off between attempts. Without this the three retries fire
+        # back-to-back and all land inside the SAME startup window, so a
+        # race the retry exists to absorb is retried three times in the
+        # few hundred ms during which it cannot possibly succeed — which
+        # is how a transient became a FAIL.
+        time.sleep(2.0 * (attempt + 1))
+    if err:
+        led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
+        return
+    led.ok("seeded")
+    scenarios.run_scenarios(led, engine, tag, url)
+    if not ns.keep:
+        docker("rm", "-fv", engine_container(engine, tag))
 
 
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
