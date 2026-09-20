@@ -118,12 +118,18 @@ fn ts_type(e: SqlEngine) -> &'static str {
     }
 }
 
-/// `ids` as rows `(id, 'r<id>', id*10, now, now)` — a VALUES list, since only
-/// PostgreSQL has `generate_series`.
-fn insert_rows(e: SqlEngine, table: &str, ids: std::ops::RangeInclusive<i64>) {
+/// `ids` as rows `(id, 'r<id>', id*10, created, now)` — a VALUES list, since only
+/// PostgreSQL has `generate_series`; `created_days_ago` backdates the business date.
+fn insert_rows(
+    e: SqlEngine,
+    table: &str,
+    ids: std::ops::RangeInclusive<i64>,
+    created_days_ago: i64,
+) {
     let now = e.ago(0);
+    let created = e.ago(created_days_ago * 24 * 60);
     let rows: Vec<String> = ids
-        .map(|i| format!("({i}, 'r{i}', {}, {now}, {now})", i * 10))
+        .map(|i| format!("({i}, 'r{i}', {}, {created}, {now})", i * 10))
         .collect();
     e.exec(&format!(
         "INSERT INTO {table} (id, name, amount, created_at, changed_at) VALUES {}",
@@ -162,7 +168,7 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
              created_at {ts} NOT NULL, changed_at {ts} NOT NULL"
         ),
     );
-    insert_rows(e, &table, 1..=10);
+    insert_rows(e, &table, 1..=10, 0);
 
     let dir = tempfile::tempdir().expect("config dir");
     let cfg_path = dir.path().join("rivet.yaml");
@@ -211,10 +217,16 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
     let said = rivet_ok(&["compact", "-c", cfg], &[]);
     assert!(said.contains("COMPACT SKIP"), "no buffer yet: {said}");
 
-    // 2. A delta of five inserts and one UPDATE — the cursor must carry both.
-    insert_rows(e, &table, 11..=15);
+    // 2. A delta of five inserts and one UPDATE — the cursor must carry both. The
+    //    whole delta is dated three days back (late-arriving rows; the UPDATE moves
+    //    the row's business date), and init partitions the base by `created_at`: the
+    //    base holds row 3 under its OLD day, which no buffer row shares, so a
+    //    compaction that looks for it only under the buffer's days re-inserts it —
+    //    two live rows for one key, from a config init wrote.
+    insert_rows(e, &table, 11..=15, 3);
     e.exec(&format!(
-        "UPDATE {table} SET amount = 999, changed_at = {} WHERE id = 3",
+        "UPDATE {table} SET amount = 999, created_at = {}, changed_at = {} WHERE id = 3",
+        e.ago(3 * 24 * 60),
         e.ago(0)
     ));
     rivet_ok(&["run", "-c", cfg], &db);
@@ -233,7 +245,11 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
     // 3. Compact merges the buffer and drops it; the base equals the source.
     let said = rivet_ok(&["compact", "-c", cfg], &[]);
     assert!(said.contains("COMPACT OK"), "{said}");
-    assert_eq!(bq.read_bq_count(&export), "15");
+    assert_eq!(
+        bq.read_bq_count(&export),
+        "15",
+        "one row per key — the moved row was matched under its old partition, not re-inserted"
+    );
     assert!(
         bq.read_bq_table_type(&changes).is_none(),
         "the buffer is dropped after the merge"

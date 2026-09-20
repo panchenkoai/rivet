@@ -569,11 +569,14 @@ impl TargetLoader for BigQueryLoader {
         // become a script variable and every MERGE prunes to exactly those partitions.
         let day_column = match key {
             None => Some(None),
+            // A load date (`_rivet_exported_at`, the load time) is a different value
+            // on every run: the base holds every key under an older one, so there is
+            // nothing to prune by — one unbounded MERGE.
+            Some(k) if k.is_load_date() => Some(None),
             Some(PartitionKey::Time {
                 column,
                 granularity: Granularity::Day,
             }) => Some(column.as_deref()),
-            Some(PartitionKey::Time { column: None, .. }) => Some(None),
             Some(_) => None,
         };
         if let Some(day_column) = day_column {
@@ -594,7 +597,7 @@ impl TargetLoader for BigQueryLoader {
         // MERGE per window of constant bounds, then the DROP — separate jobs.
         let part_col = key.and_then(PartitionKey::column);
         let time_key = matches!(key, Some(PartitionKey::Time { .. }));
-        let probe = compact_probe_sql(&changes_fqtn, part_col, time_key);
+        let probe = compact_probe_sql(&changes_fqtn, &base, pk, part_col, time_key);
         let row = self
             .api()?
             .run_query_first_row(&probe, &self.labels("merge", table))?;

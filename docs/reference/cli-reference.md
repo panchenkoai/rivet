@@ -383,7 +383,7 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--gcs-credentials-file <PATH>` — Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML
 * `--s3-bucket <NAME>` — Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--gcs-bucket` and `--discover`
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
-* `--bigquery-project <PROJECT>` — Scaffold a `load:` block for this BigQuery project. With `--bigquery-dataset` the generated config carries the warehouse target, a per-table partition guess and the base+buffer layout, so `rivet load` and `rivet compact` work from it after a review
+* `--bigquery-project <PROJECT>` — Scaffold a `load:` block for this BigQuery project. With `--bigquery-dataset` the generated config carries the warehouse target, a per-table partition guess and the base+buffer layout, so `rivet load` and `rivet compact` work from it after a review. Needs `--gcs-bucket`: the load reads GCS only, so a local or S3 scaffold with a `load:` block is a config `rivet load` refuses
 * `--bigquery-dataset <DATASET>` — The dataset the load creates its tables in (with `--bigquery-project`)
 * `--tls <MODE>` — TLS posture for BOTH the introspection connection init opens AND the `source.tls:` block written into the scaffold. Required (or `disable`, explicitly) for any non-loopback host — without it the TLS gate refuses before connecting, and at init time there is no config file to add a `tls:` block to yet
 

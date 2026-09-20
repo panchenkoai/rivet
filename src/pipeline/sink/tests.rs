@@ -485,6 +485,15 @@ fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
         1,
         "the part must be closed before the fourth partition is written"
     );
+    // A closing part tells the loader how many partitions it holds (the footer note
+    // `split_now` writes): the loader's own bound is the footer's min/max, which
+    // over-counts a part cut at 4,000 DISTINCT days over a gappy history — and
+    // refused, by name, a file the writer sized to fit. The open part holds two days.
+    assert_eq!(
+        sink.partition.footer_note().as_deref(),
+        Some("d|day|2"),
+        "the note names the column, the granularity and the distinct partitions held"
+    );
     assert_eq!(
         sink.completed_parts[0].rows, 3,
         "the closed part holds exactly the rows that fit its budget"

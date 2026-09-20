@@ -230,6 +230,18 @@ impl PartBudget {
         Some((buckets, cap))
     }
 
+    /// What the closing part records in its footer — the column, granularity and the
+    /// distinct partitions it holds; `None` when the part is not budgeted.
+    fn footer_note(&self) -> Option<String> {
+        self.col?;
+        let r = self.rollover.as_ref()?;
+        Some(crate::plan::rollover::partition_buckets_note(
+            &r.column,
+            r.granularity,
+            self.buckets.len(),
+        ))
+    }
+
     /// The budget the current part has already spent.
     fn held(&self) -> &std::collections::HashSet<i64> {
         &self.buckets
@@ -572,7 +584,10 @@ impl ExportSink {
     /// Close the current part and open the next one, whatever asked for it — the byte
     /// cap or the partition budget.
     pub(in crate::pipeline) fn split_now(&mut self) -> Result<()> {
-        if let Some(w) = self.writer.take() {
+        if let Some(mut w) = self.writer.take() {
+            if let Some(note) = self.partition.footer_note() {
+                w.note(crate::plan::rollover::PARTITION_BUCKETS_KEY, &note);
+            }
             w.finish()?;
         }
 
@@ -790,7 +805,9 @@ impl ExportSink {
             self.partition.spend(&buckets[offset..offset + fit]);
             self.write_batch_part(&dest_batch.slice(offset, fit))?;
             offset += fit;
-            if offset < buckets.len() {
+            // The byte cap may have rotated inside `write_batch_part` already; closing
+            // the fresh part again would ship an empty file and a 0-row manifest entry.
+            if offset < buckets.len() && self.part_rows > 0 {
                 self.split_now()?;
             }
         }

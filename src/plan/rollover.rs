@@ -34,6 +34,25 @@ pub struct PartitionRollover {
     pub cap: usize,
 }
 
+/// Parquet footer key under which the writer records the distinct partitions a part
+/// holds — the loader's bound where the footer's min/max over-counts a scattered part.
+pub const PARTITION_BUCKETS_KEY: &str = "rivet.partition_buckets";
+
+/// The footer note: `<column>|<granularity>|<distinct buckets>`.
+pub fn partition_buckets_note(column: &str, granularity: Granularity, buckets: usize) -> String {
+    format!("{column}|{}|{buckets}", granularity.as_str())
+}
+
+/// The note read back as `(column, granularity, buckets)`; `None` for anything else.
+pub fn parse_partition_buckets_note(note: &str) -> Option<(&str, &str, i64)> {
+    let mut parts = note.split('|');
+    let (column, granularity, buckets) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((column, granularity, buckets.parse().ok()?))
+}
+
 /// How a partition column's values are stored, for the conversion to epoch seconds.
 /// Named here rather than in the sink so the arithmetic below can be graded offline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

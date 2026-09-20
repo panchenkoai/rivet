@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **`rivet compact` matches a base row under its OLD partition value.** The MERGE
+  pruned the base to the days (or the range) found in the BUFFER, so a key whose
+  partition column changed between two cycles — a corrected business date, a row
+  partitioned by its `updated_at` — sat in the base under a day the buffer never named:
+  NOT MATCHED, re-INSERTed, two live rows for one key, `COMPACT OK`. Found by the
+  generated-config chain (init partitions by `created_at`; the delta moved a row's
+  date), and the shape a `_rivet_exported_at` partition hits on EVERY change. The days
+  and the range are now collected over the buffer AND the base's rows of the buffer's
+  keys (one semi-join, the key and partition columns only), the base side is bounded by
+  the whole touched set plus its NULL partition — never by one window of the winners —
+  and a load-date key merges unbounded, as its doc always said. A range value outside
+  the key's `[start, end)` merges once, unbounded, instead of windowing up to it.
+
+- **A delete DELETES when the base carries no `__is_deleted`.** With
+  `deleted_flag: false` on a stream the MERGE had no tombstone arm, so a
+  `__op = 'delete'` winner fell through to the upsert and overwrote the live row with
+  the delete's key-only before-image — NULLs in every non-key column, still live.
+  Without the flag there is nothing to flag; the row is removed.
+
+- **A CLONE'd base is a table.** The batched whole-table load ends in
+  `CREATE OR REPLACE TABLE … CLONE`, and the catalog reports that table as `CLONE` for
+  life; the object-kind probe counted only `BASE TABLE`, so every later `compact` and
+  overwrite of a base that took two or more load jobs was refused as "neither a table
+  nor a view" (gate: `layout[batches:cdc]`).
+
+- **A part the writer budgeted is loaded on the count it recorded.** The extract rotates
+  parts at 4,000 DISTINCT partitions; the load bounded a file by its footer min/max and
+  its row count, and a large part cut at 4,000 business days spans ~5,600 calendar days
+  — refused by name, although it fits. The closing part now records
+  `rivet.partition_buckets = <column>|<granularity>|<n>` in its Parquet footer and the
+  load takes that bound when the column and granularity are the ones it partitions by.
+  The load-time refusal itself is reachable only by a file written BEFORE the partition
+  was declared, which is what the live cell now stages.
+
+- **A multiplex stream's `load.tables.<name>.partition` reaches the WRITER of that
+  table's baseline leg**, not only the load: the leg resolved its partition at the export
+  level, so a per-table partition budgeted nothing while the load held the files to it.
+
+- **`rivet init`:** `--bigquery-project/--bigquery-dataset` need `--gcs-bucket` (the load
+  reads GCS only — a local or S3 scaffold with a `load:` block was refused by its own
+  next-steps command); the whole-DB CDC scaffold writes each table's partition guess on
+  the stream's `load.tables.<name>` — where the load reads it — instead of on the
+  recipes, which the load never reads (the bases came out unpartitioned); the per-table
+  MySQL fallback gives every CDC export its own `server_id`; a partition column named
+  like a YAML scalar is quoted; the creation stamp (`created_at` / `made_at` /
+  `occurred_at`) is preferred as the partition column over any other business date.
+
 - **`load.layout: base_buffer` — a physical base and `rivet compact` for an ORDINARY
   incremental export.** Compaction used to be a property of the MODE: only a `mode: cdc`
   stream with a `backfill:` kept a physical base plus a disposable buffer, and every

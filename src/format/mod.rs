@@ -11,6 +11,8 @@ use crate::error::Result;
 pub trait FormatWriter {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()>;
     fn finish(self: Box<Self>) -> Result<()>;
+    /// Record a key/value in the file's footer, where the format has one.
+    fn note(&mut self, _key: &str, _value: &str) {}
     /// Approximate bytes written so far (for file-size splitting).
     fn bytes_written(&self) -> u64;
 }

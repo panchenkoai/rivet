@@ -304,11 +304,15 @@ pub enum Commands {
         /// Scaffold a `load:` block for this BigQuery project. With
         /// `--bigquery-dataset` the generated config carries the warehouse target,
         /// a per-table partition guess and the base+buffer layout, so `rivet load`
-        /// and `rivet compact` work from it after a review.
+        /// and `rivet compact` work from it after a review. Needs `--gcs-bucket`:
+        /// the load reads GCS only, so a local or S3 scaffold with a `load:` block
+        /// is a config `rivet load` refuses.
         #[arg(
             long = "bigquery-project",
             value_name = "PROJECT",
-            requires = "bigquery_dataset"
+            requires = "bigquery_dataset",
+            requires = "gcs_bucket",
+            conflicts_with = "s3_bucket"
         )]
         bigquery_project: Option<String>,
         /// The dataset the load creates its tables in (with `--bigquery-project`).
@@ -695,6 +699,31 @@ mod tests {
         assert_eq!(
             state_reset_chunks_parse_from(&[]).unwrap_err(),
             clap::error::ErrorKind::MissingRequiredArgument,
+        );
+    }
+
+    /// `rivet load` reads GCS only, so a `load:` scaffold over a local or S3
+    /// destination is a config whose own next-steps command refuses it. Refused at
+    /// the flag, where the operator can still change it.
+    #[test]
+    fn init_clap_requires_a_gcs_bucket_for_a_bigquery_load_scaffold() {
+        let bq = ["--bigquery-project", "p", "--bigquery-dataset", "d"];
+        let src = ["--source", "postgresql://localhost/db"];
+        assert_init_err(
+            &[src.as_slice(), bq.as_slice()].concat(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--bigquery-* without --gcs-bucket",
+        );
+        // A conflict, not a missing requirement: clap drops a requirement that conflicts
+        // with a present flag, so `requires` alone let `--s3-bucket` satisfy it.
+        assert_init_err(
+            &[src.as_slice(), bq.as_slice(), &["--s3-bucket", "s"]].concat(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--bigquery-* with --s3-bucket only",
+        );
+        assert_init_ok(
+            &[src.as_slice(), bq.as_slice(), &["--gcs-bucket", "g"]].concat(),
+            "--bigquery-* with --gcs-bucket",
         );
     }
 

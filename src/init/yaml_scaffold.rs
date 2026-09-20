@@ -39,7 +39,7 @@ pub(super) fn generate_config(
     let unbounded = table_has_unbounded_decimal_columns(info);
     let mut lines = config_header_lines(st, &header, unbounded, provenance, tls);
     lines.push("exports:".to_string());
-    lines.extend(export_block_lines(info, st, dest, mode_override, false));
+    lines.extend(export_block_lines(info, st, dest, mode_override, false, 0));
     let compactable = matches!(
         mode_override.unwrap_or_else(|| info.suggest_mode()),
         "incremental" | "cdc"
@@ -113,6 +113,7 @@ pub(super) fn generate_schema_config(
                 dest,
                 Some(recipe_mode(info)),
                 true,
+                0,
             ));
         }
         let readable: Vec<TableInfo> = readable.into_iter().cloned().collect();
@@ -128,8 +129,15 @@ pub(super) fn generate_schema_config(
     };
     lines.push(dest_note.to_string());
     lines.push("exports:".to_string());
-    for info in infos {
-        lines.extend(export_block_lines(info, st, dest, mode_override, false));
+    for (ordinal, info) in infos.iter().enumerate() {
+        lines.extend(export_block_lines(
+            info,
+            st,
+            dest,
+            mode_override,
+            false,
+            ordinal,
+        ));
     }
     let compactable = infos.iter().any(|i| {
         matches!(
@@ -541,7 +549,8 @@ fn recipe_mode(info: &TableInfo) -> &'static str {
     }
 }
 
-/// `force_table` emits the `table:` shortcut whatever the engine's default form —
+/// `recipe` (a stream's baseline recipe) emits the `table:` shortcut whatever the
+/// engine's default form, and no `load:` block — the load never reads a recipe —
 /// a backfill recipe must name the relation it reads (`query:` cannot be paired).
 /// The `load:` block `rivet init` writes when a warehouse was named — the
 /// defaults an operator is expected to READ and adjust, not a contract.
@@ -599,7 +608,8 @@ fn export_block_lines(
     source_type: &str,
     dest: &InitYamlDestination,
     mode_override: Option<&str>,
-    force_table: bool,
+    recipe: bool,
+    ordinal: usize,
 ) -> Vec<String> {
     let mode = mode_override.unwrap_or_else(|| info.suggest_mode());
     let columns: Vec<&str> = info.columns.iter().map(|c| c.name.as_str()).collect();
@@ -626,7 +636,7 @@ fn export_block_lines(
     // CDC reads the transaction log, not a query — a wholly different block
     // (no cursor/chunk/meta_columns; engine-specific stream knobs instead).
     if mode == "cdc" {
-        return cdc_export_lines(info, source_type, dest, &qualified_table);
+        return cdc_export_lines(info, source_type, dest, &qualified_table, ordinal);
     }
 
     // For `mode: full` on a plain table, emit the `table:` shortcut: it produces
@@ -664,7 +674,7 @@ fn export_block_lines(
         "mongo" => shortcut_shape_ok,
         _ => shortcut_shape_ok,
     };
-    let table_form_safe = table_form_safe || force_table;
+    let table_form_safe = table_form_safe || recipe;
     let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
     if source_type == "mongo" && !table_form_safe {
         // Unexportable in ANY form today: `table:` is Mongo's only export form
@@ -680,7 +690,7 @@ fn export_block_lines(
             "  #   collection or export it with another tool.".to_string(),
         ];
     }
-    if force_table
+    if recipe
         || table_form_safe
             && (is_keyset
                 || (mode == "full" && (source_type == "postgres" || source_type == "mongo")))
@@ -871,13 +881,17 @@ fn export_block_lines(
 
     // The warehouse partition, guessed from THIS table's own columns so a schema
     // whose tables name their business date differently needs no hand-merge. A
-    // guess, said as one: the operator reviews it before the first load.
+    // guess, said as one: the operator reviews it before the first load. Not on a
+    // recipe — the load never reads one; its table's guess rides the stream's
+    // `load.tables.<name>` instead.
     if dest.bigquery_project.is_some()
+        && !recipe
         && let Some(col) = info.best_partition_column()
     {
         lines.push("    load:".to_string());
         lines.push(format!(
-            "      partition: {{ column: {col}, granularity: day }}  # day holds ~4,000 partitions (11 years); use month for a longer history"
+            "      partition: {{ column: {}, granularity: day }}  # day holds ~4,000 partitions (11 years); use month for a longer history",
+            yaml_quote_if_needed(col)
         ));
     }
 
@@ -892,6 +906,7 @@ fn cdc_export_lines(
     source_type: &str,
     dest: &InitYamlDestination,
     qualified_table: &str,
+    ordinal: usize,
 ) -> Vec<String> {
     let mut lines = vec![
         format!("  - name: {}", yaml_quote_if_needed(&info.table)),
@@ -914,10 +929,12 @@ omitting differ per engine — see cdc.md)",
             .to_string(),
     ];
     match source_type {
-        "mysql" => lines.push(
-            "      server_id: 4271  # unique replica id; source needs binlog_format=ROW + a REPLICATION SLAVE grant"
-                .to_string(),
-        ),
+        // One id per export: two exports sharing a replica id evict each other's
+        // binlog connection, so the per-table scaffold counts up from the first.
+        "mysql" => lines.push(format!(
+            "      server_id: {}  # unique replica id; source needs binlog_format=ROW + a REPLICATION SLAVE grant",
+            4271 + ordinal
+        )),
         "postgres" => lines.push(format!(
             "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
             cdc_ident(&info.table)
@@ -1012,6 +1029,39 @@ fn cdc_multiplex_export_lines(
     }
     lines.extend(cdc_multiplex_destination(dest));
     lines.extend(cdc_multiplex_column_lines(infos));
+    lines.extend(cdc_multiplex_load_lines(infos, dest));
+    lines
+}
+
+/// The per-table partition guesses, where the LOAD reads them for a stream: its
+/// `load.tables.<name>` blocks. On the recipes they were dead text — a recipe is
+/// never loaded — and the bases were created unpartitioned under a config that
+/// visibly said otherwise.
+fn cdc_multiplex_load_lines(infos: &[TableInfo], dest: &InitYamlDestination) -> Vec<String> {
+    if dest.bigquery_project.is_none() {
+        return Vec::new();
+    }
+    let guesses: Vec<String> = infos
+        .iter()
+        .filter_map(|i| {
+            i.best_partition_column().map(|col| {
+                format!(
+                    "        {}: {{ partition: {{ column: {}, granularity: day }} }}",
+                    yaml_quote_if_needed(&i.table),
+                    yaml_quote_if_needed(col)
+                )
+            })
+        })
+        .collect();
+    if guesses.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "    load:".to_string(),
+        "      # Each table's warehouse partition, guessed from its own columns — day holds ~4,000 partitions (11 years); use month for a longer history".to_string(),
+        "      tables:".to_string(),
+    ];
+    lines.extend(guesses);
     lines
 }
 
@@ -2025,6 +2075,110 @@ mod tests {
         let cfg = crate::config::Config::from_yaml(&yaml)
             .expect("the scaffold must be a config rivet accepts");
         assert_eq!(cfg.exports.len(), 3, "two recipes + the stream");
+    }
+
+    /// With a warehouse, the whole-DB CDC scaffold's partition guesses must sit where
+    /// the LOAD reads them for a stream — `load.tables.<name>` on the stream — not on
+    /// the recipes, which the load never reads (the bases came out unpartitioned under
+    /// a config that visibly said `partition:`). The oracle is the resolver the load
+    /// itself uses on the parsed config. RED against the recipe-side `load:` block.
+    #[test]
+    fn whole_db_cdc_puts_each_tables_partition_where_the_load_reads_it() {
+        let mk = |table: &str| TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![
+                ColumnInfo {
+                    is_primary_key: true,
+                    ..col("id", "bigint")
+                },
+                col("created_at", "datetime"),
+            ],
+        };
+        let dest = InitYamlDestination {
+            bigquery_project: Some("proj".into()),
+            bigquery_dataset: Some("ds".into()),
+            gcs_bucket: Some("b".into()),
+            ..Default::default()
+        };
+        let yaml = generate_schema_config(
+            &[mk("orders"), mk("items")],
+            "mysql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            "MySQL database \"app\"",
+            &dest,
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        let cfg = crate::config::Config::from_yaml(&yaml)
+            .expect("the scaffold must be a config rivet accepts");
+        let stream = cfg
+            .exports
+            .iter()
+            .find(|e| e.mode == crate::config::ExportMode::Cdc)
+            .expect("the cdc export");
+        for table in ["orders", "items"] {
+            let spec = crate::load::plan::resolved_partition(&cfg, stream, Some(table))
+                .unwrap_or_else(|| {
+                    panic!("{table} has a partition where the load reads it:\n{yaml}")
+                });
+            assert!(
+                matches!(
+                    spec.form,
+                    crate::config::load::PartitionForm::Column { ref column, granularity: crate::config::load::Granularity::Day } if column == "created_at"
+                ),
+                "{table}: {spec:?}"
+            );
+        }
+        assert!(
+            cfg.exports
+                .iter()
+                .filter(|e| e.mode != crate::config::ExportMode::Cdc)
+                .all(|e| e.load.is_none()),
+            "a recipe carries no `load:` block — the load never reads one:\n{yaml}"
+        );
+    }
+
+    /// The MySQL twin of the fallback below: N per-table CDC exports need N distinct
+    /// replica ids, or the second binlog client evicts the first (the consolidated
+    /// stream avoided this by having ONE id; the fallback must not bring it back).
+    #[test]
+    fn whole_db_cdc_fallback_on_mysql_gives_every_export_its_own_server_id() {
+        let mk = |table: &str| TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![ColumnInfo {
+                is_primary_key: true,
+                ..col("id", "bigint")
+            }],
+        };
+        // Leading digits: legal on MySQL, never a `table:` shortcut, so no recipe.
+        let yaml = generate_schema_config(
+            &[mk("2024_orders"), mk("2025_orders")],
+            "mysql://rivet:rivet@localhost/app",
+            &crate::init::SourceProvenance::Inline,
+            "MySQL database \"app\"",
+            &InitYamlDestination::default(),
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            yaml.matches("mode: cdc").count(),
+            2,
+            "per-table fallback:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("server_id: 4271") && yaml.contains("server_id: 4272"),
+            "two exports, two replica ids:\n{yaml}"
+        );
     }
 
     /// A `public` schema with NO recipe-readable table (every name CamelCase on

@@ -67,6 +67,9 @@ pub(crate) fn plan_load_batches(
         let meta = read_footer(store, key)
             .with_context(|| format!("reading the Parquet footer of {uri}"))?;
         let rows = meta.file_metadata().num_rows();
+        // A part the writer budgeted says how many partitions it holds — the bound the
+        // span cannot give for a scattered part (4,000 distinct days across 5,600).
+        let rows = footer_buckets(&meta, &partition.key).map_or(rows, |b| rows.min(b));
         match column_span(&meta, column) {
             Some(span) => spanned.push((uri.clone(), span, rows)),
             None => blind.push(uri.clone()),
@@ -129,6 +132,28 @@ fn pack_batches(
         batches.push(uris);
     }
     Ok(batches)
+}
+
+/// The distinct partitions the writer recorded for this file, when it budgeted the same
+/// column at the same granularity the load partitions by.
+fn footer_buckets(meta: &ParquetMetaData, key: &PartitionKey) -> Option<i64> {
+    use crate::plan::rollover::{PARTITION_BUCKETS_KEY, parse_partition_buckets_note};
+    let PartitionKey::Time {
+        column: Some(column),
+        granularity,
+    } = key
+    else {
+        return None;
+    };
+    let note = meta
+        .file_metadata()
+        .key_value_metadata()?
+        .iter()
+        .find(|kv| kv.key == PARTITION_BUCKETS_KEY)?
+        .value
+        .as_deref()?;
+    let (c, g, n) = parse_partition_buckets_note(note)?;
+    (c == column && g == granularity.as_str()).then_some(n)
 }
 
 /// The footer of the Parquet object at the bucket-relative `key`: its last 8 bytes name
@@ -339,6 +364,17 @@ mod tests {
     }
 
     fn write(dir: &std::path::Path, name: &str, field: Field, column: ArrayRef, stats: bool) {
+        write_noted(dir, name, field, column, stats, None);
+    }
+
+    fn write_noted(
+        dir: &std::path::Path,
+        name: &str,
+        field: Field,
+        column: ArrayRef,
+        stats: bool,
+        note: Option<&str>,
+    ) {
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
         let props = WriterProperties::builder()
@@ -347,6 +383,12 @@ mod tests {
             } else {
                 EnabledStatistics::None
             })
+            .set_key_value_metadata(note.map(|n| {
+                vec![parquet::file::metadata::KeyValue::new(
+                    crate::plan::rollover::PARTITION_BUCKETS_KEY.to_string(),
+                    n.to_string(),
+                )]
+            }))
             .build();
         let path = dir.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -356,7 +398,7 @@ mod tests {
         w.close().unwrap();
     }
 
-    fn ts_file(dir: &std::path::Path, name: &str, secs: &[i64], stats: bool) {
+    fn ts_column(secs: &[i64]) -> (Field, ArrayRef) {
         let field = Field::new(
             "ts",
             DataType::Timestamp(ArrowUnit::Microsecond, Some("UTC".into())),
@@ -365,7 +407,73 @@ mod tests {
         let values: Vec<i64> = secs.iter().map(|s| micros(*s)).collect();
         let column: ArrayRef =
             Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"));
+        (field, column)
+    }
+
+    fn ts_file(dir: &std::path::Path, name: &str, secs: &[i64], stats: bool) {
+        let (field, column) = ts_column(secs);
         write(dir, name, field, column, stats);
+    }
+
+    /// The writer rotates parts at 4,000 DISTINCT partitions, and a part cut there over
+    /// a gappy history spans far more calendar days than it occupies — 4,000 business
+    /// days are ~5,600 calendar days. Its footer min/max, and its row count once it is
+    /// large, both say "over the cap"; the count the writer recorded in the footer is
+    /// the truth, and only for the column and granularity the load partitions by.
+    /// RED against ignoring the footer note.
+    #[test]
+    fn a_part_the_writer_budgeted_is_bounded_by_the_count_it_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        // 4,000 distinct days two days apart (an 8,000-day span), 100 of them twice.
+        let mut days: Vec<i64> = (0..4000).map(|i| start + i * 2 * DAY).collect();
+        days.extend((0..100).map(|i| start + i * 2 * DAY));
+        let key = time("ts", Granularity::Day);
+        let uri = |n: &str| vec![format!("gs://b/{n}")];
+
+        let (field, column) = ts_column(&days);
+        write_noted(dir.path(), "bare.parquet", field, column, true, None);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let err = plan_load_batches(&store, &uri("bare.parquet"), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("alone spans about 4100 day partitions"),
+            "without the note the rows (4,100) are the tighter bound, and still over: {err}"
+        );
+
+        let (field, column) = ts_column(&days);
+        write_noted(
+            dir.path(),
+            "noted.parquet",
+            field,
+            column,
+            true,
+            Some("ts|day|4000"),
+        );
+        assert_eq!(
+            plan_load_batches(&store, &uri("noted.parquet"), &key).unwrap(),
+            vec![uri("noted.parquet")],
+            "4,000 recorded partitions fit one job, whatever the span"
+        );
+
+        // A note about another column, or another granularity, says nothing about
+        // this load and must not be trusted.
+        for foreign in ["other|day|4000", "ts|month|4000"] {
+            let (field, column) = ts_column(&days);
+            write_noted(
+                dir.path(),
+                "foreign.parquet",
+                field,
+                column,
+                true,
+                Some(foreign),
+            );
+            assert!(
+                plan_load_batches(&store, &uri("foreign.parquet"), &key).is_err(),
+                "a note for {foreign} must not bound a DAY load of `ts`"
+            );
+        }
     }
 
     fn time(column: &str, granularity: Granularity) -> TablePartition {

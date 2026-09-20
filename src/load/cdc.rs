@@ -233,41 +233,75 @@ pub fn flag_spec(warehouse: Warehouse) -> TargetColumnSpec {
     meta_spec(DELETE_FLAG_COLUMN, ty)
 }
 
-/// A half-open bound on the base's partition column, as typed SQL literals, that a
-/// compaction MERGE applies to BOTH sides so BigQuery prunes the base's partitions
-/// (only constants prune a MERGE target).
+/// A half-open window on the partition column, as typed SQL literals: `lo..hi_exclusive`
+/// selects the buffer's winners one MERGE takes, `all_lo..all_hi_exclusive` is the whole
+/// range a compaction touches — buffer values AND the base rows of the buffer's keys —
+/// and bounds the base side. A key whose value moved from one window into another sits
+/// in the base under the OLD value; bounding the base by the winner's window alone
+/// missed it and inserted a second row (only constants prune a MERGE target).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeBound {
     pub column: String,
     pub lo: String,
     pub hi_exclusive: String,
+    pub all_lo: String,
+    pub all_hi_exclusive: String,
 }
 
-/// `(rows, min, max, null_count)` of the buffer's partition column, as strings —
-/// the MERGE's pruning bounds come from here. `DATE(col)` normalises DATE /
-/// DATETIME / TIMESTAMP to one `YYYY-MM-DD` shape; an integer range column is cast.
+/// `T.k = S.k AND …` over the key columns.
+fn key_join(pk: &[&str]) -> String {
+    pk.iter()
+        .map(|k| format!("T.`{k}` = S.`{k}`"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// The partition column over every row a compaction can touch, as one column `v`:
+/// the buffer's rows and the base rows of the buffer's keys. The buffer alone names
+/// only a key's NEW value; the base holds the row under its old one.
+fn touched_values_sql(
+    changes_fqtn: &str,
+    base_fqtn: &str,
+    pk: &[&str],
+    column: &str,
+    as_date: bool,
+) -> String {
+    let (own, base) = if as_date {
+        (format!("DATE(`{column}`)"), format!("DATE(T.`{column}`)"))
+    } else {
+        (format!("`{column}`"), format!("T.`{column}`"))
+    };
+    format!(
+        "SELECT {own} AS v FROM `{changes_fqtn}` UNION ALL SELECT {base} FROM `{base_fqtn}` AS T \
+         WHERE EXISTS (SELECT 1 FROM `{changes_fqtn}` AS S WHERE {})",
+        key_join(pk)
+    )
+}
+
+/// `(rows, min, max, null_count)` — rows and NULLs of the buffer, min/max of the
+/// partition column over everything the compaction touches ([`touched_values_sql`]) —
+/// as strings; the MERGE's pruning bounds come from here. `DATE(col)` normalises
+/// DATE / DATETIME / TIMESTAMP to one `YYYY-MM-DD` shape; an integer range column is cast.
 pub fn compact_probe_sql(
     changes_fqtn: &str,
+    base_fqtn: &str,
+    pk: &[String],
     partition_col: Option<&str>,
     time_key: bool,
 ) -> String {
-    match partition_col {
-        None => {
-            format!(
-                "SELECT COUNT(*) AS n, '' AS lo, '' AS hi, 0 AS null_keys FROM `{changes_fqtn}`"
-            )
-        }
-        Some(c) if time_key => format!(
-            "SELECT COUNT(*) AS n, IFNULL(CAST(MIN(DATE(`{c}`)) AS STRING), '') AS lo, \
-             IFNULL(CAST(MAX(DATE(`{c}`)) AS STRING), '') AS hi, COUNTIF(`{c}` IS NULL) AS null_keys \
-             FROM `{changes_fqtn}`"
-        ),
-        Some(c) => format!(
-            "SELECT COUNT(*) AS n, IFNULL(CAST(MIN(`{c}`) AS STRING), '') AS lo, \
-             IFNULL(CAST(MAX(`{c}`) AS STRING), '') AS hi, COUNTIF(`{c}` IS NULL) AS null_keys \
-             FROM `{changes_fqtn}`"
-        ),
-    }
+    let Some(c) = partition_col else {
+        return format!(
+            "SELECT COUNT(*) AS n, '' AS lo, '' AS hi, 0 AS null_keys FROM `{changes_fqtn}`"
+        );
+    };
+    let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    format!(
+        "SELECT (SELECT COUNT(*) FROM `{changes_fqtn}`) AS n, \
+         IFNULL(CAST(MIN(v) AS STRING), '') AS lo, IFNULL(CAST(MAX(v) AS STRING), '') AS hi, \
+         (SELECT COUNTIF(`{c}` IS NULL) FROM `{changes_fqtn}`) AS null_keys \
+         FROM ({})",
+        touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_key)
+    )
 }
 
 /// Split `[lo, hi]` (inclusive dates) into half-open day windows of at most
@@ -350,34 +384,50 @@ pub fn compact_merge_sql(
 pub enum MergeFilter {
     All,
     Range(RangeBound),
-    /// `DATE(column) IN UNNEST(variable)` — a day-partitioned base.
+    /// A day-partitioned base: the winners in `DATE(column) IN UNNEST(chunk)`, the base
+    /// bounded by `all` — every day the compaction touches, old values included.
     Days {
         column: String,
-        variable: String,
+        chunk: String,
+        all: String,
     },
     NullKeys(String),
 }
 
 impl MergeFilter {
-    /// The predicate on a row of `alias` (no alias for the buffer's own columns).
+    /// The predicate on a row of `alias` — no alias for the buffer's own columns, `T`
+    /// for the base. The base side is bounded by the WHOLE touched range, plus the
+    /// NULL partition: a base row's value is the OLD one, which no window of the
+    /// winners has to contain.
     fn predicate(&self, alias: &str) -> String {
+        let base = !alias.is_empty();
         let q = |c: &str| {
-            if alias.is_empty() {
-                format!("`{c}`")
-            } else {
+            if base {
                 format!("{alias}.`{c}`")
+            } else {
+                format!("`{c}`")
             }
         };
         match self {
             MergeFilter::All => String::new(),
+            MergeFilter::Range(b) if base => format!(
+                " AND ({c} >= {lo} AND {c} < {hi} OR {c} IS NULL)",
+                c = q(&b.column),
+                lo = b.all_lo,
+                hi = b.all_hi_exclusive
+            ),
             MergeFilter::Range(b) => format!(
                 " AND {c} >= {lo} AND {c} < {hi}",
                 c = q(&b.column),
                 lo = b.lo,
                 hi = b.hi_exclusive
             ),
-            MergeFilter::Days { column, variable } => {
-                format!(" AND DATE({}) IN UNNEST({variable})", q(column))
+            MergeFilter::Days { column, all, .. } if base => format!(
+                " AND (DATE({c}) IN UNNEST({all}) OR {c} IS NULL)",
+                c = q(column)
+            ),
+            MergeFilter::Days { column, chunk, .. } => {
+                format!(" AND DATE({}) IN UNNEST({chunk})", q(column))
             }
             MergeFilter::NullKeys(c) => format!(" AND {} IS NULL", q(c)),
         }
@@ -399,11 +449,7 @@ pub fn compact_merge_filtered_sql(
     let partition = quote_partition(wh, pk);
     let order = order.order_by(wh);
     let source_filter = filter.predicate("");
-    let on_keys = pk
-        .iter()
-        .map(|k| format!("T.`{k}` = S.`{k}`"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
+    let on_keys = key_join(pk);
     // NULL-keyed winners match the base by key alone: their partition is unknown.
     let on_bound = match filter {
         MergeFilter::NullKeys(_) => String::new(),
@@ -428,15 +474,16 @@ pub fn compact_merge_filtered_sql(
         .chain(flag("FALSE".to_string()))
         .collect::<Vec<_>>()
         .join(", ");
-    // Without the flag column there is no tombstone to write: a query-based
-    // export cannot express a delete, and naming the column would break a MERGE
-    // into a base that does not have it.
+    // Without the flag column there is no tombstone to write, so a delete deletes:
+    // a stream with `deleted_flag: false` still delivers `__op = 'delete'` rows
+    // (a query-based export never does), and letting one fall through to the
+    // upsert arm overwrote the live row with the delete's key-only image.
     let tombstone = if deleted_flag {
         format!(
             "WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n"
         )
     } else {
-        String::new()
+        "WHEN MATCHED AND S.__op = 'delete' THEN DELETE\n".to_string()
     };
     format!(
         "MERGE `{base_fqtn}` AS T\n\
@@ -1004,11 +1051,15 @@ pub fn plan_compact_merges(
                     probe.hi
                 );
             };
+            let all_lo = time_literal(ty, lo_d);
+            let all_hi = time_literal(ty, hi_d + chrono::Duration::days(1));
             for (from, to) in day_windows(lo_d, hi_d, step) {
                 let bound = RangeBound {
                     column: col.to_string(),
                     lo: time_literal(ty, from),
                     hi_exclusive: time_literal(ty, to),
+                    all_lo: all_lo.clone(),
+                    all_hi_exclusive: all_hi.clone(),
                 };
                 merges.push(merge(Some(&bound), None));
             }
@@ -1016,7 +1067,15 @@ pub fn plan_compact_merges(
                 merges.push(merge(None, Some(col)));
             }
         }
-        (Some(PartitionKey::Range { interval, .. }), Some(col)) if !probe.lo.is_empty() => {
+        (
+            Some(PartitionKey::Range {
+                interval,
+                start,
+                end,
+                ..
+            }),
+            Some(col),
+        ) if !probe.lo.is_empty() => {
             let (Ok(lo_i), Ok(hi_i)) = (probe.lo.parse::<i64>(), probe.hi.parse::<i64>()) else {
                 anyhow::bail!(
                     "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
@@ -1024,7 +1083,15 @@ pub fn plan_compact_merges(
                     probe.hi
                 );
             };
+            // A value outside `[start, end)` lives in the one unpartitioned bucket, which
+            // no window reaches and which windowing up to it would count in the millions
+            // (a legal BIGINT far past `end`): such a buffer merges once, unbounded.
+            if lo_i < *start || hi_i >= *end {
+                merges.push(merge(None, None));
+                return Ok(merges);
+            }
             let step = interval.saturating_mul(4000).max(1);
+            let all_hi = hi_i.saturating_add(1).to_string();
             let mut from = lo_i;
             while from <= hi_i {
                 let to = from.saturating_add(step);
@@ -1032,6 +1099,8 @@ pub fn plan_compact_merges(
                     column: col.to_string(),
                     lo: from.to_string(),
                     hi_exclusive: to.to_string(),
+                    all_lo: lo_i.to_string(),
+                    all_hi_exclusive: all_hi.clone(),
                 };
                 merges.push(merge(Some(&bound), None));
                 from = to;
@@ -1051,11 +1120,12 @@ pub const MERGE_PARTITION_CAP: usize = 4000;
 /// ONE multi-statement job that compacts a base whose partition key is a DAY
 /// column — or no key at all — and drops the buffer: the probe, the MERGEs and
 /// the DROP are statements of one script, so a cycle costs one round trip and one
-/// labelled job (its children inherit the labels). The buffer's distinct days are
-/// collected into a script variable and the MERGE prunes the base with
-/// `DATE(col) IN UNNEST(<variable>)` — exactly the touched partitions, in chunks of
-/// [`MERGE_PARTITION_CAP`]; NULL-keyed winners merge on their own, unpruned. The
-/// last statement returns `(changes_rows, merge_jobs)` for the report.
+/// labelled job (its children inherit the labels). The distinct days of every row
+/// the compaction touches — the buffer's, and the base's rows of the buffer's keys,
+/// whose day may be the OLD one — are collected into a script variable and the
+/// MERGE prunes the base with `DATE(col) IN UNNEST(days) OR col IS NULL`, the
+/// winners taken in chunks of [`MERGE_PARTITION_CAP`]; NULL-keyed winners merge on
+/// their own, unpruned. The last statement returns `(changes_rows, merge_jobs)`.
 pub fn compact_script_sql(
     base_fqtn: &str,
     changes_fqtn: &str,
@@ -1089,9 +1159,11 @@ pub fn compact_script_sql(
     };
     let by_days = merge(&MergeFilter::Days {
         column: col.to_string(),
-        variable: "chunk".to_string(),
+        chunk: "chunk".to_string(),
+        all: "days".to_string(),
     });
     let null_keys = merge(&MergeFilter::NullKeys(col.to_string()));
+    let touched = touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, col, true);
     format!(
         "DECLARE n INT64 DEFAULT 0;\n\
          DECLARE null_keys INT64 DEFAULT 0;\n\
@@ -1099,7 +1171,8 @@ pub fn compact_script_sql(
          DECLARE chunk ARRAY<DATE>;\n\
          DECLARE i INT64 DEFAULT 0;\n\
          DECLARE jobs INT64 DEFAULT 0;\n\
-         SET (n, null_keys, days) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL), IFNULL(ARRAY_AGG(DISTINCT DATE(`{col}`) IGNORE NULLS), []) FROM `{changes_fqtn}`);\n\
+         SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL) FROM `{changes_fqtn}`);\n\
+         SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM ({touched}));\n\
          WHILE i < ARRAY_LENGTH(days) DO\n\
          \x20 SET chunk = ARRAY(SELECT d FROM UNNEST(days) AS d WITH OFFSET AS o WHERE o >= i AND o < i + {cap});\n\
          {by_days}\n\
@@ -1135,23 +1208,35 @@ mod compact_tests {
         );
         assert!(
             s.contains(
-                "SET (n, null_keys, days) = (SELECT AS STRUCT COUNT(*), COUNTIF(`created_at` IS NULL), \
-                 IFNULL(ARRAY_AGG(DISTINCT DATE(`created_at`) IGNORE NULLS), []) FROM `p.d.t__changes`);"
+                "SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`);"
             ),
-            "ONE probe statement over the buffer — every statement that reads a table is \
+            "ONE count statement over the buffer — every statement that reads a table is \
              billed a 10 MB floor: {s}"
+        );
+        assert!(
+            s.contains(
+                "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM (\
+                 SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL \
+                 SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS \
+                 (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)));"
+            ),
+            "the days are the buffer's AND the base's for the buffer's keys: {s}"
         );
         assert_eq!(
             s.matches("FROM `p.d.t__changes`").count(),
-            3,
-            "the buffer is read by the probe and the two MERGEs, nowhere else: {s}"
+            5,
+            "the buffer is read by the count, the day probe (twice), and the two MERGEs, \
+             nowhere else: {s}"
         );
         assert!(s.contains("WHILE i < ARRAY_LENGTH(days) DO"), "{s}");
         assert!(s.contains("WHERE o >= i AND o < i + 4000"), "{s}");
         assert!(
             s.contains(") WHERE __rn = 1 AND DATE(`created_at`) IN UNNEST(chunk)")
-                && s.contains("ON T.`id` = S.`id` AND DATE(T.`created_at`) IN UNNEST(chunk)"),
-            "winners filtered by the chunk, the base pruned by the same variable: {s}"
+                && s.contains(
+                    "ON T.`id` = S.`id` AND (DATE(T.`created_at`) IN UNNEST(days) OR T.`created_at` IS NULL)"
+                ),
+            "winners filtered by the chunk, the base pruned to EVERY touched day plus the \
+             NULL partition — never to the chunk alone: {s}"
         );
         assert!(
             s.contains("IF null_keys > 0 THEN")
@@ -1203,7 +1288,7 @@ mod compact_tests {
             "{hostile}"
         );
         assert!(
-            hostile.contains("ON T.`order` = S.`order` AND DATE(T.`created_at`)"),
+            hostile.contains("ON T.`order` = S.`order` AND (DATE(T.`created_at`)"),
             "{hostile}"
         );
         assert!(
@@ -1307,13 +1392,23 @@ mod compact_tests {
         let two = plan(Some(&day), &probe(9, "2000-01-01", "2013-09-08", 0));
         assert_eq!(two.len(), 2, "5,000 days → two windows of ≤ 4,000");
         assert!(
-            two[0].contains("T.`created_at` >= DATETIME '2000-01-01T00:00:00' AND T.`created_at` < DATETIME '2010-12-14T00:00:00'"),
-            "{}",
+            two[0].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '2000-01-01T00:00:00' AND `created_at` < DATETIME '2010-12-14T00:00:00'"),
+            "the winners of the first window: {}",
             two[0]
         );
         assert!(
-            two[1].contains(">= DATETIME '2010-12-14T00:00:00'"),
+            two[1].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '2010-12-14T00:00:00'"),
             "{}",
+            two[1]
+        );
+        // Both windows bound the BASE by the whole touched range: a key whose value
+        // moved from the first window into the second sits in the base under the old
+        // value, and a base bound by the winner's window alone re-inserted it.
+        let base_bound = "ON T.`id` = S.`id` AND (T.`created_at` >= DATETIME '2000-01-01T00:00:00' AND T.`created_at` < DATETIME '2013-09-09T00:00:00' OR T.`created_at` IS NULL)";
+        assert!(
+            two[0].contains(base_bound) && two[1].contains(base_bound),
+            "{}\n{}",
+            two[0],
             two[1]
         );
 
@@ -1347,6 +1442,12 @@ mod compact_tests {
             "{}",
             stepped[1]
         );
+
+        // A value outside the key's `[start, end)` lives in the unpartitioned bucket no
+        // window reaches: one unbounded MERGE, not a million windows up to it.
+        let stray = plan(Some(&range), &probe(5, "0", "4000000000", 0));
+        assert_eq!(stray.len(), 1, "{stray:?}");
+        assert!(stray[0].contains("ON T.`id` = S.`id`\n"), "{}", stray[0]);
 
         // A monthly key steps 4,000 × 28 days: 400 years span two windows, not one
         // and not hundreds.
@@ -1385,6 +1486,8 @@ mod compact_tests {
             column: "created_at".into(),
             lo: lo.into(),
             hi_exclusive: hi.into(),
+            all_lo: lo.into(),
+            all_hi_exclusive: hi.into(),
         }
     }
 
@@ -1410,8 +1513,8 @@ mod compact_tests {
             "the buffer side is bounded AFTER ranking, on the winner: {sql}"
         );
         assert!(
-            sql.contains("ON T.`id` = S.`id` AND T.`created_at` >= DATE '2000-01-01' AND T.`created_at` < DATE '2010-12-14'"),
-            "the base side is bounded by the same constants: {sql}"
+            sql.contains("ON T.`id` = S.`id` AND (T.`created_at` >= DATE '2000-01-01' AND T.`created_at` < DATE '2010-12-14' OR T.`created_at` IS NULL)"),
+            "the base side is bounded by the same constants, plus its NULL partition: {sql}"
         );
         assert!(
             sql.contains(
@@ -1501,14 +1604,21 @@ mod compact_tests {
 
     #[test]
     fn the_probe_normalises_time_keys_to_dates_and_reads_ranges_as_is() {
-        let t = compact_probe_sql("p.d.t__changes", Some("created_at"), true);
+        let pk = ["id".to_string()];
+        let t = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("created_at"), true);
         assert!(
-            t.contains("MIN(DATE(`created_at`))") && t.contains("COUNTIF(`created_at` IS NULL)"),
-            "{t}"
+            t.contains("SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)")
+                && t.contains("MIN(v)")
+                && t.contains("(SELECT COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`) AS null_keys"),
+            "the range covers the base's rows of the buffer's keys, the NULL count is the buffer's: {t}"
         );
-        let r = compact_probe_sql("p.d.t__changes", Some("bucket"), false);
-        assert!(r.contains("MIN(`bucket`)") && !r.contains("DATE("), "{r}");
-        let n = compact_probe_sql("p.d.t__changes", None, false);
+        let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), false);
+        assert!(
+            r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT T.`bucket` FROM `p.d.t` AS T")
+                && !r.contains("DATE("),
+            "{r}"
+        );
+        let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, false);
         assert!(
             n.contains("'' AS lo") && n.contains("0 AS null_keys"),
             "{n}"
@@ -1672,8 +1782,10 @@ mod compact_flag_tests {
             "the column is named nowhere when the base has none: {without}"
         );
         assert!(
-            !without.contains("WHEN MATCHED AND S.__op = 'delete'"),
-            "no flag, no tombstone to write: {without}"
+            without.contains("WHEN MATCHED AND S.__op = 'delete' THEN DELETE\n")
+                && !without.contains("THEN UPDATE SET `__is_deleted`"),
+            "no flag, no tombstone to write — a delete DELETES, never falls through to the \
+             upsert with its key-only image: {without}"
         );
         assert!(
             without.contains("WHEN MATCHED THEN UPDATE SET `id` = S.`id`, `v` = S.`v`\n")
