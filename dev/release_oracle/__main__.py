@@ -475,11 +475,27 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # So the ceiling goes on the CONTAINER (kernel-enforced) and, where the engine
     # has its own knob, on the engine too — below the container limit, which is
     # Microsoft's own guidance, so the OS keeps headroom. 2 GB is the documented
-    # minimum to START SQL Server on Linux; 4g/3072 clears it with room.
+    # minimum to START SQL Server on Linux.
+    #
+    # Tightened 2026-09-20 against what the engines ACTUALLY take under this
+    # gate's 150k-row fixture, measured live during the matrix and cross-checked
+    # against the long-lived stand containers (two independent samples each):
+    #
+    #   postgres  145-176 MiB (gate) / 146 MiB (stand)  -> 512m, ~3x headroom
+    #   mongo     174-189 MiB (gate) / 225 MiB (stand)  -> 1g,   ~4x, and above
+    #                                                      the 0.5 GiB cache pin
+    #   mssql     1.67 GiB   (gate) / 2.91 GiB uncapped -> 3g/2048, still over
+    #                                                      the documented floor
+    #   mysql     NOT MEASURED in the gate; the stand shows 861 MiB, well above
+    #             postgres and mongo, so 2g STAYS until there is a real number.
+    #
+    # Multiples, not tight fits: those samples are moments during the matrix, not
+    # proven peaks, and a cap that OOM-kills a container mid-run surfaces as a
+    # product failure rather than as a resource decision.
     args: list[str] = ["run", "-d", "--name", name]
     cmd: list[str] = []
     if engine == "postgres":
-        args += ["--memory", "1g",
+        args += ["--memory", "512m",
                  "-e", "POSTGRES_USER=rivet", "-e", "POSTGRES_PASSWORD=rivet",
                  "-e", "POSTGRES_DB=rivet", "-p", f"{port}:5432"]
     elif engine == "mysql":
@@ -487,10 +503,10 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
                  "-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
                  "-e", "MYSQL_USER=rivet", "-e", "MYSQL_PASSWORD=rivet", "-p", f"{port}:3306"]
     elif engine == "mssql":
-        args += ["--memory", "4g", "-e", "MSSQL_MEMORY_LIMIT_MB=3072",
+        args += ["--memory", "3g", "-e", "MSSQL_MEMORY_LIMIT_MB=2048",
                  "-e", "ACCEPT_EULA=Y", "-e", "MSSQL_SA_PASSWORD=Rivet_Passw0rd!", "-p", f"{port}:1433"]
     elif engine == "mongo":
-        args += ["--memory", "2g", "-p", f"{port}:27017"]
+        args += ["--memory", "1g", "-p", f"{port}:27017"]
         cmd = ["--wiredTigerCacheSizeGB", "0.5"]
     else:
         led.skipped(engine, tag, "all", "-", f"{engine}:{tag} unknown engine kind")
