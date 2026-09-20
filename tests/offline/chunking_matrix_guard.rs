@@ -236,7 +236,14 @@ const MATRICES: &[(&str, usize)] = &[
     // runner's END-TO-END governor shed, which two offline proofs could not reach —
     // was filled by `checkpoint_governor_backs_off_under_concurrent_write_pressure`.
     // At 0 this ledger admits nothing: any new gap cell fails here immediately.
-    ("docs/runner-coverage-matrix.yaml", 0),
+    //
+    // Raised 0 -> 5 (2026-09-20), honestly: `partition_budget_footer_note` — the note
+    // the loader bounds a part by is written where the writer CLOSES, and every runner
+    // closes its last part itself (`ExportSink::finish_writer`; a bare `finish()` shipped
+    // the final part of every export unnoted, bughunt round 4). The sink unit test
+    // proves the method; no test yet reads the footers of the parts each runner ships.
+    // Lower a cell the moment a per-runner readback exists.
+    ("docs/runner-coverage-matrix.yaml", 5),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     ("docs/mode-transition-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a

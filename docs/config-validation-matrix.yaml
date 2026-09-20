@@ -130,3 +130,8 @@ scenarios:
     what: "`load.tables: { <table>: {…} }` on an export that is not a multiplex `tables:` stream, a name the stream does not capture, or a nested `tables:` inside a table's block, was a silently ignored override — refused at config load naming the export and the table."
     rejected_wrong_mode: { test: per_table_load_overrides_name_captured_tables_of_a_multiplex_stream }
     valid_form_accepted: { test: a_multiplex_export_takes_per_table_load_overrides }
+
+  - id: layout_base_buffer_needs_a_compacting_warehouse
+    what: "`layout: base_buffer` promises a `rivet compact`, which is BigQuery-only: on Snowflake the base froze at the backfill while the buffer grew for ever, with no view and every load prescribing a command that could only fail. Refused at config load wherever the key is written (section, export, `load.tables.<t>`) outside BigQuery; BigQuery takes it; Snowflake without the key makes no promise (the `backfill:` derivation yields the changelog and its view there)."
+    rejected_wrong_mode: { test: a_base_and_buffer_layout_needs_a_compacting_warehouse }
+    valid_form_accepted: { test: a_base_and_buffer_layout_needs_a_compacting_warehouse }

@@ -2242,6 +2242,68 @@ mod tests {
         assert!(wrap_comments(&format!("{mysql}\n")).contains("`qty # ea`, `b`"));
     }
 
+    /// The one-stream form is for `--mode cdc` over TWO OR MORE tables on MySQL or an
+    /// all-`public` PostgreSQL schema; every other shape is one export per table. RED
+    /// against each operator of that gate: a batch multi-table scaffold is never a
+    /// stream, nor a non-`public` PostgreSQL schema, nor SQL Server, nor one table.
+    #[test]
+    fn only_a_multi_table_cdc_scaffold_on_mysql_or_public_postgres_is_one_stream() {
+        let mk = |schema: &str, table: &str| TableInfo {
+            density: None,
+            schema: schema.into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![ColumnInfo {
+                is_primary_key: true,
+                ..col("id", "bigint")
+            }],
+        };
+        let streams = |infos: &[TableInfo], url: &str, mode: Option<&str>| {
+            generate_schema_config(
+                infos,
+                url,
+                &crate::init::SourceProvenance::Inline,
+                "x",
+                &InitYamlDestination::default(),
+                mode,
+                None,
+            )
+            .unwrap()
+            .matches("tables: [")
+            .count()
+        };
+        let my = "mysql://u:p@h/app";
+        let pg = "postgresql://u:p@h/db";
+        assert_eq!(
+            streams(&[mk("app", "a"), mk("app", "b")], my, Some("cdc")),
+            1
+        );
+        assert_eq!(
+            streams(&[mk("app", "a"), mk("app", "b")], my, None),
+            0,
+            "batch"
+        );
+        assert_eq!(streams(&[mk("app", "a")], my, Some("cdc")), 0, "one table");
+        assert_eq!(
+            streams(&[mk("public", "a"), mk("public", "b")], pg, Some("cdc")),
+            1
+        );
+        assert_eq!(
+            streams(&[mk("sales", "a"), mk("sales", "b")], pg, Some("cdc")),
+            0
+        );
+        assert_eq!(
+            streams(
+                &[mk("dbo", "a"), mk("dbo", "b")],
+                "mssql://u:p@h/db",
+                Some("cdc")
+            ),
+            0,
+            "SQL Server keeps per-table capture instances"
+        );
+    }
+
     /// A `public` schema with NO recipe-readable table (every name CamelCase on
     /// PostgreSQL — Prisma / EF Core shapes) must not become a stream over nothing
     /// under a header that promises recipes: it falls through to the per-table

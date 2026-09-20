@@ -193,7 +193,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `storage_integration` | `string` |  | Snowflake: a pre-created GCS `STORAGE INTEGRATION`. |
 | `cleanup_source` | `boolean` |  | After a successful load, delete the staged Parquet under the export prefix. |
 | `pk` | `auto` \| `none` |  | Dedup key of the incremental/CDC current-state view: `auto` (the source primary key `rivet run` recorded), `none`, or explicit columns; ignored for `full`. |
-| `layout` | `log_view` \| `base_buffer` |  | `log_view` or `base_buffer` — where the current state lives. Absent derives it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest changelog+view. |
+| `layout` | `log_view` \| `base_buffer` |  | `log_view` or `base_buffer` — where the current state lives. Absent derives it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest changelog+view. `base_buffer` needs `target: bigquery` — `rivet compact` is what merges the buffer into the base, and it is BigQuery-only. |
 | `deleted_flag` | `boolean` |  | Whether the base carries a `__is_deleted` column. Absent derives it from the mode: a CDC stream expresses deletes and gets the flag, a query-based export cannot express one and does not — an extra column per row otherwise. |
 | `allow_source_drift` | `boolean` |  | Load even when a run manifest's source count disagrees with what it extracted (source→file drift): warn instead of blocking. |
 | `gc_orphans` | `boolean` |  | After a successful load, delete staged Parquet under the export prefix that no `Success` manifest references — crash leftovers. Only when no extract writes the prefix concurrently. |

@@ -596,8 +596,14 @@ impl TargetLoader for BigQueryLoader {
         // Other keys (hour/month/year, integer ranges): the range probe, then one
         // MERGE per window of constant bounds, then the DROP — separate jobs.
         let part_col = key.and_then(PartitionKey::column);
-        let time_key = matches!(key, Some(PartitionKey::Time { .. }));
-        let probe = compact_probe_sql(&changes_fqtn, &base, pk, part_col, time_key);
+        // A time key's column type decides whether the probe's `DATE()` is pinned to
+        // UTC; `TIMESTAMP` when the specs do not name the column.
+        let time_type = matches!(key, Some(PartitionKey::Time { .. })).then(|| {
+            part_col
+                .and_then(|c| specs.iter().find(|s| s.column_name == c))
+                .map_or("TIMESTAMP", |s| s.target_type.as_str())
+        });
+        let probe = compact_probe_sql(&changes_fqtn, &base, pk, part_col, time_type);
         let row = self
             .api()?
             .run_query_first_row(&probe, &self.labels("merge", table))?;

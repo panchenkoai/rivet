@@ -484,9 +484,7 @@ pub(crate) fn write_sink_parts(
     validate: Option<crate::config::FormatType>,
     name_for: impl Fn(usize, usize) -> String,
 ) -> Result<Vec<PartRecord>> {
-    if let Some(w) = sink.writer.take() {
-        w.finish()?;
-    }
+    sink.finish_writer()?;
     if sink.part_rows > 0 {
         sink.completed_parts
             .push(crate::pipeline::sink::CompletedPart {

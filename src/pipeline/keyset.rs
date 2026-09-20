@@ -173,9 +173,7 @@ pub(crate) fn read_keyset_page_bounded(
             .with_page_limit(page_size),
         &mut sink,
     )?;
-    if let Some(w) = sink.writer.take() {
-        w.finish()?;
-    }
+    sink.finish_writer()?;
     let rows = sink.total_rows;
     if rows == 0 {
         return Ok(None); // range exhausted, or an exact-multiple last page

@@ -1049,6 +1049,9 @@ fn flush(
     let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
     let mut w = fmt.create_writer(schema, writer)?;
     w.write_batch(&batch)?;
+    // No partition budget and no footer note here, by design: a change part lands in
+    // `<table>__changes`, which takes no partition (the buffer is read whole by one
+    // MERGE), so the per-job partition cap never applies to it.
     w.finish()?;
 
     let file_name = format!("cdc-{run_token}-{seq:06}.{}", format.label());

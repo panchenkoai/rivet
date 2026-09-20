@@ -1705,7 +1705,7 @@
           "$ref": "#/$defs/KeyColumns"
         },
         "layout": {
-          "description": "`log_view` or `base_buffer` — where the current state lives. Absent derives\nit from the mode: a CDC stream with a `backfill:` is base+buffer, the rest\nchangelog+view.",
+          "description": "`log_view` or `base_buffer` — where the current state lives. Absent derives\nit from the mode: a CDC stream with a `backfill:` is base+buffer, the rest\nchangelog+view. `base_buffer` needs `target: bigquery` — `rivet compact` is\nwhat merges the buffer into the base, and it is BigQuery-only.",
           "anyOf": [
             {
               "$ref": "#/$defs/LayoutChoice"

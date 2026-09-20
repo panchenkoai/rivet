@@ -317,9 +317,7 @@ pub(super) fn run_single_export(
     // Deterministic "alive mid-export" window for the OPT-6 signal-reaping test.
     crate::test_hook::maybe_block_at("after_source_read");
 
-    if let Some(w) = sink.writer.take() {
-        w.finish()?;
-    }
+    sink.finish_writer()?;
 
     // ADR-0029: feed the OBSERVATION half of the ledger the moment the read is
     // done — the dest schema this run SAW and the shape bytes it measured carry

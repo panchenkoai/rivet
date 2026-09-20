@@ -122,21 +122,34 @@ rivet load --config cfg.yaml
 
 Check:
 
-- `orders` is now a **view** over `orders__changes`. A deleted key stays in it
-  as a tombstone with `__is_deleted = TRUE` — the disappearance is data too — so
-  live state is `WHERE NOT __is_deleted`:
+- With a `backfill:` recipe the layout is **base + buffer** (`load.layout:
+  base_buffer`, the default for this shape): `orders` is a physical **table**
+  holding the baseline, and this cycle's changes landed in the buffer
+  `orders__changes` — exactly the number of changed rows (an update is one row,
+  a delete is one row with `__op = 'delete'`). The base does not move until you
+  compact:
+
+  ```sh
+  rivet compact --config cfg.yaml
+  ```
+
+  `COMPACT OK` merges the latest change per key into `orders`, flags a deleted key
+  with `__is_deleted = TRUE` (its last values kept — the disappearance is data
+  too) and drops the buffer. Live state is `WHERE NOT __is_deleted`:
 
   ```sql
   SELECT COUNT(*), COUNT(DISTINCT id) FROM `my-proj.my_ds.orders` WHERE NOT __is_deleted;
   ```
 
-  Both equal the source's `COUNT(*)`.
-- `orders__changes` grew by exactly the number of changed rows — an update is
-  one row, a delete is one row with `__op = 'delete'`.
-- A second `rivet load` with no new run appends nothing (the load ledger).
+  Both equal the source's `COUNT(*)`; `orders__changes` is gone until the next load.
+- Under `load.layout: log_view` (a capture-only stream, or written explicitly)
+  there is no compaction: `orders` is a **view** over `orders__changes`, which
+  keeps every change, and the same `WHERE NOT __is_deleted` reads live state.
+- A second `rivet load` with no new run appends nothing (the load ledger); a
+  second `rivet compact` finds no buffer and says so.
 
-The load into a changelog is **always an append**: `LOAD DATA INTO`, never an
-overwrite, unless you asked for `--rebuild-changelog`.
+A load never merges: the baseline `OVERWRITE`s the base, changes `LOAD DATA INTO`
+the buffer (or the changelog); only `rivet compact` rewrites base rows.
 
 ## 5. An interruption ON THE CDC LEG → run 3 → load 3
 

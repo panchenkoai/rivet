@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **The LAST part of every export carries its partition count too.** The footer note
+  the loader bounds a part by (`rivet.partition_buckets`) was written only when the
+  writer ROTATED; every runner closes its final part itself — and a keyset page is
+  one such part — through a bare `finish()`, so the one part every export has went out
+  unnoted and the loader fell back to the span. One close path now
+  (`ExportSink::finish_writer`), read back from the Parquet the sink wrote.
+
+- **The compaction reads a TIMESTAMP partition column as a UTC day.** `DATE(col)` with
+  no zone follows the project's `default_time_zone`, while the bounds it fed are
+  rendered `+00` and the table's partitions ARE UTC days — under any other default the
+  two disagreed by up to a day at both ends (a skipped winner, a re-inserted key), and
+  the day list stopped pruning. `DATE(col, 'UTC')` wherever a TIMESTAMP is dated; a
+  DATE or DATETIME takes no zone.
+
+- **Docs and ledgers caught up with the layout.** `layout` / `deleted_flag` /
+  `rivet compact` are in the cheat sheet, the CDC full-cycle walkthrough (which
+  described a view where the config it shows builds a base and a buffer), the init
+  reference (the warehouse flags) and ADR-0034 (D7); the load-mode matrix no longer
+  calls the incremental base-and-buffer cycle `na` (it is proven by the generated-config
+  chain), the config-validation matrix carries the BigQuery-only refusal, and the
+  runner-coverage matrix carries the footer note as five honest gaps.
+
 - **A `9999-12-31` partition value no longer wedges compaction.** On an hour / month /
   year key the MERGE's upper bound was `hi + 1 day`, which for the SCD "end of time"
   sentinel rendered `DATE '+10000-01-01'` — past the warehouse's range, a hard error on

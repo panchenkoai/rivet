@@ -585,13 +585,22 @@ impl ExportSink {
 
     /// Close the current part and open the next one, whatever asked for it — the byte
     /// cap or the partition budget.
-    pub(in crate::pipeline) fn split_now(&mut self) -> Result<()> {
+    /// Close the current writer, recording in its footer what the part holds — the ONE
+    /// close path. Every runner ends its last part here as well as every rotation: a
+    /// bare `writer.take()` + `finish()` shipped the final part of every export (and
+    /// every keyset page) without the note the loader bounds it by.
+    pub(in crate::pipeline) fn finish_writer(&mut self) -> Result<()> {
         if let Some(mut w) = self.writer.take() {
             if let Some(note) = self.partition.footer_note() {
                 w.note(crate::plan::rollover::PARTITION_BUCKETS_KEY, &note);
             }
             w.finish()?;
         }
+        Ok(())
+    }
+
+    pub(in crate::pipeline) fn split_now(&mut self) -> Result<()> {
+        self.finish_writer()?;
 
         let old_tmp = std::mem::replace(&mut self.tmp, tempfile::NamedTempFile::new()?);
         self.completed_parts.push(CompletedPart {

@@ -264,12 +264,14 @@ fn touched_values_sql(
     base_fqtn: &str,
     pk: &[&str],
     column: &str,
-    as_date: bool,
+    as_date: Option<&str>,
 ) -> String {
-    let (own, base) = if as_date {
-        (format!("DATE(`{column}`)"), format!("DATE(T.`{column}`)"))
-    } else {
-        (format!("`{column}`"), format!("T.`{column}`"))
+    let (own, base) = match as_date {
+        Some(ty) => (
+            date_of(&format!("`{column}`"), ty),
+            date_of(&format!("T.`{column}`"), ty),
+        ),
+        None => (format!("`{column}`"), format!("T.`{column}`")),
     };
     format!(
         "SELECT {own} AS v FROM `{changes_fqtn}` UNION ALL SELECT {base} FROM `{base_fqtn}` AS T \
@@ -278,16 +280,39 @@ fn touched_values_sql(
     )
 }
 
+/// The partition column as a `DATE`. A TIMESTAMP is pinned to UTC: an unqualified
+/// `DATE(timestamp)` follows the project's `default_time_zone`, while the bounds it
+/// feeds are rendered `+00` and the table's partitions ARE UTC days — under any other
+/// default the two disagreed by up to a day at both ends (a skipped winner, a
+/// re-inserted key). A DATE or DATETIME takes no zone.
+fn date_of(col_sql: &str, target_type: &str) -> String {
+    if target_type.eq_ignore_ascii_case("TIMESTAMP") {
+        format!("DATE({col_sql}, 'UTC')")
+    } else {
+        format!("DATE({col_sql})")
+    }
+}
+
+/// The partition column's warehouse type, `TIMESTAMP` when the specs do not name it —
+/// the conservative reading, since only that one carries a zone.
+fn column_type_of<'a>(specs: &'a [TargetColumnSpec], col: &str) -> &'a str {
+    specs
+        .iter()
+        .find(|s| s.column_name == col)
+        .map_or("TIMESTAMP", |s| s.target_type.as_str())
+}
+
 /// `(rows, min, max, null_count)` — rows and NULLs of the buffer, min/max of the
 /// partition column over everything the compaction touches ([`touched_values_sql`]) —
-/// as strings; the MERGE's pruning bounds come from here. `DATE(col)` normalises
-/// DATE / DATETIME / TIMESTAMP to one `YYYY-MM-DD` shape; an integer range column is cast.
+/// as strings; the MERGE's pruning bounds come from here. `time_type` (the column's
+/// DATE / DATETIME / TIMESTAMP) normalises a time key to one `YYYY-MM-DD` shape via
+/// [`date_of`]; an integer range column is cast.
 pub fn compact_probe_sql(
     changes_fqtn: &str,
     base_fqtn: &str,
     pk: &[String],
     partition_col: Option<&str>,
-    time_key: bool,
+    time_type: Option<&str>,
 ) -> String {
     let Some(c) = partition_col else {
         return format!(
@@ -300,7 +325,7 @@ pub fn compact_probe_sql(
          IFNULL(CAST(MIN(v) AS STRING), '') AS lo, IFNULL(CAST(MAX(v) AS STRING), '') AS hi, \
          (SELECT COUNTIF(`{c}` IS NULL) FROM `{changes_fqtn}`) AS null_keys \
          FROM ({})",
-        touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_key)
+        touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_type)
     )
 }
 
@@ -386,8 +411,10 @@ pub enum MergeFilter {
     Range(RangeBound),
     /// A day-partitioned base: the winners in `DATE(column) IN UNNEST(chunk)`, the base
     /// bounded by `all` — every day the compaction touches, old values included.
+    /// `column_type` decides whether `DATE()` is pinned to UTC (see [`date_of`]).
     Days {
         column: String,
+        column_type: String,
         chunk: String,
         all: String,
     },
@@ -431,13 +458,25 @@ impl MergeFilter {
                 lo = b.lo,
                 hi = upper(&q(&b.column), &b.hi_exclusive)
             ),
-            MergeFilter::Days { column, all, .. } if base => format!(
-                " AND (DATE({c}) IN UNNEST({all}) OR {c} IS NULL)",
+            MergeFilter::Days {
+                column,
+                column_type,
+                all,
+                ..
+            } if base => format!(
+                " AND ({d} IN UNNEST({all}) OR {c} IS NULL)",
+                d = date_of(&q(column), column_type),
                 c = q(column)
             ),
-            MergeFilter::Days { column, chunk, .. } => {
-                format!(" AND DATE({}) IN UNNEST({chunk})", q(column))
-            }
+            MergeFilter::Days {
+                column,
+                column_type,
+                chunk,
+                ..
+            } => format!(
+                " AND {} IN UNNEST({chunk})",
+                date_of(&q(column), column_type)
+            ),
             MergeFilter::NullKeys(c) => format!(" AND {} IS NULL", q(c)),
         }
     }
@@ -1182,13 +1221,15 @@ pub fn compact_script_sql(
             merge_all = merge(&MergeFilter::All)
         );
     };
+    let ty = column_type_of(specs, col);
     let by_days = merge(&MergeFilter::Days {
         column: col.to_string(),
+        column_type: ty.to_string(),
         chunk: "chunk".to_string(),
         all: "days".to_string(),
     });
     let null_keys = merge(&MergeFilter::NullKeys(col.to_string()));
-    let touched = touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, col, true);
+    let touched = touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, col, Some(ty));
     format!(
         "DECLARE n INT64 DEFAULT 0;\n\
          DECLARE null_keys INT64 DEFAULT 0;\n\
@@ -1295,6 +1336,28 @@ mod compact_tests {
         assert!(
             plain.ends_with("SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;"),
             "{plain}"
+        );
+
+        // A TIMESTAMP day column is read as a UTC day at every site of the script — the
+        // day list, the winners' chunk filter and the base's bound — or the project's
+        // default time zone decides which day a row is, against `+00` literals and
+        // UTC-day partitions. A DATETIME (`specs()` above) takes no zone.
+        let utc = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &[
+                meta_spec("id", "INT64"),
+                meta_spec("created_at", "TIMESTAMP"),
+            ],
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some("created_at"),
+        );
+        assert!(
+            utc.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`, 'UTC') FROM `p.d.t` AS T")
+                && utc.contains(") WHERE __rn = 1 AND DATE(`created_at`, 'UTC') IN UNNEST(chunk)")
+                && utc.contains("ON T.`id` = S.`id` AND (DATE(T.`created_at`, 'UTC') IN UNNEST(days) OR T.`created_at` IS NULL)"),
+            "{utc}"
         );
 
         // Hostile names: a reserved-word key and a dashed table id are quoted
@@ -1643,20 +1706,41 @@ mod compact_tests {
     #[test]
     fn the_probe_normalises_time_keys_to_dates_and_reads_ranges_as_is() {
         let pk = ["id".to_string()];
-        let t = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("created_at"), true);
+        let t = compact_probe_sql(
+            "p.d.t__changes",
+            "p.d.t",
+            &pk,
+            Some("created_at"),
+            Some("DATETIME"),
+        );
         assert!(
             t.contains("SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)")
                 && t.contains("MIN(v)")
                 && t.contains("(SELECT COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`) AS null_keys"),
             "the range covers the base's rows of the buffer's keys, the NULL count is the buffer's: {t}"
         );
-        let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), false);
+        // A TIMESTAMP is read as a UTC day: an unqualified `DATE(timestamp)` follows the
+        // project's default time zone, while the bounds it feeds are rendered `+00` and
+        // the partitions are UTC days — under `Asia/Tokyo` the two disagreed by a day at
+        // both ends (a skipped winner, a re-inserted key). A DATETIME takes no zone.
+        let ts = compact_probe_sql(
+            "p.d.t__changes",
+            "p.d.t",
+            &pk,
+            Some("created_at"),
+            Some("TIMESTAMP"),
+        );
+        assert!(
+            ts.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`, 'UTC') FROM `p.d.t` AS T"),
+            "{ts}"
+        );
+        let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), None);
         assert!(
             r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT T.`bucket` FROM `p.d.t` AS T")
                 && !r.contains("DATE("),
             "{r}"
         );
-        let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, false);
+        let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, None);
         assert!(
             n.contains("'' AS lo") && n.contains("0 AS null_keys"),
             "{n}"

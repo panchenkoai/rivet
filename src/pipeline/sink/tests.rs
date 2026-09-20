@@ -587,6 +587,47 @@ fn a_batch_past_the_partition_budget_closes_the_part_mid_batch() {
     assert_eq!(sink.total_rows, 5, "no row is dropped by the rotation");
 }
 
+/// The LAST part of an export never rotates — it is closed by the runner — and it is
+/// the one part every export has. It must carry the footer note too, or the loader
+/// bounds it by its span and refuses the file the writer sized to fit. Read back from
+/// the Parquet the sink wrote. RED against a bare `writer.take()` + `finish()`.
+#[test]
+fn the_final_part_records_its_partitions_in_the_footer_like_a_rotated_one() {
+    use parquet::file::reader::FileReader as _;
+    let (sink, schema) = sink_with_partition_budget(10);
+    let mut sink = ExportSink {
+        format_type: crate::config::FormatType::Parquet,
+        ..sink
+    };
+    sink.on_schema(schema.clone()).unwrap();
+    sink.on_batch_inner(&day_batch(&schema, vec![Some(0), Some(1), Some(1)]))
+        .unwrap();
+    assert!(
+        sink.completed_parts.is_empty(),
+        "within budget: no rotation"
+    );
+    sink.finish_writer().unwrap();
+
+    let reader = parquet::file::reader::SerializedFileReader::new(
+        std::fs::File::open(sink.tmp.path()).unwrap(),
+    )
+    .unwrap();
+    let note = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| {
+            kv.iter()
+                .find(|kv| kv.key == crate::plan::rollover::PARTITION_BUCKETS_KEY)
+                .and_then(|kv| kv.value.clone())
+        });
+    assert_eq!(
+        note.as_deref(),
+        Some("d|day|2"),
+        "two distinct days in the final part"
+    );
+}
+
 /// The budget counts DISTINCT partitions, not rows: a wide batch that all lands in one
 /// day costs one partition and must never rotate.
 ///

@@ -318,10 +318,15 @@ load:
   cleanup_source: true          # delete staged Parquet after the count gate passes
   gc_orphans: false             # also delete unmanifested crash leftovers
   allow_source_drift: false     # load even if the manifest's source count ≠ extracted
+  layout: base_buffer           # log_view (default for incremental / capture-only CDC) | base_buffer
+                                #   base_buffer: `<table>` is a PHYSICAL table, `<table>__changes` a
+                                #   per-cycle buffer that `rivet compact` MERGEs in and drops. BigQuery only.
+                                #   Absent: a CDC stream with `backfill:` gets base_buffer, the rest log_view.
+  deleted_flag: true            # whether the base carries `__is_deleted`; absent: true for cdc, false otherwise
 exports:
   - name: {{NAME}}
     # ...
-    load: { pk: [{{PK}}], partition: none }   # per-export override: pk, cluster_by, partition, cleanup_source, gc_orphans, allow_source_drift
+    load: { pk: [{{PK}}], partition: none }   # per-export override: pk, cluster_by, partition, cleanup_source, gc_orphans, allow_source_drift, layout, deleted_flag
     # a multiplex `tables:` stream adds `tables: { <table>: { pk: [...], partition: none } }` — one block per captured table
 ```
 
@@ -334,6 +339,7 @@ rivet run  -c rivet.yaml              # extract → bucket
 rivet load -c rivet.yaml              # load → warehouse
 rivet load -c rivet.yaml --run-id "nightly-$(date +%F)"   # tag jobs (BQ label / Snowflake QUERY_TAG)
 rivet load -c rivet.yaml --rebuild-changelog               # allow a billed rebuild when partitioning changed
+rivet compact -c rivet.yaml           # base_buffer only: MERGE `<table>__changes` into `<table>`, drop the buffer
 rivet state loads -c rivet.yaml -t {{WAREHOUSE_TABLE}}
 ```
 
@@ -342,7 +348,7 @@ What the load does for each export `mode:`:
 | mode | warehouse result |
 |---|---|
 | `full` | `OVERWRITE` the table with the latest snapshot. Re-running is idempotent |
-| `incremental` | append to `<table>__changes`, plus a current-state view deduped on `pk` |
+| `incremental` | `log_view` (default): append to `<table>__changes`, plus a current-state view deduped on `pk`. `layout: base_buffer`: the first pass lands `<table>` as a physical base, every later delta lands in the buffer `<table>__changes`, and `rivet compact` merges it in (latest per `pk`, deletes flagged in `__is_deleted`) and drops the buffer — the cycle is `run → load → compact` |
 | `cdc` | append to `<table>__changes`, plus a view keeping the latest `(__pos, __seq)` per PK with `__is_deleted` (soft delete: live rows are `WHERE NOT __is_deleted`) |
 | `cdc` with `tables:` | one `__changes` table and one view per source table |
 

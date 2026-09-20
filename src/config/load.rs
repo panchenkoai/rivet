@@ -84,7 +84,8 @@ struct RawLoadSection {
     pk: KeyColumns,
     /// `log_view` or `base_buffer` — where the current state lives. Absent derives
     /// it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest
-    /// changelog+view.
+    /// changelog+view. `base_buffer` needs `target: bigquery` — `rivet compact` is
+    /// what merges the buffer into the base, and it is BigQuery-only.
     #[serde(default)]
     layout: Option<LayoutChoice>,
     /// Whether the base carries a `__is_deleted` column. Absent derives it from the

@@ -185,6 +185,37 @@ mod tests {
         }));
     }
 
+    /// The scores are a SUM of the documented weights — +40 for a timestamp type, +40
+    /// for a mutation stamp, +20 for a creation stamp, the position bonus — so the
+    /// discovery artifact stays reproducible. RED against `*=` / `-=` in place of `+=`
+    /// (a product of the weights still sorts first, and a subtraction still trails).
+    #[test]
+    fn scores_add_the_documented_weights() {
+        let t = table(vec![
+            col("id", "bigint", true, false),
+            col("created_at", "timestamp", false, false),
+            col("updated_at", "timestamp", false, false),
+        ]);
+        let score = |name: &str| {
+            cursor_candidates(&t)
+                .into_iter()
+                .find(|c| c.column == name)
+                .map(|c| c.score)
+                .unwrap_or_else(|| panic!("{name} is a candidate"))
+        };
+        assert_eq!(
+            score("updated_at"),
+            40 + 40 + 1,
+            "type + mutation stamp + position"
+        );
+        assert_eq!(
+            score("created_at"),
+            40 + 20 + 2,
+            "type + creation stamp + position"
+        );
+        assert_eq!(score("id"), 25 + 3, "integer PK + position");
+    }
+
     #[test]
     fn nullable_updated_at_still_leads_but_with_nullable_reason() {
         let t = table(vec![
