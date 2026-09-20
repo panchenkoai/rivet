@@ -7,8 +7,9 @@
 //! of 1,000 rows):
 //!   * batch `mode: full`-shaped keyset export → `<table>` via staging + CLONE, two
 //!     jobs (files 1–4 span exactly 4,000 days), DAY partitions, no staging left;
-//!   * the same table with the dates PERMUTED (every file spans all 5,000 days) →
-//!     refused BEFORE any job, naming the file; the ledger says `refused`;
+//!   * the same history in ONE file, written before any partition was declared (the
+//!     writer budgets only what `load.partition` names) → the load that declares DAY
+//!     partitions is refused BEFORE any job, naming the file; the ledger says `refused`;
 //!   * the CDC shape (`backfill: auto` with the keyset recipe) → the baseline lands in
 //!     the BASE `<table>` via staging + CLONE in two jobs, DAY partitions, every row
 //!     `__is_deleted = false`; no buffer yet.
@@ -22,23 +23,15 @@ use crate::common::*;
 use mysql::prelude::Queryable as _;
 
 const ROWS: i64 = 5000;
-/// Multiplier coprime with 5000: `(id * 7919) % 5000` is a permutation of 0..5000.
-const SHUFFLE: i64 = 7919;
 
-/// One row per day from 2000-01-01; `permuted` breaks the id ↔ date correlation so
-/// every keyset file spans the whole history.
-fn seed(conn: &mut mysql::PooledConn, table: &str, permuted: bool) {
-    let day = if permuted {
-        format!("(n * {SHUFFLE}) % {ROWS}")
-    } else {
-        "n - 1".to_string()
-    };
+/// One row per day from 2000-01-01, `id` growing with the date.
+fn seed(conn: &mut mysql::PooledConn, table: &str) {
     conn.query_drop("SET SESSION cte_max_recursion_depth = 10000")
         .expect("cte depth");
     conn.query_drop(format!(
         "INSERT INTO {table} (id, v, created_at) \
          WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < {ROWS}) \
-         SELECT n, n, DATE_ADD('2000-01-01', INTERVAL {day} DAY) FROM s"
+         SELECT n, n, DATE_ADD('2000-01-01', INTERVAL n - 1 DAY) FROM s"
     ))
     .expect("seed 5000 dated rows");
 }
@@ -77,7 +70,7 @@ fn a_wide_history_read_by_keyset_loads_daily_partitions_in_batches() {
     ))
     .expect("create");
     let _guard = MysqlTable::adopt(table.clone());
-    seed(&mut conn, &table, false);
+    seed(&mut conn, &table);
     let _cleanup = bq.cleanup(&[&table, &format!("{table}__staging")]);
 
     let rig = Rig::mysql_batch(&table)
@@ -123,6 +116,11 @@ fn a_wide_history_read_by_keyset_loads_daily_partitions_in_batches() {
     );
 }
 
+/// The load-time budget is reachable only by a file the WRITER never budgeted: the
+/// extract rotates parts at 4,000 distinct partitions of the column `load.partition`
+/// names, so under one config no rivet-written file can be over the cap. The operator
+/// who declares `partition:` over an export already written is the one this refusal
+/// serves — the file exists, nothing splits it, and the message must name it.
 #[test]
 #[ignore = "live: requires mysql + BigQuery creds"]
 fn a_file_spanning_the_whole_history_is_refused_by_name_before_any_job() {
@@ -136,16 +134,22 @@ fn a_file_spanning_the_whole_history_is_refused_by_name_before_any_job() {
     ))
     .expect("create");
     let _guard = MysqlTable::adopt(table.clone());
-    seed(&mut conn, &table, true);
+    seed(&mut conn, &table);
     let _cleanup = bq.cleanup(&[&table, &format!("{table}__staging")]);
 
-    let rig = Rig::mysql_batch(&table)
+    // One 5,000-row file over 5,000 days, written with no partition declared …
+    let mut rig = Rig::mysql_batch(&table)
         .mode("chunked")
         .export_line("chunk_by_key: id")
-        .export_line("chunk_size: 1000")
+        .export_line("chunk_size: 5000")
         .dest_gcs_live(&bq.bucket, &bq.prefix)
-        .top_line(&bq.load_line(", partition: { column: created_at, granularity: day }"));
+        .top_line(&bq.load_line(""));
     rig.run_ok();
+    // … then loaded under DAY partitions declared after the fact.
+    rig.replace_top_line(
+        "load:",
+        &bq.load_line(", partition: { column: created_at, granularity: day }"),
+    );
 
     let out = rig.cli(&["load"]);
     let err = String::from_utf8_lossy(&out.stderr).to_string();
@@ -154,9 +158,8 @@ fn a_file_spanning_the_whole_history_is_refused_by_name_before_any_job() {
         "a file no batching splits must be refused:\n{err}"
     );
     assert!(
-        // 5,000 residues over 1,000-row files: each file spans ~4,999 days.
-        err.contains("alone spans about 499")
-            && err.contains("day partitions of `created_at`")
+        // 5,000 rows on 5,000 distinct days: over the cap by rows AND by span.
+        err.contains("alone spans about 5000 day partitions of `created_at`")
             && err.contains("no batching splits one file")
             && err.contains("use `granularity: month` (about 16"),
         "{err}"

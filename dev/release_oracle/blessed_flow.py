@@ -1413,6 +1413,12 @@ FLAG_EXCUSED = {
                "pool_split_realizes_the_range_split_and_the_union_is_exact (prime → clear → "
                "--pool --split → DuckDB union exact, plus a vacuous-oracle guard that the "
                "split actually fired).",
+    "--bigquery-project": "scaffolds the `load:` section, which the blessed chain never loads. "
+                          "Carried INSIDE the gate by init_delta.verify_init_delta: "
+                          "tests/live/live_init_delta.rs runs init with both flags, then "
+                          "run → load → compact on the generated file (three engines, "
+                          "incremental and CDC) — run 1 everything, run 2 the delta.",
+    "--bigquery-dataset": "the other half of the `load:` scaffold — see --bigquery-project.",
 }
 
 

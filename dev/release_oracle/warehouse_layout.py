@@ -15,9 +15,10 @@ the gate's binary:
     the cycle's changes, one MERGE that flags deletes and keeps their last values,
     `DROP` of the buffer, a crash between MERGE and DROP re-merged idempotently;
   * `live_load_partition_batches` — 5,000 daily partitions read by keyset: the
-    overwrite lands via staging + CLONE in two jobs, a file no batching splits is
-    refused BY NAME before any job (ledger `refused`), a CDC baseline over the same
-    history lands in the base in two jobs.
+    overwrite lands via staging + CLONE in two jobs, a file no batching splits
+    (written before the partition was declared — the writer budgets what the config
+    names) is refused BY NAME before any job (ledger `refused`), a CDC baseline over
+    the same history lands in the base in two jobs and its CLONE'd base compacts.
 
 Oracles are the tests': the source, `bq`, the SQLite ledger — never rivet's report.
 SKIP — never a silent pass — without cargo, the Postgres state URL, the BigQuery

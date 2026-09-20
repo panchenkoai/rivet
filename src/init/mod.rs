@@ -157,7 +157,7 @@ impl TableInfo {
             .filter(|c| is_timestamp_type(&c.data_type))
             .collect();
         ts.iter()
-            .find(|c| c.name == "created_at" || c.name == "made_at" || c.name == "occurred_at")
+            .find(|c| is_creation_stamp(&c.name))
             .or_else(|| ts.iter().find(|c| !is_mutation_stamp(&c.name)))
             .or_else(|| ts.first())
             .map(|c| c.name.as_str())
@@ -382,6 +382,15 @@ fn is_timestamp_type(t: &str) -> bool {
     // `datetimeoffset` and `smalldatetime`, none of which the equality admitted —
     // so the mutation stamp scored zero and the integer PK became the cursor.
     t.contains("timestamp") || t.contains("datetime") || t == "date"
+}
+
+/// Whether the column name means "when the row came to BE" — the partition key's
+/// first choice, ahead of any other business date.
+fn is_creation_stamp(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "created_at" | "made_at" | "occurred_at"
+    )
 }
 
 /// Whether the column name means "this stamp moves when the row CHANGES". The
@@ -1739,6 +1748,22 @@ mod tests {
             ],
         );
         assert_eq!(info.best_partition_column(), Some("event_date"));
+    }
+
+    /// Among several business dates the creation stamp wins, whatever its position:
+    /// `shipped_at` is a business date too, and it comes first. RED against the
+    /// creation-stamp match never firing (`||` → `&&` in the old inline literals),
+    /// which fell through to "the first non-mutation stamp".
+    #[test]
+    fn partition_prefers_the_creation_stamp_over_an_earlier_business_date() {
+        let info = make_table(
+            0,
+            vec![
+                col("shipped_at", "timestamp", false),
+                col("created_at", "timestamp", false),
+            ],
+        );
+        assert_eq!(info.best_partition_column(), Some("created_at"));
     }
 
     #[test]

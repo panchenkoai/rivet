@@ -50,6 +50,7 @@ from . import (
     cdc,
     concurrency,
     gifs,
+    init_delta,
     partner_shape,
     regression,
     release_path,
@@ -403,6 +404,8 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     # The partner's warehouse layout: base + buffer + `compact`, and loads batched
     # under BigQuery's per-job partition cap.
     warehouse_layout.verify_warehouse_layout(led)
+    # The same cycle on configs `rivet init` wrote: run 1 everything, run 2 the delta.
+    init_delta.verify_init_delta(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),

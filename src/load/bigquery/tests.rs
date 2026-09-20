@@ -26,15 +26,21 @@ fn the_clone_replaces_the_target_with_the_staging_table() {
     );
 }
 
+/// A batched whole-table load ends in `CREATE OR REPLACE TABLE … CLONE`, and the catalog
+/// reports that table as `CLONE` for the rest of its life. Counting only `BASE TABLE` as a
+/// table refused every later compaction and overwrite of such a base as "neither a table
+/// nor a view" (gate: `layout[batches:cdc]`).
 #[test]
-fn object_kind_probe_reads_the_dataset_catalog() {
+fn object_kind_probe_reads_the_dataset_catalog_and_counts_a_clone_as_a_table() {
     let sql = build_object_kind_sql("p", "d", "orders");
     assert!(
         sql.contains("FROM `p.d`.INFORMATION_SCHEMA.TABLES WHERE table_name = 'orders'"),
         "{sql}"
     );
     assert!(
-        sql.contains("COUNTIF(table_type = 'BASE TABLE') + 2 * COUNTIF(table_type = 'VIEW')"),
+        sql.contains(
+            "COUNTIF(table_type IN ('BASE TABLE', 'CLONE')) + 2 * COUNTIF(table_type = 'VIEW')"
+        ) && sql.contains("4 * COUNTIF(table_type NOT IN ('BASE TABLE', 'CLONE', 'VIEW'))"),
         "{sql}"
     );
 }
