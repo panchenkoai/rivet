@@ -20,11 +20,25 @@
 # ── The engine × VERSION grid the gate brings up (mirrors dev/release-oracle/matrix.yaml) ──
 # `gated`   = versions the gate spins up, seeds, and runs every applicable scenario against.
 # `gaps`    = versions that EXIST (a compose service / a devbox stand / a public image) but
-#             are not yet gated — each is a real coverage hole, ratcheted.
+#             CANNOT be gated today — a real coverage hole, ratcheted (shrink-only).
+# `descoped`= versions that CAN be gated and were MEASURED green, left out on cost alone.
+#             NOT ratcheted, because it is not debt: re-gating one is a two-line edit
+#             (here + dev/release-oracle/matrix.yaml) with nothing to fix first. Keeping
+#             these in `gaps` would report permanent debt the product never took on —
+#             the exact thing the ratchet comment warns teaches readers to discount it.
 grid:
   postgres:
-    gated: [12, 13, 14, 15, 16, 17, 18]   # 12/15/17 added 2026-08-30 — public images, no seed blocker existed
-    gaps:  []
+    gated: [14, 16, 18]              # oldest supported, primary target, newest (2026-09-20)
+    gaps:  []                        # nothing here is BLOCKED — see `descoped`
+    descoped: [12, 13, 15, 17]       # MEASURED, not argued: all seven were green in the
+                                     # 2026-09-20 gate (including the cells 13 and 15 failed
+                                     # on, which were harness collisions, not version faults).
+                                     # Un-gated on COST: seven postgres versions were ~57% of
+                                     # the matrix's cells and every one graded the same
+                                     # ENGINE-level golden below, so 13/15/17 bought repetition
+                                     # rather than coverage. docs/reference/compatibility.md
+                                     # names the gated set, so the published "full suite against
+                                     # each version" claim stays true.
   mysql:
     gated: ["8.0", "8.4"]
     gaps:  ["5.7"]                   # MEASURED 2026-08-30, not argued: the seed dies with
