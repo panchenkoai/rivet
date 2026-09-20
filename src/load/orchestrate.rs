@@ -1168,7 +1168,7 @@ fn load_one_cdc_base(
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
                 // Reached only through `plan.layout.compacts()`, which is the `true`:
                 // the one predicate that owns "does the base carry the flag" is asked.
-                if let Some(why) = load::stale_buffer_refusal(loader, &plan.table)? {
+                if let Some(why) = load::stale_buffer_refusal(loader, &plan.table, true)? {
                     anyhow::bail!(why);
                 }
                 let mut specs = plan.specs.clone();
@@ -2128,8 +2128,7 @@ fn load_one_incremental(
                 // The base carries the delete flag as DATA, like a CDC baseline:
                 // the buffer's tombstones flip it, and the column must exist from
                 // the first pass or the MERGE has nothing to set.
-                if base_and_buffer
-                    && let Some(why) = load::stale_buffer_refusal(loader, &plan.table)?
+                if let Some(why) = load::stale_buffer_refusal(loader, &plan.table, base_and_buffer)?
                 {
                     anyhow::bail!(why);
                 }

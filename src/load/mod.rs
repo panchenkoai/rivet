@@ -359,7 +359,11 @@ pub(crate) fn before_write<T>(r: Result<T>) -> Result<T> {
 pub(crate) fn stale_buffer_refusal(
     loader: &dyn TargetLoader,
     table: &str,
+    base_and_buffer: bool,
 ) -> Result<Option<String>> {
+    if !base_and_buffer {
+        return Ok(None);
+    }
     let changes = format!("{table}__changes");
     if loader.object_kind(&changes)? != ObjectKind::Table {
         return Ok(None);
@@ -1742,20 +1746,25 @@ pub(crate) mod tests {
     #[test]
     fn a_whole_table_pass_over_a_buffered_base_is_refused_until_the_buffer_is_dealt_with() {
         let first_cycle = FakeLoader::default();
-        assert_eq!(stale_buffer_refusal(&first_cycle, "t").unwrap(), None);
+        assert_eq!(stale_buffer_refusal(&first_cycle, "t", true).unwrap(), None);
 
         let compacted = FakeLoader {
             kinds: RefCell::new([("t__changes".to_string(), ObjectKind::Table)].into()),
             ..Default::default()
         };
-        assert_eq!(stale_buffer_refusal(&compacted, "t").unwrap(), None);
+        assert_eq!(stale_buffer_refusal(&compacted, "t", true).unwrap(), None);
 
         let buffered = FakeLoader {
             kinds: RefCell::new([("t__changes".to_string(), ObjectKind::Table)].into()),
             counts: RefCell::new([("t__changes".to_string(), 7)].into()),
             ..Default::default()
         };
-        let why = stale_buffer_refusal(&buffered, "t")
+        assert_eq!(
+            stale_buffer_refusal(&buffered, "t", false).unwrap(),
+            None,
+            "a changelog + view layout has no base to replace"
+        );
+        let why = stale_buffer_refusal(&buffered, "t", true)
             .unwrap()
             .expect("a buffered base refuses the pass");
         assert!(

@@ -108,6 +108,12 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) partition: PartBudget,
 }
 
+/// Whether the byte cap closes the current part: a cap is declared, the part has
+/// reached it, and it holds at least one row (an empty part is never shipped).
+fn should_split(written: u64, max_file_size: Option<u64>, part_rows: usize) -> bool {
+    max_file_size.is_some_and(|max| written >= max) && part_rows > 0
+}
+
 /// The unit an Arrow date/timestamp type stores, or `None` for a type no warehouse
 /// partitions by — the signal `on_schema` turns into a warning rather than silence.
 fn partition_unit_of(data_type: &arrow::datatypes::DataType) -> Option<PartitionUnit> {
@@ -570,15 +576,11 @@ impl ExportSink {
     }
 
     pub fn maybe_split(&mut self) -> Result<()> {
-        let max = match self.max_file_size {
-            Some(m) => m,
-            None => return Ok(()),
-        };
         let written = self.writer.as_ref().map(|w| w.bytes_written()).unwrap_or(0);
-        if written < max || self.part_rows == 0 {
-            return Ok(());
+        if should_split(written, self.max_file_size, self.part_rows) {
+            self.split_now()?;
         }
-        self.split_now()
+        Ok(())
     }
 
     /// Close the current part and open the next one, whatever asked for it — the byte

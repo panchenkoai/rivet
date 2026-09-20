@@ -191,6 +191,83 @@ fn run_quality_checks_detects_excess_nulls() {
     assert!(issues[0].message.contains("null ratio"));
 }
 
+/// The null-ratio rule is a strict `>` on `nulls / rows`: exactly the cap passes, one
+/// more null fails, and a small count over a large total stays small. RED against
+/// `>=` at the boundary and against `*` / `%` in place of the division.
+#[test]
+fn null_ratio_at_exactly_the_cap_passes_and_one_null_over_it_fails() {
+    let mut sink = minimal_sink_with_quality(vec!["col".into()], vec![]);
+    sink.quality
+        .columns
+        .as_mut()
+        .unwrap()
+        .null_ratio_max
+        .insert("col".into(), 0.1);
+    sink.total_rows = 100;
+    sink.quality.null_counts.insert("col".into(), 10);
+    assert!(
+        sink.run_quality_checks().is_empty(),
+        "10 of 100 is the cap, not over it"
+    );
+    sink.quality.null_counts.insert("col".into(), 11);
+    assert_eq!(sink.run_quality_checks().len(), 1, "11 of 100 is over");
+    sink.quality.null_counts.insert("col".into(), 1);
+    assert!(
+        sink.run_quality_checks().is_empty(),
+        "1 of 100 is a ratio of 0.01, whatever a product or a remainder would say"
+    );
+}
+
+/// The byte cap closes a part only once it is reached and the part holds a row.
+#[test]
+fn the_byte_cap_splits_at_the_cap_and_never_an_empty_part() {
+    assert!(!should_split(999, Some(1000), 5));
+    assert!(should_split(1000, Some(1000), 5));
+    assert!(should_split(5000, Some(1000), 1));
+    assert!(
+        !should_split(5000, Some(1000), 0),
+        "an empty part is never shipped"
+    );
+    assert!(!should_split(5000, None, 5), "no cap declared");
+}
+
+/// Every date/timestamp Arrow type an engine produces has a unit — MySQL `DATETIME(6)`
+/// and SQL Server `DATETIME2` arrive as microsecond timestamps, MongoDB dates as
+/// milliseconds, PostgreSQL `DATE` as `Date32`. A type mapped to `None` is a part the
+/// writer never budgets, and a wide history refused at load time.
+#[test]
+fn every_date_and_timestamp_arrow_type_has_a_partition_unit() {
+    use arrow::datatypes::TimeUnit;
+    let cases = [
+        (DataType::Date32, PartitionUnit::Days),
+        (DataType::Date64, PartitionUnit::Millis),
+        (
+            DataType::Timestamp(TimeUnit::Second, None),
+            PartitionUnit::Seconds,
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            PartitionUnit::Millis,
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            PartitionUnit::Micros,
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            PartitionUnit::Nanos,
+        ),
+    ];
+    for (ty, unit) in cases {
+        assert_eq!(partition_unit_of(&ty), Some(unit), "{ty:?}");
+    }
+    assert_eq!(
+        partition_unit_of(&DataType::Int64),
+        None,
+        "an integer is no time partition on this path"
+    );
+}
+
 #[test]
 fn run_quality_checks_detects_duplicates() {
     let mut sink = minimal_sink_with_quality(vec![], vec!["id".into()]);
