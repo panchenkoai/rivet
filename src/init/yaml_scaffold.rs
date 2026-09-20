@@ -2242,6 +2242,43 @@ mod tests {
         assert!(wrap_comments(&format!("{mysql}\n")).contains("`qty # ea`, `b`"));
     }
 
+    /// A recipe reads by `table:` when its name passes the shortcut gate — on MySQL a
+    /// CamelCase name does (case is the server's business), on PostgreSQL only a name
+    /// that is its own case-fold — and pages by the PK when it can: a uuid PK is
+    /// keysettable though no integer column exists. RED against `&&` in
+    /// `recipe_readable` and in `recipe_mode` (mutation survivors).
+    #[test]
+    fn recipe_readability_and_mode_follow_the_engine_and_the_key() {
+        let mk = |table: &str, cols: Vec<ColumnInfo>| TableInfo {
+            density: None,
+            schema: "app".into(),
+            table: table.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: cols,
+        };
+        let pk = |ty: &str| ColumnInfo {
+            is_primary_key: true,
+            ..col("id", ty)
+        };
+        assert!(recipe_readable(&mk("Orders", vec![pk("bigint")]), "mysql"));
+        assert!(!recipe_readable(
+            &mk("Orders", vec![pk("bigint")]),
+            "postgres"
+        ));
+        assert!(recipe_readable(
+            &mk("orders", vec![pk("bigint")]),
+            "postgres"
+        ));
+        assert!(!recipe_readable(
+            &mk("2024_orders", vec![pk("bigint")]),
+            "mysql"
+        ));
+        assert_eq!(recipe_mode(&mk("orders", vec![pk("uuid")])), "chunked");
+        assert_eq!(recipe_mode(&mk("orders", vec![pk("bigint")])), "chunked");
+        assert_eq!(recipe_mode(&mk("audit", vec![col("note", "text")])), "full");
+    }
+
     /// The one-stream form is for `--mode cdc` over TWO OR MORE tables on MySQL or an
     /// all-`public` PostgreSQL schema; every other shape is one export per table. RED
     /// against each operator of that gate: a batch multi-table scaffold is never a
