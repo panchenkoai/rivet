@@ -93,8 +93,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // of re-resolving `RIVET_STATE_URL` per table — `open_at_ref` is the path the
     // state ref exists for — and it costs one connection per WORKER, not per
     // table, so the one-worker default opens exactly one, as this loop always
-    // did. A worker whose reconnect fails degrades to the stateless path: the
-    // same tri-state the parent's own open degrades to above.
+    // did. A worker whose reconnect fails does NOT degrade to the stateless path:
+    // `state_ref` is `Some` only when the parent's own open SUCCEEDED, so the
+    // refusal below always fires for it. Stateless is reachable only through the
+    // parent's degradation above, where no worker ever had a ledger to lose.
     let state_ref = state.as_ref().map(|s| s.state_ref().clone());
     // The parent store has done its job: it migrated the schema before any thread
     // starts (the order `pipeline/run.rs` uses) and handed over its `StateRef`.
@@ -123,7 +125,8 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                 Err(e) => {
                     eprintln!(
                         "  warning: state store unavailable to this worker ({e:#}); \
-                         loading without a ledger (no incremental skip / audit log)"
+                         its table is REFUSED below — the run started WITH a ledger, \
+                         so this worker may not load unleased and unrecorded"
                     );
                     (None, true)
                 }
@@ -1490,7 +1493,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 Err(e) => {
                     eprintln!(
                         "  warning: state store unavailable to this worker ({e:#}); \
-                         compacting without a ledger"
+                         its table is REFUSED below unless this run would skip it anyway"
                     );
                     None
                 }

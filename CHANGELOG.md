@@ -25,6 +25,15 @@
   returns the LAST maximum, so a completion-ordered fold would have reported a
   different error out of a tie on each run of the same failing config.
 
+- **A worker that loses the state ledger now says what it will actually do.** The
+  warning printed when a pool worker could not reopen the ledger said it was
+  "loading without a ledger", and the code then REFUSED the table a few frames
+  later. The claim was wrong every time it could appear: the warning is only
+  reachable when the parent's own open SUCCEEDED, which is precisely the case the
+  refusal covers, so it never once described what happened. Both legs (`rivet
+  load` and `rivet compact`) now name the refusal, and the comment above the pool
+  that described the same path as degrading to the stateless path went with it.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product

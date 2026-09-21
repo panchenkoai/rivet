@@ -156,6 +156,44 @@ impl Rig {
         self.run_args_env(extra, &[])
     }
 
+    /// `rivet load --config <cfg>` plus `extra` flags.
+    fn load_argv(&self, extra: &[&str]) -> Vec<String> {
+        let cfg = self.config_path();
+        let mut v = vec![
+            "load".to_string(),
+            "--config".to_string(),
+            cfg.display().to_string(),
+        ];
+        v.extend(extra.iter().map(|a| a.to_string()));
+        v
+    }
+
+    /// `rivet load` with extra flags and environment — the load leg's
+    /// counterpart to [`Rig::run_args_env`].
+    ///
+    /// Warehouse tests were each spelling `cli_env(&["load", …])`, which is the
+    /// per-file command wrapper the rig exists to remove; `RIVET_STATE_URL` is
+    /// an env var, so the env-carrying form is the one that has to exist.
+    pub fn load_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        self.invoke(&self.load_argv(extra), envs)
+    }
+
+    /// `load_args_env` with no env — a plain load with extra flags.
+    pub fn load_args(&self, extra: &[&str]) -> std::process::Output {
+        self.load_args_env(extra, &[])
+    }
+
+    /// Load and assert it succeeded, surfacing stderr on failure.
+    pub fn load_ok(&self, extra: &[&str], envs: &[(&str, &str)]) {
+        let out = self.load_args_env(extra, envs);
+        assert!(
+            out.status.success(),
+            "rig load failed for '{}':\n{}",
+            self.name,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Run with the child's WORKING DIRECTORY set — the seam for path-resolution
     /// contracts.
     ///
