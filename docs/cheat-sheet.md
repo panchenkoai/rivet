@@ -183,6 +183,39 @@ exports:
 > With several `mode: cdc` exports, each one needs its own `slot`, `server_id`
 > and `checkpoint`. The defaults collide, and config validation rejects them.
 
+### 1.3 One config for the whole cycle: extract → load → compact
+
+Add the warehouse flags to either scaffold above and `rivet init` writes **one file
+that drives everything** — the exports, the top-level `load:` block, and the
+base-and-buffer layout `rivet compact` needs. Nothing is hand-added afterwards.
+
+```bash
+rivet init --source-env DATABASE_URL --table {{TABLE}} --mode incremental --tls {{TLS}} \
+  --gcs-bucket {{BUCKET}} --bigquery-project {{BQ_PROJECT}} --bigquery-dataset {{BQ_DATASET}} -o rivet.yaml
+rivet init --source-env DATABASE_URL --mode cdc --tls {{TLS}} \
+  --gcs-bucket {{BUCKET}} --bigquery-project {{BQ_PROJECT}} --bigquery-dataset {{BQ_DATASET}} -o rivet.yaml
+                                               # whole DB: one `tables:` stream with backfill: auto
+
+rivet doctor  -c rivet.yaml    # source + destination auth
+rivet run     -c rivet.yaml    # Parquet → gs://{{BUCKET}}/exports/{{TABLE}}/
+rivet load    -c rivet.yaml    # → the base on the first pass, the buffer on later ones
+rivet compact -c rivet.yaml    # MERGE the buffer into the base, drop the buffer
+```
+
+Every value in the generated `load:` block is a guess from the catalog — review it
+before the first load. It carries `target: bigquery`, `pk: auto`, `cluster_by: auto`,
+`cleanup_source: true`; a per-table `partition:` on the **creation** stamp at
+`granularity: day` (never a mutation stamp, which would move a row between partitions
+on every update); and, for a mode that carries deltas (`incremental`, `cdc`),
+`layout: base_buffer` so `compact` has a base to merge into. Field-by-field reference:
+§3 below.
+
+> `--gcs-bucket` is required with the BigQuery flags: `rivet load` reads GCS only, so a
+> `load:` block over a local or S3 destination is a config its own next step refuses.
+> On a whole-database CDC scaffold the partition guesses land on the stream's
+> `load.tables.<table>` blocks — the place the load reads them — not on the per-table
+> recipes, which the load never reads.
+
 ---
 
 ## 2. Extract

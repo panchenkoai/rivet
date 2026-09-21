@@ -33,6 +33,13 @@
   calls the incremental base-and-buffer cycle `na` (it is proven by the generated-config
   chain), the config-validation matrix carries the BigQuery-only refusal, and the
   runner-coverage matrix carries the footer note as five honest gaps.
+  The cheat sheet also gained the step that was missing from it entirely: it explained
+  the `load:` block but never the `rivet init` invocation that WRITES one, so a reader
+  following it had to hand-add the block — against the rule that every config is
+  generated. A new §1.3 shows the three warehouse flags on both scaffolds (single table
+  and whole-database CDC), the `run → load → compact` cycle they enable from one file,
+  what in the generated block is a catalog guess worth reviewing, and why
+  `--gcs-bucket` is required with them.
 
 - **A `9999-12-31` partition value no longer wedges compaction.** On an hour / month /
   year key the MERGE's upper bound was `hi + 1 day`, which for the SCD "end of time"
