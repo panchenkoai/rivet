@@ -134,6 +134,14 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         return PERMANENT;
     }
 
+    // --- Typed marker: rivet stopped WAITING for a warehouse job it submitted ---
+    // Same reasoning, opposite end of the pipeline: the wait already expired, so
+    // repeating it only spends the budget again. Keyed on the TYPE for the same
+    // reason — a reworded message must not be able to make it retryable.
+    if err.downcast_ref::<crate::load::JobWaitTimeout>().is_some() {
+        return PERMANENT;
+    }
+
     // --- Postgres: check SQLSTATE via the `postgres::Error` downcasted type ---
     if let Some(pg) = err.downcast_ref::<postgres::Error>() {
         if let Some(db) = pg.as_db_error() {

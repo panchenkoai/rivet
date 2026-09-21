@@ -322,6 +322,41 @@ pub(crate) fn column_list(cols: &[String]) -> String {
         .join(", ")
 }
 
+/// A warehouse job rivet stopped WAITING for, having waited out its budget.
+///
+/// Deliberately NOT a [`Refused`]: that one means "stopped before touching the
+/// warehouse", and this is the opposite — the statement was submitted and may well
+/// still be running server-side. The type is what the retry classifier keys off
+/// (`pipeline::retry::classify_error`), so the permanence of a deterministic
+/// timeout cannot be undone by rewording its message; retrying a wait that already
+/// expired only doubles the wait.
+#[derive(Debug)]
+pub struct JobWaitTimeout {
+    message: String,
+}
+
+impl JobWaitTimeout {
+    /// The BigQuery poll loop gave up on `job_id` after `seconds`.
+    pub fn bigquery(job_id: &str, seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "bigquery: stopped waiting for job `{job_id}` after {seconds}s — the job may \
+                 still be RUNNING in BigQuery, so check it there (INFORMATION_SCHEMA.JOBS, \
+                 label `rivet_table`) before re-running: an append mode that re-consumes the \
+                 same runs would double them"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for JobWaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for JobWaitTimeout {}
+
 /// A load that stopped before touching the warehouse. The ledger records such a stop as
 /// `refused`, which never makes the target rivet's own — a `failed` row can.
 #[derive(Debug)]

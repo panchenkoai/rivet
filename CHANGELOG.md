@@ -44,6 +44,33 @@
   load` and `rivet compact`) now name the refusal, and the comment above the pool
   that described the same path as degrading to the stateless path went with it.
 
+- **A BigQuery job that never finishes now ends the wait instead of the run.**
+  `await_job` polled `for attempt in 0..` with no ceiling, no `jobTimeoutMs` on the
+  job and no `jobs.cancel` anywhere, so a job BigQuery never completed hung rivet
+  with no diagnostic and no exit — the only bound in the file was the 120 s
+  per-REQUEST timeout, which says nothing about the job. The poll now carries a
+  budget (four hours, deliberately generous: a deadline that fires on healthy work
+  is worse than none) and gives up with a TYPED marker, `load::JobWaitTimeout`,
+  which `classify_error` reads as PERMANENT — retrying a wait that already expired
+  only spends the budget twice. The message says what an operator actually needs to
+  know: the job may still be RUNNING in BigQuery, so look there before re-running,
+  because an append mode that re-consumes the same runs would double them. The
+  budget is a parameter rather than a constant read inline, so the deadline is
+  testable in milliseconds; the test drives a real socket that answers `RUNNING`
+  for ever, since the crash hook kills rather than stalls and cannot express this.
+
+- **Two retry decisions in the BigQuery transport were ungraded, and mutation
+  testing found them.** `insert_query_job` and `get_response` both guarded their
+  backoff with an inline `attempt > 0`, and both `> → <` (every retry fires
+  IMMEDIATELY — no backoff at all, which on a 429 is exactly wrong) and `> → >=`
+  (a wasted `POLL_MIN` before the first request of every call) survived the whole
+  suite at BOTH sites. `table_metadata`'s inline `== Some("TABLE")` survived too;
+  inverted, it makes every real table read as absent, which turns `rivet compact`
+  into a silent "nothing to merge" on a table that has a buffer. All three are now
+  named predicates — `should_back_off`, `is_table` — with unit tests, and the
+  extraction was verified the only way that counts: a scoped mutation run over the
+  two functions reports 16 mutants, 16 caught.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product

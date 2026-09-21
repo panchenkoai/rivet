@@ -63,6 +63,15 @@ const POLL_MAX: Duration = Duration::from_secs(5);
 /// one polling GET before the load gives up.
 const MAX_TRANSIENT_RETRIES: u32 = 5;
 
+/// How long the poll loop waits for ONE job before giving up on it.
+///
+/// Generous on purpose — a large `LOAD DATA` or a CTAS rebuild can legitimately
+/// run for a long time, and a deadline that fires on healthy work is worse than
+/// none. What it rules out is the unbounded case: before this, `await_job` looped
+/// `for attempt in 0..` with no ceiling at all, so a job BigQuery never finishes
+/// hung rivet with no diagnostic and no exit.
+const JOB_POLL_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+
 // ── the client ───────────────────────────────────────────────────────────────
 
 /// A blocking BigQuery JSON-API client scoped to one project.
@@ -211,9 +220,7 @@ impl BigQueryApi {
             "{}/bigquery/v2/projects/{}/datasets/{dataset}/tables/{table}",
             self.endpoint, self.project
         );
-        Ok(self
-            .get_json_if_found(&url, "tables.get")?
-            .filter(|meta| meta.get("type").and_then(Value::as_str) == Some("TABLE")))
+        Ok(self.get_json_if_found(&url, "tables.get")?.filter(is_table))
     }
 
     /// How many row access policies `dataset.table` has (`rowAccessPolicies.list`); a
@@ -270,7 +277,7 @@ impl BigQueryApi {
         match job_outcome(&job) {
             JobOutcome::Done => Ok(job_ref),
             JobOutcome::Failed(detail) => bail!("{}", job_failed_message(&job_ref.job_id, &detail)),
-            JobOutcome::Running => self.await_job(&job_ref).map(|_| job_ref),
+            JobOutcome::Running => self.await_job(&job_ref, JOB_POLL_DEADLINE).map(|_| job_ref),
         }
     }
 
@@ -292,7 +299,7 @@ impl BigQueryApi {
         );
         let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
         for attempt in 0..=MAX_TRANSIENT_RETRIES {
-            if attempt > 0 {
+            if should_back_off(attempt) {
                 std::thread::sleep(poll_interval(attempt));
             }
             let sent = self.authorized(self.http.post(&url))?.json(&body).send();
@@ -333,21 +340,34 @@ impl BigQueryApi {
             })
     }
 
-    /// Poll `jobs.get` until the job reaches a terminal state.
-    fn await_job(&self, job_ref: &JobRef) -> Result<String> {
+    /// Poll `jobs.get` until the job reaches a terminal state, or `budget` is spent.
+    ///
+    /// `budget` is a PARAMETER rather than the constant read inline, so a test can
+    /// drive the expiry in milliseconds; every caller passes [`JOB_POLL_DEADLINE`].
+    /// The check sits in the `Running` arm, so a job that is already terminal is
+    /// never refused for being slow to answer.
+    fn await_job(&self, job_ref: &JobRef, budget: Duration) -> Result<String> {
         let url = self.job_url(job_ref);
+        let started = std::time::Instant::now();
         for attempt in 0.. {
             std::thread::sleep(poll_interval(attempt));
             let job = self.get_json(&url, "jobs.get")?;
             match job_outcome(&job) {
-                JobOutcome::Running => continue,
                 JobOutcome::Done => return Ok(job_ref.job_id.clone()),
                 JobOutcome::Failed(detail) => {
                     bail!("{}", job_failed_message(&job_ref.job_id, &detail))
                 }
+                JobOutcome::Running if started.elapsed() > budget => {
+                    return Err(crate::load::JobWaitTimeout::bigquery(
+                        &job_ref.job_id,
+                        budget.as_secs(),
+                    )
+                    .into());
+                }
+                JobOutcome::Running => continue,
             }
         }
-        unreachable!("the poll loop only exits through a terminal state")
+        unreachable!("the poll loop only exits through a terminal state or the budget")
     }
 
     fn job_url(&self, job_ref: &JobRef) -> String {
@@ -395,7 +415,7 @@ impl BigQueryApi {
     fn get_response(&self, url: &str, what: &str) -> Result<reqwest::blocking::Response> {
         let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
         for attempt in 0..=MAX_TRANSIENT_RETRIES {
-            if attempt > 0 {
+            if should_back_off(attempt) {
                 std::thread::sleep(poll_interval(attempt));
             }
             let sent = self.authorized(self.http.get(url))?.send();
@@ -850,6 +870,29 @@ fn is_transient_status(code: u16) -> bool {
     code == 429 || (500..600).contains(&code)
 }
 
+/// Whether to wait before `attempt`: every retry backs off, the first try does not.
+///
+/// Named rather than written inline at the two retry loops, because mutation
+/// testing showed the inline `attempt > 0` ungraded at BOTH sites: `>` → `<` makes
+/// every retry fire IMMEDIATELY (no backoff at all, which on a 429 is precisely
+/// wrong) and `>` → `>=` pays `POLL_MIN` before the first request of every call.
+/// Neither is visible to any test while the decision lives inside a body that only
+/// a real HTTP round trip reaches.
+fn should_back_off(attempt: u32) -> bool {
+    attempt > 0
+}
+
+/// Whether a `tables.get` resource describes a TABLE — a view (or anything else)
+/// is not one.
+///
+/// Extracted for the same reason: the inline `== Some("TABLE")` was ungraded
+/// offline, and inverting it makes every real table read as absent — which turns
+/// `compact` into a silent no-op that reports "nothing to merge" on a table that
+/// has a buffer.
+fn is_table(meta: &Value) -> bool {
+    meta.get("type").and_then(Value::as_str) == Some("TABLE")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,6 +1279,110 @@ mod tests {
         assert!(
             poll_interval(0) < poll_interval(2),
             "must actually back off"
+        );
+    }
+
+    /// The first try is immediate; every retry waits.
+    ///
+    /// Both halves matter and neither is redundant: without the `false` case a
+    /// mutant that always backs off pays `POLL_MIN` on every first request, and
+    /// without the `true` cases a mutant that never backs off hammers BigQuery
+    /// through all five retries with no pause. Both survived before this test.
+    #[test]
+    fn only_a_retry_backs_off_never_the_first_try() {
+        assert!(!should_back_off(0), "the first request waits for nothing");
+        for attempt in 1..=MAX_TRANSIENT_RETRIES {
+            assert!(should_back_off(attempt), "retry {attempt} must back off");
+        }
+    }
+
+    /// A table is a TABLE; a view, an absent `type`, and an unexpected one are not.
+    ///
+    /// The inverted form of this predicate makes every real table read as absent,
+    /// which turns `compact` into a silent "nothing to merge" on a table that has
+    /// a buffer — caught live today, ungraded offline until now.
+    #[test]
+    fn only_a_table_resource_is_a_table() {
+        assert!(is_table(&json!({"type": "TABLE"})));
+        assert!(!is_table(&json!({"type": "VIEW"})));
+        assert!(!is_table(&json!({"type": "MATERIALIZED_VIEW"})));
+        assert!(!is_table(&json!({"type": "EXTERNAL"})));
+        // No `type` at all, and a `type` that is not a string: neither is a table.
+        assert!(!is_table(&json!({})));
+        assert!(!is_table(&json!({"type": 1})));
+    }
+
+    /// A job that never finishes ends the WAIT, not the process.
+    ///
+    /// `await_job` looped `for attempt in 0..` with no ceiling, no deadline and no
+    /// `jobs.cancel`, so a job BigQuery never finished hung rivet with no
+    /// diagnostic and no exit. The stub is a real socket answering `RUNNING` for
+    /// ever, because that is the only shape that reaches the loop — the crash hook
+    /// (`maybe_panic_at`) kills rather than stalls, so it cannot express this.
+    #[test]
+    fn a_job_that_never_finishes_ends_the_wait_with_a_typed_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stub port");
+        let addr = listener.local_addr().expect("the stub's address");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // Accept in a LOOP: the poll asks again after every interval, and a
+            // one-shot accept (the `notify.rs` idiom) would answer once and hang
+            // the rest on connect — proving a timeout for the wrong reason.
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"status":{"state":"RUNNING"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let api = BigQueryApi {
+            project: "p".into(),
+            location: None,
+            dataset: None,
+            dataset_location: std::sync::OnceLock::new(),
+            endpoint: format!("http://{addr}"),
+            http: reqwest::blocking::Client::new(),
+            auth: Auth::Static(Zeroizing::new("t".into())),
+        };
+        let job_ref = JobRef {
+            project: "p".into(),
+            job_id: "never_finishes".into(),
+            location: None,
+        };
+
+        // The elapsed WALL TIME is half the oracle, and the half that makes this a
+        // test of the DEADLINE rather than of the error type. Asserting only the
+        // type let three mutants through — the guard forced to `true`, and `>`
+        // flipped to `<` or `>=` — because each of those returns the very same
+        // typed error on the FIRST poll, having waited for nothing at all.
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = api
+            .await_job(&job_ref, budget)
+            .expect_err("a job that never reports DONE must not return Ok");
+        let waited = started.elapsed();
+        assert!(
+            err.downcast_ref::<crate::load::JobWaitTimeout>().is_some(),
+            "the wait must end with the TYPED marker `classify_error` reads as \
+             permanent — a bare message would be retried, spending the budget \
+             again: {err:#}"
+        );
+        assert!(
+            waited >= budget,
+            "the budget must actually be spent before giving up, not merely \
+             reported: gave up after {waited:?} of a {budget:?} budget"
+        );
+        assert!(
+            waited < Duration::from_secs(30),
+            "the budget must also BOUND the wait: {waited:?} for a {budget:?} budget"
         );
     }
 
