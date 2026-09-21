@@ -209,6 +209,17 @@ pub enum Commands {
         /// rebuild is never a side effect of a scheduled load.
         #[arg(long)]
         rebuild_changelog: bool,
+        /// Load the config's tables on N worker threads instead of one after
+        /// another: every freeing worker takes the next table, so a slow table
+        /// no longer blocks the ones queued behind it. A failing table still
+        /// isolates to itself and the rest keep loading, and the per-table lease
+        /// is unchanged — `rivet load` and `rivet compact` still refuse a table
+        /// the other holds. Each worker opens its own ledger connection, so N is
+        /// also N connections to the state backend; a worker that cannot reopen
+        /// the ledger REFUSES its table rather than loading it without a lease.
+        /// Defaults to 1 (one after another), capped at the number of tables.
+        #[arg(long, value_name = "N")]
+        pool: Option<usize>,
     },
     /// Merge each base-and-buffer CDC table's `<table>__changes` buffer into its
     /// base table (`MERGE` by primary key: updates, inserts, deletes flagged as
@@ -222,6 +233,16 @@ pub enum Commands {
         /// (BigQuery `rivet_run` label). Defaults to a generated id.
         #[arg(long, env = "RIVET_RUN_ID")]
         run_id: Option<String>,
+        /// Merge the config's tables on N worker threads instead of one after
+        /// another: every freeing worker takes the next table. A failing table
+        /// still isolates to itself, and the per-table lease is unchanged — a
+        /// table `rivet load` holds is still refused. Each worker opens its own
+        /// ledger connection, so N is also N connections to the state backend; a
+        /// worker that cannot reopen the ledger REFUSES its table rather than
+        /// compacting it without a lease. Defaults to 1 (one after another),
+        /// capped at the number of tables.
+        #[arg(long, value_name = "N")]
+        pool: Option<usize>,
     },
     /// Manage export state
     State {

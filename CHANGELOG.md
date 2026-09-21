@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **`rivet load` and `rivet compact` can work the config's tables in parallel.**
+  `--pool N` runs the per-table loop on N worker threads instead of one after
+  another: every freeing worker takes the next table, so one slow table no longer
+  holds up the ones queued behind it. The default is unchanged — without the flag
+  there is exactly one worker, which is the single pass the loop always made, and
+  `N` is capped at the number of tables. Per-table FAULT ISOLATION is preserved (a
+  failing table isolates to itself and the rest keep loading) and so is the
+  per-table lease, so `rivet load` and `rivet compact` still refuse a table the
+  other holds. Each worker opens its own state handle by reconnecting to the
+  backend the parent already resolved (`open_at_ref`) — once per WORKER, not per
+  table — and a worker that cannot reconnect says so and carries the ERRORED half
+  of the tri-state rather than passing for absent-by-design.
+
+  The scheduling lives in a generic executor (`src/load/pool.rs`) rather than in
+  the orchestrator, because `run_loads` / `run_compacts` are live-only bodies that
+  nothing offline grades; the executor's contracts — every table runs exactly
+  once, a failure isolates, `init` runs once per worker, results come back in
+  CONFIG order — are unit-tested against a fake closure, with no warehouse and no
+  credentials. Folding results in config order is a fix in its own right:
+  `aggregate_load_failures` picks its representative with `max_by_key`, which
+  returns the LAST maximum, so a completion-ordered fold would have reported a
+  different error out of a tie on each run of the same failing config.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product

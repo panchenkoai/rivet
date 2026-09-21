@@ -22,12 +22,16 @@ pub struct LoadArgs {
     pub run_id: Option<String>,
     /// Rebuild a change log whose partition differs from the config (ADR-0034 D5).
     pub rebuild_changelog: bool,
+    /// Worker threads to load the config's tables on; `None` is one after another.
+    pub pool: Option<usize>,
 }
 
 /// `rivet compact` arguments.
 pub struct CompactArgs {
     pub config: String,
     pub run_id: Option<String>,
+    /// Worker threads to merge the config's tables on; `None` is one after another.
+    pub pool: Option<usize>,
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
@@ -84,107 +88,181 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // `ensure_single_export` and `reconcile`), so one poisoned prefix starved
     // every other table, every cycle, indefinitely. The CLI reference already
     // promised "loads every export into the shared target, one after another".
-    let mut failures: Vec<anyhow::Error> = Vec::new();
     let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
-    for plan in &plans {
-        let load_id = format!("{run_id}:{}", plan.table);
-        let drift = plan.load.allow_source_drift;
-        let outcome = (|| -> Result<()> {
-            // Typed from the spec of the run this load consumes, not the by-name
-            // row. Inside the per-table closure: a spec the config does not fit is
-            // THIS table's failure, and the others still load.
-            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "load")?;
-            let plan = &pinned;
-            match plan.mode {
-                // CDC: APPEND the change log + rebuild the current-state dedup view.
-                load::plan::LoadMode::Cdc => {
-                    let pk = require_pk(plan, "cdc")?;
-                    match load_one_cdc(
-                        plan,
-                        &run_id,
-                        engine.expect("engine resolved above for a cdc plan"),
-                        pk,
-                        drift,
-                        args.rebuild_changelog,
-                        state.as_ref(),
-                        ledger_errored,
-                        &load_id,
-                    )? {
-                        Some(report) => {
-                            println!("CDC LOAD OK [{}]: {}", plan.table, cdc_ok_line(&report))
+    // Each worker RECONNECTS to the backend the parent already resolved instead
+    // of re-resolving `RIVET_STATE_URL` per table — `open_at_ref` is the path the
+    // state ref exists for — and it costs one connection per WORKER, not per
+    // table, so the one-worker default opens exactly one, as this loop always
+    // did. A worker whose reconnect fails degrades to the stateless path: the
+    // same tri-state the parent's own open degrades to above.
+    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
+    // The parent store has done its job: it migrated the schema before any thread
+    // starts (the order `pipeline/run.rs` uses) and handed over its `StateRef`.
+    // Holding it left `--pool 1` with TWO connections and TWO migrations — on BOTH
+    // backends, since the Postgres arm of `open_at_ref` migrates too — where the
+    // sequential loop had one of each.
+    let parent_had_state = state.is_some();
+    drop(state);
+    let outcomes = load::pool::run_workers(
+        &plans,
+        load::pool::effective_pool(args.pool, plans.len()),
+        // A worker that cannot reconnect degrades to the stateless path AND carries
+        // the ERRORED half of the tri-state, exactly as the parent's own open does
+        // above. A bare `.ok()` here would conflate a per-worker DB blip with
+        // absent-by-design — the conflation round-9 already paid for, where the
+        // re-baseline guard note-and-proceeds a doomed post-gap baseline on the
+        // very host whose ledger just blipped.
+        || match state_ref.as_ref() {
+            None => (None, ledger_errored),
+            Some(r) => match StateStore::open_at_ref(r) {
+                Ok(s) => (Some(s), ledger_errored),
+                Err(e) => {
+                    eprintln!(
+                        "  warning: state store unavailable to this worker ({e:#}); \
+                         loading without a ledger (no incremental skip / audit log)"
+                    );
+                    (None, true)
+                }
+            },
+        },
+        |worker, _idx, plan| {
+            let (state, ledger_errored) = (&worker.0, worker.1);
+            // A worker that lost a ledger the RUN started with refuses its table.
+            // The lease is taken as `state.map(..)`, so a ledger-less worker takes
+            // NONE at all — a skip, not a refusal — then reads an empty skip set,
+            // loads every run and records nothing, which silently re-appends on the
+            // next run. The sequential loop opened ONE store before any table, so
+            // "some tables with a ledger, some without" could not exist and nothing
+            // downstream was written to notice it. The pool invents that state; this
+            // is where it stops.
+            if load::pool::reconnect_failure_is_fatal(parent_had_state, state.is_some()) {
+                anyhow::bail!(
+                    "`{}`: this worker could not reopen the state ledger the run started \
+                     with — refusing the table rather than loading it without a lease and \
+                     without recording it. Lower `--pool`, or fix the state backend.",
+                    plan.table
+                );
+            }
+            let load_id = format!("{run_id}:{}", plan.table);
+            let drift = plan.load.allow_source_drift;
+            let outcome = (|| -> Result<()> {
+                // Typed from the spec of the run this load consumes, not the by-name
+                // row. Inside the per-table closure: a spec the config does not fit is
+                // THIS table's failure, and the others still load.
+                let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "load")?;
+                let plan = &pinned;
+                match plan.mode {
+                    // CDC: APPEND the change log + rebuild the current-state dedup view.
+                    load::plan::LoadMode::Cdc => {
+                        let pk = require_pk(plan, "cdc")?;
+                        match load_one_cdc(
+                            plan,
+                            &run_id,
+                            engine.expect("engine resolved above for a cdc plan"),
+                            pk,
+                            drift,
+                            args.rebuild_changelog,
+                            state.as_ref(),
+                            ledger_errored,
+                            &load_id,
+                        )? {
+                            Some(report) => {
+                                println!("CDC LOAD OK [{}]: {}", plan.table, cdc_ok_line(&report))
+                            }
+                            None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
                         }
-                        None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+                    }
+                    // Incremental: APPEND the delta + a cursor-ordered current-state view.
+                    load::plan::LoadMode::Incremental => {
+                        let pk = require_pk(plan, "incremental")?;
+                        match load_one_incremental(
+                            plan,
+                            &run_id,
+                            pk,
+                            drift,
+                            args.rebuild_changelog,
+                            state.as_ref(),
+                            &load_id,
+                        )? {
+                            Some(report) => {
+                                println!(
+                                    "INCREMENTAL LOAD OK [{}]: {}",
+                                    plan.table,
+                                    report.summary()
+                                )
+                            }
+                            None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                        }
+                    }
+                    // Full/chunked: ledger-driven latest-run OVERWRITE.
+                    //
+                    // Named, not a `_` catch-all: this match is the mode ROUTER, and
+                    // the in-diff mutation gate reported both of the arms above alive
+                    // as `delete match arm …` — a deleted arm fell through to `_` and
+                    // silently loaded a CDC change log as a full-snapshot OVERWRITE.
+                    // Exhaustive over `LoadMode`, the arm deletions stop compiling
+                    // (the mutants are unviable rather than uncaught) and a NEW mode
+                    // has to be routed deliberately instead of inheriting this one.
+                    load::plan::LoadMode::Full => {
+                        match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
+                            Some(report) => println!(
+                                "LOAD OK [{}]: {} row(s) in `{}`{}",
+                                plan.table,
+                                report.rows_loaded,
+                                report.target_table,
+                                cleaned_suffix(report.source_cleaned)
+                            ),
+                            None => println!("LOAD SKIP [{}]: up to date", plan.table),
+                        }
                     }
                 }
-                // Incremental: APPEND the delta + a cursor-ordered current-state view.
-                load::plan::LoadMode::Incremental => {
-                    let pk = require_pk(plan, "incremental")?;
-                    match load_one_incremental(
-                        plan,
-                        &run_id,
-                        pk,
-                        drift,
-                        args.rebuild_changelog,
-                        state.as_ref(),
-                        &load_id,
-                    )? {
-                        Some(report) => {
-                            println!("INCREMENTAL LOAD OK [{}]: {}", plan.table, report.summary())
-                        }
-                        None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
-                    }
-                }
-                // Full/chunked: ledger-driven latest-run OVERWRITE.
+                Ok(())
+            })();
+            if let Err(e) = &outcome {
+                // Name the table on the way out: the aggregate must say WHICH load
+                // failed, or an operator reading a mixed batch cannot act on it.
+                // Through redact (round-8): a raw eprintln bypasses both the log
+                // sink and main's top-level redactor — a future URL-bearing load
+                // error would print credentials unredacted.
                 //
-                // Named, not a `_` catch-all: this match is the mode ROUTER, and
-                // the in-diff mutation gate reported both of the arms above alive
-                // as `delete match arm …` — a deleted arm fell through to `_` and
-                // silently loaded a CDC change log as a full-snapshot OVERWRITE.
-                // Exhaustive over `LoadMode`, the arm deletions stop compiling
-                // (the mutants are unviable rather than uncaught) and a NEW mode
-                // has to be routed deliberately instead of inheriting this one.
-                load::plan::LoadMode::Full => {
-                    match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
-                        Some(report) => println!(
-                            "LOAD OK [{}]: {} row(s) in `{}`{}",
-                            plan.table,
-                            report.rows_loaded,
-                            report.target_table,
-                            cleaned_suffix(report.source_cleaned)
-                        ),
-                        None => println!("LOAD SKIP [{}]: up to date", plan.table),
-                    }
+                // Said HERE, from the worker, so a pooled run reports a table when it
+                // fails rather than after every other table has finished — the
+                // one-worker default keeps the order it always had. The aggregate
+                // still folds in CONFIG order (the pool returns results by item), and
+                // that is what keeps the chosen representative stable: `max_by_key`
+                // returns the LAST maximum, so a completion-ordered fold would pick a
+                // different error out of a tie on each run of the same failing config.
+                eprintln!(
+                    "  LOAD FAILED [{}]: {}",
+                    plan.table,
+                    crate::redact::redact_secrets(&format!("{e:#}"))
+                );
+            }
+            outcome.map_err(|e| e.context(format!("load '{}'", plan.table)))?;
+            if plan.load.gc_orphans {
+                // The store is opened HERE rather than inside `maybe_gc_orphans` so
+                // the GC body itself takes a store and is offline-testable against a
+                // filesystem-backed one (`GcsStore::open_fs`) — its whole-function
+                // stub was one of the in-diff gate's misses, and a stubbed orphan GC
+                // is a delete that silently stops happening.
+                match load::open_store(&plan.destination) {
+                    Ok(store) => maybe_gc_orphans(&store, plan, state.as_ref()),
+                    Err(e) => eprintln!(
+                        "  gc-orphans [{}]: skipped (store unavailable): {e:#}",
+                        plan.table
+                    ),
                 }
             }
             Ok(())
-        })();
+        },
+    );
+    // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
+    // the table, whatever order the workers finished in — so the representative
+    // `aggregate_load_failures` picks out of a tie is the same on every run.
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    for outcome in outcomes {
         if let Err(e) = outcome {
-            // Name the table on the way out: the aggregate must say WHICH load
-            // failed, or an operator reading a mixed batch cannot act on it.
-            // Through redact (round-8): a raw eprintln bypasses both the log
-            // sink and main's top-level redactor — a future URL-bearing load
-            // error would print credentials unredacted.
-            eprintln!(
-                "  LOAD FAILED [{}]: {}",
-                plan.table,
-                crate::redact::redact_secrets(&format!("{e:#}"))
-            );
-            failures.push(e.context(format!("load '{}'", plan.table)));
-            continue;
-        }
-        if plan.load.gc_orphans {
-            // The store is opened HERE rather than inside `maybe_gc_orphans` so
-            // the GC body itself takes a store and is offline-testable against a
-            // filesystem-backed one (`GcsStore::open_fs`) — its whole-function
-            // stub was one of the in-diff gate's misses, and a stubbed orphan GC
-            // is a delete that silently stops happening.
-            match load::open_store(&plan.destination) {
-                Ok(store) => maybe_gc_orphans(&store, plan, state.as_ref()),
-                Err(e) => eprintln!(
-                    "  gc-orphans [{}]: skipped (store unavailable): {e:#}",
-                    plan.table
-                ),
-            }
+            failures.push(e);
         }
     }
     match aggregate_load_failures(failures) {
@@ -1367,90 +1445,147 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     } else {
         None
     };
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    let mut attempted = 0usize;
-    for plan in &plans {
-        if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
-            eprintln!("  compact [{}]: skipped — {why}", plan.table);
-            continue;
-        }
-        attempted += 1;
-        let load_id = format!("{run_id}:{}", plan.table);
-        let outcome = (|| -> Result<()> {
-            let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
-            let loader = load::build_loader(&pinned, &run_id);
-            let target_fqtn = loader.fqtn(&pinned.table);
-            let _lease = match state
-                .as_ref()
-                .map(|s| s.try_load_lease(&target_fqtn))
-                .transpose()?
-            {
-                Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
-                held => held.flatten(),
-            };
-            let pk = require_pk(&pinned, "cdc")?;
-            // The base is checked BEFORE the MERGE, and only when a buffer exists:
-            // an absent base surfaced as BigQuery's own `Not found: Table`, and a
-            // base rivet never loaded was not checked at all. Metadata, no job.
-            let report = match compact_gate_of(loader.as_ref(), &pinned.table, state.as_ref()) {
-                Err(e) => Err(e),
-                Ok(()) => compact_order_of(&pinned, engine).and_then(|order| {
-                    // The MERGE reads its tombstone arm off the specs it is HANDED,
-                    // and the recorded spec holds source columns only — the load leg
-                    // appends the flag to its own copy. Compact must do the same or
-                    // every delete merges as an ordinary upsert and every insert
-                    // lands with a NULL flag. `compact_skip_reason` already kept
-                    // non-compacting layouts out — that gate is the `true` here, so
-                    // the ONE predicate that owns this decision is the one asked.
-                    let mut specs = pinned.specs.clone();
-                    if load::plan::base_carries_delete_flag(true, pinned.deleted_flag) {
-                        specs.push(load::cdc::flag_spec(loader.warehouse()));
-                    }
-                    loader.compact(&pinned.table, &specs, pk, order)
-                }),
-            };
-            if let Some(s) = state.as_ref() {
-                let rec = LoadRecord {
-                    load_id: load_id.clone(),
-                    export_name: pinned.table.clone(),
-                    target_table: target_fqtn.clone(),
-                    warehouse: pinned.load.target.name().to_string(),
-                    mode: "compact".to_string(),
-                    source_run_ids: Vec::new(),
-                    source_ident: String::new(),
-                    rows_loaded: report.as_ref().map_or(0, |r| r.changes_rows as i64),
-                    status: match &report {
-                        Ok(_) => "success".to_string(),
-                        // A refusal is a stop before the write, exactly as on the
-                        // load path — never a `failed` row that makes the target
-                        // look like rivet's own on the next attempt.
-                        Err(e) => ledger_status(e).to_string(),
-                    },
-                    finished_at: chrono::Utc::now().to_rfc3339(),
-                };
-                if let Err(e) = s.store_load(&rec) {
-                    eprintln!("  warning: compact ledger write failed for `{target_fqtn}`: {e:#}");
+    // Counted from several workers, so an atomic — read once after the join for
+    // the failure message below. Skipped tables are not attempts, so the count
+    // still happens AFTER the skip gate, exactly where `attempted += 1` sat.
+    //
+    // The cheaper shape — filter `plans` BEFORE the pool, so `attempted` is just
+    // `filtered.len()` and no atomic is needed — was considered and rejected: it
+    // moves every "skipped — <why>" line to the front of the run in one block,
+    // while the sequential loop interleaved them with the work. Keeping the skip
+    // INSIDE the worker keeps `--pool 1` printing exactly what it always printed.
+    let attempted = std::sync::atomic::AtomicUsize::new(0);
+    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
+    // Same as the load leg: the parent migrated the schema before any thread starts
+    // and has handed over its `StateRef`. Holding it would leave `--pool 1` with TWO
+    // connections and TWO migrations — on both backends — where the sequential loop
+    // had one of each.
+    let parent_had_state = state.is_some();
+    drop(state);
+    let outcomes = load::pool::run_workers(
+        &plans,
+        load::pool::effective_pool(args.pool, plans.len()),
+        || match state_ref.as_ref() {
+            None => None,
+            Some(r) => match StateStore::open_at_ref(r) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "  warning: state store unavailable to this worker ({e:#}); \
+                         compacting without a ledger"
+                    );
+                    None
                 }
+            },
+        },
+        |state, _idx, plan| {
+            if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
+                eprintln!("  compact [{}]: skipped — {why}", plan.table);
+                return Ok(());
             }
-            let report = report?;
-            if report.had_buffer {
-                println!(
-                    "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE statement(s); buffer dropped",
-                    plan.table, report.changes_rows, report.base, report.merge_jobs
-                );
-            } else {
-                println!(
-                    "COMPACT SKIP [{}]: no `{}__changes` buffer — nothing to merge",
-                    plan.table, plan.table
+            // AFTER the skip gate on purpose: a table this run would not compact
+            // anyway needs no ledger, so refusing it would be noise. One that WOULD
+            // compact must not proceed without a lease — `rivet load` may hold it,
+            // and a ledger-less worker takes no lease at all rather than being
+            // refused (the lease is `state.map(..)`, so `None` skips it).
+            if load::pool::reconnect_failure_is_fatal(parent_had_state, state.is_some()) {
+                anyhow::bail!(
+                    "`{}`: this worker could not reopen the state ledger the run started \
+                     with — refusing the table rather than compacting it without a lease. \
+                     Lower `--pool`, or fix the state backend.",
+                    plan.table
                 );
             }
-            Ok(())
-        })();
+            attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let load_id = format!("{run_id}:{}", plan.table);
+            let outcome = (|| -> Result<()> {
+                let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
+                let loader = load::build_loader(&pinned, &run_id);
+                let target_fqtn = loader.fqtn(&pinned.table);
+                let _lease = match state
+                    .as_ref()
+                    .map(|s| s.try_load_lease(&target_fqtn))
+                    .transpose()?
+                {
+                    Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
+                    held => held.flatten(),
+                };
+                let pk = require_pk(&pinned, "cdc")?;
+                // The base is checked BEFORE the MERGE, and only when a buffer exists:
+                // an absent base surfaced as BigQuery's own `Not found: Table`, and a
+                // base rivet never loaded was not checked at all. Metadata, no job.
+                let report = match compact_gate_of(loader.as_ref(), &pinned.table, state.as_ref()) {
+                    Err(e) => Err(e),
+                    Ok(()) => compact_order_of(&pinned, engine).and_then(|order| {
+                        // The MERGE reads its tombstone arm off the specs it is HANDED,
+                        // and the recorded spec holds source columns only — the load leg
+                        // appends the flag to its own copy. Compact must do the same or
+                        // every delete merges as an ordinary upsert and every insert
+                        // lands with a NULL flag. `compact_skip_reason` already kept
+                        // non-compacting layouts out — that gate is the `true` here, so
+                        // the ONE predicate that owns this decision is the one asked.
+                        let mut specs = pinned.specs.clone();
+                        if load::plan::base_carries_delete_flag(true, pinned.deleted_flag) {
+                            specs.push(load::cdc::flag_spec(loader.warehouse()));
+                        }
+                        loader.compact(&pinned.table, &specs, pk, order)
+                    }),
+                };
+                if let Some(s) = state.as_ref() {
+                    let rec = LoadRecord {
+                        load_id: load_id.clone(),
+                        export_name: pinned.table.clone(),
+                        target_table: target_fqtn.clone(),
+                        warehouse: pinned.load.target.name().to_string(),
+                        mode: "compact".to_string(),
+                        source_run_ids: Vec::new(),
+                        source_ident: String::new(),
+                        rows_loaded: report.as_ref().map_or(0, |r| r.changes_rows as i64),
+                        status: match &report {
+                            Ok(_) => "success".to_string(),
+                            // A refusal is a stop before the write, exactly as on the
+                            // load path — never a `failed` row that makes the target
+                            // look like rivet's own on the next attempt.
+                            Err(e) => ledger_status(e).to_string(),
+                        },
+                        finished_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    if let Err(e) = s.store_load(&rec) {
+                        eprintln!(
+                            "  warning: compact ledger write failed for `{target_fqtn}`: {e:#}"
+                        );
+                    }
+                }
+                let report = report?;
+                if report.had_buffer {
+                    println!(
+                        "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE statement(s); buffer dropped",
+                        plan.table, report.changes_rows, report.base, report.merge_jobs
+                    );
+                } else {
+                    println!(
+                        "COMPACT SKIP [{}]: no `{}__changes` buffer — nothing to merge",
+                        plan.table, plan.table
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(e) = &outcome {
+                eprintln!("  COMPACT FAILED [{}]: {e:#}", plan.table);
+            }
+            outcome.map_err(|e| e.context(format!("compact '{}'", plan.table)))
+        },
+    );
+    // Folded in CONFIG order, like the load leg: the pool returns one result per
+    // table, indexed by the table, so the `|`-joined list below reads the same on
+    // every run of the same failing config.
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    for outcome in outcomes {
         if let Err(e) = outcome {
-            eprintln!("  COMPACT FAILED [{}]: {e:#}", plan.table);
-            failures.push(e.context(format!("compact '{}'", plan.table)));
+            failures.push(e);
         }
     }
+    let attempted = attempted.load(std::sync::atomic::Ordering::Relaxed);
     match failures.len() {
         0 => Ok(()),
         1 => Err(failures.pop().unwrap()),

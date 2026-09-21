@@ -19,6 +19,7 @@ pub mod cdc;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
 pub mod plan;
+pub(crate) mod pool;
 pub mod reconcile;
 mod snowflake;
 

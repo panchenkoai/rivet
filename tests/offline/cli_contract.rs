@@ -169,6 +169,49 @@ fn doctor_help_exit_zero_and_mentions_command() {
     );
 }
 
+/// Both `--pool` flags exist on the commands that own them, and a non-numeric
+/// value is refused.
+///
+/// SCOPE, said here because this test cannot grow into more and should not be
+/// mistaken for proof that it has: it pins the CLI SURFACE only. No table is
+/// loaded, no worker is spawned, no lease is taken. Exercising the pool needs a
+/// real warehouse — the same credential-gated wall that leaves `run_loads`
+/// ungraded in an offline run — so the honest home for that proof is a LOCAL load
+/// target, not this file.
+///
+/// It is also NOT written to satisfy `cli_flag_coverage_guard`. That guard keys on
+/// the flag NAME and was already green for `pool` via `apply --pool`, so it
+/// reported these two flags as covered while nothing referenced them: naming never
+/// closed the hole. This closes the part that can be closed here.
+#[test]
+fn load_and_compact_accept_pool_and_refuse_a_non_numeric_value() {
+    for cmd in ["load", "compact"] {
+        let (code, stdout, _stderr) = run(&[cmd, "--help"]);
+        assert_eq!(code, 0, "`rivet {cmd} --help` must exit zero");
+        assert!(
+            stdout.contains("--pool"),
+            "`rivet {cmd} --help` must mention '--pool'; got:\n{stdout}"
+        );
+    }
+    for cmd in ["load", "compact"] {
+        let (code, _stdout, stderr) = run(&[
+            cmd,
+            "-c",
+            "/nonexistent/rivet_pool_contract.yaml",
+            "--pool",
+            "notanumber",
+        ]);
+        assert_ne!(
+            code, 0,
+            "`rivet {cmd} --pool notanumber` must be refused, not coerced"
+        );
+        assert!(
+            stderr.contains("--pool") || stderr.to_lowercase().contains("invalid"),
+            "the refusal must name the offending flag or value; got stderr:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn unknown_subcommand_exits_nonzero_and_suggests_help() {
     let (code, _stdout, stderr) = run(&["definitely-not-a-real-subcommand"]);

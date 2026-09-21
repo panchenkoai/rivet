@@ -27,6 +27,51 @@ fn pg_store() -> Option<StateStore> {
     Some(store)
 }
 
+/// PARITY: the per-table lease refuses a second holder on Postgres exactly as it
+/// does on SQLite. This is the ONE mechanism in the state layer with two genuinely
+/// different implementations — `flock` on a per-key sidecar file vs
+/// `pg_try_advisory_lock` on the SESSION — and the only one this file did not cover,
+/// while nine other aspects of the backend already were.
+///
+/// `rivet load --pool N` / `rivet compact --pool N` rest on it: every worker reopens
+/// its own store, so every worker holds its own session, and the lease is the only
+/// thing keeping two of them off one table.
+///
+/// MEASURED DIVERGENCE, deliberately NOT asserted below because it is PostgreSQL's
+/// behaviour rather than rivet's: `pg_try_advisory_lock` is RE-ENTRANT within one
+/// session — the same session takes the same key twice and both calls return true
+/// (`pg_locks` still shows a single entry; it counts). SQLite's `flock` refuses the
+/// second holder even inside one process, which is exactly what the sibling unit test
+/// in `state/load_lease.rs` pins. So a future change that hands several workers ONE
+/// shared store would fail loudly on SQLite and pass SILENTLY on Postgres, with the
+/// per-table guarantee quietly gone. One store per worker is a requirement, not a
+/// style choice.
+#[test]
+#[ignore]
+fn pg_lease_refuses_a_second_session_like_sqlite_refuses_a_second_store() {
+    let Some(a) = pg_store() else { return };
+    let Some(b) = pg_store() else { return };
+    let key = format!("p.d.lease_{}", std::process::id());
+
+    let held = a
+        .try_load_lease(&key)
+        .unwrap()
+        .expect("the first session takes the lease");
+    assert!(
+        b.try_load_lease(&key).unwrap().is_none(),
+        "a second SESSION must be refused while the first holds the lease"
+    );
+    assert!(
+        b.try_load_lease(&format!("{key}_other")).unwrap().is_some(),
+        "another table is independent — the lease is per-table, not global"
+    );
+    drop(held);
+    assert!(
+        b.try_load_lease(&key).unwrap().is_some(),
+        "free once released — no timer, no cleanup step"
+    );
+}
+
 #[test]
 #[ignore]
 fn pg_cursor_round_trip() {
