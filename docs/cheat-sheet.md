@@ -129,7 +129,7 @@ Source prerequisites:
 
 | Engine | Server config |
 |---|---|
-| **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1` |
+| **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1`. For a DELETE to carry more than the primary key, `ALTER TABLE <t> REPLICA IDENTITY FULL` — the default (`d`) sends the key alone, which rivet warns about on every run |
 | **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended), binlog retention ≫ the run interval |
 | **SQL Server** | SQL Server Agent running; Enterprise / Standard / Developer (not Express/Web) |
 | **MongoDB** | Replica set required (`?directConnection=true` for a port-mapped single node) |
@@ -236,9 +236,19 @@ rivet run -c rivet.yaml --resume                # continue a crashed chunked run
 rivet plan  -c rivet.yaml                       # read-only schedule
 rivet plan  -c rivet.yaml --annotate-waves      # write wave:/parallel_safe: into the config
 rivet apply rivet.yaml                          # wave by wave
-rivet apply rivet.yaml --resume                 # skip exports with _SUCCESS, resume the rest
-rivet apply rivet.yaml --pool 4 --split         # work-stealing pool; split one dominant table
-rivet plan  -c rivet.yaml -e {{NAME}} -o plan.json && rivet apply plan.json   # sealed replay
+rivet apply rivet.yaml --resume                 # skip exports with _SUCCESS, resume the rest.
+                                                #   WITHOUT it a re-run appends fresh parts beside the old
+                                                #   ones and rewrites manifest.json for this run only — a
+                                                #   glob reader then double-counts. Clear the prefix first.
+rivet apply rivet.yaml --pool 4 --split         # work-stealing pool; split one dominant table.
+                                                #   A GENERATED config carries no `parallel_safe:`, so every
+                                                #   export counts as heavy and `--pool` alone overlaps
+                                                #   NOTHING — run `--annotate-waves` first. `--split` needs a
+                                                #   dominant full/chunked/keyset export with a chunk key
+                                                #   (never incremental/cdc). Measured on one 1.26M-row set:
+                                                #   66s waves · 74s bare --pool · 57s annotated · 42s +split
+rivet plan  -c rivet.yaml -e {{NAME}} --format json -o plan.json && rivet apply plan.json   # sealed replay
+                                                # `-o` REQUIRES `--format json` (pretty mode ignores it)
 ```
 
 Mode snippets:
@@ -381,7 +391,7 @@ What the load does for each export `mode:`:
 | mode | warehouse result |
 |---|---|
 | `full` | `OVERWRITE` the table with the latest snapshot. Re-running is idempotent |
-| `incremental` | `log_view` (default): append to `<table>__changes`, plus a current-state view deduped on `pk`. `layout: base_buffer`: the first pass lands `<table>` as a physical base, every later delta lands in the buffer `<table>__changes`, and `rivet compact` merges it in (latest per `pk`, deletes flagged in `__is_deleted`) and drops the buffer — the cycle is `run → load → compact` |
+| `incremental` | `log_view` (default): append to `<table>__changes`, plus a current-state view deduped on `pk`. `layout: base_buffer`: the first pass lands `<table>` as a physical base, every later delta lands in the buffer `<table>__changes`, and `rivet compact` merges it in (latest per `pk`) and drops the buffer — the cycle is `run → load → compact`. **DELETES ARE NOT CAPTURED**: a cursor read only sees rows whose cursor advanced, and a deleted row has none, so the warehouse keeps it forever (`deleted_flag` is off for non-CDC, so there is no `__is_deleted` to set). Use `mode: cdc` if deletions must reach the warehouse |
 | `cdc` | append to `<table>__changes`, plus a view keeping the latest `(__pos, __seq)` per PK with `__is_deleted` (soft delete: live rows are `WHERE NOT __is_deleted`) |
 | `cdc` with `tables:` | one `__changes` table and one view per source table |
 
@@ -456,6 +466,10 @@ python dev/correctness/verify_export.py \
 
 > A prefix with orphaned pre-crash parts reads *high*. Verify only the parts
 > named in `manifest.json`.
+>
+> Run this BEFORE `rivet load`, or set `cleanup_source: false`: the generated
+> `load:` block sets `cleanup_source: true`, so a successful load deletes the
+> staged Parquet and leaves this oracle nothing to read.
 
 CDC replay check in DuckDB (latest image per key; the LSN parsing is PostgreSQL's):
 
@@ -482,8 +496,13 @@ FROM `region-us`.INFORMATION_SCHEMA.JOBS
 WHERE EXISTS (SELECT 1 FROM UNNEST(labels) WHERE key='managed_by' AND value='rivet')
 GROUP BY op, tbl ORDER BY bytes_billed DESC;
 
--- current state of an incremental / cdc load vs the source
+-- current state of a CDC load vs the source (cdc only: `__is_deleted` exists
+-- when `deleted_flag` is on, which is the default for cdc and OFF otherwise —
+-- on an `incremental` base this query fails with "Unrecognized name")
 SELECT COUNT(*) FROM {{WAREHOUSE_SQL}} WHERE NOT __is_deleted;
+
+-- an incremental / full base has no delete flag: count it plainly
+SELECT COUNT(*) FROM {{WAREHOUSE_SQL}};
 ```
 
 ### 4.6 Inspection
@@ -491,6 +510,10 @@ SELECT COUNT(*) FROM {{WAREHOUSE_SQL}} WHERE NOT __is_deleted;
 ```bash
 rivet state files -c rivet.yaml -e {{NAME}} --json   # files actually written
 rivet metrics     -c rivet.yaml -e {{NAME}} --json   # rows / files / bytes / status per run
+                                                     #   NOTE: neither reaches `--split` sub-units — their
+                                                     #   run ids are `<export>#0…#N` and `-e` only accepts a
+                                                     #   config export name. Use `rivet state runs`, which
+                                                     #   does list them.
 rivet journal     -c rivet.yaml -e {{NAME}} --run-id <id>
 ```
 

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- **The cheat sheet was driven end to end, and corrected where it and the product
+  disagreed.** Three scenarios on GENERATED configs against a live stand — batch +
+  `compact`, CDC, and a multi-table `plan`/`apply`/`--pool`/`--split` — produced
+  eighteen divergences. The load-bearing ones are now fixed in `docs/cheat-sheet.md`:
+  §3's mode table promised that `incremental` + `layout: base_buffer` flags deletes in
+  `__is_deleted`, but a cursor read never sees a DELETE, so the warehouse keeps the row
+  for ever (measured: 250,002 rows against a source of 250,001 — the surplus was the
+  deleted id); §2.1's sealed-replay line could not work as printed (`-o` requires
+  `--format json`); `--pool 4` on a generated config is the SLOWEST of the four paths,
+  because `rivet init` writes no `parallel_safe:` (measured on one 1.26M-row set: 66s
+  waves, 74s bare `--pool`, 57s after `--annotate-waves`, 42s with `--split`); §4.5's
+  `WHERE NOT __is_deleted` errors on an `incremental` base, where the flag does not
+  exist; §4.4's independent oracle cannot run after a load, because the generated
+  `cleanup_source: true` deletes the very parts it reads; re-running `apply` without
+  `--resume` orphans the prior run's parts; PostgreSQL's `REPLICA IDENTITY` was absent
+  from the CDC prerequisites though rivet warns about it on every run; and
+  `rivet state files` / `rivet metrics` cannot reach `--split` sub-units (`rivet state
+  runs` can). The split itself was verified correct by the independent DuckDB oracle —
+  39 fingerprint fields over 1,000,749 rows across four sub-exports sharing one prefix.
+
+- **`rivet init` explained a decision it had not taken.** A backfill recipe's mode comes
+  from `recipe_mode`, which pages whenever a usable key exists and never reads the row
+  count — but the inline rationale printed `suggest_mode`'s reason regardless, so a
+  200-row recipe was scaffolded `chunked` under "~200 rows ≥ 100K threshold". The
+  threshold is now claimed only when it was actually crossed, mirroring what the `full`
+  arm already did for exactly this class of false diagnostic. The generated header also
+  stopped naming `rivet.yaml` whatever `-o` said — it is built without the output path,
+  so it now points at `<this file>` instead of a config that may not exist.
+
 - **`rivet validate` blamed a missing manifest on rivet's age.** The verdict read
   `legacy_run (no manifest at destination — pre-0.7.0 prefix)`, but the check establishes
   only that no manifest is at the prefix — never when, or whether, anything was written

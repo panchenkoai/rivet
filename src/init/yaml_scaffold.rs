@@ -247,7 +247,10 @@ fn config_header_lines(
 ) -> Vec<String> {
     let mut lines = vec![
         title_line.to_string(),
-        "# Review and adjust before running: rivet check -c rivet.yaml".to_string(),
+        // Do NOT name a file here: `-o` decides the path, and this header is
+        // built without it, so a literal `rivet.yaml` sends anyone who used
+        // `-o cdc.yaml` at a config that does not exist.
+        "# Review and adjust before running: rivet check -c <this file>".to_string(),
     ];
     if unbounded_decimal_note {
         lines.push(

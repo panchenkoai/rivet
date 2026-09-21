@@ -221,8 +221,18 @@ impl TableInfo {
     pub(crate) fn mode_rationale(&self, mode: &str) -> String {
         match mode {
             "chunked" => {
+                // The 100K threshold is `suggest_mode`'s reason, not the only road
+                // to `chunked`: a backfill recipe takes `recipe_mode`, which pages
+                // whenever a usable key exists and never reads the row count. So
+                // "~200 rows ≥ 100K threshold" explained a decision that was not
+                // the one taken (measured on a generated CDC partner shape).
+                let why = if self.row_estimate > 100_000 {
+                    "≥ 100K threshold and"
+                } else {
+                    "below the 100K threshold, but pageable because"
+                };
                 let base = format!(
-                    "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
+                    "auto: ~{} rows {why} chunk column '{}' is available",
                     fmt_row_estimate(self.row_estimate),
                     // Name the REAL chunk key: a keyset table has no chunk_column
                     // but a keysettable PK — falling back to a phantom 'id' named
@@ -252,9 +262,14 @@ impl TableInfo {
             }
             "incremental" => match self.chosen_cursor_column() {
                 Some(cursor) => format!(
-                    "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to \
+                    "auto: ~{} rows {}; chunk column missing, falling back to \
                      incremental on '{cursor}'",
                     fmt_row_estimate(self.row_estimate),
+                    if self.row_estimate > 100_000 {
+                        "≥ 100K threshold"
+                    } else {
+                        "below the 100K threshold"
+                    },
                 ),
                 // No timestamp candidate: do NOT name a phantom `updated_at` —
                 // the scaffold emits a REVIEW marker here, so the rationale must
@@ -1753,6 +1768,31 @@ mod tests {
         assert!(
             !r.contains("mode: incremental"),
             "no cursor column → no hint: {r}"
+        );
+    }
+
+    #[test]
+    fn chunked_rationale_does_not_claim_a_threshold_it_did_not_cross() {
+        // `chunked` is reachable far below 100K: a backfill recipe's mode comes from
+        // `recipe_mode`, which pages whenever a usable key exists and never reads the
+        // row count. The rationale used to print `suggest_mode`'s reason regardless,
+        // so a 200-row recipe read "~200 rows ≥ 100K threshold" — explaining a
+        // decision that was not the one taken (measured on a generated CDC partner
+        // shape, 2026-09-21).
+        let small = make_table(200, vec![col("id", "bigint", true)]);
+        assert_eq!(
+            small.suggest_mode(),
+            "full",
+            "suggest_mode would not pick chunked here — only recipe_mode does"
+        );
+        let r = small.mode_rationale("chunked");
+        assert!(
+            !r.contains("≥ 100K threshold"),
+            "a 200-row table must not claim it crossed the threshold: {r}"
+        );
+        assert!(
+            r.contains("below the 100K threshold") && r.contains("pageable"),
+            "it must name the real reason — a usable key, not the row count: {r}"
         );
     }
 
