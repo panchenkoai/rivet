@@ -96,7 +96,7 @@ pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<Doct
     // grants, not the binlog.
     let mut checks = Vec::new();
     let result = match config.source.source_type {
-        SourceType::Postgres => pg_checks(&url, tls, &cdc, &mut checks),
+        SourceType::Postgres => pg_checks(&url, tls, &cdc, config_dir, &mut checks),
         SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir, &mut checks),
         SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir, &mut checks),
         // Change streams: probe the replica-set requirement + declare the capture
@@ -243,9 +243,41 @@ pub(crate) fn pg_foreign_slots_warning(
     })
 }
 
-fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorCheck {
+/// `resume_ckpt`: a checkpoint file exists AND carries a position — the SAME
+/// decision the run makes (`cdc_job.rs`, `Position::load(p)?.is_some()`), not a
+/// second copy of it.
+///
+/// Without it this arm reported a PASSING "slot absent — created on the first
+/// run" for a slot that had been dropped or invalidated under an existing
+/// checkpoint, and the very next `rivet run` hard-refused
+/// (`source/postgres/cdc.rs`). `doctor && run` — the order `init` itself prints —
+/// gave a green light and then a wall. Postgres was the one engine missing this:
+/// MySQL, SQL Server and Mongo each load the checkpoint through `Position::load`
+/// in this file, and the MSSQL arm's comment records the same defect MEASURED
+/// there. The message below is the run's own, verbatim, so the operator is told
+/// the same thing twice rather than two different things.
+fn pg_slot_verdict(
+    export: &str,
+    slot: &str,
+    state: Option<PgSlot>,
+    resume_ckpt: bool,
+) -> DoctorCheck {
     let name = format!("CDC slot '{slot}' (export '{export}')");
     match state {
+        None if resume_ckpt => check(
+            name,
+            false,
+            Some(
+                "slot is missing but a resume checkpoint exists — the slot was dropped or \
+                 invalidated, and the changes since then are no longer in the log. Recover in \
+                 rivet's OWN order: delete the checkpoint file so the next run pins a fresh slot \
+                 at the current WAL position, THEN re-snapshot the table (mode: full). \
+                 Snapshotting first leaves everything changed between the snapshot and the new \
+                 slot in neither."
+                    .into(),
+            ),
+            None,
+        ),
         None => check(
             name,
             true,
@@ -319,6 +351,7 @@ fn pg_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
+    config_dir: &std::path::Path,
     checks: &mut Vec<DoctorCheck>,
 ) -> Result<()> {
     let mut client = crate::source::postgres::connect_client(url, tls)?;
@@ -338,7 +371,16 @@ fn pg_checks(
             active: r.get(0),
             retained_bytes: r.get(1),
         });
-        checks.push(pg_slot_verdict(&e.name, &slot, state));
+        // The run's own resume decision, read the same way it reads it — the three
+        // sibling engines in this file already do exactly this.
+        let resume_ckpt = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
+            None => false,
+            Some(raw) => {
+                let p = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+                crate::source::cdc::Position::load(p)?.is_some()
+            }
+        };
+        checks.push(pg_slot_verdict(&e.name, &slot, state, resume_ckpt));
         ours.push(slot);
     }
     let rows = client.query(
@@ -890,10 +932,41 @@ mod tests {
     // ── PostgreSQL verdicts ──
 
     #[test]
-    fn pg_absent_slot_is_healthy_created_on_first_run() {
-        let c = pg_slot_verdict("orders", "rivet_orders", None);
+    fn pg_absent_slot_with_no_checkpoint_is_healthy_created_on_first_run() {
+        let c = pg_slot_verdict("orders", "rivet_orders", None, false);
         assert!(c.ok);
         assert!(c.detail.unwrap().contains("first run"));
+    }
+
+    /// The case the old signature could not express, and the reason it was added:
+    /// an absent slot is a healthy FIRST RUN only when no checkpoint claims a
+    /// position. With one, the slot was dropped or invalidated and the run
+    /// hard-refuses — so `doctor && run` must not green-light it.
+    ///
+    /// Postgres was the one engine missing this; MySQL, SQL Server and Mongo each
+    /// load the checkpoint through `Position::load` in this file, and the MSSQL
+    /// arm's comment records the same defect MEASURED there.
+    ///
+    /// Both directions, because either alone passes a broken build: the
+    /// checkpoint case must FAIL, and the true first run must stay healthy.
+    /// RED against dropping the `resume_ckpt` arm.
+    #[test]
+    fn pg_absent_slot_with_a_resume_checkpoint_fails_and_names_the_recovery_order() {
+        let c = pg_slot_verdict("orders", "rivet_orders", None, true);
+        assert!(
+            !c.ok,
+            "a dropped slot under an existing checkpoint is not a first run: {c:?}"
+        );
+        let detail = c.detail.expect("the verdict must say why");
+        assert!(
+            detail.contains("resume checkpoint exists"),
+            "it must name the state, not just fail: {detail}"
+        );
+        assert!(
+            detail.contains("delete the checkpoint file") && detail.contains("THEN re-snapshot"),
+            "…and the run's OWN recovery order, or preflight and run tell the operator two \
+             different things: {detail}"
+        );
     }
 
     #[test]
@@ -905,6 +978,7 @@ mod tests {
                 active: false,
                 retained_bytes: 10 << 20,
             }),
+            false,
         );
         assert!(ok.ok, "10 MiB retained is healthy");
 
@@ -915,6 +989,7 @@ mod tests {
                 active: false,
                 retained_bytes: 2 << 30,
             }),
+            false,
         );
         assert!(!bad.ok, "2 GiB retained fails");
         assert!(bad.hint.unwrap().contains("pg_drop_replication_slot"));
