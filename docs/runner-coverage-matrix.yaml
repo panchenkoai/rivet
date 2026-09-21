@@ -458,3 +458,19 @@ scenarios:
     chunked_checkpoint: { na: "shared seam (run_export_job wrapper)" }
     keyset:         { na: "shared seam (run_export_job wrapper)" }
     mongo_parallel: { na: "shared seam (run_export_job wrapper); the Mongo capture itself is proven by run_records_the_load_spec_of_a_mongo_collection" }
+
+  - id: cdc_backfill_leg
+    what: "the CDC baseline leg under `cdc.backfill:` BORROWS its recipe's read (mode, key, workers, page size, resume, tuning, column types narrowed by the table label) and keeps its own identity and prefix — built once in `apply_backfill_recipe` and dispatched through the ordinary `run_export_job`, so WHICH runner runs is the recipe's mode, and no runner re-applies anything the leg could bypass. The cells name the recipe mode each is proven with."
+    single:         { test: full_cdc_cycle_mysql }
+    chunked:        { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
+    chunked_checkpoint: { test: a_crashed_chunked_baseline_finishes_on_the_next_plain_run }
+    keyset:         { test: a_crashed_keyset_baseline_finishes_on_the_next_plain_run }
+    mongo_parallel: { na: "the leg is the recipe dispatched as a batch export (shared seam); a Mongo recipe is proven live with a full-scan recipe (full_cdc_cycle_mongo), a parallel-Mongo recipe borrows the same fields (backfill_leg_borrows_the_recipe_read_and_keeps_its_own_identity)" }
+
+  - id: partition_budget_footer_note
+    what: "the writer keeps every part inside the load job's partition cap (`PartBudget`, 4,000 distinct buckets of the `load.partition` column) and records the count it measured in the Parquet footer (`rivet.partition_buckets`), which the loader takes as the bound instead of the footer's min/max span. The budget itself is shared-seam (one `ExportSink`, one `on_batch_inner`); the NOTE is not — it is written when the writer CLOSES, and every runner closes its LAST part itself (`ExportSink::finish_writer`, formerly a bare `writer.take()` + `finish()` that shipped the final part of every export, and every keyset page, unnoted — bughunt round 4). The sink unit test proves the method; a per-runner proof reads the footers of the parts each runner actually shipped, which no test does yet."
+    single:         { gap: "no test reads the footer of a single-runner export's last part" }
+    chunked:        { gap: "no test reads the footer of a chunk's tail part" }
+    chunked_checkpoint: { gap: "as chunked" }
+    keyset:         { gap: "a keyset page is one part closed by the runner — the only path the note took before round 4 never ran here" }
+    mongo_parallel: { gap: "as keyset" }

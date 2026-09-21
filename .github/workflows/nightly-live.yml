@@ -171,6 +171,18 @@ jobs:
       - name: Disk snapshot — post-build
         run: df -h /
 
+      - name: Independent row-hash oracle deps
+        # `xxhash` is what makes the row-hash check INDEPENDENT: it rebuilds the
+        # canonical image from the spec in src/enrich.rs and hashes it with a
+        # different library, so rivet is never compared against itself. Without
+        # the package `live_batch_census` ASSERTS rather than falling back (the
+        # self-oracle its helper refuses) — and that assert has failed this job
+        # every night since 2026-08-30: nextest cancels on first failure, so the
+        # run stopped at test 149 of 837 and 688 live tests went unexecuted for
+        # 22 consecutive nights while the workflow still "ran". ci.yml has had
+        # this exact step since the same breakage hit it there.
+        run: python3 -m pip install --break-system-packages xxhash
+
       - name: Run FULL live suite (skip 1M-row stress + the type-validator job's tests)
         # Everything #[ignore]d — light suite (also covered by per-PR e2e,
         # which is cheap insurance against docker-compose regressions like

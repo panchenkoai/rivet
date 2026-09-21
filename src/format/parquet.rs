@@ -117,6 +117,14 @@ impl super::FormatWriter for ParquetFormatWriter {
         Ok(())
     }
 
+    fn note(&mut self, key: &str, value: &str) {
+        self.inner
+            .append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                key.to_string(),
+                value.to_string(),
+            ));
+    }
+
     fn bytes_written(&self) -> u64 {
         self.inner.bytes_written() as u64
     }
@@ -206,6 +214,37 @@ mod tests {
             .unwrap();
         writer.write_batch(&one_batch(&schema)).unwrap();
         writer.finish().unwrap(); // finalizes the parquet file footer
+    }
+
+    /// A note lands in the file footer's key/value metadata, where a loader reads it
+    /// back — the sink records the partitions a part holds this way.
+    #[test]
+    fn a_note_is_written_into_the_footer() {
+        use parquet::file::reader::FileReader as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noted.parquet");
+        let schema = int64_schema();
+        let fmt = ParquetFormat::new(CompressionType::None, None, None);
+        let mut writer = fmt
+            .create_writer(&schema, Box::new(std::fs::File::create(&path).unwrap()))
+            .unwrap();
+        writer.write_batch(&one_batch(&schema)).unwrap();
+        writer.note("rivet.partition_buckets", "d|day|3");
+        writer.finish().unwrap();
+
+        let reader =
+            parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&path).unwrap())
+                .unwrap();
+        let kv = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        let note = kv
+            .iter()
+            .find(|kv| kv.key == "rivet.partition_buckets")
+            .and_then(|kv| kv.value.clone());
+        assert_eq!(note.as_deref(), Some("d|day|3"));
     }
 
     #[test]

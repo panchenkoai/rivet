@@ -50,10 +50,14 @@ from . import (
     cdc,
     concurrency,
     gifs,
+    init_delta,
+    partner_shape,
     regression,
     release_path,
     scenarios,
+    shared_state,
     state_parity,
+    warehouse_layout,
 )
 
 
@@ -209,6 +213,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="release-oracle", add_help=True)
     ap.add_argument("--engines", default="", help="comma-separated subset, e.g. postgres,mysql")
     ap.add_argument(
+        "--versions",
+        default=os.environ.get("RIVET_ORACLE_VERSIONS", ""),
+        help="narrow THIS RUN to the named versions, as `engine=tag,tag` joined by "
+        "`;` (e.g. postgres=14,16,18). Engines not named run their whole grid. "
+        "This is deliberately a RUN filter, not a matrix edit: deleting versions "
+        "from matrix.yaml forces them into `gaps` in docs/release-gate-matrix.yaml, "
+        "whose guard asserts EQUALITY against a shrink-only ratchet — so the edit "
+        "would trade wall-clock for a false coverage claim. A tag the matrix does "
+        "not list FAILS that engine loudly; running zero versions green is the one "
+        "outcome this must never produce.",
+    )
+    ap.add_argument(
+        "--version-parallel", type=int, default=1,
+        help="how many VERSIONS of one engine family to run concurrently "
+        "(default 1 = the serial behaviour). The family's versions are the "
+        "matrix's critical path — postgres alone is 22.5 of the 23.2-minute "
+        "matrix wall, seven versions back to back. Each version owns its own "
+        "container name and port, so the ceiling is MEMORY, not collisions: "
+        "measured 2026-09-20, the Docker VM caps at 39.2 GiB with ~10.5 GiB "
+        "free, while every family at full version parallelism wants ~25 GiB. "
+        "Raise it per run, deliberately; the global --cell-parallel cap still "
+        "bounds what the extra containers can actually do at once.",
+    )
+    ap.add_argument(
         "--latest-only",
         action="store_true",
         default=env_flag("RIVET_ORACLE_LATEST_ONLY"),
@@ -358,6 +386,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
+    partner_shape.verify_partner_shape(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
@@ -393,6 +422,14 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
             "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
         ),
     )
+    # Four SAME-NAMED configs on one shared Postgres state, at once — the
+    # deployment shape the shared-state docs recommend; blessed and crashed.
+    shared_state.verify_shared_state_same_name(led)
+    # The partner's warehouse layout: base + buffer + `compact`, and loads batched
+    # under BigQuery's per-job partition cap.
+    warehouse_layout.verify_warehouse_layout(led)
+    # The same cycle on configs `rivet init` wrote: run 1 everything, run 2 the delta.
+    init_delta.verify_init_delta(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
@@ -425,22 +462,59 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # run, so there is nothing in them worth keeping past teardown.
     docker("rm", "-fv", name)
 
+    # Every engine ran with NO memory limit, and each then sized itself off the
+    # WHOLE Docker VM rather than off what a 150k-row fixture needs. Measured on
+    # this stand: SQL Server held 4,226 MiB with `max server memory` unbounded
+    # (SQLOS target 9,954 MiB and climbing), and MongoDB's WiredTiger ceiling came
+    # out at 19,544 MiB — exactly its documented default of 50% of (RAM − 1 GiB),
+    # so the engine was obeying its own rule applied to a 39 GiB VM. PostgreSQL is
+    # the counter-case and the reason this is about POLICY, not weight: 7 MiB of
+    # its own plus reclaimable page cache, because `shared_buffers` is a fixed
+    # 128 MB and does not scale with RAM.
+    #
+    # So the ceiling goes on the CONTAINER (kernel-enforced) and, where the engine
+    # has its own knob, on the engine too — below the container limit, which is
+    # Microsoft's own guidance, so the OS keeps headroom. 2 GB is the documented
+    # minimum to START SQL Server on Linux.
+    #
+    # Tightened 2026-09-20 against what the engines ACTUALLY take under this
+    # gate's 150k-row fixture, measured live during the matrix and cross-checked
+    # against the long-lived stand containers (two independent samples each):
+    #
+    #   postgres  145-176 MiB (gate) / 146 MiB (stand)  -> 512m, ~3x headroom
+    #   mongo     174-189 MiB (gate) / 225 MiB (stand)  -> 1g,   ~4x, and above
+    #                                                      the 0.5 GiB cache pin
+    #   mssql     1.67 GiB   (gate) / 2.91 GiB uncapped -> 3g/2048, still over
+    #                                                      the documented floor
+    #   mysql     509 MiB (8.0) / 644 MiB (8.4), measured in the 2026-09-21
+    #             matrix — the "real number" the previous note said 2g was
+    #             waiting for. 1g keeps ~1.5x over the larger sample, the same
+    #             multiple the other three carry.
+    #
+    # Multiples, not tight fits: those samples are moments during the matrix, not
+    # proven peaks, and a cap that OOM-kills a container mid-run surfaces as a
+    # product failure rather than as a resource decision.
     args: list[str] = ["run", "-d", "--name", name]
+    cmd: list[str] = []
     if engine == "postgres":
-        args += ["-e", "POSTGRES_USER=rivet", "-e", "POSTGRES_PASSWORD=rivet",
+        args += ["--memory", "512m",
+                 "-e", "POSTGRES_USER=rivet", "-e", "POSTGRES_PASSWORD=rivet",
                  "-e", "POSTGRES_DB=rivet", "-p", f"{port}:5432"]
     elif engine == "mysql":
-        args += ["-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
+        args += ["--memory", "2g",
+                 "-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
                  "-e", "MYSQL_USER=rivet", "-e", "MYSQL_PASSWORD=rivet", "-p", f"{port}:3306"]
     elif engine == "mssql":
-        args += ["-e", "ACCEPT_EULA=Y", "-e", "MSSQL_SA_PASSWORD=Rivet_Passw0rd!", "-p", f"{port}:1433"]
+        args += ["--memory", "3g", "-e", "MSSQL_MEMORY_LIMIT_MB=2048",
+                 "-e", "ACCEPT_EULA=Y", "-e", "MSSQL_SA_PASSWORD=Rivet_Passw0rd!", "-p", f"{port}:1433"]
     elif engine == "mongo":
-        args += ["-p", f"{port}:27017"]
+        args += ["--memory", "1g", "-p", f"{port}:27017"]
+        cmd = ["--wiredTigerCacheSizeGB", "0.5"]
     else:
         led.skipped(engine, tag, "all", "-", f"{engine}:{tag} unknown engine kind")
         return None
 
-    if not docker(*args, image).ok:
+    if not docker(*args, image, *cmd).ok:
         led.skip(f"{engine}:{tag} could not start ({image})")
         return None
 
@@ -583,6 +657,15 @@ def sqlcmd_path(container: str) -> str:
     )
 
 
+def _wanted_versions(spec: str, engine: str) -> set[str] | None:
+    """Tags this run wants for `engine`, or None when the whole grid runs."""
+    for part in (p.strip() for p in spec.split(";") if p.strip()):
+        name, _, tags = part.partition("=")
+        if name.strip() == engine:
+            return {t.strip() for t in tags.split(",") if t.strip()} or None
+    return None
+
+
 def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
     """One engine's whole leg: every gridded version brought up, seeded, and run
     through the scenarios, then torn down. Takes `led` so a parallel caller can
@@ -590,6 +673,24 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
     version_lines = [
         l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
     ]
+    # --versions: narrow this RUN, never the declared grid (see the flag's help).
+    want = _wanted_versions(getattr(ns, "versions", ""), engine)
+    if want is not None:
+        have = {l.split()[0] for l in version_lines}
+        missing = sorted(want - have)
+        if missing:
+            # Loud, not a SKIP: a typo'd tag that silently ran nothing would be a
+            # green leg over zero versions — the exact vacuous pass this gate exists
+            # to refuse.
+            led.failed(engine, "-", "versions", "-",
+                       f"--versions named {', '.join(missing)} for {engine}, which the "
+                       f"matrix does not list (it has: {', '.join(sorted(have))})")
+            return
+        dropped = len(version_lines) - len(want)
+        version_lines = [l for l in version_lines if l.split()[0] in want]
+        if dropped:
+            led.add(engine, "-", "other-versions", "-", Status.SKIP,
+                    f"--versions: {dropped} other {engine} version(s) not run this pass")
     # --latest-only: keep just the last version of the family (the newest,
     # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
     # proportion to the version count (postgres 4→1, mongo 5→1) while every
@@ -600,37 +701,72 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
         if skipped:
             led.add(engine, "-", "older-versions", "-", Status.SKIP,
                     f"--latest-only: {skipped} older {engine} version(s) not run")
-    for line in version_lines:
-        parts = line.split()
-        tag, image, port = parts[0], parts[1], int(parts[2])
-        led.phase(f"{engine} {tag} ({image})")
-        with led.span(f"{engine}: bring-up"):
-            url = bring_up(led, engine, tag, image, port)
-        if not url:
-            led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
-            continue
-        # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
-        # failure is retried: a fresh container under load can drop the seed
-        # connection mid-stream, and crying wolf on that is worse than a retry.
-        err = ""
-        with led.span(f"{engine}: seed"):
-          for attempt in range(3):
-            err = seed_engine(engine, tag, url)
-            if not err:
-                break
-            # Back off between attempts. Without this the three retries fire
-            # back-to-back and all land inside the SAME startup window, so a
-            # race the retry exists to absorb is retried three times in the
-            # few hundred ms during which it cannot possibly succeed — which
-            # is how a transient became a FAIL.
-            time.sleep(2.0 * (attempt + 1))
-        if err:
-            led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
-            continue
-        led.ok("seeded")
-        scenarios.run_scenarios(led, engine, tag, url)
-        if not ns.keep:
-            docker("rm", "-fv", engine_container(engine, tag))
+    cap = max(1, getattr(ns, "version_parallel", 1))
+    if cap == 1 or len(version_lines) <= 1:
+        for line in version_lines:
+            _run_one_version(led, ns, engine, line)
+        return
+    # Versions of one family in parallel: each owns its own container name
+    # (engine×tag) and its own port from matrix.yaml, so nothing is shared but the
+    # state backend — which the gate races on DELIBERATELY. Output would interleave,
+    # so each version runs into a BUFFERED sub-ledger, flushed in MATRIX order (not
+    # completion order) after the join, exactly as `engine_loop` does for engines.
+    workers = min(cap, len(version_lines))
+    # Say the setting OUT LOUD, the way the engine matrix phase does. Without it
+    # the only way to answer "is --version-parallel actually in force?" mid-run is
+    # to read the driver's argv out of the process table — which cost three failed
+    # attempts through three different broken readers on 2026-09-20. A run must be
+    # able to explain its own concurrency from its own log.
+    led.ok(
+        f"{engine}: {len(version_lines)} versions, up to {workers} concurrent "
+        f"(--version-parallel {cap})"
+    )
+    subs = [led.buffered_child() for _ in version_lines]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(pair: tuple[Ledger, str]) -> None:
+        sub, line = pair
+        with sub.span(f"{engine} {line.split()[0]}: version-total"):
+            _run_one_version(sub, ns, engine, line)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_one, zip(subs, version_lines)))
+    for sub in subs:
+        sub.flush_into(led)
+
+
+def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str) -> None:
+    """One engine×version: brought up, seeded, run through the scenarios, torn down."""
+    parts = line.split()
+    tag, image, port = parts[0], parts[1], int(parts[2])
+    led.phase(f"{engine} {tag} ({image})")
+    with led.span(f"{engine}: bring-up"):
+        url = bring_up(led, engine, tag, image, port)
+    if not url:
+        led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
+        return
+    # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
+    # failure is retried: a fresh container under load can drop the seed
+    # connection mid-stream, and crying wolf on that is worse than a retry.
+    err = ""
+    with led.span(f"{engine}: seed"):
+      for attempt in range(3):
+        err = seed_engine(engine, tag, url)
+        if not err:
+            break
+        # Back off between attempts. Without this the three retries fire
+        # back-to-back and all land inside the SAME startup window, so a
+        # race the retry exists to absorb is retried three times in the
+        # few hundred ms during which it cannot possibly succeed — which
+        # is how a transient became a FAIL.
+        time.sleep(2.0 * (attempt + 1))
+    if err:
+        led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
+        return
+    led.ok("seeded")
+    scenarios.run_scenarios(led, engine, tag, url)
+    if not ns.keep:
+        docker("rm", "-fv", engine_container(engine, tag))
 
 
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:

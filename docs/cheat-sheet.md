@@ -129,8 +129,8 @@ Source prerequisites:
 
 | Engine | Server config |
 |---|---|
-| **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1` |
-| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended) |
+| **PostgreSQL** | `wal_level=logical` (restart), `max_replication_slots>=1`, `max_wal_senders>=1`. For a DELETE to carry more than the primary key, `ALTER TABLE <t> REPLICA IDENTITY FULL` — the default (`d`) sends the key alone, which rivet warns about on every run |
+| **MySQL** | `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, `binlog_row_metadata=FULL` (recommended), binlog retention ≫ the run interval |
 | **SQL Server** | SQL Server Agent running; Enterprise / Standard / Developer (not Express/Web) |
 | **MongoDB** | Replica set required (`?directConnection=true` for a port-mapped single node) |
 
@@ -143,6 +143,15 @@ Grants for the selected engine:
 Rules of thumb:
 
 - MySQL: connect **directly**, not through ProxySQL/MaxScale. Give rivet a unique `server_id`.
+- **MySQL on RDS / Aurora: two settings that are not in `my.cnf`.** Binary logging
+  follows automated backups — with retention at 0 the instance runs `log_bin = 0`
+  and every binlog query answers `ERROR 1381`, whatever the parameter group says.
+  And retention is *not* `binlog_expire_logs_seconds`: RDS purges a binlog as soon
+  as the engine no longer needs it, so the next run's resume dies with `ERROR 1236`
+  (measured: a checkpoint taken at 13:42 was already past retention at 13:59).
+  Set it explicitly, well above the run interval:
+  `CALL mysql.rds_set_configuration('binlog retention hours', 72);`
+  A read replica also needs `log_replica_updates = 1`.
 - PostgreSQL: an abandoned slot pins WAL and fills the disk. Drop it with
   `SELECT pg_drop_replication_slot('{{SLOT}}');`. Set `max_slot_wal_keep_size` to cap it.
 - SQL Server: change-table retention defaults to about 3 days. A run that falls
@@ -164,7 +173,7 @@ exports:
     format: parquet
     cdc:
       initial: snapshot            # first run: anchor → full snapshot → drain stream
-      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for MySQL/MSSQL with initial: snapshot
+      checkpoint: {{CKPT_DIR}}/{{NAME}}.ckpt   # required for a baseline (initial:/backfill:) on every engine but PostgreSQL; MySQL/MongoDB need it for any mode: cdc
       until_current: true          # default: drain to the log end as of open, then exit
       {{CDC_PARAM}}
       # rollover: 100000           # rows per part (≈ drain memory)
@@ -173,6 +182,39 @@ exports:
 
 > With several `mode: cdc` exports, each one needs its own `slot`, `server_id`
 > and `checkpoint`. The defaults collide, and config validation rejects them.
+
+### 1.3 One config for the whole cycle: extract → load → compact
+
+Add the warehouse flags to either scaffold above and `rivet init` writes **one file
+that drives everything** — the exports, the top-level `load:` block, and the
+base-and-buffer layout `rivet compact` needs. Nothing is hand-added afterwards.
+
+```bash
+rivet init --source-env DATABASE_URL --table {{TABLE}} --mode incremental --tls {{TLS}} \
+  --gcs-bucket {{BUCKET}} --bigquery-project {{BQ_PROJECT}} --bigquery-dataset {{BQ_DATASET}} -o rivet.yaml
+rivet init --source-env DATABASE_URL --mode cdc --tls {{TLS}} \
+  --gcs-bucket {{BUCKET}} --bigquery-project {{BQ_PROJECT}} --bigquery-dataset {{BQ_DATASET}} -o rivet.yaml
+                                               # whole DB: one `tables:` stream with backfill: auto
+
+rivet doctor  -c rivet.yaml    # source + destination auth
+rivet run     -c rivet.yaml    # Parquet → gs://{{BUCKET}}/exports/{{TABLE}}/
+rivet load    -c rivet.yaml    # → the base on the first pass, the buffer on later ones
+rivet compact -c rivet.yaml    # MERGE the buffer into the base, drop the buffer
+```
+
+Every value in the generated `load:` block is a guess from the catalog — review it
+before the first load. It carries `target: bigquery`, `pk: auto`, `cluster_by: auto`,
+`cleanup_source: true`; a per-table `partition:` on the **creation** stamp at
+`granularity: day` (never a mutation stamp, which would move a row between partitions
+on every update); and, for a mode that carries deltas (`incremental`, `cdc`),
+`layout: base_buffer` so `compact` has a base to merge into. Field-by-field reference:
+§3 below.
+
+> `--gcs-bucket` is required with the BigQuery flags: `rivet load` reads GCS only, so a
+> `load:` block over a local or S3 destination is a config its own next step refuses.
+> On a whole-database CDC scaffold the partition guesses land on the stream's
+> `load.tables.<table>` blocks — the place the load reads them — not on the per-table
+> recipes, which the load never reads.
 
 ---
 
@@ -194,9 +236,19 @@ rivet run -c rivet.yaml --resume                # continue a crashed chunked run
 rivet plan  -c rivet.yaml                       # read-only schedule
 rivet plan  -c rivet.yaml --annotate-waves      # write wave:/parallel_safe: into the config
 rivet apply rivet.yaml                          # wave by wave
-rivet apply rivet.yaml --resume                 # skip exports with _SUCCESS, resume the rest
-rivet apply rivet.yaml --pool 4 --split         # work-stealing pool; split one dominant table
-rivet plan  -c rivet.yaml -e {{NAME}} -o plan.json && rivet apply plan.json   # sealed replay
+rivet apply rivet.yaml --resume                 # skip exports with _SUCCESS, resume the rest.
+                                                #   WITHOUT it a re-run appends fresh parts beside the old
+                                                #   ones and rewrites manifest.json for this run only — a
+                                                #   glob reader then double-counts. Clear the prefix first.
+rivet apply rivet.yaml --pool 4 --split         # work-stealing pool; split one dominant table.
+                                                #   A GENERATED config carries no `parallel_safe:`, so every
+                                                #   export counts as heavy and `--pool` alone overlaps
+                                                #   NOTHING — run `--annotate-waves` first. `--split` needs a
+                                                #   dominant full/chunked/keyset export with a chunk key
+                                                #   (never incremental/cdc). Measured on one 1.26M-row set:
+                                                #   66s waves · 74s bare --pool · 57s annotated · 42s +split
+rivet plan  -c rivet.yaml -e {{NAME}} --format json -o plan.json && rivet apply plan.json   # sealed replay
+                                                # `-o` REQUIRES `--format json` (pretty mode ignores it)
 ```
 
 Mode snippets:
@@ -284,8 +336,8 @@ Recovery:
 | Symptom | Action |
 |---|---|
 | Run failed | Re-run. The checkpoint did not advance, so the data is re-read, not lost |
-| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-snapshot (`initial: snapshot` or `mode: full`), then start from a fresh checkpoint |
-| MySQL checkpoint used against another server | Refused on purpose. Re-snapshot on the new host |
+| PG slot invalidated/dropped, MySQL binlog purged (ERROR 1236), MSSQL below retention | Re-baseline in ONE run (the run anchors first, then re-reads the baseline): delete the checkpoint (MySQL/MSSQL/Mongo) or let the slot be recreated (PG), AND clear the export's `cdc_snapshot` row + `snapshot/_SUCCESS`, AND truncate `<table>__changes` before the next load. Deleting the checkpoint alone is refused (prior-run evidence exists) |
+| MySQL checkpoint used against another server | Refused on purpose. Same order on the new host: fresh checkpoint first, then re-snapshot |
 
 ---
 
@@ -309,10 +361,16 @@ load:
   cleanup_source: true          # delete staged Parquet after the count gate passes
   gc_orphans: false             # also delete unmanifested crash leftovers
   allow_source_drift: false     # load even if the manifest's source count ≠ extracted
+  layout: base_buffer           # log_view (default for incremental / capture-only CDC) | base_buffer
+                                #   base_buffer: `<table>` is a PHYSICAL table, `<table>__changes` a
+                                #   per-cycle buffer that `rivet compact` MERGEs in and drops. BigQuery only.
+                                #   Absent: a CDC stream with `backfill:` gets base_buffer, the rest log_view.
+  deleted_flag: true            # whether the base carries `__is_deleted`; absent: true for cdc, false otherwise
 exports:
   - name: {{NAME}}
     # ...
-    load: { pk: [{{PK}}], partition: none }   # per-export override (every field except target)
+    load: { pk: [{{PK}}], partition: none }   # per-export override: pk, cluster_by, partition, cleanup_source, gc_orphans, allow_source_drift, layout, deleted_flag
+    # a multiplex `tables:` stream adds `tables: { <table>: { pk: [...], partition: none } }` — one block per captured table
 ```
 
 Required target fields: BigQuery takes `project` and `dataset`. Snowflake takes
@@ -324,6 +382,7 @@ rivet run  -c rivet.yaml              # extract → bucket
 rivet load -c rivet.yaml              # load → warehouse
 rivet load -c rivet.yaml --run-id "nightly-$(date +%F)"   # tag jobs (BQ label / Snowflake QUERY_TAG)
 rivet load -c rivet.yaml --rebuild-changelog               # allow a billed rebuild when partitioning changed
+rivet compact -c rivet.yaml           # base_buffer only: MERGE `<table>__changes` into `<table>`, drop the buffer
 rivet state loads -c rivet.yaml -t {{WAREHOUSE_TABLE}}
 ```
 
@@ -332,7 +391,7 @@ What the load does for each export `mode:`:
 | mode | warehouse result |
 |---|---|
 | `full` | `OVERWRITE` the table with the latest snapshot. Re-running is idempotent |
-| `incremental` | append to `<table>__changes`, plus a current-state view deduped on `pk` |
+| `incremental` | `log_view` (default): append to `<table>__changes`, plus a current-state view deduped on `pk`. `layout: base_buffer`: the first pass lands `<table>` as a physical base, every later delta lands in the buffer `<table>__changes`, and `rivet compact` merges it in (latest per `pk`) and drops the buffer — the cycle is `run → load → compact`. **DELETES ARE NOT CAPTURED**: a cursor read only sees rows whose cursor advanced, and a deleted row has none, so the warehouse keeps it forever (`deleted_flag` is off for non-CDC, so there is no `__is_deleted` to set). Use `mode: cdc` if deletions must reach the warehouse |
 | `cdc` | append to `<table>__changes`, plus a view keeping the latest `(__pos, __seq)` per PK with `__is_deleted` (soft delete: live rows are `WHERE NOT __is_deleted`) |
 | `cdc` with `tables:` | one `__changes` table and one view per source table |
 
@@ -407,6 +466,10 @@ python dev/correctness/verify_export.py \
 
 > A prefix with orphaned pre-crash parts reads *high*. Verify only the parts
 > named in `manifest.json`.
+>
+> Run this BEFORE `rivet load`, or set `cleanup_source: false`: the generated
+> `load:` block sets `cleanup_source: true`, so a successful load deletes the
+> staged Parquet and leaves this oracle nothing to read.
 
 CDC replay check in DuckDB (latest image per key; the LSN parsing is PostgreSQL's):
 
@@ -433,8 +496,13 @@ FROM `region-us`.INFORMATION_SCHEMA.JOBS
 WHERE EXISTS (SELECT 1 FROM UNNEST(labels) WHERE key='managed_by' AND value='rivet')
 GROUP BY op, tbl ORDER BY bytes_billed DESC;
 
--- current state of an incremental / cdc load vs the source
+-- current state of a CDC load vs the source (cdc only: `__is_deleted` exists
+-- when `deleted_flag` is on, which is the default for cdc and OFF otherwise —
+-- on an `incremental` base this query fails with "Unrecognized name")
 SELECT COUNT(*) FROM {{WAREHOUSE_SQL}} WHERE NOT __is_deleted;
+
+-- an incremental / full base has no delete flag: count it plainly
+SELECT COUNT(*) FROM {{WAREHOUSE_SQL}};
 ```
 
 ### 4.6 Inspection
@@ -442,6 +510,10 @@ SELECT COUNT(*) FROM {{WAREHOUSE_SQL}} WHERE NOT __is_deleted;
 ```bash
 rivet state files -c rivet.yaml -e {{NAME}} --json   # files actually written
 rivet metrics     -c rivet.yaml -e {{NAME}} --json   # rows / files / bytes / status per run
+                                                     #   NOTE: neither reaches `--split` sub-units — their
+                                                     #   run ids are `<export>#0…#N` and `-e` only accepts a
+                                                     #   config export name. Use `rivet state runs`, which
+                                                     #   does list them.
 rivet journal     -c rivet.yaml -e {{NAME}} --run-id <id>
 ```
 

@@ -288,3 +288,101 @@ fn init_cloud_destination_flags_scaffold_and_exclude_each_other() {
          credentials path with no bucket scaffolds a destination that cannot resolve"
     );
 }
+
+/// `rivet init --bigquery-project/--bigquery-dataset` — the pair that decides whether the
+/// generated config carries a `load:` block at all.
+///
+/// Without them init scaffolds an extract and nothing else; with them the same command
+/// produces the whole cycle `rivet load` and `rivet compact` run from, including the
+/// per-table partition guess. That guess is load-bearing: a part written past a load job's
+/// partition budget cannot be loaded at any granularity, so the block these two flags emit
+/// is what the writer's budget is measured against.
+///
+/// The two carry `requires` on each other, and a dropped `requires` fails SILENTLY in the
+/// worst direction — a `load:` block naming a project with no dataset (or the reverse)
+/// scaffolds a target that cannot resolve, discovered only when a load is attempted
+/// against durable artifacts.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn init_bigquery_flags_scaffold_the_load_block_and_require_each_other() {
+    require_alive(LiveService::Postgres);
+    let _table = seed_pg_numeric_table(5);
+
+    let init = |extra: &[&str]| -> std::process::Output {
+        let mut args = vec!["init", "--source", POSTGRES_URL];
+        args.extend_from_slice(extra);
+        std::process::Command::new(RIVET_BIN)
+            .args(&args)
+            .output()
+            .expect("spawn rivet init")
+    };
+
+    // The pair: the scaffold must name the warehouse AND carry both halves it was given.
+    // Asserting only "bigquery" would pass on a block that dropped the dataset and points
+    // the load at nothing.
+    // `--gcs-bucket` rides along: the load reads GCS only, so a `load:` block over a
+    // local destination is a config `rivet load` refuses — init refuses first.
+    let both = init(&[
+        "--bigquery-project",
+        "qa-scaffold-project",
+        "--bigquery-dataset",
+        "qa_scaffold_dataset",
+        "--gcs-bucket",
+        "qa-scaffold-bucket",
+    ]);
+    assert!(
+        both.status.success(),
+        "init --bigquery-project/--bigquery-dataset --gcs-bucket must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&both.stdout);
+    assert!(
+        yaml.contains("target: bigquery"),
+        "the scaffold must declare the warehouse target; got:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("qa-scaffold-project") && yaml.contains("qa_scaffold_dataset"),
+        "both halves must reach the scaffold — a dropped one leaves a load target that \
+         cannot resolve; got:\n{yaml}"
+    );
+
+    // The same command WITHOUT them scaffolds an extract only. This is the half that keeps
+    // the assertion above honest: without it the test would pass on a scaffold that emits
+    // the load block unconditionally, which is a different product.
+    let neither = init(&[]);
+    assert!(
+        neither.status.success(),
+        "init with no warehouse flags must still exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&neither.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&neither.stdout).contains("target: bigquery"),
+        "a config scaffolded with no warehouse flags must carry no load target"
+    );
+
+    // The constraints, both `assert!(!success)`: what they guard is a half-populated
+    // block, not an error message.
+    let project_alone = init(&["--bigquery-project", "qa-scaffold-project"]);
+    assert!(
+        !project_alone.status.success(),
+        "--bigquery-project without --bigquery-dataset must be REFUSED (clap `requires`) — \
+         a project with no dataset names no table the load could create"
+    );
+    let dataset_alone = init(&["--bigquery-dataset", "qa_scaffold_dataset"]);
+    assert!(
+        !dataset_alone.status.success(),
+        "--bigquery-dataset without --bigquery-project must be REFUSED (clap `requires`) — \
+         a dataset with no project is not a resolvable target"
+    );
+    let no_bucket = init(&[
+        "--bigquery-project",
+        "qa-scaffold-project",
+        "--bigquery-dataset",
+        "qa_scaffold_dataset",
+    ]);
+    assert!(
+        !no_bucket.status.success(),
+        "--bigquery-* without --gcs-bucket must be REFUSED — the scaffold would pair a \
+         `load:` block with a local destination, which `rivet load` refuses"
+    );
+}

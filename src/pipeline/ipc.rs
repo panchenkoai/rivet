@@ -48,6 +48,16 @@ pub(crate) fn clear_in_process_tx() {
     *IN_PROCESS_TX.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
+/// Hand a formatted `log` line to the in-process renderer while one owns the
+/// screen; `false` when none is installed (or it has already gone), and the
+/// caller writes the line to stderr itself.
+pub(crate) fn route_log_line(line: String) -> bool {
+    let guard = IN_PROCESS_TX.lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .as_ref()
+        .is_some_and(|tx| tx.send(UiMessage::Log(line)).is_ok())
+}
+
 pub(crate) fn in_process_events_enabled() -> bool {
     IN_PROCESS_TX
         .lock()

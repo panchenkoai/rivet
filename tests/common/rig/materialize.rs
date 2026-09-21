@@ -166,6 +166,19 @@ impl Rig {
         self.rerender_all_materializations()
     }
 
+    /// Replace the first TOP-level line starting with `prefix` (a `load:` section, say)
+    /// over the same config path — for a second stage that changes what the warehouse
+    /// side declares about an export already written. Panics if no line matches.
+    pub fn replace_top_line(&mut self, prefix: &str, new_line: &str) -> PathBuf {
+        let slot = self
+            .top_lines
+            .iter_mut()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("replace_top_line: no top line starts with {prefix:?}"));
+        *slot = new_line.to_string();
+        self.rerender_all_materializations()
+    }
+
     pub fn checkpoint(&self) -> PathBuf {
         self.ckpt_override
             .clone()

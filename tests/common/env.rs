@@ -150,17 +150,31 @@ pub fn live_shared_tmp_host() -> std::path::PathBuf {
     // never again silently. A worktree's `.git` is a FILE ("gitdir: …"), a real
     // checkout's is a DIR — that is the cheap, reliable tell.
     let git = root.join(".git");
-    if git.is_file() && std::env::var_os("RIVET_ALLOW_WORKTREE_LIVE").is_none() {
+    let dir = root.join("tests").join(".live-tmp");
+    // A SYMLINKED `tests/.live-tmp` IS the reconciliation this guard exists to
+    // demand, so accept it instead of refusing: it resolves to the checkout
+    // `docker compose up` was started from, i.e. the very directory the
+    // containers bind-mount at /work (verified 2026-09-21 by comparing
+    // st_dev/st_ino against `docker inspect rivet-duckdb`). The guard only ever
+    // asked "is this a worktree?", never "do the paths actually diverge?" —
+    // measured cost of that gap: NINE gate cells lost per run (network faults,
+    // mongo SCRAM, and every pool / pool-split cell), each panicking here, while
+    // CI never sees it because CI is a plain checkout that `mkdir -p`s the dir.
+    let reconciled = std::fs::symlink_metadata(&dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if git.is_file() && !reconciled && std::env::var_os("RIVET_ALLOW_WORKTREE_LIVE").is_none() {
         panic!(
             "live tests are running from a git WORKTREE ({}), but the duckdb/clickhouse \
              containers bind-mount tests/.live-tmp of the checkout `docker compose up` was \
              started from — the paths diverge and the oracle reads the wrong directory. \
              Run live tests from the main checkout (where you started the stand); or, if you \
-             genuinely started the stand from THIS worktree, set RIVET_ALLOW_WORKTREE_LIVE=1.",
+             genuinely started the stand from THIS worktree, set RIVET_ALLOW_WORKTREE_LIVE=1; \
+             or symlink tests/.live-tmp at the stand checkout's own tests/.live-tmp, which \
+             makes the two paths the SAME directory and is accepted without the env var.",
             root.display()
         );
     }
-    let dir = root.join("tests").join(".live-tmp");
     std::fs::create_dir_all(&dir).expect("create tests/.live-tmp");
     dir
 }

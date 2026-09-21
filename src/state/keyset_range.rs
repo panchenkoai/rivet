@@ -43,6 +43,7 @@ impl StateStore {
         &self,
         export_name: &str,
         run_id: &str,
+        key_column: &str,
         ranges: &[(Option<String>, Option<String>)],
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -53,8 +54,8 @@ impl StateStore {
         for (idx, (lo, hi)) in ranges.iter().enumerate() {
             self.execute(
                 "INSERT INTO keyset_range \
-                 (export_name, run_id, range_index, lo, hi, done, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                 (export_name, run_id, range_index, lo, hi, done, updated_at, key_column) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
                 &[
                     export_name.into(),
                     run_id.into(),
@@ -62,6 +63,7 @@ impl StateStore {
                     lo.clone().into(),
                     hi.clone().into(),
                     now.as_str().into(),
+                    key_column.into(),
                 ],
             )?;
         }
@@ -69,22 +71,29 @@ impl StateStore {
     }
 
     /// Load the persisted ranges for a resuming run, ordered by `range_index`.
-    /// Filtered by `run_id` so a stale set from a superseded run is ignored.
+    /// Filtered by `run_id` so a stale set from a superseded run is ignored, and by
+    /// `key_column`: ranges sampled on another key bound nothing on this one, so a
+    /// `done` range would be skipped rows. A pre-v29 set (no key recorded) loads.
     pub fn load_keyset_ranges(
         &self,
         export_name: &str,
         run_id: &str,
+        key_column: &str,
     ) -> Result<Vec<KeysetRangeRow>> {
         let sql = "SELECT range_index, lo, hi, done FROM keyset_range \
-                   WHERE export_name = ?1 AND run_id = ?2 ORDER BY range_index";
-        self.query(sql, &[export_name.into(), run_id.into()], |r| {
-            KeysetRangeRow {
+                   WHERE export_name = ?1 AND run_id = ?2 \
+                     AND (key_column IS NULL OR key_column = ?3) \
+                   ORDER BY range_index";
+        self.query(
+            sql,
+            &[export_name.into(), run_id.into(), key_column.into()],
+            |r| KeysetRangeRow {
                 range_index: r.i64(0),
                 lo: r.opt_text(1),
                 hi: r.opt_text(2),
                 done: r.i64(3) != 0,
-            }
-        })
+            },
+        )
     }
 
     /// Clear an export's persisted ranges. Called post-finalize (via
@@ -194,8 +203,9 @@ mod tests {
             (Some("k0500".to_string()), Some("k1000".to_string())),
             (Some("k1000".to_string()), None),
         ];
-        s.persist_keyset_ranges("exp", "run-1", &ranges).unwrap();
-        let loaded = s.load_keyset_ranges("exp", "run-1").unwrap();
+        s.persist_keyset_ranges("exp", "run-1", "id", &ranges)
+            .unwrap();
+        let loaded = s.load_keyset_ranges("exp", "run-1", "id").unwrap();
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].lo, None);
         assert_eq!(loaded[0].hi.as_deref(), Some("k0500"));
@@ -203,13 +213,46 @@ mod tests {
         assert!(loaded.iter().all(|r| !r.done), "fresh ranges are not done");
     }
 
+    /// The recipe's `chunk_by_key` changed between the crash and the resume: the
+    /// persisted ranges bound the OLD key, so a `done` range means nothing now.
+    #[test]
+    fn persisted_ranges_are_not_reloaded_for_a_different_key_column() {
+        let s = store();
+        s.persist_keyset_ranges(
+            "exp",
+            "run-1",
+            "id",
+            &[(None, Some("500".into())), (Some("500".into()), None)],
+        )
+        .unwrap();
+        assert!(
+            s.load_keyset_ranges("exp", "run-1", "order_no")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.load_keyset_ranges("exp", "run-1", "id").unwrap().len(), 2);
+        // A pre-v29 set recorded no key: it loads for whatever key asks.
+        s.execute("UPDATE keyset_range SET key_column = NULL", &[])
+            .unwrap();
+        assert_eq!(
+            s.load_keyset_ranges("exp", "run-1", "order_no")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[test]
     fn load_with_a_different_run_id_returns_nothing() {
         // A stale set from a superseded run must not leak into a fresh run's load.
         let s = store();
-        s.persist_keyset_ranges("exp", "run-1", &[(None, None)])
+        s.persist_keyset_ranges("exp", "run-1", "id", &[(None, None)])
             .unwrap();
-        assert!(s.load_keyset_ranges("exp", "run-2").unwrap().is_empty());
+        assert!(
+            s.load_keyset_ranges("exp", "run-2", "id")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -224,7 +267,8 @@ mod tests {
             (None, Some("k5".to_string())),
             (Some("k5".to_string()), None),
         ];
-        s.persist_keyset_ranges("exp", "run-1", &ranges).unwrap();
+        s.persist_keyset_ranges("exp", "run-1", "id", &ranges)
+            .unwrap();
 
         StateStore::commit_keyset_range_at_ref(
             s.state_ref(),
@@ -241,7 +285,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = s.load_keyset_ranges("exp", "run-1").unwrap();
+        let loaded = s.load_keyset_ranges("exp", "run-1", "id").unwrap();
         assert!(!loaded[0].done, "range 0 untouched");
         assert!(loaded[1].done, "range 1 committed → done");
         // The part landed in file_log under the run_id (rehydration source).
@@ -254,9 +298,13 @@ mod tests {
     #[test]
     fn clear_removes_all_ranges_for_the_export() {
         let s = store();
-        s.persist_keyset_ranges("exp", "run-1", &[(None, None)])
+        s.persist_keyset_ranges("exp", "run-1", "id", &[(None, None)])
             .unwrap();
         s.clear_keyset_ranges("exp").unwrap();
-        assert!(s.load_keyset_ranges("exp", "run-1").unwrap().is_empty());
+        assert!(
+            s.load_keyset_ranges("exp", "run-1", "id")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -19,19 +19,24 @@ engines:
     driver: postgres
     url: "postgresql://rivet:rivet@127.0.0.1:%PORT%/rivet"
     seed: seeds/common/postgres.sql
+    # Three versions, not seven: OLDEST supported, primary target, NEWEST. Seven
+    # postgres versions were ~57% of the matrix's cells and every one of them
+    # graded the same engine-level golden (docs/release-gate-matrix.yaml keys
+    # cells by ENGINE, never by version), so versions 13/15/17 bought repetition
+    # rather than coverage. NOT a support change — 12..18 stay supported; see
+    # docs/reference/compatibility.md, which now says which set the gate runs.
     versions:
-      - { tag: "12", image: "postgres:12", port: 55012 }
-      - { tag: "13", image: "postgres:13", port: 55013 }
       - { tag: "14", image: "postgres:14", port: 55014 }
-      - { tag: "15", image: "postgres:15", port: 55015 }
       - { tag: "16", image: "postgres:16", port: 55016 }
-      - { tag: "17", image: "postgres:17", port: 55017 }
       - { tag: "18", image: "postgres:18", port: 55018 }
   mysql:
-    # 5.7 is IN as of 2026-08-30. The note here used to say the seed needed a
-    # recursive CTE and so was 8.0+ only — stale: seeds/common/mysql.sql says in
-    # its own header "no CTEs / window functions; numbers come from a digits
-    # cross-join". The blocker had been removed and the gap outlived it.
+    # 5.7 is NOT in the list below — this note claimed it was "IN as of
+    # 2026-08-30" and nothing ever added the row (corrected 2026-09-20). What
+    # 2026-08-30 actually established is that the BLOCKER is gone: the note used
+    # to say the seed needed a recursive CTE and so was 8.0+ only, which
+    # seeds/common/mysql.sql contradicts in its own header ("no CTEs / window
+    # functions; numbers come from a digits cross-join"). So 5.7 can be added —
+    # it is a supported version the gate does not exercise, not an impossible one.
     driver: mysql
     url: "mysql://rivet:rivet@127.0.0.1:%PORT%/rivet"
     seed: seeds/common/mysql.sql
@@ -39,10 +44,13 @@ engines:
       - { tag: "8.0", image: "mysql:8.0", port: 55080 }
       - { tag: "8.4", image: "mysql:8.4", port: 55084 }
   mssql:
-    # 2019 is IN as of 2026-08-30. The note here used to blame GENERATE_SERIES —
-    # stale: the seed fills through `ROW_NUMBER() OVER`, which SQL Server has had
-    # since 2005. The real blocker was a hardcoded `/opt/mssql-tools18` path in
-    # the harness (2019 ships plain `mssql-tools`), now probed per container.
+    # 2019 is NOT in the list below — this note claimed it was "IN as of
+    # 2026-08-30" and nothing ever added the row (corrected 2026-09-20). What
+    # 2026-08-30 established is that the BLOCKER is gone: not GENERATE_SERIES as
+    # an older note blamed (the seed fills through `ROW_NUMBER() OVER`, which SQL
+    # Server has had since 2005) but a hardcoded `/opt/mssql-tools18` path in the
+    # harness — 2019 ships plain `mssql-tools` — now probed per container. So
+    # 2019 can be added; docs/reference/compatibility.md does not claim it today.
     driver: mssql
     url: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:%PORT%/rivet"
     tls: accept_invalid_certs
@@ -94,6 +102,8 @@ preflight:
     what: "the FLAT-RSS guarantee at scale (rivet's headline value prop, the 454M-row no-OOM win), PER ENGINE over TWO EXISTING tables (no seeding, default users vs events): peak RSS on the large table must stay flat vs the small (RSS(large) <= RSS(small) × tol, def 3×) — a buffering regression that scales RSS with the table ships green otherwise. Measured for cur + the downloaded prev. Env per engine: RIVET_SCALE_<ENGINE>_URL + _SMALL + _LARGE; SKIP-if-absent."
   - id: cdc_e2e
     what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise). For each engine whose RIVET_CDC_<ENGINE>_URL is set: anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 change events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (a cdc_after_flush_before_ack panic holds the anchor; the re-run re-reads the delta id=4, never loses it). PLUS SQLite-vs-Postgres state PARITY: a PG CDC run against both backends must populate the SAME table set, matching golden/cdc_state_snapshot.json (the эталонный слепок). Each engine's anchor is its own mechanism: PG logical slot (server-side), MySQL binlog checkpoint file, SQL Server from-LSN, Mongo change-stream resume token. SKIP (never a silent pass) when the env URL is absent; the PG state-parity leg additionally needs RIVET_CDC_STATE_URL. dev/release_oracle/cdc.py; regenerate the snapshot golden with python3 -m dev.release_oracle --bless-cdc."
+  - id: partner_shape
+    what: "the partner shape as the OPERATOR gets it — the config `rivet init --mode cdc` EMITS over three tables (one keyset recipe per table + one `tables:` stream with `backfill: auto`; never `initial: snapshot`), with a `load:` appended, driven through the whole cycle on MySQL and PostgreSQL (the engines init consolidates): doctor → check → run 1 (anchor + every table's baseline through its recipe) → load → per table BigQuery COUNT == source == 5 → a delta in every table → run 2 → load → per table live view == source == 7 and `<table>__changes` == baseline + 5. Oracles: the `bq` CLI and a source re-query, never rivet. Every other CDC cell hand-writes its config; a scaffold that parses but cannot complete the cycle is what this catches. Env: RIVET_CDC_<ENGINE>_URL + BQ_ORACLE_PROJECT (or gcloud's project) + `bq`; SKIP-if-absent. dev/release_oracle/partner_shape.py (verify_partner_shape)."
 
 # ── Scenarios (the manual dogfood, codified) ────────────────────────────────
 # Each runs per engine×version. `sql`-only ones skip Mongo where noted.

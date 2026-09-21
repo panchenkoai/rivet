@@ -70,6 +70,7 @@ from . import blessed_path, cdc, scenarios
 from .core import (
     run,
     Ledger,
+    ROOT,
     cell_gate,
     cell_parallel,
     container_for_port,
@@ -300,20 +301,66 @@ CHAIN = {
 
 
 def _why(p) -> str:
-    """The line that explains a non-zero exit.
+    """The line that explains a non-zero exit — and a path to the FULL output.
 
     `exit=1` in a 200-row report tells a reader to go re-run the cell by hand.
     rivet already prints the reason; carrying it into the ledger is the
     difference between a report and a to-do list.
+
+    But ONE line is not always the reason, and the gate kept no second copy.
+    `rivet doctor` ends with "one or more preflight checks failed (see output
+    above)" — truthful, and useless alone, because the checks it names are the
+    lines ABOVE it, which this helper dropped. Measured 2026-09-20: a `doctor`
+    cell failed that way, and the diagnosis could not be recovered at any price
+    — a two-hour re-run graded the same config green and said nothing about the
+    first failure. A gate that cannot say WHY a cell failed sends its reader to
+    re-run the whole thing and guess.
+
+    So the headline stays one line for the report, and the whole stdout+stderr
+    goes where it SURVIVES: `target/` (gitignored), never the run's work dir,
+    which `__main__` deletes at teardown — that deletion is what made the
+    output unrecoverable in the first place.
     """
+    # A SUCCESS has no "why". Two call sites embed `_why(p)` in an f-string built
+    # whether or not the stage passed, so without this the helper wrote a full
+    # output log for every GREEN cell: measured 2026-09-20, 274 files in
+    # target/gate-failures after one gate run, every one of them `exit=0`. The
+    # directory then reads as a collapsed run to anyone who opens it (it did to
+    # the author). Every call site passes a Proc from `rivet(...)` — including
+    # the one whose variable is named `e`, which is a Proc, not an exception.
+    if p.returncode == 0:
+        return ""
+    head = ""
     for src in (p.stderr or "", p.stdout or ""):
         lines = [ln.strip() for ln in src.splitlines() if ln.strip()]
-        for ln in reversed(lines):
-            if ln.lower().startswith(("error", "caused by", "rivet: error")):
-                return ln[:220]
-        if lines:
-            return lines[-1][:220]
-    return ""
+        if not lines:
+            continue
+        head = next(
+            (
+                ln
+                for ln in reversed(lines)
+                if ln.lower().startswith(("error", "caused by", "rivet: error"))
+            ),
+            lines[-1],
+        )[:220]
+        break
+    if not (p.stdout or p.stderr):
+        return head
+    argv = " ".join(str(a) for a in (getattr(p, "argv", None) or []))
+    blob = (
+        f"$ {argv}\n\nexit={p.returncode}\n\n"
+        f"--- stdout ---\n{p.stdout or ''}\n--- stderr ---\n{p.stderr or ''}\n"
+    )
+    # Content-addressed: two cells failing the same way share one file rather
+    # than racing over a name, which matters at 16-way cell parallelism.
+    try:
+        d = ROOT / "target" / "gate-failures"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{os.getpid()}-{hashlib.sha1(blob.encode()).hexdigest()[:10]}.log"
+        f.write_text(blob)
+    except OSError:
+        return head
+    return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
 def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str) -> bool:
@@ -431,16 +478,25 @@ def _state_sql(cell: Cell, work: Path, state_url: str, sql: str) -> int:
         db = work / ".rivet_state.db"
         if not db.is_file():
             return -1
-        tmp = db.with_name(".read_state.db")
-        # Read a COPY: `mode=ro` on a live WAL database fails to open, which
-        # reads as "no state DB" when the file is right there.
-        shutil.copy2(db, tmp)
-        for side in ("-wal", "-shm"):
-            sc = db.with_name(db.name + side)
-            if sc.is_file():
-                shutil.copy2(sc, tmp.with_name(tmp.name + side))
+        # Snapshot with sqlite's OWN backup API, not a file copy. `mode=ro` is
+        # still avoided — it cannot open a live WAL database, which is what the
+        # copy was working around — but `shutil.copy2` of a live WAL db is not
+        # atomic against a concurrent writer, and it only had to be once
+        # --version-parallel let sibling versions write while this reads. A torn
+        # copy surfaces as sqlite3.Error -> -1; a whole-but-stale one, missing the
+        # last commits, as 0 matching rows. BOTH appeared on 2026-09-20 across 8
+        # cells (postgres, mongo) while the real databases held every row —
+        # verified after the fact: export_metrics=2, file_log=2, run_status=2.
+        # `backup()` takes a consistent snapshot and retries under contention; a
+        # read-only connection that never writes takes no lock the writer minds.
         try:
-            row = sqlite3.connect(str(tmp)).execute(sql).fetchone()
+            src = sqlite3.connect(str(db))
+            try:
+                snap = sqlite3.connect(":memory:")
+                src.backup(snap)
+            finally:
+                src.close()
+            row = snap.execute(sql).fetchone()
             return int(row[0]) if row and row[0] is not None else 0
         except sqlite3.Error:
             return -1
@@ -1074,9 +1130,13 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # found: rivet_blessed_mssql.users"). A per-cell dataset gives each its own
     # `{dset}.users`. Only ~6 slugs × N engines distinct names, reused every run (bq
     # mk -f is idempotent), so this does not accumulate datasets.
+    # …and PER VERSION since 2026-09-20: --version-parallel runs two versions of a
+    # family at once, so a per-cell-per-engine name still collided — 4 cells hit
+    # rivet's lease guard on `rivet_blessed_postgres_repeat_gcs_postgres.users` and
+    # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
     dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
-            + f"_{cell.engine}_{_cell_slug}")
+            + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — the warehouse leg runs on the "
@@ -1121,8 +1181,20 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # set, so without a per-invocation token the load_id repeats and _load_rows' `LIKE
     # load_id%` count on the shared, never-reset Postgres ledger passes on a PRIOR run's
     # rows. rivet records THIS load under this id (--run-id), so the scoping isolates it.
+    # + TAG: the cross-product this id is built from (engine/lifecycle/state) is
+    # rebuilt IDENTICALLY for every version of one engine, and `work_dir()` is a
+    # module-level global set once per run — so under --version-parallel two
+    # versions at the same lifecycle computed the SAME load_id. `load_run` is
+    # upserted BY load_id product-side (state/load_journal_store.rs, `ON CONFLICT
+    # (load_id) DO UPDATE`), so the second version REPLACED the first's row —
+    # target_table included — and `_load_rows`' `n < 1` check for a broken version
+    # then read the healthy sibling's row and passed. The comment above already
+    # stated the rule; the id stopped keeping it when versions began running
+    # concurrently. `dset` and `pfx` in this same function were version-keyed for
+    # exactly this reason; this one was missed.
     load_id = (
-        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}-{os.getpid()}"
+        f"flow-{cell.engine}{tag.replace('.', '_')}-{cell.lifecycle}-{cell.state}"
+        f"-{scenarios.work_dir().name}-{os.getpid()}"
     )
     # No `--rivet-bin`: the load resolves types IN PROCESS now (the flag existed
     # only to pin which binary the `rivet check` subprocess was, and is gone).
@@ -1302,9 +1374,13 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
     # cdc cells DESTRUCTIVELY set up the ONE shared source probe per engine
     # (drop/create/enable orc_cdc_probe), so they cannot run concurrently WITH EACH
     # OTHER on this engine — RED-proven: 12 "orc_cdc_probe does not exist" collisions.
-    # Each engine has its own lock (sc_blessed_flow is per-engine), so cdc still
-    # overlaps ACROSS the 4 engines; batch cells never take it.
-    cdc_lock = threading.Lock()
+    # The lock is keyed by ENGINE and lives at module scope, NOT created per call:
+    # `sc_blessed_flow` used to be per-engine, but --version-parallel makes it
+    # per-engine×VERSION, so a local lock gave each version its own and stopped
+    # serialising anything — 2026-09-20 brought the same collision straight back
+    # ("Table 'rivet.orc_cdc_probe' doesn't exist", mysql). cdc still overlaps
+    # ACROSS the 4 engines; batch cells never take it.
+    cdc_lock = cdc._cdc_lock_for(engine)
 
     def run_one(task: tuple[Cell, str, str]) -> None:
         cell, key, u = task
@@ -1413,6 +1489,12 @@ FLAG_EXCUSED = {
                "pool_split_realizes_the_range_split_and_the_union_is_exact (prime → clear → "
                "--pool --split → DuckDB union exact, plus a vacuous-oracle guard that the "
                "split actually fired).",
+    "--bigquery-project": "scaffolds the `load:` section, which the blessed chain never loads. "
+                          "Carried INSIDE the gate by init_delta.verify_init_delta: "
+                          "tests/live/live_init_delta.rs runs init with both flags, then "
+                          "run → load → compact on the generated file (three engines, "
+                          "incremental and CDC) — run 1 everything, run 2 the delta.",
+    "--bigquery-dataset": "the other half of the `load:` scaffold — see --bigquery-project.",
 }
 
 

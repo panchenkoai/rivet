@@ -2,6 +2,353 @@
 
 ## Unreleased
 
+- **The cheat sheet was driven end to end, and corrected where it and the product
+  disagreed.** Three scenarios on GENERATED configs against a live stand — batch +
+  `compact`, CDC, and a multi-table `plan`/`apply`/`--pool`/`--split` — produced
+  eighteen divergences. The load-bearing ones are now fixed in `docs/cheat-sheet.md`:
+  §3's mode table promised that `incremental` + `layout: base_buffer` flags deletes in
+  `__is_deleted`, but a cursor read never sees a DELETE, so the warehouse keeps the row
+  for ever (measured: 250,002 rows against a source of 250,001 — the surplus was the
+  deleted id); §2.1's sealed-replay line could not work as printed (`-o` requires
+  `--format json`); `--pool 4` on a generated config is the SLOWEST of the four paths,
+  because `rivet init` writes no `parallel_safe:` (measured on one 1.26M-row set: 66s
+  waves, 74s bare `--pool`, 57s after `--annotate-waves`, 42s with `--split`); §4.5's
+  `WHERE NOT __is_deleted` errors on an `incremental` base, where the flag does not
+  exist; §4.4's independent oracle cannot run after a load, because the generated
+  `cleanup_source: true` deletes the very parts it reads; re-running `apply` without
+  `--resume` orphans the prior run's parts; PostgreSQL's `REPLICA IDENTITY` was absent
+  from the CDC prerequisites though rivet warns about it on every run; and
+  `rivet state files` / `rivet metrics` cannot reach `--split` sub-units (`rivet state
+  runs` can). The split itself was verified correct by the independent DuckDB oracle —
+  39 fingerprint fields over 1,000,749 rows across four sub-exports sharing one prefix.
+
+- **`rivet init` explained a decision it had not taken.** A backfill recipe's mode comes
+  from `recipe_mode`, which pages whenever a usable key exists and never reads the row
+  count — but the inline rationale printed `suggest_mode`'s reason regardless, so a
+  200-row recipe was scaffolded `chunked` under "~200 rows ≥ 100K threshold". The
+  threshold is now claimed only when it was actually crossed, mirroring what the `full`
+  arm already did for exactly this class of false diagnostic. The generated header also
+  stopped naming `rivet.yaml` whatever `-o` said — it is built without the output path,
+  so it now points at `<this file>` instead of a config that may not exist.
+
+- **`rivet validate` blamed a missing manifest on rivet's age.** The verdict read
+  `legacy_run (no manifest at destination — pre-0.7.0 prefix)`, but the check establishes
+  only that no manifest is at the prefix — never when, or whether, anything was written
+  there. A prefix that was never written reaches the same verdict, which is what an
+  operator sees whenever `validate` runs from a different working directory than the
+  export did: `destination.path` is the one relative path rivet resolves against the
+  CURRENT directory rather than the config's, and `rivet init` generates one. The line now
+  names both causes and asserts neither. The `legacy_run` label ADR-0012 M6 requires, and
+  the exit code, are unchanged.
+
+- **The LAST part of every export carries its partition count too.** The footer note
+  the loader bounds a part by (`rivet.partition_buckets`) was written only when the
+  writer ROTATED; every runner closes its final part itself — and a keyset page is
+  one such part — through a bare `finish()`, so the one part every export has went out
+  unnoted and the loader fell back to the span. One close path now
+  (`ExportSink::finish_writer`), read back from the Parquet the sink wrote.
+
+- **The compaction reads a TIMESTAMP partition column as a UTC day.** `DATE(col)` with
+  no zone follows the project's `default_time_zone`, while the bounds it fed are
+  rendered `+00` and the table's partitions ARE UTC days — under any other default the
+  two disagreed by up to a day at both ends (a skipped winner, a re-inserted key), and
+  the day list stopped pruning. `DATE(col, 'UTC')` wherever a TIMESTAMP is dated; a
+  DATE or DATETIME takes no zone.
+
+- **Docs and ledgers caught up with the layout.** `layout` / `deleted_flag` /
+  `rivet compact` are in the cheat sheet, the CDC full-cycle walkthrough (which
+  described a view where the config it shows builds a base and a buffer), the init
+  reference (the warehouse flags) and ADR-0034 (D7); the load-mode matrix no longer
+  calls the incremental base-and-buffer cycle `na` (it is proven by the generated-config
+  chain), the config-validation matrix carries the BigQuery-only refusal, and the
+  runner-coverage matrix carries the footer note as five honest gaps.
+  The cheat sheet also gained the step that was missing from it entirely: it explained
+  the `load:` block but never the `rivet init` invocation that WRITES one, so a reader
+  following it had to hand-add the block — against the rule that every config is
+  generated. A new §1.3 shows the three warehouse flags on both scaffolds (single table
+  and whole-database CDC), the `run → load → compact` cycle they enable from one file,
+  what in the generated block is a catalog guess worth reviewing, and why
+  `--gcs-bucket` is required with them.
+
+- **A `9999-12-31` partition value no longer wedges compaction.** On an hour / month /
+  year key the MERGE's upper bound was `hi + 1 day`, which for the SCD "end of time"
+  sentinel rendered `DATE '+10000-01-01'` — past the warehouse's range, a hard error on
+  every `rivet compact` of the table while the buffer grew. The last representable day
+  (and `i64::MAX` for a range key) has no successor: the bound is simply open above.
+
+- **`__is_deleted` is a reserved source column**, like `__op` / `__pos` / `__seq`: a
+  captured table carrying one is refused with the remedy. The compaction decides that
+  column and was silently overwriting the source's values, and its mere presence flipped
+  the tombstone arm on regardless of `deleted_flag:`.
+
+- **`rivet init` on SQL Server:** `DATA_TYPE = 'timestamp'` is `rowversion` (an 8-byte
+  binary counter), not a time — read back under its real name, so it is neither a cursor
+  candidate (it scored above the integer PK and never advanced) nor a partition guess (a
+  `BYTES` column BigQuery cannot partition by). Stamp names are folded (`ModifiedDate`,
+  `CreatedDate`, `LAST_UPDATED` …) so PascalCase schemas get the mutation stamp as cursor
+  and the creation stamp as partition, as snake_case ones do. A mixed-case PostgreSQL
+  table scaffolds a lowercase slot name (`rivet_orders`), the only spelling the server
+  accepts. The comment wrapper leaves a ` #` inside `` ` `` or `[ ]` identifier quotes
+  alone (a long generated `query:` lost its trailing columns to a "comment").
+
+- **Two CDC checkpoints that differ only by case are one file on macOS / Windows** — the
+  collision guard folds case, since a config written on Linux is run elsewhere.
+
+- **A whole-table pass over a base whose buffer still holds rows is refused.** Under
+  `layout: base_buffer` a re-baseline (a re-snapshot after a gap, a fresh whole-table
+  incremental run) replaced the base but left `<table>__changes` as it was, so the next
+  `rivet compact` merged OLDER values over the new base — restoring exactly the pre-gap
+  rows the re-snapshot existed to fix, `COMPACT OK`. The load now refuses by name with
+  the two recoveries (compact first if the buffer belongs to the current base, drop it
+  if the pass re-snapshots past it); nothing is consumed.
+
+- **The baseline leg asks the load's own layout resolver.** `initial: snapshot` under a
+  written `load.layout: base_buffer` derived its layout from `backfill:` presence alone,
+  wrote the snapshot without `__is_deleted`, and `LOAD DATA` filled every row's flag
+  with NULL — the whole backfill invisible to `WHERE NOT __is_deleted`.
+
+- **`layout: base_buffer` needs a warehouse that compacts.** `rivet compact` is
+  BigQuery-only; on Snowflake a stream with a `backfill:` derived a base that froze at
+  the backfill while its buffer grew for ever, with no view and every load prescribing
+  a command that could only fail. A written `base_buffer` is refused at config load
+  outside BigQuery, and the `backfill:` derivation yields the changelog and its view.
+
+- **Messages:** init's next steps prescribe `rivet compact` only for a scaffold that
+  declares a base and a buffer (a `full` scaffold's load OVERWRITES its table); the
+  `COMPACT SKIP` reason names the levers that decide the layout (`cdc.backfill:`,
+  `load.layout:`), not `initial: snapshot`, which decides nothing; the pinned-run
+  refusal names the command that raised it (`compact`, not `load`); the lease refusal
+  names both holders; "drop the buffer" says it discards every change since the last
+  compaction; "N of M failed" counts the tables compaction attempted.
+
+- **`rivet compact` matches a base row under its OLD partition value.** The MERGE
+  pruned the base to the days (or the range) found in the BUFFER, so a key whose
+  partition column changed between two cycles — a corrected business date, a row
+  partitioned by its `updated_at` — sat in the base under a day the buffer never named:
+  NOT MATCHED, re-INSERTed, two live rows for one key, `COMPACT OK`. Found by the
+  generated-config chain (init partitions by `created_at`; the delta moved a row's
+  date), and the shape a `_rivet_exported_at` partition hits on EVERY change. The days
+  and the range are now collected over the buffer AND the base's rows of the buffer's
+  keys (one semi-join, the key and partition columns only), the base side is bounded by
+  the whole touched set plus its NULL partition — never by one window of the winners —
+  and a load-date key merges unbounded, as its doc always said. A range value outside
+  the key's `[start, end)` merges once, unbounded, instead of windowing up to it.
+
+- **A delete DELETES when the base carries no `__is_deleted`.** With
+  `deleted_flag: false` on a stream the MERGE had no tombstone arm, so a
+  `__op = 'delete'` winner fell through to the upsert and overwrote the live row with
+  the delete's key-only before-image — NULLs in every non-key column, still live.
+  Without the flag there is nothing to flag; the row is removed.
+
+- **A CLONE'd base is a table.** The batched whole-table load ends in
+  `CREATE OR REPLACE TABLE … CLONE`, and the catalog reports that table as `CLONE` for
+  life; the object-kind probe counted only `BASE TABLE`, so every later `compact` and
+  overwrite of a base that took two or more load jobs was refused as "neither a table
+  nor a view" (gate: `layout[batches:cdc]`).
+
+- **A part the writer budgeted is loaded on the count it recorded.** The extract rotates
+  parts at 4,000 DISTINCT partitions; the load bounded a file by its footer min/max and
+  its row count, and a large part cut at 4,000 business days spans ~5,600 calendar days
+  — refused by name, although it fits. The closing part now records
+  `rivet.partition_buckets = <column>|<granularity>|<n>` in its Parquet footer and the
+  load takes that bound when the column and granularity are the ones it partitions by.
+  The load-time refusal itself is reachable only by a file written BEFORE the partition
+  was declared, which is what the live cell now stages.
+
+- **A multiplex stream's `load.tables.<name>.partition` reaches the WRITER of that
+  table's baseline leg**, not only the load: the leg resolved its partition at the export
+  level, so a per-table partition budgeted nothing while the load held the files to it.
+
+- **`rivet init`:** `--bigquery-project/--bigquery-dataset` need `--gcs-bucket` (the load
+  reads GCS only — a local or S3 scaffold with a `load:` block was refused by its own
+  next-steps command); the whole-DB CDC scaffold writes each table's partition guess on
+  the stream's `load.tables.<name>` — where the load reads it — instead of on the
+  recipes, which the load never reads (the bases came out unpartitioned); the per-table
+  MySQL fallback gives every CDC export its own `server_id`; a partition column named
+  like a YAML scalar is quoted; the creation stamp (`created_at` / `made_at` /
+  `occurred_at`) is preferred as the partition column over any other business date.
+
+- **`load.layout: base_buffer` — a physical base and `rivet compact` for an ORDINARY
+  incremental export.** Compaction used to be a property of the MODE: only a `mode: cdc`
+  stream with a `backfill:` kept a physical base plus a disposable buffer, and every
+  query-based `incremental` export got the changelog and a dedup view instead — a view
+  that re-ranks the whole log on every read, with no partition pruning (measured: a
+  full-table scan per read against 19 MiB for the same question on a pruned base). The
+  layout is now a written choice, honored for `incremental` as well as `cdc`: the first
+  pass lands as the base (source columns plus `__is_deleted`), every later delta lands
+  in the buffer, and `rivet compact` merges and drops it. Absent, the key keeps exactly
+  what shipped, so no existing deployment changes shape; `full` ignores it, since a full
+  load overwrites the whole table and has no accumulated state to lay out.
+  The winner per key is picked by `CompactOrder`: a stream ranks by its log position, an
+  incremental export by its `cursor_column` — rendered by the same builder the
+  current-state view ranks with, so a compacted base and a view over the same rows can
+  never disagree about which row is latest.
+
+- **A base-and-buffer load no longer budgets the BUFFER against the base's partitions.**
+  The pre-load partition budget measured EVERY file of the load against the target's
+  granularity, so a change file spanning more days than one BigQuery job may write
+  (4,000 partitions) was refused by name — although the buffer takes no partition at
+  all and is read whole by one MERGE. Found by dogfooding a 5,000-day history: the
+  baseline landed in two jobs as designed, then the stream's own file was refused and
+  the cycle could not proceed. The budget now measures the baseline leg only, which is
+  what lands in the partitioned base; a stream-only cycle budgets nothing. The live
+  wide-history cell grew the missing half: changes 500 days apart, a ~4,500-day buffer
+  file loading in one job, and its compaction chunking the day list inside one job.
+
+- **`rivet compact` checks the base before it merges.** A buffer whose base table is
+  ABSENT surfaced as BigQuery's own `Not found: Table … in location US`, and a base
+  this state DB's ledger has no record of rivet loading was not checked at all — a
+  MERGE would have rewritten someone else's rows. Both are now refusals by name,
+  taken from two metadata reads before any job, with the buffer left whole so the
+  cycle is deferred rather than lost; a view under the base's name (the changelog+view
+  layout) and a non-table object are refused the same way. The refusal is recorded
+  `refused` in the load ledger, as a stop before the write, never `failed`.
+
+- **`cdc.backfill: auto | [exports]` — a CDC export's baseline, declared by reference.**
+  Instead of `initial: snapshot` (one single-stream full scan per table, no `parallel:`), a
+  `mode: cdc` export names the ordinary batch exports that already describe how to read its
+  tables — keyset, range-chunked, `full`, with their `columns:` and tuning — and runs each once,
+  after the anchor, into its own `snapshot/` prefix. `auto` pairs each captured table with the
+  one export reading it (qualified names whole, bare names by table; ambiguity and a missing
+  recipe are refused at config load); `[names]` pairs explicitly. A recipe is a READ recipe,
+  never a second load target: whole-config `rivet run` / `apply` / `plan` skip it at `warn`
+  (`rivet run -e <recipe>` still exports it alone), `rivet load` never types it, and a column
+  the recipe and the stream type differently is refused at the start of every run, before
+  that run's anchor step (not at config load). An `incremental` / `time_window` recipe reads
+  a slice and is refused. A crashed baseline leg — range-chunked or keyset, the shape init
+  scaffolds — resumes on the next plain run, complete and without duplicates (both live-proven
+  against a crash after the first page). A recipe's
+  table shortcut and `columns:` are validated at config load, and `backfill:` written with no
+  value is refused rather than read as "no baseline". A bare recipe name pairs only with the
+  default schema's spelling (`orders` is `public.orders` / `dbo.orders`, never `sales.orders`). MySQL needs
+  `cdc.checkpoint:` for any baseline (the file is the anchor); PostgreSQL does not (the slot
+  is). The step-by-step operator cycle — anchor → backfill → load → delta → load, with the
+  interruption points — is `docs/cdc-full-cycle.md`.
+- **`rivet init --mode cdc` over several tables scaffolds that shape**: one batch recipe per
+  table (keyset where the table has a single-column keysettable key, range or `full`
+  otherwise, always in the `table:` form — a name that cannot be a `table:` shortcut is left
+  out of the stream and said so) and one `tables:` stream with `backfill: auto`, on MySQL and
+  PostgreSQL `public` over two or more tables. Its next-steps epilogue ends in `rivet run`,
+  not `rivet plan` (a CDC config has no batch plan to seal), and a per-table capture-only
+  scaffold (SQL Server, MongoDB, a single table) says the baseline is yours.
+- **A load is typed from the spec of the run it consumes.** `rivet run` now records each
+  run's columns and key under its run id as well as under the export name; `rivet load` pins
+  every table's plan to the newest loadable run under its own prefix and rebuilds the DDL and
+  `pk: auto` key from that run's spec. On a state DB shared by two configs whose exports share
+  a NAME (`users` from PostgreSQL and `users` from MongoDB), the by-name row is last-writer-
+  wins and the other config's run could retype this table between the run and its load — a
+  `_id` key on a PostgreSQL table, another engine's column types in the DDL. "Newest" is the
+  newest successful run that recorded a spec; a newer run that recorded none (a crash between
+  its manifest and its spec write) is named on stderr. Runs older than this release, or a load
+  that cannot list its prefix, keep the by-name spec and say so. On the same shared state DB,
+  a live run of one config's `users` is no longer declared dead by the other config's finished
+  `users` run: supersession of a `running` row now needs a newer success under the same
+  prefix, so `gc_orphans` keeps sparing the live writer's in-flight parts.
+- **A multiplex `tables:` stream's `load:` takes per-table overrides** — `load: { partition:
+  { column: created_at, granularity: day }, tables: { customers: { partition: none },
+  line_items: { pk: [id, line_no] } } }` on the export: each captured table's block is
+  layered over the export's, over the top-level `load:`, so six tables through one binlog
+  stream no longer share one partition column and one key. Names must be captured tables.
+- **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
+  it used to abort the whole config on the first `mode: cdc` export.
+- **A `backfill:` stream lands as a BASE TABLE plus a per-cycle buffer, and `rivet compact`
+  merges the buffer.** The baseline legs now OVERWRITE a physical `<table>` — the source
+  columns plus one service column, `__is_deleted BOOL`, written as `false` inside the baseline
+  Parquet itself — and the stream's runs append into `<table>__changes`, a buffer with no
+  partition. The new command `rivet compact -c cfg` runs ONE scripted job per table: the latest
+  change per key is upserted into the base, a tombstone flags the row (`__is_deleted = TRUE`,
+  values kept — the warehouse deletes nothing), a later insert un-flags it; on a
+  day-partitioned base the MERGE prunes to exactly the days the buffer touched
+  (`DATE(col) IN UNNEST(<days>)`, measured 172 bytes against 48 KB for a MIN..MAX range), in
+  chunks of 4,000 days, and the script drops the buffer, so the next load creates it fresh
+  from its run's spec. A cycle bills a 30 MB floor with changes and nothing without. There is no view in this layout; consumers read
+  `<table>` and filter `WHERE NOT __is_deleted`. A crash between the MERGE and the DROP is
+  re-merged idempotently by the next compact. Every compaction job carries `rivet_op:merge`;
+  the ledger records it as `mode: compact`. The winner per key is ranked over the WHOLE
+  buffer before the partition bound is applied, so a key with changes on both sides of a
+  split (a window and the NULL set) lands in exactly one MERGE — the one its latest change
+  belongs to. `initial: snapshot` streams keep the changelog +
+  view layout. BigQuery only in this release. The cycle (`run → load → compact`, the crash
+  between MERGE and DROP included) and the batched loads are a release-gate cell
+  (`warehouse_layout`) over `tests/live/live_cdc_compact.rs` and
+  `tests/live/live_load_partition_batches.rs`.
+- **A wide history loads in daily partitions, in batches — never coarsened to `month`.**
+  BigQuery writes at most 4,000 partitions per job; a 317M-row table with eleven years of
+  `created_at` days refused to load under `granularity: day`. `rivet load` now packs the
+  Parquet files, by the partition column's range in each footer, into as many `LOAD DATA`
+  jobs as the span needs (files from a keyset export over an autoincrement key are date-local
+  without anything being chunked by date), appends them in turn to `__changes`, and for a
+  whole-table load fills `<table>__staging` and swaps it in with one zero-copy `CLONE`. The one
+  shape no batching splits — a single file wider than 4,000 partitions, dates uncorrelated with
+  the read key — is refused before any job, naming the file. Every BigQuery job of a load now
+  carries `rivet_op:load` (DDL, counts, staging and clone included) beside `rivet_table`, so
+  cost sums per table per operation; `rivet_op:merge` is reserved for compaction.
+- **A shared state DB with same-named configs, made safe (state schema v29).** Four configs each
+  exporting `users` — one per engine — on one Postgres state, run at once, is the deployment
+  shape the shared-state docs recommend; three things broke under it. The baseline marker
+  (`cdc_snapshot`) was keyed by export name, so config B skipped its baseline because config A
+  had one: v29 keys it by the table's destination too (a pre-v29 row counts for every prefix, so
+  an upgrade never re-baselines). A parallel keyset run resumed after its `chunk_by_key` changed
+  reused ranges sampled on the OLD key and skipped rows of the new one: v29 records the key with
+  the ranges and a resume asking with another key re-samples. A run id was `<export>_<ms>`, so
+  two configs on one scheduler tick could share one `run_status` and per-run spec row: the pid
+  is part of it now. Two concurrent `rivet load`s of one table both appended the same runs: a
+  per-table lease (a Postgres advisory lock on a shared state, an `flock` sidecar beside a
+  SQLite one, released when the holder dies) admits one at a time and refuses the other by
+  name. And a run landing between the load's two prefix listings is refused for that cycle
+  instead of being loaded with an older run's columns. The plan `rivet load` first builds
+  from the by-name spec is provisional: its `pk` / `cluster_by` / `partition` columns are
+  checked against the pinned run's spec, not the last writer's — MySQL's `users` was refused
+  on MongoDB's `_id` before the pin could run. The whole shape — blessed, crashed at
+  once, crashed in turn — is a release-gate cell (`shared_state_same_name`) over
+  `tests/live/live_shared_state_same_name.rs`, CDC and batch cycles.
+- **A CDC run records its peak RSS.** `export_metrics.peak_rss_mb` was 0 for every CDC run
+  (the partner's whole e2e ledger); the stream now keeps the same RSS bracket the batch tail
+  does. Oracle: `a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run` reads
+  the row back (RED at 0 before the fix).
+- **`rivet --version` names the commit** — `rivet 0.27.0 (9d4a662d5)`. A bug report names a
+  version, and one version ships from many pre-release builds. `RIVET_GIT_SHA` overrides for
+  a build without `.git` (Docker); `unknown` is the honest fallback, never a build failure.
+- **Log lines no longer duplicate the card block.** An interactive `rivet run` repaints its
+  cards in place by walking the cursor up; a `WARN` written straight to stderr between two
+  frames put the count off by one and the block was printed again into scrollback (seen as
+  "three rows for one leg" on the partner's run — the data was never read twice). While a
+  renderer owns the screen, `log` lines go through its channel and land above the block.
+- **The tmp-disk spill diagnosis says the counter is server-global.** `Created_tmp_disk_tables`
+  counts every session on the server: the partner's baselines logged about one per SECOND of
+  the production source's own traffic (45 in 42 s, 995 in 17 min), while ten keyset pages on a
+  quiet stand log none (`mysql_keyset_pages_create_no_tmp_disk_tables`). The solo line no
+  longer says "the source spilled to disk" as if the export did it.
+- **A recipe and its stream typing one column apart is refused at config load.** The check
+  ran on every `rivet run`, after the anchor; it is a pure config decision and now fails
+  `rivet validate` / `check` / `run` when the config is read, with the same message.
+- **`rivet doctor` keeps the CDC verdicts it already reached when a later probe fails.** Each
+  engine's health probes appended to one list; a probe that died half-way (MySQL `SHOW BINARY
+  LOGS` with `log_bin = 0`) replaced "log_bin is OFF — enable binary logging" with one generic
+  failure blaming source auth. MySQL now stops before the retention probe when binlog is off,
+  and the probe hint no longer names auth.
+- Fixes: a MySQL CDC checkpoint kept `server_uuid` / `gtid_executed` only until the first
+  captured transaction, disarming the wrong-server guard afterwards; `rivet check` graded a
+  `mode: cdc` export as a table scan; a MySQL primary key wider than 1024 bytes was silently
+  truncated by `GROUP_CONCAT` (one row per key column now); a load carrying a bare engine
+  identity (`mysql`) was refused against its own qualified prior (`mysql:app.orders`) and vice
+  versa — a bare identity is "table unrecorded", two qualified tables of one engine are still
+  two sources; `rivet apply` no longer drops the recorded `pk`; a `<table>__changes` log now
+  counts as occupying its warehouse table in duplicate-target detection; an incremental or
+  CDC load that would adopt an earlier full-load table with a different partition as its
+  change log is refused BEFORE the rename, not after; on SQL Server a
+  label-cased `columns:` key (`Orders.price` on a `dbo.orders` catalog) typed the CDC stream
+  but not its backfill leg — both are now narrowed by the configured table label; two captured
+  tables sharing a leaf name (`sales.orders`, `archive.orders`) with a typed recipe are refused
+  rather than sharing one table's `columns:`; a MongoDB backfill recipe must name the
+  collection literally (`audit.events` is a name, not a schema); a state DB migrated by a
+  newer rivet is refused by name ("schema v29, newer than this rivet knows") instead of
+  "migration incomplete"; a qualified recipe key (`orders.price`) and a bare stream key
+  (`price`) for one column are now seen as the same column by the type-conflict refusal, and
+  a recipe declaring both spellings resolves to the qualified one deterministically; a chunked
+  baseline leg whose recipe changed after a crash names `rivet state reset-chunks -e <leg>`,
+  which now accepts the leg's name.
+
 ## 0.26.0 — 2026-09-14
 
 - **`load: { partition }` — the warehouse table's partitioning, per table**

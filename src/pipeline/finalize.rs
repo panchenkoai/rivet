@@ -474,7 +474,7 @@ pub(super) fn finalize_manifest(
     }
     // The source COUNT(*) `--reconcile` already ran. Recording it is what makes
     // `load::reconcile`'s source→file leg executable: without it that check,
-    // `LoadIntegrity.source_rows` and `--allow-source-drift` are unreachable,
+    // `LoadIntegrity.source_rows` and `allow_source_drift` are unreachable,
     // and the only "did the extract drop rows" evidence a loader ever sees is
     // rivet's own part-row arithmetic compared against itself.
     //
@@ -1311,6 +1311,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             export_name: "public.orders".into(),
+            partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
             is_split_unit: false,

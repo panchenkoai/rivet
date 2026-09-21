@@ -6,6 +6,23 @@ This project uses Rust **1.94** (edition 2024). The pinned toolchain is defined
 in `rust-toolchain.toml` — running `cargo build` will automatically use it if
 you have `rustup` installed.
 
+The Python harness (`dev/release_oracle`) is pinned with
+[uv](https://docs.astral.sh/uv/): `pyproject.toml` + `uv.lock` fix the interpreter
+floor and every dependency, so two runs of the same gate read the data with the
+same reader — an oracle that moves under you grades nothing.
+
+```bash
+uv sync                  # once per clone
+make release-oracle      # the gate, through `uv run python`
+```
+
+The oracle's DuckDB session lives in ONE place, `dev/release_oracle/duck.py`: it
+attaches the stand engines and, via `INSTALL bigquery FROM community`, reads
+BigQuery directly — a second implementation beside the `bq` CLI, so a
+disagreement between them is a finding. An absent credential is a SKIP the cell
+names (`bq_target()` returns `None`), never an empty result that reads as
+agreement.
+
 ## Before submitting changes
 
 ```bash

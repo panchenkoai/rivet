@@ -401,6 +401,11 @@ fn derived_capture_marker_set_is_pinned() {
         "run_rivet_bounded(",
         "run_rivet_env(",
         "run_rivet_export(",
+        // `run_rivet_in_dir` — the runner-side twin of `Rig::run_in_dir`, for a
+        // config `rivet init` GENERATED: its relative `destination.path:` resolves
+        // against the process CWD, so running one needs the directory set. It
+        // spawns rivet, so it is a capture marker like its siblings.
+        "run_rivet_in_dir(",
         "run_rivet_ok(",
         "run_rivet_with_warn_log(",
         "run_with_env(",
@@ -665,11 +670,22 @@ fn oracle_class_census_is_pinned() {
         "assert_complete(",
         "confirmed_flush_lsn",
         "query_one(",
+        // The warehouse read back through the `bq` CLI — a reader sharing no
+        // code with rivet's write path (live_cdc_backfill's BigQuery cycle).
+        "read_bq_",
     ];
     let shared_codec = [
         "cdc_id_ops(",
         "read_all_parts(",
         "read_cdc_changes(",
+        // Parts under one prefix through rivet's own arrow/parquet crate
+        // (`common::parquet`; live_cdc_backfill reads the snapshot child vs the
+        // delta parent with it).
+        "total_parquet_rows(",
+        "parquet_column_type(",
+        // The single-part reader in the rig — nine CDC tests grade arrow cells
+        // through it and were counted as `presence` until it was listed here.
+        "read_one_batch(",
         "read_mongo_cdc_changes(",
         "run_and_read(",
         "drain_and_read(",
@@ -743,10 +759,25 @@ fn oracle_class_census_is_pinned() {
 // needs no data oracle — the pressure is (1) tier 2 below keeps completeness
 // CLAIMS out of that bucket, and (2) new data-truth tests land in the left
 // buckets. `self_counter` at 6 is the audit's residue after the 10 upgrades.
-const PIN_INDEPENDENT: usize = 69;
-const PIN_SHARED_CODEC: usize = 57;
+// 2026-09-16, the `cdc.backfill` suite (+7 capture tests): +2 independent (a
+// source re-query on the cycle test, the `bq` CLI on the BigQuery repeated-run
+// test), +5 shared_codec (parts read back under one prefix, the identity
+// checkpoint test's change re-read). `presence` unchanged.
+// 2026-09-17, the harness roast: `read_one_batch(` was an outcome marker but in
+// NO census bucket, so nine CDC tests grading arrow cells through it sat in
+// `presence` — listed, they move to shared_codec (presence 71 -> 62, banked).
+// +2 tests: the recipe-types test (`parquet_column_type`, shared_codec) and the
+// mixed-config `plan` test (reads `plan.json` — presence, its subject is the
+// planner's skip, not data).
+// 2026-09-17, v29: +1 independent — the crashed KEYSET baseline leg, graded by
+// DuckDB over the manifest-declared parts (`duckdb_declared_dir_id_set`).
+// 2026-09-18, the compact guard: +3 independent — a foreign base refused before
+// any write, a dropped base refused by name with the buffer kept, and a compact
+// killed before its merge; all three graded by `bq` and the load ledger.
+const PIN_INDEPENDENT: usize = 78;
+const PIN_SHARED_CODEC: usize = 73;
 const PIN_SELF_COUNTER: usize = 6;
-const PIN_PRESENCE: usize = 71;
+const PIN_PRESENCE: usize = 63;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
@@ -784,6 +815,7 @@ fn every_completeness_named_cdc_test_carries_an_independent_oracle() {
         // strongest claim shape — allowed because every caller hand-writes the
         // expectation from the SEED, not from rivet's output
         "query_one(", // a source re-query
+        "read_bq_",   // the warehouse through the `bq` CLI (same class as in the census)
     ];
     let mut weak = Vec::new();
     for entry in fs::read_dir(root.join("tests/live")).unwrap() {
@@ -943,8 +975,16 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // reading the manifest SIDECAR back (source-identity /
                 // snapshot-leg tests assert on its recorded fields);
                 || chunk.contains("manifest.json")
+                // `rivet plan`'s own artifact — the product a plan-shaped test
+                // reads back (live_cdc_backfill: a mixed config still plans).
+                || chunk.contains("plan.json")
                 // the mssql change-row replay oracle (read_cdc_rows' sibling);
                 || chunk.contains("read_cdc_changes(")
+                // live_cdc_backfill: parts under ONE prefix (the snapshot child
+                // vs the delta parent) through arrow/parquet, and the warehouse
+                // read back through the `bq` CLI.
+                || chunk.contains("total_parquet_rows(")
+                || chunk.contains("read_bq_")
                 // the four-way DuckDB census — the SOURCE table, the delivered
                 // parquet and rivet's two ledgers, from a session sharing no code
                 // with the product. Registered for the soak stand, whose whole

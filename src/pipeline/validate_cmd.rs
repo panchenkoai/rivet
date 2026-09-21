@@ -102,7 +102,17 @@ pub fn run_validate_command(
             Some(e) => vec![e],
             None => anyhow::bail!("export '{}' not found in config", name),
         },
-        None => config.exports.iter().collect(),
+        None => {
+            // A `cdc.backfill` recipe never runs on its own, so its prefix holds
+            // nothing to certify; the baseline it describes is verified under the
+            // CDC export's `snapshot/`. Same whole-config rule as `run`.
+            let recipes = crate::config::backfill_recipe_names(&config.exports);
+            config
+                .exports
+                .iter()
+                .filter(|e| !recipes.contains(&e.name))
+                .collect()
+        }
     };
 
     if exports.is_empty() {
@@ -147,8 +157,7 @@ pub fn run_validate_command(
         // fail the `__pos` check on a missing part.
         let multiplex = export.multiplex_tables();
         let has_snapshot = export.mode == crate::config::ExportMode::Cdc
-            && export.cdc.as_ref().and_then(|c| c.initial)
-                == Some(crate::config::CdcInitialMode::Snapshot);
+            && export.cdc.as_ref().is_some_and(|c| c.has_baseline());
         match multiplex {
             Some(tables) => {
                 for table in tables {
@@ -193,7 +202,9 @@ pub fn run_validate_command(
     }
 
     match format {
-        ValidateOutputFormat::Pretty => render_pretty(&all_results, &hard_failures),
+        ValidateOutputFormat::Pretty => {
+            render_pretty(&mut std::io::stdout().lock(), &all_results, &hard_failures)
+        }
         ValidateOutputFormat::Json(out_path) => {
             render_json(&all_results, &hard_failures, out_path)?
         }
@@ -506,11 +517,12 @@ fn verify_one_prefix(
     }
 }
 
-fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut h = stdout.lock();
-
+/// Render the text verdicts to `h`.
+///
+/// Takes the writer rather than locking stdout itself: these lines are what an
+/// operator reads to decide whether a dataset is sound, so they need a seam a
+/// test can assert on.
+fn render_pretty(h: &mut impl std::io::Write, results: &[ExportVerdict], hard_failures: &[String]) {
     for r in results {
         let _ = writeln!(h, "── {} ──", r.name);
         let _ = writeln!(h, "  prefix:    {}", r.resolved_prefix);
@@ -520,9 +532,13 @@ fn render_pretty(results: &[ExportVerdict], hard_failures: &[String]) {
         // only the manifest + _SUCCESS (light).
         let _ = writeln!(h, "  depth:     {}", v.depth_level);
         if v.legacy_run {
+            // The check establishes "no manifest here" and nothing more, so the
+            // line names BOTH causes rather than asserting the one it cannot
+            // know. A prefix that was never written reaches this verdict too.
             let _ = writeln!(
                 h,
-                "  status:    legacy_run (no manifest at destination — pre-0.7.0 prefix)"
+                "  status:    legacy_run (no manifest at this prefix — a pre-0.7.0 export, \
+                 or nothing was ever written here)"
             );
             continue;
         }
@@ -788,6 +804,37 @@ mod tests {
         // M6: no manifest, no failures — "cannot certify" is not "found a
         // problem".
         assert!(!verdict_fails_exit(&ManifestVerification::legacy()));
+    }
+
+    /// The legacy verdict says what the check ESTABLISHED — no manifest here —
+    /// and names both causes rather than asserting the one it cannot know.
+    ///
+    /// It read "pre-0.7.0 prefix" until 2026-09-21, which is precisely the cause
+    /// a mis-anchored run is NOT: `destination.path` is the one relative path
+    /// rivet resolves against the process CWD instead of the config's dir, so
+    /// validating from a different directory reaches this same verdict over a
+    /// prefix that was simply never written. Measured on a GENERATED config —
+    /// data under the working directory, ledger and checkpoint under the config,
+    /// and `validate` from the config's own directory printed `legacy_run`, exit 0.
+    #[test]
+    fn the_legacy_verdict_names_both_causes_and_asserts_neither() {
+        let verdict = ExportVerdict {
+            name: "orders".into(),
+            resolved_prefix: "./output/orders/".into(),
+            verification: ManifestVerification::legacy(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        render_pretty(&mut out, std::slice::from_ref(&verdict), &[]);
+        let text = String::from_utf8(out).expect("render is utf8");
+
+        assert!(
+            text.contains("no manifest at this prefix"),
+            "the line must state what was OBSERVED: {text}"
+        );
+        assert!(
+            text.contains("or nothing was ever written here"),
+            "…and the cause the old wording denied by omission: {text}"
+        );
     }
 
     #[test]

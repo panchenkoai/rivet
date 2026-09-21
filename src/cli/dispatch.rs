@@ -116,6 +116,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             run_id,
             rebuild_changelog,
         }),
+        Commands::Compact { config, run_id } => {
+            load::orchestrate::run_compacts(load::orchestrate::CompactArgs { config, run_id })
+        }
         Commands::Init {
             source,
             source_env,
@@ -131,6 +134,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             gcs_credentials_file,
             s3_bucket,
             s3_region,
+            bigquery_project,
+            bigquery_dataset,
             tls,
             tls_ca,
         } => dispatch_init(
@@ -148,6 +153,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             gcs_credentials_file,
             s3_bucket,
             s3_region,
+            bigquery_project,
+            bigquery_dataset,
             tls,
             tls_ca,
         ),
@@ -543,6 +550,8 @@ fn dispatch_init(
     gcs_credentials_file: Option<String>,
     s3_bucket: Option<String>,
     s3_region: Option<String>,
+    bigquery_project: Option<String>,
+    bigquery_dataset: Option<String>,
     tls: Option<crate::config::TlsMode>,
     tls_ca: Option<String>,
 ) -> Result<()> {
@@ -567,6 +576,8 @@ fn dispatch_init(
         gcs_credentials_file,
         s3_bucket,
         s3_region,
+        bigquery_project,
+        bigquery_dataset,
     };
     let filter = init::TableFilter { include, exclude };
     let tls_config = resolve_init_tls(tls, tls_ca)?;
@@ -1018,6 +1029,8 @@ mod init_tls_tests {
             vec![],
             None,
             false,
+            None,
+            None,
             None,
             None,
             None,

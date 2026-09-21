@@ -118,6 +118,10 @@ mutants.out/
 # Python bytecode (dev/ helper scripts)
 __pycache__/
 
+# uv's resolved environment for the harness pin. `uv.lock` IS committed — it is
+# what makes the oracle's reader reproducible — but the materialized venv is not.
+.venv/
+
 # Local dev-stand overlay: the compose override that keeps the stand's data
 # volumes across `down` (see dev/stand/README.md). Machine-specific by nature —
 # ports, volume paths and which engines a given box runs — so it is never

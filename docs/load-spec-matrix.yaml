@@ -165,9 +165,14 @@ scenarios:
     snowflake:  { na: "rebuild_changelog is refused as unsupported on Snowflake" }
 
   - id: span_over_the_job_cap_refused
-    what: "a load whose Parquet spans more than 4,000 partitions is refused from the footer statistics before any job, naming the granularity that fits (D4)"
+    what: "ONE Parquet file whose values alone span more than 4,000 partitions is refused from the footer statistics before any job, naming the file and the granularity that fits (D4) — the shape no batching splits (dates uncorrelated with the read key)"
     bigquery:   { test: bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load }
     snowflake:  { na: "no per-job partition cap" }
+
+  - id: span_over_the_job_cap_loads_in_batches
+    what: "files that are each narrow but together wide are packed, by their lowest value, into LOAD DATA jobs of at most 4,000 partitions each (a keyset export over an autoincrement key is date-local without chunking by date); a whole-table load that needs several jobs fills `<table>__staging` and swaps it in with one CLONE, an append load runs its batches into `__changes`. Measured live: 5,000 daily partitions read by keyset → two jobs, DAY partitions kept; the same rows with dates permuted → refused by file name, ledger `refused`, nothing in the warehouse"
+    bigquery:   { test: a_wide_history_read_by_keyset_loads_daily_partitions_in_batches }
+    snowflake:  { na: "no per-job partition cap — one COPY" }
 
   - id: hourly_lifetime_warning
     what: "hourly partitions without an expiry of at most 416 days warn at plan time — 10,000 partitions per table"

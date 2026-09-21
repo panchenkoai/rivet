@@ -119,6 +119,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `server_id` | `integer` |  | MySQL replica server-id for the binlog connection (default 4271; must be distinct from the source's and any other replica). |
 | `slot` | `string` |  | PostgreSQL logical replication slot name (default `rivet_slot`). |
 | `capture_instance` | `string` |  | SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources. |
+| `backfill` | `auto` |  | Which EXPORTS supply the baseline read (see [`CdcBackfill`]). Absent ⇒ no baseline: the stream captures changes only, and the operator owns the initial load. |
 
 ### `exports[].tuning`
 
@@ -177,4 +178,39 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `row_group_rows` | `integer` |  | Exact number of rows per group (`fixed_rows` only). |
 | `target_row_group_mb` | `integer` |  | Target Arrow buffer memory per row group in MB (`auto` and `fixed_memory`). Default: 128. |
 | `max_row_group_mb` | `integer` |  | Hard upper bound on row group memory in MB. When set, further reduces computed row count. |
+
+### `load` (the warehouse target, consumed by `rivet load`)
+
+| Field | Type | Required | Description |
+|-------|------|:--------:|-------------|
+| `target` | `bigquery` \| `snowflake` | **yes** | The warehouse: `bigquery` or `snowflake`. |
+| `project` | `string` |  | BigQuery: the project the dataset lives in. |
+| `dataset` | `string` |  | BigQuery: the dataset the tables are created in. |
+| `connection` | `string` |  | Snowflake: the `snow` CLI connection name. |
+| `warehouse` | `string` |  | Snowflake: the virtual warehouse the load runs on. |
+| `database` | `string` |  | Snowflake: the database the tables are created in. |
+| `schema` | `string` |  | Snowflake: the schema the tables are created in. |
+| `storage_integration` | `string` |  | Snowflake: a pre-created GCS `STORAGE INTEGRATION`. |
+| `cleanup_source` | `boolean` |  | After a successful load, delete the staged Parquet under the export prefix. |
+| `pk` | `auto` \| `none` |  | Dedup key of the incremental/CDC current-state view: `auto` (the source primary key `rivet run` recorded), `none`, or explicit columns; ignored for `full`. |
+| `layout` | `log_view` \| `base_buffer` |  | `log_view` or `base_buffer` — where the current state lives. Absent derives it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest changelog+view. `base_buffer` needs `target: bigquery` — `rivet compact` is what merges the buffer into the base, and it is BigQuery-only. |
+| `deleted_flag` | `boolean` |  | Whether the base carries a `__is_deleted` column. Absent derives it from the mode: a CDC stream expresses deletes and gets the flag, a query-based export cannot express one and does not — an extra column per row otherwise. |
+| `allow_source_drift` | `boolean` |  | Load even when a run manifest's source count disagrees with what it extracted (source→file drift): warn instead of blocking. |
+| `gc_orphans` | `boolean` |  | After a successful load, delete staged Parquet under the export prefix that no `Success` manifest references — crash leftovers. Only when no extract writes the prefix concurrently. |
+| `cluster_by` | `auto` \| `none` |  | `CLUSTER BY` of the table the load writes: `auto` (the primary key), `none`, or explicit columns (at most 4 on BigQuery). |
+| `partition` | `none` |  | How the table the load writes is partitioned: `none` (default), or exactly one of `column` (+ `granularity`), an integer `range`, or `ingestion` time. |
+
+### `exports[].load` and `exports[].load.tables.<table>`
+
+| Field | Type | Required | Description |
+|-------|------|:--------:|-------------|
+| `pk` | `auto` \| `none` |  | Dedup key of this table's current-state view. |
+| `cleanup_source` | `boolean` |  |  |
+| `gc_orphans` | `boolean` |  |  |
+| `cluster_by` | `auto` \| `none` |  | `CLUSTER BY` of this table. |
+| `allow_source_drift` | `boolean` |  |  |
+| `layout` | `log_view` \| `base_buffer` |  | Where this table's current state lives; inherits when absent. |
+| `deleted_flag` | `boolean` |  | Whether this table's base carries `__is_deleted`; inherits when absent. |
+| `partition` | `none` |  | This table's partitioning; `none` clears an inherited one. |
+| `tables` | `object` |  | On a multiplex `tables:` CDC export: the override for ONE captured table, keyed by its name, layered over this block — six tables through one stream rarely share a partition column or a key. Every name must be one of the export's `tables:`; a nested `tables:` is refused. |
 

@@ -640,14 +640,18 @@ pub fn reconcile(manifests: &[RunManifest], allow_source_drift: bool) -> Result<
                 if allow_source_drift {
                     eprintln!(
                         "warning: source→file drift for run `{}` (export `{}`): source had {src} \
-                         rows, extracted {rows} (--allow-source-drift)",
+                         rows, extracted {rows} (allowed by `allow_source_drift: true`)",
                         m.run_id, m.export_name
                     );
                 } else {
+                    // The remedy is a config key, not a CLI flag — clap defines no such
+                    // argument. Name where it goes, or the reader is still hunting.
                     bail!(
                         "source→file mismatch for run `{}` (export `{}`): source had {src} rows \
                          but {rows} were extracted — the extract dropped {} row(s). Investigate \
-                         before loading, or pass --allow-source-drift to override.",
+                         before loading; to accept it, set `allow_source_drift: true` in this \
+                         export's `load:` override (or the top-level `load:` block) and re-run \
+                         `rivet load`.",
                         m.run_id,
                         m.export_name,
                         src.abs_diff(rows)
@@ -1213,7 +1217,7 @@ mod tests {
     #[test]
     fn source_file_mismatch_is_allowed_under_the_override() {
         let m = manifest("r1", 100, Some(120));
-        let got = reconcile(&[m], true).expect("--allow-source-drift proceeds");
+        let got = reconcile(&[m], true).expect("allow_source_drift: true proceeds");
         assert_eq!(got.file_rows, 100);
         assert_eq!(
             got.source_rows,

@@ -42,7 +42,6 @@ fn main() {
     // password to stderr (and `main` defaults the filter to `warn`, so these
     // lines are shown). Route every formatted line through `redacted_log_line` so
     // the sink itself is the chokepoint: no call site has to remember.
-    use std::io::Write;
     // `opendal::layers::retry` is NOT filtered here: rivet installs its own
     // `RetryInterceptor` on the RetryLayer (`destination::cloud::RivetRetryNotify`)
     // that logs the FIRST transient retry per process at WARN (the error kind
@@ -51,17 +50,7 @@ fn main() {
     // would suppress the "destination is degrading" signal; aggregation keeps
     // the truth without the per-attempt spam (field find, 2026-08-13: a
     // 154-export pool run interleaved a retry WARN between most result lines).
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format(|buf, record| {
-            let line = redact::redacted_log_line(
-                &buf.timestamp().to_string(),
-                record.level().as_str(),
-                record.target(),
-                &record.args().to_string(),
-            );
-            writeln!(buf, "{line}")
-        })
-        .init();
+    redact::install_logger();
     let cli = cli::parse_cli();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {

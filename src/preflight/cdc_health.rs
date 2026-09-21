@@ -61,7 +61,11 @@ fn probe_failed(e: &anyhow::Error) -> DoctorCheck {
         "CDC health probe".into(),
         false,
         Some(super::doctor::trim_probe_error(e)),
-        Some("the CDC checks need a working source connection — fix the source auth failure above first".into()),
+        Some(
+            "the CDC probe stopped at this error — fix what it reports; any CDC checks listed \
+             above this line already ran and still apply"
+                .into(),
+        ),
     )
 }
 
@@ -82,15 +86,27 @@ pub(super) fn collect(config: &Config, config_dir: &std::path::Path) -> Vec<Doct
         Err(e) => return vec![probe_failed(&e)],
     };
     let tls = config.source.tls.as_ref();
+    // The engines APPEND to one vec rather than returning their own, so a probe that
+    // dies half-way keeps the verdicts it already reached. This used to be
+    // `Result<Vec<_>>` + `unwrap_or_else`, which REPLACED every collected verdict with
+    // the generic probe failure: against a live MySQL 8.4 replica with `log_bin=OFF`
+    // (2026-09-16) doctor graded "log_bin is OFF — enable binary logging", then threw
+    // that away when the next query (`SHOW BINARY LOGS`) failed with ERROR 1381, and
+    // printed a hint blaming source auth — which had passed. The operator fixed the
+    // grants, not the binlog.
+    let mut checks = Vec::new();
     let result = match config.source.source_type {
-        SourceType::Postgres => pg_checks(&url, tls, &cdc),
-        SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir),
-        SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir),
+        SourceType::Postgres => pg_checks(&url, tls, &cdc, config_dir, &mut checks),
+        SourceType::Mysql => mysql_checks(&url, tls, &cdc, config_dir, &mut checks),
+        SourceType::Mssql => mssql_checks(&url, tls, &cdc, config_dir, &mut checks),
         // Change streams: probe the replica-set requirement + declare the capture
         // fidelity tier (6.0+ pre/post-images vs current-state UpdateLookup).
-        SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir),
+        SourceType::Mongo => mongo_checks(&url, tls, &cdc, config_dir, &mut checks),
     };
-    result.unwrap_or_else(|e| vec![probe_failed(&e)])
+    if let Err(e) = result {
+        checks.push(probe_failed(&e));
+    }
+    checks
 }
 
 // ─── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -227,9 +243,41 @@ pub(crate) fn pg_foreign_slots_warning(
     })
 }
 
-fn pg_slot_verdict(export: &str, slot: &str, state: Option<PgSlot>) -> DoctorCheck {
+/// `resume_ckpt`: a checkpoint file exists AND carries a position — the SAME
+/// decision the run makes (`cdc_job.rs`, `Position::load(p)?.is_some()`), not a
+/// second copy of it.
+///
+/// Without it this arm reported a PASSING "slot absent — created on the first
+/// run" for a slot that had been dropped or invalidated under an existing
+/// checkpoint, and the very next `rivet run` hard-refused
+/// (`source/postgres/cdc.rs`). `doctor && run` — the order `init` itself prints —
+/// gave a green light and then a wall. Postgres was the one engine missing this:
+/// MySQL, SQL Server and Mongo each load the checkpoint through `Position::load`
+/// in this file, and the MSSQL arm's comment records the same defect MEASURED
+/// there. The message below is the run's own, verbatim, so the operator is told
+/// the same thing twice rather than two different things.
+fn pg_slot_verdict(
+    export: &str,
+    slot: &str,
+    state: Option<PgSlot>,
+    resume_ckpt: bool,
+) -> DoctorCheck {
     let name = format!("CDC slot '{slot}' (export '{export}')");
     match state {
+        None if resume_ckpt => check(
+            name,
+            false,
+            Some(
+                "slot is missing but a resume checkpoint exists — the slot was dropped or \
+                 invalidated, and the changes since then are no longer in the log. Recover in \
+                 rivet's OWN order: delete the checkpoint file so the next run pins a fresh slot \
+                 at the current WAL position, THEN re-snapshot the table (mode: full). \
+                 Snapshotting first leaves everything changed between the snapshot and the new \
+                 slot in neither."
+                    .into(),
+            ),
+            None,
+        ),
         None => check(
             name,
             true,
@@ -303,9 +351,10 @@ fn pg_checks(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
-) -> Result<Vec<DoctorCheck>> {
+    config_dir: &std::path::Path,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     let mut client = crate::source::postgres::connect_client(url, tls)?;
-    let mut checks = Vec::new();
     let mut ours: Vec<String> = Vec::new();
     for e in exports {
         let slot = e
@@ -322,7 +371,16 @@ fn pg_checks(
             active: r.get(0),
             retained_bytes: r.get(1),
         });
-        checks.push(pg_slot_verdict(&e.name, &slot, state));
+        // The run's own resume decision, read the same way it reads it — the three
+        // sibling engines in this file already do exactly this.
+        let resume_ckpt = match e.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) {
+            None => false,
+            Some(raw) => {
+                let p = &crate::source::cdc::resolve_checkpoint(raw, config_dir);
+                crate::source::cdc::Position::load(p)?.is_some()
+            }
+        };
+        checks.push(pg_slot_verdict(&e.name, &slot, state, resume_ckpt));
         ours.push(slot);
     }
     let rows = client.query(
@@ -336,10 +394,24 @@ fn pg_checks(
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect();
     checks.push(pg_foreign_slots_verdict(&foreign));
-    Ok(checks)
+    Ok(())
 }
 
 // ─── MySQL ───────────────────────────────────────────────────────────────────
+
+/// `true` when the server has binary logging OFF — the one state in which the
+/// retention probe (`SHOW BINARY LOGS`) answers with ERROR 1381 instead of a log
+/// list. Pure, so the skip decision below is graded offline even though the probe
+/// it guards is live-only. MySQL renders the variable as `ON`/`OFF` or `1`/`0`
+/// depending on how it is asked; both spellings mean the same thing.
+fn binlog_disabled(vars: &[(String, String)]) -> bool {
+    let log_bin = vars
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("log_bin"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("OFF");
+    !log_bin.eq_ignore_ascii_case("ON") && log_bin != "1"
+}
 
 /// The binlog server config CDC needs; anything else breaks capture quietly
 /// (STATEMENT rows never arrive; MINIMAL drops the unchanged columns the
@@ -351,10 +423,9 @@ fn mysql_binlog_config_verdict(vars: &[(String, String)]) -> DoctorCheck {
             .map(|(_, v)| v.as_str())
     };
     let name = "CDC binlog server config".to_string();
-    let log_bin = get("log_bin").unwrap_or("OFF");
     let format = get("binlog_format").unwrap_or("?");
     let row_image = get("binlog_row_image").unwrap_or("FULL");
-    if !log_bin.eq_ignore_ascii_case("ON") && log_bin != "1" {
+    if binlog_disabled(vars) {
         return check(
             name,
             false,
@@ -458,17 +529,25 @@ fn mysql_checks(
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
     config_dir: &std::path::Path,
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     use mysql::prelude::Queryable;
     let pool = crate::source::mysql::connect_pool(url, tls)?;
     let mut conn = pool.get_conn()?;
-    let mut checks = Vec::new();
 
     let vars: Vec<(String, String)> = conn.query(
         "SHOW GLOBAL VARIABLES WHERE Variable_name IN \
          ('log_bin','binlog_format','binlog_row_image')",
     )?;
     checks.push(mysql_binlog_config_verdict(&vars));
+    // Binlog OFF ⇒ stop here. The retention probe below (`SHOW BINARY LOGS`) fails
+    // with ERROR 1381 "You are not using binary logging", which says strictly less
+    // than the verdict just pushed, and every checkpoint verdict needs the log list
+    // it would have returned. Returning leaves the operator one actionable line with
+    // nothing contradicting it.
+    if binlog_disabled(&vars) {
+        return Ok(());
+    }
 
     // SHOW BINARY LOGS: Log_name, File_size (+ Encrypted on 8.0.14+); take the
     // first two columns positionally so the extra column never breaks the map.
@@ -528,7 +607,7 @@ fn mysql_checks(
         };
         checks.push(mysql_ckpt_verdict(&e.name, ckpt, &logs));
     }
-    Ok(checks)
+    Ok(())
 }
 
 // ─── SQL Server ──────────────────────────────────────────────────────────────
@@ -664,9 +743,9 @@ fn mssql_checks(
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
     config_dir: &std::path::Path,
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
-    let mut checks = Vec::new();
     for e in exports {
         let ci = e.cdc.as_ref().and_then(|c| c.capture_instance.as_deref());
         let health = src.cdc_health(ci)?;
@@ -720,7 +799,7 @@ fn mssql_checks(
         }
         checks.extend(mssql_verdicts(&e.name, ci, &mssql_health, ckpt_state));
     }
-    Ok(checks)
+    Ok(())
 }
 
 // ─── MongoDB ─────────────────────────────────────────────────────────────────
@@ -734,9 +813,9 @@ fn mongo_checks(
     tls: Option<&crate::config::TlsConfig>,
     exports: &[&ExportConfig],
     config_dir: &std::path::Path,
-) -> Result<Vec<DoctorCheck>> {
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
     let cap = crate::source::mongo::cdc::probe_capability(url, tls)?;
-    let mut checks = Vec::new();
 
     // The checkpoint, which this took as `_exports` and never read. `create_change_
     // stream`'s Mongo arm loads it and `Position::load` HARD-FAILS on a corrupt file,
@@ -813,20 +892,81 @@ fn mongo_checks(
                 .to_string()
         }),
     ));
-    Ok(checks)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `collect` is the doctor's CDC entry point: nothing for a config without a
+    /// stream, and — when the probe cannot even resolve the source — ONE failed
+    /// check that says so, never an empty list a reader takes for "all healthy".
+    /// RED against `collect` stubbed to `vec![]`. No network: the URL comes from an
+    /// environment variable that is not set.
+    #[test]
+    fn collect_reports_a_probe_that_cannot_start_and_nothing_for_a_batch_config() {
+        let cfg = |mode: &str| {
+            Config::from_yaml(&format!(
+                "source:\n  type: postgres\n  url_env: RIVET_DOCTOR_TEST_UNSET_URL\nexports:\n\
+                 \x20 - name: t\n    table: t\n    mode: {mode}\n    format: parquet\n\
+                 \x20   {}destination: {{ type: local, path: ./out }}\n",
+                if mode == "cdc" {
+                    "cdc: { checkpoint: ./t.ckpt }\n    "
+                } else {
+                    ""
+                }
+            ))
+            .expect("a config")
+        };
+        let dir = std::path::Path::new(".");
+        assert!(collect(&cfg("full"), dir).is_empty());
+        let checks = collect(&cfg("cdc"), dir);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert!(
+            !checks[0].ok && checks[0].name == "CDC health probe",
+            "{checks:?}"
+        );
+    }
+
     // ── PostgreSQL verdicts ──
 
     #[test]
-    fn pg_absent_slot_is_healthy_created_on_first_run() {
-        let c = pg_slot_verdict("orders", "rivet_orders", None);
+    fn pg_absent_slot_with_no_checkpoint_is_healthy_created_on_first_run() {
+        let c = pg_slot_verdict("orders", "rivet_orders", None, false);
         assert!(c.ok);
         assert!(c.detail.unwrap().contains("first run"));
+    }
+
+    /// The case the old signature could not express, and the reason it was added:
+    /// an absent slot is a healthy FIRST RUN only when no checkpoint claims a
+    /// position. With one, the slot was dropped or invalidated and the run
+    /// hard-refuses — so `doctor && run` must not green-light it.
+    ///
+    /// Postgres was the one engine missing this; MySQL, SQL Server and Mongo each
+    /// load the checkpoint through `Position::load` in this file, and the MSSQL
+    /// arm's comment records the same defect MEASURED there.
+    ///
+    /// Both directions, because either alone passes a broken build: the
+    /// checkpoint case must FAIL, and the true first run must stay healthy.
+    /// RED against dropping the `resume_ckpt` arm.
+    #[test]
+    fn pg_absent_slot_with_a_resume_checkpoint_fails_and_names_the_recovery_order() {
+        let c = pg_slot_verdict("orders", "rivet_orders", None, true);
+        assert!(
+            !c.ok,
+            "a dropped slot under an existing checkpoint is not a first run: {c:?}"
+        );
+        let detail = c.detail.expect("the verdict must say why");
+        assert!(
+            detail.contains("resume checkpoint exists"),
+            "it must name the state, not just fail: {detail}"
+        );
+        assert!(
+            detail.contains("delete the checkpoint file") && detail.contains("THEN re-snapshot"),
+            "…and the run's OWN recovery order, or preflight and run tell the operator two \
+             different things: {detail}"
+        );
     }
 
     #[test]
@@ -838,6 +978,7 @@ mod tests {
                 active: false,
                 retained_bytes: 10 << 20,
             }),
+            false,
         );
         assert!(ok.ok, "10 MiB retained is healthy");
 
@@ -848,6 +989,7 @@ mod tests {
                 active: false,
                 retained_bytes: 2 << 30,
             }),
+            false,
         );
         assert!(!bad.ok, "2 GiB retained fails");
         assert!(bad.hint.unwrap().contains("pg_drop_replication_slot"));
@@ -966,6 +1108,36 @@ mod tests {
             ("binlog_format".into(), format.into()),
             ("binlog_row_image".into(), image.into()),
         ]
+    }
+
+    /// `log_bin=OFF` must be RECOGNISED as the skip condition, in both spellings the
+    /// server uses. RED against `binlog_disabled` returning false: `mysql_checks` then
+    /// runs `SHOW BINARY LOGS`, which answers ERROR 1381, and the collected verdict —
+    /// the only line naming the real cause — is replaced by a generic probe failure.
+    /// Measured live on a MySQL 8.4.8 replica (2026-09-16), where `@@log_bin` reads `0`.
+    #[test]
+    fn binlog_off_is_detected_in_both_spellings_and_named_in_the_verdict() {
+        let off = |v: &str| {
+            vec![
+                ("log_bin".to_string(), v.to_string()),
+                ("binlog_format".to_string(), "ROW".to_string()),
+                ("binlog_row_image".to_string(), "FULL".to_string()),
+            ]
+        };
+        assert!(binlog_disabled(&off("OFF")), "`OFF` is binlog disabled");
+        assert!(binlog_disabled(&off("0")), "8.x renders @@log_bin as 0/1");
+        assert!(!binlog_disabled(&off("ON")), "`ON` must probe retention");
+        assert!(!binlog_disabled(&off("1")), "`1` must probe retention");
+        assert!(
+            binlog_disabled(&[]),
+            "a server that did not report the variable is not provably logging"
+        );
+        let verdict = mysql_binlog_config_verdict(&off("0"));
+        assert!(!verdict.ok);
+        assert!(
+            verdict.detail.unwrap().contains("log_bin is OFF"),
+            "the failing verdict must name the cause, not the format/image checks below it"
+        );
     }
 
     #[test]

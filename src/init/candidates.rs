@@ -5,7 +5,7 @@
 
 use super::{
     ChunkCandidate, CursorCandidate, CursorCandidateReason, TableInfo, is_integer_type,
-    is_timestamp_type,
+    is_mutation_stamp, is_timestamp_type,
 };
 
 /// Rank every plausible cursor candidate.
@@ -31,16 +31,12 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
             continue;
         }
 
-        match col.name.as_str() {
-            "updated_at" | "modified_at" => {
-                reasons.push(CursorCandidateReason::NameSuggestsUpdated);
-                score += 40;
-            }
-            "created_at" => {
-                reasons.push(CursorCandidateReason::NameSuggestsCreated);
-                score += 20;
-            }
-            _ => {}
+        if is_mutation_stamp(&col.name) {
+            reasons.push(CursorCandidateReason::NameSuggestsUpdated);
+            score += 40;
+        } else if super::is_creation_stamp(&col.name) {
+            reasons.push(CursorCandidateReason::NameSuggestsCreated);
+            score += 20;
         }
 
         if col.is_nullable {
@@ -146,6 +142,78 @@ mod tests {
             c.reasons
                 .contains(&CursorCandidateReason::NameSuggestsUpdated)
         }));
+    }
+
+    /// A mutation stamp that is not spelled `updated_at` must still outrank the
+    /// create-only column. Measured on a dogfood stand 2026-09-18: the scorer knew
+    /// exactly two literals, so `created_at` (+20 name) beat `changed_at` (+0) and
+    /// init wrote the create-only column as `cursor_column` — on a table where all
+    /// 1000 rows had `changed_at > created_at`, an incremental export that misses
+    /// 100% of updates. RED against the old `"updated_at" | "modified_at"` arm.
+    #[test]
+    fn a_mutation_stamp_spelled_otherwise_still_outranks_created_at() {
+        for stamp in ["changed_at", "last_modified", "update_date"] {
+            let t = table(vec![
+                col("id", "bigint", true, false),
+                col("created_at", "timestamp", false, false),
+                col(stamp, "timestamp", false, false),
+            ]);
+            let cands = cursor_candidates(&t);
+            assert_eq!(
+                cands[0].column, stamp,
+                "'{stamp}' moves on update, 'created_at' does not — it must lead"
+            );
+        }
+    }
+
+    /// PascalCase (SQL Server's convention): `ModifiedDate` is the mutation stamp and
+    /// must lead `CreatedDate`, whatever their order. RED against snake_case-only
+    /// name lists, under which both scored +0 and the earlier column won.
+    #[test]
+    fn pascal_case_mutation_stamp_leads_the_creation_stamp() {
+        let t = table(vec![
+            col("BusinessEntityID", "bigint", true, false),
+            col("CreatedDate", "datetime2", false, false),
+            col("ModifiedDate", "datetime2", false, false),
+        ]);
+        let cands = cursor_candidates(&t);
+        assert_eq!(cands[0].column, "ModifiedDate");
+        assert!(cands.iter().any(|c| {
+            c.column == "CreatedDate"
+                && c.reasons
+                    .contains(&CursorCandidateReason::NameSuggestsCreated)
+        }));
+    }
+
+    /// The scores are a SUM of the documented weights — +40 for a timestamp type, +40
+    /// for a mutation stamp, +20 for a creation stamp, the position bonus — so the
+    /// discovery artifact stays reproducible. RED against `*=` / `-=` in place of `+=`
+    /// (a product of the weights still sorts first, and a subtraction still trails).
+    #[test]
+    fn scores_add_the_documented_weights() {
+        let t = table(vec![
+            col("id", "bigint", true, false),
+            col("created_at", "timestamp", false, false),
+            col("updated_at", "timestamp", false, false),
+        ]);
+        let score = |name: &str| {
+            cursor_candidates(&t)
+                .into_iter()
+                .find(|c| c.column == name)
+                .map(|c| c.score)
+                .unwrap_or_else(|| panic!("{name} is a candidate"))
+        };
+        assert_eq!(
+            score("updated_at"),
+            40 + 40 + 1,
+            "type + mutation stamp + position"
+        );
+        assert_eq!(
+            score("created_at"),
+            40 + 20 + 2,
+            "type + creation stamp + position"
+        );
+        assert_eq!(score("id"), 25 + 3, "integer PK + position");
     }
 
     #[test]

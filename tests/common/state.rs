@@ -35,6 +35,7 @@ pub struct MetricsRow {
     pub quality_passed: Option<bool>,
     pub batch_size_memory_mb: Option<i64>,
     pub skip_reason: Option<String>,
+    pub peak_rss_mb: Option<i64>,
 }
 
 /// A handle to one run's state DB. Open once, query many.
@@ -120,8 +121,10 @@ impl StateDb {
             .flatten()
     }
 
-    /// The `load_run.status` of every load into `target_table`, oldest first.
-    pub fn load_statuses(&self, target_table: &str) -> Vec<String> {
+    /// The `load_run.status` of every load into `target_table`, oldest first — in
+    /// the SQLite file this handle opened. Tests call [`ledger_load_statuses`],
+    /// which reads the backend the binary actually wrote.
+    fn load_statuses(&self, target_table: &str) -> Vec<String> {
         let mut stmt = self
             .conn
             .prepare("SELECT status FROM load_run WHERE target_table = ?1 ORDER BY finished_at")
@@ -166,6 +169,35 @@ impl StateDb {
         Some((names, key))
     }
 
+    /// `(column, rivet_type as recorded)` of the load spec — the TYPE half, for
+    /// tests whose subject is what the warehouse DDL will be typed from.
+    pub fn load_spec_types(&self, export: &str, unit: Option<&str>) -> Vec<(String, String)> {
+        let columns: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT columns_json FROM export_load_spec WHERE export_name = ?1 AND unit = ?2",
+                [export, unit.unwrap_or("")],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("query export_load_spec")
+            .flatten();
+        columns
+            .map(|c| {
+                serde_json::from_str::<Vec<serde_json::Value>>(&c)
+                    .expect("columns_json")
+                    .iter()
+                    .map(|v| {
+                        (
+                            v["name"].as_str().expect("column name").to_string(),
+                            v["rivet_type"].to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The full `export_metrics` row for `run_id`, read in one query.
     pub fn metrics_row(&self, run_id: &str) -> MetricsRow {
         self.conn
@@ -173,7 +205,8 @@ impl StateDb {
                 "SELECT run_id, status, total_rows, source_type, destination_type, \
                         rivet_version, batch_size, chunk_size, parallel, files_committed, \
                         longest_chunk_ms, pg_temp_bytes_delta, source_count, reconciled, validated, \
-                        schema_fingerprint, quality_passed, batch_size_memory_mb, skip_reason \
+                        schema_fingerprint, quality_passed, batch_size_memory_mb, skip_reason, \
+                        peak_rss_mb \
                  FROM export_metrics WHERE run_id = ?1",
                 [run_id],
                 |r| {
@@ -197,6 +230,7 @@ impl StateDb {
                         quality_passed: r.get(16)?,
                         batch_size_memory_mb: r.get(17)?,
                         skip_reason: r.get(18)?,
+                        peak_rss_mb: r.get(19)?,
                     })
                 },
             )
@@ -285,5 +319,33 @@ impl StateDb {
             })
             .expect("query export_metrics");
         rows.filter_map(|r| r.ok()).collect()
+    }
+}
+
+/// `load_run.status` for `target_table`, oldest first, from the backend the run
+/// USED: Postgres when `RIVET_STATE_URL` names one (the gate's Postgres pass sets
+/// it for every cell), else the SQLite file beside `cfg`. Reading the SQLite file
+/// under a Postgres pass opens an EMPTY database and panics on the missing table —
+/// two gates lost the `batches:refusal` cell to exactly that.
+pub fn ledger_load_statuses(cfg: &std::path::Path, target_table: &str) -> Vec<String> {
+    let pg = std::env::var("RIVET_STATE_URL")
+        .ok()
+        .filter(|u| u.starts_with("postgres"));
+    match pg {
+        Some(url) => {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_STATE_URL: {e}")
+            });
+            client
+                .query(
+                    "SELECT status FROM load_run WHERE target_table = $1 ORDER BY finished_at",
+                    &[&target_table],
+                )
+                .expect("query load_run")
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect()
+        }
+        None => StateDb::next_to_config(cfg).load_statuses(target_table),
     }
 }

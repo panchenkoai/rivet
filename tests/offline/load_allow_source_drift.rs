@@ -71,10 +71,13 @@ fn a_drifted_second_run_is_refused_unless_allow_source_drift_is_set() {
         "the refusal names the drifted run: {err}"
     );
     assert!(err.contains("dropped 2 row(s)"), "{err}");
+    // The underscored key, not the hyphenated flag: a substring matching both
+    // cannot tell them apart, which is how the wrong spelling survived a guard.
     assert!(
-        err.contains("allow-source-drift"),
-        "and the way past it: {err}"
+        err.contains("allow_source_drift: true"),
+        "the refusal must name the config key, not a flag: {err}"
     );
+    assert!(err.contains("`load:`"), "…and where that key goes: {err}");
 
     let got =
         reconcile(&[clean, drifted], true).expect("allow_source_drift downgrades to a warning");

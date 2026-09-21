@@ -108,3 +108,51 @@ scenarios:
     full:        { test: warehouse_cell_smoke_batch_mysql }
     incremental: { test: warehouse_cell_incremental_dedup_mysql }
     cdc:         { test: warehouse_cell_cdc_backfill_snapshot_mysql }
+
+  - id: per_run_spec_pin
+    what: "a load is typed from the spec of the RUN it consumes (export_load_spec_run, state v28), not the by-name row: on a state DB shared by two configs whose exports share a name, the by-name row is last-writer-wins and the other config's run retyped this table between the run and its load (measured: a `_id` key on a PostgreSQL `users`). `pin_plan_to_its_run` runs inside the per-table closure for every mode; a run older than v28 or an unlistable prefix keeps the by-name spec and says so."
+    full:        { test: a_load_is_typed_from_its_own_run_not_from_the_last_writer_of_its_name }
+    incremental: { na: "shared seam: the pin runs in the per-table closure before the mode dispatch; the per-run row itself is pinned by each_run_keeps_its_own_spec_while_the_by_name_row_follows_the_last_writer" }
+    cdc:         { na: "shared seam (same closure); the init-recorded key a run cannot see is borrowed by the_run_spec_borrows_an_init_recorded_key_but_never_another_runs" }
+
+  - id: per_table_load_override
+    what: "a multiplex `tables:` stream's `load:` takes `tables: { <table>: {…} }` — each captured table's block layers over the export's, over the top-level `load:`, so six tables through one stream no longer share one partition column and one key"
+    full:        { na: "a batch export has one table; its per-table block IS the export's `load:`" }
+    incremental: { na: "one table per export, as full" }
+    cdc:         { test: a_multiplex_export_takes_per_table_load_overrides }
+
+  - id: load_lease
+    what: "ONE `rivet load` per warehouse table at a time: two concurrent loads both read the ledger before either wrote it and appended the same runs twice. The lease is a Postgres session advisory lock on a shared state, an `flock` sidecar beside a SQLite state — released by the OS when the holder dies, no clock, no cleanup command. Taken in `execute_load` before `prepare_load`, so every mode passes through it."
+    full:        { test: a_second_load_of_the_same_table_waits_for_the_first_to_release }
+    incremental: { na: "shared seam (execute_load), one lease call for every mode" }
+    cdc:         { na: "shared seam (execute_load)" }
+
+  - id: by_name_plan_fit_deferred_until_pin
+    what: "the plan `rivet load` builds from the BY-NAME spec is provisional: on a shared state DB that row may be another config's same-named export (measured live: MySQL's `users` load refused `pk: id` against Mongo's `_id` spec before the pin could run). `pk` / `cluster_by` / `partition` column existence is DEFERRED at plan time (`SpecFit::Deferred`), checked strictly by the pin's rebuild from the run's own spec, and by `check_spec_fit` on every path that keeps the by-name plan."
+    full:        { test: a_by_name_plan_defers_its_key_fit_to_the_pin_and_still_owes_it }
+    incremental: { na: "shared seam: plan_loads builds every mode's plan with the same fit" }
+    cdc:         { na: "shared seam (plan_loads / pin_plan_to_its_run)" }
+
+  - id: base_and_buffer_layout
+    what: "a `backfill:` stream's baseline OVERWRITES a physical base (`<table>`: source columns + `__is_deleted` written as data by the leg — BigQuery fills an absent column with NULL, never its DEFAULT, measured) and its changes APPEND into a partition-less buffer `<table>__changes`; no view, no MT7 adoption, no re-baseline refusal (a new baseline replaces the base). Live: run → load → base TABLE of 5 rows, no NULL flag; the changes land in the buffer while the base waits"
+    full:        { na: "a batch export has no baseline leg / change stream" }
+    incremental: { test: a_generated_config_drives_run_load_compact_into_the_warehouse_postgres }
+    cdc:         { test: base_and_buffer_cycle_run_load_compact_keeps_deletes_as_flags }
+
+  - id: compact_merges_the_buffer_and_drops_it
+    what: "`rivet compact`: one MERGE per table (per ≤4,000-partition window) upserts the latest change per key into the base, flags a tombstone instead of deleting, un-flags a re-insert, then DROPs the buffer; both MERGE sides are bounded by the same constants so the base prunes; a crash between MERGE and DROP re-merges idempotently. Live: 8 rows / 7 live / 1 flagged with its last values, buffer gone, second compact a no-op, crash-and-retry merges once"
+    full:        { na: "nothing to compact" }
+    incremental: { test: a_generated_config_drives_run_load_compact_into_the_warehouse_postgres }
+    cdc:         { test: compact_merge_flags_deletes_and_prunes_both_sides_by_constants }
+
+  - id: whole_table_pass_over_a_buffered_base_is_refused
+    what: "under `layout: base_buffer` a whole-table pass (a CDC re-baseline, an incremental run with no cursor to resume from) REPLACES the base — and a buffer still holding rows from before it would, at the next `rivet compact`, merge OLDER values over the new base (a re-snapshot after a gap restored exactly the pre-gap rows it existed to fix). Refused by name when `<table>__changes` holds rows, naming the two recoveries (compact first if the buffer belongs to the current base, drop it if the pass re-snapshots past them); nothing consumed. The `incremental` cell is the same predicate the CDC leg calls — one function, two callers."
+    full:        { na: "a full load has no buffer" }
+    incremental: { test: a_whole_table_pass_over_a_buffered_base_is_refused_until_the_buffer_is_dealt_with }
+    cdc:         { test: a_whole_table_pass_over_a_buffered_base_is_refused_until_the_buffer_is_dealt_with }
+
+  - id: pin_listing_consistency
+    what: "the pin lists the prefix and types the plan from the newest run WITH a spec; `prepare_load` lists again — a run that finishes between the two listings would be loaded with the older spec's columns. A run in the load's listing that finished AFTER the pinned run is refused for this cycle (`late_runs_refusal`, pure) and named; the next load pins it."
+    full:        { test: a_run_that_finished_after_the_pinned_one_is_refused_this_cycle }
+    incremental: { na: "shared seam: the check runs in prepare_load on the selected runs of every mode" }
+    cdc:         { na: "shared seam (prepare_load)" }

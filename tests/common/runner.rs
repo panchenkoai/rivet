@@ -88,6 +88,23 @@ pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
     cmd.output().expect("spawn rivet binary")
 }
 
+/// `run_rivet_env` with the process working directory set to `dir`.
+///
+/// A config `rivet init` GENERATED carries a relative `destination.path:`
+/// (`./output/<table>/`), and `LocalDestination` keeps that string verbatim —
+/// so it resolves against the process CWD, unlike `cdc.checkpoint:`, which the
+/// runtime resolves through the config's own directory. Running a generated
+/// config the way its next-steps text tells an operator to — from the directory
+/// holding it — is therefore only expressible with the CWD set.
+pub fn run_rivet_in_dir(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(rivet_bin());
+    cmd.args(args).current_dir(dir);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn rivet binary")
+}
+
 /// Spawn `rivet run --config <cfg>` and wait up to `timeout` for it to exit on
 /// its own. Returns the elapsed time if it terminated within the budget (and
 /// asserts a clean exit), or `None` if it had to be killed. This is what makes a

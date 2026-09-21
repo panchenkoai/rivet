@@ -146,6 +146,34 @@ pub enum LoadMode {
     Cdc,
 }
 
+/// How a CDC export's tables are laid out in the warehouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdcLayout {
+    /// Baseline and changes in one `<table>__changes` log; `<table>` is the dedup
+    /// view over it (`initial: snapshot`, and every stream without a baseline).
+    LogAndView,
+    /// `<table>` is a physical base (source schema + `__is_deleted`) the baseline
+    /// legs overwrite; `<table>__changes` is a per-cycle buffer `rivet compact`
+    /// merges into the base and drops (`backfill:` streams).
+    BaseAndBuffer,
+}
+
+impl CdcLayout {
+    /// The `<table>__changes` log is a disposable per-cycle buffer: no partition
+    /// declaration, no option settling, no `__rebuild` leftovers to look for —
+    /// `compact` drops it whole.
+    pub fn log_is_disposable(self) -> bool {
+        matches!(self, CdcLayout::BaseAndBuffer)
+    }
+
+    /// `rivet compact` has something to merge for this layout: the base is a
+    /// physical table the legs overwrote, the log a buffer of changes since the
+    /// last merge. The changelog + view layout keeps its state in the log itself.
+    pub fn compacts(self) -> bool {
+        matches!(self, CdcLayout::BaseAndBuffer)
+    }
+}
+
 impl LoadMode {
     /// The ledger's `mode` discriminator (the `load_run.mode` column) — the single
     /// source of truth for the string that names each strategy in the state DB, so
@@ -198,6 +226,9 @@ pub struct LoadPlan {
     /// table it resolves to (dogfood LOW: require_pk labelled the table as the
     /// export).
     pub export_name: String,
+    /// The captured source table for a multiplex `tables:` export, `None` for a
+    /// single-relation one — the `unit` the state DB keys its load specs by.
+    pub unit: Option<String>,
     pub table: String,
     /// The resolved `load.partition` of the table the load writes.
     pub partition: Option<TablePartition>,
@@ -219,6 +250,16 @@ pub struct LoadPlan {
     pub pk: Vec<String>,
     /// The clustering of the table the load writes.
     pub clustering: Clustering,
+    /// The run this plan was typed from — `(run_id, finished_at)` — once the load
+    /// pinned it; a run that finishes after it is refused for this cycle.
+    pub pinned_run: Option<(String, String)>,
+    /// Where a CDC table's baseline lives (see [`CdcLayout`]); `LogAndView` for
+    /// every non-CDC mode.
+    pub layout: CdcLayout,
+    /// Whether the base carries `__is_deleted`. A stream expresses deletes, so it
+    /// defaults ON there and OFF for a query-based export; `load.deleted_flag`
+    /// decides when written.
+    pub deleted_flag: bool,
 }
 
 /// The clustering columns of the table a load writes, and where they came from: a
@@ -353,7 +394,197 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
         .context("opening the state DB, which holds the column types `rivet run` recorded")?;
     let (reports, keys) = crate::preflight::load_type_reports(&cfg, &state, target)?;
 
-    build_plans_keyed(&cfg, &load, reports, &keys)
+    // Deferred: this plan is typed from the BY-NAME spec, which the load then pins
+    // to the run it consumes (`orchestrate::pin_plan_to_its_run`) — a same-named
+    // export of another config may have written that row, and its columns are not
+    // this table's. The fit is checked strictly after the pin, or by
+    // `check_spec_fit` when no pin is possible.
+    build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)
+}
+
+/// The warehouse layout of one export: a `backfill:` stream keeps a physical base
+/// and a disposable change buffer; everything else is the changelog + view.
+/// An export mode's load strategy. Exhaustive (no `_`) on purpose: a future
+/// delta-style mode fails to COMPILE here until someone picks its load
+/// semantics, instead of silently defaulting to OVERWRITE (the
+/// incremental-overwrite data-loss class).
+pub fn load_mode_of(mode: crate::config::ExportMode) -> LoadMode {
+    match mode {
+        crate::config::ExportMode::Cdc => LoadMode::Cdc,
+        crate::config::ExportMode::Incremental => LoadMode::Incremental,
+        crate::config::ExportMode::Full => LoadMode::Full, // whole result set
+        crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
+        crate::config::ExportMode::TimeWindow => LoadMode::Full, // the current window, whole
+    }
+}
+
+/// One export's effective load settings: the shared section, the export's own `load:`
+/// block layered over it, then — for a captured table of a multiplex stream — that
+/// table's `load.tables.<name>` block over both.
+///
+/// THE overlay. It was written out four times (three `resolved_*` readers and the plan
+/// builder), and only the builder's copy applied the third layer, so the load honoured a
+/// per-table override the extract never saw.
+pub(crate) fn overlay(
+    section: &LoadSection,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> LoadSection {
+    let mut eff = match &export.load {
+        Some(o) => section.with_override(o),
+        None => section.clone(),
+    };
+    if let (Some(o), Some(t)) = (&export.load, table)
+        && let Some(per_table) = o.tables.get(t)
+    {
+        eff = eff.with_override(per_table);
+    }
+    eff
+}
+
+/// [`overlay`] against the config's shared `load:` block; `None` when there is none.
+pub fn effective_load(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> Option<LoadSection> {
+    config.load.as_ref().map(|s| overlay(s, export, table))
+}
+
+/// Whether THIS export's base carries the delete flag, from the config alone — the extract
+/// asks, because only the writer can put a constant column in the file.
+///
+/// `table` names the captured table when the caller has one (a multiplex stream stamps per
+/// table); `None` answers for the export as a whole.
+pub fn resolved_deleted_flag(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> bool {
+    effective_load(config, export, table)
+        .and_then(|eff| eff.deleted_flag)
+        .unwrap_or(matches!(load_mode_of(export.mode), LoadMode::Cdc))
+}
+
+/// Whether the BASE table this export lands carries `__is_deleted` as data.
+///
+/// Only a base-and-buffer layout has a base to carry it: under the log-and-view layout the
+/// flag lives in the changelog, and a base that is really a view cannot hold a column at
+/// all. Named and offline-graded because every caller — the CDC baseline leg, the
+/// incremental whole pass and the compaction — is a live-only body, where an inline
+/// `&&` is a decision the mutation corpus excludes with nothing asked in return. Two
+/// of the three know the layout statically and pass `true`; the third computes it.
+pub fn base_carries_delete_flag(base_and_buffer: bool, deleted_flag: bool) -> bool {
+    base_and_buffer && deleted_flag
+}
+
+/// Whether a whole-table pass may be folded into the changelog instead of landing as the
+/// base table.
+///
+/// Folding is the log-and-view layout's answer, where the name is a view and cannot be
+/// overwritten. Under base-and-buffer the first pass IS the base, so it must land as a
+/// table and never join the log.
+///
+/// Takes only the layout: whether a first pass EXISTS is carried by the `Option` the
+/// caller filters, so asking for it again here would put the same decision in two places.
+pub fn whole_table_pass_may_join_the_log(base_and_buffer: bool) -> bool {
+    !base_and_buffer
+}
+
+/// This export's effective warehouse partition. The EXTRACT asks, because nothing splits
+/// one Parquet file at load time: only the writer can keep a part inside a load job's
+/// partition budget. `table` names the captured table when the caller has one.
+pub fn resolved_partition(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> Option<PartitionSpec> {
+    effective_load(config, export, table).and_then(|eff| eff.partition)
+}
+
+/// Where THIS export's current state will live — the section's `layout:` with the export's
+/// block, and a captured table's block, layered over it. The EXTRACT asks too: a
+/// base-and-buffer table's rows carry the delete flag as data, and only the writer can put
+/// it in the file.
+pub fn resolved_layout(
+    config: &crate::config::Config,
+    export: &crate::config::ExportConfig,
+    table: Option<&str>,
+) -> CdcLayout {
+    let eff = effective_load(config, export, table);
+    let choice = eff.as_ref().and_then(|eff| eff.layout);
+    let compacts = eff.as_ref().is_some_and(warehouse_compacts);
+    cdc_layout(export, load_mode_of(export.mode), choice, compacts)
+}
+
+/// Whether the warehouse can merge a buffer into a base: `rivet compact` is
+/// BigQuery-only, so only there does a base-and-buffer table ever complete a cycle.
+pub(crate) fn warehouse_compacts(section: &LoadSection) -> bool {
+    matches!(section.target, LoadTarget::Bigquery { .. })
+}
+
+fn cdc_layout(
+    export: &crate::config::ExportConfig,
+    mode: LoadMode,
+    choice: Option<crate::config::load::LayoutChoice>,
+    warehouse_compacts: bool,
+) -> CdcLayout {
+    use crate::config::load::LayoutChoice;
+    match (mode, choice) {
+        // A `full` load overwrites the whole table on every pass: there is no
+        // accumulated current state to lay out, so the key means nothing here.
+        (LoadMode::Full, _) => CdcLayout::LogAndView,
+        // A base without a compaction is a snapshot frozen at the backfill and a buffer
+        // that grows for ever (measured on Snowflake): only a compacting warehouse gets
+        // one — written, or derived from a stream's `backfill:`.
+        (_, Some(LayoutChoice::BaseBuffer)) if warehouse_compacts => CdcLayout::BaseAndBuffer,
+        (LoadMode::Cdc, None) if warehouse_compacts => {
+            match export.cdc.as_ref().and_then(|c| c.backfill.as_ref()) {
+                Some(_) => CdcLayout::BaseAndBuffer,
+                None => CdcLayout::LogAndView,
+            }
+        }
+        // A written `log_view`, an unwritten incremental, or a warehouse that cannot
+        // compact: the changelog and its view.
+        _ => CdcLayout::LogAndView,
+    }
+}
+
+/// Whether a plan's `pk` / `cluster_by` / `partition` must name columns of the
+/// spec it is built from now, or may be checked later against the pinned run's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecFit {
+    Strict,
+    Deferred,
+}
+
+const NOT_A_COLUMN: &str = "is not a column of the export";
+
+/// The strict fit check a deferred plan still owes: every key, clustering and
+/// partition column is a column of the spec it is typed from.
+pub fn check_spec_fit(plan: &LoadPlan) -> Result<()> {
+    let has = |c: &str| plan.specs.iter().any(|s| s.column_name == c);
+    if let Some(m) = plan.pk.iter().find(|c| !has(c)) {
+        bail!(
+            "export `{}`: primary-key column `{m}` {NOT_A_COLUMN} — the dedup view partitions \
+             by it. fix `pk` in the export's `load:` block",
+            plan.export_name
+        );
+    }
+    if let Some(m) = plan.clustering.columns().iter().find(|c| !has(c)) {
+        bail!(
+            "export `{}`: `cluster_by` column `{m}` {NOT_A_COLUMN}",
+            plan.export_name
+        );
+    }
+    resolve_partition(
+        &plan.export_name,
+        &plan.load,
+        plan.mode,
+        &plan.specs,
+        SpecFit::Strict,
+    )?;
+    Ok(())
 }
 
 /// The **pure core** of [`plan_loads`]: map the resolver's type reports onto
@@ -375,6 +606,7 @@ fn build_plans_keyed(
     load: &LoadSection,
     reports: Vec<crate::preflight::type_report::ExportTypeReport>,
     keys: &RecordedKeys,
+    fit: SpecFit,
 ) -> Result<Vec<LoadPlan>> {
     let mut plans = Vec::with_capacity(reports.len());
     for report in reports {
@@ -512,60 +744,105 @@ fn build_plans_keyed(
         // ExportMode then fails to COMPILE here until someone picks its load
         // semantics, instead of silently defaulting to OVERWRITE (the
         // incremental-overwrite data-loss class).
-        let mode = match export.mode {
-            crate::config::ExportMode::Cdc => LoadMode::Cdc,
-            crate::config::ExportMode::Incremental => LoadMode::Incremental,
-            crate::config::ExportMode::Full => LoadMode::Full, // whole result set
-            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
-            crate::config::ExportMode::TimeWindow => {
-                // Full OVERWRITE by design — and said out loud (round-6): each
-                // load replaces the warehouse table with the CURRENT window, so
-                // history past `days_window` is capped, not accumulated. An
-                // accumulation-minded operator loses history silently otherwise.
-                eprintln!(
-                    "  note: export `{}` is mode: time_window — each load OVERWRITES the \
-                     warehouse table with the current window; rows older than the window \
-                     are dropped from the warehouse (append-history needs mode: \
-                     incremental).",
-                    export.name
-                );
-                LoadMode::Full
-            }
-        };
-        // Effective load config: the shared top-level `load:`, with this export's
-        // own `load:` block overriding the table-specific fields (pk, cleanup, …).
-        // The warehouse `target` is shared and cannot be re-targeted per export.
-        let eff_load = match &export.load {
-            Some(o) => load.with_override(o),
-            None => load.clone(),
-        };
+        let mode = load_mode_of(export.mode);
+        if matches!(export.mode, crate::config::ExportMode::TimeWindow) {
+            // Full OVERWRITE by design — and said out loud (round-6): each
+            // load replaces the warehouse table with the CURRENT window, so
+            // history past `days_window` is capped, not accumulated. An
+            // accumulation-minded operator loses history silently otherwise.
+            eprintln!(
+                "  note: export `{}` is mode: time_window — each load OVERWRITES the \
+                 warehouse table with the current window; rows older than the window \
+                 are dropped from the warehouse (append-history needs mode: \
+                 incremental).",
+                export.name
+            );
+        }
+        // The shared `load:`, this export's block, and — for a captured table of a
+        // multiplex stream — that table's block. One overlay, shared with the readers the
+        // extract calls, so both sides answer the same question the same way.
+        let eff_load = overlay(load, export, unit.as_deref());
         let (pk, cluster_by) = resolve_keys(
             &export.name,
             &eff_load,
             keys.get(&(export.name.clone(), unit)).map(Vec::as_slice),
             &specs,
+            fit,
         )?;
-        let partition = resolve_partition(&export.name, &eff_load, mode, &specs)?;
+        let partition = resolve_partition(&export.name, &eff_load, mode, &specs, fit)?;
         let clustering = match eff_load.cluster_by {
             KeyColumns::Auto => Clustering::Auto(cluster_by),
             _ => Clustering::Written(cluster_by),
         };
         plans.push(LoadPlan {
             export_name: export.name.clone(),
+            unit: report.table.clone(),
             table,
             partition,
             specs,
             gcs_prefix,
             destination: export.destination.clone(),
+            layout: cdc_layout(export, mode, eff_load.layout, warehouse_compacts(&eff_load)),
+            // A CDC stream can express a delete, a query cannot — so the flag is a
+            // column a batch base does not pay for unless its operator asks.
+            deleted_flag: eff_load
+                .deleted_flag
+                .unwrap_or(matches!(mode, LoadMode::Cdc)),
             load: eff_load,
             mode,
             cursor_column: export.cursor_column.clone(),
             pk,
             clustering,
+            pinned_run: None,
         });
     }
-    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;
+    reject_duplicate_target_tables(
+        &plans
+            .iter()
+            .map(|p| (p.table.as_str(), p.mode))
+            .collect::<Vec<_>>(),
+    )?;
     Ok(plans)
+}
+
+/// `plan` rebuilt from `spec` — the columns and key ONE run recorded — instead of
+/// the by-name spec [`plan_loads`] typed it from.
+///
+/// The by-name row (`export_load_spec`) is last-writer-wins: on a state DB shared
+/// by two configs whose exports share a NAME, the other config's run can retype
+/// this table between the run and its load — a `_id` key on a PostgreSQL table,
+/// another engine's column types in the DDL. The load therefore pins each plan to
+/// the spec of the run it is about to consume, which only that run wrote.
+pub fn retype_plan(
+    cfg: &crate::config::Config,
+    plan: &LoadPlan,
+    spec: &crate::state::LoadSpec,
+    target: crate::types::target::ExportTarget,
+) -> Result<LoadPlan> {
+    let export = cfg
+        .exports
+        .iter()
+        .find(|e| e.name == plan.export_name)
+        .with_context(|| format!("export `{}` not found in config", plan.export_name))?;
+    let load = cfg
+        .load
+        .clone()
+        .context("config has no top-level `load:` block")?;
+    let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
+    let report = crate::preflight::type_report::report_from_mappings(
+        export,
+        plan.unit.clone(),
+        mappings,
+        &crate::types::policy::TypePolicy::warn_only(),
+        Some(target),
+    );
+    let mut keys = RecordedKeys::new();
+    if let Some(pk) = &spec.primary_key {
+        keys.insert((export.name.clone(), plan.unit.clone()), pk.clone());
+    }
+    build_plans_keyed(cfg, &load, vec![report], &keys, SpecFit::Strict)?
+        .pop()
+        .context("one report yields one plan")
 }
 
 /// [`build_plans_keyed`] with no recorded keys.
@@ -575,7 +852,7 @@ fn build_plans(
     load: &LoadSection,
     reports: Vec<crate::preflight::type_report::ExportTypeReport>,
 ) -> Result<Vec<LoadPlan>> {
-    build_plans_keyed(cfg, load, reports, &RecordedKeys::new())
+    build_plans_keyed(cfg, load, reports, &RecordedKeys::new(), SpecFit::Strict)
 }
 
 /// Resolve `pk` and `cluster_by` for one export from its `load:` block, the key
@@ -585,6 +862,7 @@ fn resolve_keys(
     load: &LoadSection,
     recorded: Option<&[String]>,
     specs: &[TargetColumnSpec],
+    fit: SpecFit,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let pk = match &load.pk {
         KeyColumns::Columns(cols) => cols.clone(),
@@ -599,7 +877,9 @@ fn resolve_keys(
             .find(|s| s.column_name == c)
             .map(|s| s.target_type.as_str())
     };
-    if let Some(missing) = pk.iter().find(|c| type_of(c).is_none()) {
+    if fit == SpecFit::Strict
+        && let Some(missing) = pk.iter().find(|c| type_of(c).is_none())
+    {
         let fix = match &load.pk {
             KeyColumns::Auto => {
                 "`rivet run` recorded it as the source table's key; name the export's own key \
@@ -608,7 +888,7 @@ fn resolve_keys(
             _ => "fix `pk` in the export's `load:` block",
         };
         bail!(
-            "export `{export}`: primary-key column `{missing}` is not a column of the export — \
+            "export `{export}`: primary-key column `{missing}` {NOT_A_COLUMN} — \
              the dedup view partitions by it. {fix}"
         );
     }
@@ -623,9 +903,8 @@ fn resolve_keys(
             }
             for c in cols {
                 match type_of(c) {
-                    None => bail!(
-                        "export `{export}`: `cluster_by` column `{c}` is not a column of the export"
-                    ),
+                    None if fit == SpecFit::Deferred => {}
+                    None => bail!("export `{export}`: `cluster_by` column `{c}` {NOT_A_COLUMN}"),
                     Some(t) if bigquery && !super::bigquery::clusterable(t) => bail!(
                         "export `{export}`: BigQuery cannot cluster on `{c}` ({t}); clusterable \
                          types are INT64, NUMERIC, BIGNUMERIC, STRING, BOOL, DATE, DATETIME, \
@@ -667,10 +946,19 @@ fn resolve_partition(
     load: &LoadSection,
     mode: LoadMode,
     specs: &[TargetColumnSpec],
+    fit: SpecFit,
 ) -> Result<Option<TablePartition>> {
     let Some(spec) = &load.partition else {
         return Ok(None);
     };
+    // Deferred: a partition column the BY-NAME spec lacks is not yet a refusal —
+    // the pinned run's spec decides, or `check_spec_fit` refuses.
+    if fit == SpecFit::Deferred
+        && let Some(col) = spec.form.column()
+        && !specs.iter().any(|s| s.column_name == col)
+    {
+        return Ok(None);
+    }
     let column_type = |c: &str| -> Result<String> {
         if !super::is_safe_load_ident(c) {
             bail!(
@@ -683,9 +971,7 @@ fn resolve_partition(
             .iter()
             .find(|s| s.column_name == c)
             .map(|s| base_type(&s.target_type))
-            .with_context(|| {
-                format!("export `{export}`: partition column `{c}` is not a column of the export")
-            })
+            .with_context(|| format!("export `{export}`: partition column `{c}` {NOT_A_COLUMN}"))
     };
     let (key, expr) = match &load.target {
         LoadTarget::Bigquery { .. } => {
@@ -747,20 +1033,32 @@ pub(crate) fn base_type(target_type: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Reject two exports that resolve to the SAME warehouse table. The `target:` is
+/// Reject two exports that touch the SAME warehouse object. The `target:` is
 /// shared, so two exports whose `table:` (or `name:`) resolves alike land on one
-/// warehouse object — a full OVERWRITE would clobber what a cdc/incremental
-/// export appends a `<table>__changes` view over, and they'd share one ledger
-/// skip-set. Pure + unit-testable; caught here, not silently at load time.
-fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for t in tables {
-        if !seen.insert(*t) {
-            bail!(
-                "two exports resolve to the same load target table `{t}` — each would clobber \
-                 the other (a full OVERWRITE vs a cdc/incremental append share the table and \
-                 its ledger). Give each export its own `table:` or destination."
-            );
+/// object — a full OVERWRITE would clobber what a cdc/incremental export appends
+/// a `<table>__changes` view over, and they'd share one ledger skip-set.
+///
+/// An append mode occupies TWO objects: `<table>` (the view) and
+/// `<table>__changes` (the log). Comparing plan tables alone missed a full
+/// export of a source table literally named `orders__changes` next to a CDC
+/// export of `orders` — different strings, one warehouse object, and the full
+/// load's OVERWRITE landed on the live change log. Pure + unit-testable.
+fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for (t, mode) in plans {
+        let mut objects = vec![t.to_string()];
+        if !matches!(mode, LoadMode::Full) {
+            objects.push(format!("{t}__changes"));
+        }
+        for o in objects {
+            if let Some(prior) = seen.insert(o.clone(), t) {
+                bail!(
+                    "two exports resolve to the same warehouse object `{o}` (load targets `{prior}` \
+                     and `{t}`) — each would clobber the other (a full OVERWRITE vs a \
+                     cdc/incremental append share the object and its ledger). Give each export \
+                     its own `table:` or destination."
+                );
+            }
         }
     }
     Ok(())
@@ -819,6 +1117,50 @@ mod tests {
     }
 
     use super::*;
+
+    /// The delete flag is DATA on a base table, so only a layout that HAS a physical base
+    /// can carry it. Under log-and-view the name is a view, which holds no column of its
+    /// own — declaring the flag there must not put one in the file.
+    ///
+    /// Extracted from two live-only bodies (`load_one_incremental`, the CDC job's snapshot
+    /// synthesis) where the same `&&` sat inline and the mutation corpus excluded it.
+    #[test]
+    fn a_base_carries_the_delete_flag_only_when_there_is_a_base_and_it_was_declared() {
+        assert!(
+            base_carries_delete_flag(true, true),
+            "base-and-buffer with the flag declared: the column must exist from the first \
+             pass, or the buffer's tombstones have nothing to flip"
+        );
+        assert!(
+            !base_carries_delete_flag(true, false),
+            "a base whose export did not declare the flag pays no column for it"
+        );
+        assert!(
+            !base_carries_delete_flag(false, true),
+            "log-and-view has no physical base — the flag lives in the changelog, and a \
+             view cannot hold a column of its own"
+        );
+        assert!(!base_carries_delete_flag(false, false));
+    }
+
+    /// Folding a whole-table pass into the changelog is the log-and-view answer, where the
+    /// target name is a view and cannot be overwritten. Under base-and-buffer that same
+    /// pass IS the base and must land as a table, so it may never join the log.
+    ///
+    /// Only the layout is graded here. Whether a first pass EXISTS is carried by the
+    /// `Option` the caller filters, so it is the caller's `if let` — not this predicate —
+    /// and duplicating it as a parameter would put one decision in two places.
+    #[test]
+    fn a_whole_table_pass_joins_the_log_only_under_the_view_layout() {
+        assert!(
+            whole_table_pass_may_join_the_log(false),
+            "log-and-view: a whole-table pass folds into the changelog"
+        );
+        assert!(
+            !whole_table_pass_may_join_the_log(true),
+            "base-and-buffer: the first pass IS the base and must land as a table"
+        );
+    }
 
     #[test]
     fn ledger_str_names_each_mode_stably() {
@@ -905,6 +1247,18 @@ mod tests {
         })
     }
 
+    /// A TIMESTAMP column — the shape a `partition.column` needs.
+    fn ts_col(name: &str) -> TypeReportRow {
+        row_from_spec(&TargetColumnSpec {
+            column_name: name.into(),
+            target_type: "TIMESTAMP".into(),
+            autoload_type: "TIMESTAMP".into(),
+            status: TargetStatus::Ok,
+            note: None,
+            cast_sql: None,
+        })
+    }
+
     /// One export's report, as the resolver returns it.
     fn report(export: &str, columns: Vec<TypeReportRow>) -> ExportTypeReport {
         ExportTypeReport {
@@ -970,6 +1324,80 @@ load:
         );
     }
 
+    /// The by-name spec may belong to ANOTHER config's same-named export (a shared
+    /// state DB, last writer wins): `pk: [id]` against a spec holding `_id` is not
+    /// a refusal at plan time — the pin retypes from the run's own spec — but the
+    /// strict check still refuses the plan if no pin happens. Measured live: four
+    /// `users` exports on one Postgres state, MySQL's load refused on Mongo's `_id`.
+    #[test]
+    fn a_by_name_plan_defers_its_key_fit_to_the_pin_and_still_owes_it() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: users
+    table: users
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: pa/ }
+    load: { pk: [id], cluster_by: [id], partition: { column: created_at, granularity: day } }
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .unwrap();
+        let load = cfg.load.clone().unwrap();
+        // The by-name row another config wrote: `_id` and `v`, none of ours.
+        let foreign = || {
+            vec![report(
+                "users",
+                vec![col("_id", TargetStatus::Ok), col("v", TargetStatus::Ok)],
+            )]
+        };
+        let strict = build_plans_keyed(
+            &cfg,
+            &load,
+            foreign(),
+            &RecordedKeys::new(),
+            SpecFit::Strict,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(strict.contains("primary-key column `id`"), "{strict}");
+        let deferred = build_plans_keyed(
+            &cfg,
+            &load,
+            foreign(),
+            &RecordedKeys::new(),
+            SpecFit::Deferred,
+        )
+        .expect("deferred: the pin decides")
+        .pop()
+        .unwrap();
+        assert_eq!(deferred.pk, vec!["id".to_string()]);
+        assert_eq!(
+            deferred.partition, None,
+            "a partition column the spec lacks waits for the pin"
+        );
+        let owed = check_spec_fit(&deferred).unwrap_err().to_string();
+        assert!(owed.contains("primary-key column `id`"), "{owed}");
+        // The run's own spec fits: the strict rebuild (what `retype_plan` does) passes.
+        let own = vec![report(
+            "users",
+            vec![col("id", TargetStatus::Ok), ts_col("created_at")],
+        )];
+        let fitted = build_plans_keyed(&cfg, &load, own, &RecordedKeys::new(), SpecFit::Strict)
+            .expect("the run's own columns fit")
+            .pop()
+            .unwrap();
+        check_spec_fit(&fitted).expect("nothing owed");
+    }
+
     #[test]
     fn build_plans_matches_by_name_maps_statuses_and_mode() {
         let cfg = crate::config::Config::from_yaml(
@@ -1020,6 +1448,52 @@ load:
 
         let plans = build_plans(&cfg, &load, reports).unwrap();
         assert_eq!(plans.len(), 2);
+
+        // A plan retyped from ONE run's recorded spec carries that run's columns
+        // and key — not the by-name spec it was planned from. This is the seam the
+        // shared-state race crosses: another config's same-named export can retype
+        // the by-name row between the run and its load; the per-run spec cannot.
+        {
+            use crate::state::{LoadSpec, LoadSpecColumn};
+            use crate::types::{RivetType, TypeFidelity};
+            let alpha = plans.iter().find(|p| p.table == "alpha_tbl").unwrap();
+            assert_eq!(
+                alpha.pk,
+                Vec::<String>::new(),
+                "planned with no recorded key"
+            );
+            let column = |name: &str| LoadSpecColumn {
+                name: name.into(),
+                source_type: "int8".into(),
+                rivet_type: RivetType::Int64,
+                fidelity: TypeFidelity::Exact,
+                nullable: false,
+                warnings: Vec::new(),
+            };
+            let spec = LoadSpec {
+                export_name: "alpha".into(),
+                unit: None,
+                columns: vec![column("tenant"), column("id")],
+                primary_key: Some(vec!["tenant".into(), "id".into()]),
+                run_id: Some("alpha_run_7".into()),
+                origin: "run".into(),
+                captured_at: "2026-09-17T00:00:00Z".into(),
+            };
+            let target = crate::types::target::ExportTarget::parse("bigquery").unwrap();
+            let retyped = retype_plan(&cfg, alpha, &spec, target).unwrap();
+            assert_eq!(retyped.table, "alpha_tbl");
+            assert_eq!(retyped.gcs_prefix, alpha.gcs_prefix);
+            assert_eq!(
+                retyped
+                    .specs
+                    .iter()
+                    .map(|s| s.column_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["tenant", "id"],
+                "the run's columns, in the run's order"
+            );
+            assert_eq!(retyped.pk, vec!["tenant".to_string(), "id".to_string()]);
+        }
 
         // reports[0] = beta → matched by name to the 2nd export (kills `==`→`!=`,
         // which would resolve the first NON-matching export instead).
@@ -1235,6 +1709,95 @@ load:
         }
     }
 
+    /// One `load:` on a six-table stream is one partition column, one key, for six
+    /// tables that do not share a schema. The stream's `load:` therefore takes a
+    /// `tables:` map — a per-TABLE override layered over the export's, layered
+    /// over the top level — so `created_at` partitions the tables that have it
+    /// and `none` clears it where they do not, without splitting the stream.
+    #[test]
+    fn a_multiplex_export_takes_per_table_load_overrides() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: cdc
+    tables: [orders, customers, line_items]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      initial: snapshot
+    destination:
+      type: gcs
+      bucket: b
+      prefix: cdc/
+    load:
+      partition: { column: created_at, granularity: day }   # the stream's default
+      tables:
+        customers: { partition: none }                       # has no created_at
+        line_items: { pk: [id, line_no], cluster_by: none }  # a composite key
+load:
+  target: bigquery
+  project: p
+  dataset: d
+  pk: [id]
+"#,
+        )
+        .unwrap();
+        let load = cfg.load.clone().unwrap();
+        let reports = vec![
+            table_report(
+                "cdc",
+                "orders",
+                vec![col("id", TargetStatus::Ok), ts_col("created_at")],
+            ),
+            table_report("cdc", "customers", vec![col("id", TargetStatus::Ok)]),
+            table_report(
+                "cdc",
+                "line_items",
+                vec![
+                    col("id", TargetStatus::Ok),
+                    col("line_no", TargetStatus::Ok),
+                    ts_col("created_at"),
+                ],
+            ),
+        ];
+        let plans = build_plans(&cfg, &load, reports).unwrap();
+        let by_table = |t: &str| plans.iter().find(|p| p.table == t).expect(t);
+
+        assert!(
+            by_table("orders").partition.is_some(),
+            "the stream's default applies"
+        );
+        assert_eq!(by_table("orders").pk, vec!["id"]);
+        assert!(
+            by_table("customers").partition.is_none(),
+            "`partition: none` on the table clears the stream's default"
+        );
+        assert_eq!(
+            by_table("customers").pk,
+            vec!["id"],
+            "the rest is inherited"
+        );
+        assert!(by_table("line_items").partition.is_some());
+        assert_eq!(
+            by_table("line_items").pk,
+            vec!["id", "line_no"],
+            "the table's own key over the top-level one"
+        );
+        assert!(
+            matches!(&by_table("line_items").clustering, Clustering::Written(c) if c.is_empty()),
+            "the table's `cluster_by: none` is a WRITTEN empty clustering: {:?}",
+            by_table("line_items").clustering
+        );
+        assert!(
+            matches!(&by_table("orders").clustering, Clustering::Auto(_)),
+            "a table without its own block inherits the default `cluster_by: auto`"
+        );
+    }
+
     /// The multiplex sub-prefix rule itself: the table becomes ONE path segment
     /// under the resolved base, with both slashes supplied — a cloud prefix is a
     /// literal key prefix, so a missing separator lists a mangled flat key
@@ -1278,9 +1841,30 @@ load:
     fn reject_duplicate_target_tables_catches_a_collision() {
         // Two exports resolving to the same warehouse table would clobber each
         // other — caught at plan time, not silently at load time.
-        assert!(reject_duplicate_target_tables(&["orders", "events", "orders"]).is_err());
-        assert!(reject_duplicate_target_tables(&["orders", "events"]).is_ok());
+        use LoadMode::{Cdc, Full, Incremental};
+        assert!(
+            reject_duplicate_target_tables(&[("orders", Full), ("events", Full), ("orders", Full)])
+                .is_err()
+        );
+        assert!(reject_duplicate_target_tables(&[("orders", Full), ("events", Full)]).is_ok());
         assert!(reject_duplicate_target_tables(&[]).is_ok());
+
+        // An append mode also occupies `<table>__changes`: a full export of a
+        // source table NAMED `orders__changes` would OVERWRITE the CDC export's
+        // live change log — two different plan tables, one warehouse object.
+        let err = reject_duplicate_target_tables(&[("orders", Cdc), ("orders__changes", Full)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("orders__changes"), "{err}");
+        assert!(
+            reject_duplicate_target_tables(&[("orders__changes", Full), ("orders", Incremental)])
+                .is_err(),
+            "order-independent"
+        );
+        // Two append exports on different tables occupy four distinct objects.
+        assert!(
+            reject_duplicate_target_tables(&[("orders", Cdc), ("events", Incremental)]).is_ok()
+        );
     }
 
     #[test]
@@ -1590,6 +2174,7 @@ load:
             &load_with("bigquery", serde_json::json!({})),
             Some(&recorded),
             &specs,
+            SpecFit::Strict,
         )
         .unwrap();
         assert_eq!(pk, recorded);
@@ -1606,6 +2191,7 @@ load:
                 &load_with(target, serde_json::json!({})),
                 Some(&cols(&names)),
                 &specs,
+                SpecFit::Strict,
             )
             .unwrap()
             .1
@@ -1618,9 +2204,15 @@ load:
     fn explicit_clustering_is_refused_when_bigquery_cannot_hold_it() {
         let specs = [typed("id", "INT64"), typed("score", "FLOAT64")];
         let err = |extra| {
-            resolve_keys("e", &load_with("bigquery", extra), None, &specs)
-                .unwrap_err()
-                .to_string()
+            resolve_keys(
+                "e",
+                &load_with("bigquery", extra),
+                None,
+                &specs,
+                SpecFit::Strict,
+            )
+            .unwrap_err()
+            .to_string()
         };
         let e = err(serde_json::json!({ "cluster_by": ["score"] }));
         assert!(e.contains("cannot cluster on `score` (FLOAT64)"), "{e}");
@@ -1640,6 +2232,7 @@ load:
             &load_with("bigquery", serde_json::json!({ "pk": ["idd"] })),
             None,
             &specs,
+            SpecFit::Strict,
         )
         .unwrap_err()
         .to_string();
@@ -1654,6 +2247,7 @@ load:
             &load_with("bigquery", serde_json::json!({})),
             Some(&cols(&["id", "missing"])),
             &specs,
+            SpecFit::Strict,
         )
         .unwrap_err()
         .to_string();
@@ -1666,7 +2260,14 @@ load:
         let specs = [typed("id", "INT64"), typed("ext", "INT64")];
         let recorded = cols(&["id"]);
         let resolve = |extra| {
-            resolve_keys("e", &load_with("bigquery", extra), Some(&recorded), &specs).unwrap()
+            resolve_keys(
+                "e",
+                &load_with("bigquery", extra),
+                Some(&recorded),
+                &specs,
+                SpecFit::Strict,
+            )
+            .unwrap()
         };
         assert_eq!(
             resolve(serde_json::json!({ "pk": ["ext"] })),
@@ -1685,6 +2286,7 @@ load:
             &load_with("bigquery", serde_json::json!({})),
             None,
             &[typed("id", "INT64")],
+            SpecFit::Strict,
         )
         .unwrap();
         assert!(pk.is_empty() && cluster.is_empty());
@@ -1699,6 +2301,7 @@ load:
             &load_with("bigquery", serde_json::json!({ "partition": block })),
             LoadMode::Full,
             specs,
+            SpecFit::Strict,
         )
     }
 
@@ -1808,6 +2411,7 @@ load:
                 &load_with("snowflake", serde_json::json!({ "partition": block })),
                 LoadMode::Full,
                 &specs,
+                SpecFit::Strict,
             )
         };
         let p = resolve(serde_json::json!({ "column": "ts", "granularity": "month" }))
@@ -1890,5 +2494,297 @@ load:
         assert_eq!(Granularity::Year.coarser(), None);
         assert_eq!(Granularity::parse_sql("MONTH"), Some(Granularity::Month));
         assert_eq!(Granularity::parse_sql("WEEK"), None);
+    }
+
+    /// Where the current state will live, resolved from the CONFIG alone: the
+    /// section's key with the export's own block layered over it. The EXTRACT asks
+    /// this too — a base-and-buffer table's rows carry the delete flag as data, and
+    /// a wrong answer here lands a base whose flag is NULL on every row.
+    #[test]
+    fn the_resolved_layout_composes_the_section_and_the_export_override() {
+        let cfg = |load: &str, export_extra: &str, mode: &str| {
+            let yaml = format!(
+                "source:\n  type: mysql\n  url_env: DB_URL\nexports:\n  - name: t\n    \
+                 table: t\n    mode: {mode}\n    cursor_column: updated_at\n    \
+                 format: parquet\n    destination: {{ type: local, path: /tmp/t }}\n{export_extra}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n{load}"
+            );
+            serde_yaml_ng::from_str::<crate::config::Config>(&yaml).expect("a config")
+        };
+
+        let written = cfg("  layout: base_buffer\n", "", "incremental");
+        assert_eq!(
+            resolved_layout(&written, &written.exports[0], None),
+            CdcLayout::BaseAndBuffer,
+            "an ordinary incremental export asks for a base by name"
+        );
+
+        let unwritten = cfg("", "", "incremental");
+        assert_eq!(
+            resolved_layout(&unwritten, &unwritten.exports[0], None),
+            CdcLayout::LogAndView,
+            "unwritten keeps the changelog and its view"
+        );
+
+        let overridden = cfg(
+            "  layout: base_buffer\n",
+            "    load:\n      layout: log_view\n",
+            "incremental",
+        );
+        assert_eq!(
+            resolved_layout(&overridden, &overridden.exports[0], None),
+            CdcLayout::LogAndView,
+            "the export's own block layers over the section"
+        );
+
+        let full = cfg("  layout: base_buffer\n", "", "full");
+        assert_eq!(
+            resolved_layout(&full, &full.exports[0], None),
+            CdcLayout::LogAndView,
+            "a full load overwrites its table; the key means nothing there"
+        );
+    }
+
+    /// A stream with a `backfill:` on a warehouse without `rivet compact` (Snowflake)
+    /// keeps the changelog and its view: a base there would freeze at the backfill
+    /// while its buffer grew for ever, with every load prescribing a command that can
+    /// only fail. RED against deriving the layout from the export alone.
+    #[test]
+    fn a_warehouse_without_compact_keeps_the_changelog_and_its_view() {
+        let cfg = serde_yaml_ng::from_str::<crate::config::Config>(
+            "source:\n  type: postgres\n  url: postgresql://localhost/db\nexports:\n\
+             \x20 - name: t\n    table: t\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: { backfill: auto, checkpoint: ./t.ckpt }\n\
+             \x20   destination: { type: gcs, bucket: b, prefix: t/ }\n\
+             load:\n  target: snowflake\n  connection: c\n  warehouse: w\n  database: d\n\
+             \x20 schema: s\n  storage_integration: i\n",
+        )
+        .expect("a config");
+        assert_eq!(
+            resolved_layout(&cfg, &cfg.exports[0], None),
+            CdcLayout::LogAndView
+        );
+    }
+
+    /// Whether the base carries `__is_deleted`. A stream expresses deletes, so it
+    /// defaults ON there; a query-based export cannot, so it defaults OFF and does
+    /// not pay for the column. Written, the key decides either way.
+    #[test]
+    fn the_delete_flag_defaults_on_for_a_stream_and_off_for_a_query() {
+        let cfg = |load: &str, mode: &str| {
+            let yaml = format!(
+                "source:\n  type: mysql\n  url_env: DB_URL\nexports:\n  - name: t\n    \
+                 table: t\n    mode: {mode}\n    cursor_column: updated_at\n    \
+                 format: parquet\n    destination: {{ type: local, path: /tmp/t }}\n\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n{load}"
+            );
+            serde_yaml_ng::from_str::<crate::config::Config>(&yaml).expect("a config")
+        };
+        let q = cfg("", "incremental");
+        assert!(
+            !resolved_deleted_flag(&q, &q.exports[0], None),
+            "a query cannot express a delete — no column by default"
+        );
+        let s = cfg("", "cdc");
+        assert!(
+            resolved_deleted_flag(&s, &s.exports[0], None),
+            "a stream can, and its base keeps the flag"
+        );
+        let asked = cfg("  deleted_flag: true\n", "incremental");
+        assert!(
+            resolved_deleted_flag(&asked, &asked.exports[0], None),
+            "written, the key decides"
+        );
+        let refused = cfg("  deleted_flag: false\n", "cdc");
+        assert!(
+            !resolved_deleted_flag(&refused, &refused.exports[0], None),
+            "and it decides against a stream too"
+        );
+    }
+
+    /// A multiplex stream's `load.tables.<name>` block must reach the EXTRACT, not only
+    /// the load plan.
+    ///
+    /// The plan builder applied all three layers while the extract-side readers stopped at
+    /// the export block, so the warehouse expected a per-table answer and the snapshot leg
+    /// stamped one export-level value into every captured table's files. The leg has the
+    /// table name in hand (`cdc_job.rs`, the `pending_idx` loop), so the fix is the
+    /// argument, not a new mechanism.
+    ///
+    /// RED against passing the export level: `customers` reads `true` with the override
+    /// ignored.
+    #[test]
+    fn a_per_table_override_reaches_the_extract_not_only_the_load_plan() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: mysql
+  url: "mysql://localhost/test"
+exports:
+  - name: cdc
+    tables: [orders, customers]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      initial: snapshot
+    destination:
+      type: gcs
+      bucket: b
+      prefix: cdc/
+    load:
+      deleted_flag: true
+      partition: { column: created_at, granularity: day }
+      tables:
+        customers: { deleted_flag: false, partition: none }
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .expect("a multiplex config");
+        let export = &cfg.exports[0];
+
+        assert!(
+            resolved_deleted_flag(&cfg, export, Some("orders")),
+            "a table with no block of its own keeps the export's answer"
+        );
+        assert!(
+            !resolved_deleted_flag(&cfg, export, Some("customers")),
+            "its own block decides — this is what the load plan already honoured"
+        );
+        assert!(
+            resolved_deleted_flag(&cfg, export, None),
+            "asked for the export as a whole, the export-level answer stands"
+        );
+
+        assert!(
+            resolved_partition(&cfg, export, Some("orders")).is_some(),
+            "the stream's default partition applies to a table without a block"
+        );
+        assert!(
+            resolved_partition(&cfg, export, Some("customers")).is_none(),
+            "`partition: none` clears the inherited one for that table only"
+        );
+    }
+
+    /// The partition the WRITER budgets each part against, resolved from the config alone.
+    /// Shipped on this branch with no test of its own while both its siblings had one.
+    #[test]
+    fn the_resolved_partition_composes_the_section_and_the_export_override() {
+        let cfg = |load: &str, export_extra: &str| {
+            let yaml = format!(
+                "source:\n  type: mysql\n  url_env: DB_URL\nexports:\n  - name: t\n    \
+                 table: t\n    mode: incremental\n    cursor_column: updated_at\n    \
+                 format: parquet\n    destination: {{ type: local, path: /tmp/t }}\n{export_extra}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n{load}"
+            );
+            serde_yaml_ng::from_str::<crate::config::Config>(&yaml).expect("a config")
+        };
+
+        let none = cfg("", "");
+        assert!(
+            resolved_partition(&none, &none.exports[0], None).is_none(),
+            "no `partition:` anywhere leaves the part sizing to max_file_size alone"
+        );
+
+        let shared = cfg(
+            "  partition: { column: created_at, granularity: day }\n",
+            "",
+        );
+        let spec = resolved_partition(&shared, &shared.exports[0], None)
+            .expect("the section's partition applies to every export");
+        assert_eq!(spec.form.column(), Some("created_at"));
+
+        let overridden = cfg(
+            "  partition: { column: created_at, granularity: day }\n",
+            "    load:\n      partition: { column: made_at, granularity: month }\n",
+        );
+        let spec = resolved_partition(&overridden, &overridden.exports[0], None)
+            .expect("the export's own block layers over the section");
+        assert_eq!(spec.form.column(), Some("made_at"));
+
+        let cleared = cfg(
+            "  partition: { column: created_at, granularity: day }\n",
+            "    load:\n      partition: none\n",
+        );
+        assert!(
+            resolved_partition(&cleared, &cleared.exports[0], None).is_none(),
+            "`none` clears an inherited partition rather than inheriting it"
+        );
+    }
+
+    /// Only a CDC load of a stream WITH `backfill:` takes the base-and-buffer
+    /// layout; the same stream without a baseline, and any batch load, keep the
+    /// changelog + view.
+    #[test]
+    fn a_cdc_export_with_a_backfill_lands_as_base_and_buffer_only() {
+        let parse = |yaml: &str| {
+            serde_yaml_ng::from_str::<crate::config::ExportConfig>(yaml).expect("an export")
+        };
+        let with = parse(
+            "name: t\ntable: t\nmode: cdc\nformat: parquet\n\
+             cdc: { backfill: auto, checkpoint: ./t.ckpt }\n\
+             destination: { type: local, path: /tmp/t }\n",
+        );
+        let without = parse(
+            "name: t\ntable: t\nmode: cdc\nformat: parquet\ncdc: { checkpoint: ./t.ckpt }\n\
+             destination: { type: local, path: /tmp/t }\n",
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Cdc, None, true),
+            CdcLayout::BaseAndBuffer
+        );
+        assert_eq!(
+            cdc_layout(&without, LoadMode::Cdc, None, true),
+            CdcLayout::LogAndView
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Full, None, true),
+            CdcLayout::LogAndView,
+            "a batch load of the same export is no CDC layout"
+        );
+        // A warehouse that cannot compact (Snowflake) never gets a base and a buffer:
+        // the base would freeze at the backfill and the buffer grow for ever, with no
+        // view either. RED against deriving the layout from the export alone.
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Cdc, None, false),
+            CdcLayout::LogAndView,
+            "no compaction, no base: the changelog and its view"
+        );
+        // WRITTEN, the key decides — which is how an ordinary query-based
+        // incremental export gets a physical base to compact into.
+        use crate::config::load::LayoutChoice;
+        assert_eq!(
+            cdc_layout(
+                &without,
+                LoadMode::Incremental,
+                Some(LayoutChoice::BaseBuffer),
+                true
+            ),
+            CdcLayout::BaseAndBuffer,
+            "an incremental export asks for a base by name"
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Cdc, Some(LayoutChoice::LogView), true),
+            CdcLayout::LogAndView,
+            "written wins over the backfill-derived default"
+        );
+        assert_eq!(
+            cdc_layout(&with, LoadMode::Full, Some(LayoutChoice::BaseBuffer), true),
+            CdcLayout::LogAndView,
+            "a full load overwrites the whole table; the key means nothing there"
+        );
+        assert_eq!(
+            cdc_layout(&without, LoadMode::Incremental, None, true),
+            CdcLayout::LogAndView,
+            "unwritten keeps what shipped"
+        );
+        // The two properties every site depends on, as a truth table.
+        assert!(CdcLayout::BaseAndBuffer.log_is_disposable());
+        assert!(CdcLayout::BaseAndBuffer.compacts());
+        assert!(!CdcLayout::LogAndView.log_is_disposable());
+        assert!(!CdcLayout::LogAndView.compacts());
     }
 }

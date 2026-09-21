@@ -705,14 +705,19 @@ impl super::Source for MysqlSource {
             Some((s, t)) => (format!("'{}'", s.replace('\'', "''")), t.to_string()),
             None => ("DATABASE()".to_string(), bare.clone()),
         };
+        // One row per column, assembled here — not `GROUP_CONCAT`, which silently
+        // TRUNCATES at `group_concat_max_len` (1024 bytes by default) and handed the
+        // load a partial merge key that collapses distinct rows.
         let sql = format!(
-            "SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION SEPARATOR '\u{1f}') \
-             FROM information_schema.KEY_COLUMN_USAGE \
+            "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE \
              WHERE CONSTRAINT_NAME = 'PRIMARY' AND TABLE_SCHEMA = {schema} \
-             AND TABLE_NAME = '{}'",
+             AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
             name.replace('\'', "''")
         );
-        Ok(crate::source::split_key_list(self.query_scalar(&sql)?))
+        let mut conn = self.pool.get_conn()?;
+        let mut guard = MysqlSessionGuard::apply(&mut conn, None)?;
+        let cols: Vec<String> = guard.conn().query(sql)?;
+        Ok(crate::source::split_key_list(Some(cols.join("\u{1f}"))))
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {

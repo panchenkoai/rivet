@@ -96,11 +96,12 @@ pub(super) fn leftover_names(code: u64, names: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Probe whose scalar is `1·table + 2·view + 4·other` for `table` in the dataset.
+/// Probe whose scalar is `1·table + 2·view + 4·other` for `table` in the dataset; a
+/// `CLONE` (what the batched load's `CREATE OR REPLACE TABLE … CLONE` leaves) is a table.
 pub(super) fn build_object_kind_sql(project: &str, dataset: &str, table: &str) -> String {
     format!(
-        "SELECT COUNTIF(table_type = 'BASE TABLE') + 2 * COUNTIF(table_type = 'VIEW') \
-         + 4 * COUNTIF(table_type NOT IN ('BASE TABLE', 'VIEW')) AS n \
+        "SELECT COUNTIF(table_type IN ('BASE TABLE', 'CLONE')) + 2 * COUNTIF(table_type = 'VIEW') \
+         + 4 * COUNTIF(table_type NOT IN ('BASE TABLE', 'CLONE', 'VIEW')) AS n \
          FROM `{project}.{dataset}`.INFORMATION_SCHEMA.TABLES WHERE table_name = '{table}'"
     )
 }
@@ -214,6 +215,12 @@ pub(super) fn table_shape_clauses(
         s.push_str(&format!("\nOPTIONS({opts})"));
     }
     s
+}
+
+/// Replace `target` with a zero-copy clone of `staging` — the atomic hand-off of a
+/// whole-table load that arrived in several jobs.
+pub(super) fn build_clone_sql(target: &str, staging: &str) -> String {
+    format!("CREATE OR REPLACE TABLE `{target}` CLONE `{staging}`;")
 }
 
 /// A `FROM FILES(...)` Parquet source list.

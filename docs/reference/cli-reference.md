@@ -10,6 +10,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet doctor`↴](#rivet-doctor)
 * [`rivet cdc`↴](#rivet-cdc)
 * [`rivet load`↴](#rivet-load)
+* [`rivet compact`↴](#rivet-compact)
 * [`rivet state`↴](#rivet-state)
 * [`rivet state show`↴](#rivet-state-show)
 * [`rivet state reset`↴](#rivet-state-reset)
@@ -54,6 +55,7 @@ Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md
 * `doctor` — Verify source + destination auth/connectivity (run this first)
 * `cdc` — Stream change data capture (CDC) from a source's transaction log
 * `load` — Load an export's Parquet into a warehouse (BigQuery / Snowflake)
+* `compact` — Merge each base-and-buffer CDC table's `<table>__changes` buffer into its base table (`MERGE` by primary key: updates, inserts, deletes flagged as `__is_deleted`) and drop the buffer — the billed step of the cycle `run → load → compact`, labelled `rivet_op:merge` per table
 * `state` — Manage export state
 * `completions` — Generate shell completions
 * `init` — Generate a config scaffold from a live database (connect + introspect)
@@ -174,6 +176,19 @@ The native column schema, target table, partition, and source URIs are all deriv
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
 * `--rebuild-changelog` — Rebuild a `<table>__changes` whose partitioning differs from the config's `load.partition` — a billed query copying every row — and swap it in. Without this flag such a load is refused naming the difference; a rebuild is never a side effect of a scheduled load
+
+
+
+## `rivet compact`
+
+Merge each base-and-buffer CDC table's `<table>__changes` buffer into its base table (`MERGE` by primary key: updates, inserts, deletes flagged as `__is_deleted`) and drop the buffer — the billed step of the cycle `run → load → compact`, labelled `rivet_op:merge` per table
+
+**Usage:** `rivet compact [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>` — Path to YAML config file — the same one `rivet load` reads
+* `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job of this compaction (BigQuery `rivet_run` label). Defaults to a generated id
 
 
 
@@ -363,11 +378,13 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--exclude <GLOB>` — Whole-schema only: drop tables/views matching these globs (`*`/`?`) — several after one flag or the flag repeated; `--exclude` wins over `--include`
 * `-o`, `--output <OUTPUT>` — Write output to this file instead of stdout
 * `--discover` — Emit a machine-readable JSON discovery artifact instead of a YAML scaffold. Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes. Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags
-* `--mode <MODE>` — Override the suggested extraction mode for every scaffolded export. `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block with engine-specific stream params) instead of a batch query. Other values (full / incremental / chunked / time_window) just override the auto-suggested mode
+* `--mode <MODE>` — Override the suggested extraction mode for every scaffolded export. `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block with engine-specific stream params) instead of a batch query; on MySQL, and on PostgreSQL when every table is in `public`, over two or more tables it writes one batch recipe per table plus one `tables:` stream with `backfill: auto` (one export per table otherwise). Other values (full / incremental / chunked / time_window) just override the auto-suggested mode
 * `--gcs-bucket <NAME>` — Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--s3-bucket` and `--discover`
 * `--gcs-credentials-file <PATH>` — Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML
 * `--s3-bucket <NAME>` — Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--gcs-bucket` and `--discover`
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
+* `--bigquery-project <PROJECT>` — Scaffold a `load:` block for this BigQuery project. With `--bigquery-dataset` the generated config carries the warehouse target, a per-table partition guess and the base+buffer layout, so `rivet load` and `rivet compact` work from it after a review. Needs `--gcs-bucket`: the load reads GCS only, so a local or S3 scaffold with a `load:` block is a config `rivet load` refuses
+* `--bigquery-dataset <DATASET>` — The dataset the load creates its tables in (with `--bigquery-project`)
 * `--tls <MODE>` — TLS posture for BOTH the introspection connection init opens AND the `source.tls:` block written into the scaffold. Required (or `disable`, explicitly) for any non-loopback host — without it the TLS gate refuses before connecting, and at init time there is no config file to add a `tls:` block to yet
 
   Possible values:

@@ -20,11 +20,25 @@
 # ── The engine × VERSION grid the gate brings up (mirrors dev/release-oracle/matrix.yaml) ──
 # `gated`   = versions the gate spins up, seeds, and runs every applicable scenario against.
 # `gaps`    = versions that EXIST (a compose service / a devbox stand / a public image) but
-#             are not yet gated — each is a real coverage hole, ratcheted.
+#             CANNOT be gated today — a real coverage hole, ratcheted (shrink-only).
+# `descoped`= versions that CAN be gated and were MEASURED green, left out on cost alone.
+#             NOT ratcheted, because it is not debt: re-gating one is a two-line edit
+#             (here + dev/release-oracle/matrix.yaml) with nothing to fix first. Keeping
+#             these in `gaps` would report permanent debt the product never took on —
+#             the exact thing the ratchet comment warns teaches readers to discount it.
 grid:
   postgres:
-    gated: [12, 13, 14, 15, 16, 17, 18]   # 12/15/17 added 2026-08-30 — public images, no seed blocker existed
-    gaps:  []
+    gated: [14, 16, 18]              # oldest supported, primary target, newest (2026-09-20)
+    gaps:  []                        # nothing here is BLOCKED — see `descoped`
+    descoped: [12, 13, 15, 17]       # MEASURED, not argued: all seven were green in the
+                                     # 2026-09-20 gate (including the cells 13 and 15 failed
+                                     # on, which were harness collisions, not version faults).
+                                     # Un-gated on COST: seven postgres versions were ~57% of
+                                     # the matrix's cells and every one graded the same
+                                     # ENGINE-level golden below, so 13/15/17 bought repetition
+                                     # rather than coverage. docs/reference/compatibility.md
+                                     # names the gated set, so the published "full suite against
+                                     # each version" claim stays true.
   mysql:
     gated: ["8.0", "8.4"]
     gaps:  ["5.7"]                   # MEASURED 2026-08-30, not argued: the seed dies with
@@ -214,6 +228,22 @@ preflights:
     what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise): anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (cdc_after_flush_before_ack holds the anchor; the re-run re-reads id=4) → large-transaction ATOMICITY (a >rollover 12-row PG tx survives a cdc_after_ack mid-flush crash whole, 12/12 — the committed-boundary invariant). PLUS SQLite-vs-Postgres state PARITY vs golden/cdc_state_snapshot.json (the reference snapshot). Each engine's anchor is its own mechanism (PG slot / MySQL binlog / MSSQL from-LSN / Mongo resume token). RED-proven by mutation vs the release binary: a drop-one-event sink mutant reddens the independent readback on all 4 engines (while rivet validate stays green); a committed:true-every-event PG mutant reddens the large-tx leg."
     backends: [sqlite, postgres]
     status: test        # verify_cdc_e2e (dev/release_oracle/cdc.py) — env-driven RIVET_CDC_<ENGINE>_URL, SKIP-if-absent
+  - id: partner_shape
+    what: "the partner shape as the OPERATOR gets it: the config `rivet init --mode cdc` EMITS over three tables — one keyset recipe per table plus one `tables:` stream with `backfill: auto`, never `initial: snapshot` — with a `load:` appended, driven through the whole cycle on MySQL and PostgreSQL (the engines init consolidates): doctor → check → run 1 (anchor + every table's baseline through its recipe) → load 1 → per table BigQuery COUNT == source == 5 → a delta in every table (3 inserts, 1 update, 1 delete) → run 2 → load 2 → per table the live view (`WHERE NOT __is_deleted`) == source == 7 and `<table>__changes` == baseline + 5. Oracles: the `bq` CLI and a source re-query, never rivet. Every other CDC cell hand-writes its config; a scaffold that parses but cannot complete the cycle is what this catches. RED-proven against the downloaded v0.26.0 (its scaffold is `initial: snapshot` with no recipe: the init stage names every miss); 20/20 rows green on the current binary."
+    backends: [sqlite, gcs]
+    status: test        # verify_partner_shape (dev/release_oracle/partner_shape.py) — RIVET_CDC_<ENGINE>_URL + BQ_ORACLE_PROJECT + `bq`, SKIP-if-absent
+  - id: shared_state_same_name
+    what: "FOUR configs with ONE export name (`users`) — MySQL, PostgreSQL, SQL Server, MongoDB — sharing ONE Postgres state DB, run AT THE SAME TIME, each into its own prefix and BigQuery dataset: blessed, then every stream crashed at once (cdc_after_flush_before_ack / after_file_write), then crashed one at a time while the others run clean; the CDC cycle (anchor + backfill → load → delta → load) and the batch cycle (full → load). Grades per engine: warehouse == source (count, distinct key, SUM(id) in the engine's id band), and the state DB: one `cdc_snapshot` row per PREFIX, a per-run load spec for every successful run, the newest `run_status` row per prefix a success. Three shared-state defects were measured before this cell: a live run superseded by another config's success, one baseline row per NAME, the by-name spec retyped by the last writer."
+    backends: [postgres, gcs]
+    status: test        # verify_shared_state_same_name (dev/release_oracle/shared_state.py) — runs tests/live/live_shared_state_same_name.rs through the Rig against the gate binary; RIVET_CDC_STATE_URL + BQ_ORACLE_PROJECT + `bq` + cargo, SKIP-if-absent
+  - id: warehouse_layout
+    what: "the layout a `backfill:` CDC stream lands in BigQuery and the cycle the partner runs on it — `run → load → compact`: the base `<table>` is a PHYSICAL table with the source columns plus `__is_deleted` carried as data inside the baseline Parquet (never NULL — LOAD DATA fills an absent column with NULL, not DEFAULT, measured); `<table>__changes` is a per-cycle buffer holding exactly the cycle's changes; `rivet compact` runs ONE MERGE (latest per key; a delete flags the row and keeps its last values; a re-insert un-flags) and DROPs the buffer; a crash between MERGE and DROP re-merges idempotently. Plus the partition budget: 5,000 daily partitions read by keyset land via `__staging` + CLONE in two jobs with DAY partitioning intact, a file no batching splits is refused BY NAME before any job with the ledger saying `refused`, and a CDC baseline over the same history lands in the base in two jobs with no buffer yet. Oracles: the source and `bq` (COUNT, COUNTIF on the flag, SUM(id), the table type, the partitioning), the SQLite ledger — never rivet's report. Measured before the cell: the partner's 317M-row baseline inside `__changes` behind a view, and their first wide-history load refused with no way through."
+    backends: [sqlite, gcs]
+    status: test        # verify_warehouse_layout (dev/release_oracle/warehouse_layout.py) — runs tests/live/live_cdc_compact.rs + live_load_partition_batches.rs through the Rig against the gate binary; RIVET_CDC_STATE_URL + BQ_ORACLE_PROJECT + `bq` + cargo, SKIP-if-absent
+  - id: init_delta
+    what: "the guarantee path on configs the PRODUCT wrote: `rivet init --bigquery-project/--bigquery-dataset` scaffolds the `load:` section, and on that file run 1 takes everything and run 2 takes only the delta — batch on PostgreSQL / MySQL / SQL Server (`run → load → compact`: run 1 a BASE TABLE, run 2 a buffered delta that `compact` merges, the UPDATE landed, the buffer gone), an incremental export (every row, then the delta), a single-table CDC scaffold (run 1 captures NOTHING — the anchor — run 2 the changes), a multi-table `backfill: auto` scaffold (every baseline, then the changes). No hand-typed YAML anywhere: init's own decisions (the cursor, the layout, the load block) are what is graded — the SQL Server `datetime2` cursor miss was found this way. Oracles: the source, `bq`, the Parquet on disk — never rivet's report."
+    backends: [sqlite, gcs]
+    status: test        # verify_init_delta (dev/release_oracle/init_delta.py) — runs tests/live/live_init_delta.rs through the Rig against the gate binary; RIVET_CDC_STATE_URL + BQ_ORACLE_PROJECT + `bq` + cargo, SKIP-if-absent
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-

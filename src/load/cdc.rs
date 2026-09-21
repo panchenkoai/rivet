@@ -98,11 +98,45 @@ impl Warehouse {
     }
 }
 
+/// What decides the WINNER when a key appears more than once in a compaction
+/// buffer: a CDC stream's log position, or an incremental export's cursor.
+///
+/// One type so the two cannot drift: the cursor arm renders the SAME order the
+/// incremental current-state view ranks by (`inc_dedup_view_sql`), including the
+/// NULL-baseline guard — a first pass has no cursor bound, so its rows carry a
+/// NULL cursor and must lose to any later value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactOrder {
+    Cdc(SourceEngine),
+    Cursor(String),
+}
+
+impl From<SourceEngine> for CompactOrder {
+    fn from(e: SourceEngine) -> Self {
+        CompactOrder::Cdc(e)
+    }
+}
+
+impl CompactOrder {
+    /// The complete `ORDER BY` clause of the winner-picking `ROW_NUMBER`.
+    pub(crate) fn order_by(&self, warehouse: Warehouse) -> String {
+        match self {
+            CompactOrder::Cdc(engine) => engine
+                .order_exprs(warehouse)
+                .into_iter()
+                .map(|e| format!("{e} DESC"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            CompactOrder::Cursor(column) => cursor_order_by(warehouse, column),
+        }
+    }
+}
+
 impl SourceEngine {
     /// The `ORDER BY` expressions (most-significant first) that totally-order
     /// the change log for this engine in `warehouse`'s SQL dialect: the parsed
     /// commit position, then `__seq`.
-    fn order_exprs(self, warehouse: Warehouse) -> Vec<String> {
+    pub(crate) fn order_exprs(self, warehouse: Warehouse) -> Vec<String> {
         let pos: Vec<String> = match (warehouse, self) {
             // ── BigQuery: JSON_VALUE + SPLIT(...)[OFFSET(n)] + CAST(... AS INT64)
             (Warehouse::BigQuery, SourceEngine::MySql) => vec![
@@ -188,6 +222,330 @@ fn meta_spec(name: &str, ty: &str) -> TargetColumnSpec {
 /// for a PK was a delete. In rivet's reserved `__` namespace so it can never
 /// collide with a source column (a plain `is_deleted` might).
 pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
+
+/// The base table's delete flag as a column spec, appended to the source columns
+/// of a base-and-buffer load (the baseline Parquet carries it as `false`).
+pub fn flag_spec(warehouse: Warehouse) -> TargetColumnSpec {
+    let ty = match warehouse {
+        Warehouse::BigQuery => "BOOL",
+        Warehouse::Snowflake => "BOOLEAN",
+    };
+    meta_spec(DELETE_FLAG_COLUMN, ty)
+}
+
+/// A half-open window on the partition column, as typed SQL literals: `lo..hi_exclusive`
+/// selects the buffer's winners one MERGE takes, `all_lo..all_hi_exclusive` is the whole
+/// range a compaction touches — buffer values AND the base rows of the buffer's keys —
+/// and bounds the base side. A key whose value moved from one window into another sits
+/// in the base under the OLD value; bounding the base by the winner's window alone
+/// missed it and inserted a second row (only constants prune a MERGE target).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeBound {
+    pub column: String,
+    pub lo: String,
+    pub hi_exclusive: String,
+    pub all_lo: String,
+    pub all_hi_exclusive: String,
+}
+
+/// `T.k = S.k AND …` over the key columns.
+fn key_join(pk: &[&str]) -> String {
+    pk.iter()
+        .map(|k| format!("T.`{k}` = S.`{k}`"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// The partition column over every row a compaction can touch, as one column `v`:
+/// the buffer's rows and the base rows of the buffer's keys. The buffer alone names
+/// only a key's NEW value; the base holds the row under its old one.
+fn touched_values_sql(
+    changes_fqtn: &str,
+    base_fqtn: &str,
+    pk: &[&str],
+    column: &str,
+    as_date: Option<&str>,
+) -> String {
+    let (own, base) = match as_date {
+        Some(ty) => (
+            date_of(&format!("`{column}`"), ty),
+            date_of(&format!("T.`{column}`"), ty),
+        ),
+        None => (format!("`{column}`"), format!("T.`{column}`")),
+    };
+    format!(
+        "SELECT {own} AS v FROM `{changes_fqtn}` UNION ALL SELECT {base} FROM `{base_fqtn}` AS T \
+         WHERE EXISTS (SELECT 1 FROM `{changes_fqtn}` AS S WHERE {})",
+        key_join(pk)
+    )
+}
+
+/// The partition column as a `DATE`. A TIMESTAMP is pinned to UTC: an unqualified
+/// `DATE(timestamp)` follows the project's `default_time_zone`, while the bounds it
+/// feeds are rendered `+00` and the table's partitions ARE UTC days — under any other
+/// default the two disagreed by up to a day at both ends (a skipped winner, a
+/// re-inserted key). A DATE or DATETIME takes no zone.
+fn date_of(col_sql: &str, target_type: &str) -> String {
+    if target_type.eq_ignore_ascii_case("TIMESTAMP") {
+        format!("DATE({col_sql}, 'UTC')")
+    } else {
+        format!("DATE({col_sql})")
+    }
+}
+
+/// The partition column's warehouse type, `TIMESTAMP` when the specs do not name it —
+/// the conservative reading, since only that one carries a zone.
+fn column_type_of<'a>(specs: &'a [TargetColumnSpec], col: &str) -> &'a str {
+    specs
+        .iter()
+        .find(|s| s.column_name == col)
+        .map_or("TIMESTAMP", |s| s.target_type.as_str())
+}
+
+/// `(rows, min, max, null_count)` — rows and NULLs of the buffer, min/max of the
+/// partition column over everything the compaction touches ([`touched_values_sql`]) —
+/// as strings; the MERGE's pruning bounds come from here. `time_type` (the column's
+/// DATE / DATETIME / TIMESTAMP) normalises a time key to one `YYYY-MM-DD` shape via
+/// [`date_of`]; an integer range column is cast.
+pub fn compact_probe_sql(
+    changes_fqtn: &str,
+    base_fqtn: &str,
+    pk: &[String],
+    partition_col: Option<&str>,
+    time_type: Option<&str>,
+) -> String {
+    let Some(c) = partition_col else {
+        return format!(
+            "SELECT COUNT(*) AS n, '' AS lo, '' AS hi, 0 AS null_keys FROM `{changes_fqtn}`"
+        );
+    };
+    let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+    format!(
+        "SELECT (SELECT COUNT(*) FROM `{changes_fqtn}`) AS n, \
+         IFNULL(CAST(MIN(v) AS STRING), '') AS lo, IFNULL(CAST(MAX(v) AS STRING), '') AS hi, \
+         (SELECT COUNTIF(`{c}` IS NULL) FROM `{changes_fqtn}`) AS null_keys \
+         FROM ({})",
+        touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_type)
+    )
+}
+
+/// Split `[lo, hi]` (inclusive dates) into half-open day windows of at most
+/// `step_days` — one MERGE per window keeps each job under BigQuery's cap on the
+/// partitions one statement may modify.
+pub fn day_windows(
+    lo: chrono::NaiveDate,
+    hi: chrono::NaiveDate,
+    step_days: i64,
+) -> Vec<(chrono::NaiveDate, chrono::NaiveDate)> {
+    let mut out = Vec::new();
+    let mut start = lo;
+    let end = hi + chrono::Duration::days(1);
+    while start < end {
+        let next = (start + chrono::Duration::days(step_days)).min(end);
+        out.push((start, next));
+        start = next;
+    }
+    out
+}
+
+/// A `date` as a literal of the partition column's BigQuery type.
+pub fn time_literal(target_type: &str, date: chrono::NaiveDate) -> String {
+    let d = date.format("%Y-%m-%d");
+    match target_type.to_ascii_uppercase().as_str() {
+        "DATE" => format!("DATE '{d}'"),
+        "DATETIME" => format!("DATETIME '{d}T00:00:00'"),
+        _ => format!("TIMESTAMP '{d} 00:00:00+00'"),
+    }
+}
+
+/// The compaction MERGE: the latest change per key in `changes` (the buffer) is
+/// upserted into `base`; a tombstone flags the base row (`__is_deleted = TRUE`,
+/// values kept — the warehouse deletes nothing), a later insert un-flags it.
+/// `columns` are the source columns both tables share; `bound`, when given, is
+/// applied to the buffer AND to the base in `ON`, so the base's partitions prune.
+/// `nulls_only` selects the buffer rows whose partition column is NULL (a
+/// tombstone with a minimal before-image) — merged unpruned, on their own.
+///
+/// The winner per key is ranked over the WHOLE buffer and only then filtered by
+/// the bound, so a key with changes on both sides of a split (a window and the
+/// NULL set, or two windows) lands in exactly ONE job — the one its latest change
+/// belongs to. Ranking inside the filter picked a stale winner per subset and let
+/// the job order decide the row (RED: `a_key_changed_across_the_partition_split…`).
+// The arity IS the statement: two tables, the shared columns, the dedup key, what
+// ranks the winner, the bound, the NULL-key pass, and whether the base carries the
+// delete flag. Bundling them would only move the same seven facts elsewhere.
+#[allow(clippy::too_many_arguments)]
+pub fn compact_merge_sql(
+    base_fqtn: &str,
+    changes_fqtn: &str,
+    columns: &[&str],
+    pk: &[&str],
+    order: impl Into<CompactOrder>,
+    bound: Option<&RangeBound>,
+    nulls_only: Option<&str>,
+    deleted_flag: bool,
+) -> String {
+    let filter = match (bound, nulls_only) {
+        (Some(b), _) => MergeFilter::Range(b.clone()),
+        (None, Some(c)) => MergeFilter::NullKeys(c.to_string()),
+        (None, None) => MergeFilter::All,
+    };
+    compact_merge_filtered_sql(
+        base_fqtn,
+        changes_fqtn,
+        columns,
+        pk,
+        &order.into(),
+        &filter,
+        deleted_flag,
+    )
+}
+
+/// Which of the buffer's WINNERS one MERGE takes, and the matching constant
+/// predicate on the base so BigQuery prunes it. `Days` names a script variable
+/// (`ARRAY<DATE>`) — measured: `DATE(T.col) IN UNNEST(var)` reads only the listed
+/// partitions (172 bytes against 48 KB for the MIN..MAX range on the same buffer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeFilter {
+    All,
+    Range(RangeBound),
+    /// A day-partitioned base: the winners in `DATE(column) IN UNNEST(chunk)`, the base
+    /// bounded by `all` — every day the compaction touches, old values included.
+    /// `column_type` decides whether `DATE()` is pinned to UTC (see [`date_of`]).
+    Days {
+        column: String,
+        column_type: String,
+        chunk: String,
+        all: String,
+    },
+    NullKeys(String),
+}
+
+impl MergeFilter {
+    /// The predicate on a row of `alias` — no alias for the buffer's own columns, `T`
+    /// for the base. The base side is bounded by the WHOLE touched range, plus the
+    /// NULL partition: a base row's value is the OLD one, which no window of the
+    /// winners has to contain.
+    fn predicate(&self, alias: &str) -> String {
+        let base = !alias.is_empty();
+        let q = |c: &str| {
+            if base {
+                format!("{alias}.`{c}`")
+            } else {
+                format!("`{c}`")
+            }
+        };
+        // An empty upper bound is "no upper bound": the warehouse's last representable
+        // day has no successor to write `< …` against.
+        let upper = |c: &str, hi: &str| {
+            if hi.is_empty() {
+                String::new()
+            } else {
+                format!(" AND {c} < {hi}")
+            }
+        };
+        match self {
+            MergeFilter::All => String::new(),
+            MergeFilter::Range(b) if base => format!(
+                " AND ({c} >= {lo}{hi} OR {c} IS NULL)",
+                c = q(&b.column),
+                lo = b.all_lo,
+                hi = upper(&q(&b.column), &b.all_hi_exclusive)
+            ),
+            MergeFilter::Range(b) => format!(
+                " AND {c} >= {lo}{hi}",
+                c = q(&b.column),
+                lo = b.lo,
+                hi = upper(&q(&b.column), &b.hi_exclusive)
+            ),
+            MergeFilter::Days {
+                column,
+                column_type,
+                all,
+                ..
+            } if base => format!(
+                " AND ({d} IN UNNEST({all}) OR {c} IS NULL)",
+                d = date_of(&q(column), column_type),
+                c = q(column)
+            ),
+            MergeFilter::Days {
+                column,
+                column_type,
+                chunk,
+                ..
+            } => format!(
+                " AND {} IN UNNEST({chunk})",
+                date_of(&q(column), column_type)
+            ),
+            MergeFilter::NullKeys(c) => format!(" AND {} IS NULL", q(c)),
+        }
+    }
+}
+
+/// [`compact_merge_sql`] over a [`MergeFilter`]: the filter is applied to the
+/// buffer's winners AND, for a partition filter, to the base in `ON`.
+pub fn compact_merge_filtered_sql(
+    base_fqtn: &str,
+    changes_fqtn: &str,
+    columns: &[&str],
+    pk: &[&str],
+    order: &CompactOrder,
+    filter: &MergeFilter,
+    deleted_flag: bool,
+) -> String {
+    let wh = Warehouse::BigQuery;
+    let partition = quote_partition(wh, pk);
+    let order = order.order_by(wh);
+    let source_filter = filter.predicate("");
+    let on_keys = key_join(pk);
+    // NULL-keyed winners match the base by key alone: their partition is unknown.
+    let on_bound = match filter {
+        MergeFilter::NullKeys(_) => String::new(),
+        other => other.predicate("T"),
+    };
+    let flag = |rendered: String| deleted_flag.then_some(rendered);
+    let set = columns
+        .iter()
+        .map(|c| format!("`{c}` = S.`{c}`"))
+        .chain(flag(format!("`{DELETE_FLAG_COLUMN}` = FALSE")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_cols = columns
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .chain(flag(format!("`{DELETE_FLAG_COLUMN}`")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_vals = columns
+        .iter()
+        .map(|c| format!("S.`{c}`"))
+        .chain(flag("FALSE".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Without the flag column there is no tombstone to write, so a delete deletes:
+    // a stream with `deleted_flag: false` still delivers `__op = 'delete'` rows
+    // (a query-based export never does), and letting one fall through to the
+    // upsert arm overwrote the live row with the delete's key-only image.
+    let tombstone = if deleted_flag {
+        format!(
+            "WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n"
+        )
+    } else {
+        "WHEN MATCHED AND S.__op = 'delete' THEN DELETE\n".to_string()
+    };
+    format!(
+        "MERGE `{base_fqtn}` AS T\n\
+         USING (\n\
+         \x20 SELECT * EXCEPT (__rn) FROM (\n\
+         \x20   SELECT *, ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order}) AS __rn\n\
+         \x20   FROM `{changes_fqtn}`\n\
+         \x20 ) WHERE __rn = 1{source_filter}\n\
+         ) AS S\n\
+         ON {on_keys}{on_bound}\n\
+         {tombstone}WHEN MATCHED THEN UPDATE SET {set}\n\
+         WHEN NOT MATCHED AND COALESCE(S.__op, '') != 'delete' THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
+    )
+}
 
 /// Build the current-state dedup view over a `<table>__changes` log for
 /// `warehouse`. `pk` is the change log's primary key column(s); `engine`
@@ -306,6 +664,15 @@ fn build_dedup_view(
 /// PK. Incremental can't observe deletes, so [`DELETE_FLAG_COLUMN`] is a constant
 /// `FALSE` — the view SHAPE matches CDC so downstream reads `WHERE NOT
 /// __is_deleted` uniformly across both modes.
+/// The order an incremental key's latest row wins by: real cursor values above
+/// NULL — a first pass has no cursor bound, so its rows carry a NULL cursor and
+/// must lose to any later value — then newest first. Shared by the current-state
+/// view and the compaction merge so the two can never rank one key differently.
+fn cursor_order_by(warehouse: Warehouse, cursor_column: &str) -> String {
+    let cur = warehouse.quote_ident(cursor_column);
+    format!("{cur} IS NOT NULL DESC, {cur} DESC")
+}
+
 pub fn inc_dedup_view_sql(
     warehouse: Warehouse,
     view_fqtn: &str,
@@ -323,8 +690,7 @@ pub fn inc_dedup_view_sql(
     // non-NULL-cursor update (stale current state; BigQuery sorts NULLs last, so
     // it was correct only by luck). Ranking real cursor values above NULL makes
     // the dedup deterministic across both dialects.
-    let cur = warehouse.quote_ident(cursor_column);
-    let order = format!("{cur} IS NOT NULL DESC, {cur} DESC");
+    let order = cursor_order_by(warehouse, cursor_column);
     build_dedup_view(
         warehouse,
         view_fqtn,
@@ -643,5 +1009,910 @@ mod tests {
         let sf = meta_column_specs(Warehouse::Snowflake);
         assert_eq!(sf[1].target_type, "VARCHAR");
         assert_eq!(sf[2].target_type, "INTEGER");
+    }
+}
+
+/// What the compaction probe read from the buffer: its rows, the partition
+/// column's MIN/MAX as text (dates for a time key, integers for a range key),
+/// and how many rows carry a NULL partition column.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompactProbe {
+    pub rows: u64,
+    pub lo: String,
+    pub hi: String,
+    pub nulls: u64,
+}
+
+/// What every compaction MERGE is built from: the data columns (meta columns and
+/// the delete flag excluded), the key columns, and whether the base carries the
+/// delete flag at all — the one fact that turns the tombstone arm on. One derivation
+/// for both builders, so the filter and the flag cannot drift between them.
+fn merge_inputs<'a>(
+    specs: &'a [TargetColumnSpec],
+    pk: &'a [String],
+) -> (Vec<&'a str>, Vec<&'a str>, bool) {
+    let columns = specs
+        .iter()
+        .map(|s| s.column_name.as_str())
+        .filter(|c| !is_meta_column(c) && *c != DELETE_FLAG_COLUMN)
+        .collect();
+    let pk_refs = pk.iter().map(String::as_str).collect();
+    let deleted_flag = specs.iter().any(|s| s.column_name == DELETE_FLAG_COLUMN);
+    (columns, pk_refs, deleted_flag)
+}
+
+/// The MERGE statements one compaction runs, decided from the probe alone: none
+/// for an empty buffer; one unbounded MERGE when the base has no partition key
+/// (or the key is the load time); otherwise one per window of the key's range —
+/// at most 4,000 partitions each, the cap on what one statement may modify —
+/// plus one for the rows whose key is NULL. Pure, so the loader is glue.
+pub fn plan_compact_merges(
+    base: &str,
+    changes_fqtn: &str,
+    specs: &[TargetColumnSpec],
+    pk: &[String],
+    order: impl Into<CompactOrder>,
+    key: Option<&crate::load::plan::PartitionKey>,
+    probe: &CompactProbe,
+) -> anyhow::Result<Vec<String>> {
+    use crate::load::plan::{Granularity, PartitionKey};
+    let order = order.into();
+    if probe.rows == 0 {
+        return Ok(Vec::new());
+    }
+    let (columns, pk_refs, deleted_flag) = merge_inputs(specs, pk);
+    let merge = |bound: Option<&RangeBound>, nulls_only: Option<&str>| {
+        compact_merge_sql(
+            base,
+            changes_fqtn,
+            &columns,
+            &pk_refs,
+            order.clone(),
+            bound,
+            nulls_only,
+            deleted_flag,
+        )
+    };
+    let part_col = key.and_then(PartitionKey::column);
+    let mut merges = Vec::new();
+    match (key, part_col) {
+        (Some(PartitionKey::Time { granularity, .. }), Some(col)) if !probe.lo.is_empty() => {
+            let ty = specs
+                .iter()
+                .find(|s| s.column_name == col)
+                .map(|s| s.target_type.as_str())
+                .unwrap_or("TIMESTAMP");
+            // Days per window such that no window touches more than 4,000 partitions
+            // of this granularity. Finite on every arm: `chrono` panics past
+            // ~10^11 days, and a sentinel here did exactly that on a monthly table.
+            let step = match granularity {
+                Granularity::Hour => 166,
+                Granularity::Day => 4000,
+                Granularity::Month => 4000 * 28,
+                Granularity::Year => 4000 * 365,
+            };
+            let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d");
+            let (Ok(lo_d), Ok(hi_d)) = (parse(&probe.lo), parse(&probe.hi)) else {
+                anyhow::bail!(
+                    "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
+                    probe.lo,
+                    probe.hi
+                );
+            };
+            // The day AFTER `9999-12-31` (the SCD "end of time" sentinel, a legal
+            // value) is past the warehouse's range: `DATE '+10000-01-01'` was a hard
+            // error that wedged every compaction of the table. No successor, no bound.
+            let upper = |d: chrono::NaiveDate| {
+                if chrono::Datelike::year(&d) > 9999 {
+                    String::new()
+                } else {
+                    time_literal(ty, d)
+                }
+            };
+            let all_lo = time_literal(ty, lo_d);
+            let all_hi = upper(hi_d + chrono::Duration::days(1));
+            for (from, to) in day_windows(lo_d, hi_d, step) {
+                let bound = RangeBound {
+                    column: col.to_string(),
+                    lo: time_literal(ty, from),
+                    hi_exclusive: upper(to),
+                    all_lo: all_lo.clone(),
+                    all_hi_exclusive: all_hi.clone(),
+                };
+                merges.push(merge(Some(&bound), None));
+            }
+            if probe.nulls > 0 {
+                merges.push(merge(None, Some(col)));
+            }
+        }
+        (
+            Some(PartitionKey::Range {
+                interval,
+                start,
+                end,
+                ..
+            }),
+            Some(col),
+        ) if !probe.lo.is_empty() => {
+            let (Ok(lo_i), Ok(hi_i)) = (probe.lo.parse::<i64>(), probe.hi.parse::<i64>()) else {
+                anyhow::bail!(
+                    "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
+                    probe.lo,
+                    probe.hi
+                );
+            };
+            // A value outside `[start, end)` lives in the one unpartitioned bucket, which
+            // no window reaches and which windowing up to it would count in the millions
+            // (a legal BIGINT far past `end`): such a buffer merges once, unbounded.
+            if lo_i < *start || hi_i >= *end {
+                merges.push(merge(None, None));
+                return Ok(merges);
+            }
+            let step = interval.saturating_mul(4000).max(1);
+            // No successor past `i64::MAX`: an empty bound is "no upper bound".
+            let all_hi = hi_i
+                .checked_add(1)
+                .map_or_else(String::new, |h| h.to_string());
+            let mut from = lo_i;
+            loop {
+                let to = from.checked_add(step);
+                let bound = RangeBound {
+                    column: col.to_string(),
+                    lo: from.to_string(),
+                    hi_exclusive: to.map_or_else(String::new, |t| t.to_string()),
+                    all_lo: lo_i.to_string(),
+                    all_hi_exclusive: all_hi.clone(),
+                };
+                merges.push(merge(Some(&bound), None));
+                match to {
+                    Some(t) if t <= hi_i => from = t,
+                    _ => break,
+                }
+            }
+            if probe.nulls > 0 {
+                merges.push(merge(None, Some(col)));
+            }
+        }
+        _ => merges.push(merge(None, None)),
+    }
+    Ok(merges)
+}
+
+/// Partitions one MERGE statement may touch (BigQuery's cap per DML statement).
+pub const MERGE_PARTITION_CAP: usize = 4000;
+
+/// ONE multi-statement job that compacts a base whose partition key is a DAY
+/// column — or no key at all — and drops the buffer: the probe, the MERGEs and
+/// the DROP are statements of one script, so a cycle costs one round trip and one
+/// labelled job (its children inherit the labels). The distinct days of every row
+/// the compaction touches — the buffer's, and the base's rows of the buffer's keys,
+/// whose day may be the OLD one — are collected into a script variable and the
+/// MERGE prunes the base with `DATE(col) IN UNNEST(days) OR col IS NULL`, the
+/// winners taken in chunks of [`MERGE_PARTITION_CAP`]; NULL-keyed winners merge on
+/// their own, unpruned. The last statement returns `(changes_rows, merge_jobs)`.
+pub fn compact_script_sql(
+    base_fqtn: &str,
+    changes_fqtn: &str,
+    specs: &[TargetColumnSpec],
+    pk: &[String],
+    order: impl Into<CompactOrder>,
+    day_column: Option<&str>,
+) -> String {
+    let order = order.into();
+    let (columns, pk_refs, deleted_flag) = merge_inputs(specs, pk);
+    let merge = |filter: &MergeFilter| {
+        compact_merge_filtered_sql(
+            base_fqtn,
+            changes_fqtn,
+            &columns,
+            &pk_refs,
+            &order,
+            filter,
+            deleted_flag,
+        )
+    };
+    let Some(col) = day_column else {
+        return format!(
+            "DECLARE n INT64 DEFAULT 0;\n\
+             SET n = (SELECT COUNT(*) FROM `{changes_fqtn}`);\n\
+             IF n > 0 THEN\n{merge_all}\nEND IF;\n\
+             DROP TABLE `{changes_fqtn}`;\n\
+             SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;",
+            merge_all = merge(&MergeFilter::All)
+        );
+    };
+    let ty = column_type_of(specs, col);
+    let by_days = merge(&MergeFilter::Days {
+        column: col.to_string(),
+        column_type: ty.to_string(),
+        chunk: "chunk".to_string(),
+        all: "days".to_string(),
+    });
+    let null_keys = merge(&MergeFilter::NullKeys(col.to_string()));
+    let touched = touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, col, Some(ty));
+    format!(
+        "DECLARE n INT64 DEFAULT 0;\n\
+         DECLARE null_keys INT64 DEFAULT 0;\n\
+         DECLARE days ARRAY<DATE> DEFAULT [];\n\
+         DECLARE chunk ARRAY<DATE>;\n\
+         DECLARE i INT64 DEFAULT 0;\n\
+         DECLARE jobs INT64 DEFAULT 0;\n\
+         SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL) FROM `{changes_fqtn}`);\n\
+         SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM ({touched}));\n\
+         WHILE i < ARRAY_LENGTH(days) DO\n\
+         \x20 SET chunk = ARRAY(SELECT d FROM UNNEST(days) AS d WITH OFFSET AS o WHERE o >= i AND o < i + {cap});\n\
+         {by_days}\n\
+         \x20 SET i = i + {cap};\n\
+         \x20 SET jobs = jobs + 1;\n\
+         END WHILE;\n\
+         IF null_keys > 0 THEN\n{null_keys_merge}\n\x20 SET jobs = jobs + 1;\nEND IF;\n\
+         DROP TABLE `{changes_fqtn}`;\n\
+         SELECT n AS changes_rows, jobs AS merge_jobs;",
+        cap = MERGE_PARTITION_CAP,
+        null_keys_merge = null_keys,
+    )
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use crate::load::plan::{Granularity, PartitionKey};
+
+    /// The day-key script: one job — probe, chunked `IN UNNEST(chunk)` MERGEs (≤ 4,000
+    /// days each, the base pruned to exactly those days), the NULL-keyed pass, the
+    /// DROP, and the `(changes_rows, merge_jobs)` row last. No key: one unbounded
+    /// MERGE guarded by the row count, then the DROP.
+    #[test]
+    fn the_compaction_script_probes_merges_by_day_list_and_drops_in_one_job() {
+        let s = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some("created_at"),
+        );
+        assert!(
+            s.contains(
+                "SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`);"
+            ),
+            "ONE count statement over the buffer — every statement that reads a table is \
+             billed a 10 MB floor: {s}"
+        );
+        assert!(
+            s.contains(
+                "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM (\
+                 SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL \
+                 SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS \
+                 (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)));"
+            ),
+            "the days are the buffer's AND the base's for the buffer's keys: {s}"
+        );
+        assert_eq!(
+            s.matches("FROM `p.d.t__changes`").count(),
+            5,
+            "the buffer is read by the count, the day probe (twice), and the two MERGEs, \
+             nowhere else: {s}"
+        );
+        assert!(s.contains("WHILE i < ARRAY_LENGTH(days) DO"), "{s}");
+        assert!(s.contains("WHERE o >= i AND o < i + 4000"), "{s}");
+        assert!(
+            s.contains(") WHERE __rn = 1 AND DATE(`created_at`) IN UNNEST(chunk)")
+                && s.contains(
+                    "ON T.`id` = S.`id` AND (DATE(T.`created_at`) IN UNNEST(days) OR T.`created_at` IS NULL)"
+                ),
+            "winners filtered by the chunk, the base pruned to EVERY touched day plus the \
+             NULL partition — never to the chunk alone: {s}"
+        );
+        assert!(
+            s.contains("IF null_keys > 0 THEN")
+                && s.contains(") WHERE __rn = 1 AND `created_at` IS NULL")
+                && s.contains("ON T.`id` = S.`id`\nWHEN MATCHED AND S.__op = 'delete'"),
+            "NULL-keyed winners merge by key alone: {s}"
+        );
+        let drop = s.find("DROP TABLE `p.d.t__changes`;").expect("the drop");
+        let last_merge = s.rfind("MERGE `p.d.t`").expect("a merge");
+        assert!(last_merge < drop, "every MERGE precedes the DROP: {s}");
+        assert!(
+            s.trim_end()
+                .ends_with("SELECT n AS changes_rows, jobs AS merge_jobs;"),
+            "{s}"
+        );
+
+        let plain = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            None,
+        );
+        assert!(
+            plain.contains("IF n > 0 THEN\nMERGE `p.d.t` AS T"),
+            "{plain}"
+        );
+        assert!(plain.contains("ON T.`id` = S.`id`\n"), "unbounded: {plain}");
+        assert!(!plain.contains("UNNEST"), "{plain}");
+        assert!(
+            plain.ends_with("SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;"),
+            "{plain}"
+        );
+
+        // A TIMESTAMP day column is read as a UTC day at every site of the script — the
+        // day list, the winners' chunk filter and the base's bound — or the project's
+        // default time zone decides which day a row is, against `+00` literals and
+        // UTC-day partitions. A DATETIME (`specs()` above) takes no zone.
+        let utc = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &[
+                meta_spec("id", "INT64"),
+                meta_spec("created_at", "TIMESTAMP"),
+            ],
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some("created_at"),
+        );
+        assert!(
+            utc.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`, 'UTC') FROM `p.d.t` AS T")
+                && utc.contains(") WHERE __rn = 1 AND DATE(`created_at`, 'UTC') IN UNNEST(chunk)")
+                && utc.contains("ON T.`id` = S.`id` AND (DATE(T.`created_at`, 'UTC') IN UNNEST(days) OR T.`created_at` IS NULL)"),
+            "{utc}"
+        );
+
+        // Hostile names: a reserved-word key and a dashed table id are quoted
+        // everywhere they appear — the ON clause, the window, the buffer filter.
+        let hostile = compact_script_sql(
+            "p.d.my-orders",
+            "p.d.my-orders__changes",
+            &[meta_spec("order", "INT64"), meta_spec("created_at", "DATE")],
+            &["order".to_string()],
+            SourceEngine::Postgres,
+            Some("created_at"),
+        );
+        assert!(hostile.contains("MERGE `p.d.my-orders` AS T"), "{hostile}");
+        assert!(
+            hostile.contains("PARTITION BY `order` ORDER BY"),
+            "{hostile}"
+        );
+        assert!(
+            hostile.contains("ON T.`order` = S.`order` AND (DATE(T.`created_at`)"),
+            "{hostile}"
+        );
+        assert!(
+            hostile.contains("DROP TABLE `p.d.my-orders__changes`;"),
+            "{hostile}"
+        );
+        assert!(
+            !hostile.contains(" order "),
+            "never a bare reserved word: {hostile}"
+        );
+    }
+
+    fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
+        CompactProbe {
+            rows,
+            lo: lo.into(),
+            hi: hi.into(),
+            nulls,
+        }
+    }
+
+    fn specs() -> Vec<TargetColumnSpec> {
+        vec![
+            meta_spec("id", "INT64"),
+            meta_spec("v", "INT64"),
+            meta_spec("created_at", "DATETIME"),
+            meta_spec("__is_deleted", "BOOL"),
+        ]
+    }
+
+    fn plan(key: Option<&PartitionKey>, p: &CompactProbe) -> Vec<String> {
+        plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            key,
+            p,
+        )
+        .expect("a plan")
+    }
+
+    /// An empty buffer plans nothing; no key plans one unbounded MERGE; a day
+    /// key over 5,000 days plans two windows (+ one for the NULL rows when there
+    /// are any); a range key steps by interval × 4,000; the flag column never
+    /// appears among the merged columns.
+    #[test]
+    fn the_compaction_plan_follows_the_probe_and_the_key() {
+        let day = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Day,
+        };
+        assert!(
+            plan(Some(&day), &probe(0, "", "", 0)).is_empty(),
+            "nothing to merge"
+        );
+        let all_null_keys = plan(Some(&day), &probe(3, "", "", 3));
+        assert_eq!(
+            all_null_keys.len(),
+            1,
+            "a key with no range (every row's key NULL) merges once, unbounded"
+        );
+        assert!(
+            all_null_keys[0].contains("ON T.`id` = S.`id`\n"),
+            "{}",
+            all_null_keys[0]
+        );
+        let hour = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Hour,
+        };
+        assert_eq!(
+            plan(Some(&hour), &probe(4, "2024-01-01", "2024-07-18", 0)).len(),
+            2,
+            "hourly partitions: 4,000 of them are 166 days, so 200 days take two windows"
+        );
+        let month = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Month,
+        };
+        assert_eq!(
+            plan(Some(&month), &probe(4, "1990-01-01", "2026-09-17", 0)).len(),
+            1,
+            "monthly partitions never reach the cap: one window"
+        );
+
+        let none = plan(None, &probe(7, "", "", 0));
+        assert_eq!(none.len(), 1);
+        assert!(
+            none[0].contains("ON T.`id` = S.`id`\n"),
+            "unbounded: {}",
+            none[0]
+        );
+        assert!(
+            none[0].contains("SET `id` = S.`id`, `v` = S.`v`, `created_at` = S.`created_at`, `__is_deleted` = FALSE"),
+            "the flag is set, never copied from the buffer: {}",
+            none[0]
+        );
+
+        let two = plan(Some(&day), &probe(9, "2000-01-01", "2013-09-08", 0));
+        assert_eq!(two.len(), 2, "5,000 days → two windows of ≤ 4,000");
+        assert!(
+            two[0].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '2000-01-01T00:00:00' AND `created_at` < DATETIME '2010-12-14T00:00:00'"),
+            "the winners of the first window: {}",
+            two[0]
+        );
+        assert!(
+            two[1].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '2010-12-14T00:00:00'"),
+            "{}",
+            two[1]
+        );
+        // Both windows bound the BASE by the whole touched range: a key whose value
+        // moved from the first window into the second sits in the base under the old
+        // value, and a base bound by the winner's window alone re-inserted it.
+        let base_bound = "ON T.`id` = S.`id` AND (T.`created_at` >= DATETIME '2000-01-01T00:00:00' AND T.`created_at` < DATETIME '2013-09-09T00:00:00' OR T.`created_at` IS NULL)";
+        assert!(
+            two[0].contains(base_bound) && two[1].contains(base_bound),
+            "{}\n{}",
+            two[0],
+            two[1]
+        );
+
+        let with_nulls = plan(Some(&day), &probe(9, "2024-01-01", "2024-01-02", 3));
+        assert_eq!(with_nulls.len(), 2, "one window + the NULL set");
+        assert!(
+            with_nulls[1].contains("WHERE __rn = 1 AND `created_at` IS NULL"),
+            "{}",
+            with_nulls[1]
+        );
+
+        let range = PartitionKey::Range {
+            column: "bucket".into(),
+            start: 0,
+            end: 1_000_000,
+            interval: 10,
+        };
+        let stepped = plan(Some(&range), &probe(5, "0", "45000", 1));
+        assert_eq!(
+            stepped.len(),
+            3,
+            "45,001 keys at 10 × 4,000 per job → two windows + NULLs"
+        );
+        assert!(
+            stepped[0].contains("`bucket` >= 0 AND `bucket` < 40000"),
+            "{}",
+            stepped[0]
+        );
+        assert!(
+            stepped[1].contains("`bucket` >= 40000 AND `bucket` < 80000"),
+            "{}",
+            stepped[1]
+        );
+
+        // A value outside the key's `[start, end)` lives in the unpartitioned bucket no
+        // window reaches: one unbounded MERGE, not a million windows up to it.
+        let stray = plan(Some(&range), &probe(5, "0", "4000000000", 0));
+        assert_eq!(stray.len(), 1, "{stray:?}");
+        assert!(stray[0].contains("ON T.`id` = S.`id`\n"), "{}", stray[0]);
+
+        // The warehouse's last day has no successor: a `9999-12-31` sentinel (the SCD
+        // "end of time", a legal value) must not render `DATE '+10000-01-01'` — a hard
+        // error that wedged every compaction of the table. RED against `hi + 1 day`.
+        let eot = plan(Some(&month), &probe(2, "9999-01-01", "9999-12-31", 0));
+        assert_eq!(eot.len(), 1, "{eot:?}");
+        assert!(
+            !eot[0].contains("10000")
+                && eot[0].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '9999-01-01T00:00:00'\n")
+                && eot[0].contains("ON T.`id` = S.`id` AND (T.`created_at` >= DATETIME '9999-01-01T00:00:00' OR T.`created_at` IS NULL)"),
+            "no upper bound past the last day: {}",
+            eot[0]
+        );
+
+        // A monthly key steps 4,000 × 28 days: 400 years span two windows, not one
+        // and not hundreds.
+        let long_month = plan(Some(&month), &probe(4, "1600-01-01", "2000-01-01", 0));
+        assert_eq!(long_month.len(), 2, "146,000 days at 112,000 per window");
+        // A range key without NULL keys plans no NULL pass; one whose every key is
+        // NULL (no range to read) merges once, unbounded.
+        assert_eq!(plan(Some(&range), &probe(5, "0", "45000", 0)).len(), 2);
+        let range_nulls = plan(Some(&range), &probe(2, "", "", 2));
+        assert_eq!(range_nulls.len(), 1);
+        assert!(
+            range_nulls[0].contains("ON T.`id` = S.`id`\n"),
+            "{}",
+            range_nulls[0]
+        );
+
+        let err = plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some(&day),
+            &probe(1, "not-a-date", "x", 0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot read the buffer's `created_at` range"),
+            "{err}"
+        );
+    }
+
+    fn bound(lo: &str, hi: &str) -> RangeBound {
+        RangeBound {
+            column: "created_at".into(),
+            lo: lo.into(),
+            hi_exclusive: hi.into(),
+            all_lo: lo.into(),
+            all_hi_exclusive: hi.into(),
+        }
+    }
+
+    /// The MERGE upserts the latest change per key, flags a tombstone instead of
+    /// deleting, un-flags a re-insert, never inserts a delete — and prunes BOTH sides
+    /// by the same constant bound, since only constants prune a MERGE target.
+    #[test]
+    fn compact_merge_flags_deletes_and_prunes_both_sides_by_constants() {
+        let sql = compact_merge_sql(
+            "p.d.orders",
+            "p.d.orders__changes",
+            &["id", "v", "created_at"],
+            &["id"],
+            SourceEngine::MySql,
+            Some(&bound("DATE '2000-01-01'", "DATE '2010-12-14'")),
+            None,
+            true,
+        );
+        assert!(sql.starts_with("MERGE `p.d.orders` AS T"), "{sql}");
+        assert!(sql.contains("PARTITION BY `id` ORDER BY"), "{sql}");
+        assert!(
+            sql.contains("FROM `p.d.orders__changes`\n  ) WHERE __rn = 1 AND `created_at` >= DATE '2000-01-01' AND `created_at` < DATE '2010-12-14'"),
+            "the buffer side is bounded AFTER ranking, on the winner: {sql}"
+        );
+        assert!(
+            sql.contains("ON T.`id` = S.`id` AND (T.`created_at` >= DATE '2000-01-01' AND T.`created_at` < DATE '2010-12-14' OR T.`created_at` IS NULL)"),
+            "the base side is bounded by the same constants, plus its NULL partition: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `__is_deleted` = TRUE"
+            ),
+            "a tombstone flags, never deletes: {sql}"
+        );
+        assert!(
+            sql.contains("WHEN MATCHED THEN UPDATE SET `id` = S.`id`, `v` = S.`v`, `created_at` = S.`created_at`, `__is_deleted` = FALSE"),
+            "an update refreshes the values and un-flags: {sql}"
+        );
+        assert!(
+            sql.contains("WHEN NOT MATCHED AND COALESCE(S.__op, '') != 'delete' THEN INSERT (`id`, `v`, `created_at`, `__is_deleted`) VALUES (S.`id`, S.`v`, S.`created_at`, FALSE)"),
+            "an insert lands live; a delete of an unknown key inserts nothing: {sql}"
+        );
+        assert!(
+            !sql.contains("THEN DELETE"),
+            "the warehouse deletes nothing: {sql}"
+        );
+        // MySQL orders by the binlog file's ordinal then position, `__seq` last.
+        assert!(
+            sql.contains("JSON_VALUE(__pos,'$.file')") && sql.contains("__seq DESC"),
+            "{sql}"
+        );
+    }
+
+    /// Rows whose partition column is NULL (a tombstone with a minimal before-image)
+    /// merge on their own, unpruned, so a bounded pass cannot skip them.
+    #[test]
+    fn compact_merge_of_null_partition_rows_is_unbounded() {
+        let sql = compact_merge_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &["id"],
+            &["id"],
+            SourceEngine::Postgres,
+            None,
+            Some("created_at"),
+            true,
+        );
+        assert!(
+            sql.contains("WHERE __rn = 1 AND `created_at` IS NULL"),
+            "the NULL set is chosen among the WINNERS, so a key whose latest change is \
+             dated never merges here as well: {sql}"
+        );
+        assert!(
+            sql.contains("ON T.`id` = S.`id`\n"),
+            "no bound on the base: {sql}"
+        );
+    }
+
+    /// Windows of at most `step` days cover `[lo, hi]` exactly once each — 5,000
+    /// days at BigQuery's 4,000-partition cap is two MERGEs, not one refusal.
+    #[test]
+    fn day_windows_cover_the_span_once_in_cap_sized_steps() {
+        let lo = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        let hi = lo + chrono::Duration::days(4999);
+        let w = day_windows(lo, hi, 4000);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].0, lo);
+        assert_eq!(w[0].1, lo + chrono::Duration::days(4000));
+        assert_eq!(w[1].0, w[0].1, "windows abut");
+        assert_eq!(
+            w[1].1,
+            hi + chrono::Duration::days(1),
+            "the last is half-open past hi"
+        );
+        assert_eq!(
+            day_windows(lo, lo, 4000),
+            vec![(lo, lo + chrono::Duration::days(1))]
+        );
+    }
+
+    #[test]
+    fn time_literals_follow_the_columns_type() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap();
+        assert_eq!(time_literal("DATE", d), "DATE '2026-09-17'");
+        assert_eq!(
+            time_literal("DATETIME", d),
+            "DATETIME '2026-09-17T00:00:00'"
+        );
+        assert_eq!(
+            time_literal("TIMESTAMP", d),
+            "TIMESTAMP '2026-09-17 00:00:00+00'"
+        );
+    }
+
+    #[test]
+    fn the_probe_normalises_time_keys_to_dates_and_reads_ranges_as_is() {
+        let pk = ["id".to_string()];
+        let t = compact_probe_sql(
+            "p.d.t__changes",
+            "p.d.t",
+            &pk,
+            Some("created_at"),
+            Some("DATETIME"),
+        );
+        assert!(
+            t.contains("SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)")
+                && t.contains("MIN(v)")
+                && t.contains("(SELECT COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`) AS null_keys"),
+            "the range covers the base's rows of the buffer's keys, the NULL count is the buffer's: {t}"
+        );
+        // A TIMESTAMP is read as a UTC day: an unqualified `DATE(timestamp)` follows the
+        // project's default time zone, while the bounds it feeds are rendered `+00` and
+        // the partitions are UTC days — under `Asia/Tokyo` the two disagreed by a day at
+        // both ends (a skipped winner, a re-inserted key). A DATETIME takes no zone.
+        let ts = compact_probe_sql(
+            "p.d.t__changes",
+            "p.d.t",
+            &pk,
+            Some("created_at"),
+            Some("TIMESTAMP"),
+        );
+        assert!(
+            ts.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`, 'UTC') FROM `p.d.t` AS T"),
+            "{ts}"
+        );
+        let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), None);
+        assert!(
+            r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT T.`bucket` FROM `p.d.t` AS T")
+                && !r.contains("DATE("),
+            "{r}"
+        );
+        let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, None);
+        assert!(
+            n.contains("'' AS lo") && n.contains("0 AS null_keys"),
+            "{n}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_column_tests {
+    use super::*;
+    use crate::load::plan::{Granularity, PartitionKey};
+
+    fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
+        CompactProbe {
+            rows,
+            lo: lo.into(),
+            hi: hi.into(),
+            nulls,
+        }
+    }
+
+    /// A YEAR key steps 4,000 x 365 days, so four centuries are ONE window. RED
+    /// against `4000 + 365` (34 windows) and `4000 / 365` (13,000 of them) — the
+    /// arm the day/hour/month cases never reach.
+    #[test]
+    fn a_yearly_key_plans_one_window_for_four_centuries() {
+        let year = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Year,
+        };
+        let specs = vec![
+            meta_spec("id", "INT64"),
+            meta_spec("created_at", "DATETIME"),
+            flag_spec(Warehouse::BigQuery),
+        ];
+        let plans = plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs,
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some(&year),
+            &probe(4, "1600-01-01", "2000-01-01", 0),
+        )
+        .expect("a plan");
+        assert_eq!(plans.len(), 1, "146,098 days at 1,460,000 per window");
+        assert!(
+            plans[0].contains("T.`created_at` >= DATETIME '1600-01-01T00:00:00'")
+                && plans[0].contains("T.`created_at` < DATETIME '2000-01-02T00:00:00'"),
+            "the one window covers the whole span: {}",
+            plans[0]
+        );
+    }
+
+    /// The scripted MERGE carries the DATA columns only. The buffer's `__op` /
+    /// `__pos` / `__seq` are its own bookkeeping, and `__is_deleted` is DECIDED by
+    /// the merge, never copied from a buffer row that has no such column.
+    #[test]
+    fn the_compaction_script_merges_data_columns_only() {
+        let mut specs = meta_column_specs(Warehouse::BigQuery);
+        specs.push(meta_spec("id", "INT64"));
+        specs.push(meta_spec("v", "INT64"));
+        specs.push(flag_spec(Warehouse::BigQuery));
+        let s = compact_script_sql(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs,
+            &["id".to_string()],
+            SourceEngine::MySql,
+            None,
+        );
+        assert!(
+            s.contains("SET `id` = S.`id`, `v` = S.`v`, `__is_deleted` = FALSE"),
+            "data columns, then the flag the merge sets: {s}"
+        );
+        assert!(
+            s.contains("INSERT (`id`, `v`, `__is_deleted`) VALUES (S.`id`, S.`v`, FALSE)"),
+            "{s}"
+        );
+        for meta in ["__op", "__pos", "__seq"] {
+            assert!(
+                !s.contains(&format!("`{meta}` = S.`{meta}`")),
+                "the buffer's {meta} must not land in the base: {s}"
+            );
+        }
+        assert!(
+            !s.contains("`__is_deleted` = S.`__is_deleted`"),
+            "the flag is the merge's decision, not a copied column: {s}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_order_tests {
+    use super::*;
+
+    /// The compaction and the current-state view must rank ONE key the same way,
+    /// or a compacted base and a view over the same rows disagree about which is
+    /// latest. The cursor arm renders the view's own order, NULL guard included.
+    #[test]
+    fn the_cursor_order_is_the_one_the_incremental_view_ranks_by() {
+        let order = CompactOrder::Cursor("updated_at".into()).order_by(Warehouse::BigQuery);
+        assert_eq!(order, "`updated_at` IS NOT NULL DESC, `updated_at` DESC");
+        let view = inc_dedup_view_sql(
+            Warehouse::BigQuery,
+            "p.d.t",
+            "p.d.t__changes",
+            &["id"],
+            "updated_at",
+        );
+        assert!(
+            view.contains(&order),
+            "the view must rank by the same order: {view}"
+        );
+        let cdc = CompactOrder::Cdc(SourceEngine::MySql).order_by(Warehouse::BigQuery);
+        assert!(
+            cdc.contains("__pos") && cdc.ends_with("DESC"),
+            "a stream ranks by its log position: {cdc}"
+        );
+        assert_eq!(
+            CompactOrder::from(SourceEngine::MySql).order_by(Warehouse::BigQuery),
+            cdc
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_flag_tests {
+    use super::*;
+
+    /// A query-based export cannot express a DELETE, so its base need not carry
+    /// `__is_deleted` — an extra column per row on the warehouse side. With the
+    /// column absent the MERGE must not name it ANYWHERE: not in the SET list, not
+    /// among the inserted columns, and not as a tombstone arm, or it would fail
+    /// against a base that does not have it.
+    #[test]
+    fn a_base_without_the_delete_flag_merges_without_naming_it() {
+        let data = vec![meta_spec("id", "INT64"), meta_spec("v", "INT64")];
+        let mut flagged = data.clone();
+        flagged.push(flag_spec(Warehouse::BigQuery));
+        let build = |specs: &[TargetColumnSpec]| {
+            compact_script_sql(
+                "p.d.t",
+                "p.d.t__changes",
+                specs,
+                &["id".to_string()],
+                SourceEngine::MySql,
+                None,
+            )
+        };
+
+        let with = build(&flagged);
+        assert!(
+            with.contains("`__is_deleted` = FALSE") && with.contains("`__is_deleted` = TRUE"),
+            "a stream's base keeps the flag and its tombstone arm: {with}"
+        );
+
+        let without = build(&data);
+        assert!(
+            !without.contains("__is_deleted"),
+            "the column is named nowhere when the base has none: {without}"
+        );
+        assert!(
+            without.contains("WHEN MATCHED AND S.__op = 'delete' THEN DELETE\n")
+                && !without.contains("THEN UPDATE SET `__is_deleted`"),
+            "no flag, no tombstone to write — a delete DELETES, never falls through to the \
+             upsert with its key-only image: {without}"
+        );
+        assert!(
+            without.contains("WHEN MATCHED THEN UPDATE SET `id` = S.`id`, `v` = S.`v`\n")
+                && without.contains("INSERT (`id`, `v`) VALUES (S.`id`, S.`v`)"),
+            "the data columns still upsert: {without}"
+        );
     }
 }

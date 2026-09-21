@@ -1526,17 +1526,24 @@ impl CdcSchemaResolver {
         // Round-10 bughunt, read-only there; refused here rather than papered over,
         // because there is no rendering of this table that is both faithful and
         // unambiguous.
-        if let Some(m) = mappings
-            .iter()
-            .find(|m| matches!(m.column_name.as_str(), "__op" | "__pos" | "__seq"))
-        {
+        // `__is_deleted` is reserved too: the base-and-buffer layout adds it to the
+        // baseline as data and the compaction DECIDES it — a source column of that
+        // name was silently overwritten by the merge's own flag, and flipped the
+        // tombstone arm on regardless of `deleted_flag:`.
+        if let Some(m) = mappings.iter().find(|m| {
+            matches!(
+                m.column_name.as_str(),
+                "__op" | "__pos" | "__seq" | crate::load::cdc::DELETE_FLAG_COLUMN
+            )
+        }) {
             anyhow::bail!(
-                "cdc: `{table}` has a column named `{}`, which is one of the names the \
-                 CDC sink adds to every part (`__op`, `__pos`, `__seq`). Capturing it \
-                 would put two fields of that name in one part and silently redirect \
-                 `_rivet_row_hash` to the sink's value instead of the source's — the \
-                 drain and the snapshot leg would then disagree about the same row. \
-                 Project the column to another name with a `query:`, or exclude it.",
+                "cdc: `{table}` has a column named `{}`, which is one of the names rivet \
+                 adds to every part (`__op`, `__pos`, `__seq`) or to the warehouse base \
+                 (`__is_deleted`). Capturing it would put two fields of that name in one \
+                 part and silently redirect `_rivet_row_hash` to the sink's value instead \
+                 of the source's — the drain and the snapshot leg would then disagree about \
+                 the same row. Project the column to another name with a `query:`, or \
+                 exclude it.",
                 m.column_name
             );
         }

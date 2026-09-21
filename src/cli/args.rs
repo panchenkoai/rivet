@@ -19,7 +19,7 @@ pub use crate::pipeline::ValidateDepth;
 #[derive(Parser)]
 #[command(
     name = "rivet",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RIVET_GIT_SHA"), ")"),
     about = "Export data from databases to files",
     after_help = "Getting started (the happy path):\n  \
         1. rivet init     scaffold a config from your database\n  \
@@ -210,6 +210,19 @@ pub enum Commands {
         #[arg(long)]
         rebuild_changelog: bool,
     },
+    /// Merge each base-and-buffer CDC table's `<table>__changes` buffer into its
+    /// base table (`MERGE` by primary key: updates, inserts, deletes flagged as
+    /// `__is_deleted`) and drop the buffer — the billed step of the cycle
+    /// `run → load → compact`, labelled `rivet_op:merge` per table.
+    Compact {
+        /// Path to YAML config file — the same one `rivet load` reads.
+        #[arg(short = 'c', long)]
+        config: String,
+        /// Correlation id stamped on every warehouse job of this compaction
+        /// (BigQuery `rivet_run` label). Defaults to a generated id.
+        #[arg(long, env = "RIVET_RUN_ID")]
+        run_id: Option<String>,
+    },
     /// Manage export state
     State {
         #[command(subcommand)]
@@ -261,8 +274,11 @@ pub enum Commands {
         discover: bool,
         /// Override the suggested extraction mode for every scaffolded export.
         /// `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block
-        /// with engine-specific stream params) instead of a batch query. Other
-        /// values (full / incremental / chunked / time_window) just override the
+        /// with engine-specific stream params) instead of a batch query; on MySQL,
+        /// and on PostgreSQL when every table is in `public`, over two or more
+        /// tables it writes one batch recipe per table plus one `tables:` stream
+        /// with `backfill: auto` (one export per table otherwise). Other values
+        /// (full / incremental / chunked / time_window) just override the
         /// auto-suggested mode.
         #[arg(long, value_name = "MODE")]
         mode: Option<String>,
@@ -285,6 +301,27 @@ pub enum Commands {
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
+        /// Scaffold a `load:` block for this BigQuery project. With
+        /// `--bigquery-dataset` the generated config carries the warehouse target,
+        /// a per-table partition guess and the base+buffer layout, so `rivet load`
+        /// and `rivet compact` work from it after a review. Needs `--gcs-bucket`:
+        /// the load reads GCS only, so a local or S3 scaffold with a `load:` block
+        /// is a config `rivet load` refuses.
+        #[arg(
+            long = "bigquery-project",
+            value_name = "PROJECT",
+            requires = "bigquery_dataset",
+            requires = "gcs_bucket",
+            conflicts_with = "s3_bucket"
+        )]
+        bigquery_project: Option<String>,
+        /// The dataset the load creates its tables in (with `--bigquery-project`).
+        #[arg(
+            long = "bigquery-dataset",
+            value_name = "DATASET",
+            requires = "bigquery_project"
+        )]
+        bigquery_dataset: Option<String>,
         /// TLS posture for BOTH the introspection connection init opens AND the
         /// `source.tls:` block written into the scaffold. Required (or `disable`,
         /// explicitly) for any non-loopback host — without it the TLS gate
@@ -662,6 +699,31 @@ mod tests {
         assert_eq!(
             state_reset_chunks_parse_from(&[]).unwrap_err(),
             clap::error::ErrorKind::MissingRequiredArgument,
+        );
+    }
+
+    /// `rivet load` reads GCS only, so a `load:` scaffold over a local or S3
+    /// destination is a config whose own next-steps command refuses it. Refused at
+    /// the flag, where the operator can still change it.
+    #[test]
+    fn init_clap_requires_a_gcs_bucket_for_a_bigquery_load_scaffold() {
+        let bq = ["--bigquery-project", "p", "--bigquery-dataset", "d"];
+        let src = ["--source", "postgresql://localhost/db"];
+        assert_init_err(
+            &[src.as_slice(), bq.as_slice()].concat(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--bigquery-* without --gcs-bucket",
+        );
+        // A conflict, not a missing requirement: clap drops a requirement that conflicts
+        // with a present flag, so `requires` alone let `--s3-bucket` satisfy it.
+        assert_init_err(
+            &[src.as_slice(), bq.as_slice(), &["--s3-bucket", "s"]].concat(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--bigquery-* with --s3-bucket only",
+        );
+        assert_init_ok(
+            &[src.as_slice(), bq.as_slice(), &["--gcs-bucket", "g"]].concat(),
+            "--bigquery-* with --gcs-bucket",
         );
     }
 

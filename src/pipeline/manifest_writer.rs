@@ -187,7 +187,7 @@ impl ManifestBuilder {
     /// reach the manifest even if a caller had one to give. Combined with all
     /// three production writers passing `None` there, the effect was that
     /// `load::reconcile`'s source→file bail, its `LoadIntegrity.source_rows`
-    /// field and the whole `--allow-source-drift` flag were unreachable code:
+    /// field and the whole `allow_source_drift` config key were unreachable code:
     /// the chain of custody always ended at "rivet says it wrote N" (audit
     /// 2026-08-17).
     ///

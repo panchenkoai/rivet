@@ -197,6 +197,33 @@ To refresh many files at once (per-table YAMLs plus combined schema snapshots), 
 
 ---
 
+## Warehouse scaffold: `--bigquery-project` / `--bigquery-dataset` / `--gcs-bucket`
+
+With the three flags together, the generated config carries the warehouse half of
+the cycle — a top-level `load:` block (`target: bigquery`, `pk: auto`,
+`cluster_by: auto`, `cleanup_source: true`), a per-table `partition:` guess (the
+creation stamp — `created_at` / `CreatedDate` … — at `granularity: day`, never a
+mutation stamp, which would move a row between partitions on every update) and,
+for a mode that carries deltas (`incremental`, `cdc`), `layout: base_buffer` so
+`rivet compact` has a base to merge into. Every value is a guess from the catalog:
+review the block before the first load.
+
+```bash
+rivet init --source "$PG_URL" --table orders --mode incremental \
+  --gcs-bucket my-bucket --bigquery-project my-proj --bigquery-dataset my_ds -o rivet.yaml
+rivet run     -c rivet.yaml   # Parquet → gs://my-bucket/exports/orders/
+rivet load    -c rivet.yaml   # → the base on the first pass, the buffer on later ones
+rivet compact -c rivet.yaml   # MERGE the buffer into the base and drop it
+```
+
+`--gcs-bucket` is required with the BigQuery flags: `rivet load` reads GCS only, so a
+`load:` block over a local or S3 destination is a config its own next step refuses.
+For a whole-database CDC scaffold (one `tables:` stream with `backfill: auto`) the
+partition guesses are written on the stream's `load.tables.<table>` blocks — the
+place the load reads them — not on the per-table recipes, which the load never reads.
+
+---
+
 ## Limitations
 
 - **Not** a migration or DDL tool — only read-only introspection and YAML output.

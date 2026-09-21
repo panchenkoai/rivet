@@ -33,6 +33,7 @@
 - [Failure modes & recovery](reference/cdc-failure-modes.md)
 - [Change ordering](cdc-seq-ordering.md)
 - [Load CDC into BigQuery](cdc-bigquery-load.md)
+- [The full CDC cycle, step by step](cdc-full-cycle.md)
 
 # Sources
 

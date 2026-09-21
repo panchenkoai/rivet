@@ -83,9 +83,18 @@ fn export_one_chunk_range(
         ),
         &mut sink,
     )?;
-    if let Some(w) = sink.writer.take() {
-        w.finish()?;
-    }
+    // NO bare `writer.take() + finish()` here. `ExportSink::finish_writer` is the
+    // ONE close path and says so: it stamps PARTITION_BUCKETS_KEY into the part's
+    // footer before closing, and `load::plan_load_batches` reads that note FIRST,
+    // falling back to the raw row count when it is missing
+    // (src/load/partition_budget.rs:72). Closing by hand here left `writer` None,
+    // so the `sink.finish_writer()?` that opens `write_sink_parts` below
+    // (src/pipeline/commit.rs:487) became a no-op and the last part of EVERY chunk
+    // on this runner shipped without the bound — the load then over-counts a
+    // scattered part's partitions, silently, on this runner only.
+    // The schema fingerprint below only needs `sink.dest_schema`, which the sink
+    // resolves during `export` and keeps after the writer is closed.
+    sink.finish_writer()?;
     // ADR-0012 M3: capture the dest schema fingerprint as soon as the sink
     // resolves it.  Idempotent: the helper no-ops once `summary` already
     // carries one, and the schema is identical across chunks of one run.
@@ -115,7 +124,7 @@ fn export_one_chunk_range(
         summary.validated = Some(true);
     }
 
-    let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+    let key = sink.checksum_key();
     let rows = sink.total_rows;
     Ok((rows, recs, std::mem::take(&mut sink.column_checksums), key))
 }

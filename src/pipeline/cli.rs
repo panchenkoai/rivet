@@ -381,13 +381,24 @@ pub fn show_metrics(
     Ok(())
 }
 
+/// Whether `name` is a declared export — or a CDC baseline leg
+/// (`<stream>__snapshot_<table>`, rivet's own name) whose PARENT stream is: its
+/// interrupted chunk run is the one a changed recipe leaves un-resumable.
+fn export_is_declared(config: &Config, name: &str) -> bool {
+    let parent = crate::manifest::snapshot_family(name);
+    config
+        .exports
+        .iter()
+        .any(|e| e.name == name || e.name == parent)
+}
+
 pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()> {
     // Parity with `reset_state`: validate the export name against the config
     // BEFORE touching state, so a typo (`-e pa_audi` for `pa_audit`) errors with
     // the declared names instead of silently "Removed 0 chunk run record(s)"
     // (rc=0) — which looked like the resume was abandoned when it was not.
     let config = require_config(config_path)?;
-    if !config.exports.iter().any(|e| e.name == export_name) {
+    if !export_is_declared(&config, export_name) {
         let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
         anyhow::bail!(
             "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state chunks -c {} -e <name>` to inspect a checkpoint.",
@@ -1485,5 +1496,21 @@ exports:
         let (dir, config_path) = setup_dir();
         let _ = open_state(&dir);
         assert!(show_chunk_checkpoint(&config_path, "orders", false).is_ok());
+    }
+
+    /// A CDC baseline leg (`<stream>__snapshot_<table>`) resolves to its declared
+    /// parent stream; a typo resolves to nothing. RED against requiring BOTH the
+    /// name and its parent to be declared.
+    #[test]
+    fn a_snapshot_leg_resolves_to_its_declared_stream() {
+        let cfg = Config::from_yaml(
+            "source:\n  type: postgres\n  url: postgresql://localhost/db\nexports:\n\
+             \x20 - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out }\n",
+        )
+        .unwrap();
+        assert!(export_is_declared(&cfg, "orders"));
+        assert!(export_is_declared(&cfg, "orders__snapshot_orders"));
+        assert!(!export_is_declared(&cfg, "ordrs"));
     }
 }

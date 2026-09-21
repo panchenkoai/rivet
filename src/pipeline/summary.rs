@@ -266,13 +266,21 @@ pub struct RunSummary {
 /// fixed string literal; the value is computed per run.
 type Row = (&'static str, String);
 
+/// A run id: `<export>_<UTC ms>_<pid>`. The pid keeps two processes that start a
+/// same-named export in one millisecond (two configs on one scheduler tick, one
+/// shared state DB) from writing one `run_status` / per-run spec row.
+pub(crate) fn fresh_run_id(export_name: &str) -> String {
+    format!(
+        "{}_{}_{}",
+        export_name,
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
+        std::process::id()
+    )
+}
+
 impl RunSummary {
     pub(super) fn new(plan: &ResolvedRunPlan) -> Self {
-        let run_id = format!(
-            "{}_{}",
-            plan.export_name,
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
-        );
+        let run_id = fresh_run_id(&plan.export_name);
         let mut journal = RunJournal::new(&run_id, &plan.export_name);
         journal.record(RunEvent::PlanResolved(Box::new(plan_snapshot_from(plan))));
 
@@ -1249,6 +1257,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
+            partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
             is_split_unit: false,
@@ -1451,6 +1460,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             export_name: "events".into(),
+            partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
             is_split_unit: false,
@@ -1528,6 +1538,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             export_name: export_name.into(),
+            partition_rollover: None,
             source_table: None,
             base_query: "SELECT 1".into(),
             is_split_unit: false,

@@ -275,7 +275,7 @@ fn unit_index<'a>(m: &'a RunManifest, family: &str) -> Option<&'a str> {
 /// to a lexical compare only if either fails to parse). Parses as an INSTANT — a
 /// lexical byte compare mis-picks on mixed RFC3339 precision (`…00.5Z` sorts
 /// before `…00Z`) — and never panics on a malformed manifest.
-fn finished_after(a: &str, b: &str) -> bool {
+pub(crate) fn finished_after(a: &str, b: &str) -> bool {
     match (
         chrono::DateTime::parse_from_rfc3339(a).ok(),
         chrono::DateTime::parse_from_rfc3339(b).ok(),
@@ -410,6 +410,36 @@ pub fn ensure_single_generation(selected: &[&CensusRun<'_>]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Ties are not "after" in either direction (a `>=` would make the pin's
+    /// comparator an inconsistent order), mixed precision compares as an instant,
+    /// and the malformed fallback is lexical in the SAME direction.
+    #[test]
+    fn finished_after_is_a_strict_instant_order_with_a_lexical_fallback() {
+        use super::finished_after;
+        assert!(!finished_after(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(!finished_after(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.000Z"
+        ));
+        assert!(finished_after(
+            "2026-01-01T00:00:00.5Z",
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(!finished_after(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.5Z"
+        ));
+        assert!(finished_after(
+            "2026-01-01T00:00:01+00:00",
+            "2026-01-01T00:00:00Z"
+        ));
+        assert!(finished_after("junk-b", "junk-a"));
+        assert!(!finished_after("junk-a", "junk-b"));
+    }
+
     use super::*;
     use crate::manifest::{
         MANIFEST_VERSION, ManifestDestination, ManifestPart, ManifestSource, SplitWindow,

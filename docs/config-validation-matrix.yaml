@@ -115,3 +115,23 @@ scenarios:
     what: "a mistyped CDC knob (e.g. `checkpont`) was silently accepted and defaulted (checkpoint=None) — CdcExportConfig lacked deny_unknown_fields. Now rejected at load."
     rejected_wrong_mode: { test: cdc_typoed_key_rejected_not_silently_defaulted }
     valid_form_accepted: { na: "the accept side is every existing passing cdc config in this file + the cdc goldens" }
+
+  - id: cdc_backfill_mongo_recipe_literal_name
+    what: "`cdc.backfill: auto` paired a Mongo collection with a recipe by the BARE fold (`events` ~ `audit.events`), but a dot is a legal character in a collection name, not a qualifier — the leg would have read another collection as the baseline. On MongoDB the recipe must name the collection exactly."
+    rejected_wrong_mode: { test: a_mongo_backfill_recipe_must_name_the_collection_exactly }
+    valid_form_accepted: { test: resolve_backfill_pairs_tables_with_their_recipe_exports }
+
+  - id: cdc_backfill_same_leaf_typed_recipes
+    what: "two captured tables sharing a leaf name (`sales.orders`, `archive.orders`) each paired with a recipe declaring `columns:`: the recipe's bare keys are qualified by the LEAF, so one table's types reached the other's stream and load spec. Refused at config load when either recipe types a column; two `mode: cdc` exports or an untyped recipe still load."
+    rejected_wrong_mode: { test: two_captured_tables_with_one_leaf_cannot_carry_recipe_column_types }
+    valid_form_accepted: { test: effective_columns_qualifies_each_recipe_to_its_table_and_lets_the_stream_win }
+
+  - id: load_tables_names_captured_tables
+    what: "`load.tables: { <table>: {…} }` on an export that is not a multiplex `tables:` stream, a name the stream does not capture, or a nested `tables:` inside a table's block, was a silently ignored override — refused at config load naming the export and the table."
+    rejected_wrong_mode: { test: per_table_load_overrides_name_captured_tables_of_a_multiplex_stream }
+    valid_form_accepted: { test: a_multiplex_export_takes_per_table_load_overrides }
+
+  - id: layout_base_buffer_needs_a_compacting_warehouse
+    what: "`layout: base_buffer` promises a `rivet compact`, which is BigQuery-only: on Snowflake the base froze at the backfill while the buffer grew for ever, with no view and every load prescribing a command that could only fail. Refused at config load wherever the key is written (section, export, `load.tables.<t>`) outside BigQuery; BigQuery takes it; Snowflake without the key makes no promise (the `backfill:` derivation yields the changelog and its view there)."
+    rejected_wrong_mode: { test: a_base_and_buffer_layout_needs_a_compacting_warehouse }
+    valid_form_accepted: { test: a_base_and_buffer_layout_needs_a_compacting_warehouse }

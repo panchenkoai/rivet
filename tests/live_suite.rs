@@ -67,6 +67,12 @@ mod live_batch_switch_golden;
 mod live_catalog_hints;
 #[path = "live/live_cdc.rs"]
 mod live_cdc;
+#[path = "live/live_cdc_backfill.rs"]
+mod live_cdc_backfill;
+#[path = "live/live_cdc_compact.rs"]
+mod live_cdc_compact;
+#[path = "live/live_cdc_full_cycle.rs"]
+mod live_cdc_full_cycle;
 #[path = "live/live_cdc_golden.rs"]
 mod live_cdc_golden;
 #[path = "live/live_cdc_mbt.rs"]
@@ -75,6 +81,8 @@ mod live_cdc_mbt;
 mod live_cdc_mongo;
 #[path = "live/live_cdc_mssql.rs"]
 mod live_cdc_mssql;
+#[path = "live/live_cdc_multi_table_cycle.rs"]
+mod live_cdc_multi_table_cycle;
 #[path = "live/live_cdc_oracle.rs"]
 mod live_cdc_oracle;
 #[path = "live/live_cdc_property.rs"]
@@ -109,6 +117,8 @@ mod live_harness_canary;
 mod live_incremental_settle;
 #[path = "live/live_init.rs"]
 mod live_init;
+#[path = "live/live_init_delta.rs"]
+mod live_init_delta;
 #[path = "live/live_init_extended.rs"]
 mod live_init_extended;
 #[path = "live/live_keyset.rs"]
@@ -117,8 +127,12 @@ mod live_keyset;
 mod live_keyset_metrics;
 #[path = "live/live_keyset_parallel.rs"]
 mod live_keyset_parallel;
+#[path = "live/live_load_partition_batches.rs"]
+mod live_load_partition_batches;
 #[path = "live/live_load_spec.rs"]
 mod live_load_spec;
+#[path = "live/live_load_spec_pin.rs"]
+mod live_load_spec_pin;
 #[path = "live/live_metrics_persist.rs"]
 mod live_metrics_persist;
 #[path = "live/live_mode_transition.rs"]
@@ -187,6 +201,8 @@ mod live_resume;
 mod live_retry_and_faults;
 #[path = "live/live_schema_drift.rs"]
 mod live_schema_drift;
+#[path = "live/live_shared_state_same_name.rs"]
+mod live_shared_state_same_name;
 #[path = "live/live_source_parity_sweep.rs"]
 mod live_source_parity_sweep;
 #[path = "live/live_state_backend_parity.rs"]

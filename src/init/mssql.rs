@@ -148,7 +148,7 @@ fn parse_columns_agg(agg: &str) -> Vec<ColumnInfo> {
             Some(ColumnInfo {
                 is_indexed: f[2] == "1",
                 name: f[0].to_string(),
-                data_type: f[1].to_string(),
+                data_type: catalog_type(f[1]),
                 is_primary_key: f[2] == "1",
                 is_nullable: f[3].eq_ignore_ascii_case("YES"),
                 numeric_precision: f[4].parse::<u32>().ok(),
@@ -158,9 +158,38 @@ fn parse_columns_agg(agg: &str) -> Vec<ColumnInfo> {
         .collect()
 }
 
+/// SQL Server's catalog spells its 8-byte row-version counter `timestamp` — a name
+/// that is a time on every other engine and a `binary(8)` here. Read back under its
+/// real name, so no type predicate takes it for a date: init scored it as a cursor
+/// (+40, above the integer PK) and chose it as the partition column, a `BYTES`
+/// column the warehouse cannot partition by and a cursor that never advances.
+fn catalog_type(data_type: &str) -> String {
+    if data_type.eq_ignore_ascii_case("timestamp") {
+        "rowversion".to_string()
+    } else {
+        data_type.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DATA_TYPE = 'timestamp'` on SQL Server is `rowversion`, never a time: the
+    /// parsed column must not pass the temporal predicate. RED against reading the
+    /// catalog spelling verbatim.
+    #[test]
+    fn a_rowversion_column_is_never_read_as_a_timestamp() {
+        let agg = format!(
+            "id{US}bigint{US}1{US}NO{US}19{US}0{RS}rv{US}timestamp{US}0{US}NO{US}{US}{RS}\
+             seen_at{US}datetime2{US}0{US}YES{US}{US}"
+        );
+        let cols = parse_columns_agg(&agg);
+        let ty = |n: &str| cols.iter().find(|c| c.name == n).unwrap().data_type.clone();
+        assert_eq!(ty("rv"), "rowversion");
+        assert!(!super::super::is_timestamp_type(&ty("rv")));
+        assert!(super::super::is_timestamp_type(&ty("seen_at")));
+    }
 
     /// Guard the whole init-introspection SQL against Msg 9829: STRING_AGG caps its
     /// result at 8000 bytes UNLESS its input is `CONVERT(nvarchar(max), ..)`. A wide

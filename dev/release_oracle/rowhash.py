@@ -91,7 +91,16 @@ def row_hash_of(cells: list[str | None]) -> int:
 
 def _export(engine: str, url: str, table: str, dest: Path, row_hash: str) -> bool:
     """Export the probe with a given `meta_columns.row_hash` setting."""
-    yaml_path = work_dir() / f"rh_{os.getpid()}_{row_hash.strip('[] ').replace(', ', '_')}.yaml"
+    # PARENT + name, not name alone: both callers pass a SUBDIRECTORY of the
+    # version-keyed base (`base/"full"`, `base/"pair"`), so `dest.name` is the
+    # constant "full"/"pair" and the version lives one level up
+    # (`rh_<engine>_<tag>`). Same correction as scenarios.py::_export_local —
+    # a first cut keyed on `.name` alone and serialised nothing.
+    yaml_path = (
+        work_dir()
+        / f"rh_{os.getpid()}_{dest.parent.name}_{dest.name}"
+        f"_{row_hash.strip('[] ').replace(', ', '_')}.yaml"
+    )
     shutil.rmtree(dest, ignore_errors=True)
     tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
     yaml_path.write_text(

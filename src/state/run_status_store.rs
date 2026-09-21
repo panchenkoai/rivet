@@ -87,45 +87,18 @@ impl StateStore {
     }
 
     /// Is a LIVE extract writing `prefix`? True iff some `running` run on that
-    /// prefix is NOT superseded by a newer run of the SAME export (a newer
-    /// `started_at` means the old run crashed and its successor already re-ran,
-    /// so the stale `running` no longer protects anything). Supersession, not a
-    /// clock — the reconciliation is record-vs-record, never record-vs-`now`.
+    /// prefix is NOT superseded by a newer run of the SAME export that also wrote
+    /// at-or-under/over `prefix` (a newer `started_at` means the old run crashed
+    /// and its successor already re-ran, so the stale `running` no longer protects
+    /// anything). A same-named export of ANOTHER config on a shared state DB
+    /// writes elsewhere and supersedes nothing here. Supersession, not a clock —
+    /// the reconciliation is record-vs-record, never record-vs-`now`.
     pub fn has_active_run_on_prefix(&self, prefix: &str) -> Result<bool> {
-        // SUPERSESSION requires a newer SUCCESS, not merely a newer terminal row.
-        // The first cut accepted any non-running successor, and a FAILED one
-        // proves nothing: under the documented overlap model (interval overrun,
-        // cron double-fire) cycle N+1 can start, fail at open (cycle N holds the
-        // slot), and finish terminal while N is still streaming — the inference
-        // "newer terminal ⇒ the old run crashed and was re-run" then declared
-        // the LIVE run dead, `gc_orphans` collected its just-flushed unmanifested
-        // parts in the flush→manifest window, and the ack advanced the source
-        // past them: gone from both ends, manifest says Success. A newer SUCCESS
-        // over the same export genuinely proves a full pass happened after the
-        // stale row; a newer failure only proves somebody tried.
-        //
-        // A running, non-superseded run whose write prefix OVERLAPS this prefix —
-        // either direction, so a query at ANY granularity matches:
-        //   * equal (batch: run and load prefix coincide),
-        //   * run AT-OR-UNDER query (a partitioned run's `…/created_at=…/` vs the
-        //     load's base, truncated at `{partition}`), and
-        //   * query AT-OR-UNDER run (a CDC run records its BASE `…/`, but the load
-        //     gc's a per-TABLE child `…/<table>/`).
-        // Over-matching (a broad run covering an unrelated child) only makes gc
-        // SPARE — the safe direction (defer, never wrong-delete). `rtrim(x,'/')` +
-        // `||` + `LIKE` are all portable across the SQLite and Postgres backends.
-        let sql = "SELECT 1 FROM run_status r
-                   WHERE (rtrim(r.prefix, '/') = rtrim(?1, '/')
-                          OR r.prefix LIKE rtrim(?1, '/') || '/%'
-                          OR rtrim(?1, '/') LIKE rtrim(r.prefix, '/') || '/%')
-                     AND r.status = 'running'
-                     AND NOT EXISTS (
-                         SELECT 1 FROM run_status r2
-                         WHERE r2.export_name = r.export_name
-                           AND r2.started_at > r.started_at
-                           AND r2.status = 'success')
-                   LIMIT 1";
-        Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
+        let sql = format!(
+            "SELECT 1 FROM run_status r WHERE {} LIMIT 1",
+            live_on_prefix("r", "?1")
+        );
+        Ok(self.query_opt(&sql, &[prefix.into()], |_| ())?.is_some())
     }
 
     /// The run_ids of the runs [`has_active_run_on_prefix`] answers `true` for —
@@ -159,17 +132,22 @@ impl StateStore {
         // row mapper's text() refuses NULL — the running rows are exactly the
         // ones this listing exists for (caught by the e2e test seeding through
         // the REAL begin_run; a hand-seeded '' fixture hid it).
+        // ONE column list for both branches, because the mapper below reads by
+        // POSITION (`r.text(0)`..`r.text(5)`): a column added to one arm and not
+        // the other shifts every field after it, silently and with no compile
+        // error to catch it. The arms may differ in their predicate, never in
+        // what they select.
+        const COLS: &str =
+            "run_id, export_name, prefix, status, started_at, COALESCE(finished_at, '')";
         let sql = if running_only {
-            "SELECT run_id, export_name, prefix, status, started_at,
-                    COALESCE(finished_at, '')
-             FROM run_status WHERE status = 'running'
-             ORDER BY started_at DESC LIMIT ?1"
+            format!(
+                "SELECT {COLS} FROM run_status WHERE status = 'running' \
+                 ORDER BY started_at DESC LIMIT ?1"
+            )
         } else {
-            "SELECT run_id, export_name, prefix, status, started_at,
-                    COALESCE(finished_at, '')
-             FROM run_status ORDER BY started_at DESC LIMIT ?1"
+            format!("SELECT {COLS} FROM run_status ORDER BY started_at DESC LIMIT ?1")
         };
-        self.query(sql, &[(last as i64).into()], |r| RunStatusRow {
+        self.query(&sql, &[(last as i64).into()], |r| RunStatusRow {
             run_id: r.text(0),
             export_name: r.text(1),
             prefix: r.text(2),
@@ -235,12 +213,12 @@ impl StateStore {
         // configs can both carry a split giant named `orders` — a name-only
         // stamp would close the OTHER config's live rows. Same containment
         // predicate as `active_run_ids_on_prefix`.
-        let sql = "SELECT r.run_id, r.export_name FROM run_status r
-                   WHERE r.export_name LIKE ?1 || '#%' AND r.status = 'running'
-                     AND (rtrim(r.prefix, '/') = rtrim(?2, '/')
-                          OR r.prefix LIKE rtrim(?2, '/') || '/%'
-                          OR rtrim(?2, '/') LIKE rtrim(r.prefix, '/') || '/%')";
-        let rows = self.query(sql, &[giant.into(), prefix.into()], |r| {
+        let sql = format!(
+            "SELECT r.run_id, r.export_name FROM run_status r
+             WHERE r.export_name LIKE ?1 || '#%' AND r.status = 'running' AND {}",
+            prefix_overlaps("r", "?2")
+        );
+        let rows = self.query(&sql, &[giant.into(), prefix.into()], |r| {
             (r.text(0), r.text(1))
         })?;
         let mut stamped = Vec::new();
@@ -260,26 +238,84 @@ impl StateStore {
     }
 
     pub fn active_run_ids_on_prefix(&self, prefix: &str) -> Result<HashSet<String>> {
-        let sql = "SELECT r.run_id FROM run_status r
-                   WHERE (rtrim(r.prefix, '/') = rtrim(?1, '/')
-                          OR r.prefix LIKE rtrim(?1, '/') || '/%'
-                          OR rtrim(?1, '/') LIKE rtrim(r.prefix, '/') || '/%')
-                     AND r.status = 'running'
-                     AND NOT EXISTS (
-                         SELECT 1 FROM run_status r2
-                         WHERE r2.export_name = r.export_name
-                           AND r2.started_at > r.started_at
-                           AND r2.status = 'success')";
+        let sql = format!(
+            "SELECT r.run_id FROM run_status r WHERE {}",
+            live_on_prefix("r", "?1")
+        );
         Ok(self
-            .query(sql, &[prefix.into()], |r| r.text(0))?
+            .query(&sql, &[prefix.into()], |r| r.text(0))?
             .into_iter()
             .collect())
     }
 }
 
+/// The prefix-containment predicate, EITHER direction, so a query at any
+/// granularity matches: equal (batch: run and load prefix coincide); the run
+/// at-or-under the query (a partitioned run's `…/created_at=…/` vs the load's
+/// base); the query at-or-under the run (a CDC run records its BASE `…/`, the
+/// load gc's a per-TABLE child). Over-matching only makes gc SPARE — the safe
+/// direction. `rtrim(x,'/')` + `||` + `LIKE` are portable across SQLite and
+/// Postgres. `alias` is the `run_status` row, `param` the query prefix.
+fn prefix_overlaps(alias: &str, param: &str) -> String {
+    format!(
+        "(rtrim({alias}.prefix, '/') = rtrim({param}, '/') \
+         OR {alias}.prefix LIKE rtrim({param}, '/') || '/%' \
+         OR rtrim({param}, '/') LIKE rtrim({alias}.prefix, '/') || '/%')"
+    )
+}
+
+/// A `running` row on the prefix that no newer SUCCESS of the same export has
+/// superseded — "is this prefix live?", the one decision `gc_orphans` exists for.
+///
+/// Supersession requires a newer SUCCESS, not merely a newer terminal row. The
+/// first cut accepted any non-running successor, and a FAILED one proves
+/// nothing: under the documented overlap model (interval overrun, cron
+/// double-fire) cycle N+1 can start, fail at open (cycle N holds the slot), and
+/// finish terminal while N is still streaming — the inference "newer terminal ⇒
+/// the old run crashed and was re-run" then declared the LIVE run dead,
+/// `gc_orphans` collected its just-flushed unmanifested parts in the
+/// flush→manifest window, and the ack advanced the source past them: gone from
+/// both ends, manifest says Success. A newer SUCCESS over the same export
+/// genuinely proves a full pass happened after the stale row; a newer failure
+/// only proves somebody tried. Supersession, not a clock — record vs record.
+fn live_on_prefix(alias: &str, param: &str) -> String {
+    format!(
+        "{overlap} AND {alias}.status = 'running' AND NOT EXISTS (\
+           SELECT 1 FROM run_status r2 WHERE r2.export_name = {alias}.export_name \
+           AND {newer_overlap} AND r2.started_at > {alias}.started_at \
+           AND r2.status = 'success')",
+        overlap = prefix_overlaps(alias, param),
+        newer_overlap = prefix_overlaps("r2", param),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three queries that decide "is this prefix live?" compose ONE
+    /// containment fragment and ONE supersession fragment — a change to either
+    /// reaches every reader, and the fragments say what they mean.
+    #[test]
+    fn the_liveness_predicate_is_one_fragment() {
+        let overlap = prefix_overlaps("r", "?1");
+        assert_eq!(
+            overlap,
+            "(rtrim(r.prefix, '/') = rtrim(?1, '/') OR r.prefix LIKE rtrim(?1, '/') || '/%' \
+             OR rtrim(?1, '/') LIKE rtrim(r.prefix, '/') || '/%')"
+        );
+        let live = live_on_prefix("r", "?1");
+        assert!(live.starts_with(&overlap), "{live}");
+        assert!(live.contains("r.status = 'running'"), "{live}");
+        assert!(
+            live.contains("r2.started_at > r.started_at AND r2.status = 'success'"),
+            "supersession needs a newer SUCCESS: {live}"
+        );
+        assert!(
+            live.contains(&prefix_overlaps("r2", "?1")),
+            "the successor is matched by the SAME containment: {live}"
+        );
+    }
 
     /// The escape hatch's three answers, each decisive: a typo'd id must not
     /// read as success, an already-terminal row must say its status, and only
@@ -462,12 +498,19 @@ mod tests {
              writer's committed parts"
         );
 
-        // Terminal successor: now the crashed r1 is releasable, clock-free.
+        // Terminal successor: now the crashed r1 is releasable, clock-free — as
+        // seen from the BASE both runs wrote under (the prefix a load gc's). Seen
+        // from r1's own sub-prefix, r2 wrote nothing there and supersedes nothing:
+        // that is the same-named export of ANOTHER config on a shared state DB.
         st.finish_run("r2", "success", "2026-01-01T00:00:09Z")
             .unwrap();
         assert!(
-            !st.has_active_run_on_prefix(pa).unwrap(),
-            "a FINISHED successor supersedes it — no age timer, no second clock"
+            !st.has_active_run_on_prefix("gs://b/e/").unwrap(),
+            "a FINISHED successor under the same base supersedes it — no age timer, no second clock"
+        );
+        assert!(
+            st.has_active_run_on_prefix(pa).unwrap(),
+            "a success that never touched r1's prefix is not r1's successor"
         );
     }
 
@@ -522,9 +565,14 @@ mod tests {
         b.finish_run(&r2, "success", "2026-01-01T00:00:09Z")
             .unwrap();
         assert!(
-            !a.has_active_run_on_prefix(&pa).unwrap(),
-            "a FINISHED successor supersedes the crashed run1 — that is what makes \
-             a stale `running` row releasable without comparing two clocks"
+            !a.has_active_run_on_prefix(&format!("gs://b/{exp}/"))
+                .unwrap(),
+            "a FINISHED successor under the same base supersedes the crashed run1 — that \
+             is what makes a stale `running` row releasable without comparing two clocks"
+        );
+        assert!(
+            a.has_active_run_on_prefix(&pa).unwrap(),
+            "a success that never wrote under run1's own prefix is not its successor"
         );
         b.begin_run(&r2, &exp, &pb, "2026-01-01T00:00:02Z").unwrap();
         assert!(
@@ -635,6 +683,28 @@ mod tests {
         assert!(
             !s.has_active_run_on_prefix(P).unwrap(),
             "r1 is `running` but SUPERSEDED by the finished r2 → NOT active (no clock)"
+        );
+    }
+
+    /// Shared state DB, two configs both exporting `users` into DIFFERENT prefixes:
+    /// the other config's finished run is not this run's successor, so it must not
+    /// declare this LIVE run dead (gc would collect its in-flight parts).
+    #[test]
+    fn a_success_of_a_same_named_export_on_another_prefix_does_not_supersede() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.begin_run("a", "users", "pa/", "2026-01-01T00:00:00Z")
+            .unwrap();
+        s.begin_run("b", "users", "pb/", "2026-01-01T00:00:05Z")
+            .unwrap();
+        s.finish_run("b", "success", "2026-01-01T00:01:00Z")
+            .unwrap();
+        assert!(
+            s.has_active_run_on_prefix("pa/").unwrap(),
+            "a newer success on ANOTHER prefix is not a successor of `a`"
+        );
+        assert_eq!(
+            s.active_run_ids_on_prefix("pa/").unwrap(),
+            HashSet::from(["a".to_string()])
         );
     }
 

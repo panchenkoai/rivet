@@ -16,6 +16,30 @@ use super::contract::{
 /// This is the only place where raw `ExportConfig` fields and CLI flags
 /// are read for execution decisions. After this call the pipeline operates
 /// only on `ResolvedRunPlan`.
+/// The partition budget the writer keeps one part inside — nothing splits a Parquet
+/// file at load time. Only a COLUMN partition can be counted while writing: ingestion
+/// time is one partition by construction, a range key buckets integers this path does
+/// not resolve. Resolved for the table the export STANDS FOR: a multiplex stream's
+/// baseline leg carries its table as `snapshot_label`, and that table's
+/// `load.tables.<name>` block is what the load will hold the files to.
+pub(crate) fn partition_rollover_of(
+    config: &Config,
+    export: &ExportConfig,
+) -> Option<crate::plan::rollover::PartitionRollover> {
+    crate::load::plan::resolved_partition(config, export, export.snapshot_label.as_deref())
+        .and_then(|spec| match spec.form {
+            crate::config::load::PartitionForm::Column {
+                column,
+                granularity,
+            } => Some(crate::plan::rollover::PartitionRollover {
+                column,
+                granularity,
+                cap: crate::load::partition_budget::MAX_PARTITIONS_PER_JOB as usize,
+            }),
+            _ => None,
+        })
+}
+
 pub fn build_plan(
     config: &Config,
     export: &ExportConfig,
@@ -140,6 +164,7 @@ pub fn build_plan(
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),
+        partition_rollover: partition_rollover_of(config, export),
         // The LABEL, where the two differ. `plan.source_table` has exactly one
         // consumer — the manifest's recorded identity in `finalize` — and the two
         // legs of one `initial: snapshot` export must record the SAME source or
@@ -869,6 +894,37 @@ mod tests {
             },
             ..crate::config::sample_export("test_export")
         }
+    }
+
+    /// A multiplex stream's per-table `load.tables.<name>.partition` must reach the
+    /// WRITER of that table's baseline leg, not only the load: the leg is the stream
+    /// cloned with `snapshot_label = <table>`, and resolving its partition at the
+    /// export level wrote the `orders` baseline — the largest files in the system —
+    /// with no budget while the load held them to DAY partitions. RED against
+    /// resolving with `None`.
+    #[test]
+    fn a_per_table_partition_reaches_the_writer_of_that_tables_baseline_leg() {
+        let cfg = Config::from_yaml(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n\
+             \x20 - name: cdc\n    tables: [orders, customers]\n    mode: cdc\n    format: parquet\n\
+             \x20   cdc: { checkpoint: ./c.ckpt }\n    destination: { type: gcs, bucket: b, prefix: cdc/ }\n\
+             \x20   load: { tables: { orders: { partition: { column: created_at, granularity: day } } } }\n\
+             load:\n  target: bigquery\n  project: p\n  dataset: d\n",
+        )
+        .unwrap_or_else(|e| panic!("fixture must load: {e:#}"));
+        let leg = |table: &str| ExportConfig {
+            snapshot_label: Some(table.into()),
+            ..cfg.exports[0].clone()
+        };
+        let orders = partition_rollover_of(&cfg, &leg("orders")).expect("orders is budgeted");
+        assert_eq!(
+            (orders.column.as_str(), orders.granularity, orders.cap),
+            ("created_at", crate::config::load::Granularity::Day, 4000)
+        );
+        assert!(
+            partition_rollover_of(&cfg, &leg("customers")).is_none(),
+            "customers declares no partition at any layer"
+        );
     }
 
     /// The rule `rivet check` and `rivet plan` now share, in every direction.

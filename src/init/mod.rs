@@ -146,6 +146,23 @@ impl TableInfo {
             .map(|c| c.column)
     }
 
+    /// Best candidate for the warehouse PARTITION column: the business date the
+    /// rows are ABOUT, not the stamp that moves when a row changes. The mirror of
+    /// [`best_cursor_column`], which wants the opposite — partitioning by a
+    /// mutation stamp would move a row between partitions on every update.
+    pub(crate) fn best_partition_column(&self) -> Option<&str> {
+        let ts: Vec<&ColumnInfo> = self
+            .columns
+            .iter()
+            .filter(|c| is_timestamp_type(&c.data_type))
+            .collect();
+        ts.iter()
+            .find(|c| is_creation_stamp(&c.name))
+            .or_else(|| ts.iter().find(|c| !is_mutation_stamp(&c.name)))
+            .or_else(|| ts.first())
+            .map(|c| c.name.as_str())
+    }
+
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
@@ -154,7 +171,7 @@ impl TableInfo {
             .collect();
         ts_cols
             .iter()
-            .find(|c| c.name == "updated_at" || c.name == "modified_at")
+            .find(|c| is_mutation_stamp(&c.name))
             .or_else(|| ts_cols.iter().find(|c| c.name == "created_at"))
             .or_else(|| ts_cols.first())
             .map(|c| c.name.as_str())
@@ -204,8 +221,18 @@ impl TableInfo {
     pub(crate) fn mode_rationale(&self, mode: &str) -> String {
         match mode {
             "chunked" => {
+                // The 100K threshold is `suggest_mode`'s reason, not the only road
+                // to `chunked`: a backfill recipe takes `recipe_mode`, which pages
+                // whenever a usable key exists and never reads the row count. So
+                // "~200 rows ≥ 100K threshold" explained a decision that was not
+                // the one taken (measured on a generated CDC partner shape).
+                let why = if self.row_estimate > 100_000 {
+                    "≥ 100K threshold and"
+                } else {
+                    "below the 100K threshold, but pageable because"
+                };
                 let base = format!(
-                    "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
+                    "auto: ~{} rows {why} chunk column '{}' is available",
                     fmt_row_estimate(self.row_estimate),
                     // Name the REAL chunk key: a keyset table has no chunk_column
                     // but a keysettable PK — falling back to a phantom 'id' named
@@ -235,9 +262,14 @@ impl TableInfo {
             }
             "incremental" => match self.chosen_cursor_column() {
                 Some(cursor) => format!(
-                    "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to \
+                    "auto: ~{} rows {}; chunk column missing, falling back to \
                      incremental on '{cursor}'",
                     fmt_row_estimate(self.row_estimate),
+                    if self.row_estimate > 100_000 {
+                        "≥ 100K threshold"
+                    } else {
+                        "below the 100K threshold"
+                    },
                 ),
                 // No timestamp candidate: do NOT name a phantom `updated_at` —
                 // the scaffold emits a REVIEW marker here, so the rationale must
@@ -361,7 +393,64 @@ fn is_integer_type(t: &str) -> bool {
 
 fn is_timestamp_type(t: &str) -> bool {
     let t = t.to_lowercase();
-    t.contains("timestamp") || t == "datetime" || t == "date"
+    // `contains("datetime")`, not `== "datetime"`: SQL Server reports `datetime2`,
+    // `datetimeoffset` and `smalldatetime`, none of which the equality admitted —
+    // so the mutation stamp scored zero and the integer PK became the cursor.
+    t.contains("timestamp") || t.contains("datetime") || t == "date"
+}
+
+/// A column name folded for the stamp predicates — lowercase, separators dropped — so
+/// `ModifiedDate`, `modified_date` and `MODIFIED_DATE` are one spelling. SQL Server
+/// schemas are PascalCase by convention, and snake_case-only lists took `ModifiedDate`
+/// for a business date: the create-only column became the cursor there.
+fn stamp_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether the column name means "when the row came to BE" — the partition key's
+/// first choice, ahead of any other business date.
+fn is_creation_stamp(name: &str) -> bool {
+    matches!(
+        stamp_key(name).as_str(),
+        "createdat"
+            | "madeat"
+            | "occurredat"
+            | "createdon"
+            | "createddate"
+            | "creationdate"
+            | "datecreated"
+            | "createdtime"
+    )
+}
+
+/// Whether the column name means "this stamp moves when the row CHANGES". The
+/// cursor picker wants one (only a mutation stamp catches updates); the warehouse
+/// partition key must avoid one (a row would hop partitions on every update). One
+/// predicate, because the same two literals were repeated at three sites and the
+/// partition mirror had already drifted from the cursor one.
+fn is_mutation_stamp(name: &str) -> bool {
+    matches!(
+        stamp_key(name).as_str(),
+        "updatedat"
+            | "modifiedat"
+            | "changedat"
+            | "lastupdated"
+            | "lastmodified"
+            | "lastchanged"
+            | "lastupdate"
+            | "updatedon"
+            | "modifiedon"
+            | "changedon"
+            | "updatedate"
+            | "modifieddate"
+            | "datemodified"
+            | "dateupdated"
+            | "modifiedtime"
+            | "updatedtime"
+    )
 }
 
 /// Whether a column of this type can be a KEYSET (seek) key — i.e. the keyset
@@ -497,6 +586,11 @@ pub struct InitYamlDestination {
     pub gcs_credentials_file: Option<String>,
     pub s3_bucket: Option<String>,
     pub s3_region: Option<String>,
+    /// `--bigquery-project` / `--bigquery-dataset`: when both are given the
+    /// scaffold carries a `load:` block, so the generated config drives the
+    /// warehouse half of the cycle too.
+    pub bigquery_project: Option<String>,
+    pub bigquery_dataset: Option<String>,
 }
 
 impl InitYamlDestination {
@@ -611,7 +705,17 @@ pub fn init(
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block(path, provenance));
+                eprint!(
+                    "{}",
+                    next_steps_block(
+                        path,
+                        provenance,
+                        mode_override,
+                        text.contains("      backfill: auto"),
+                        text.contains("\nload:"),
+                        text.contains("\n  layout: base_buffer")
+                    )
+                );
             }
         }
         None => {
@@ -619,7 +723,17 @@ pub fn init(
             // on stderr so `rivet init | tee rivet.yaml` isn't a dead end.
             print!("{text}");
             if matches!(format, InitFormat::Yaml) {
-                eprint!("{}", next_steps_block("rivet.yaml", provenance));
+                eprint!(
+                    "{}",
+                    next_steps_block(
+                        "rivet.yaml",
+                        provenance,
+                        mode_override,
+                        text.contains("      backfill: auto"),
+                        text.contains("\nload:"),
+                        text.contains("\n  layout: base_buffer")
+                    )
+                );
             }
         }
     }
@@ -631,7 +745,17 @@ pub fn init(
 /// inline `--source` URL it leads with a step-0 export reminder, because the
 /// scaffold deliberately writes `url_env: DATABASE_URL` (it never persists the
 /// literal URL) and would otherwise fail on an unset variable.
-fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
+/// `has_backfill` is read off the scaffold itself (`backfill: auto` present): only the
+/// consolidated multi-table shape carries a baseline; the per-table CDC scaffold
+/// (SQL Server, MongoDB, a non-`public` schema, a single table) captures changes only.
+fn next_steps_block(
+    path: &str,
+    provenance: &SourceProvenance,
+    mode: Option<&str>,
+    has_backfill: bool,
+    has_load: bool,
+    has_compact: bool,
+) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
         s.push_str(
@@ -643,12 +767,45 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
          2. rivet check  -c {path}            # column-type & schema report\n  \
          3. rivet run    -c {path} --validate # export, then verify row counts\n"
     ));
-    s.push_str(&format!(
-        "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
-         rivet plan  -c {path}                    # review the schedule (read-only)\n  \
-         rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
-         rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
-    ));
+    // A CDC scaffold has no batch plan: `rivet plan` skips every export in it and
+    // stops with "nothing to plan". Its schedule is the run itself.
+    if mode == Some("cdc") && has_backfill {
+        s.push_str(&format!(
+            "\nThe first run anchors the stream and reads every table's baseline through its \
+             recipe; each later run captures only the changes since. Put it on a schedule:\n  \
+             rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
+        ));
+    } else if mode == Some("cdc") {
+        s.push_str(&format!(
+            "\nThis stream captures CHANGES ONLY from its anchor on — the baseline is yours: add \
+             `cdc.initial: snapshot`, or a batch export of the table plus `cdc.backfill: auto`. \
+             Then put it on a schedule:\n  \
+             rivet run   -c {path}                    # bounded (until_current) — safe to repeat\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
+             rivet plan  -c {path}                    # review the schedule (read-only)\n  \
+             rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
+             rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
+        ));
+    }
+    // A scaffold that names a warehouse has more steps: the extract alone leaves
+    // Parquet in a bucket. The cycle is run -> load -> compact only where the file
+    // declares a base and a buffer (`layout: base_buffer`); a `full` scaffold's load
+    // OVERWRITES its table every pass and `rivet compact` would only say "skipped".
+    if has_load && has_compact {
+        s.push_str(&format!(
+            "\nThen the warehouse half of the cycle (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # Parquet -> the base, or the buffer on later runs\n  \
+             rivet compact -c {path}                  # merge the buffer into the base and drop it\n"
+        ));
+    } else if has_load {
+        s.push_str(&format!(
+            "\nThen the warehouse half (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # Parquet -> the table; each load OVERWRITES it\n"
+        ));
+    }
     s
 }
 
@@ -1223,15 +1380,123 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+    /// SQL Server's temporal types are `datetime2`, `datetimeoffset` and
+    /// `smalldatetime` — none EQUAL to `datetime`, which is all the predicate
+    /// admitted. A `changed_at DATETIME2(6)` therefore scored zero as a cursor
+    /// candidate and the integer PK won: an incremental scaffold blind to every
+    /// UPDATE. Caught live by the generated-config chain on MSSQL (2026-09-20).
+    #[test]
+    fn every_sql_server_temporal_type_is_a_timestamp_type() {
+        for t in [
+            "datetime2",
+            "DATETIME2",
+            "datetimeoffset",
+            "smalldatetime",
+            "datetime",
+            "timestamp",
+            "timestamptz",
+            "date",
+        ] {
+            assert!(
+                super::is_timestamp_type(t),
+                "{t} must be a cursor candidate"
+            );
+        }
+        // SQL Server's `timestamp` is a row-version counter, not a time: the catalog
+        // reader renames it (`init::mssql::catalog_type`), so it never reaches here
+        // under the temporal spelling.
+        assert!(!super::is_timestamp_type("rowversion"));
+        for t in ["bigint", "int", "varchar", "uniqueidentifier", "time"] {
+            assert!(!super::is_timestamp_type(t), "{t} must not be");
+        }
+    }
+
     /// `next_steps_block` is a pure string builder reached only via the init
     /// command's `eprint!` (live/CLI-only), so its `-> String::new()` /
     /// `"xyzzy"` stubs survive `cargo mutants -- --lib --bins`. This pins the
     /// content directly — including the read-only-vs-annotate distinction the
     /// 2026-08-20 plan change added — so the stubs die at the lib gate and the
     /// help text can't silently drift back to "plan writes waves".
+    /// A CDC scaffold's next steps end in `rivet run`, never `rivet plan`: plan
+    /// skips every export in such a config and stops with "nothing to plan".
+    #[test]
+    fn next_steps_block_for_cdc_schedules_the_run_not_a_plan() {
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            true,
+            false,
+            false,
+        );
+        assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
+        assert!(
+            !s.contains("--annotate-waves") && !s.contains("rivet apply"),
+            "a cdc config has no batch plan to seal; block:\n{s}"
+        );
+        assert!(
+            s.contains("rivet run   -c rivet.yaml") && s.contains("through its recipe"),
+            "block:\n{s}"
+        );
+        // The per-table scaffold (SQL Server, Mongo, a single table) has NO baseline:
+        // promising one "through its recipe" would send the operator to capture
+        // changes over history nobody loaded.
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+            false,
+            false,
+        );
+        assert!(
+            s.contains("CHANGES ONLY") && !s.contains("through its recipe"),
+            "a capture-only scaffold must say so; block:\n{s}"
+        );
+        assert!(s.contains("cdc.backfill: auto") && s.contains("cdc.initial: snapshot"));
+    }
+
+    /// The terminal block must agree with the file it describes: `rivet compact` is a
+    /// step only where the scaffold declares a base and a buffer. A `full` scaffold
+    /// with a warehouse printed both lines while its own `load:` comment said every
+    /// load OVERWRITES the table and compact would only say "skipped".
+    #[test]
+    fn next_steps_block_prescribes_compact_only_for_a_base_and_buffer_scaffold() {
+        let block = |has_compact: bool| {
+            super::next_steps_block(
+                "rivet.yaml",
+                &super::SourceProvenance::Env("X".into()),
+                None,
+                false,
+                true,
+                has_compact,
+            )
+        };
+        let compacting = block(true);
+        assert!(
+            compacting.contains("rivet load    -c rivet.yaml")
+                && compacting.contains("rivet compact -c rivet.yaml"),
+            "block:\n{compacting}"
+        );
+        let overwriting = block(false);
+        assert!(
+            overwriting.contains("rivet load    -c rivet.yaml")
+                && overwriting.contains("OVERWRITES")
+                && !overwriting.contains("rivet compact"),
+            "block:\n{overwriting}"
+        );
+    }
+
     #[test]
     fn next_steps_block_shows_read_only_plan_then_annotate() {
-        let s = super::next_steps_block("rivet.yaml", &super::SourceProvenance::Env("X".into()));
+        let s = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            None,
+            false,
+            false,
+            false,
+        );
         // The core three-step path is always present.
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1507,6 +1772,31 @@ mod tests {
     }
 
     #[test]
+    fn chunked_rationale_does_not_claim_a_threshold_it_did_not_cross() {
+        // `chunked` is reachable far below 100K: a backfill recipe's mode comes from
+        // `recipe_mode`, which pages whenever a usable key exists and never reads the
+        // row count. The rationale used to print `suggest_mode`'s reason regardless,
+        // so a 200-row recipe read "~200 rows ≥ 100K threshold" — explaining a
+        // decision that was not the one taken (measured on a generated CDC partner
+        // shape, 2026-09-21).
+        let small = make_table(200, vec![col("id", "bigint", true)]);
+        assert_eq!(
+            small.suggest_mode(),
+            "full",
+            "suggest_mode would not pick chunked here — only recipe_mode does"
+        );
+        let r = small.mode_rationale("chunked");
+        assert!(
+            !r.contains("≥ 100K threshold"),
+            "a 200-row table must not claim it crossed the threshold: {r}"
+        );
+        assert!(
+            r.contains("below the 100K threshold") && r.contains("pageable"),
+            "it must name the real reason — a usable key, not the row count: {r}"
+        );
+    }
+
+    #[test]
     fn full_rationale_distinguishes_below_threshold_from_no_key_at_scale() {
         // Below 100K → the honest "below threshold" message.
         let small = make_table(500, vec![col("id", "bigint", true)]);
@@ -1552,6 +1842,60 @@ mod tests {
             ],
         );
         assert_eq!(info.best_cursor_column(), Some("updated_at"));
+    }
+
+    /// The partition key is the date the rows are ABOUT, so it must skip EVERY
+    /// mutation stamp, not just the two spelled `updated_at`/`modified_at` — a row
+    /// partitioned by `changed_at` hops partitions on every update. RED against the
+    /// old two-literal exclusion, which took `changed_at` because it came first.
+    #[test]
+    fn partition_column_skips_a_mutation_stamp_spelled_otherwise() {
+        let info = make_table(
+            0,
+            vec![
+                col("changed_at", "timestamp", false),
+                col("event_date", "date", false),
+            ],
+        );
+        assert_eq!(info.best_partition_column(), Some("event_date"));
+    }
+
+    /// SQL Server's house convention is PascalCase: `CreatedDate` / `ModifiedDate`.
+    /// Folded to one spelling, the mutation stamp is the cursor and the creation
+    /// stamp the partition — snake_case-only lists saw neither, and the tie went to
+    /// the earlier column (create-only cursor, mutable partition). RED against the
+    /// unfolded lists.
+    #[test]
+    fn pascal_case_stamps_are_recognised() {
+        let info = make_table(
+            0,
+            vec![
+                col("BusinessEntityID", "bigint", true),
+                col("CreatedDate", "datetime2", false),
+                col("ModifiedDate", "datetime2", false),
+            ],
+        );
+        assert_eq!(info.best_cursor_column(), Some("ModifiedDate"));
+        assert_eq!(info.best_partition_column(), Some("CreatedDate"));
+        assert!(
+            super::is_mutation_stamp("LAST_UPDATED") && super::is_creation_stamp("DateCreated")
+        );
+    }
+
+    /// Among several business dates the creation stamp wins, whatever its position:
+    /// `shipped_at` is a business date too, and it comes first. RED against the
+    /// creation-stamp match never firing (`||` → `&&` in the old inline literals),
+    /// which fell through to "the first non-mutation stamp".
+    #[test]
+    fn partition_prefers_the_creation_stamp_over_an_earlier_business_date() {
+        let info = make_table(
+            0,
+            vec![
+                col("shipped_at", "timestamp", false),
+                col("created_at", "timestamp", false),
+            ],
+        );
+        assert_eq!(info.best_partition_column(), Some("created_at"));
     }
 
     #[test]
@@ -1877,6 +2221,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: None,
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1904,6 +2250,8 @@ mod tests {
             gcs_credentials_file: Some("/path/sa.json".to_string()),
             s3_bucket: None,
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1931,6 +2279,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("my-s3-bucket".to_string()),
             s3_region: Some("eu-central-1".to_string()),
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1963,6 +2313,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("b".to_string()),
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -1984,6 +2336,8 @@ mod tests {
             gcs_credentials_file: None,
             s3_bucket: Some("s".into()),
             s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

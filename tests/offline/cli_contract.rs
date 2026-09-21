@@ -357,3 +357,24 @@ fn state_runs_refuses_a_missing_config_and_last_zero_tells_the_truth() {
         "--last 0 must not read as an empty-DB verdict: {out}"
     );
 }
+
+/// `--version` names the COMMIT beside the version: a partner's bug report
+/// names "0.27.0" and three pre-release builds carried that number. The shape
+/// is `rivet <semver> (<sha>)`, `unknown` only where no git and no
+/// `RIVET_GIT_SHA` reached the build (a Docker context without `.git`).
+#[test]
+fn version_names_the_commit_beside_the_semver() {
+    let (code, out, _err) = run(&["--version"]);
+    assert_eq!(code, 0);
+    let out = out.trim();
+    let (name, rest) = out.split_once(' ').expect("`rivet <version> (<sha>)`");
+    assert_eq!(name, "rivet");
+    let (semver, sha) = rest.split_once(" (").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(semver, env!("CARGO_PKG_VERSION"), "{out}");
+    let sha = sha.strip_suffix(')').unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        sha == "unknown" || (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())),
+        "the commit is a hex sha or the honest `unknown`: {out}"
+    );
+    assert_ne!(sha, "", "{out}");
+}

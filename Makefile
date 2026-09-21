@@ -1,6 +1,13 @@
 # Rivet developer shortcuts.
 # Requires Rust 1.94+ (see rust-toolchain.toml if present).
 
+# The Python harness runs through its pin (pyproject.toml + uv.lock), so the
+# oracle's reader is the same one on every run — `uv run` resolves the locked
+# environment, creating it on first use. Override for a bare interpreter:
+# `make release-oracle PY=python3` (then the duckdb-backed cells need duckdb
+# installed some other way).
+PY ?= uv run python
+
 .PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo seed-garbage seed-garbage-postgres seed-garbage-mysql seed-garbage-mssql
 
 # PR-fast: offline type-mapping contracts (no docker).
@@ -185,7 +192,7 @@ seed-garbage-mssql:
 # its closing line are keyed on the baseline rather than on this flag, so such a
 # run is reported honestly instead of being announced as a skip it was not.
 release-oracle:  ## Release gate, BARE: only what is already in your shell. With no RIVET_PREV_RELEASE_BIN in your environment the prev-release comparison is GIVEN UP by name (cannot support a tag); with one exported, those three stages run and grade. Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
-	python3 -m dev.release_oracle --without-prev-release-comparison $(ARGS)
+	$(PY) -m dev.release_oracle --without-prev-release-comparison $(ARGS)
 
 # ─── the gate's environment, assembled ────────────────────────────────────────
 #
@@ -295,7 +302,7 @@ release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE env
 	@# reaches here with an empty $$prev is telling you the download failed.
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
-	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" python3 -m dev.release_oracle $(ARGS)
+	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle $(ARGS)
 
 release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckdb-type goldens. Deliberate: a golden must be written by rivet's own code, never edited by hand.
 	@rm -rf target/package
@@ -305,4 +312,4 @@ release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckd
 	@# binary it had just fetched. Same threading as release-oracle-full.
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
-	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" python3 -m dev.release_oracle --bless-local $(ARGS)
+	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle --bless-local $(ARGS)

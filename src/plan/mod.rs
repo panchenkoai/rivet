@@ -8,6 +8,7 @@ pub mod prioritization;
 pub mod recommend;
 pub mod reconcile;
 pub mod repair;
+pub mod rollover;
 pub mod validate;
 pub(crate) mod waves;
 

@@ -406,12 +406,81 @@ impl Config {
         self.validate_cdc_resource_conflicts()?;
         self.validate_csv_exports_are_not_loaded()?;
         self.validate_load_overrides()?;
+        self.validate_layout_has_a_compacting_warehouse()?;
         self.validate_non_sql_source_modes()?;
+        Ok(())
+    }
+
+    /// `layout: base_buffer` promises a `rivet compact`, which is BigQuery-only: on
+    /// another warehouse the base would freeze at the backfill while the buffer grew.
+    fn validate_layout_has_a_compacting_warehouse(&self) -> crate::error::Result<()> {
+        use crate::config::load::LayoutChoice;
+        let Some(load) = &self.load else {
+            return Ok(());
+        };
+        if crate::load::plan::warehouse_compacts(load) {
+            return Ok(());
+        }
+        let base = |l: Option<LayoutChoice>| l == Some(LayoutChoice::BaseBuffer);
+        let written = if base(load.layout) {
+            Some("`load.layout`".to_string())
+        } else {
+            self.exports.iter().find_map(|e| {
+                let o = e.load.as_ref()?;
+                if base(o.layout) {
+                    return Some(format!("export '{}': `load.layout`", e.name));
+                }
+                o.tables
+                    .iter()
+                    .find(|(_, t)| base(t.layout))
+                    .map(|(t, _)| format!("export '{}': `load.tables.{t}.layout`", e.name))
+            })
+        };
+        if let Some(site) = written {
+            anyhow::bail!(
+                "{site}: `base_buffer` needs `target: bigquery` — `rivet compact` is \
+                 BigQuery-only in this release, so the base would never take its buffer. \
+                 Drop the key to keep the changelog and its dedup view"
+            );
+        }
         Ok(())
     }
 
     /// A per-export `load:` override needs the top-level block it overrides.
     fn validate_load_overrides(&self) -> crate::error::Result<()> {
+        // `load.tables:` names captured tables of a multiplex stream — nothing else
+        // has per-table units, and a name that is not captured would be an override
+        // silently applied to nothing.
+        for e in &self.exports {
+            let Some(o) = &e.load else { continue };
+            if o.tables.is_empty() {
+                continue;
+            }
+            let Some(captured) = e.multiplex_tables() else {
+                anyhow::bail!(
+                    "export '{}': `load.tables:` is for a `mode: cdc` export with `tables:` — \
+                     this export has one unit, so its `load:` block already IS the table's",
+                    e.name
+                );
+            };
+            for (t, sub) in &o.tables {
+                if !captured.iter().any(|c| c == t) {
+                    anyhow::bail!(
+                        "export '{}': `load.tables.{t}` names a table this export does not \
+                         capture (tables: [{}])",
+                        e.name,
+                        captured.join(", ")
+                    );
+                }
+                if !sub.tables.is_empty() {
+                    anyhow::bail!(
+                        "export '{}': `load.tables.{t}.tables` — a per-table block takes no \
+                         `tables:` of its own",
+                        e.name
+                    );
+                }
+            }
+        }
         if self.load.is_some() {
             return Ok(());
         }
@@ -531,7 +600,8 @@ impl Config {
 
         let mut slots: HashMap<String, &str> = HashMap::new();
         let mut server_ids: HashMap<u32, &str> = HashMap::new();
-        let mut checkpoints: HashMap<std::path::PathBuf, &str> = HashMap::new();
+        // Keyed by the NORMALISED, case-folded path (see the insert below).
+        let mut checkpoints: HashMap<String, &str> = HashMap::new();
 
         for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
             let cdc = e.cdc.as_ref();
@@ -632,18 +702,23 @@ impl Config {
                     // two), so CurDir is filtered explicitly. The resolver never
                     // sees it either: `config_dir.join(p)` makes every dot
                     // interior before ITS components() pass.
+                    // Case-folded as well: `Orders.ckpt` and `orders.ckpt` are ONE file
+                    // on macOS and Windows, and a config written on Linux is run there.
                     std::path::Path::new(ckpt)
                         .components()
                         .filter(|c| !matches!(c, std::path::Component::CurDir))
-                        .collect::<std::path::PathBuf>(),
+                        .collect::<std::path::PathBuf>()
+                        .to_string_lossy()
+                        .to_lowercase(),
                     &e.name,
                 )
             {
                 crate::config_bail!(
                     crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
-                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' — each export \
-                     must own its resume position or they overwrite each other's. Set a \
-                     distinct `cdc.checkpoint:` per export.",
+                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' (compared \
+                     case-insensitively: on macOS and Windows two spellings are one file) — \
+                     each export must own its resume position or they overwrite each \
+                     other's. Set a distinct `cdc.checkpoint:` per export.",
                     e.name
                 );
             }
@@ -1525,11 +1600,11 @@ impl Config {
             }
         }
 
-        // `initial: snapshot` writes each table's snapshot under the reserved
-        // sub-prefix `snapshot/` — a table actually NAMED "snapshot" would share
-        // a prefix with another table's marker. Refuse the collision at load.
+        // A baseline (`initial: snapshot` or `backfill:`) writes each table's
+        // snapshot under the reserved sub-prefix `snapshot/` — a table actually
+        // NAMED "snapshot" would share a prefix with another table's marker.
         if let Some(cdc) = &export.cdc
-            && cdc.initial == Some(CdcInitialMode::Snapshot)
+            && cdc.has_baseline()
         {
             let clashes = |t: &str| t.rsplit('.').next().unwrap_or(t) == "snapshot";
             if export.table.as_deref().is_some_and(clashes)
@@ -1537,8 +1612,9 @@ impl Config {
             {
                 anyhow::bail!(
                     "export '{}': a table named 'snapshot' collides with the reserved \
-                     `snapshot/` sub-prefix that `cdc.initial: snapshot` writes — rename \
-                     the table or use a separate export without `initial:`",
+                     `snapshot/` sub-prefix that a baseline (`cdc.initial: snapshot` or \
+                     `cdc.backfill`) writes — rename the table or use a separate export \
+                     without a baseline",
                     export.name
                 );
             }
@@ -1551,19 +1627,84 @@ impl Config {
         // inherits the requirement instead of silently deferring the failure to
         // `ensure_anchor` — which demands a checkpoint on these engines for ANY
         // mode, i.e. after the run has already started.
+        // One predicate for both baselines (`initial:` and `backfill:`).
+        if let Some(why) = export::baseline_checkpoint_refusal(export, self.source.source_type) {
+            anyhow::bail!(why);
+        }
+
+        // `cdc.backfill` is the other way to get a baseline, and it is the same
+        // step: anchor first, then read the table. Declaring both would run two
+        // baselines over one anchor — the synthesized `mode: full` leg AND the
+        // referenced export's — into one prefix, which is not a merge but a
+        // duplicate nobody asked for.
         if let Some(cdc) = &export.cdc
+            && cdc.backfill.is_some()
             && cdc.initial.is_some()
-            && self.source.source_type != SourceType::Postgres
-            && cdc.checkpoint.is_none()
         {
             anyhow::bail!(
-                "export '{}': `cdc.initial:` on {:?} requires `cdc.checkpoint:` — these \
-                 engines have no server-side anchor, so the checkpoint file is the anchor, \
-                 and without it each run re-anchors at the current log position and \
-                 silently skips every change since the last one",
-                export.name,
-                self.source.source_type
+                "export '{}': `cdc.initial:` and `cdc.backfill:` both describe the FIRST run's \
+                 baseline — keep one. `initial: snapshot` synthesizes a single-stream full scan; \
+                 `backfill:` borrows the read strategy of the batch export that already describes \
+                 the table (its key, workers, page size and resume).",
+                export.name
             );
+        }
+
+        // The pairing itself, resolved by the ONE function the CDC job also calls,
+        // so a reference the run would reject cannot pass validation.
+        // (The checkpoint requirement is `baseline_checkpoint_refusal`, above.)
+        if let Some(cdc) = &export.cdc
+            && cdc.backfill.is_some()
+        {
+            let pairs = export::resolve_backfill(export, &self.exports)
+                .map_err(|why| anyhow::anyhow!(why))?;
+            // A document store has no schema qualifier: `audit.events` is a
+            // collection, not `events` in schema `audit`. The bare-name fold that
+            // pairs `orders` with `public.orders` on SQL would pair two DIFFERENT
+            // collections here — and turn the other one's export into a recipe the
+            // run loop stops running.
+            if !self.source.source_type.is_sql() {
+                for (captured, recipe) in &pairs {
+                    if recipe.table.as_deref() != Some(captured.as_str()) {
+                        anyhow::bail!(
+                            "export '{}': `cdc.backfill` paired collection '{captured}' with export \
+                             '{}', which reads '{}' — a MongoDB collection name is literal (a dot \
+                             is part of the name, not a schema), so the recipe must read exactly \
+                             `table: {captured}`",
+                            export.name,
+                            recipe.name,
+                            recipe.table.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+            }
+            // The recipe's READ is validated here, not at the leg: `plan`/`check`
+            // skip a recipe, so its table shortcut and `columns:` were first parsed
+            // by the leg — after the anchor had been taken.
+            for (table, recipe) in &pairs {
+                if self.source.source_type.is_sql()
+                    && let Some(t) = recipe.table.as_deref()
+                {
+                    export::validate_table_shortcut_ident(&recipe.name, t)?;
+                }
+                crate::plan::build::parse_column_overrides_pub(&recipe.columns, &recipe.name)?;
+                // One column, one type across the recipe and the stream — decided
+                // here, for every pair, so a conflict added after the baseline
+                // refuses the next run at config load, not after its anchor.
+                export::refuse_backfill_type_conflict(export, table, recipe)?;
+            }
+            // A `table.column` type key is narrowed by LEAF, so two captured tables
+            // with one leaf cannot be typed apart: a recipe's `columns:` on either
+            // would type both. Refuse rather than let the later recipe win silently.
+            if let Some((a, b)) = export::same_leaf_typed_pair(&pairs) {
+                anyhow::bail!(
+                    "export '{}': captured tables '{a}' and '{b}' share the leaf name and a \
+                     recipe declares `columns:` — per-table column types are keyed \
+                     `table.column` by the bare name, so one declaration would type both. \
+                     Capture them in two `mode: cdc` exports, or drop the recipe's `columns:`.",
+                    export.name
+                );
+            }
         }
 
         // MongoDB change streams and the MySQL binlog have NO server-side resume
@@ -2002,6 +2143,190 @@ mod reserved_load_extension {
         assert!(
             err.contains("no top-level `load:` block"),
             "an override with nothing to override: {err}"
+        );
+    }
+
+    /// `load.tables:` is a per-table layer of a multiplex stream: a name the stream
+    /// does not capture, a single-unit export, or a nested `tables:` is refused at
+    /// load — never an override silently applied to nothing.
+    #[test]
+    fn per_table_load_overrides_name_captured_tables_of_a_multiplex_stream() {
+        let cfg = |export_body: &str| {
+            format!(
+                "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n{export_body}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n"
+            )
+        };
+        let stream = |load: &str| {
+            cfg(&format!(
+                "  - name: cdc\n    tables: [orders, customers]\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ checkpoint: ./c.ckpt }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n    \
+                 load: {load}\n"
+            ))
+        };
+        Config::from_yaml(&stream("{ tables: { customers: { partition: none } } }"))
+            .expect("a captured table may carry its own block");
+        let err = Config::from_yaml(&stream("{ tables: { payments: { partition: none } } }"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not capture") && err.contains("payments"),
+            "{err}"
+        );
+        let err = Config::from_yaml(&stream(
+            "{ tables: { customers: { tables: { orders: { pk: [id] } } } } }",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("takes no `tables:` of its own"), "{err}");
+        let single = cfg(
+            "  - name: t\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination: { type: gcs, bucket: b, prefix: t/ }\n    load: { tables: { t: { pk: [id] } } }\n",
+        );
+        let err = Config::from_yaml(&single).unwrap_err().to_string();
+        assert!(err.contains("has one unit"), "{err}");
+    }
+
+    /// On MongoDB a dotted collection name is LITERAL — `audit.events` is not
+    /// `events` in a schema — so the SQL bare-name fold must not pair a captured
+    /// `events` with an export reading `audit.events` (that export would silently
+    /// become a recipe and stop running). Exact names still pair.
+    #[test]
+    fn a_mongo_backfill_recipe_must_name_the_collection_exactly() {
+        let cfg = |recipe_table: &str| {
+            format!(
+                "source:\n  type: mongo\n  url: \"mongodb://localhost/app\"\nexports:\n\
+                 \x20 - name: base\n    table: {recipe_table}\n    mode: full\n    format: parquet\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: base/ }}\n\
+                 \x20 - name: stream\n    table: events\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ backfill: auto, checkpoint: ./c.ckpt }}\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("events")).expect("the exact collection pairs");
+        let err = Config::from_yaml(&cfg("audit.events"))
+            .unwrap_err()
+            .to_string();
+        // `audit.events` is not `events` on any engine now (a bare name folds only
+        // onto `public`/`dbo`), so the pairing never forms and the refusal is the
+        // missing-recipe one; the literal-name refusal below covers `public.events`.
+        assert!(err.contains("no export reading table 'events'"), "{err}");
+        let err = Config::from_yaml(
+            &cfg("public.events")
+                .replace("table: events", "table: public.events")
+                .replace(
+                    "table: public.events\n    mode: full",
+                    "table: events\n    mode: full",
+                ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("collection name is literal") && err.contains("public.events"),
+            "{err}"
+        );
+    }
+
+    /// A recipe is skipped by `plan` and `check`, so a bad `columns:` type or table
+    /// shortcut on it used to surface only when the leg ran — after the anchor.
+    #[test]
+    fn a_backfill_recipes_read_is_validated_at_config_load() {
+        let cfg = |cols: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                 \x20 - name: base\n    table: orders\n    mode: full\n    format: parquet\n{cols}    \
+                 destination: {{ type: gcs, bucket: b, prefix: base/ }}\n\
+                 \x20 - name: stream\n    table: orders\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ backfill: auto }}\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("    columns: { qty: int32 }\n")).expect("a valid recipe");
+        let err = Config::from_yaml(&cfg("    columns: { qty: \"decimal (10, 2)\" }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("base") && err.contains("qty"), "{err}");
+    }
+
+    /// `backfill:` with no value is a typed key with nothing said — refused, never
+    /// read as "no baseline" (the silent-success shape every message here warns of).
+    #[test]
+    fn an_empty_backfill_key_is_refused_not_read_as_absent() {
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                    \x20 - name: stream\n    table: orders\n    mode: cdc\n    format: parquet\n    \
+                    cdc:\n      backfill:\n    \
+                    destination: { type: gcs, bucket: b, prefix: cdc/ }\n";
+        let err = Config::from_yaml(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("`cdc.backfill` must be `auto` or a list"),
+            "{err}"
+        );
+        let err = Config::from_yaml(&yaml.replace("backfill:\n", "backfill: atuo\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`cdc.backfill` must be `auto` or a list"),
+            "{err}"
+        );
+    }
+
+    /// Two captured tables with one LEAF (`sales.orders`, `archive.orders`) route
+    /// fine, but a `table.column` type key is narrowed by leaf — so a recipe's
+    /// `columns:` on either would type both. Refused only when a recipe declares
+    /// types; two untyped recipes are still one stream.
+    #[test]
+    fn two_captured_tables_with_one_leaf_cannot_carry_recipe_column_types() {
+        let cfg = |sales_cols: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                 \x20 - name: sales\n    table: sales.orders\n    mode: full\n    format: parquet\n{sales_cols}    \
+                 destination: {{ type: gcs, bucket: b, prefix: sales/ }}\n\
+                 \x20 - name: archive\n    table: archive.orders\n    mode: full\n    format: parquet\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: archive/ }}\n\
+                 \x20 - name: stream\n    tables: [sales.orders, archive.orders]\n    mode: cdc\n    format: parquet\n    \
+                 cdc: {{ backfill: auto }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("")).expect("untyped recipes over two same-leaf tables pair fine");
+        let err = Config::from_yaml(&cfg("    columns: { amount: \"decimal(18,2)\" }\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("share the leaf name")
+                && err.contains("sales.orders")
+                && err.contains("archive.orders"),
+            "{err}"
+        );
+    }
+
+    /// A column typed one way by the recipe and another by the stream is refused
+    /// at CONFIG LOAD — not on the next run, after its anchor. Same spelling in
+    /// two dialects (`decimal` / `numeric`) is one type, not a conflict.
+    #[test]
+    fn a_recipe_and_its_stream_typing_one_column_apart_is_refused_at_load() {
+        let cfg = |stream_cols: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/app\"\nexports:\n\
+                 \x20 - name: orders_baseline\n    table: orders\n    mode: full\n    format: parquet\n    \
+                 columns: {{ amount: \"decimal(18,2)\" }}\n    \
+                 destination: {{ type: gcs, bucket: b, prefix: base/ }}\n\
+                 \x20 - name: stream\n    tables: [orders]\n    mode: cdc\n    format: parquet\n{stream_cols}    \
+                 cdc: {{ backfill: auto }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n"
+            )
+        };
+        Config::from_yaml(&cfg("")).expect("a recipe typing alone is fine");
+        Config::from_yaml(&cfg(
+            "    columns: { \"orders.amount\": \"numeric(18,2)\" }\n",
+        ))
+        .expect("the same type in another spelling is no conflict");
+        let err = Config::from_yaml(&cfg(
+            "    columns: { \"orders.amount\": \"decimal(11,4)\" }\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("one column cannot have two types") && err.contains("'amount'"),
+            "{err}"
         );
     }
 }

@@ -786,6 +786,26 @@ fn two_mysql_cdc_exports_defaulting_to_the_same_server_id_are_rejected() {
     );
 }
 
+/// `Orders.ckpt` and `orders.ckpt` are two strings and ONE file on macOS / Windows —
+/// case twins (legal on PostgreSQL, and on MySQL / SQL Server under a case-sensitive
+/// collation) scaffolded per-table wrote each other's resume position there. Refused
+/// wherever the config is loaded, since a config written on Linux is run elsewhere.
+/// RED against the byte-wise comparison.
+#[test]
+fn two_cdc_exports_whose_checkpoints_differ_only_by_case_are_rejected() {
+    let yaml = cdc_pair_yaml(
+        "postgres",
+        "cdc: { slot: slot_a, checkpoint: ./cdc/Orders.ckpt }",
+        "cdc: { slot: slot_b, checkpoint: ./cdc/orders.ckpt }",
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("checkpoint") && msg.contains("case-insensitively"),
+        "expected a case-folded checkpoint conflict: {msg}"
+    );
+}
+
 #[test]
 fn two_cdc_exports_sharing_a_checkpoint_path_are_rejected() {
     let yaml = cdc_pair_yaml(
@@ -1457,6 +1477,88 @@ fn misplaced_tuning_list_covers_every_field() {
 
 // ─── typed `load:` block flags ────────────────────────────────
 
+/// `deleted_flag` decides whether the base carries `__is_deleted` — an extra column on
+/// every row, so it must not appear by accident. Absent it DERIVES from the mode (only a
+/// CDC stream can express a delete), and it is declarable at all three layers the overlay
+/// applies: the shared `load:` block, one export's `load:`, and — on a multiplex stream —
+/// one captured table's `load.tables.<name>`.
+#[test]
+fn deleted_flag_derives_from_the_mode_and_is_overridable_at_every_layer() {
+    use crate::load::plan::resolved_deleted_flag;
+
+    let cfg = |export_body: &str, section: &str| {
+        Config::from_yaml(&format!(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n{export_body}\
+             load:\n  target: bigquery\n  project: p\n  dataset: d{section}\n"
+        ))
+        .unwrap_or_else(|e| panic!("fixture must load: {e:#}"))
+    };
+    let full = |load: &str| {
+        format!(
+            "  - name: t\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination: {{ type: gcs, bucket: b, prefix: t/ }}\n{load}"
+        )
+    };
+    let stream = |load: &str| {
+        format!(
+            "  - name: cdc\n    tables: [orders, customers]\n    mode: cdc\n    format: parquet\n    \
+             cdc: {{ checkpoint: ./c.ckpt }}\n    destination: {{ type: gcs, bucket: b, prefix: cdc/ }}\n{load}"
+        )
+    };
+    let flag = |c: &Config, table: Option<&str>| resolved_deleted_flag(c, &c.exports[0], table);
+
+    // The EMPTY case — nothing declared anywhere, so the mode alone answers.
+    assert!(
+        !flag(&cfg(&full(""), ""), None),
+        "a query-based export cannot express a delete, so it must not pay a column for one"
+    );
+    assert!(
+        flag(&cfg(&stream(""), ""), None),
+        "a CDC stream expresses deletes, so its base carries the flag by default"
+    );
+
+    // Declared on the shared section — an explicit value beats the derivation, in the
+    // direction the derivation would not have chosen on its own.
+    assert!(
+        !flag(&cfg(&stream(""), "\n  deleted_flag: false"), None),
+        "`deleted_flag: false` must suppress the flag the CDC mode would have derived"
+    );
+    assert!(
+        flag(&cfg(&full(""), "\n  deleted_flag: true"), None),
+        "`deleted_flag: true` must reach a non-CDC export the derivation would have left bare"
+    );
+
+    // One export's own block, layered over a section that says the opposite.
+    assert!(
+        flag(
+            &cfg(
+                &full("    load: { deleted_flag: true }\n"),
+                "\n  deleted_flag: false"
+            ),
+            None
+        ),
+        "an export's `load:` must win over the shared section"
+    );
+
+    // The per-table layer, which only a multiplex stream has. `orders` inherits the
+    // export's `false`; `customers` overrides it back to `true`.
+    let per_table = cfg(
+        &stream(
+            "    load: { deleted_flag: false, tables: { customers: { deleted_flag: true } } }\n",
+        ),
+        "",
+    );
+    assert!(
+        !flag(&per_table, Some("orders")),
+        "a captured table with no block of its own inherits the export's value"
+    );
+    assert!(
+        flag(&per_table, Some("customers")),
+        "`load.tables.customers.deleted_flag` must be the third and last layer applied — \
+         the layer a reader that stops at the export's block silently drops"
+    );
+}
+
 /// `allow_source_drift`, `gc_orphans` and `cleanup_source` are the booleans of the typed
 /// `load:` block: read when the config is read, flipped per export by a `load:` override
 /// that inherits the rest, and refused on a typo at either level.
@@ -1514,4 +1616,40 @@ exports:
         .unwrap_err()
     );
     assert!(err.contains("allow_source_drfit"), "{err}");
+}
+
+/// `layout: base_buffer` promises `rivet compact`, which is BigQuery-only: on Snowflake
+/// the base would freeze at the backfill while the buffer grew, and every load would
+/// prescribe a command that can only fail. Refused where the key is written, at every
+/// layer; BigQuery takes it, and Snowflake without the key makes no promise.
+#[test]
+fn a_base_and_buffer_layout_needs_a_compacting_warehouse() {
+    let cfg = |target: &str, export_load: &str| {
+        format!(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\nexports:\n  - name: t\n    \
+             table: t\n    mode: incremental\n    cursor_column: updated_at\n    format: parquet\n    \
+             destination: {{ type: gcs, bucket: b, prefix: t/ }}\n{export_load}load:\n{target}"
+        )
+    };
+    let snowflake = "  target: snowflake\n  connection: c\n  warehouse: w\n  database: d\n  \
+                     schema: s\n  storage_integration: i\n";
+    let bigquery = "  target: bigquery\n  project: p\n  dataset: d\n";
+
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&cfg(&format!("{snowflake}  layout: base_buffer\n"), "")).unwrap_err()
+    );
+    assert!(
+        err.contains("`load.layout`") && err.contains("BigQuery-only"),
+        "{err}"
+    );
+    let err = format!(
+        "{:#}",
+        Config::from_yaml(&cfg(snowflake, "    load: { layout: base_buffer }\n")).unwrap_err()
+    );
+    assert!(err.contains("export 't': `load.layout`"), "{err}");
+
+    Config::from_yaml(&cfg(&format!("{bigquery}  layout: base_buffer\n"), ""))
+        .expect("BigQuery compacts, so it may promise a base and a buffer");
+    Config::from_yaml(&cfg(snowflake, "")).expect("no key written, no promise made");
 }

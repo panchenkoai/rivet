@@ -419,6 +419,25 @@ pub fn total_parquet_rows(dir: &Path) -> usize {
         .sum()
 }
 
+/// The Arrow type of `col` in the first `.parquet` directly under `dir` — the
+/// question "did two legs write ONE type into one log" is asked of the schema,
+/// not the rows. A missing part or column is a harness bug, never a default.
+pub fn parquet_column_type(dir: &Path, col: &str) -> arrow::datatypes::DataType {
+    let mut parts = files_with_extension(dir, "parquet");
+    parts.sort();
+    let part = parts
+        .first()
+        .unwrap_or_else(|| panic!("no parquet part under {}", dir.display()));
+    let f = std::fs::File::open(part).expect("open part");
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .expect("parquet part")
+        .schema()
+        .field_with_name(col)
+        .unwrap_or_else(|e| panic!("column {col} in {}: {e}", part.display()))
+        .data_type()
+        .clone()
+}
+
 /// All `id` values across every `.parquet` under `dir`, WITH multiplicity.
 pub fn dir_parquet_ids(dir: &Path) -> Vec<i64> {
     files_with_extension(dir, "parquet")

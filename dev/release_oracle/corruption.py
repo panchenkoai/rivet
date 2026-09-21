@@ -56,7 +56,15 @@ EXIT_DATA_INTEGRITY = 3
 
 
 def _export(engine: str, url: str, table: str, dest: Path) -> Path | None:
-    yaml_path = work_dir() / f"corrupt_{os.getpid()}_{engine}.yaml"
+    # Named from `dest`, which the CALLERS already key by version — the pid+engine
+    # name was shared by every version of one engine in this ONE process, so under
+    # --version-parallel N threads wrote N different `dest` paths into the SAME
+    # file: a cell could flip a byte in its own part and then validate a config
+    # pointing at another version's clean one. That surfaces as "validate PASSED
+    # on a part whose bytes were changed" — rivet accused of not verifying when
+    # rivet was right (2026-09-20 gate, pg13; all 7 versions were green at
+    # --version-parallel 2, which is why it read as version-specific).
+    yaml_path = work_dir() / f"corrupt_{os.getpid()}_{dest.name}.yaml"
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
     tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
@@ -236,12 +244,27 @@ def _read_values(part: Path) -> str | None:
 
 def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) -> None:
     """Positive and negative for a CDC prefix: clean capture verifies, a flipped
-    byte in a captured part does not."""
+    byte in a captured part does not.
+
+    Serialised per ENGINE: this cell runs per engine×VERSION but drives the ONE
+    shared CDC stand, so N concurrent versions drop and recreate `orc_cdc_probe`
+    under each other — setup, capture and the `finally` cleanup all have to be
+    inside the lock. blessed_flow took the same lock and this cell did not, so
+    the lock protected its own cells from each other and nothing from this one
+    (2026-09-20 gate: postgres 3 of 7 versions FAILED "the capture wrote no
+    part", while mysql/mssql/mongo — whose fixtures do no DDL under an open
+    replication slot — were green).
+    """
     try:
         from . import cdc as cdc_mod
     except ImportError:  # pragma: no cover
         import cdc as cdc_mod  # type: ignore
 
+    with cdc_mod._cdc_lock_for(engine):
+        _cdc_corruption_locked(led, engine, tag, url, cdc_mod)
+
+
+def _cdc_corruption_locked(led: Ledger, engine: str, tag: str, url: str, cdc_mod) -> None:
     spec = cdc_mod._ENGINES.get(engine)
     uvar = f"RIVET_CDC_{engine.upper()}_URL"
     cdc_url = os.environ.get(uvar, "")
