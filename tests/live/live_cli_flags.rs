@@ -367,7 +367,7 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
     // `load::reconcile` checks the source→file leg only `if let Some(src) =
     // …source_row_count`, and until 2026-08-17 every production writer passed
     // `None` — so that bail, `LoadIntegrity.source_rows` and the whole
-    // `--allow-source-drift` flag were unreachable, and a loader's only
+    // `allow_source_drift` config key were unreachable, and a loader's only
     // evidence about the extract was rivet's own part arithmetic compared
     // against itself. This asserts the value AT THE BOUNDARY, read out of the
     // artifact the real producer wrote — not handed to a decider by a test.
