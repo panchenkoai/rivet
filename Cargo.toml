@@ -146,7 +146,7 @@ futures-util = "0.3"
 # same tree from a different angle; `ring` alone would mean hand-rolling the JWT
 # framing this crate gets for free. Version tracks reqsign's — a resolution to
 # two majors would duplicate the crate, which the offline lock guard would show.
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 reqsign = "0.16"
 # Single reqwest version (0.12) shared with the one reqsign 0.16 / opendal pull
 # in. Keeping one HTTP+TLS stack avoids duplicating rustls / hyper / h2 in the
