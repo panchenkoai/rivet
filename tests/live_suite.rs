@@ -189,8 +189,8 @@ mod live_pg_state;
 mod live_plan_apply;
 #[path = "live/live_plan_output_ux.rs"]
 mod live_plan_output_ux;
-#[path = "live/live_pool_ledger_toxiproxy.rs"]
-mod live_pool_ledger_toxiproxy;
+#[path = "live/live_pool_ledger.rs"]
+mod live_pool_ledger;
 #[path = "live/live_pool_safety.rs"]
 mod live_pool_safety;
 #[path = "live/live_pool_toxiproxy.rs"]

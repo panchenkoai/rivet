@@ -5,12 +5,22 @@
 - **`rivet load` and `rivet compact` can work the config's tables in parallel.**
   `--pool N` runs the per-table loop on N worker threads instead of one after
   another: every freeing worker takes the next table, so one slow table no longer
-  holds up the ones queued behind it. The default is unchanged — without the flag
-  there is exactly one worker, which is the single pass the loop always made, and
-  `N` is capped at the number of tables. Per-table FAULT ISOLATION is preserved (a
-  failing table isolates to itself and the rest keep loading) and so is the
-  per-table lease, so `rivet load` and `rivet compact` still refuse a table the
-  other holds. Each worker opens its own state handle by reconnecting to the
+  holds up the ones queued behind it. **The default is now 16**, the ceiling, so
+  an operator who passes nothing gets the parallel pass; `--pool 1` restores the
+  strictly sequential one, and `N` is capped at the number of tables either way.
+  This widens what a plain `rivet load` does on upgrade: up to 16 ledger
+  connections instead of one, and up to 16 concurrent warehouse loads, which
+  count against Postgres `max_connections` and BigQuery's 100 concurrent
+  interactive queries per PROJECT. Measured before defaulting it: 16 workers over
+  16 tables on the DEFAULT (SQLite) ledger lost no table and surfaced no lock
+  error — SQLite's single writer is not a ceiling for this workload, because a
+  load reads each spec at the front and writes one record at the end, and the
+  per-table lease is a `flock` sidecar rather than a SQLite write. What was NOT
+  measured is several rivet processes pooling at once against one backend.
+
+  Per-table FAULT ISOLATION is preserved (a failing table isolates to itself and
+  the rest keep loading) and so is the per-table lease, so `rivet load` and
+  `rivet compact` still refuse a table the other holds. Each worker opens its own state handle by reconnecting to the
   backend the parent already resolved (`open_at_ref`) — once per WORKER, not per
   table — and a worker that cannot reconnect says so and carries the ERRORED half
   of the tri-state rather than passing for absent-by-design.

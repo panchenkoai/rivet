@@ -36,16 +36,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// serialise anyway.
 pub(crate) const MAX_POOL: usize = 16;
 
+/// Workers when the operator passes no `--pool` at all.
+///
+/// A LITERAL, not `MAX_POOL`, on purpose: the ceiling and the default are two
+/// decisions that happen to agree today, and writing the default as the ceiling
+/// would make any future raise of the ceiling silently raise what every unflagged
+/// run does. Defaulting this high was measured first — 16 workers over 16 tables
+/// on the default SQLite ledger lost no table and surfaced no lock error.
+pub(crate) const DEFAULT_POOL: usize = 16;
+
 /// Worker threads to run `items` on: at least one, never more than there is work,
 /// never more than [`MAX_POOL`].
 ///
-/// `None` is one worker — the sequential path, which must stay byte-for-byte what
-/// it was before the pool existed.
+/// `None` is [`DEFAULT_POOL`]: the flag is an OVERRIDE, not an opt-in. `--pool 1`
+/// is the strictly sequential pass the loop made before the pool existed, and the
+/// CLI help promises exactly that, so it is pinned by a test.
 pub(crate) fn effective_pool(requested: Option<usize>, items: usize) -> usize {
     // The upper bound is computed first: whichever is smaller, the work available or
     // the ceiling — and never below 1, so the clamp below cannot invert.
     let ceiling = items.clamp(1, MAX_POOL);
-    requested.unwrap_or(1).clamp(1, ceiling)
+    requested.unwrap_or(DEFAULT_POOL).clamp(1, ceiling)
 }
 
 /// What to tell an operator who asked for more workers than the ceiling allows.
@@ -245,13 +255,27 @@ mod tests {
         );
     }
 
-    /// No requested size is one worker; a request is clamped to [1, items].
+    /// No requested size is [`DEFAULT_POOL`]; a request is clamped to [1, items].
+    ///
+    /// Both default cases are here on purpose. `None` against NINE items only
+    /// proves the item clamp — it stays green for any default at or above nine —
+    /// so the case with work to spare is what actually pins the default's value.
     #[test]
     fn effective_pool_clamps_to_at_least_one_and_at_most_the_work() {
         assert_eq!(
+            effective_pool(None, 100),
+            DEFAULT_POOL,
+            "with work to spare, no flag means the default pool"
+        );
+        assert_eq!(
             effective_pool(None, 9),
+            9,
+            "the default is still capped by the work available"
+        );
+        assert_eq!(
+            effective_pool(Some(1), 9),
             1,
-            "the default is the sequential path"
+            "`--pool 1` is the way back to the sequential pass, as the help promises"
         );
         assert_eq!(
             effective_pool(Some(0), 9),
@@ -388,14 +412,19 @@ mod tests {
         assert_eq!(out[1].as_ref().unwrap_err(), "from item 1");
     }
 
-    /// One worker runs the items IN ORDER — the default path is still sequential.
+    /// One worker runs the items IN ORDER — what `--pool 1` still guarantees.
+    ///
+    /// Asks for the single worker EXPLICITLY. It used to say `None` and call that
+    /// "the default path", which stopped being true the moment the default became
+    /// [`DEFAULT_POOL`] — a test that leans on a default to express its subject
+    /// starts grading the default instead of the subject.
     #[test]
     fn a_single_worker_runs_in_item_order() {
         let items: Vec<usize> = (0..5).collect();
         let order: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         run_workers(
             &items,
-            effective_pool(None, items.len()),
+            effective_pool(Some(1), items.len()),
             || (),
             |_, i, _| {
                 order.lock().unwrap().push(i);
