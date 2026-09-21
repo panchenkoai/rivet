@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.27.0 — 2026-09-21
+
 - **The cheat sheet was driven end to end, and corrected where it and the product
   disagreed.** Three scenarios on GENERATED configs against a live stand — batch +
   `compact`, CDC, and a multi-table `plan`/`apply`/`--pool`/`--split` — produced
