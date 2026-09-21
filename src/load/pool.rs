@@ -25,12 +25,76 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Worker threads to run `items` on: at least one, never more than there is work.
+/// The hard ceiling on worker threads.
 ///
-/// `None` is one worker — the sequential path, which is the default and must stay
-/// byte-for-byte what it was before the pool existed.
+/// Not the warehouse quota. BigQuery allows 100 concurrent interactive queries per
+/// PROJECT (rivet's loads are query jobs — `statement_type = LOAD_DATA`, measured in
+/// the job ledger), but that budget is shared with everything else in the project,
+/// and the STATE backend runs out long before it: every worker opens its own ledger
+/// connection. 16 keeps a default deployment well inside both — a Postgres state DB
+/// at the stock `max_connections` of 100, and a SQLite one where the writers
+/// serialise anyway.
+pub(crate) const MAX_POOL: usize = 16;
+
+/// Worker threads to run `items` on: at least one, never more than there is work,
+/// never more than [`MAX_POOL`].
+///
+/// `None` is one worker — the sequential path, which must stay byte-for-byte what
+/// it was before the pool existed.
 pub(crate) fn effective_pool(requested: Option<usize>, items: usize) -> usize {
-    requested.unwrap_or(1).clamp(1, items.max(1))
+    // The upper bound is computed first: whichever is smaller, the work available or
+    // the ceiling — and never below 1, so the clamp below cannot invert.
+    let ceiling = items.clamp(1, MAX_POOL);
+    requested.unwrap_or(1).clamp(1, ceiling)
+}
+
+/// What to tell an operator who asked for more workers than the ceiling allows.
+///
+/// Separate from [`effective_pool`] so the DECISION is graded while the printing
+/// stays glue, and pure so both can be tested without a warehouse.
+///
+/// It names BOTH bounds on purpose. The warehouse side is the obvious one, but the
+/// STATE backend runs out first and reports an error about a database the operator
+/// was not thinking about: every worker opens its own ledger connection, so N is
+/// also N connections. On Postgres that meets `max_connections` (100 by default,
+/// minus whatever else is connected and the superuser reserve) and fails with
+/// "sorry, too many clients already" — which rivet classifies as RETRYABLE, so the
+/// run would retry a condition that waiting cannot improve. On SQLite it is not
+/// connections but writers: WAL allows many readers and ONE writer, so the workers
+/// queue on the write lock and surface `SQLITE_BUSY` once `busy_timeout` (10s) is
+/// spent.
+pub(crate) fn pool_ceiling_warning(
+    requested: Option<usize>,
+    items: usize,
+    sqlite_state: bool,
+) -> Option<String> {
+    let asked = requested?;
+    if asked <= MAX_POOL {
+        return None;
+    }
+    let running = effective_pool(requested, items);
+    if sqlite_state {
+        // Said plainly, because on SQLite the limit is not a quota that could be
+        // raised — it is the storage engine. Telling an operator "capped" without
+        // telling them WHY, or what to do instead, invites them to keep raising a
+        // number that cannot help.
+        return Some(format!(
+            "--pool {asked} exceeds the ceiling of {MAX_POOL}; running {running} worker(s). \
+             On a SQLite ledger rivet cannot usefully go higher in any case: WAL gives many \
+             readers but exactly ONE writer, so workers queue on the write lock and stop \
+             gaining past that point. If you want more parallelism than this, move the state \
+             to Postgres (set RIVET_STATE_URL) — there the bound is `max_connections`, not a \
+             single writer."
+        ));
+    }
+    Some(format!(
+        "--pool {asked} exceeds the ceiling of {MAX_POOL}; running {running} worker(s). \
+         Each worker opens its own ledger connection, so N is also N connections to the \
+         Postgres state backend and counts against its `max_connections` (100 by default, \
+         minus the superuser reserve and whatever else is connected). The warehouse has its \
+         own budget as well: BigQuery allows 100 concurrent interactive queries per PROJECT, \
+         shared with everything else running there."
+    ))
 }
 
 /// Whether a worker that has no ledger must REFUSE its table rather than load it.
@@ -66,17 +130,19 @@ fn take_next<'a, T>(next: &AtomicUsize, items: &'a [T]) -> Option<(usize, &'a T)
 /// Fault isolation is the contract this exists to keep: a failing item is
 /// recorded and the worker takes the next one, so one poisoned table can never
 /// abandon the tables behind it in the queue.
-pub(crate) fn run_workers<T, W, E, I, F>(
+pub(crate) fn run_workers<T, W, E, I, F, P>(
     items: &[T],
     workers: usize,
     init: I,
     work: F,
+    on_panic: P,
 ) -> Vec<Result<(), E>>
 where
     T: Sync,
     E: Send,
     I: Fn() -> W + Sync,
     F: Fn(&W, usize, &T) -> Result<(), E> + Sync,
+    P: Fn(&T) -> E + Sync,
 {
     let next = AtomicUsize::new(0);
     let done: Mutex<Vec<(usize, Result<(), E>)>> = Mutex::new(Vec::with_capacity(items.len()));
@@ -85,7 +151,18 @@ where
             scope.spawn(|| {
                 let resource = init();
                 while let Some((i, item)) = take_next(&next, items) {
-                    let outcome = work(&resource, i, item);
+                    // A PANIC in one item must not discard what the others already
+                    // did. Unwinding out of `thread::scope` skips the fold entirely,
+                    // so the run would exit without reporting the tables that had
+                    // already succeeded — after they had already changed the
+                    // warehouse. Caught here it becomes an ORDINARY failure for that
+                    // item: same fold, same aggregate, same isolation. It is not a
+                    // separate channel, because a separate channel is how it would
+                    // get lost a second time.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        work(&resource, i, item)
+                    }))
+                    .unwrap_or_else(|_| Err(on_panic(item)));
                     done.lock().unwrap().push((i, outcome));
                 }
             });
@@ -99,6 +176,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling warning fires only when the ASK exceeds it, and names both bounds.
+    ///
+    /// The boundary cases are the point: `MAX_POOL` itself must stay silent (it is
+    /// allowed, not excessive) and `MAX_POOL + 1` must speak. A test that only
+    /// checked "big number warns" would pass with the comparison flipped either way.
+    #[test]
+    fn the_ceiling_warns_only_above_it_and_says_what_to_do_per_backend() {
+        assert!(
+            pool_ceiling_warning(None, 50, false).is_none(),
+            "no request, no warning"
+        );
+        assert!(
+            pool_ceiling_warning(Some(MAX_POOL), 500, false).is_none(),
+            "asking for exactly the ceiling is allowed, not excessive"
+        );
+
+        let pg = pool_ceiling_warning(Some(MAX_POOL + 1), 500, false)
+            .expect("one over the ceiling must warn");
+        assert!(
+            pg.contains(&(MAX_POOL + 1).to_string()),
+            "the warning must quote what was asked: {pg}"
+        );
+        assert!(
+            pg.contains("max_connections") && pg.contains("BigQuery"),
+            "on Postgres it must name BOTH bounds — the state backend runs out first, and \
+             the error arrives from a database the operator was not thinking about: {pg}"
+        );
+
+        let lite = pool_ceiling_warning(Some(MAX_POOL + 1), 500, true)
+            .expect("the SQLite ledger must warn too");
+        assert!(
+            lite.contains("ONE writer"),
+            "on SQLite the limit is the storage engine, not a quota — say so: {lite}"
+        );
+        assert!(
+            lite.contains("RIVET_STATE_URL"),
+            "and say what to do instead, or the operator keeps raising a number that \
+             cannot help: {lite}"
+        );
+    }
 
     /// Only a worker that lost a ledger the RUN started with is fatal.
     ///
@@ -142,6 +260,16 @@ mod tests {
         );
         assert_eq!(effective_pool(Some(4), 9), 4);
         assert_eq!(
+            effective_pool(Some(500), 1000),
+            MAX_POOL,
+            "the ceiling stops a request the warehouse quota cannot serve"
+        );
+        assert_eq!(
+            effective_pool(Some(500), 8),
+            8,
+            "with fewer tables than the ceiling, the table count still wins"
+        );
+        assert_eq!(
             effective_pool(Some(99), 3),
             3,
             "never more workers than tables"
@@ -172,6 +300,7 @@ mod tests {
                     seen.lock().unwrap().push(i);
                     Ok::<(), String>(())
                 },
+                |item| format!("item {item} panicked"),
             );
             let mut seen = seen.into_inner().unwrap();
             seen.sort_unstable();
@@ -206,6 +335,7 @@ mod tests {
                     Ok(())
                 }
             },
+            |item| format!("item {item} panicked"),
         );
 
         let mut ran = ran.into_inner().unwrap();
@@ -252,6 +382,7 @@ mod tests {
                 }
                 Err::<(), String>(format!("from item {i}"))
             },
+            |item| format!("item {item} panicked"),
         );
         assert_eq!(out[0].as_ref().unwrap_err(), "from item 0");
         assert_eq!(out[1].as_ref().unwrap_err(), "from item 1");
@@ -270,6 +401,7 @@ mod tests {
                 order.lock().unwrap().push(i);
                 Ok::<(), String>(())
             },
+            |item| format!("item {item} panicked"),
         );
         assert_eq!(
             order.into_inner().unwrap(),
@@ -291,6 +423,7 @@ mod tests {
                 inits.fetch_add(1, Ordering::Relaxed);
             },
             |_, _, _| Ok::<(), String>(()),
+            |item| format!("item {item} panicked"),
         );
         assert_eq!(
             inits.load(Ordering::Relaxed),
@@ -308,7 +441,64 @@ mod tests {
             effective_pool(Some(4), items.len()),
             || (),
             |_, _, _| Ok::<(), String>(()),
+            |item| format!("item {item} panicked"),
         );
         assert!(out.is_empty());
+    }
+
+    /// A PANIC in one item must not discard what the others already did.
+    ///
+    /// RED against the pre-fix executor: an unwind out of `thread::scope` skipped
+    /// the fold entirely, so the run ended with NO aggregate at all — after the
+    /// other tables had already changed the warehouse. Panicking on exactly one
+    /// item and asserting the rest still ran is what distinguishes "caught and
+    /// reported" from "crashed politely".
+    ///
+    /// The panic hook is silenced for the duration: its default output is a
+    /// backtrace on stderr, which reads like a failed run in an otherwise green
+    /// suite.
+    #[test]
+    fn a_panicking_item_is_recorded_and_the_others_still_report() {
+        let items: Vec<usize> = (0..6).collect();
+        let ran: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = run_workers(
+            &items,
+            2,
+            || (),
+            |_, i, _| {
+                if i == 3 {
+                    panic!("boom in item 3");
+                }
+                ran.lock().unwrap().push(i);
+                Ok::<(), String>(())
+            },
+            |item| format!("item {item} panicked"),
+        );
+        std::panic::set_hook(prev);
+
+        let mut ran = ran.into_inner().unwrap();
+        ran.sort_unstable();
+        assert_eq!(
+            ran,
+            vec![0, 1, 2, 4, 5],
+            "every other item must still have run"
+        );
+        assert_eq!(
+            out.len(),
+            6,
+            "one result per item, the panicking one included"
+        );
+        assert_eq!(
+            out[3].as_ref().unwrap_err(),
+            "item 3 panicked",
+            "the panicking item is reported as ITS OWN failure, in its own slot"
+        );
+        assert!(
+            out[0].is_ok() && out[5].is_ok(),
+            "the others' results are untouched"
+        );
     }
 }

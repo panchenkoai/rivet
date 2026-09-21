@@ -14,7 +14,7 @@
 
 use crate::error::Result;
 use crate::load;
-use crate::state::{LoadRecord, StateStore};
+use crate::state::{LoadRecord, StateRef, StateStore};
 use anyhow::Context as _;
 
 pub struct LoadArgs {
@@ -103,6 +103,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // sequential loop had one of each.
     let parent_had_state = state.is_some();
     drop(state);
+    let sqlite_state = matches!(state_ref, Some(StateRef::Sqlite(_)));
+    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), sqlite_state) {
+        eprintln!("  warning: {w}");
+    }
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
@@ -254,6 +258,16 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                 }
             }
             Ok(())
+        },
+        // A panic becomes THIS table's failure, not the run's silent end. Named as
+        // a bug on the way out: catching it must not disguise an abort as an
+        // ordinary load error.
+        |plan| {
+            anyhow::anyhow!(
+                "load '{}' PANICKED — reported as this table's failure so every other \
+                 table still aggregates; the panic itself is a bug, please report it",
+                plan.table
+            )
         },
     );
     // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
@@ -1462,6 +1476,10 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     // had one of each.
     let parent_had_state = state.is_some();
     drop(state);
+    let sqlite_state = matches!(state_ref, Some(StateRef::Sqlite(_)));
+    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), sqlite_state) {
+        eprintln!("  warning: {w}");
+    }
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
@@ -1574,6 +1592,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 eprintln!("  COMPACT FAILED [{}]: {e:#}", plan.table);
             }
             outcome.map_err(|e| e.context(format!("compact '{}'", plan.table)))
+        },
+        |plan| {
+            anyhow::anyhow!(
+                "compact '{}' PANICKED — reported as this table's failure so every other \
+                 table still aggregates; the panic itself is a bug, please report it",
+                plan.table
+            )
         },
     );
     // Folded in CONFIG order, like the load leg: the pool returns one result per
