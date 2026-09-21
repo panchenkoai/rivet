@@ -31,7 +31,14 @@ else
   # No nextest: fall back to the built-in harness. NOTE this runs each consolidated suite
   # (offline_suite / live_suite) as threads in ONE process — a crash / SIGKILL / global-state
   # test can poison its siblings (per-test isolation is gone). Install cargo-nextest to restore
-  # it; CI runs under nextest regardless.
+  # it.
+  #
+  # This used to end "CI runs under nextest regardless", which was NOT true and is the
+  # reason to install it rather than rely on the gate: `.github/workflows/ci.yml:1232`
+  # (job `test:`) runs `cargo test --all-targets`, and `nextest` appears ZERO times in
+  # ci.yml — only nightly-live.yml uses it, for `live_suite`. So the PR gate runs the
+  # consolidated offline suite threaded too, with no per-test timeout from
+  # .config/nextest.toml. Corrected 2026-09-21; wiring CI to nextest is a separate call.
   echo "pre-push: cargo test --tests (NO per-test isolation — install cargo-nextest)"
   cargo test --tests --quiet
 fi

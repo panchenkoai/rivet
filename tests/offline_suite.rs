@@ -6,7 +6,11 @@
 //! whole set LINKS ONCE instead of N times (PoC measured 21 files: 42s -> 8s, 5x). The default
 //! harness still collects every `#[test]` from each module.
 //!
-//! Run these under cargo-nextest (process-per-test) — as the pre-push hook and CI do. Under the
+//! Run these under cargo-nextest (process-per-test) — as the pre-push hook does WHEN nextest is
+//! installed. The PR gate does NOT: `.github/workflows/ci.yml:1232` (job `test:`) runs
+//! `cargo test --all-targets`, and `nextest` appears zero times in that workflow, so in CI this
+//! suite runs threaded and `.config/nextest.toml`'s slow-timeout/retry settings do not apply.
+//! (This line claimed "and CI do" until 2026-09-21; it was never true.) Under the
 //! plain libtest harness (`cargo test --test offline_suite`) every `#[test]` here runs as a THREAD
 //! in one process, so an abort / SIGKILL / `std::process::exit` / corrupted process-global state in
 //! one test takes its siblings down with it. That isolation was free in the old one-binary-per-file

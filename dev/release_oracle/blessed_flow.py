@@ -1181,8 +1181,20 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # set, so without a per-invocation token the load_id repeats and _load_rows' `LIKE
     # load_id%` count on the shared, never-reset Postgres ledger passes on a PRIOR run's
     # rows. rivet records THIS load under this id (--run-id), so the scoping isolates it.
+    # + TAG: the cross-product this id is built from (engine/lifecycle/state) is
+    # rebuilt IDENTICALLY for every version of one engine, and `work_dir()` is a
+    # module-level global set once per run — so under --version-parallel two
+    # versions at the same lifecycle computed the SAME load_id. `load_run` is
+    # upserted BY load_id product-side (state/load_journal_store.rs, `ON CONFLICT
+    # (load_id) DO UPDATE`), so the second version REPLACED the first's row —
+    # target_table included — and `_load_rows`' `n < 1` check for a broken version
+    # then read the healthy sibling's row and passed. The comment above already
+    # stated the rule; the id stopped keeping it when versions began running
+    # concurrently. `dset` and `pfx` in this same function were version-keyed for
+    # exactly this reason; this one was missed.
     load_id = (
-        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}-{os.getpid()}"
+        f"flow-{cell.engine}{tag.replace('.', '_')}-{cell.lifecycle}-{cell.state}"
+        f"-{scenarios.work_dir().name}-{os.getpid()}"
     )
     # No `--rivet-bin`: the load resolves types IN PROCESS now (the flag existed
     # only to pin which binary the `rivet check` subprocess was, and is gone).
