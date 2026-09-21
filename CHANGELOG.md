@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`rivet validate` blamed a missing manifest on rivet's age.** The verdict read
+  `legacy_run (no manifest at destination — pre-0.7.0 prefix)`, but the check establishes
+  only that no manifest is at the prefix — never when, or whether, anything was written
+  there. A prefix that was never written reaches the same verdict, which is what an
+  operator sees whenever `validate` runs from a different working directory than the
+  export did: `destination.path` is the one relative path rivet resolves against the
+  CURRENT directory rather than the config's, and `rivet init` generates one. The line now
+  names both causes and asserts neither. The `legacy_run` label ADR-0012 M6 requires, and
+  the exit code, are unchanged.
+
 - **The LAST part of every export carries its partition count too.** The footer note
   the loader bounds a part by (`rivet.partition_buckets`) was written only when the
   writer ROTATED; every runner closes its final part itself — and a keyset page is
