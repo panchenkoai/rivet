@@ -498,18 +498,12 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
 }
 
 /// [`source_type`] as the enum the rest of the tree speaks.
-///
-/// Same derivation, one place: init reads the engine from the URL everywhere else, so
-/// a caller that needs the typed form should not have to re-load and re-VALIDATE the
-/// config to get it — which is exactly the trap `record_primary_keys` fell into.
 pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceType> {
     use crate::config::SourceType;
     Ok(match source_type(source_url)? {
         "postgres" => SourceType::Postgres,
         "mysql" => SourceType::Mysql,
         "mssql" => SourceType::Mssql,
-        // `source_type` returns these four and nothing else; a fifth would fail to
-        // compile here rather than silently pick an engine.
         _ => SourceType::Mongo,
     })
 }
@@ -702,16 +696,6 @@ pub fn init(
         }
     };
 
-    // Every export the scaffold could not give a cursor, at once.
-    //
-    // Leaving the column for the operator is DELIBERATE — the alternative is a phantom
-    // `updated_at` that fails at READ time — but the REPORTING was serial: `Config::load`
-    // stops at the first invalid export, so init's own warning and `rivet check` each
-    // named one offender, and finding three took three init runs.
-    //
-    // The config is also, in this state, one that NO command can load. So the "Next
-    // steps" block below is suppressed: printing `rivet check -c …` under a file that
-    // refuses to parse is an instruction that cannot be followed.
     let needs_cursor = match format {
         InitFormat::Yaml => yaml_scaffold::exports_needing_a_cursor(&text),
         InitFormat::DiscoveryJson => Vec::new(),
@@ -1385,18 +1369,6 @@ fn record_primary_keys(
     if snapshots.is_empty() {
         return;
     }
-    // NOT `Config::load`. That VALIDATES the whole config, so one export the scaffold
-    // could not complete — `--mode incremental` forced onto a table with no cursor
-    // candidate, which init writes with a `# REVIEW:` comment — returned before the
-    // loop below recorded ANY key. Measured on a 62-table schema: 63 exports, 0 keys.
-    // The operator then got a complete-LOOKING config whose `pk: auto` resolves to
-    // nothing, and the failure surfaced much later at `rivet load` as a refusal about
-    // PRIMARY KEYS — pointing at `load.pk`, three steps from the cause.
-    //
-    // Nothing here needs a validated config. The source TYPE is derived from the URL,
-    // exactly as the rest of init derives it, and the snapshots carry their own
-    // schema/table. This mirrors `record_strategy_snapshots` twenty lines above, which
-    // has always degraded per item instead of all-or-nothing.
     let kind = match source_type_of(source_url) {
         Ok(k) => k,
         Err(e) => {
@@ -1418,8 +1390,6 @@ fn record_primary_keys(
             return;
         }
     };
-    // PER EXPORT from here: one table rivet cannot read a key for must not cost the
-    // other sixty-one theirs.
     let mut failed: Vec<&str> = Vec::new();
     for s in snapshots {
         let relation = relation_for_key(&kind, s.source_schema.as_deref(), &s.source_table);
@@ -1433,8 +1403,6 @@ fn record_primary_keys(
                     failed.push(&s.export_name);
                 }
             }
-            // No key is ORDINARY — a view, a `query:` export, a keyless table. The
-            // load says so in its own words when it needs one.
             Ok(None) => {}
             Err(e) => {
                 log::debug!(
@@ -1445,8 +1413,6 @@ fn record_primary_keys(
             }
         }
     }
-    // Every offender at once. Naming the first one only makes finding N of them take N
-    // init runs, which is how three cursor-less tables were discovered one at a time.
     if !failed.is_empty() {
         log::warn!(
             "init: source primary keys not recorded for {} of {} export(s) — `rivet load` \
@@ -1479,22 +1445,6 @@ fn relation_for_key(
 #[cfg(test)]
 mod tests {
     /// Recording primary keys must not re-load and re-VALIDATE the config.
-    ///
-    /// `record_primary_keys` opened with `Config::load(config_path)?`, which validates
-    /// the whole file — so ONE export the scaffold could not complete (`--mode
-    /// incremental` forced onto a table with no cursor candidate, which init writes
-    /// with a `# REVIEW:` comment) returned before the loop recorded ANY key.
-    ///
-    /// Measured A/B on a 62-table schema, identical flags, the binary the only
-    /// variable: `c4684d8c` wrote 63 exports and **0** keys; the fix writes 63 exports
-    /// and **59** — exactly the tables that have a primary key. The operator's symptom
-    /// was a complete-LOOKING config whose `pk: auto` resolved to nothing, failing much
-    /// later at `rivet load` with a refusal about PRIMARY KEYS — three steps from the
-    /// cause.
-    ///
-    /// This is source-shaped for the reason `destructive_delete_gate` is: the defect is
-    /// a LOCAL wiring choice, and the behavioural half needs a live source. It fails
-    /// while `Config::load` is back in that function.
     #[test]
     fn recording_primary_keys_does_not_validate_the_whole_config() {
         let src = include_str!("mod.rs");
@@ -1506,10 +1456,6 @@ mod tests {
             .next()
             .expect("its body");
 
-        // The CALL, with its paren — not the name. The first version of this assertion
-        // tripped on the comment inside the function that explains why the call is
-        // gone, which is the source-guard version of an assertion loose enough to
-        // admit both spellings.
         assert!(
             !body.contains("Config::load("),
             "record_primary_keys must not VALIDATE the config to record keys — one \
@@ -1520,8 +1466,6 @@ mod tests {
             body.contains("connect_source_of"),
             "it should take the source by TYPE, not by a config it had to load"
         );
-        // Per-export isolation: the loop must not `?` out of the whole function on one
-        // unreadable key. `record_strategy_snapshots` twenty lines above is the model.
         assert!(
             body.contains("failed.push"),
             "one table rivet cannot read a key for must not cost the others theirs — \
@@ -1530,18 +1474,7 @@ mod tests {
         );
     }
 
-    /// Every export that needs a cursor is named at ONCE, and by the marker the
-    /// scaffold actually wrote.
-    ///
-    /// Leaving the column for the operator is DELIBERATE — the `None` arm of the cursor
-    /// emitter says why: a guessed `updated_at` may not exist and fails at READ time.
-    /// What was wrong is the REPORTING. `Config::load` stops at the first invalid
-    /// export, so init's warning and `rivet check` each named ONE, and finding the
-    /// three on a 62-table schema took three init runs.
-    ///
-    /// The list is read back out of the TEXT, so it cannot disagree with the file the
-    /// operator is about to open — and the emitter and this reader share one constant,
-    /// so the marker cannot drift either.
+    /// Every export that needs a cursor is named at once, read from the scaffold text.
     #[test]
     fn exports_needing_a_cursor_names_every_one_of_them() {
         use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_needing_a_cursor};

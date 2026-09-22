@@ -419,11 +419,6 @@ pub(crate) fn connect_source(
 }
 
 /// [`connect_source`] by the one thing it actually needs.
-///
-/// The `&Config` form reads exactly one field, so a caller that has the TYPE but no
-/// valid config had to produce one — and `Config::load` VALIDATES. That is how
-/// `record_primary_keys` came to bail on the whole config, and so record no key for
-/// ANY export, when a single export was invalid.
 pub(crate) fn connect_source_of(
     source_type: SourceType,
     url: &str,

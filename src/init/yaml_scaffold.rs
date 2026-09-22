@@ -518,21 +518,10 @@ const INIT_UNBOUNDED_DECIMAL_DEFAULT_SCALE: u32 = 18;
 /// Present on generated `columns:` lines that use the default above — `rivet init` reminds on stderr.
 pub(crate) const INIT_DECIMAL_REVIEW_MARKER: &str = "# REVIEW:";
 
-/// The line the scaffold leaves where a delta mode needs a cursor and no timestamp
-/// candidate exists. Deliberately NOT a guessed `updated_at` — see the `None` arm of
-/// the cursor emitter: a phantom column fails at READ time, which is worse.
+/// Marker left where a delta mode needs a cursor and no timestamp column exists.
 pub(crate) const INIT_CURSOR_REVIEW_MARKER: &str = "REVIEW: no timestamp column detected";
 
 /// Every export the scaffold could not give a cursor column, by name.
-///
-/// Read back OUT OF THE TEXT rather than tracked beside it, so the list an operator is
-/// told cannot disagree with the file they are about to open — the same reason
-/// `next_steps_block` is driven by `text.contains(..)`.
-///
-/// Why it exists: `Config::load` stops at the FIRST invalid export, so init's own
-/// warning and `rivet check` both named one offender at a time. Finding three took
-/// three init runs. Nothing about the scaffold was wrong — only the reporting was
-/// serial.
 pub(crate) fn exports_needing_a_cursor(config_text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current: Option<&str> = None;
@@ -861,8 +850,6 @@ fn export_block_lines(
             // the honest signal. The snapshot records None here too — they agree
             // (bug hunt 2026-08-08: the old literal fallback diverged from the
             // snapshot's None and named a phantom column).
-            // The marker is the CONSTANT, so the reader that lists these exports
-            // (`exports_needing_a_cursor`) cannot drift from what is written here.
             None => lines.push(
                 format!("    # {INIT_CURSOR_REVIEW_MARKER} — set cursor_column: <col> manually")
                     .to_string(),
