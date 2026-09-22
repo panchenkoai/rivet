@@ -702,6 +702,34 @@ pub fn init(
         }
     };
 
+    // Every export the scaffold could not give a cursor, at once.
+    //
+    // Leaving the column for the operator is DELIBERATE — the alternative is a phantom
+    // `updated_at` that fails at READ time — but the REPORTING was serial: `Config::load`
+    // stops at the first invalid export, so init's own warning and `rivet check` each
+    // named one offender, and finding three took three init runs.
+    //
+    // The config is also, in this state, one that NO command can load. So the "Next
+    // steps" block below is suppressed: printing `rivet check -c …` under a file that
+    // refuses to parse is an instruction that cannot be followed.
+    let needs_cursor = match format {
+        InitFormat::Yaml => yaml_scaffold::exports_needing_a_cursor(&text),
+        InitFormat::DiscoveryJson => Vec::new(),
+    };
+    if !needs_cursor.is_empty() {
+        eprintln!(
+            "rivet: {} export(s) have no timestamp column, so `{}` cannot give them a \
+             `cursor_column:` — the config will NOT load until you set one for each \
+             (search for `{}`), or re-run init excluding them (`--exclude {}`): {}",
+            needs_cursor.len(),
+            mode_override.unwrap_or("this mode"),
+            yaml_scaffold::INIT_CURSOR_REVIEW_MARKER,
+            needs_cursor.join(" "),
+            needs_cursor.join(", "),
+        );
+    }
+    let runnable = needs_cursor.is_empty();
+
     match output {
         Some(path) => {
             write_config_output(path, &text)?;
@@ -721,7 +749,7 @@ pub fn init(
             // Don't leave the user holding a cold artifact — show the path from
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
-            if matches!(format, InitFormat::Yaml) {
+            if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
                     "{}",
                     next_steps_block(
@@ -739,7 +767,7 @@ pub fn init(
             // stdout stays pure (pipeable); the guidance still reaches the user
             // on stderr so `rivet init | tee rivet.yaml` isn't a dead end.
             print!("{text}");
-            if matches!(format, InitFormat::Yaml) {
+            if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
                     "{}",
                     next_steps_block(
@@ -1499,6 +1527,42 @@ mod tests {
             "one table rivet cannot read a key for must not cost the others theirs — \
              collect the offenders and name them ALL, since reporting only the first \
              makes finding N of them take N init runs"
+        );
+    }
+
+    /// Every export that needs a cursor is named at ONCE, and by the marker the
+    /// scaffold actually wrote.
+    ///
+    /// Leaving the column for the operator is DELIBERATE — the `None` arm of the cursor
+    /// emitter says why: a guessed `updated_at` may not exist and fails at READ time.
+    /// What was wrong is the REPORTING. `Config::load` stops at the first invalid
+    /// export, so init's warning and `rivet check` each named ONE, and finding the
+    /// three on a 62-table schema took three init runs.
+    ///
+    /// The list is read back out of the TEXT, so it cannot disagree with the file the
+    /// operator is about to open — and the emitter and this reader share one constant,
+    /// so the marker cannot drift either.
+    #[test]
+    fn exports_needing_a_cursor_names_every_one_of_them() {
+        use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_needing_a_cursor};
+        let cfg = format!(
+            "exports:\n\
+             \x20 - name: good_one\n    mode: incremental\n    cursor_column: updated_at\n\
+             \x20 - name: no_stamp_a\n    mode: incremental\n    # {m} — set cursor_column: <col> manually\n\
+             \x20 - name: also_good\n    mode: incremental\n    cursor_column: changed_at\n\
+             \x20 - name: no_stamp_b\n    mode: incremental\n    # {m} — set cursor_column: <col> manually\n",
+            m = INIT_CURSOR_REVIEW_MARKER
+        );
+        assert_eq!(
+            exports_needing_a_cursor(&cfg),
+            vec!["no_stamp_a".to_string(), "no_stamp_b".to_string()],
+            "every offender, in file order — naming only the first is what made \
+             finding three take three init runs"
+        );
+        assert!(
+            exports_needing_a_cursor("exports:\n  - name: fine\n    cursor_column: ts\n")
+                .is_empty(),
+            "a scaffold with no marker reports nothing"
         );
     }
 

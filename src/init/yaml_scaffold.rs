@@ -518,6 +518,36 @@ const INIT_UNBOUNDED_DECIMAL_DEFAULT_SCALE: u32 = 18;
 /// Present on generated `columns:` lines that use the default above — `rivet init` reminds on stderr.
 pub(crate) const INIT_DECIMAL_REVIEW_MARKER: &str = "# REVIEW:";
 
+/// The line the scaffold leaves where a delta mode needs a cursor and no timestamp
+/// candidate exists. Deliberately NOT a guessed `updated_at` — see the `None` arm of
+/// the cursor emitter: a phantom column fails at READ time, which is worse.
+pub(crate) const INIT_CURSOR_REVIEW_MARKER: &str = "REVIEW: no timestamp column detected";
+
+/// Every export the scaffold could not give a cursor column, by name.
+///
+/// Read back OUT OF THE TEXT rather than tracked beside it, so the list an operator is
+/// told cannot disagree with the file they are about to open — the same reason
+/// `next_steps_block` is driven by `text.contains(..)`.
+///
+/// Why it exists: `Config::load` stops at the FIRST invalid export, so init's own
+/// warning and `rivet check` both named one offender at a time. Finding three took
+/// three init runs. Nothing about the scaffold was wrong — only the reporting was
+/// serial.
+pub(crate) fn exports_needing_a_cursor(config_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<&str> = None;
+    for line in config_text.lines() {
+        if let Some(rest) = line.strip_prefix("  - name: ") {
+            current = Some(rest.trim());
+        } else if line.contains(INIT_CURSOR_REVIEW_MARKER)
+            && let Some(name) = current.take()
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 fn init_default_decimal_yaml_line(col_name: &str) -> String {
     format!(
         "      {}: decimal({},{})  # REVIEW: DDL has no numeric(p,s); edit to the real decimal(p,s) or change the column type — values outside this bound may truncate or fail export.",
@@ -831,8 +861,10 @@ fn export_block_lines(
             // the honest signal. The snapshot records None here too — they agree
             // (bug hunt 2026-08-08: the old literal fallback diverged from the
             // snapshot's None and named a phantom column).
+            // The marker is the CONSTANT, so the reader that lists these exports
+            // (`exports_needing_a_cursor`) cannot drift from what is written here.
             None => lines.push(
-                "    # REVIEW: no timestamp column detected — set cursor_column: <col> manually"
+                format!("    # {INIT_CURSOR_REVIEW_MARKER} — set cursor_column: <col> manually")
                     .to_string(),
             ),
         },
