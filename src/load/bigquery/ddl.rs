@@ -284,20 +284,6 @@ pub(super) fn loads_directly(renames: &[Rename], batches: &[Vec<String>]) -> boo
     renames.is_empty() && batches.len() <= 1
 }
 
-/// Append every row of `source` into `target`, by column name.
-pub(super) fn build_insert_select_sql(
-    target: &str,
-    source: &str,
-    specs: &[TargetColumnSpec],
-) -> String {
-    let cols = specs
-        .iter()
-        .map(|s| format!("`{}`", s.column_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("INSERT INTO `{target}` ({cols})\nSELECT {cols} FROM `{source}`;")
-}
-
 /// A free `LOAD DATA` batch-load statement declaring the native `schema`, so
 /// BigQuery coerces the Parquet to native types on load.
 pub(super) fn build_load_data_sql(

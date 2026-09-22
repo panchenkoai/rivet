@@ -1336,10 +1336,6 @@ fn a_renamed_column_loads_under_its_file_name_then_renames_and_appends_by_name()
         Some("ALTER TABLE `p.d.t__staging` RENAME COLUMN `\u{441}omment` TO `comment`;")
     );
     assert_eq!(build_rename_columns_sql("p.d.t__staging", &[]), None);
-    assert_eq!(
-        build_insert_select_sql("p.d.t__changes", "p.d.s", &specs),
-        "INSERT INTO `p.d.t__changes` (`id`, `comment`)\nSELECT `id`, `comment` FROM `p.d.s`;"
-    );
 }
 
 #[test]

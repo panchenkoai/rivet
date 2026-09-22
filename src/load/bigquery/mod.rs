@@ -178,29 +178,42 @@ impl BigQueryLoader {
         self
     }
 
-    /// Append `batches` to `changes` one job at a time through a staging table loaded under the file names and renamed.
+    /// Append `batches` to `changes` one job at a time: load a staging table under the file names, rename, then a free copy job.
     fn append_renamed(
         &self,
         changes: &str,
         specs: &[TargetColumnSpec],
         batches: &[Vec<String>],
+        partition: Option<&TablePartition>,
     ) -> Result<()> {
-        let staging_fqtn = self.fqtn(&format!("{changes}__staging"));
+        let staging = format!("{changes}__staging");
+        let staging_fqtn = self.fqtn(&staging);
         let schema = build_file_schema(specs, &self.renames);
-        let insert = build_insert_select_sql(&self.fqtn(changes), &staging_fqtn, specs);
+        let partition_expr = partition.map(|p| p.expr.as_str());
+        let drop = format!("DROP TABLE IF EXISTS `{staging_fqtn}`;");
         for batch in batches {
-            let load = build_load_data_sql(&staging_fqtn, true, &schema, None, &[], None, batch);
+            self.run_sql(&drop, "load", changes)?;
+            let load = build_load_data_sql(
+                &staging_fqtn,
+                true,
+                &schema,
+                partition_expr,
+                self.cluster_by(),
+                None,
+                batch,
+            );
             self.run_sql(&load, "load", changes)?;
             if let Some(rename) = build_rename_columns_sql(&staging_fqtn, &self.renames) {
                 self.run_sql(&rename, "load", changes)?;
             }
-            self.run_sql(&insert, "load", changes)?;
+            self.api()?.copy_append(
+                &self.dataset,
+                &staging,
+                changes,
+                &self.labels("load", changes),
+            )?;
         }
-        self.run_sql(
-            &format!("DROP TABLE IF EXISTS `{staging_fqtn}`;"),
-            "load",
-            changes,
-        )
+        self.run_sql(&drop, "load", changes)
     }
 
     /// The CDC layout the load writes (see the field).
@@ -554,7 +567,7 @@ impl TargetLoader for BigQueryLoader {
                 self.run_sql(&load, "load", &changes)?;
             }
         } else {
-            self.append_renamed(&changes, &full, &batches)?;
+            self.append_renamed(&changes, &full, &batches, log_partition_decl)?;
         }
         let after = self.count_rows(&changes)?;
         Ok(after.saturating_sub(before))
