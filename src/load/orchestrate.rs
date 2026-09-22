@@ -756,6 +756,12 @@ struct LoadInputs {
     /// (round-4 TOCTOU). `None` = the sample could not be taken (stateless, or
     /// the query failed): record then consumes NOTHING this cycle.
     active_at_fetch: Option<std::collections::HashSet<String>>,
+    /// Which runs the BUCKET says are still writing — non-superseded `running`
+    /// markers. Carried separately from `active_at_fetch` because it is available
+    /// even when the ledger is not, and because `record` must union it into its OWN
+    /// record-time sample: that sample has the same `Ok({})` blind spot as the fetch
+    /// one, and a foreign-host load hits it on every cycle, not as a race.
+    marker_active: std::collections::HashSet<String>,
     /// The selected run manifests, keyed by their bucket path.
     runs: Vec<(String, crate::manifest::RunManifest)>,
     /// Whether the target table, if it exists, is one rivet loaded (per the ledger).
@@ -838,6 +844,23 @@ fn prepare_load(
         }
     });
     let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    // The bucket's own liveness markers, at run-id granularity. The ledger sample
+    // above fails SAFE on `Err` — it consumes nothing — but it cannot fail safe on
+    // `Ok({})`, and an EMPTY answer is what a load on a FOREIGN HOST gets: `StateStore
+    // ::open` creates a fresh state DB beside the LOAD's config, which has never seen
+    // the extract's runs. Empty then excludes nothing, every in-flight run is recorded
+    // consumed, and every part it writes afterwards is skipped for ever.
+    //
+    // `gc_orphans` — the DELETE path — has consulted both signals since it was
+    // written, for exactly this case. Consuming is the more permanent decision of the
+    // two (a consumed run is never read again; a spared orphan is collected next
+    // cycle), and it had the weaker guard. Union, never replace: the ledger stays the
+    // precise signal where it can answer.
+    let marker_active = load::reconcile::active_running_run_ids(&keyed);
+    let active_at_fetch = active_at_fetch.map(|mut s| {
+        s.extend(marker_active.iter().cloned());
+        s
+    });
     // Round-6: "up to date — every extraction run already loaded" was printed
     // for BOTH "all runs consumed" and "this prefix holds NOTHING" — and the
     // second is what a typo'd/mis-encoded prefix produces, forever, exit 0.
@@ -1014,6 +1037,7 @@ fn prepare_load(
         source_run_ids,
         source_ident,
         active_at_fetch,
+        marker_active,
         runs: new,
         ownership,
     }))
@@ -1061,6 +1085,10 @@ struct LoadCtx<'a> {
     /// unions it with its own record-time sample so a run that finished DURING
     /// the copy is still excluded from the consumed set.
     active_at_fetch: Option<std::collections::HashSet<String>>,
+    /// [`LoadInputs::marker_active`] — the BUCKET's liveness answer, unioned into
+    /// the record-time sample below. Empty when nothing is running, which is the
+    /// ordinary case and costs nothing.
+    marker_active: std::collections::HashSet<String>,
 }
 
 /// The source runs this load may record as CONSUMED: everything it read, MINUS
@@ -1129,7 +1157,16 @@ impl LoadCtx<'_> {
         // "assume they are all active" records none of them, and the next cycle
         // re-evaluates: at-least-once, which the current-state view absorbs.
         let mut active = match s.active_run_ids_on_prefix(self.source_prefix) {
-            Ok(a) => a,
+            // `Ok` is not the safe answer it looks like: an EMPTY set excludes
+            // nothing, and empty-without-error is exactly what a FOREIGN-HOST load
+            // gets — `StateStore::open` makes a fresh DB beside the load's own
+            // config, which never saw the extract's runs. The `Err` arm below fails
+            // safe; this one could not, so the BUCKET's markers are unioned in.
+            // Union, never replace: the ledger stays authoritative where it answers.
+            Ok(mut a) => {
+                a.extend(self.marker_active.iter().cloned());
+                a
+            }
             Err(e) => {
                 log::warn!(
                     "load: cannot tell which runs are still writing into {} ({e:#}) — not \
@@ -1250,6 +1287,7 @@ fn execute_load<R>(
         source_prefix: job.plan.gcs_prefix.as_str(),
         source_ident: String::new(),
         active_at_fetch: None,
+        marker_active: std::collections::HashSet::new(),
     };
     let inputs = match prepare_load(
         store,
@@ -1261,6 +1299,7 @@ fn execute_load<R>(
         Some(i) => {
             ctx.source_ident = i.source_ident.clone();
             ctx.active_at_fetch = i.active_at_fetch.clone();
+            ctx.marker_active = i.marker_active.clone();
             i
         }
         None => {
@@ -2674,6 +2713,7 @@ mod load_ledger_tests {
         LoadCtx {
             source_ident: String::new(),
             active_at_fetch: Some(Default::default()),
+            marker_active: Default::default(),
             source_prefix: "gs://b/p/",
             state: Some(state),
             load_id,
@@ -2899,6 +2939,7 @@ mod load_ledger_tests {
         let c = LoadCtx {
             source_ident: String::new(),
             active_at_fetch: None,
+            marker_active: Default::default(),
             state: None,
             load_id: "L1",
             export_name: "orders",
@@ -2994,6 +3035,7 @@ mod live_only_decisions {
             source_prefix: prefix,
             source_ident: String::new(),
             active_at_fetch: Some(Default::default()),
+            marker_active: Default::default(),
         };
         let stop = load::refused("refusing to overwrite".into());
         ctx.record(&["run-1".to_string()], 0, ledger_status(&stop));
@@ -3011,6 +3053,60 @@ mod live_only_decisions {
         // A failure AFTER the write is what makes the table rivet's own.
         ctx.record_failed(&["run-1".to_string()]);
         assert_eq!(ownership(&state), load::Ownership::Own);
+    }
+
+    /// The BUCKET's liveness markers keep a still-writing run out of the consumed
+    /// set when the LEDGER answers empty without erroring.
+    ///
+    /// That answer is not hypothetical and not a race: a load on a FOREIGN HOST gets
+    /// it on every cycle, because `StateStore::open` creates a fresh state DB beside
+    /// the LOAD's own config and that DB never saw the extract's runs. `Ok({})`
+    /// excludes nothing, so the in-flight run was recorded consumed and every part it
+    /// flushed afterwards was skipped for ever — while the next load printed
+    /// "up to date".
+    ///
+    /// `gc_orphans` — the DELETE path — has consulted both the ledger and the bucket
+    /// markers since it was written, for exactly this case. The CONSUME path had only
+    /// the ledger, and consuming is the more permanent of the two decisions: a
+    /// consumed run is never read again, whereas a spared orphan is merely collected
+    /// next cycle.
+    ///
+    /// RED against dropping the union in `record`: without it `run-live` is marked
+    /// loaded and `loaded_source_run_ids` returns both runs.
+    #[test]
+    fn a_run_the_bucket_says_is_live_is_not_consumed_when_the_ledger_answers_empty() {
+        let state = StateStore::open_in_memory().unwrap();
+        let target = "p.d.orders";
+        let ctx = LoadCtx {
+            state: Some(&state),
+            load_id: "load-marker",
+            export_name: "orders",
+            target_fqtn: target,
+            warehouse: "bigquery",
+            mode: LoadMode::Cdc,
+            source_prefix: "gs://b/exports/orders/",
+            source_ident: String::new(),
+            // The ledger answered, and answered EMPTY — the foreign-host shape. The
+            // `None` arm (a FAILED query) already fails safe and is not the subject.
+            active_at_fetch: Some(Default::default()),
+            marker_active: ["run-live".to_string()].into_iter().collect(),
+        };
+        ctx.record(
+            &["run-done".to_string(), "run-live".to_string()],
+            2,
+            "success",
+        );
+
+        let loaded = state.loaded_source_run_ids(target).unwrap();
+        assert!(
+            loaded.contains("run-done"),
+            "a terminal run must still be recorded, or every load re-reads it: {loaded:?}"
+        );
+        assert!(
+            !loaded.contains("run-live"),
+            "the bucket says `run-live` is still writing — recording it consumed strands \
+             every part it flushes after this load: {loaded:?}"
+        );
     }
 
     /// The identity guard reads the SAME population the recorder writes. A live
@@ -3127,6 +3223,7 @@ mod live_only_decisions {
             source_prefix: prefix,
             source_ident: crate::manifest::identity_source(&good),
             active_at_fetch: Some(Default::default()),
+            marker_active: Default::default(),
         }
         .record(&["run-9".to_string()], 1, "success");
 
@@ -3546,6 +3643,7 @@ mod live_only_decisions {
             source_prefix: prefix,
             source_ident: inputs.source_ident.clone(),
             active_at_fetch: inputs.active_at_fetch.clone(), // execute_load's copy
+            marker_active: Default::default(),
         };
         ctx.record_success(&inputs.source_run_ids, 2);
 
@@ -3863,6 +3961,7 @@ mod live_only_decisions {
             source_run_ids: vec!["r1".into()],
             source_ident: "postgres:public.orders".into(),
             active_at_fetch: Some(Default::default()),
+            marker_active: Default::default(),
             runs: Vec::new(),
             ownership: load::Ownership::Own,
         };

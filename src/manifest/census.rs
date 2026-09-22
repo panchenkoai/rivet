@@ -158,6 +158,23 @@ impl<'a> ManifestCensus<'a> {
             .any(|r| r.manifest.status == ManifestStatus::Running && !self.superseded(r))
     }
 
+    /// [`Self::active_running`] at RUN-ID granularity — which live runs, not merely
+    /// whether one exists.
+    ///
+    /// The bool answers gc's question ("may I delete an unmanifested part?"). A load
+    /// asks a different one: *which* runs must not be recorded as fully consumed,
+    /// because they are still writing into the prefix it just read. The ledger is the
+    /// precise answer to that and this is its cross-boundary projection — needed
+    /// exactly when the ledger answers EMPTY without erroring, which is what a load on
+    /// a foreign host gets from the fresh state DB opened beside its own config.
+    pub fn active_running_ids(&self) -> std::collections::HashSet<String> {
+        self.runs
+            .iter()
+            .filter(|r| r.manifest.status == ManifestStatus::Running && !self.superseded(r))
+            .map(|r| r.manifest.run_id.clone())
+            .collect()
+    }
+
     /// True if `run` (a Failed/Interrupted manifest) is superseded by a LIVE run
     /// of the SAME family — a non-superseded `Running` marker with a newer
     /// `started_at`. That live run is a chunk-checkpoint resume which ADOPTS the
@@ -619,6 +636,50 @@ mod tests {
         let census = ManifestCensus::new(&keyed);
         assert!(census.superseded(&census.runs()[0]));
         assert!(!census.active_running());
+    }
+
+    /// `active_running_ids` names the SAME runs `active_running` counts — including
+    /// when supersession makes a `running` marker dead.
+    ///
+    /// The bool answers gc's question; the ids answer the load's, which is WHICH runs
+    /// must stay out of the consumed set. They must never disagree: a marker the bool
+    /// calls dead but the ids call live would defer a run for ever, and the reverse
+    /// would strand the parts it is still writing.
+    #[test]
+    fn active_running_ids_names_exactly_the_runs_active_running_counts() {
+        let running = |id: &str, unit: &str, at: &str| {
+            let mut x = m(id, unit, "orders");
+            x.status = ManifestStatus::Running;
+            x.started_at = at.into();
+            x
+        };
+
+        // Two live markers of DIFFERENT split units: both named, neither superseded.
+        let two_live = vec![
+            keyed("r0", running("r0", "orders#0", "2026-08-21T00:00:00Z")),
+            keyed("r9", running("r9", "orders#1", "2026-08-21T00:00:00Z")),
+        ];
+        let census = ManifestCensus::new(&two_live);
+        assert!(census.active_running());
+        let ids = census.active_running_ids();
+        assert_eq!(ids.len(), 2, "both live markers are named: {ids:?}");
+        assert!(ids.contains("r0") && ids.contains("r9"), "{ids:?}");
+
+        // A newer SUCCESS of the same unit supersedes the marker: dead, so the bool
+        // goes false and the ids must go EMPTY, not merely shrink.
+        let mut done = m("r1", "orders#0", "orders");
+        done.started_at = "2026-08-21T00:01:00Z".into();
+        let superseded = vec![
+            keyed("r0", running("r0", "orders#0", "2026-08-21T00:00:00Z")),
+            keyed("r1", done),
+        ];
+        let census = ManifestCensus::new(&superseded);
+        assert!(!census.active_running());
+        assert!(
+            census.active_running_ids().is_empty(),
+            "a superseded marker is a dead crash marker, not a live run: {:?}",
+            census.active_running_ids()
+        );
     }
 
     /// Census twin of the ledger's `a_newer_failed_run_does_not_supersede_a_live_one`

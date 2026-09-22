@@ -331,6 +331,21 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
     ManifestCensus::new(keyed).active_running()
 }
 
+/// WHICH runs are still writing under the prefix, per the bucket markers — the
+/// run-id form of [`has_active_running_manifest`].
+///
+/// The DELETE path (`gc_orphans`) has had two liveness signals since it was written:
+/// the run-status ledger and this bucket projection, "belt-and-suspenders … the
+/// marker covers cross-host". The CONSUME path had only the ledger, and consuming is
+/// the more permanent decision of the two — a run recorded consumed is never read
+/// again, while a spared orphan is merely collected next cycle. This is what lets
+/// both paths ask the same question.
+pub fn active_running_run_ids(
+    keyed: &[(String, RunManifest)],
+) -> std::collections::HashSet<String> {
+    ManifestCensus::new(keyed).active_running_ids()
+}
+
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
 /// manifests under the prefix) pick the newest run of each split unit
 /// ([`ManifestCensus::latest_generation`], which owns the grouping rule). Full
