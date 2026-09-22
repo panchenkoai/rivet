@@ -154,7 +154,7 @@ impl TableInfo {
         let ts: Vec<&ColumnInfo> = self
             .columns
             .iter()
-            .filter(|c| is_timestamp_type(&c.data_type))
+            .filter(|c| is_timestamp_type(&c.data_type) && !is_tombstone_stamp(&c.name))
             .collect();
         ts.iter()
             .find(|c| is_creation_stamp(&c.name))
@@ -167,7 +167,7 @@ impl TableInfo {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
             .iter()
-            .filter(|c| is_timestamp_type(&c.data_type))
+            .filter(|c| is_timestamp_type(&c.data_type) && !is_tombstone_stamp(&c.name))
             .collect();
         ts_cols
             .iter()
@@ -193,6 +193,11 @@ impl TableInfo {
         is_keysettable_type(ty).then_some(pk)
     }
 
+    /// Whether the table has any key `chunked` can page by: an integer column or a keysettable PK.
+    pub(crate) fn has_chunk_key(&self) -> bool {
+        self.best_chunk_column().is_some() || self.keysettable_pk_column().is_some()
+    }
+
     /// Suggest extraction mode based on row count and available columns.
     pub(crate) fn suggest_mode(&self) -> &'static str {
         if self.row_estimate > 100_000 {
@@ -204,7 +209,7 @@ impl TableInfo {
             // unbounded scan that is not durability-safe on a large table (ADR-0020).
             // A decimal PK is NOT keysettable (planner refuses it), so it stays
             // `full` unless it also has an integer column to range-chunk.
-            if self.best_chunk_column().is_some() || self.keysettable_pk_column().is_some() {
+            if self.has_chunk_key() {
                 return "chunked";
             }
             if self.best_cursor_column().is_some() {
@@ -252,7 +257,7 @@ impl TableInfo {
                 // timestamp cursor exists (roast 2026-08-09: the incremental
                 // ARM below names chosen_, but this SUGGESTION must stay
                 // timestamp-gated, unlike an actual incremental export).
-                match self.best_cursor_column() {
+                match self.best_cursor_column().filter(|c| is_mutation_stamp(c)) {
                     Some(cursor) => format!(
                         "{base}. NOTE: chunked re-reads the whole table each run — for scheduled \
                          re-runs, `mode: incremental` on '{cursor}' pulls only changed rows"
@@ -450,6 +455,14 @@ fn is_mutation_stamp(name: &str) -> bool {
             | "dateupdated"
             | "modifiedtime"
             | "updatedtime"
+    )
+}
+
+/// Whether the column name marks a soft delete: NULL on every live row, so it can never be a cursor.
+pub(crate) fn is_tombstone_stamp(name: &str) -> bool {
+    matches!(
+        stamp_key(name).as_str(),
+        "deletedat" | "deletedon" | "deleteddate" | "removedat" | "archivedat" | "purgedat"
     )
 }
 
@@ -703,16 +716,24 @@ pub fn init(
     if !needs_cursor.is_empty() {
         eprintln!(
             "rivet: {} export(s) have no timestamp column, so `{}` cannot give them a \
-             `cursor_column:` — the config will NOT load until you set one for each \
+             `{}:` — the config will NOT load until you set one for each \
              (search for `{}`), or re-run init excluding them (`--exclude {}`): {}",
             needs_cursor.len(),
             mode_override.unwrap_or("this mode"),
+            if mode_override == Some("time_window") {
+                "time_column"
+            } else {
+                "cursor_column"
+            },
             yaml_scaffold::INIT_CURSOR_REVIEW_MARKER,
             needs_cursor.join(" "),
             needs_cursor.join(", "),
         );
     }
     let runnable = needs_cursor.is_empty();
+    if matches!(format, InitFormat::Yaml) {
+        warn_marked_exports(&text);
+    }
 
     match output {
         Some(path) => {
@@ -1065,6 +1086,31 @@ fn mark_mssql_catalog_exact(info: &mut TableInfo) {
         k: 0,
         w: 0,
     });
+}
+
+/// One line per informational marker, naming every export that carries it.
+fn warn_marked_exports(text: &str) {
+    for (marker, what) in [
+        (
+            yaml_scaffold::INIT_INSERT_ONLY_MARKER,
+            "use a cursor that does not change on UPDATE: updated rows are never re-exported \
+             (set `cursor_column:` to an updated_at-style column, or use `mode: cdc`)",
+        ),
+        (
+            yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER,
+            "have no integer column or keysettable primary key, so they were written as \
+             `mode: full` instead of `chunked`",
+        ),
+    ] {
+        let names = yaml_scaffold::exports_marked(text, marker);
+        if !names.is_empty() {
+            eprintln!(
+                "rivet: {} export(s) {what}: {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
+    }
 }
 
 fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::StrategySnapshot {
@@ -2379,6 +2425,95 @@ mod tests {
         assert!(
             !yaml.contains("credentials_file"),
             "ADC / env key: YAML should omit credentials_file, got:\n{yaml}"
+        );
+    }
+
+    fn scaffold(info: &TableInfo, mode: Option<&str>) -> String {
+        let dest = InitYamlDestination {
+            gcs_bucket: None,
+            gcs_credentials_file: None,
+            s3_bucket: None,
+            s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
+        };
+        yaml_scaffold::generate_config(
+            info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+            mode,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn forced_chunked_on_a_keyless_table_is_written_as_full_not_a_phantom_id() {
+        let mut deleted_at = col("deleted_at", "timestamp", false);
+        deleted_at.is_nullable = true;
+        let info = make_table(
+            100,
+            vec![
+                col("email", "text", false),
+                deleted_at,
+                col("payload", "text", false),
+            ],
+        );
+        let yaml = scaffold(&info, Some("chunked"));
+        assert!(yaml.contains("    mode: full"), "got:\n{yaml}");
+        assert!(!yaml.contains("chunk_column"), "got:\n{yaml}");
+        assert_eq!(
+            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER),
+            vec!["orders".to_string()]
+        );
+        let d = yaml_scaffold::decided_strategy(&info, Some("chunked"));
+        assert_eq!(
+            (d.mode.as_str(), d.kind),
+            ("full", "full"),
+            "snapshot agrees with the YAML"
+        );
+    }
+
+    #[test]
+    fn a_soft_delete_stamp_is_never_a_cursor_or_a_partition_key() {
+        let mut deleted_at = col("deleted_at", "timestamp", false);
+        deleted_at.is_nullable = true;
+        let only_tombstone = make_table(100, vec![col("email", "text", false), deleted_at.clone()]);
+        assert_eq!(only_tombstone.chosen_cursor_column(), None);
+        assert_eq!(only_tombstone.best_cursor_column(), None);
+        assert_eq!(only_tombstone.best_partition_column(), None);
+        let with_created = make_table(100, vec![deleted_at, col("created_at", "timestamp", false)]);
+        assert_eq!(
+            with_created.chosen_cursor_column().as_deref(),
+            Some("created_at")
+        );
+        assert_eq!(with_created.best_partition_column(), Some("created_at"));
+    }
+
+    #[test]
+    fn an_incremental_cursor_that_misses_updates_is_marked_insert_only() {
+        let by_id = make_table(
+            100,
+            vec![col("id", "bigint", true), col("v", "text", false)],
+        );
+        let yaml = scaffold(&by_id, Some("incremental"));
+        assert_eq!(
+            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_INSERT_ONLY_MARKER),
+            vec!["orders".to_string()],
+            "got:\n{yaml}"
+        );
+        let by_stamp = make_table(
+            100,
+            vec![
+                col("id", "bigint", true),
+                col("updated_at", "timestamp", false),
+            ],
+        );
+        let yaml = scaffold(&by_stamp, Some("incremental"));
+        assert!(
+            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_INSERT_ONLY_MARKER).is_empty(),
+            "got:\n{yaml}"
         );
     }
 

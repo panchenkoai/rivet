@@ -19,6 +19,9 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
         let mut reasons: Vec<CursorCandidateReason> = Vec::new();
         let mut score: i32 = 0;
 
+        if super::is_tombstone_stamp(&col.name) {
+            continue;
+        }
         if is_timestamp_type(&col.data_type) {
             reasons.push(CursorCandidateReason::TimestampType);
             score += 40;

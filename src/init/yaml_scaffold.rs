@@ -523,12 +523,23 @@ pub(crate) const INIT_CURSOR_REVIEW_MARKER: &str = "REVIEW: no timestamp column 
 
 /// Every export the scaffold could not give a cursor column, by name.
 pub(crate) fn exports_needing_a_cursor(config_text: &str) -> Vec<String> {
+    exports_marked(config_text, INIT_CURSOR_REVIEW_MARKER)
+}
+
+/// Marks an incremental export whose cursor does not move when a row is updated.
+pub(crate) const INIT_INSERT_ONLY_MARKER: &str = "NOTE: insert-only cursor";
+
+/// Marks a forced `chunked` export written as `full` because the table has no key to page by.
+pub(crate) const INIT_NO_CHUNK_KEY_MARKER: &str = "NOTE: no chunk key";
+
+/// Every export whose block carries `marker`, in config order.
+pub(crate) fn exports_marked(config_text: &str, marker: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current: Option<&str> = None;
     for line in config_text.lines() {
         if let Some(rest) = line.strip_prefix("  - name: ") {
             current = Some(rest.trim());
-        } else if line.contains(INIT_CURSOR_REVIEW_MARKER)
+        } else if line.contains(marker)
             && let Some(name) = current.take()
         {
             out.push(name.to_string());
@@ -704,6 +715,10 @@ fn export_block_lines(
     };
     let table_form_safe = table_form_safe || recipe;
     let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
+    let no_chunk_key = mode == "chunked"
+        && info.best_chunk_column().is_none()
+        && !(is_keyset && info.keysettable_pk_column().is_some());
+    let mode = if no_chunk_key { "full" } else { mode };
     if source_type == "mongo" && !table_form_safe {
         // Unexportable in ANY form today: `table:` is Mongo's only export form
         // and the config gate refuses this name (while its "use query:" remedy
@@ -746,7 +761,14 @@ fn export_block_lines(
     // Inline rationale above `mode:` so the operator can see *why* this
     // mode got picked, not just *what*. Easy to delete; the suggestion
     // is documentation, not a contract.
-    lines.push(format!("    # {}", info.mode_rationale(mode)));
+    if no_chunk_key {
+        lines.push(format!(
+            "    # {INIT_NO_CHUNK_KEY_MARKER} — chunked needs an integer column or a keysettable \
+             primary key, and this table has neither; written as a full scan"
+        ));
+    } else {
+        lines.push(format!("    # {}", info.mode_rationale(mode)));
+    }
     lines.push(format!("    mode: {mode}"));
 
     match mode {
@@ -781,7 +803,9 @@ fn export_block_lines(
                 );
             } else {
                 // No single-column PK → range chunk on the best integer column.
-                let chunk_col = info.best_chunk_column().unwrap_or("id");
+                let chunk_col = info
+                    .best_chunk_column()
+                    .expect("no_chunk_key downgrades a keyless table to full");
                 let parallel =
                     suggest_parallel(info.row_estimate, info.avg_row_bytes(), source_type);
                 lines.push(format!(
@@ -831,6 +855,12 @@ fn export_block_lines(
                     "    cursor_column: {}",
                     yaml_quote_if_needed(&cursor)
                 ));
+                if !super::is_mutation_stamp(&cursor) {
+                    lines.push(format!(
+                        "    # {INIT_INSERT_ONLY_MARKER} — '{cursor}' does not change when a row \
+                         is updated, so updates to existing rows are never captured"
+                    ));
+                }
                 // If the chosen cursor is NULLABLE and a not-null sibling exists,
                 // scaffold coalesce mode — otherwise `WHERE cursor > $last` skips
                 // every NULL-cursor row (roast 2026-08-09, #173).
@@ -2697,6 +2727,11 @@ pub(crate) fn decided_strategy(
     let mode = mode_override
         .map(str::to_string)
         .unwrap_or_else(|| info.suggest_mode().to_string());
+    let mode = if mode == "chunked" && !info.has_chunk_key() {
+        "full".to_string()
+    } else {
+        mode
+    };
     match mode.as_str() {
         "chunked" => {
             let size = info.suggest_chunk_size() as i64;
