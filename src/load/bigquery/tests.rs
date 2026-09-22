@@ -726,8 +726,17 @@ fn job_labels_tag_managed_by_op_and_table() {
     let labels = build_labels("recover", "Orders", Some("Run-7"));
     assert_eq!(labels["managed_by"], "rivet");
     assert_eq!(labels["rivet_op"], "recover");
-    assert_eq!(labels["rivet_table"], "orders"); // sanitized to lowercase
-    assert_eq!(labels["rivet_run"], "run-7"); // sanitized to lowercase
+    // Case-folding is LOSSY, and case is the live-proven collision shape
+    // (`CaseTwin` beside `casetwin`), so a folded value carries a digest of the
+    // original — see `sanitize_label_does_not_collapse_two_distinct_tables_into_one`.
+    // The folded form stays the PREFIX, so the label still reads as the table.
+    assert!(labels["rivet_table"].starts_with("orders"), "{labels:?}");
+    assert!(labels["rivet_run"].starts_with("run-7"), "{labels:?}");
+    assert_ne!(
+        labels["rivet_table"], "orders",
+        "a table named `Orders` must not bill under the same label as one named \
+         `orders`: {labels:?}"
+    );
     assert_eq!(
         labels.len(),
         4,
@@ -759,8 +768,15 @@ fn the_loader_sends_its_labels_in_the_job_configuration() {
     );
     assert_eq!(body["configuration"]["labels"]["managed_by"], "rivet");
     assert_eq!(body["configuration"]["labels"]["rivet_op"], "load");
-    assert_eq!(body["configuration"]["labels"]["rivet_table"], "orders");
-    assert_eq!(body["configuration"]["labels"]["rivet_run"], "run-9");
+    // Folded values carry a disambiguating digest (see `sanitize_label`), so the
+    // transport assertion pins the PREFIX — what it exists to check is that the
+    // label set reaches the job configuration, not how a value is spelled.
+    for (key, want) in [("rivet_table", "orders"), ("rivet_run", "run-9")] {
+        let got = body["configuration"]["labels"][key]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} missing: {body}"));
+        assert!(got.starts_with(want), "{key}: {got}");
+    }
 }
 
 #[test]
@@ -771,10 +787,64 @@ fn fqtn_qualifies_project_dataset_table() {
 
 #[test]
 fn sanitize_label_coerces_to_bq_charset() {
-    assert_eq!(sanitize_label("My.Table!"), "my_table_");
-    assert_eq!(sanitize_label(""), "unnamed");
+    // Unchanged by the mapping → the exact string, so ordinary labels stay readable.
     assert_eq!(sanitize_label("ok-name_1"), "ok-name_1");
-    assert_eq!(sanitize_label(&"x".repeat(80)).len(), 63);
+    assert_eq!(sanitize_label(""), "unnamed");
+
+    // Altered by the mapping → the folded form PLUS a digest of the original.
+    let folded = sanitize_label("My.Table!");
+    assert!(folded.starts_with("my_table_"), "{folded}");
+    assert!(
+        folded.len() > "my_table_".len(),
+        "a lossy fold must carry a disambiguator: {folded}"
+    );
+
+    // Within BigQuery's cap, always.
+    assert!(sanitize_label(&"x".repeat(80)).len() <= 63);
+    assert!(folded.len() <= 63);
+}
+
+/// Two distinct tables never share a `rivet_table` label.
+///
+/// The value is the per-table IDENTITY the cost query in this module's header
+/// GROUPs by, and the mapping is lossy three ways: case-folding, `[^a-z0-9_-] → _`,
+/// and the 63-char cap. Two tables folding to one label reported their jobs, bytes
+/// and spend as ONE line with nothing indicating the merge — a confidently wrong
+/// answer, which is worse than a missing one.
+///
+/// None of these inputs is exotic. `"CaseTwin"` beside `casetwin` is a shape
+/// `yaml_scaffold` records as live-proven on PostgreSQL; MSSQL's `sysname` is 128
+/// chars and a Mongo collection name ~235, so two names agreeing on their first 63
+/// sanitized characters are ordinary.
+///
+/// Scope, kept from the hunt's refuters: nothing in rivet READS these labels back,
+/// so the harm was bounded to cost attribution — no data or control flow moved.
+///
+/// RED against returning the folded form alone.
+#[test]
+fn sanitize_label_does_not_collapse_two_distinct_tables_into_one() {
+    let pairs = [
+        // case twins — the live-proven shape
+        ("CaseTwin", "casetwin"),
+        // differ only in a character the charset forbids
+        ("orders.eu", "orders-eu"),
+        // agree on the first 63 characters, differ past the cap
+        (
+            &format!("{}_2024_01", "history_archive".repeat(4)),
+            &format!("{}_2024_02", "history_archive".repeat(4)),
+        ),
+    ];
+    for (a, b) in pairs {
+        assert_ne!(
+            sanitize_label(a),
+            sanitize_label(b),
+            "`{a}` and `{b}` are different tables and must bill separately"
+        );
+        assert!(sanitize_label(a).len() <= 63 && sanitize_label(b).len() <= 63);
+    }
+    // Stable: the same input always yields the same label, or cost queries would
+    // scatter one table across several lines instead of merging two into one.
+    assert_eq!(sanitize_label("My.Table!"), sanitize_label("My.Table!"));
 }
 
 /// THE foreign-table safety test. A table rivet did not create keeps its

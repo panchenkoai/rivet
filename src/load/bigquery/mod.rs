@@ -956,9 +956,30 @@ fn build_labels(op: &str, table: &str, run_id: Option<&str>) -> BTreeMap<String,
 }
 
 /// Coerce a string into BigQuery's label charset: lowercase `[a-z0-9_-]`, other
-/// characters become `_`, truncated to 63 chars. Empty maps to `unnamed`.
+/// characters become `_`, capped at 63 chars. Empty maps to `unnamed`.
+///
+/// INJECTIVE where it matters. The mapping is lossy three ways — case-folding,
+/// `[^a-z0-9_-] → _`, and the length cap — and this value is the per-table
+/// IDENTITY that the cost query in this module's own header groups by. Two tables
+/// folding to one label reported their jobs, bytes and spend as ONE line, with
+/// nothing saying a merge had happened: a confidently wrong answer, which is worse
+/// than a missing one.
+///
+/// The collisions are not exotic. `"CaseTwin"` beside `casetwin` is a shape
+/// `yaml_scaffold` records as live-proven on PostgreSQL; MSSQL's `sysname` runs to
+/// 128 characters and a Mongo collection name to ~235, so two names sharing their
+/// first 63 sanitized characters are ordinary.
+///
+/// So: a string the mapping leaves UNCHANGED keeps its exact label — the common
+/// case, and labels stay readable. Anything the mapping altered carries a digest of
+/// the ORIGINAL, which cannot collide unless the originals do. Injectivity cannot
+/// be restored inside BigQuery's charset any other way.
+///
+/// Scope, from the hunt's refuters and worth keeping: NOTHING in rivet reads these
+/// labels back, so no data or control flow ever depended on them. The harm was
+/// bounded to cost attribution.
 fn sanitize_label(s: &str) -> String {
-    let mut out: String = s
+    let mapped: String = s
         .chars()
         .map(|c| {
             let c = c.to_ascii_lowercase();
@@ -969,12 +990,26 @@ fn sanitize_label(s: &str) -> String {
             }
         })
         .collect();
-    out.truncate(63);
-    if out.is_empty() {
-        "unnamed".clone_into(&mut out);
+    if mapped.is_empty() {
+        // Only the empty string maps here, so `unnamed` collides with nothing.
+        return "unnamed".to_string();
     }
+    if mapped == s && mapped.len() <= MAX_LABEL_LEN {
+        return mapped;
+    }
+    // Lossy: disambiguate by the INPUT, not by the folded form.
+    let digest = format!("{:08x}", xxhash_rust::xxh3::xxh3_64(s.as_bytes()) as u32);
+    let mut out: String = mapped
+        .chars()
+        .take(MAX_LABEL_LEN - 1 - digest.len())
+        .collect();
+    out.push('-');
+    out.push_str(&digest);
     out
 }
+
+/// BigQuery's cap on a label value.
+const MAX_LABEL_LEN: usize = 63;
 
 /// Turn BigQuery's partition-quota failure into an actionable error.
 ///
