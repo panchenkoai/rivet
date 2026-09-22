@@ -572,12 +572,57 @@ fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Owners
 /// without quoting: `[A-Za-z_][A-Za-z0-9_]*`. Round-5: column names are
 /// SOURCE-derived and spliced raw into executed warehouse SQL (build_schema,
 /// build_copy_select, …), so a name outside this set is an injection vector.
-fn is_safe_load_ident(s: &str) -> bool {
+pub(crate) fn is_safe_load_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The Latin letter a Cyrillic letter is drawn identically to, if any.
+fn latin_lookalike(c: char) -> Option<char> {
+    Some(match c {
+        'а' => 'a',
+        'е' => 'e',
+        'о' => 'o',
+        'р' => 'p',
+        'с' => 'c',
+        'у' => 'y',
+        'х' => 'x',
+        'і' => 'i',
+        'ј' => 'j',
+        'ѕ' => 's',
+        'ԁ' => 'd',
+        'һ' => 'h',
+        'А' => 'A',
+        'В' => 'B',
+        'Е' => 'E',
+        'К' => 'K',
+        'М' => 'M',
+        'Н' => 'H',
+        'О' => 'O',
+        'Р' => 'P',
+        'С' => 'C',
+        'Т' => 'T',
+        'Х' => 'X',
+        'І' => 'I',
+        'Ј' => 'J',
+        'Ѕ' => 'S',
+        _ => return None,
+    })
+}
+
+/// The plain identifier `name` becomes with its Cyrillic look-alikes made Latin; `None` when it needs no fold or no fold makes it plain.
+pub(crate) fn latin_fold(name: &str) -> Option<String> {
+    if is_safe_load_ident(name) {
+        return None;
+    }
+    let folded: String = name
+        .chars()
+        .map(|c| latin_lookalike(c).unwrap_or(c))
+        .collect();
+    is_safe_load_ident(&folded).then_some(folded)
 }
 
 /// Refuse any Parquet URI that can't be splice-safely single-quoted into the
@@ -642,7 +687,8 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
             bail!(
                 "cannot load `{table}`: column name `{}` is not a plain SQL identifier \
                  ([A-Za-z_][A-Za-z0-9_]*) — the warehouse loader splices it into DDL/COPY. \
-                 Rename or alias the column in the export query.",
+                 Rename the column in the source, or alias it in the export's `query:` \
+                 (a CDC export has no query to alias it in).",
                 s.column_name.escape_default()
             );
         }
@@ -1158,7 +1204,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
                 run_id,
             )
             .batched_by_footers(plan.destination.clone())
-            .layout(plan.layout),
+            .layout(plan.layout)
+            .renamed(plan.renames.clone()),
         ),
         LoadTarget::Snowflake {
             connection,
@@ -1209,6 +1256,19 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_name_that_is_plain_once_its_cyrillic_lookalikes_are_latin_folds() {
+        assert_eq!(latin_fold("\u{441}omment").as_deref(), Some("comment"));
+        assert_eq!(latin_fold("\u{421}\u{410}\u{422}").as_deref(), Some("CAT"));
+        assert_eq!(latin_fold("comment"), None, "a plain name needs no fold");
+        assert_eq!(
+            latin_fold("\u{438}\u{43c}\u{44f}"),
+            None,
+            "a Cyrillic word is not a look-alike"
+        );
+        assert_eq!(latin_fold("\u{441}omment x"), None, "a fold must end plain");
+    }
     use std::cell::RefCell;
 
     /// Records every call and returns a canned row count — the seam the driver's

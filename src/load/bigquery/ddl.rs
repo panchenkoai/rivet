@@ -257,6 +257,50 @@ pub(super) fn build_schema(specs: &[TargetColumnSpec]) -> String {
         .join(",\n")
 }
 
+/// [`build_schema`] under the Parquet's own column names, for a load whose `renames` map file names to warehouse names.
+pub(super) fn build_file_schema(
+    specs: &[TargetColumnSpec],
+    renames: &[(String, String)],
+) -> String {
+    let file_specs: Vec<TargetColumnSpec> = specs
+        .iter()
+        .map(
+            |s| match renames.iter().find(|(_, latin)| *latin == s.column_name) {
+                Some((file, _)) => TargetColumnSpec {
+                    column_name: file.clone(),
+                    ..s.clone()
+                },
+                None => s.clone(),
+            },
+        )
+        .collect();
+    build_schema(&file_specs)
+}
+
+/// One metadata-only statement renaming each file-named column to its warehouse name.
+pub(super) fn build_rename_columns_sql(fqtn: &str, renames: &[(String, String)]) -> String {
+    let clauses = renames
+        .iter()
+        .map(|(file, latin)| format!("RENAME COLUMN `{file}` TO `{latin}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ALTER TABLE `{fqtn}` {clauses};")
+}
+
+/// Append every row of `source` into `target`, by column name.
+pub(super) fn build_insert_select_sql(
+    target: &str,
+    source: &str,
+    specs: &[TargetColumnSpec],
+) -> String {
+    let cols = specs
+        .iter()
+        .map(|s| format!("`{}`", s.column_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO `{target}` ({cols})\nSELECT {cols} FROM `{source}`;")
+}
+
 /// A free `LOAD DATA` batch-load statement declaring the native `schema`, so
 /// BigQuery coerces the Parquet to native types on load.
 pub(super) fn build_load_data_sql(

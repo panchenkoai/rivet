@@ -1030,8 +1030,10 @@ fn prepare_load(
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
     // Best-effort column-drift check (only manifests with Form B record
     // column names — a checksum-less prefix yields no notes, silently-honest).
-    let spec_names: Vec<String> = plan.specs.iter().map(|s| s.column_name.clone()).collect();
-    for note in spec_manifest_column_drift(&spec_names, &manifests) {
+    for warning in &plan.rename_warnings {
+        eprintln!("{warning}");
+    }
+    for note in spec_manifest_column_drift(&plan.file_column_names(), &manifests) {
         eprintln!("{note}");
     }
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
@@ -2767,6 +2769,8 @@ mod load_ledger_tests {
         use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
         let plan = LoadPlan {
             deleted_flag: false,
+            renames: Vec::new(),
+            rename_warnings: Vec::new(),
             export_name: "c1".into(),
             unit: None,
             table: "content_items".into(),
@@ -2969,6 +2973,8 @@ mod load_ledger_tests {
         let state = StateStore::open_in_memory().unwrap();
         let plan = LoadPlan {
             deleted_flag: false,
+            renames: Vec::new(),
+            rename_warnings: Vec::new(),
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),
@@ -3583,6 +3589,8 @@ mod live_only_decisions {
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         LoadPlan {
             deleted_flag: false,
+            renames: Vec::new(),
+            rename_warnings: Vec::new(),
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),

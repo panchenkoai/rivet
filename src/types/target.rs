@@ -96,7 +96,35 @@ impl ExportTarget {
         if input.fidelity.is_unsafe_for_strict_mode() && spec.status == TargetStatus::Ok {
             spec.status = TargetStatus::Warn;
         }
+        self.grade_column_name(&mut spec);
         spec
+    }
+
+    /// Flags a column name `rivet load` renames (BigQuery look-alikes) or refuses.
+    fn grade_column_name(self, spec: &mut TargetColumnSpec) {
+        if !matches!(self, ExportTarget::BigQuery | ExportTarget::Snowflake)
+            || crate::load::is_safe_load_ident(&spec.column_name)
+        {
+            return;
+        }
+        let (status, note) = match crate::load::latin_fold(&spec.column_name) {
+            Some(latin) if self == ExportTarget::BigQuery => (
+                TargetStatus::Warn,
+                format!("Cyrillic look-alike letters: loads as `{latin}`"),
+            ),
+            _ => (
+                TargetStatus::Fail,
+                "not a plain identifier: `rivet load` refuses it — rename it in the source"
+                    .to_string(),
+            ),
+        };
+        if spec.status != TargetStatus::Fail {
+            spec.status = status;
+        }
+        spec.note = Some(match spec.note.take() {
+            Some(n) => format!("{note}; {n}"),
+            None => note,
+        });
     }
 
     /// Resolve a whole table's worth of columns, one spec per column in order.
@@ -817,6 +845,29 @@ mod tests {
 
     fn bq(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::BigQuery.resolve_column(input(rt))
+    }
+
+    #[test]
+    fn check_names_the_lookalike_rename_and_the_name_load_refuses() {
+        let named = |target: ExportTarget, name: &str| {
+            target.resolve_column(TargetInput {
+                column_name: name,
+                ..input(&RivetType::String)
+            })
+        };
+        let folded = named(ExportTarget::BigQuery, "\u{441}omment");
+        assert_eq!(folded.status, TargetStatus::Warn);
+        assert!(folded.note.unwrap().contains("loads as `comment`"));
+        assert_eq!(
+            named(ExportTarget::Snowflake, "\u{441}omment").status,
+            TargetStatus::Fail
+        );
+        assert_eq!(
+            named(ExportTarget::BigQuery, "\u{438}\u{43c}\u{44f}").status,
+            TargetStatus::Fail
+        );
+        let plain = named(ExportTarget::BigQuery, "comment");
+        assert_eq!((plain.status, plain.note), (TargetStatus::Ok, None));
     }
     fn duck(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::DuckDb.resolve_column(input(rt))

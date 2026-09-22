@@ -1317,3 +1317,26 @@ fn an_unreadable_compaction_summary_is_an_error_not_an_empty_report() {
         );
     }
 }
+
+#[test]
+fn a_renamed_column_loads_under_its_file_name_then_renames_and_appends_by_name() {
+    let specs = vec![
+        spec("id", None, TargetStatus::Ok),
+        spec("comment", None, TargetStatus::Ok),
+    ];
+    let renames = vec![("\u{441}omment".to_string(), "comment".to_string())];
+    let schema = build_file_schema(&specs, &renames);
+    assert!(schema.contains("`\u{441}omment`"), "{schema}");
+    assert!(
+        !schema.contains("`comment`"),
+        "the file name, not the warehouse name: {schema}"
+    );
+    assert_eq!(
+        build_rename_columns_sql("p.d.t__staging", &renames),
+        "ALTER TABLE `p.d.t__staging` RENAME COLUMN `\u{441}omment` TO `comment`;"
+    );
+    assert_eq!(
+        build_insert_select_sql("p.d.t__changes", "p.d.s", &specs),
+        "INSERT INTO `p.d.t__changes` (`id`, `comment`)\nSELECT `id`, `comment` FROM `p.d.s`;"
+    );
+}
