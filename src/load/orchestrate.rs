@@ -162,7 +162,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     plan.table
                 );
             }
-            let load_id = format!("{run_id}:{}", plan.table);
+            let load_id = ledger_load_id(&run_id, "load", &plan.table);
             let drift = plan.load.allow_source_drift;
             let outcome = (|| -> Result<()> {
                 // Typed from the spec of the run this load consumes, not the by-name
@@ -1327,7 +1327,7 @@ fn execute_load<R>(
         Ok(v) => v,
         Err(e) => {
             let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
-            ctx.record(&remaining, 0, ledger_status(&e));
+            ctx.record(&remaining, 0, closing_status(&e, &legs.consumed));
             return Err(e);
         }
     };
@@ -1523,6 +1523,48 @@ fn compact_order_of(
 
 /// The two metadata reads [`load::compact_gate`] decides on, and the note it may
 /// print. Glue: it fetches the facts, the decision itself is the pure predicate.
+/// The status a load's CLOSING ledger row carries after the load failed.
+///
+/// `refused` means "stopped before ANY warehouse write" — that is precisely why
+/// `has_load_attempt` does not count it. Once a LEG has LANDED the claim is false for
+/// this load: the warehouse WAS written, and the target is rivet's own.
+///
+/// It matters because the closing row reuses the leg's `load_id` — one audit row per
+/// load, deliberately — so it REPLACES whatever the leg wrote. A `refused` replacing a
+/// leg's `success` makes `has_load_attempt` return false and rivet DISOWNS the base it
+/// had just created; the next load refuses it as foreign. The success path already
+/// guards its closing row (`closing_record_applies`); the error path had no guard at
+/// all, which is the asymmetry this closes.
+///
+/// `loaded_source_run` is unaffected either way — it is written only on `success` and
+/// never deleted, so the skip set survives the replacement. The damage was always to
+/// the audit row and, through it, to ownership.
+fn closing_status(e: &anyhow::Error, consumed: &[String]) -> &'static str {
+    if consumed.is_empty() {
+        ledger_status(e)
+    } else {
+        "failed"
+    }
+}
+
+/// The `load_run` PRIMARY KEY for one table's row in one invocation.
+///
+/// The OP belongs in it because `rivet load` and `rivet compact` are two different
+/// RECORDS of the same table, and both derive their key from the same operator-supplied
+/// run id. Without it they computed the identical string, `load_run` upserts
+/// `ON CONFLICT (load_id) DO UPDATE`, and the compact's row — `mode=compact`,
+/// `source_run_ids=[]`, `rows_loaded=0` — REPLACED the load's. A scheduler that stamps
+/// one `RIVET_RUN_ID` per cycle and then runs load followed by compact is the ordinary
+/// shape that does it, and the release gate had already met this: `blessed_flow.py`
+/// works around it by minting a unique `--run-id` per cell, and says why in a comment.
+/// A harness workaround for a product behaviour is a bug report, not a fix.
+///
+/// The `{run_id}:` PREFIX is load-bearing and must stay first — the gate's ledger check
+/// scopes with `LIKE '<run-id>%'`.
+fn ledger_load_id(run_id: &str, op: &str, table: &str) -> String {
+    format!("{run_id}:{op}:{table}")
+}
+
 /// Compact's PRE-MERGE phase, with every stop marked as one.
 ///
 /// A named seam because the WIRING is the thing that was wrong, and wiring is only
@@ -1675,7 +1717,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                     plan.table
                 );
             }
-            let load_id = format!("{run_id}:{}", plan.table);
+            let load_id = ledger_load_id(&run_id, "compact", &plan.table);
             let outcome = (|| -> Result<()> {
                 let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
                 let loader = load::build_loader(&pinned, &run_id);
@@ -3032,6 +3074,75 @@ mod live_only_decisions {
             ledger_status(&anyhow::anyhow!("count validation failed")),
             "failed"
         );
+    }
+
+    /// `rivet load` and `rivet compact` cannot collide in the ledger under one run id.
+    ///
+    /// Both derive their key from the same operator-supplied run id, and `load_run`
+    /// upserts `ON CONFLICT (load_id) DO UPDATE` — so while the two computed the same
+    /// string, the compact's row (`mode=compact`, no source runs, zero rows) REPLACED
+    /// the load's. A scheduler that stamps one `RIVET_RUN_ID` per cycle and runs load
+    /// then compact is the ordinary shape that does it.
+    ///
+    /// The release gate had already MET this and worked around it — `blessed_flow.py`
+    /// mints a unique `--run-id` per cell and its comment names the upsert as the
+    /// cause. A harness workaround for a product behaviour is a bug report, not a fix.
+    ///
+    /// The `{run_id}:` prefix is pinned too: the gate's own ledger check scopes with
+    /// `LIKE '<run-id>%'`, so the op may be inserted after the run id and never before.
+    #[test]
+    fn a_load_and_a_compact_of_one_table_under_one_run_id_are_two_ledger_rows() {
+        let load = ledger_load_id("run-7", "load", "orders");
+        let compact = ledger_load_id("run-7", "compact", "orders");
+        assert_ne!(
+            load, compact,
+            "one key for both means the second command silently replaces the first's \
+             audit row"
+        );
+        assert!(
+            load.starts_with("run-7:") && compact.starts_with("run-7:"),
+            "the run id must stay the PREFIX — the gate scopes with LIKE '<run-id>%': \
+             {load} / {compact}"
+        );
+        // Two TABLES under one run id stay distinct as well, which is the property the
+        // original key had and this must not lose.
+        assert_ne!(
+            ledger_load_id("run-7", "load", "orders"),
+            ledger_load_id("run-7", "load", "invoices")
+        );
+    }
+
+    /// A load that failed AFTER a leg landed is `failed`, never `refused`.
+    ///
+    /// The closing row reuses the leg's `load_id` — one audit row per load, by design
+    /// — so it REPLACES what the leg wrote. `refused` means "stopped before any
+    /// warehouse write", which is exactly why `has_load_attempt` ignores it; once a leg
+    /// has landed that claim is false, and a `refused` replacing the leg's `success`
+    /// made rivet DISOWN the base it had just created, so the next load refused it as
+    /// foreign.
+    ///
+    /// The success path has always guarded its closing row
+    /// (`closing_record_applies`); the error path had no guard, and that asymmetry is
+    /// the whole defect.
+    #[test]
+    fn a_stop_after_a_leg_landed_is_recorded_as_a_failure_not_a_refusal() {
+        let stop = load::refused("refusing to append".into());
+
+        assert_eq!(
+            closing_status(&stop, &[]),
+            "refused",
+            "nothing landed: the stop is a stop, and the table stays foreign"
+        );
+        assert_eq!(
+            closing_status(&stop, &["run-a".to_string()]),
+            "failed",
+            "a leg LANDED — the warehouse was written, so this row must be one \
+             `has_load_attempt` counts, or rivet disowns the base it just created"
+        );
+        // A plain failure is `failed` either way; the predicate only ever upgrades.
+        let boom = anyhow::anyhow!("count validation failed");
+        assert_eq!(closing_status(&boom, &[]), "failed");
+        assert_eq!(closing_status(&boom, &["run-a".to_string()]), "failed");
     }
 
     /// COMPACT's pre-merge stops are refusals too — the sibling of
