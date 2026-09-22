@@ -402,6 +402,21 @@ fn pin_plan_to_its_run(
     if let Some(note) = skipped_runs_note(&plan.table, &run_id, &skipped) {
         eprintln!("{note}");
     }
+    let pinned_names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut respelled: Vec<(String, String, String)> = Vec::new();
+    for (_, older) in runs_older_than(&newest_first, &run_id) {
+        if let Ok(Some(o)) =
+            s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), older)
+        {
+            let names: Vec<&str> = o.columns.iter().map(|c| c.name.as_str()).collect();
+            for (was, now) in load::plan::lookalike_spelling_changes(&pinned_names, &names) {
+                respelled.push((older.clone(), was, now));
+            }
+        }
+    }
+    if let Some(refusal) = respelled_refusal(&plan.table, &run_id, &respelled) {
+        anyhow::bail!("{refusal}");
+    }
     let Some(target) = crate::types::target::ExportTarget::parse(plan.load.target.name()) else {
         return unpinned("unknown load target");
     };
@@ -441,6 +456,41 @@ fn late_runs_refusal(
             late.join(", ")
         )
     })
+}
+
+/// The runs listed after `pinned` in a newest-first listing; none when it is absent.
+fn runs_older_than<'a>(
+    newest_first: &'a [(String, String)],
+    pinned: &str,
+) -> &'a [(String, String)] {
+    let start = newest_first
+        .iter()
+        .position(|(_, id)| id == pinned)
+        .map_or(newest_first.len(), |i| i + 1);
+    &newest_first[start..]
+}
+
+/// The refusal for pending runs that spell a column differently from the run the load is typed from; `None` when none do.
+fn respelled_refusal(
+    table: &str,
+    pinned: &str,
+    respelled: &[(String, String, String)],
+) -> Option<String> {
+    if respelled.is_empty() {
+        return None;
+    }
+    let list = respelled
+        .iter()
+        .map(|(run, was, now)| format!("run {run} wrote `{was}` where run {pinned} writes `{now}`"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "load [{table}]: {list}. The source column was renamed while the older run(s) were \
+         still unloaded, and one load cannot read both spellings: BigQuery matches Parquet \
+         columns by name, so the older files would load that column as NULL. Nothing was \
+         loaded. Rename the source column back, run `rivet load` so the older run(s) land, \
+         then rename it again."
+    ))
 }
 
 /// The refusal when another `rivet load` or `rivet compact` holds the table's lease —
@@ -3524,6 +3574,35 @@ mod live_only_decisions {
             super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::LogAndView)
                 .is_some_and(|w| w.contains("base_buffer"))
         );
+    }
+
+    #[test]
+    fn only_the_runs_older_than_the_pin_are_compared() {
+        let runs: Vec<(String, String)> = ["r3", "r2", "r1"]
+            .iter()
+            .map(|r| (String::new(), r.to_string()))
+            .collect();
+        let ids = |v: &[(String, String)]| v.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(super::runs_older_than(&runs, "r2")), ["r1"]);
+        assert_eq!(ids(super::runs_older_than(&runs, "r3")), ["r2", "r1"]);
+        assert!(super::runs_older_than(&runs, "r1").is_empty());
+        assert!(super::runs_older_than(&runs, "gone").is_empty());
+    }
+
+    #[test]
+    fn the_respelling_refusal_names_each_run_and_both_spellings() {
+        assert_eq!(super::respelled_refusal("orders", "r2", &[]), None);
+        let msg = super::respelled_refusal(
+            "orders",
+            "r2",
+            &[("r1".into(), "\u{441}ity".into(), "city".into())],
+        )
+        .expect("a respelled run is refused");
+        assert!(
+            msg.starts_with("load [orders]: run r1 wrote `\u{441}ity` where run r2 writes `city`."),
+            "{msg}"
+        );
+        assert!(msg.contains("Nothing was loaded"), "{msg}");
     }
 
     #[test]

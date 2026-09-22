@@ -870,6 +870,21 @@ fn folded(name: &str) -> String {
     super::latin_fold(name).unwrap_or_else(|| name.to_string())
 }
 
+/// Columns an older run spelled differently from the pinned run but that load as one warehouse column, as (older, pinned).
+pub fn lookalike_spelling_changes(pinned: &[&str], older: &[&str]) -> Vec<(String, String)> {
+    older
+        .iter()
+        .filter(|o| !pinned.contains(o))
+        .filter_map(|o| {
+            let f = folded(o);
+            pinned
+                .iter()
+                .find(|p| folded(p) == f)
+                .map(|p| (o.to_string(), p.to_string()))
+        })
+        .collect()
+}
+
 /// Renames each column whose Cyrillic look-alikes fold to a plain identifier, warning once per column.
 fn fold_lookalike_columns(
     export: &str,
@@ -2613,6 +2628,26 @@ load:
         .unwrap_err()
         .to_string();
         assert!(err.contains("orders__changes__staging"), "{err}");
+    }
+
+    #[test]
+    fn a_column_two_runs_spell_differently_is_named_in_either_direction() {
+        let cyr = "\u{441}ity";
+        assert_eq!(
+            lookalike_spelling_changes(&["id", "city"], &["id", cyr]),
+            vec![(cyr.to_string(), "city".to_string())],
+            "renamed at the source after the older run"
+        );
+        assert_eq!(
+            lookalike_spelling_changes(&["id", cyr], &["id", "city"]),
+            vec![("city".to_string(), cyr.to_string())],
+            "the other way round: the pinned run carries the look-alike"
+        );
+        assert!(lookalike_spelling_changes(&["id", "city"], &["id", "city"]).is_empty());
+        assert!(
+            lookalike_spelling_changes(&["id", "city", "added"], &["id", "dropped"]).is_empty(),
+            "an added or dropped column is drift, not a respelling"
+        );
     }
 
     fn no_action(_: &str, _: &str) -> String {
