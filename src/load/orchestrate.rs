@@ -1801,7 +1801,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                     Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
                     held => held.flatten(),
                 };
-                let pk = require_pk(&pinned, "cdc")?;
+                // The export's OWN mode, not a hardcoded label. Compact runs on
+                // `incremental` exports too — `compact_skip_reason` says so in as many
+                // words — and telling the operator of a `mode: incremental` config that
+                // their export "is mode: cdc" sends them looking for a `cdc:` block
+                // their config cannot even contain (it is a config-load error there).
+                // Measured on a 60-table incremental run: two refusals, both mislabelled.
+                let pk = require_pk(&pinned, pinned.mode.ledger_str())?;
                 // The base is checked BEFORE the MERGE, and only when a buffer exists:
                 // an absent base surfaced as BigQuery's own `Not found: Table`, and a
                 // base rivet never loaded was not checked at all. Metadata, no job.
@@ -2795,6 +2801,23 @@ mod load_ledger_tests {
             !err.contains("content_items"),
             "must NOT label the table as the export: {err}"
         );
+
+        // And the MODE it prints is the export's own. The compact path hardcoded
+        // "cdc" — measured on a 60-table `mode: incremental` run, where two refusals
+        // both claimed `mode: cdc`, sending the operator to look for a `cdc:` block
+        // their config cannot contain (it is a config-load error on an incremental
+        // export). Compaction is a LAYOUT property, not a mode one: an incremental
+        // export with `load.layout: base_buffer` compacts, and `compact_skip_reason`
+        // says so.
+        for mode in [LoadMode::Cdc, LoadMode::Incremental] {
+            let err = require_pk(&plan, mode.ledger_str())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("is mode: {}", mode.ledger_str())),
+                "the refusal must name the export's OWN mode, not a fixed label: {err}"
+            );
+        }
     }
 
     /// Round-7 rebuild of the round-6 guard: the SHAPE is prefix-anchored (a
