@@ -135,7 +135,7 @@ pub struct BigQueryLoader {
     /// network).
     api: Arc<OnceLock<BigQueryApi>>,
     /// Columns loaded under their Parquet name and renamed after, as (file name, warehouse name).
-    renames: Vec<(String, String)>,
+    renames: Vec<crate::load::plan::Rename>,
 }
 
 impl BigQueryLoader {
@@ -173,12 +173,12 @@ impl BigQueryLoader {
     }
 
     /// Load these columns under their Parquet name and rename them to the warehouse name.
-    pub fn renamed(mut self, renames: Vec<(String, String)>) -> Self {
+    pub fn renamed(mut self, renames: Vec<crate::load::plan::Rename>) -> Self {
         self.renames = renames;
         self
     }
 
-    /// Append `batches` to `changes` through a staging table loaded under the file names and renamed.
+    /// Append `batches` to `changes` one job at a time through a staging table loaded under the file names and renamed.
     fn append_renamed(
         &self,
         changes: &str,
@@ -187,20 +187,20 @@ impl BigQueryLoader {
     ) -> Result<()> {
         let staging_fqtn = self.fqtn(&format!("{changes}__staging"));
         let schema = build_file_schema(specs, &self.renames);
+        let insert = build_insert_select_sql(&self.fqtn(changes), &staging_fqtn, specs);
+        for batch in batches {
+            let load = build_load_data_sql(&staging_fqtn, true, &schema, None, &[], None, batch);
+            self.run_sql(&load, "load", changes)?;
+            if let Some(rename) = build_rename_columns_sql(&staging_fqtn, &self.renames) {
+                self.run_sql(&rename, "load", changes)?;
+            }
+            self.run_sql(&insert, "load", changes)?;
+        }
         self.run_sql(
             &format!("DROP TABLE IF EXISTS `{staging_fqtn}`;"),
             "load",
             changes,
-        )?;
-        for (i, batch) in batches.iter().enumerate() {
-            let sql = build_load_data_sql(&staging_fqtn, i == 0, &schema, None, &[], None, batch);
-            self.run_sql(&sql, "load", changes)?;
-        }
-        let rename = build_rename_columns_sql(&staging_fqtn, &self.renames);
-        self.run_sql(&rename, "load", changes)?;
-        let insert = build_insert_select_sql(&self.fqtn(changes), &staging_fqtn, specs);
-        self.run_sql(&insert, "load", changes)?;
-        self.run_sql(&format!("DROP TABLE `{staging_fqtn}`;"), "load", changes)
+        )
     }
 
     /// The CDC layout the load writes (see the field).
@@ -394,10 +394,9 @@ impl TargetLoader for BigQueryLoader {
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
         let batches = self.batches(uris, self.partition.as_ref())?;
-        // One job (or nothing to pack) OVERWRITES the target directly; several go
-        // through staging below. A pattern, not a count compare: this body is
-        // live-only and its decisions are graded here by shape, not by mutation.
-        if self.renames.is_empty() && matches!(batches.as_slice(), [] | [_]) {
+        // One job with nothing to rename OVERWRITES the target directly; anything else
+        // goes through staging below (`loads_directly`).
+        if loads_directly(&self.renames, &batches) {
             let sql = build_load_data_sql(
                 &target,
                 true,
@@ -453,8 +452,7 @@ impl TargetLoader for BigQueryLoader {
                 self.run_sql(&sql, "load", table)?;
             }
         }
-        if !self.renames.is_empty() {
-            let rename = build_rename_columns_sql(&staging_fqtn, &self.renames);
+        if let Some(rename) = build_rename_columns_sql(&staging_fqtn, &self.renames) {
             self.run_sql(&rename, "load", table)?;
         }
         self.run_sql(&build_clone_sql(&target, &staging_fqtn), "load", table)?;

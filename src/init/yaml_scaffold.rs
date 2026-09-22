@@ -522,10 +522,6 @@ pub(crate) const INIT_DECIMAL_REVIEW_MARKER: &str = "# REVIEW:";
 pub(crate) const INIT_CURSOR_REVIEW_MARKER: &str = "REVIEW: no timestamp column detected";
 
 /// Every export the scaffold could not give a cursor column, by name.
-pub(crate) fn exports_needing_a_cursor(config_text: &str) -> Vec<String> {
-    exports_marked(config_text, INIT_CURSOR_REVIEW_MARKER)
-}
-
 /// Marks an incremental export whose cursor does not move when a row is updated.
 pub(crate) const INIT_INSERT_ONLY_MARKER: &str = "NOTE: insert-only cursor";
 
@@ -642,6 +638,38 @@ fn load_block_lines(dest: &InitYamlDestination, compactable: bool) -> Vec<String
     lines
 }
 
+/// The relation name an export of `info` addresses on `source_type`.
+fn qualified_table_of(info: &TableInfo, source_type: &str) -> String {
+    // Mongo: `info.schema` is the database and the export targets the bare
+    // collection name (the URL already selects the database), so it is never
+    // qualified — same as a MySQL table or a PG `public` table.
+    if info.schema == "public" || source_type == "mysql" || source_type == "mongo" {
+        info.table.clone()
+    } else {
+        format!("{}.{}", info.schema, info.table)
+    }
+}
+
+/// Whether `info` can be exported through the `table:` shortcut on `source_type`, which keyset requires.
+pub(crate) fn table_form_ok(info: &TableInfo, source_type: &str) -> bool {
+    // Which names may become an UNQUOTED `table:` per engine (round-8): PG
+    // case-folds unquoted idents, so only a name that IS its own fold is safe
+    // there; MySQL/MSSQL do not fold; Mongo's `table:` is a ROUTING string and
+    // the ONLY form Mongo accepts. MIRRORS `validate_table_shortcut_ident`
+    // (round-9): diverging from the config gate produced DOA scaffolds twice.
+    let qualified = qualified_table_of(info, source_type);
+    let shape_ok = table_shortcut_shape_ok(&qualified);
+    match source_type {
+        "postgres" => shape_ok && is_simple_pg_ident(&qualified),
+        _ => shape_ok,
+    }
+}
+
+/// Whether a `chunked` export of `info` has no key to page by, given whether keyset's `table:` form is available.
+pub(crate) fn chunk_key_missing(info: &TableInfo, keyset_form: bool) -> bool {
+    info.best_chunk_column().is_none() && !(keyset_form && info.keysettable_pk_column().is_some())
+}
+
 fn export_block_lines(
     info: &TableInfo,
     source_type: &str,
@@ -662,15 +690,7 @@ fn export_block_lines(
         .map(|c| quote_ident(c, source_type))
         .collect::<Vec<_>>()
         .join(", ");
-    let qualified_table =
-        if info.schema == "public" || source_type == "mysql" || source_type == "mongo" {
-            // Mongo: `info.schema` is the database and the export targets the bare
-            // collection name (the URL already selects the database), so it is never
-            // qualified — same as a MySQL table or a PG `public` table.
-            info.table.clone()
-        } else {
-            format!("{}.{}", info.schema, info.table)
-        };
+    let qualified_table = qualified_table_of(info, source_type);
 
     // CDC reads the transaction log, not a query — a wholly different block
     // (no cursor/chunk/meta_columns; engine-specific stream knobs instead).
@@ -703,21 +723,9 @@ fn export_block_lines(
     // diverging from the config gate's produced DOA scaffolds twice — a
     // >2-segment name the scaffold accepted and the validator refused, and a
     // hyphenated Mongo collection whose two refusals pointed at each other.
-    let shortcut_shape_ok = table_shortcut_shape_ok(&qualified_table);
-    let table_form_safe = match source_type {
-        "postgres" => shortcut_shape_ok && is_simple_pg_ident(&qualified_table),
-        // Mongo has ONLY the table: form — a name the gate cannot pass is
-        // unexportable in any form; the caller emits a commented-out block
-        // with the reason instead of a DOA config (round-9: `user-events`'s
-        // two refusals pointed at each other).
-        "mongo" => shortcut_shape_ok,
-        _ => shortcut_shape_ok,
-    };
-    let table_form_safe = table_form_safe || recipe;
+    let table_form_safe = table_form_ok(info, source_type) || recipe;
     let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
-    let no_chunk_key = mode == "chunked"
-        && info.best_chunk_column().is_none()
-        && !(is_keyset && info.keysettable_pk_column().is_some());
+    let no_chunk_key = mode == "chunked" && chunk_key_missing(info, table_form_safe);
     let mode = if no_chunk_key { "full" } else { mode };
     if source_type == "mongo" && !table_form_safe {
         // Unexportable in ANY form today: `table:` is Mongo's only export form
@@ -880,10 +888,9 @@ fn export_block_lines(
             // the honest signal. The snapshot records None here too — they agree
             // (bug hunt 2026-08-08: the old literal fallback diverged from the
             // snapshot's None and named a phantom column).
-            None => lines.push(
-                format!("    # {INIT_CURSOR_REVIEW_MARKER} — set cursor_column: <col> manually")
-                    .to_string(),
-            ),
+            None => lines.push(format!(
+                "    # {INIT_CURSOR_REVIEW_MARKER} — set cursor_column: <col> manually"
+            )),
         },
         "time_window" => {
             // time_window REQUIRES time_column (+ days_window) — omitting them
@@ -895,10 +902,9 @@ fn export_block_lines(
             // compared to a timestamp window at run time (bug hunt 2026-08-09).
             match info.chosen_time_column() {
                 Some(ts) => lines.push(format!("    time_column: {}", yaml_quote_if_needed(&ts))),
-                None => lines.push(
-                    "    # REVIEW: no timestamp column detected — set time_column: <col> manually"
-                        .to_string(),
-                ),
+                None => lines.push(format!(
+                    "    # {INIT_CURSOR_REVIEW_MARKER} — set time_column: <col> manually"
+                )),
             }
             lines.push(
                 "    days_window: 7  # export the last N days on each run (half-open window; tune to your retention)"
@@ -1741,7 +1747,7 @@ mod tests {
             None,
         )
         .expect("scaffold");
-        let snap_col = decided_strategy(&info, Some("incremental")).key_column;
+        let snap_col = decided_strategy(&info, Some("incremental"), true).key_column;
         // Extract the cursor_column the YAML rendered.
         let rendered = yaml
             .lines()
@@ -1772,7 +1778,7 @@ mod tests {
             "no timestamp ⇒ no phantom cursor_column, just a REVIEW note:\n{yaml2}"
         );
         assert_eq!(
-            decided_strategy(&bare, Some("incremental")).key_column,
+            decided_strategy(&bare, Some("incremental"), true).key_column,
             None
         );
     }
@@ -2723,11 +2729,12 @@ pub(crate) struct DecidedStrategy {
 pub(crate) fn decided_strategy(
     info: &crate::init::TableInfo,
     mode_override: Option<&str>,
+    keyset_form: bool,
 ) -> DecidedStrategy {
     let mode = mode_override
         .map(str::to_string)
         .unwrap_or_else(|| info.suggest_mode().to_string());
-    let mode = if mode == "chunked" && !info.has_chunk_key() {
+    let mode = if mode == "chunked" && chunk_key_missing(info, keyset_form) {
         "full".to_string()
     } else {
         mode
@@ -2735,7 +2742,7 @@ pub(crate) fn decided_strategy(
     match mode.as_str() {
         "chunked" => {
             let size = info.suggest_chunk_size() as i64;
-            if let Some(pk) = info.keysettable_pk_column() {
+            if let Some(pk) = info.keysettable_pk_column().filter(|_| keyset_form) {
                 DecidedStrategy {
                     mode,
                     kind: "keyset",

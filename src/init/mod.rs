@@ -710,7 +710,9 @@ pub fn init(
     };
 
     let needs_cursor = match format {
-        InitFormat::Yaml => yaml_scaffold::exports_needing_a_cursor(&text),
+        InitFormat::Yaml => {
+            yaml_scaffold::exports_marked(&text, yaml_scaffold::INIT_CURSOR_REVIEW_MARKER)
+        }
         InitFormat::DiscoveryJson => Vec::new(),
     };
     if !needs_cursor.is_empty() {
@@ -1027,7 +1029,7 @@ fn init_yaml(
     if let Some(t) = table {
         let info = introspect_single_table(tls, source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
-        let snaps = vec![snapshot_of(&info, mode_override)];
+        let snaps = vec![snapshot_of(&info, mode_override, source_url)];
         let yaml = yaml_scaffold::generate_config(
             &info,
             source_url,
@@ -1057,7 +1059,7 @@ fn init_yaml(
     )?;
     let snaps = infos
         .iter()
-        .map(|i| snapshot_of(i, mode_override))
+        .map(|i| snapshot_of(i, mode_override, source_url))
         .collect();
     Ok((yaml, hint, snaps))
 }
@@ -1113,8 +1115,14 @@ fn warn_marked_exports(text: &str) {
     }
 }
 
-fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::StrategySnapshot {
-    let d = yaml_scaffold::decided_strategy(info, mode_override);
+fn snapshot_of(
+    info: &TableInfo,
+    mode_override: Option<&str>,
+    source_url: &str,
+) -> crate::state::StrategySnapshot {
+    let keyset_form =
+        source_type(source_url).is_ok_and(|st| yaml_scaffold::table_form_ok(info, st));
+    let d = yaml_scaffold::decided_strategy(info, mode_override, keyset_form);
     crate::state::StrategySnapshot {
         export_name: info.table.clone(),
         source_schema: (!info.schema.is_empty()).then(|| info.schema.clone()),
@@ -1523,7 +1531,8 @@ mod tests {
     /// Every export that needs a cursor is named at once, read from the scaffold text.
     #[test]
     fn exports_needing_a_cursor_names_every_one_of_them() {
-        use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_needing_a_cursor};
+        use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_marked};
+        let exports_needing_a_cursor = |t: &str| exports_marked(t, INIT_CURSOR_REVIEW_MARKER);
         let cfg = format!(
             "exports:\n\
              \x20 - name: good_one\n    mode: incremental\n    cursor_column: updated_at\n\
@@ -2186,7 +2195,7 @@ mod tests {
             ),
         ];
         for (label, info) in cases {
-            let d = yaml_scaffold::decided_strategy(&info, None);
+            let d = yaml_scaffold::decided_strategy(&info, None, true);
             let yaml = yaml_scaffold::generate_config(
                 &info,
                 "postgresql://localhost/db",
@@ -2467,12 +2476,39 @@ mod tests {
             yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER),
             vec!["orders".to_string()]
         );
-        let d = yaml_scaffold::decided_strategy(&info, Some("chunked"));
+        let d = yaml_scaffold::decided_strategy(&info, Some("chunked"), true);
         assert_eq!(
             (d.mode.as_str(), d.kind),
             ("full", "full"),
             "snapshot agrees with the YAML"
         );
+    }
+
+    #[test]
+    fn a_table_that_cannot_use_the_table_form_is_recorded_as_the_yaml_writes_it() {
+        let snapshot_kind = |info: &TableInfo| {
+            snapshot_of(info, Some("chunked"), "postgresql://localhost/db")
+                .strategy_kind
+                .unwrap()
+        };
+        let mut uuid_only =
+            make_table(100, vec![col("uid", "uuid", true), col("v", "text", false)]);
+        uuid_only.table = "Orders".into();
+        let yaml = scaffold(&uuid_only, Some("chunked"));
+        assert!(
+            yaml.contains("    mode: full"),
+            "no table: form, no keyset: {yaml}"
+        );
+        assert_eq!(snapshot_kind(&uuid_only), "full");
+
+        let mut with_int = make_table(
+            100,
+            vec![col("uid", "uuid", true), col("n", "bigint", false)],
+        );
+        with_int.table = "Orders".into();
+        let yaml = scaffold(&with_int, Some("chunked"));
+        assert!(yaml.contains("chunk_column: n"), "{yaml}");
+        assert_eq!(snapshot_kind(&with_int), "range");
     }
 
     #[test]

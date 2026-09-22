@@ -1332,11 +1332,29 @@ fn a_renamed_column_loads_under_its_file_name_then_renames_and_appends_by_name()
         "the file name, not the warehouse name: {schema}"
     );
     assert_eq!(
-        build_rename_columns_sql("p.d.t__staging", &renames),
-        "ALTER TABLE `p.d.t__staging` RENAME COLUMN `\u{441}omment` TO `comment`;"
+        build_rename_columns_sql("p.d.t__staging", &renames).as_deref(),
+        Some("ALTER TABLE `p.d.t__staging` RENAME COLUMN `\u{441}omment` TO `comment`;")
     );
+    assert_eq!(build_rename_columns_sql("p.d.t__staging", &[]), None);
     assert_eq!(
         build_insert_select_sql("p.d.t__changes", "p.d.s", &specs),
         "INSERT INTO `p.d.t__changes` (`id`, `comment`)\nSELECT `id`, `comment` FROM `p.d.s`;"
+    );
+}
+
+#[test]
+fn only_one_job_with_nothing_to_rename_loads_straight_into_the_target() {
+    let one = vec![vec!["gs://b/p0.parquet".to_string()]];
+    let two = vec![one[0].clone(), vec!["gs://b/p1.parquet".to_string()]];
+    let renames = vec![("\u{441}omment".to_string(), "comment".to_string())];
+    assert!(loads_directly(&[], &one));
+    assert!(loads_directly(&[], &[]));
+    assert!(
+        !loads_directly(&[], &two),
+        "several jobs cannot OVERWRITE one table"
+    );
+    assert!(
+        !loads_directly(&renames, &one),
+        "a rename needs the staging table"
     );
 }

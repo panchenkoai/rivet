@@ -2,6 +2,7 @@
 //! rebuild scripts, and the catalog probes.
 
 use super::*;
+use crate::load::plan::{Rename, file_name};
 
 /// `CREATE TABLE IF NOT EXISTS` for the change log, partitioned as the load declares and
 /// clustered on `cluster_by` (capped at BigQuery's 4 clustering columns; none when empty).
@@ -258,33 +259,29 @@ pub(super) fn build_schema(specs: &[TargetColumnSpec]) -> String {
 }
 
 /// [`build_schema`] under the Parquet's own column names, for a load whose `renames` map file names to warehouse names.
-pub(super) fn build_file_schema(
-    specs: &[TargetColumnSpec],
-    renames: &[(String, String)],
-) -> String {
+pub(super) fn build_file_schema(specs: &[TargetColumnSpec], renames: &[Rename]) -> String {
     let file_specs: Vec<TargetColumnSpec> = specs
         .iter()
-        .map(
-            |s| match renames.iter().find(|(_, latin)| *latin == s.column_name) {
-                Some((file, _)) => TargetColumnSpec {
-                    column_name: file.clone(),
-                    ..s.clone()
-                },
-                None => s.clone(),
-            },
-        )
+        .map(|s| TargetColumnSpec {
+            column_name: file_name(renames, &s.column_name).to_string(),
+            ..s.clone()
+        })
         .collect();
     build_schema(&file_specs)
 }
 
-/// One metadata-only statement renaming each file-named column to its warehouse name.
-pub(super) fn build_rename_columns_sql(fqtn: &str, renames: &[(String, String)]) -> String {
+/// One metadata-only statement renaming each file-named column to its warehouse name; `None` when nothing is renamed.
+pub(super) fn build_rename_columns_sql(fqtn: &str, renames: &[Rename]) -> Option<String> {
     let clauses = renames
         .iter()
         .map(|(file, latin)| format!("RENAME COLUMN `{file}` TO `{latin}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("ALTER TABLE `{fqtn}` {clauses};")
+        .collect::<Vec<_>>();
+    (!clauses.is_empty()).then(|| format!("ALTER TABLE `{fqtn}` {};", clauses.join(", ")))
+}
+
+/// Whether a load goes straight into its target: nothing to rename and at most one job.
+pub(super) fn loads_directly(renames: &[Rename], batches: &[Vec<String>]) -> bool {
+    renames.is_empty() && batches.len() <= 1
 }
 
 /// Append every row of `source` into `target`, by column name.

@@ -261,7 +261,7 @@ pub struct LoadPlan {
     /// decides when written.
     pub deleted_flag: bool,
     /// Columns whose Parquet name has Cyrillic look-alikes, as (file name, warehouse name).
-    pub renames: Vec<(String, String)>,
+    pub renames: Vec<Rename>,
     /// One warning per renamed column, naming the fix to run on the source.
     pub rename_warnings: Vec<String>,
 }
@@ -271,12 +271,7 @@ impl LoadPlan {
     pub fn file_column_names(&self) -> Vec<String> {
         self.specs
             .iter()
-            .map(|s| {
-                self.renames
-                    .iter()
-                    .find(|(_, latin)| *latin == s.column_name)
-                    .map_or_else(|| s.column_name.clone(), |(file, _)| file.clone())
-            })
+            .map(|s| file_name(&self.renames, &s.column_name).to_string())
             .collect()
     }
 }
@@ -815,11 +810,9 @@ fn build_plans_keyed(
         // multiplex stream — that table's block. One overlay, shared with the readers the
         // extract calls, so both sides answer the same question the same way.
         let eff_load = overlay(load, export, unit.as_deref());
-        let recorded_pk: Option<Vec<String>> = keys.get(&(export.name.clone(), unit)).map(|k| {
-            k.iter()
-                .map(|c| super::latin_fold(c).unwrap_or_else(|| c.clone()))
-                .collect()
-        });
+        let recorded_pk: Option<Vec<String>> = keys
+            .get(&(export.name.clone(), unit))
+            .map(|k| k.iter().map(|c| folded(c)).collect());
         let (pk, cluster_by) =
             resolve_keys(&export.name, &eff_load, recorded_pk.as_deref(), &specs, fit)?;
         let partition = resolve_partition(&export.name, &eff_load, mode, &specs, fit)?;
@@ -844,7 +837,7 @@ fn build_plans_keyed(
                 .unwrap_or(matches!(mode, LoadMode::Cdc)),
             load: eff_load,
             mode,
-            cursor_column: export.cursor_column.clone(),
+            cursor_column: export.cursor_column.as_deref().map(folded),
             pk,
             clustering,
             pinned_run: None,
@@ -863,6 +856,19 @@ fn build_plans_keyed(
 
 /// A column's (Parquet name, warehouse name).
 pub type Rename = (String, String);
+
+/// The Parquet name of warehouse column `column`.
+pub(crate) fn file_name<'a>(renames: &'a [Rename], column: &'a str) -> &'a str {
+    renames
+        .iter()
+        .find(|(_, latin)| latin == column)
+        .map_or(column, |(file, _)| file.as_str())
+}
+
+/// `name` with its Cyrillic look-alikes made Latin, or unchanged when no fold applies.
+fn folded(name: &str) -> String {
+    super::latin_fold(name).unwrap_or_else(|| name.to_string())
+}
 
 /// Renames each column whose Cyrillic look-alikes fold to a plain identifier, warning once per column.
 fn fold_lookalike_columns(
@@ -911,7 +917,7 @@ fn fold_lookalike_columns(
         .map(|(file, latin)| {
             format!(
                 "  warning: export `{export}`: column `{file}` has Cyrillic look-alike letters — it \
-                 loads as `{latin}`. Fix it at the source: {}",
+                 loads as `{latin}`. Fix it at the source once every run already exported is loaded: {}",
                 action(file, latin)
             )
         })
@@ -964,7 +970,7 @@ fn refuse_renamed_shape_column(
         if let Some((file, _)) = renames.iter().find(|(_, latin)| latin == col) {
             bail!(
                 "export `{export}`: `{col}` partitions or clusters the table but its source \
-                 column `{file}` has Cyrillic look-alike letters — rename it in the source"
+                 column `{file}` has Cyrillic look-alike letters — rename it in the source, or, when it only clusters, set `cluster_by:` in the export's `load:` block to other columns or `none`"
             );
         }
     }
@@ -1031,7 +1037,7 @@ fn resolve_keys(
     fit: SpecFit,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let pk = match &load.pk {
-        KeyColumns::Columns(cols) => cols.clone(),
+        KeyColumns::Columns(cols) => cols.iter().map(|c| folded(c)).collect(),
         KeyColumns::Auto => recorded.map(<[String]>::to_vec).unwrap_or_default(),
         KeyColumns::None => Vec::new(),
     };
@@ -1231,6 +1237,7 @@ fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
         let mut objects = vec![t.to_string(), format!("{t}__staging")];
         if !matches!(mode, LoadMode::Full) {
             objects.push(format!("{t}__changes"));
+            objects.push(format!("{t}__changes__staging"));
         }
         for o in objects {
             if let Some(prior) = seen.insert(o.clone(), t) {
@@ -2505,7 +2512,7 @@ load:
         assert!(names.starts_with(&["id", "comment"]), "{names:?}");
         assert!(
             plan.rename_warnings[1]
-                .contains("loads as `comment`. Fix it at the source: ALTER TABLE"),
+                .contains("loads as `comment`. Fix it at the source once every run already exported is loaded: ALTER TABLE"),
             "{:?}",
             plan.rename_warnings
         );
@@ -2565,6 +2572,47 @@ load:
             .is_empty(),
             "a load with nothing to rename is untouched on every target"
         );
+    }
+
+    #[test]
+    fn a_config_written_cursor_and_key_fold_with_their_columns() {
+        let cfg = crate::config::Config::from_yaml(
+            "source: { type: postgres, url: \"postgresql://localhost/test\" }\n\
+             exports:\n\
+             \x20 - name: purchases\n\
+             \x20   query: \"SELECT 1\"\n\
+             \x20   mode: incremental\n\
+             \x20   cursor_column: \"upd\u{430}ted_at\"\n\
+             \x20   format: parquet\n\
+             \x20   destination: { type: gcs, bucket: b, prefix: pa/ }\n\
+             \x20   load: { pk: [\"\u{456}d\"], cluster_by: none }\n\
+             load: { target: bigquery, project: p, dataset: d }\n",
+        )
+        .unwrap();
+        let reports = vec![report(
+            "purchases",
+            vec![
+                col("\u{456}d", TargetStatus::Ok),
+                ts_col("upd\u{430}ted_at"),
+            ],
+        )];
+        let plan = build_plans(&cfg, cfg.load.as_ref().unwrap(), reports)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(plan.cursor_column.as_deref(), Some("updated_at"));
+        assert_eq!(plan.pk, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn an_append_load_reserves_the_staging_table_its_rename_creates() {
+        let err = reject_duplicate_target_tables(&[
+            ("orders", LoadMode::Incremental),
+            ("orders__changes__staging", LoadMode::Full),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("orders__changes__staging"), "{err}");
     }
 
     fn no_action(_: &str, _: &str) -> String {

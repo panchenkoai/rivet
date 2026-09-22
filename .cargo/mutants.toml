@@ -644,6 +644,7 @@ exclude_re = [
     "replace BigQueryLoader::count_rows -> Result<u64>",
     "replace <impl TargetLoader for BigQueryLoader>::materialize -> Result<u64>",
     "replace <impl TargetLoader for BigQueryLoader>::append_changelog -> Result<u64>",
+    "replace BigQueryLoader::append_renamed -> Result<\\(\\)>",
     "replace <impl TargetLoader for BigQueryLoader>::changes_has_prior_changes -> Result<bool>",
     "replace <impl TargetLoader for BigQueryLoader>::column_overlap -> Result<\\(u64, u64\\)>",
     "replace <impl TargetLoader for BigQueryLoader>::adopt_as_changelog -> Result<\\(\\)>",
