@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **`rivet init` records every export's primary key, even when one export cannot
+  be given a cursor.** Recording validated the whole generated config first, so a
+  single cursor-less table (common under `--mode incremental`) left EVERY export
+  without the key `load.pk: auto` resolves against, and the load then refused three
+  steps from the cause. Keys are now read per export. Init also names every export
+  it could not give a `cursor_column:` / `time_column:` in one line (with
+  `--exclude` offered only where it applies), and stops printing "Next steps" that
+  cannot run on the file it just wrote.
+
+- **`rivet init --mode` writes only what the table can do.** A forced `chunked` on
+  a table with no integer column and no keysettable primary key wrote
+  `chunk_column: id` whether or not `id` existed; it is now written as `mode: full`
+  and named. Soft-delete stamps (`deleted_at` and friends, NULL on every live row)
+  are never a cursor, time column or partition key. An incremental cursor that does
+  not move on UPDATE (`id`, `created_at`) is marked in the YAML and every such
+  export is listed, since updated rows are never re-exported. The strategy recorded
+  in the state DB now agrees with the YAML for tables that cannot use the `table:`
+  form (a mixed-case PostgreSQL name).
+
+- **One BigQuery access token per identity per run, not per table.** Concurrent
+  first callers used to mint one token each, and every table built its own token
+  source; a 60-table compaction hit an ADC timeout. Minting is single-flight and the
+  source is shared per identity (keyed so two `gcloud` users never share one).
+
+- **A column named with Cyrillic look-alike letters loads under its Latin name.**
+  `сomment` (Cyrillic с) used to refuse the whole BigQuery load. The load now folds
+  such names, warns once per table with the statement to run at the source (per
+  engine, including the MySQL 5.7 form and the SQL Server CDC caveat, and the
+  export's own config keys that must change with it), and loads through a staging
+  table under the file's name, renamed and cloned (base) or appended with a free
+  copy job (buffer): BigQuery matches Parquet columns by name, so declaring the new
+  name alone loads the column NULL. `rivet check --target bigquery` grades such a
+  column `warn`. Refused, loudly: a fold that collides with another column, a
+  renamed column that partitions or is written into `cluster_by`, a non-BigQuery
+  target, and pending runs that spell the column both ways (the older run's files
+  would load NULL).
+
 - **`rivet load` and `rivet compact` can work the config's tables in parallel.**
   `--pool N` runs the per-table loop on N worker threads instead of one after
   another: every freeing worker takes the next table, so one slow table no longer
@@ -22,8 +59,8 @@
   the rest keep loading) and so is the per-table lease, so `rivet load` and
   `rivet compact` still refuse a table the other holds. Each worker opens its own state handle by reconnecting to the
   backend the parent already resolved (`open_at_ref`) — once per WORKER, not per
-  table — and a worker that cannot reconnect says so and carries the ERRORED half
-  of the tri-state rather than passing for absent-by-design.
+  table — and a worker that cannot reconnect says so and retires, rather than
+  passing for absent-by-design.
 
   The scheduling lives in a generic executor (`src/load/pool.rs`) rather than in
   the orchestrator, because `run_loads` / `run_compacts` are live-only bodies that
@@ -35,14 +72,13 @@
   returns the LAST maximum, so a completion-ordered fold would have reported a
   different error out of a tie on each run of the same failing config.
 
-- **A worker that loses the state ledger now says what it will actually do.** The
-  warning printed when a pool worker could not reopen the ledger said it was
-  "loading without a ledger", and the code then REFUSED the table a few frames
-  later. The claim was wrong every time it could appear: the warning is only
-  reachable when the parent's own open SUCCEEDED, which is precisely the case the
-  refusal covers, so it never once described what happened. Both legs (`rivet
-  load` and `rivet compact`) now name the refusal, and the comment above the pool
-  that described the same path as degrading to the stateless path went with it.
+- **A pool worker that cannot reopen the state ledger takes no table.** It used to
+  stay in the queue and refuse every table it took in microseconds, while the
+  healthy workers sat in BigQuery jobs, so one refused connection (a Postgres state
+  DB near `max_connections`, the default `--pool 16`) refused most of a large cycle.
+  It now retires before taking anything and the other workers drain the queue; if
+  every worker retires, each table still gets its own failure, and that message no
+  longer calls a state-backend outage a bug.
 
 - **A BigQuery job that never finishes now ends the wait instead of the run.**
   `await_job` polled `for attempt in 0..` with no ceiling, no `jobTimeoutMs` on the
