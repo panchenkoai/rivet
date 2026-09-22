@@ -1100,6 +1100,23 @@ def sc_gc_survival(led: Ledger, engine: str, tag: str, url: str) -> None:
     )
 
 
+def sc_load_pool(led: Ledger, engine: str, tag: str, url: str) -> None:
+    """`rivet load --pool N` at full width — implemented in the BigQuery stage.
+
+    Same shape as `sc_gc_survival` and for the same reason: the pool is graded by
+    loading real tables into a real warehouse, so the check needs a load TARGET
+    that only the BigQuery stage has. The row is recorded here rather than left
+    out, so the ledger says WHERE the coverage lives instead of going quiet about
+    a scenario it lists.
+    """
+    del url
+    _skipped(
+        led, engine, tag, "load_pool", "-",
+        "load_pool runs in the BigQuery stage (needs a warehouse load target)",
+        "covered in BQ stage",
+    )
+
+
 def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     """Every batch scenario for one engine×version, in the gate's order."""
     sc_verdicts(led, engine, tag, url)
@@ -1132,6 +1149,7 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     if engine == "postgres":
         with led.span(f"{engine}: gc_survival"):
             sc_gc_survival(led, engine, tag, url)
+        sc_load_pool(led, engine, tag, url)
     # The COMMAND CHAIN, end to end. Both of these were registered in
     # docs/release-gate-matrix.yaml as `test` while `verify_blessed_path` had no
     # caller anywhere in the tree — the matrix guard checks that a gate function

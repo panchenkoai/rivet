@@ -229,6 +229,248 @@ def _canon(doc: object) -> str:
     return json.dumps(doc, sort_keys=True)
 
 
+# ── load_pool ────────────────────────────────────────────────────────────────
+# Sixteen, because that is BOTH `MAX_POOL` and today's `DEFAULT_POOL`: the cell
+# is meant to exercise the pool at its full declared width, not at a width that
+# happens to be comfortable. `effective_pool` clamps the pool to the work
+# available, so sixteen WORKERS need sixteen TABLES or the flag is decorative.
+_POOL_TABLES = 16
+# Small on purpose. This cell grades CONCURRENCY and COMPLETENESS, not
+# throughput: the row count only has to be large enough that each load job is a
+# real job, and every row of it is billed.
+_POOL_ROWS = 200
+_POOL_PREFIX = "pool_t"
+
+
+def _bq_json(proj: str, sql: str) -> list[dict]:
+    """One BigQuery query, as parsed JSON rows ([] when the CLI is unhappy)."""
+    p = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql",
+             "--format=json", sql], timeout=600)
+    if not p.ok:
+        return []
+    try:
+        return json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def _max_overlap(spans: list[tuple[int, int]]) -> int:
+    """The most jobs that were in flight at once, by a sweep over the endpoints.
+
+    A START adds one, an END removes one; ties resolve END-first so two jobs that
+    merely touch (one ends exactly as the next begins) are NOT counted as
+    overlapping. That tie-break is the whole point — a sequential loader produces
+    exactly that shape, and counting it would make the guard vacuous.
+    """
+    events: list[tuple[int, int]] = []
+    for s, e in spans:
+        events.append((s, +1))
+        events.append((e, -1))
+    events.sort(key=lambda ev: (ev[0], ev[1]))
+    cur = best = 0
+    for _, delta in events:
+        cur += delta
+        best = max(best, cur)
+    return best
+
+
+def verify_load_pool(led: Ledger, *, proj: str, dset: str, bucket: str, work: Path,
+                     child: dict[str, str], engine: str, url: str) -> None:
+    """`rivet load --pool N` loads N tables AT ONCE, loses none, and really overlaps.
+
+    The branch's headline feature had NO gate cell. `pool_e2e` and `pool_split`
+    both grade `apply --pool` — the EXPORT scheduler, a different subsystem — and
+    of the gate's seven `rivet load` sites six load a single table, where
+    `effective_pool` clamps the pool to one worker. `partner_shape` loads three
+    and is therefore already concurrent, but it would pass identically if the
+    pool silently degraded to sequential: nothing there can tell the difference.
+
+    So this cell carries TWO oracles, and the second is the one that matters:
+
+    * **completeness** — per table, BigQuery's own `COUNT(*)` AND `SUM(id)`
+      against a re-query of the SOURCE. Counts alone cannot see a fan-out that
+      routed one table's rows under another's name, because sixteen tables seeded
+      alike have identical counts; the id-sums differ, so they can. (The same
+      argument `partner_shape` already makes for three tables.)
+    * **non-vacuity** — BigQuery's own job history. At least two `LOAD_DATA` jobs
+      for these tables must have OVERLAPPED in time. A pool that degraded to
+      sequential still loads every row and still passes the first oracle; it
+      cannot produce overlapping jobs. This is the sibling of `keyset_parallel`'s
+      ">=2 distinct worker parts" guard, and it is BigQuery's data rather than
+      rivet's summary.
+
+    The config is GENERATED — `rivet init --include 'pool_t*' --gcs-bucket
+    --bigquery-project --bigquery-dataset` emits the exports AND the `load:`
+    block, so not one line of it is written here. That is the rule, and it also
+    buys the cell something: it grades what init DECIDES over sixteen tables
+    (per-table prefixes, the partition guess, the load target), which a
+    hand-written config would hide. If init stops emitting a loadable config, the
+    fixture check below fails before the pool is ever measured.
+
+    Postgres only. The load reads Parquet out of GCS and talks to BigQuery — the
+    source engine cannot change how the pool behaves, so the other three engines
+    are `{na}` in the ledger rather than three more billed copies of one answer.
+    """
+    if not (have("bq") and have("gcloud")):
+        led.skipped(engine, "-", "load_pool", "-",
+                    "load_pool: needs the `bq` and `gcloud` CLIs", "no cli")
+        return
+
+    pool_dset = f"{dset}_{engine}_pool"
+    tables = [f"{_POOL_PREFIX}{i:02d}" for i in range(_POOL_TABLES)]
+    name = engine_container(engine, _TAG)
+
+    # Sixteen tables, seeded alike so the COUNTS are identical and only the
+    # id-sums can tell them apart — see the completeness oracle above.
+    ddl = "\n".join(
+        f"DROP TABLE IF EXISTS {t}; "
+        f"CREATE TABLE {t} (id BIGINT PRIMARY KEY, v TEXT NOT NULL); "
+        f"INSERT INTO {t} (id, v) "
+        f"SELECT g + {i * 1000}, md5(g::text) FROM generate_series(1, {_POOL_ROWS}) g;"
+        for i, t in enumerate(tables)
+    )
+    seeded = docker_exec(name, "psql", "-U", "rivet", "-d", "rivet", "-q",
+                         "-v", "ON_ERROR_STOP=1", stdin=ddl, timeout=900)
+    if not seeded.ok:
+        led.skipped(engine, "-", "load_pool", "-",
+                    f"load_pool: seeding {_POOL_TABLES} tables failed — "
+                    f"{(seeded.out or '').strip()[-200:]}", "seed")
+        return
+
+    # A leftover prefix from an earlier gate run would be loaded alongside this
+    # one's and the read-back would compare a union. init fixes the prefix at
+    # `exports/<table>/`, so the wipe is by table name rather than by a token.
+    for t in tables:
+        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/exports/{t}"], timeout=300)
+    run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", pool_dset], timeout=600)
+    run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{pool_dset}"],
+        timeout=600)
+
+    cfg = work / f"load_pool_{engine}.yaml"
+    gen = rivet("init", "--source-env", "ORACLE_URL",
+                "--include", f"{_POOL_PREFIX}*",
+                "--gcs-bucket", bucket,
+                "--bigquery-project", proj,
+                "--bigquery-dataset", pool_dset,
+                "-o", str(cfg), env=child, timeout=600)
+    if not gen.ok or not cfg.exists():
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: `rivet init` did not produce a config — "
+                   f"{(gen.stderr or gen.stdout or '').strip()[-200:]}", "init")
+        return
+    # ACTIVATION CHECK, before anything is measured: sixteen workers need sixteen
+    # exports. If init emitted fewer, `effective_pool` clamps the pool to what it
+    # emitted and the cell would grade a narrower pool while reporting the wide
+    # one — the fixture answering for the product.
+    body = cfg.read_text()
+    emitted = sum(1 for t in tables if f"table: {t}" in body)
+    if emitted != _POOL_TABLES or "target: bigquery" not in body:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: the generated config carries {emitted} of {_POOL_TABLES} "
+                   f"pool exports and load target "
+                   f"{'present' if 'target: bigquery' in body else 'ABSENT'} — the pool "
+                   f"cannot be exercised at width {_POOL_TABLES}", "fixture")
+        return
+
+    r = rivet("run", "-c", str(cfg), env=child, timeout=None)
+    if not r.ok:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: the extract failed — "
+                   f"{(r.stderr or r.stdout or '').strip()[-200:]}", "run")
+        return
+
+    # The overlap window's lower bound comes from BIGQUERY'S clock, not this
+    # host's. The job timestamps it is compared against are BigQuery's, and
+    # comparing two clocks is how a skewed runner turns a real overlap into a
+    # phantom (or hides one) — the same two-clock trap the GC cell's liveness
+    # signal was written to avoid.
+    since_rows = _bq_json(proj, "SELECT UNIX_MILLIS(CURRENT_TIMESTAMP()) AS t")
+    if not since_rows:
+        led.skipped(engine, "-", "load_pool", "-",
+                    "load_pool: BigQuery would not answer for its own clock", "no clock")
+        return
+    since = int(since_rows[0]["t"])
+
+    with led.span(f"load_pool[{engine}]: load --pool {_POOL_TABLES}"):
+        lp = rivet("load", "-c", str(cfg), "--pool", str(_POOL_TABLES),
+                   env=child, timeout=None)
+    if not lp.ok:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: `rivet load --pool {_POOL_TABLES}` failed — "
+                   f"{(lp.stderr or lp.stdout or '').strip()[-200:]}", "load")
+        return
+
+    # ── oracle 1: completeness, per table, against the SOURCE ──
+    src = docker_exec(
+        name, "psql", "-U", "rivet", "-d", "rivet", "-t", "-A", "-F", ",",
+        "-c", " UNION ALL ".join(
+            f"SELECT '{t}', COUNT(*), COALESCE(SUM(id), 0) FROM {t}" for t in tables),
+        timeout=600)
+    source: dict[str, tuple[int, int]] = {}
+    for line in (src.stdout or "").splitlines():
+        bits = line.strip().split(",")
+        if len(bits) == 3 and bits[0] in tables:
+            source[bits[0]] = (int(bits[1]), int(bits[2]))
+
+    warehouse: dict[str, tuple[int, int]] = {}
+    for row in _bq_json(proj, " UNION ALL ".join(
+            f"SELECT '{t}' AS t, COUNT(*) AS n, IFNULL(SUM(id), 0) AS s "
+            f"FROM `{proj}.{pool_dset}.{t}`" for t in tables)):
+        warehouse[row["t"]] = (int(row["n"]), int(row["s"]))
+
+    bad = [f"{t}: source={source.get(t)} bigquery={warehouse.get(t)}"
+           for t in tables if source.get(t) != warehouse.get(t)]
+    if len(source) != _POOL_TABLES:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: the SOURCE re-query answered for {len(source)} of "
+                   f"{_POOL_TABLES} tables — the oracle itself is incomplete, so a "
+                   f"match would prove nothing", "oracle")
+        return
+    if bad:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: {len(bad)} of {_POOL_TABLES} tables disagree with the "
+                   f"source after a --pool {_POOL_TABLES} load — " + "; ".join(bad[:4]),
+                   "rows")
+        return
+
+    # ── oracle 2: the pool really OVERLAPPED (never vacuous) ──
+    jobs = _bq_json(proj, f"""
+        SELECT job_id, UNIX_MILLIS(start_time) AS s, UNIX_MILLIS(end_time) AS e
+        FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_USER
+        WHERE creation_time >= TIMESTAMP_MILLIS({since})
+          AND statement_type = 'LOAD_DATA'
+          AND EXISTS (SELECT 1 FROM UNNEST(labels) l
+                      WHERE l.key = 'rivet_table' AND STARTS_WITH(l.value, '{_POOL_PREFIX}'))
+    """)
+    spans = [(int(j["s"]), int(j["e"])) for j in jobs
+             if j.get("s") is not None and j.get("e") is not None]
+    if len(spans) < 2:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: BigQuery's job history shows {len(spans)} timed LOAD_DATA "
+                   f"job(s) for these tables — the concurrency oracle has nothing to "
+                   f"measure, so a PASS here would be vacuous", "no jobs")
+        return
+    peak = _max_overlap(spans)
+    if peak < 2:
+        led.failed(engine, "-", "load_pool", "-",
+                   f"load_pool: {len(spans)} LOAD_DATA jobs and NONE overlapped — every "
+                   f"row arrived, but `--pool {_POOL_TABLES}` ran them one after another; "
+                   f"the pool degraded to sequential", "no overlap")
+        return
+
+    led.passed(engine, "-", "load_pool", "-",
+               f"load_pool: {_POOL_TABLES} tables loaded by `--pool {_POOL_TABLES}` — "
+               f"every table's count AND sum(id) match the source, and BigQuery's job "
+               f"history shows {peak} of {len(spans)} LOAD_DATA jobs in flight at once",
+               f"peak={peak}/{len(spans)}")
+
+    run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", pool_dset], timeout=600)
+    for t in tables:
+        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/exports/{t}"], timeout=300)
+    docker_exec(name, "psql", "-U", "rivet", "-d", "rivet", "-q",
+                stdin="".join(f"DROP TABLE IF EXISTS {t};" for t in tables), timeout=600)
+
+
 def _gcs_ls(uri: str) -> list[str]:
     p = run(["gcloud", "storage", "ls", "-r", uri], timeout=300)
     return [ln.strip() for ln in p.stdout.splitlines() if ln.strip().startswith("gs://")]
@@ -490,6 +732,14 @@ def _bq_one_engine(
     if got:
         verify_gc_survival(led, bucket=bucket, pfx=pfx, cfg_text=cfgf.read_text(),
                            work=work, child=child, engine=engine)
+
+    # The LOAD pool, at its full declared width. Postgres only — the load reads
+    # Parquet from GCS and talks to BigQuery, so the source engine cannot change
+    # how the pool behaves; see verify_load_pool's own doc.
+    if engine == "postgres":
+        with led.span(f"{engine}: load_pool"):
+            verify_load_pool(led, proj=proj, dset=dset, bucket=bucket, work=work,
+                             child=child, engine=engine, url=url)
 
     run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
     run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])

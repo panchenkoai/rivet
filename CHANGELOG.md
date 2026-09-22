@@ -212,6 +212,41 @@
   every load path. The shape that closes it is a lease on the PREFIX, not a patch to
   each site.
 
+- **The release gate could not see the load pool at all, and now has a cell that
+  fails when it degrades.** `pool_e2e` and `pool_split` both grade `apply --pool` —
+  the export SCHEDULER, a different subsystem — and of the gate's seven `rivet load`
+  sites six load a single table, where `effective_pool` clamps the pool to one
+  worker. `partner_shape` loads three and is therefore already concurrent, but it
+  would pass identically if the pool silently ran them one after another: nothing
+  there can tell the difference. So the branch's headline feature had zero gate
+  coverage and not even an admitted gap row.
+
+  The new `load_pool` cell runs at the pool's FULL declared width — sixteen, because
+  that is both `MAX_POOL` and today's `DEFAULT_POOL`, and `effective_pool` clamps to
+  the work available so sixteen workers need sixteen tables or the flag is
+  decorative. The config is GENERATED: `rivet init --include 'pool_t*' --gcs-bucket
+  --bigquery-project --bigquery-dataset` emits the exports AND the `load:` block, so
+  not one line is written by hand and the cell grades what init decides over sixteen
+  tables as well as what the pool does.
+
+  Two oracles, because completeness alone is vacuous here. Per table, BigQuery's
+  `COUNT(*)` AND `SUM(id)` against a re-query of the SOURCE — sixteen tables seeded
+  alike have identical counts, so only the sums can see a fan-out that routed one
+  table's rows under another's name. Then NON-VACUITY, from BigQuery's own job
+  history: at least two `LOAD_DATA` jobs for these tables must have OVERLAPPED in
+  time, with touching-but-not-overlapping counted as one, since that is exactly the
+  shape a sequential loader produces. An activation check fails the cell BEFORE
+  anything is measured if init emitted fewer than sixteen exports, so a narrowed pool
+  can never be reported as the wide one.
+
+  Both halves are measured, not argued. The cell's first real run: sixteen tables
+  loaded, every count and sum matching the source, and **thirteen of sixteen
+  `LOAD_DATA` jobs in flight at once**. RED-proven by narrowing the pool to one with
+  the cell otherwise untouched: the completeness oracle stayed GREEN — every row
+  still arrives — and the concurrency oracle failed with "16 LOAD_DATA jobs and NONE
+  overlapped … the pool degraded to sequential". A cell that cannot go red on the
+  thing it exists to catch is decoration, and this one was made to.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product
