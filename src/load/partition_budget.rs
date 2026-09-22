@@ -34,6 +34,21 @@ struct Span {
     unit: Unit,
 }
 
+/// One file to pack: its span, its rows, and whether any value is NULL — a partition of
+/// its own that `min`/`max` cannot see.
+struct Part {
+    uri: String,
+    span: Span,
+    rows: i64,
+    has_nulls: bool,
+}
+
+/// The partitions a file or batch writes: its span's buckets, one more for the NULL
+/// partition, and never more than its rows.
+fn budgeted(key: &PartitionKey, span: Span, rows: i64, has_nulls: bool) -> i64 {
+    (partitions_touched(key, span) + i64::from(has_nulls)).min(rows)
+}
+
 /// Refuse a load one of whose files alone spans more partitions than one BigQuery job
 /// may write — the shape no batching can split. Everything else is loadable in batches
 /// (see [`plan_load_batches`]).
@@ -60,7 +75,7 @@ pub(crate) fn plan_load_batches(
     let Some(column) = partition.key.column() else {
         return Ok(vec![uris.to_vec()]);
     };
-    let mut spanned: Vec<(String, Span, i64)> = Vec::new();
+    let mut spanned: Vec<Part> = Vec::new();
     let mut blind: Vec<String> = Vec::new();
     for uri in uris {
         let (_, key) = crate::load::split_gs_uri(uri)?;
@@ -71,7 +86,12 @@ pub(crate) fn plan_load_batches(
         // span cannot give for a scattered part (4,000 distinct days across 5,600).
         let rows = footer_buckets(&meta, &partition.key).map_or(rows, |b| rows.min(b));
         match column_span(&meta, column) {
-            Some(span) => spanned.push((uri.clone(), span, rows)),
+            Some((span, has_nulls)) => spanned.push(Part {
+                uri: uri.clone(),
+                span,
+                rows,
+                has_nulls,
+            }),
             None => blind.push(uri.clone()),
         }
     }
@@ -94,20 +114,29 @@ pub(crate) fn plan_load_batches(
 /// measured on a live export, a 1,001-row part spanning 9,758 days occupies exactly 1,001
 /// partitions and BigQuery loaded it, while this check refused it by name.
 ///
-/// The REFUSAL takes the smaller bound, because that is where a wrong answer costs the
-/// operator a load they cannot perform. The batch packing deliberately stays on the span
-/// alone: being conservative there can only cost one more load job than strictly needed,
-/// never a rejection, so the extra bound would buy nothing and change how every existing
-/// load is split.
-fn pack_batches(
-    key: &PartitionKey,
-    mut files: Vec<(String, Span, i64)>,
-) -> Result<Vec<Vec<String>>> {
-    files.sort_by_key(|(_, s, _)| s.lo);
+/// BOTH the refusal and the packing take the smaller bound. The refusal always did,
+/// because that is where a wrong answer costs the operator a load they cannot perform.
+/// The packing used to stay on the span alone, on the reasoning that being conservative
+/// there "can only cost one more load job than strictly needed" — which is false for the
+/// shape this same file documents as NORMAL below: an incremental export orders rows by
+/// its cursor, so its parts are each scattered across the whole history, every pairwise
+/// merge busts the span cap, and each part becomes its own load job. The cost grows with
+/// the PART COUNT, not by one. Taking `min(rows)` here can only merge MORE, never refuse,
+/// so it cannot turn a loadable batch into a rejection.
+fn pack_batches(key: &PartitionKey, mut files: Vec<Part>) -> Result<Vec<Vec<String>>> {
+    files.sort_by_key(|p| p.span.lo);
     let mut batches: Vec<Vec<String>> = Vec::new();
-    let mut current: Option<(Vec<String>, Span)> = None;
-    for (uri, span, rows) in files {
-        let alone = partitions_touched(key, span).min(rows);
+    // The batch under construction carries the same three facts as a file, because the
+    // merge decision below applies the same bound as the per-file check above.
+    let mut current: Option<(Vec<String>, Span, i64, bool)> = None;
+    for Part {
+        uri,
+        span,
+        rows,
+        has_nulls,
+    } in files
+    {
+        let alone = budgeted(key, span, rows, has_nulls);
         if alone > MAX_PARTITIONS_PER_JOB {
             bail!(
                 "{uri} alone {} — no batching splits one file",
@@ -115,20 +144,22 @@ fn pack_batches(
             );
         }
         current = Some(match current {
-            None => (vec![uri], span),
-            Some((mut uris, cur)) => {
+            None => (vec![uri], span, rows, has_nulls),
+            Some((mut uris, cur, cur_rows, cur_nulls)) => {
                 let merged = merge(cur, span);
-                if partitions_touched(key, merged) > MAX_PARTITIONS_PER_JOB {
+                let merged_rows = cur_rows.saturating_add(rows);
+                let merged_nulls = cur_nulls || has_nulls;
+                if budgeted(key, merged, merged_rows, merged_nulls) > MAX_PARTITIONS_PER_JOB {
                     batches.push(uris);
-                    (vec![uri], span)
+                    (vec![uri], span, rows, has_nulls)
                 } else {
                     uris.push(uri);
-                    (uris, merged)
+                    (uris, merged, merged_rows, merged_nulls)
                 }
             }
         });
     }
-    if let Some((uris, _)) = current {
+    if let Some((uris, ..)) = current {
         batches.push(uris);
     }
     Ok(batches)
@@ -179,14 +210,25 @@ fn read_footer(store: &GcsStore, key: &str) -> Result<ParquetMetaData> {
 
 /// `column`'s min and max over every row group of one file, or `None` when the column
 /// is absent, of a type no partition takes, or has no statistics somewhere.
-fn column_span(meta: &ParquetMetaData, column: &str) -> Option<Span> {
+fn column_span(meta: &ParquetMetaData, column: &str) -> Option<(Span, bool)> {
     let schema = meta.file_metadata().schema_descr();
     let idx = schema.columns().iter().position(|c| c.name() == column)?;
     let descr = schema.column(idx);
     let unit = stored_unit(descr.logical_type_ref(), descr.physical_type())?;
     let mut span: Option<Span> = None;
+    // NULL rows occupy a partition of their own, and `min`/`max` exclude them by
+    // definition — so the span alone can never see it. Only a KNOWN non-zero count
+    // sets the bit: parquet's own docs warn that a missing null-count statistic
+    // means UNKNOWN (writers before 53.1.0 omitted it when the count was zero), and
+    // treating unknown as "has nulls" would inflate the count toward a REFUSAL of a
+    // load that is perfectly performable. This module's rule is that the refusal
+    // takes the smaller bound, because a wrong answer there costs the operator a
+    // load they cannot make; being cautious the other way costs at most a job.
+    let mut nulls = false;
     for rg in meta.row_groups() {
-        let (lo, hi) = match rg.column(idx).statistics()? {
+        let stats = rg.column(idx).statistics()?;
+        nulls |= stats.null_count_opt().is_some_and(|n| n > 0);
+        let (lo, hi) = match stats {
             Statistics::Int32(s) => (i64::from(*s.min_opt()?), i64::from(*s.max_opt()?)),
             Statistics::Int64(s) => (*s.min_opt()?, *s.max_opt()?),
             _ => return None,
@@ -197,7 +239,7 @@ fn column_span(meta: &ParquetMetaData, column: &str) -> Option<Span> {
             Some(s) => merge(s, file),
         });
     }
-    span
+    span.map(|s| (s, nulls))
 }
 
 /// The unit a partitionable column's statistics are in, by its Parquet type.
@@ -545,6 +587,73 @@ mod tests {
         assert!(err.contains("alone spans about 4001"), "{err}");
     }
 
+    fn ts_nullable(dir: &std::path::Path, name: &str, secs: &[Option<i64>]) {
+        let field = Field::new(
+            "ts",
+            DataType::Timestamp(ArrowUnit::Microsecond, Some("UTC".into())),
+            true,
+        );
+        let values: Vec<Option<i64>> = secs.iter().map(|s| s.map(micros)).collect();
+        let column: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC"));
+        write(dir, name, field, column, true);
+    }
+
+    /// NULL values land in a partition of their own, which `min`/`max` cannot see: a
+    /// dense 4,000-day file with a few NULL rows writes 4,001 partitions, and so do two
+    /// 2,000-day files when one of them carries a NULL. The writer's budget counts that
+    /// partition when it cuts a part; the load must count it too, or it admits a job
+    /// BigQuery rejects after the load ran. A nullable column holding NO null is not
+    /// charged — parquet records the count as `Some(0)`, and only a known non-zero
+    /// count sets the bit.
+    /// RED against dropping the bit at either site (accepted as 4,000 / one batch).
+    #[test]
+    fn a_null_value_occupies_a_partition_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        let daily = |from: i64, to: i64| -> Vec<Option<i64>> {
+            (from..to).map(|d| Some(start + d * DAY)).collect()
+        };
+        let key = time("ts", Granularity::Day);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let uris = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| format!("gs://b/{n}")).collect()
+        };
+
+        let mut with_nulls = daily(0, 4000);
+        with_nulls.extend([None; 5]);
+        ts_nullable(dir.path(), "nulls.parquet", &with_nulls);
+        let err = plan_load_batches(&store, &uris(&["nulls.parquet"]), &key)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("alone spans about 4001 day partitions"),
+            "4,000 days plus the NULL partition: {err}"
+        );
+
+        // One day twice, so the ROW clamp (4,001) is not what holds this at 4,000: a
+        // `Some(0)` charged a partition would read 4,001 and refuse. With exactly 4,000
+        // rows the clamp hid that mutant — measured, not reasoned.
+        let mut clean = daily(0, 4000);
+        clean.push(Some(start));
+        ts_nullable(dir.path(), "clean.parquet", &clean);
+        assert_eq!(
+            plan_load_batches(&store, &uris(&["clean.parquet"]), &key).unwrap(),
+            vec![uris(&["clean.parquet"])],
+            "a nullable column holding no NULL is not charged a partition"
+        );
+
+        let mut a = daily(0, 2000);
+        a.extend([None; 3]);
+        ts_nullable(dir.path(), "a.parquet", &a);
+        ts_nullable(dir.path(), "b.parquet", &daily(2000, 4000));
+        assert_eq!(
+            plan_load_batches(&store, &uris(&["a.parquet", "b.parquet"]), &key).unwrap(),
+            vec![uris(&["a.parquet"]), uris(&["b.parquet"])],
+            "4,000 days plus the NULL partition is 4,001: two jobs, not one"
+        );
+    }
+
     /// A file whose values are SCATTERED over a huge range occupies one partition per
     /// distinct value, not one per day of its range — and a file of N rows can never
     /// occupy more than N partitions. Refusing it on the span alone rejects a file the
@@ -582,19 +691,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let start = at(2000, 1, 1, 0);
         // Written out of order on purpose: packing sorts by the low end.
-        ts_file(
-            dir.path(),
-            "c.parquet",
-            &[start + 4200 * DAY, start + 6000 * DAY],
-            true,
-        );
-        ts_file(dir.path(), "a.parquet", &[start, start + 2000 * DAY], true);
-        ts_file(
-            dir.path(),
-            "b.parquet",
-            &[start + 2001 * DAY, start + 3999 * DAY],
-            true,
-        );
+        // DENSE, one row per day, so the SPAN is the binding bound and this test
+        // still measures span packing. With the old two-row files the row bound
+        // (`min(rows)`, added when packing stopped over-counting scattered parts)
+        // dominated completely and everything merged into one job — the fixture
+        // would have stopped crossing the threshold it exists to cross.
+        let days =
+            |from: i64, to: i64| -> Vec<i64> { (from..=to).map(|d| start + d * DAY).collect() };
+        ts_file(dir.path(), "c.parquet", &days(4200, 6000), true);
+        ts_file(dir.path(), "a.parquet", &days(0, 2000), true);
+        ts_file(dir.path(), "b.parquet", &days(2001, 3999), true);
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         let uris: Vec<String> = ["c.parquet", "a.parquet", "b.parquet"]
             .iter()
@@ -624,19 +730,15 @@ mod tests {
     fn a_stats_less_file_rides_in_the_first_batch() {
         let dir = tempfile::tempdir().unwrap();
         let start = at(2000, 1, 1, 0);
-        ts_file(dir.path(), "a.parquet", &[start, start + 10 * DAY], true);
-        ts_file(
-            dir.path(),
-            "blind.parquet",
-            &[start, start + 9000 * DAY],
-            false,
-        );
-        ts_file(
-            dir.path(),
-            "z.parquet",
-            &[start + 5000 * DAY, start + 5010 * DAY],
-            true,
-        );
+        // Dense for the same reason as the packing test above: two-row files let the
+        // row bound decide, and then a+z merge into ONE batch and the blind file has
+        // no second batch to be absent from. The subject here is that the blind file
+        // is never DROPPED, which needs a real two-batch split to be worth asserting.
+        let days =
+            |from: i64, to: i64| -> Vec<i64> { (from..=to).map(|d| start + d * DAY).collect() };
+        ts_file(dir.path(), "a.parquet", &days(0, 2099), true);
+        ts_file(dir.path(), "blind.parquet", &days(0, 9000), false);
+        ts_file(dir.path(), "z.parquet", &days(5000, 7099), true);
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         let uris: Vec<String> = ["a.parquet", "blind.parquet", "z.parquet"]
             .iter()

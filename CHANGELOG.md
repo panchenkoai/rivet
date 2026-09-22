@@ -133,6 +133,71 @@
   same runtime but is NOT in this blast radius — it is constructed once per
   destination (three sites in `destination/mod.rs`), not once per item.
 
+- **A multi-agent hunt over the load subsystem, outside the diff.** Fourteen
+  agents over code the parallel-load branch never touched; seven findings survived
+  an adversarial refutation pass, each re-opened by hand before anything was
+  changed. Six are fixed here; the seventh is recorded below, not patched.
+
+  *Layer seam.* `prepare_load` read the ledger's already-loaded set with
+  `.unwrap_or_default()`, so a FAILED read handed `select_runs` the same empty set
+  as "no ledger at all". For an append mode that set is the only thing between the
+  load and its own history — `select_runs` takes every run NOT in it — so a
+  transient state-backend error re-appended every run the target already held, and
+  the count gate could not see it because `reconcile` sums whatever was selected.
+  Both siblings in the same file (`active_run_ids_on_prefix`, twice) already warned
+  on this error; this read was the mute one. `ledger_read_failure_is_fatal(mode)`
+  now decides: `incremental` and `cdc` refuse and say why, `full` warns and goes on,
+  because it overwrites the latest run and never consults the set.
+
+  *Message truth.* `rivet load` printed **"up to date — every extraction run already
+  loaded"** and exited 0 for a prefix whose manifests were ALL non-Success — every
+  run aborted or still writing, nothing loaded, and the operator told to relax. The
+  manifest and Success counts are now taken BEFORE `select_runs` consumes them, and
+  an empty selection over non-empty, Success-less manifests says exactly that. In
+  `plan.rs`, a test comment claimed "retry/skip logic keys off" the ledger's `mode`
+  string; the column is write-only — one production caller, no query filters or
+  orders by it, and the skip set is keyed by `loaded_source_run` — so the comment
+  now says what the pin actually protects: the audit trail an operator reads back.
+
+  *Whole subsystem.* Two defects in the partition budget, one old and one older.
+  The per-file check took `min(span, rows)` but the MERGE stayed on the span alone,
+  on a doc claiming the extra bound "would buy nothing" — false for the normal
+  shape, an incremental export whose cursor-ordered parts are each scattered across
+  the whole history: every pairwise merge busted the span cap and each part became
+  its own load job, a cost that grows with the part count. Both sites take the
+  smaller bound now; two fixtures that had two-row files were made DENSE (one row
+  per day) so the span is still the binding bound and they still measure packing,
+  rather than editing their expectations. And NULL values sit in a partition of
+  their own that `min`/`max` exclude by definition, so a dense 4,000-day file with a
+  few NULL rows — 4,001 partitions, which is what the writer's budget counts when it
+  cuts a part — passed the check as 4,000 and was admitted to a job BigQuery rejects
+  after the load ran. A KNOWN non-zero null count now charges one partition, at the
+  refusal and at the merge. A MISSING count charges nothing: parquet's own docs say
+  it means unknown, not zero, and charging the unknown pushes toward a false
+  REFUSAL, the direction this module's rule forbids. Measured, not assumed: the
+  arrow writer records `Some(0)` for a NULL-free column in every shape tried, and
+  the first fixture for this — exactly 4,000 rows over 4,000 days — let the `>=`
+  mutant through because the ROW clamp held it at 4,000 either way; it carries one
+  duplicate day now and the mutant goes red.
+
+  *Per engine.* Snowflake has no stand service and no live test anywhere, so its SQL
+  builders are the only oracle there is. The re-baseline probe was the ONE query in
+  the adapter without `USE WAREHOUSE`; rivet does not require a default warehouse in
+  `connections.toml` (it takes `warehouse:` in the load target), and without one
+  Snowflake answers "No active warehouse selected in the current session" — text the
+  first-cycle arm cannot absorb, since it looks for "does not exist" — so the load
+  died on a probe that never ran. The probe and the overwrite script are now behind
+  `build_*` seams with tests. The second test PINS rather than fixes: `CREATE OR
+  REPLACE TABLE` runs BEFORE the `COPY`, so a failed COPY leaves a previously loaded
+  target EMPTY, where BigQuery's `LOAD DATA OVERWRITE` replaces only on success.
+  Making them match means a staging table and a swap — a behaviour change to a
+  warehouse nothing in this repo can exercise, so it is recorded as a fact to
+  inherit, in the test's own name.
+
+  Recorded, not fixed: `cleanup_source` deletes the source parts OUTSIDE the lease on
+  every load path. The shape that closes it is a lease on the PREFIX, not a patch to
+  each site.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product

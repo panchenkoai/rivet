@@ -415,6 +415,22 @@ pub fn select_runs(
     }
 }
 
+/// Whether a FAILED read of the already-loaded set must stop the load.
+///
+/// The set is the only thing standing between an append mode and its own history:
+/// [`select_runs`] selects every run NOT in it, so an empty set means "load them
+/// all". That is correct when the set is empty because there is no ledger — the
+/// documented stateless degradation — and catastrophic when it is empty because
+/// the READ failed, which re-appends every run the target already holds. The
+/// count gate cannot catch it either: `reconcile` sums whatever was selected, so
+/// the expectation inflates in lockstep with the oversized append.
+///
+/// `Full` is exempt because it never consults the set at all ([`select_runs`]
+/// takes the latest run and OVERWRITES), so a failed read costs it nothing.
+pub fn ledger_read_failure_is_fatal(mode: crate::load::plan::LoadMode) -> bool {
+    !matches!(mode, crate::load::plan::LoadMode::Full)
+}
+
 /// Bucket-relative keys of every run manifest under `base` (recursive).
 fn list_manifest_keys(store: &GcsStore, base: &str) -> Result<Vec<String>> {
     let all: Vec<String> = store
@@ -1950,6 +1966,31 @@ mod tests {
         let sel = select_runs(keyed, &HashSet::new(), LoadMode::Full).unwrap();
         assert_eq!(sel.len(), 1, "stateless Full is not a blanket load");
         assert_eq!(sel[0].1.run_id, "r2");
+    }
+
+    /// A failed ledger read stops an APPEND load and is harmless to a full one.
+    ///
+    /// The two empty sets are not the same event: stateless-by-design is the
+    /// documented degradation `select_runs_append_modes_filter_loaded_and_load_all_
+    /// when_stateless` pins, while an ERRORED read produces the identical empty set
+    /// from a target that may already hold every one of those runs. Both arms are
+    /// asserted because each fails differently — without the `Full` arm a mutant
+    /// that refuses everything would stop overwrite loads that never read the set.
+    #[test]
+    fn a_failed_ledger_read_stops_an_append_but_not_an_overwrite() {
+        use crate::load::plan::LoadMode;
+        assert!(
+            ledger_read_failure_is_fatal(LoadMode::Incremental),
+            "incremental selects what is NOT in the set — an empty one re-appends history"
+        );
+        assert!(
+            ledger_read_failure_is_fatal(LoadMode::Cdc),
+            "cdc selects what is NOT in the set — an empty one re-appends history"
+        );
+        assert!(
+            !ledger_read_failure_is_fatal(LoadMode::Full),
+            "full never consults the set: it takes the latest run and overwrites"
+        );
     }
 
     #[test]

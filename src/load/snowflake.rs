@@ -176,41 +176,7 @@ impl TargetLoader for SnowflakeLoader {
     }
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
-        let fqtn = self.fqtn(table);
-        let ddl = Self::build_schema_ddl(specs);
-        let select = Self::build_copy_select(specs);
-        let columns = Self::build_column_list(specs);
-        // A per-load external stage over the export's GCS prefix; the COPY loads
-        // exactly the driver-selected files (`FILES=(…)`), NOT every Parquet under
-        // the prefix — so the mode-aware/ledger per-run selection is honored (a
-        // `PATTERN` over the prefix would load stale runs and fail the count gate).
-        let stage = format!("rivet_stage_{}", sanitize_tag(table));
-        let files = copy_files_clause(&self.gcs_url, uris)?;
-        let cluster = Self::cluster_clause(&self.cluster_keys());
-
-        // `CREATE OR REPLACE` (overwrite): storage is the source of truth. Pin
-        // the session to UTC before the COPY — Snowflake otherwise stamps a
-        // Parquet timestamp with the session offset, shifting a `timestamptz`.
-        let sql = format!(
-            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
-             ALTER SESSION SET TIMEZONE = 'UTC';\n\
-             USE WAREHOUSE {wh};\n\
-             USE SCHEMA {db}.{sc};\n\
-             CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
-             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
-             CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
-             COPY INTO {fqtn} ({columns})\n\
-             \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
-             SELECT COUNT(*) AS ROWS_ FROM {fqtn};",
-            tag = self.query_tag(table),
-            wh = self.warehouse,
-            db = self.database,
-            sc = self.schema,
-            si = self.storage_integration,
-            url = self.gcs_url,
-        );
-
+        let sql = self.build_materialize_sql(table, specs, uris)?;
         let result = self.run_snow(&sql)?;
         // ponytail: rows via COUNT(*); can become the COPY's `rows_loaded`
         // (metadata) behind this seam, no driver change.
@@ -235,14 +201,7 @@ impl TargetLoader for SnowflakeLoader {
     }
 
     fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
-        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
-        let tag = sanitize_tag(table);
-        let sql = format!(
-            "ALTER SESSION SET QUERY_TAG = 'rivet_probe_{tag}';\n\
-             SELECT COUNT(*) AS PROBE_ FROM (SELECT 1 FROM {changes_fqtn} \
-             WHERE __op IS NOT NULL LIMIT 1);"
-        );
-        match self.run_snow(&sql) {
+        match self.run_snow(&self.build_prior_changes_sql(table)) {
             // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read
             // as "first cycle" and silently disarm the refusal — the exact
             // direction this guard exists for. BigQuery's scalar path already
@@ -314,6 +273,82 @@ impl TargetLoader for SnowflakeLoader {
 
 impl SnowflakeLoader {
     /// Probe whose `KIND_` is `1·table + 2·view + 4·other` for `table`.
+    /// The overwrite script, as ONE `snow` invocation.
+    ///
+    /// Behind a `build_*` seam like every other statement this adapter sends, so the
+    /// ORDER of the statements is gradeable offline — there is no Snowflake in the
+    /// stand and no live test anywhere, so the string is the only thing a test can
+    /// hold. The order it pins today is deliberate to RECORD, not to bless:
+    /// `CREATE OR REPLACE TABLE` runs BEFORE the `COPY`, so a COPY that fails leaves
+    /// the target replaced and EMPTY — the rows a previous successful load put there
+    /// are gone. BigQuery's sibling never does this (`LOAD DATA OVERWRITE` replaces
+    /// only on success). Changing it means loading into a staging table and swapping,
+    /// which is a behaviour change to a warehouse nothing here can exercise.
+    fn build_materialize_sql(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        uris: &[String],
+    ) -> Result<String> {
+        let fqtn = self.fqtn(table);
+        let ddl = Self::build_schema_ddl(specs);
+        let select = Self::build_copy_select(specs);
+        let columns = Self::build_column_list(specs);
+        // A per-load external stage over the export's GCS prefix; the COPY loads
+        // exactly the driver-selected files (`FILES=(…)`), NOT every Parquet under
+        // the prefix — so the mode-aware/ledger per-run selection is honored (a
+        // `PATTERN` over the prefix would load stale runs and fail the count gate).
+        let stage = format!("rivet_stage_{}", sanitize_tag(table));
+        let files = copy_files_clause(&self.gcs_url, uris)?;
+        let cluster = Self::cluster_clause(&self.cluster_keys());
+
+        // `CREATE OR REPLACE` (overwrite): storage is the source of truth. Pin
+        // the session to UTC before the COPY — Snowflake otherwise stamps a
+        // Parquet timestamp with the session offset, shifting a `timestamptz`.
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             ALTER SESSION SET TIMEZONE = 'UTC';\n\
+             USE WAREHOUSE {wh};\n\
+             USE SCHEMA {db}.{sc};\n\
+             CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
+             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
+             CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
+             COPY INTO {fqtn} ({columns})\n\
+             \x20 FROM (SELECT {select} FROM @{stage})\n\
+             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
+             SELECT COUNT(*) AS ROWS_ FROM {fqtn};",
+            tag = self.query_tag(table),
+            wh = self.warehouse,
+            db = self.database,
+            sc = self.schema,
+            si = self.storage_integration,
+            url = self.gcs_url,
+        );
+
+        Ok(sql)
+    }
+
+    /// The re-baseline probe, as one `snow` invocation.
+    ///
+    /// Behind a `build_*` seam like its siblings — and now carrying `USE WAREHOUSE`
+    /// like them too. This was the ONE query in the adapter that omitted it, so on a
+    /// connection whose `connections.toml` declares no default warehouse (rivet does
+    /// not require one there: it takes `warehouse:` in the load target and wires it
+    /// here) Snowflake answers "No active warehouse selected in the current session".
+    /// That text does not contain "does not exist", so the first-cycle arm in the
+    /// caller cannot absorb it, and a load fails on a probe that never ran.
+    fn build_prior_changes_sql(&self, table: &str) -> String {
+        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
+        let tag = sanitize_tag(table);
+        format!(
+            "ALTER SESSION SET QUERY_TAG = 'rivet_probe_{tag}';\n\
+             USE WAREHOUSE {wh};\n\
+             SELECT COUNT(*) AS PROBE_ FROM (SELECT 1 FROM {changes_fqtn} \
+             WHERE __op IS NOT NULL LIMIT 1);",
+            wh = self.warehouse,
+        )
+    }
+
     fn build_object_kind_sql(&self, table: &str) -> String {
         format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
@@ -851,6 +886,64 @@ mod tests {
             note: None,
             cast_sql: None,
         }
+    }
+
+    /// The re-baseline probe selects a warehouse, like every other query here.
+    ///
+    /// It was the ONE query in this adapter that omitted `USE WAREHOUSE`, and the
+    /// omission is invisible on a connection that happens to have a default: rivet
+    /// does not require one in `connections.toml` because it takes `warehouse:` in
+    /// the load target. Without a default, Snowflake answers "No active warehouse
+    /// selected in the current session" — which does not contain "does not exist",
+    /// so the caller's first-cycle arm cannot absorb it and the load dies on a probe
+    /// that never ran. RED against the adapter as it stood before the seam.
+    #[test]
+    fn the_rebaseline_probe_selects_a_warehouse_like_every_other_query() {
+        let sql = adoption_loader().build_prior_changes_sql("orders");
+        assert!(
+            sql.contains("USE WAREHOUSE WH;"),
+            "the probe must select a warehouse or it fails on a connection without a \
+             default — every sibling query here does: {sql}"
+        );
+        assert!(
+            sql.contains("orders__changes"),
+            "and it must probe the change log, not the base: {sql}"
+        );
+    }
+
+    /// The overwrite script REPLACES the table before the COPY — recorded, not blessed.
+    ///
+    /// This pins today's statement order so the hazard is a fact a reader inherits
+    /// rather than rediscovers: `CREATE OR REPLACE TABLE` runs first, so a COPY that
+    /// fails leaves the target EMPTY and the rows a previous successful load put
+    /// there are gone. BigQuery's sibling cannot do this — `LOAD DATA OVERWRITE`
+    /// replaces only on success. Making Snowflake match means loading into a staging
+    /// table and swapping, which is a behaviour change to a warehouse that has no
+    /// stand service and no live test anywhere in this repo; this string is the only
+    /// oracle available, which is exactly why the SQL was put behind a `build_*` seam.
+    #[test]
+    fn the_overwrite_script_replaces_the_table_before_the_copy() {
+        let mut l = adoption_loader();
+        l.gcs_url = "gcs://bkt/exports/orders/".into();
+        l.storage_integration = "RIVET_GCS".into();
+        let sql = l
+            .build_materialize_sql(
+                "orders",
+                &[col("id", "NUMBER(38,0)")],
+                &["gs://bkt/exports/orders/part-0.parquet".to_string()],
+            )
+            .expect("the overwrite script builds");
+
+        let replace = sql
+            .find("CREATE OR REPLACE TABLE")
+            .expect("the script creates the target");
+        let copy = sql.find("COPY INTO").expect("the script copies into it");
+        assert!(
+            replace < copy,
+            "today the table is replaced BEFORE the copy, so a failed COPY empties a \
+             previously loaded table. If this assertion is what broke, the order was \
+             fixed and the doc above should go with it: {sql}"
+        );
     }
 
     #[test]

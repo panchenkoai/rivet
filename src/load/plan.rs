@@ -1165,8 +1165,12 @@ mod tests {
     #[test]
     fn ledger_str_names_each_mode_stably() {
         // The state DB's `load_run.mode` discriminator — every mode must map to
-        // its exact stable string, since retry/skip logic keys off it. A drifted
-        // value would mislabel loads in the ledger.
+        // its exact stable string. NOT because anything branches on it: the column
+        // is WRITE-ONLY today (one production caller, `orchestrate.rs`'s record
+        // builder, and no query in `load_journal_store` filters or orders by it).
+        // The skip set is keyed by `loaded_source_run`, not by mode. What a drifted
+        // value breaks is the audit trail an operator reads back — `rivet state
+        // loads` and anything downstream of it — which is why the string is pinned.
         assert_eq!(LoadMode::Full.ledger_str(), "full");
         assert_eq!(LoadMode::Incremental.ledger_str(), "incremental");
         assert_eq!(LoadMode::Cdc.ledger_str(), "cdc");

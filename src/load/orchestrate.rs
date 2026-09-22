@@ -850,14 +850,61 @@ fn prepare_load(
     // disambiguate). Covers Full (wrong-export snapshot pick), incremental, and
     // CDC in one place, before any irreversible step.
     load::reconcile::ensure_single_export(&keyed)?;
-    // The ledger's already-loaded run_ids — empty when stateless (no state DB),
-    // so `select_runs` degrades safely rather than dropping the mode selection.
+    // The ledger's already-loaded run_ids. An empty set is TWO different events and
+    // they must not share a path: no state DB at all is the documented stateless
+    // degradation, while a failed READ hands `select_runs` the same empty set from a
+    // target that may already hold every one of those runs. Both siblings in this
+    // file warn and fail to the safe side on exactly this error
+    // (`active_run_ids_on_prefix`, twice); this read used to be the mute one, and
+    // `.unwrap_or_default()` sent an append mode straight back over its own history.
     let loaded = match state {
-        Some(s) => s.loaded_source_run_ids(target_fqtn).unwrap_or_default(),
+        Some(s) => match s.loaded_source_run_ids(target_fqtn) {
+            Ok(set) => set,
+            Err(e) if load::reconcile::ledger_read_failure_is_fatal(plan.mode) => {
+                anyhow::bail!(
+                    "`{}`: cannot read which extraction runs are already loaded ({e:#}) — \
+                     refusing an append load rather than re-consuming every run the target \
+                     may already hold. Fix the state backend and re-run; a `full` load is \
+                     unaffected because it overwrites.",
+                    plan.table
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "load: cannot read the already-loaded set for {target_fqtn} ({e:#}) — \
+                     harmless here because this mode OVERWRITES the latest run and never \
+                     consults the set"
+                );
+                std::collections::HashSet::new()
+            }
+        },
         None => std::collections::HashSet::new(),
     };
+    // Counted BEFORE `select_runs` takes `keyed` by value: when the selection comes
+    // back empty, this is the only thing that can say WHY. `Ok(None)` is overloaded
+    // across four states — every run consumed, a prefix holding nothing (said
+    // above), a prefix whose manifests are all NON-Success, and runs that resolved
+    // to no files — and only the first makes the caller's "up to date — every
+    // extraction run already loaded" true. A prefix of aborted runs printed that
+    // line and exited 0 having loaded nothing at all; round-6 closed the
+    // empty-prefix half of the same ambiguity and left this one.
+    let manifests_seen = keyed.len();
+    let success_runs = keyed
+        .iter()
+        .filter(|(_, m)| m.status == crate::manifest::ManifestStatus::Success)
+        .count();
     let new = load::reconcile::select_runs(keyed, &loaded, plan.mode)?;
     if new.is_empty() {
+        if manifests_seen > 0 && success_runs == 0 {
+            eprintln!(
+                "  load [{}]: {manifests_seen} manifest(s) under {} and NOT ONE is Success — \
+                 every run there aborted or is still writing, so nothing has been loaded. \
+                 This is not 'up to date': re-run the export, then load. A crashed run's \
+                 parts are deliberately left unread; the retry returns them under a new \
+                 run id.",
+                plan.table, plan.gcs_prefix
+            );
+        }
         return Ok(None);
     }
     if let Some(why) = late_runs_refusal(&plan.table, &new, plan.pinned_run.as_ref()) {
