@@ -495,11 +495,21 @@ pub(crate) fn compact_gate(
              to discard EVERY change buffered since the last compaction (it accumulates \
              across loads). Nothing was merged and the buffer is untouched"
         )),
+        // Both layout levers are named, written one FIRST, because they have a
+        // PRECEDENCE and this message used to name only the loser. `cdc_layout`
+        // matches a written `load.layout:` before it consults `cdc.backfill:`
+        // (plan.rs), and `rivet init` WRITES `layout: base_buffer` for every
+        // compactable export — so "remove `cdc.backfill:`" was a no-op on the
+        // generated config, returning this very refusal again, which left the
+        // destructive branch as the only instruction that worked. The sibling
+        // predicate `compact_skip_reason` has always named both.
         (ObjectKind::View, _) => CompactGate::Refuse(format!(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
              current-state view of the changelog+view layout, which has no base to merge into. \
              To move to base+buffer, drop the view and `{buffer_fqtn}`; to stay on the view, \
-             remove `cdc.backfill:` from the export"
+             set `load.layout: log_view` (or delete a written `layout:` key — a written one \
+             WINS over `cdc.backfill:`, and `rivet init` writes it), and remove `cdc.backfill:` \
+             from the export if it has one"
         )),
         (ObjectKind::Other, _) => CompactGate::Refuse(format!(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
@@ -2495,5 +2505,38 @@ mod compact_gate_tests {
                 "the refusal names both tables: {msg}"
             );
         }
+    }
+
+    /// The VIEW refusal names the layout lever that actually DECIDES.
+    ///
+    /// It offered two escapes and the non-destructive one was inert on exactly the
+    /// configs rivet generates: `cdc_layout` matches a WRITTEN `load.layout:` before
+    /// it consults `cdc.backfill:`, and `rivet init` writes `layout: base_buffer` for
+    /// every compactable export. So "remove `cdc.backfill:` from the export" returned
+    /// this same refusal, and the only instruction that worked was the destructive
+    /// one — drop the view. On a `mode: incremental` export it was worse than inert:
+    /// a `cdc:` block is a config-load error there, so the key named cannot exist.
+    ///
+    /// This pins the SPELLINGS, not a fragment both would satisfy — the key with its
+    /// underscore and the block it lives in — because the assertion that let the
+    /// `--allow-source-drift` message stay wrong for months was one loose enough to
+    /// admit either form.
+    #[test]
+    fn the_view_refusal_names_the_written_layout_key_that_overrides_the_derived_one() {
+        let gate = compact_gate(ObjectKind::View, Ownership::Own, "p.d.t", "p.d.t__changes");
+        let CompactGate::Refuse(msg) = gate else {
+            panic!("a VIEW base must refuse: {gate:?}")
+        };
+        assert!(
+            msg.contains("`load.layout: log_view`"),
+            "the non-destructive escape must name the key that WINS, with its block and \
+             its underscore — a message naming only `cdc.backfill:` sends the operator \
+             to a no-op on every generated config: {msg}"
+        );
+        assert!(
+            msg.contains("WINS over `cdc.backfill:`"),
+            "and it must say WHICH lever wins, or the reader cannot tell why removing \
+             the other one changed nothing: {msg}"
+        );
     }
 }
