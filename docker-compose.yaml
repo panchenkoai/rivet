@@ -573,9 +573,14 @@ services:
       - "13307:13307"  # proxied mysql-cdc (gremlin: binlog cut mid-drain)
       - "14443:14443"  # proxied fake-gcs (gremlin: upload cut mid-part)
       - "27019:27019"  # proxied Mongo (retry/faults: RST + latency mid-scan)
+      # proxied postgres-STATE (not the source): `rivet load --pool N` never touches
+      # the source, so the only thing that can throttle or drop under it is the
+      # LEDGER — every worker opens its own connection to it.
+      - "15433:15433"  # proxied postgres-state (load pool: ledger latency/outage)
     depends_on:
       - postgres
       - mysql
+      - postgres-state
 
   # ---- DuckDB & ClickHouse — Parquet validators (ADR-0014) ─────────────────
   # These two services are kept running so live type-roundtrip tests can pipe

@@ -39,6 +39,12 @@ pub fn pg_modern_alive() -> bool {
 /// RST mid-connection.
 pub const POSTGRES_TOXI_URL: &str = "postgresql://rivet:rivet@127.0.0.1:15432/rivet";
 
+/// The Postgres STATE ledger (`postgres-state`, :5433) through Toxiproxy on
+/// :15433. `rivet load --pool N` never touches the source — every worker opens
+/// its own connection to the LEDGER — so the ledger is the only link a pooled
+/// load can be throttled or dropped on.
+pub const POSTGRES_STATE_TOXI_URL: &str = "postgresql://rivet:rivet@127.0.0.1:15433/rivet_state";
+
 /// pgBouncer in transaction mode with pool_size=1, port :6432.
 /// Opt in: docker compose --profile pool up -d pgbouncer
 pub const PGBOUNCER_URL: &str = "postgresql://rivet:rivet@127.0.0.1:6432/rivet";
@@ -311,6 +317,8 @@ fn require_docker_healthy(container: &str, compose_service: &str) {
 pub enum LiveService {
     Postgres,
     PostgresToxi,
+    /// The Postgres state ledger through Toxiproxy. TCP :15433.
+    PostgresStateToxi,
     Mysql,
     MysqlToxi,
     /// SQL Server source engine. TCP :1433.
@@ -355,6 +363,11 @@ impl LiveService {
                 "127.0.0.1",
                 15432,
                 "service `toxiproxy` — proxied Postgres on :15432",
+            ),
+            LiveService::PostgresStateToxi => (
+                "127.0.0.1",
+                15433,
+                "service `toxiproxy` — proxied postgres-state on :15433",
             ),
             LiveService::Mysql => ("127.0.0.1", 3306, "service `mysql` in docker-compose.yaml"),
             LiveService::Mssql => ("127.0.0.1", 1433, "service `mssql` in docker-compose.yaml"),

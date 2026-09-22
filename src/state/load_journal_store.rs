@@ -158,14 +158,23 @@ impl StateStore {
         Ok(out)
     }
 
-    /// Whether a load ever wrote `target_table` — a success that consumed runs, or a
-    /// failure after the warehouse write — so the table is rivet's own. A load that
-    /// stopped before writing (`refused`) never makes it so.
+    /// Whether a load ever wrote `target_table` — a success that consumed runs, a
+    /// failure after the warehouse write, or a `writing` marker left by a process
+    /// that DIED mid-write — so the table is rivet's own. A load that stopped before
+    /// writing (`refused`) never makes it so.
+    ///
+    /// `writing` counts for the same reason `failed` does: both mean rivet may have
+    /// touched the table. Without it, a load killed after the warehouse write and
+    /// before its closing row left NO row, the table rivet had just created read as
+    /// FOREIGN, and the refusal told the operator to drop their own data. The marker
+    /// is replaced by the closing row on every path that survives, so it can only be
+    /// seen after a crash.
     pub fn has_load_attempt(&self, target_table: &str) -> Result<bool> {
         Ok(self
             .query_opt(
                 "SELECT COUNT(*) FROM load_run WHERE target_table = ?1 \
-                 AND (status = 'failed' OR (status = 'success' AND source_run_ids <> '[]'))",
+                 AND (status IN ('failed', 'writing') \
+                      OR (status = 'success' AND source_run_ids <> '[]'))",
                 &[target_table.into()],
                 |r| r.i64(0),
             )?

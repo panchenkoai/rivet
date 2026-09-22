@@ -2,6 +2,251 @@
 
 ## Unreleased
 
+- **`rivet load` and `rivet compact` can work the config's tables in parallel.**
+  `--pool N` runs the per-table loop on N worker threads instead of one after
+  another: every freeing worker takes the next table, so one slow table no longer
+  holds up the ones queued behind it. **The default is now 16**, the ceiling, so
+  an operator who passes nothing gets the parallel pass; `--pool 1` restores the
+  strictly sequential one, and `N` is capped at the number of tables either way.
+  This widens what a plain `rivet load` does on upgrade: up to 16 ledger
+  connections instead of one, and up to 16 concurrent warehouse loads, which
+  count against Postgres `max_connections` and BigQuery's 100 concurrent
+  interactive queries per PROJECT. Measured before defaulting it: 16 workers over
+  16 tables on the DEFAULT (SQLite) ledger lost no table and surfaced no lock
+  error — SQLite's single writer is not a ceiling for this workload, because a
+  load reads each spec at the front and writes one record at the end, and the
+  per-table lease is a `flock` sidecar rather than a SQLite write. What was NOT
+  measured is several rivet processes pooling at once against one backend.
+
+  Per-table FAULT ISOLATION is preserved (a failing table isolates to itself and
+  the rest keep loading) and so is the per-table lease, so `rivet load` and
+  `rivet compact` still refuse a table the other holds. Each worker opens its own state handle by reconnecting to the
+  backend the parent already resolved (`open_at_ref`) — once per WORKER, not per
+  table — and a worker that cannot reconnect says so and carries the ERRORED half
+  of the tri-state rather than passing for absent-by-design.
+
+  The scheduling lives in a generic executor (`src/load/pool.rs`) rather than in
+  the orchestrator, because `run_loads` / `run_compacts` are live-only bodies that
+  nothing offline grades; the executor's contracts — every table runs exactly
+  once, a failure isolates, `init` runs once per worker, results come back in
+  CONFIG order — are unit-tested against a fake closure, with no warehouse and no
+  credentials. Folding results in config order is a fix in its own right:
+  `aggregate_load_failures` picks its representative with `max_by_key`, which
+  returns the LAST maximum, so a completion-ordered fold would have reported a
+  different error out of a tie on each run of the same failing config.
+
+- **A worker that loses the state ledger now says what it will actually do.** The
+  warning printed when a pool worker could not reopen the ledger said it was
+  "loading without a ledger", and the code then REFUSED the table a few frames
+  later. The claim was wrong every time it could appear: the warning is only
+  reachable when the parent's own open SUCCEEDED, which is precisely the case the
+  refusal covers, so it never once described what happened. Both legs (`rivet
+  load` and `rivet compact`) now name the refusal, and the comment above the pool
+  that described the same path as degrading to the stateless path went with it.
+
+- **A BigQuery job that never finishes now ends the wait instead of the run.**
+  `await_job` polled `for attempt in 0..` with no ceiling, no `jobTimeoutMs` on the
+  job and no `jobs.cancel` anywhere, so a job BigQuery never completed hung rivet
+  with no diagnostic and no exit — the only bound in the file was the 120 s
+  per-REQUEST timeout, which says nothing about the job. The poll now carries a
+  budget (four hours, deliberately generous: a deadline that fires on healthy work
+  is worse than none) and gives up with a TYPED marker, `load::JobWaitTimeout`,
+  which `classify_error` reads as PERMANENT — retrying a wait that already expired
+  only spends the budget twice. The message says what an operator actually needs to
+  know: the job may still be RUNNING in BigQuery, so look there before re-running,
+  because an append mode that re-consumes the same runs would double them. The
+  budget is a parameter rather than a constant read inline, so the deadline is
+  testable in milliseconds; the test drives a real socket that answers `RUNNING`
+  for ever, since the crash hook kills rather than stalls and cannot express this.
+
+- **Two retry decisions in the BigQuery transport were ungraded, and mutation
+  testing found them.** `insert_query_job` and `get_response` both guarded their
+  backoff with an inline `attempt > 0`, and both `> → <` (every retry fires
+  IMMEDIATELY — no backoff at all, which on a 429 is exactly wrong) and `> → >=`
+  (a wasted `POLL_MIN` before the first request of every call) survived the whole
+  suite at BOTH sites. `table_metadata`'s inline `== Some("TABLE")` survived too;
+  inverted, it makes every real table read as absent, which turns `rivet compact`
+  into a silent "nothing to merge" on a table that has a buffer. All three are now
+  named predicates — `should_back_off`, `is_table` — with unit tests, and the
+  extraction was verified the only way that counts: a scoped mutation run over the
+  two functions reports 16 mutants, 16 caught.
+
+- **A roast of the parallel-load branch, axis by axis.** Six findings, each named
+  by the axis that could see it, and five candidates that turned out to be nothing
+  (recorded because clearing them is the work too).
+
+  *Diff scope.* The fix that told a worker it "degrades to the stateless path" was
+  half-applied: the sibling comment forty lines below still said it, beside code
+  that refuses instead. And `run_workers` caught panics from `work` but NOT from
+  `init` — which opens a state store, so it is not panic-free by construction — so
+  a panic there unwound through `thread::scope` and discarded every result the
+  other workers had already recorded. `init` is caught now, its worker retires,
+  and every item still gets an answer: a naive early return would have handed the
+  caller a SHORTER vector, which folds as "those tables quietly succeeded".
+
+  *Layer seam.* `rivet compact` could print **"2 of 1 compacted table(s) failed"**:
+  the attempt counter was incremented after the ledger-refusal check, so a refused
+  table entered the numerator and not the denominator. The sequential loop could
+  not reach that state — it had no refusal — so the pool introduced it. And
+  `pool_ceiling_warning` took a two-valued "is it SQLite" flag for a three-valued
+  reality: when the parent's own open FAILS there is no ledger at all, and the
+  warning quoted Postgres `max_connections` at a run that opens zero state
+  connections. It now takes a `LedgerKind` with an `Absent` arm.
+
+  *Message truth.* The new job-wait timeout told operators to look in
+  `INFORMATION_SCHEMA.JOBS` — a name that does not resolve as written, since the
+  view needs its region qualifier. It now prints the query to run. The fill-in path
+  above reused the panic message, so a table no worker ever reached was reported as
+  having PANICKED, inviting a bug report about code that never ran.
+
+  *Absence.* Both migration guards — Postgres's advisory lock and SQLite's `BEGIN
+  IMMEDIATE` — were born from measurements recorded in their own comments (four
+  concurrent exports; three of four dead on PG, five rounds of five failing on
+  SQLite) and **neither had a test**. Idempotence is not concurrency safety, and
+  the existing `migration_is_idempotent` migrates twice on ONE connection, which
+  the race cannot reach; the offline tests use `:memory:`, where a second writer
+  cannot exist. The pool leans on those guards sixteen times harder, so
+  `several_writers_migrating_one_database_at_once_all_succeed` now holds the SQLite
+  one: a file-backed DB, four writers, a barrier so the overlap is real.
+
+  The Postgres half followed, once it was clear the stand could hold it:
+  `pg_several_writers_migrating_one_database_at_once_all_succeed` races four
+  writers through `StateStore::open_at_ref` — the seam the pool's workers use,
+  which migrates inside — against a database created FRESH for the test. Fresh is
+  the entire fixture: migrating an already-migrated database is a no-op ladder, so
+  the writers never contend and the test would pass against a DELETED lock. Its
+  oracle is two-sided because the guard fails two ways — every writer returns `Ok`,
+  AND no version has duplicate rows in `rivet_schema_version`, which is the
+  double-apply signature that survives both clients reporting success. RED-proven
+  by replacing the `pg_advisory_lock` call with `SELECT 1`: writer 0 of 4 dies with
+  `state(pg): create version table: db error`, the same failure the guard's comment
+  had recorded from four concurrent exports — now reproduced by a test rather than
+  remembered by a comment.
+
+  Cleared, not fixed: orphan GC skipping a failed table and a failure being printed
+  twice (both identical to the sequential loop); the compact leg carrying no
+  `ledger_errored` (nothing consumes it there); the warehouse loader (built per
+  item, so no cache or label leaks between a worker's tables); and a ledger-refused
+  table leaving no `load_run` row (the refusal happens because there is no ledger to
+  write it with). The pool's own doc now says which half of its disjointness
+  argument is guarded: the warehouse object is, the destination PREFIX is not, and
+  what keeps that off the floor is `rivet init` writing a per-table prefix.
+
+  *Whole subsystem.* The GCS store builds a tokio runtime PER INSTANCE, and a load
+  opens one per ITEM — six sites on the production path, five of them in the load
+  orchestrator (the pin's manifest listing, the orphan GC, and each of the three
+  `LoadJob` constructions) plus the footer-batching read. Uncapped,
+  `new_multi_thread` takes one worker thread per
+  CORE, so `--pool 16` on a 12-core host held on the order of two hundred OS
+  threads where the sequential loop held one runtime at a time. These are IO-bound
+  calls into opendal, so the runtime is now capped at two workers — the cap the
+  Mongo source already settled on, and the only one that existed in the tree.
+  Nothing here corrupts data: it is scheduling pressure, which a small container
+  feels as collapse or a thread-limit failure, and no test saw it because the
+  fixtures are tiny and the machine was never saturated. The export path builds the
+  same runtime but is NOT in this blast radius — it is constructed once per
+  destination (three sites in `destination/mod.rs`), not once per item.
+
+- **A multi-agent hunt over the load subsystem, outside the diff.** Fourteen
+  agents over code the parallel-load branch never touched; seven findings survived
+  an adversarial refutation pass, each re-opened by hand before anything was
+  changed. Six are fixed here; the seventh is recorded below, not patched.
+
+  *Layer seam.* `prepare_load` read the ledger's already-loaded set with
+  `.unwrap_or_default()`, so a FAILED read handed `select_runs` the same empty set
+  as "no ledger at all". For an append mode that set is the only thing between the
+  load and its own history — `select_runs` takes every run NOT in it — so a
+  transient state-backend error re-appended every run the target already held, and
+  the count gate could not see it because `reconcile` sums whatever was selected.
+  Both siblings in the same file (`active_run_ids_on_prefix`, twice) already warned
+  on this error; this read was the mute one. `ledger_read_failure_is_fatal(mode)`
+  now decides: `incremental` and `cdc` refuse and say why, `full` warns and goes on,
+  because it overwrites the latest run and never consults the set.
+
+  *Message truth.* `rivet load` printed **"up to date — every extraction run already
+  loaded"** and exited 0 for a prefix whose manifests were ALL non-Success — every
+  run aborted or still writing, nothing loaded, and the operator told to relax. The
+  manifest and Success counts are now taken BEFORE `select_runs` consumes them, and
+  an empty selection over non-empty, Success-less manifests says exactly that. In
+  `plan.rs`, a test comment claimed "retry/skip logic keys off" the ledger's `mode`
+  string; the column is write-only — one production caller, no query filters or
+  orders by it, and the skip set is keyed by `loaded_source_run` — so the comment
+  now says what the pin actually protects: the audit trail an operator reads back.
+
+  *Whole subsystem.* Two defects in the partition budget, one old and one older.
+  The per-file check took `min(span, rows)` but the MERGE stayed on the span alone,
+  on a doc claiming the extra bound "would buy nothing" — false for the normal
+  shape, an incremental export whose cursor-ordered parts are each scattered across
+  the whole history: every pairwise merge busted the span cap and each part became
+  its own load job, a cost that grows with the part count. Both sites take the
+  smaller bound now; two fixtures that had two-row files were made DENSE (one row
+  per day) so the span is still the binding bound and they still measure packing,
+  rather than editing their expectations. And NULL values sit in a partition of
+  their own that `min`/`max` exclude by definition, so a dense 4,000-day file with a
+  few NULL rows — 4,001 partitions, which is what the writer's budget counts when it
+  cuts a part — passed the check as 4,000 and was admitted to a job BigQuery rejects
+  after the load ran. A KNOWN non-zero null count now charges one partition, at the
+  refusal and at the merge. A MISSING count charges nothing: parquet's own docs say
+  it means unknown, not zero, and charging the unknown pushes toward a false
+  REFUSAL, the direction this module's rule forbids. Measured, not assumed: the
+  arrow writer records `Some(0)` for a NULL-free column in every shape tried, and
+  the first fixture for this — exactly 4,000 rows over 4,000 days — let the `>=`
+  mutant through because the ROW clamp held it at 4,000 either way; it carries one
+  duplicate day now and the mutant goes red.
+
+  *Per engine.* Snowflake has no stand service and no live test anywhere, so its SQL
+  builders are the only oracle there is. The re-baseline probe was the ONE query in
+  the adapter without `USE WAREHOUSE`; rivet does not require a default warehouse in
+  `connections.toml` (it takes `warehouse:` in the load target), and without one
+  Snowflake answers "No active warehouse selected in the current session" — text the
+  first-cycle arm cannot absorb, since it looks for "does not exist" — so the load
+  died on a probe that never ran. The probe and the overwrite script are now behind
+  `build_*` seams with tests. The second test PINS rather than fixes: `CREATE OR
+  REPLACE TABLE` runs BEFORE the `COPY`, so a failed COPY leaves a previously loaded
+  target EMPTY, where BigQuery's `LOAD DATA OVERWRITE` replaces only on success.
+  Making them match means a staging table and a swap — a behaviour change to a
+  warehouse nothing in this repo can exercise, so it is recorded as a fact to
+  inherit, in the test's own name.
+
+  Recorded, not fixed: `cleanup_source` deletes the source parts OUTSIDE the lease on
+  every load path. The shape that closes it is a lease on the PREFIX, not a patch to
+  each site.
+
+- **The release gate could not see the load pool at all, and now has a cell that
+  fails when it degrades.** `pool_e2e` and `pool_split` both grade `apply --pool` —
+  the export SCHEDULER, a different subsystem — and of the gate's seven `rivet load`
+  sites six load a single table, where `effective_pool` clamps the pool to one
+  worker. `partner_shape` loads three and is therefore already concurrent, but it
+  would pass identically if the pool silently ran them one after another: nothing
+  there can tell the difference. So the branch's headline feature had zero gate
+  coverage and not even an admitted gap row.
+
+  The new `load_pool` cell runs at the pool's FULL declared width — sixteen, because
+  that is both `MAX_POOL` and today's `DEFAULT_POOL`, and `effective_pool` clamps to
+  the work available so sixteen workers need sixteen tables or the flag is
+  decorative. The config is GENERATED: `rivet init --include 'pool_t*' --gcs-bucket
+  --bigquery-project --bigquery-dataset` emits the exports AND the `load:` block, so
+  not one line is written by hand and the cell grades what init decides over sixteen
+  tables as well as what the pool does.
+
+  Two oracles, because completeness alone is vacuous here. Per table, BigQuery's
+  `COUNT(*)` AND `SUM(id)` against a re-query of the SOURCE — sixteen tables seeded
+  alike have identical counts, so only the sums can see a fan-out that routed one
+  table's rows under another's name. Then NON-VACUITY, from BigQuery's own job
+  history: at least two `LOAD_DATA` jobs for these tables must have OVERLAPPED in
+  time, with touching-but-not-overlapping counted as one, since that is exactly the
+  shape a sequential loader produces. An activation check fails the cell BEFORE
+  anything is measured if init emitted fewer than sixteen exports, so a narrowed pool
+  can never be reported as the wide one.
+
+  Both halves are measured, not argued. The cell's first real run: sixteen tables
+  loaded, every count and sum matching the source, and **thirteen of sixteen
+  `LOAD_DATA` jobs in flight at once**. RED-proven by narrowing the pool to one with
+  the cell otherwise untouched: the completeness oracle stayed GREEN — every row
+  still arrives — and the concurrency oracle failed with "16 LOAD_DATA jobs and NONE
+  overlapped … the pool degraded to sequential". A cell that cannot go red on the
+  thing it exists to catch is decoration, and this one was made to.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product

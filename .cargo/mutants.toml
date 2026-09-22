@@ -652,6 +652,17 @@ exclude_re = [
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_changelog -> Result<\\(\\)>",
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_leftovers -> Result<Vec<String>>",
     "replace BigQueryApi::run_query_first_row -> Result<Vec<Option<String>>>",
+    # `await_job`'s poll deadline, `started.elapsed() > budget`: EQUIVALENT against
+    # `>=`, and the reason is the clock, not the coverage. The two differ on exactly
+    # one input — elapsed EQUAL to the budget to the nanosecond — which no caller can
+    # construct through `Instant::elapsed()`. Searched for a witness before claiming
+    # this: the other four mutants at the same site are all detected, three CAUGHT by
+    # `a_job_that_never_finishes_ends_the_wait_with_a_typed_timeout` (the guard forced
+    # `true`, `>` flipped to `<`, and both whole-function stubs) and two reported as
+    # TIMEOUTS (`guard` forced `false`, `>` flipped to `==`) because a deadline that
+    # never fires hangs against a stub answering RUNNING for ever — a detection, in a
+    # different column. Only `>=` has no distinguishing input at all.
+    "replace > with >= in BigQueryApi::await_job",
     # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
     # filtering and the redacting line are graded (`redact::logger_tests`).
     "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",

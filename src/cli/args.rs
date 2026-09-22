@@ -187,10 +187,11 @@ pub enum Commands {
     ///
     /// The native column schema, target table, partition, and source URIs are
     /// all derived from the config's top-level `load:` block — nothing is
-    /// hand-typed. A multi-table config loads every export into the shared
-    /// target, one after another. Column types come from the state DB, recorded
-    /// by each export's last successful `rivet run`; the load never connects to
-    /// the source.
+    /// hand-typed. A multi-table config loads its exports into the shared target
+    /// on a POOL of up to 16 worker threads, capped at the number of tables;
+    /// `--pool 1` is the strictly sequential pass. Column types come from the
+    /// state DB, recorded by each export's last successful `rivet run`; the load
+    /// never connects to the source.
     Load {
         /// Path to YAML config file — extraction PLUS a top-level `load:` block.
         /// ONE file drives both the export and the load: the mode
@@ -209,6 +210,18 @@ pub enum Commands {
         /// rebuild is never a side effect of a scheduled load.
         #[arg(long)]
         rebuild_changelog: bool,
+        /// Load the config's tables on N worker threads instead of one after
+        /// another: every freeing worker takes the next table, so a slow table
+        /// no longer blocks the ones queued behind it. A failing table still
+        /// isolates to itself and the rest keep loading, and the per-table lease
+        /// is unchanged — `rivet load` and `rivet compact` still refuse a table
+        /// the other holds. Each worker opens its own ledger connection, so N is
+        /// also N connections to the state backend; a worker that cannot reopen
+        /// the ledger REFUSES its table rather than loading it without a lease.
+        /// Defaults to 16 — the ceiling — capped at the number of tables. Pass
+        /// `--pool 1` for the strictly sequential pass.
+        #[arg(long, value_name = "N")]
+        pool: Option<usize>,
     },
     /// Merge each base-and-buffer CDC table's `<table>__changes` buffer into its
     /// base table (`MERGE` by primary key: updates, inserts, deletes flagged as
@@ -222,6 +235,16 @@ pub enum Commands {
         /// (BigQuery `rivet_run` label). Defaults to a generated id.
         #[arg(long, env = "RIVET_RUN_ID")]
         run_id: Option<String>,
+        /// Merge the config's tables on N worker threads instead of one after
+        /// another: every freeing worker takes the next table. A failing table
+        /// still isolates to itself, and the per-table lease is unchanged — a
+        /// table `rivet load` holds is still refused. Each worker opens its own
+        /// ledger connection, so N is also N connections to the state backend; a
+        /// worker that cannot reopen the ledger REFUSES its table rather than
+        /// compacting it without a lease. Defaults to 16 — the ceiling — capped
+        /// at the number of tables. Pass `--pool 1` for the sequential pass.
+        #[arg(long, value_name = "N")]
+        pool: Option<usize>,
     },
     /// Manage export state
     State {

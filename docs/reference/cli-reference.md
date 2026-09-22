@@ -167,7 +167,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
 Load an export's Parquet into a warehouse (BigQuery / Snowflake)
 
-The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads every export into the shared target, one after another. Column types come from the state DB, recorded by each export's last successful `rivet run`; the load never connects to the source.
+The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads its exports into the shared target on a POOL of up to 16 worker threads, capped at the number of tables; `--pool 1` is the strictly sequential pass. Column types come from the state DB, recorded by each export's last successful `rivet run`; the load never connects to the source.
 
 **Usage:** `rivet load [OPTIONS] --config <CONFIG>`
 
@@ -176,6 +176,7 @@ The native column schema, target table, partition, and source URIs are all deriv
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
 * `--rebuild-changelog` — Rebuild a `<table>__changes` whose partitioning differs from the config's `load.partition` — a billed query copying every row — and swap it in. Without this flag such a load is refused naming the difference; a rebuild is never a side effect of a scheduled load
+* `--pool <N>` — Load the config's tables on N worker threads instead of one after another: every freeing worker takes the next table, so a slow table no longer blocks the ones queued behind it. A failing table still isolates to itself and the rest keep loading, and the per-table lease is unchanged — `rivet load` and `rivet compact` still refuse a table the other holds. Each worker opens its own ledger connection, so N is also N connections to the state backend; a worker that cannot reopen the ledger REFUSES its table rather than loading it without a lease. Defaults to 16 — the ceiling — capped at the number of tables. Pass `--pool 1` for the strictly sequential pass
 
 
 
@@ -189,6 +190,7 @@ Merge each base-and-buffer CDC table's `<table>__changes` buffer into its base t
 
 * `-c`, `--config <CONFIG>` — Path to YAML config file — the same one `rivet load` reads
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job of this compaction (BigQuery `rivet_run` label). Defaults to a generated id
+* `--pool <N>` — Merge the config's tables on N worker threads instead of one after another: every freeing worker takes the next table. A failing table still isolates to itself, and the per-table lease is unchanged — a table `rivet load` holds is still refused. Each worker opens its own ledger connection, so N is also N connections to the state backend; a worker that cannot reopen the ledger REFUSES its table rather than compacting it without a lease. Defaults to 16 — the ceiling — capped at the number of tables. Pass `--pool 1` for the sequential pass
 
 
 

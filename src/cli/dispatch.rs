@@ -111,14 +111,22 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             config,
             run_id,
             rebuild_changelog,
+            pool,
         } => load::orchestrate::run_loads(load::orchestrate::LoadArgs {
             config,
             run_id,
             rebuild_changelog,
+            pool,
         }),
-        Commands::Compact { config, run_id } => {
-            load::orchestrate::run_compacts(load::orchestrate::CompactArgs { config, run_id })
-        }
+        Commands::Compact {
+            config,
+            run_id,
+            pool,
+        } => load::orchestrate::run_compacts(load::orchestrate::CompactArgs {
+            config,
+            run_id,
+            pool,
+        }),
         Commands::Init {
             source,
             source_env,

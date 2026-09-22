@@ -147,18 +147,33 @@ fn cleanup_source_must_consult_the_active_run_ledger() {
          gate is gone, which is a bigger problem than the one this guard was written for."
     );
 
-    // Reaching the ledger through ONE named helper counts. A guard that demanded
-    // the call be inline would forbid the obvious refactor — and the obvious
-    // refactor is what a fix looks like when three call sites share one rule.
+    // Reaching the ledger through named helpers counts, however many hops. A guard
+    // that demanded the call be inline would forbid the obvious refactor — and the
+    // obvious refactor is what a fix looks like when several call sites share one
+    // rule. This followed exactly ONE hop until a second was needed: the cleanup
+    // delete grew a prefix LEASE, so the chain became
+    // `cleanup_target_leased` → `cleanup_target` → `prefix_has_active_run` →
+    // `has_active_run_on_prefix`, and a one-hop walk called that ungated. The
+    // one-hop limit was an implementation detail of the walk, never the rule the
+    // comment above states, so the walk is transitive now — with a `seen` set,
+    // because a cycle would otherwise hang the gate rather than fail it.
     let reaches_ledger = |body: &str| -> bool {
-        if body.contains("has_active_run_on_prefix") {
-            return true;
+        let mut frontier = vec![body.to_string()];
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        while let Some(b) = frontier.pop() {
+            if b.contains("has_active_run_on_prefix") {
+                return true;
+            }
+            for (callee, cbody) in &bodies {
+                if !callee.is_empty()
+                    && b.contains(&format!("{callee}("))
+                    && seen.insert(callee.clone())
+                {
+                    frontier.push(cbody.clone());
+                }
+            }
         }
-        bodies.iter().any(|(callee, cbody)| {
-            !callee.is_empty()
-                && body.contains(&format!("{callee}("))
-                && cbody.contains("has_active_run_on_prefix")
-        })
+        false
     };
 
     let ungated: Vec<&str> = deleters

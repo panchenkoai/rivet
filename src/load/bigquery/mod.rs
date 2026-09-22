@@ -536,37 +536,18 @@ impl TargetLoader for BigQueryLoader {
         let base = self.fqtn(table);
         let changes = format!("{table}__changes");
         let changes_fqtn = self.fqtn(&changes);
-        let api = self.api()?;
-        // No buffer table → nothing to merge, said so by the report. Metadata, not
-        // a query job: `tables.get` is free and answers the same question.
-        let Some(buffer) = api.table_metadata(&self.dataset, &changes)? else {
-            return Ok(crate::load::CompactReport {
-                base,
-                changes_rows: 0,
-                merge_jobs: 0,
-                had_buffer: false,
-            });
-        };
-        // An EMPTY buffer (the metadata row count is exact after a load job) needs
-        // no probe and no MERGE — every statement that touches a table is billed a
-        // 10 MB floor; the DROP alone is free.
-        if buffer.get("numRows").and_then(serde_json::Value::as_str) == Some("0") {
-            self.run_sql(&format!("DROP TABLE `{changes_fqtn}`;"), "merge", table)?;
-            return Ok(crate::load::CompactReport {
-                base,
-                changes_rows: 0,
-                merge_jobs: 0,
-                had_buffer: true,
-            });
-        }
-        // A crash BEFORE any MERGE: the buffer must survive whole, so the next
-        // compact applies every change exactly once (the sibling of
-        // `compact_after_merge`, where the script already dropped it).
-        crate::test_hook::maybe_panic_at("compact_before_merge");
-        let key = self.partition.as_ref().map(|p| &p.key);
+        // Both of these run BEFORE anything is written, so their failures are stops,
+        // not failures: building the client reaches expired ADC and a misconfigured
+        // project, and `tables.get` reaches 503s and quota. Unwrapped they reached
+        // the ledger as `status='failed'`, which `has_load_attempt` counts as "rivet
+        // wrote this table" — forging ownership of a base nothing had touched.
+        let api = crate::load::before_write(self.api())?;
+
+        // Resolved once, because BOTH the recovery pass and the main script need it.
         // A day-partitioned base (the partner shape, init's default) or an
         // unpartitioned one compacts in ONE scripted job: the buffer's distinct days
         // become a script variable and every MERGE prunes to exactly those partitions.
+        let key = self.partition.as_ref().map(|p| &p.key);
         let day_column = match key {
             None => Some(None),
             // A load date (`_rivet_exported_at`, the load time) is a different value
@@ -579,8 +560,94 @@ impl TargetLoader for BigQueryLoader {
             }) => Some(column.as_deref()),
             Some(_) => None,
         };
+
+        // RECOVERY, before anything else. The scripted arm renames the live buffer to
+        // this deterministic name as its first act (see `CompactRename`), so a table
+        // sitting here means a previous compaction's JOB died between the rename and
+        // its drop. Those rows are merged into no base and appear in no buffer — only
+        // a later compaction can find them, and only because the name is fixed.
+        //
+        // It must run BEFORE the rename below, which would otherwise fail on the name
+        // already existing. Its rows are counted into this run's report: they really
+        // were merged now.
+        let merging = format!("{table}__changes__merging");
+        let merging_fqtn = self.fqtn(&merging);
+        let mut recovered_rows = 0u64;
+        let mut recovered_jobs = 0usize;
+        if crate::load::before_write(api.table_metadata(&self.dataset, &merging))?.is_some() {
+            eprintln!(
+                "  note: `{merging_fqtn}` is left over from a compaction whose job did not \
+                 finish — merging it before this run's buffer"
+            );
+            let script = compact_script_sql(
+                &base,
+                &merging_fqtn,
+                None, // already renamed by the run that died; nothing to rename now
+                specs,
+                pk,
+                order.clone(),
+                // The leftover can only have come from the scripted arm. If the config
+                // has since moved to a range key, fall back to the unbounded MERGE —
+                // correct, merely less pruned, and never a reason to strand the rows.
+                day_column.unwrap_or(None),
+            );
+            let row = api.run_query_first_row(&script, &self.labels("merge", table))?;
+            let (rows, jobs) = compact_summary(&row)?;
+            recovered_rows = rows;
+            recovered_jobs = jobs;
+        }
+
+        // No buffer table → nothing to merge, said so by the report. Metadata, not
+        // a query job: `tables.get` is free and answers the same question.
+        let Some(buffer) = crate::load::before_write(api.table_metadata(&self.dataset, &changes))?
+        else {
+            // Recovered rows count even here: no LIVE buffer, yet this run really did
+            // merge a leftover. Reporting zero would print "nothing to merge" over work
+            // that just happened, and `had_buffer` follows the recovery for the same
+            // reason — it is what the caller prints.
+            return Ok(crate::load::CompactReport {
+                base,
+                changes_rows: recovered_rows,
+                merge_jobs: recovered_jobs,
+                had_buffer: recovered_jobs > 0,
+            });
+        };
+        // An EMPTY buffer (the metadata row count is exact after a load job) needs
+        // no probe and no MERGE — every statement that touches a table is billed a
+        // 10 MB floor; the DROP alone is free.
+        if buffer.get("numRows").and_then(serde_json::Value::as_str) == Some("0") {
+            self.run_sql(&format!("DROP TABLE `{changes_fqtn}`;"), "merge", table)?;
+            return Ok(crate::load::CompactReport {
+                base,
+                // Same as the no-buffer arm: a recovered leftover was really merged by
+                // this run and must not be reported as zero.
+                changes_rows: recovered_rows,
+                merge_jobs: recovered_jobs,
+                had_buffer: true,
+            });
+        }
+        // A crash BEFORE any MERGE: the buffer must survive whole, so the next
+        // compact applies every change exactly once (the sibling of
+        // `compact_after_merge`, where the script already dropped it).
+        crate::test_hook::maybe_panic_at("compact_before_merge");
         if let Some(day_column) = day_column {
-            let script = compact_script_sql(&base, &changes_fqtn, specs, pk, order, day_column);
+            // The rename is the script's first act, so the live name is free the moment
+            // the job starts and every later statement — MERGE and DROP alike — works
+            // on `merging_fqtn`. A job abandoned by a dying client therefore drops a
+            // table nothing else writes to, while `append_changelog` recreates the live
+            // buffer for the next load. See `CompactRename`.
+            let script = compact_script_sql(
+                &base,
+                &merging_fqtn,
+                Some(crate::load::cdc::CompactRename {
+                    from_fqtn: &changes_fqtn,
+                    to_bare: &merging,
+                }),
+                specs,
+                pk,
+                order,
+                day_column,
+            );
             let row = api.run_query_first_row(&script, &self.labels("merge", table))?;
             let (changes_rows, merge_jobs) = compact_summary(&row)?;
             // The buffer is gone with the script; a crash HERE loses nothing — the
@@ -588,8 +655,8 @@ impl TargetLoader for BigQueryLoader {
             crate::test_hook::maybe_panic_at("compact_after_merge");
             return Ok(crate::load::CompactReport {
                 base,
-                changes_rows,
-                merge_jobs,
+                changes_rows: changes_rows + recovered_rows,
+                merge_jobs: merge_jobs + recovered_jobs,
                 had_buffer: true,
             });
         }
@@ -889,9 +956,30 @@ fn build_labels(op: &str, table: &str, run_id: Option<&str>) -> BTreeMap<String,
 }
 
 /// Coerce a string into BigQuery's label charset: lowercase `[a-z0-9_-]`, other
-/// characters become `_`, truncated to 63 chars. Empty maps to `unnamed`.
+/// characters become `_`, capped at 63 chars. Empty maps to `unnamed`.
+///
+/// INJECTIVE where it matters. The mapping is lossy three ways — case-folding,
+/// `[^a-z0-9_-] → _`, and the length cap — and this value is the per-table
+/// IDENTITY that the cost query in this module's own header groups by. Two tables
+/// folding to one label reported their jobs, bytes and spend as ONE line, with
+/// nothing saying a merge had happened: a confidently wrong answer, which is worse
+/// than a missing one.
+///
+/// The collisions are not exotic. `"CaseTwin"` beside `casetwin` is a shape
+/// `yaml_scaffold` records as live-proven on PostgreSQL; MSSQL's `sysname` runs to
+/// 128 characters and a Mongo collection name to ~235, so two names sharing their
+/// first 63 sanitized characters are ordinary.
+///
+/// So: a string the mapping leaves UNCHANGED keeps its exact label — the common
+/// case, and labels stay readable. Anything the mapping altered carries a digest of
+/// the ORIGINAL, which cannot collide unless the originals do. Injectivity cannot
+/// be restored inside BigQuery's charset any other way.
+///
+/// Scope, from the hunt's refuters and worth keeping: NOTHING in rivet reads these
+/// labels back, so no data or control flow ever depended on them. The harm was
+/// bounded to cost attribution.
 fn sanitize_label(s: &str) -> String {
-    let mut out: String = s
+    let mapped: String = s
         .chars()
         .map(|c| {
             let c = c.to_ascii_lowercase();
@@ -902,12 +990,26 @@ fn sanitize_label(s: &str) -> String {
             }
         })
         .collect();
-    out.truncate(63);
-    if out.is_empty() {
-        "unnamed".clone_into(&mut out);
+    if mapped.is_empty() {
+        // Only the empty string maps here, so `unnamed` collides with nothing.
+        return "unnamed".to_string();
     }
+    if mapped == s && mapped.len() <= MAX_LABEL_LEN {
+        return mapped;
+    }
+    // Lossy: disambiguate by the INPUT, not by the folded form.
+    let digest = format!("{:08x}", xxhash_rust::xxh3::xxh3_64(s.as_bytes()) as u32);
+    let mut out: String = mapped
+        .chars()
+        .take(MAX_LABEL_LEN - 1 - digest.len())
+        .collect();
+    out.push('-');
+    out.push_str(&digest);
     out
 }
+
+/// BigQuery's cap on a label value.
+const MAX_LABEL_LEN: usize = 63;
 
 /// Turn BigQuery's partition-quota failure into an actionable error.
 ///

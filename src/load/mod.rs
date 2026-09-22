@@ -19,6 +19,7 @@ pub mod cdc;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
 pub mod plan;
+pub(crate) mod pool;
 pub mod reconcile;
 mod snowflake;
 
@@ -321,6 +322,42 @@ pub(crate) fn column_list(cols: &[String]) -> String {
         .join(", ")
 }
 
+/// A warehouse job rivet stopped WAITING for, having waited out its budget.
+///
+/// Deliberately NOT a [`Refused`]: that one means "stopped before touching the
+/// warehouse", and this is the opposite — the statement was submitted and may well
+/// still be running server-side. The type is what the retry classifier keys off
+/// (`pipeline::retry::classify_error`), so the permanence of a deterministic
+/// timeout cannot be undone by rewording its message; retrying a wait that already
+/// expired only doubles the wait.
+#[derive(Debug)]
+pub struct JobWaitTimeout {
+    message: String,
+}
+
+impl JobWaitTimeout {
+    /// The BigQuery poll loop gave up on `job_id` after `seconds`.
+    pub fn bigquery(job_id: &str, seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "bigquery: stopped waiting for job `{job_id}` after {seconds}s — the job may \
+                 still be RUNNING in BigQuery, so check it there before re-running: \
+                 SELECT state, error_result FROM `region-<your dataset's region>`.\
+                 INFORMATION_SCHEMA.JOBS WHERE job_id = '{job_id}'. An append mode that \
+                 re-consumes the same runs would double them"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for JobWaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for JobWaitTimeout {}
+
 /// A load that stopped before touching the warehouse. The ledger records such a stop as
 /// `refused`, which never makes the target rivet's own — a `failed` row can.
 #[derive(Debug)]
@@ -391,8 +428,14 @@ pub(crate) fn refused(reason: String) -> anyhow::Error {
 pub enum Ownership {
     Own,
     Foreign,
-    /// No ledger to ask (a stateless load).
+    /// No ledger to ask (a stateless load) — absent BY DESIGN, so proceed with a note.
     Unknown,
+    /// A ledger exists and could NOT ANSWER. Never the same as having none: the
+    /// table may well be someone else's, and the ledger that would have said so
+    /// is the thing that broke. Treating this as [`Unknown`](Ownership::Unknown)
+    /// turned the `Foreign` REFUSAL into proceed-with-a-note, so a transient state
+    /// backend error silently licensed overwriting a foreign table.
+    Unreadable,
 }
 
 /// Refuse to touch a table rivet did not load; without a ledger, proceed with a note.
@@ -403,6 +446,13 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
             "refusing to {verb} `{fqtn}`: it exists, and this state DB's load ledger has no \
              record of rivet loading it — it may hold someone else's data. Drop or rename it, \
              or load into another table"
+        ),
+        Ownership::Unreadable => bail!(
+            "refusing to {verb} `{fqtn}`: it exists, and the load ledger could not be read to \
+             confirm rivet loaded it. This is NOT the stateless case — a ledger is configured \
+             and the query failed, so the table may hold someone else's data and the record \
+             that would prove otherwise is unavailable. Fix the state backend and re-run; \
+             nothing was written"
         ),
         Ownership::Unknown => {
             eprintln!(
@@ -445,11 +495,21 @@ pub(crate) fn compact_gate(
              to discard EVERY change buffered since the last compaction (it accumulates \
              across loads). Nothing was merged and the buffer is untouched"
         )),
+        // Both layout levers are named, written one FIRST, because they have a
+        // PRECEDENCE and this message used to name only the loser. `cdc_layout`
+        // matches a written `load.layout:` before it consults `cdc.backfill:`
+        // (plan.rs), and `rivet init` WRITES `layout: base_buffer` for every
+        // compactable export — so "remove `cdc.backfill:`" was a no-op on the
+        // generated config, returning this very refusal again, which left the
+        // destructive branch as the only instruction that worked. The sibling
+        // predicate `compact_skip_reason` has always named both.
         (ObjectKind::View, _) => CompactGate::Refuse(format!(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
              current-state view of the changelog+view layout, which has no base to merge into. \
              To move to base+buffer, drop the view and `{buffer_fqtn}`; to stay on the view, \
-             remove `cdc.backfill:` from the export"
+             set `load.layout: log_view` (or delete a written `layout:` key — a written one \
+             WINS over `cdc.backfill:`, and `rivet init` writes it), and remove `cdc.backfill:` \
+             from the export if it has one"
         )),
         (ObjectKind::Other, _) => CompactGate::Refuse(format!(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
@@ -459,6 +519,13 @@ pub(crate) fn compact_gate(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
              DB's load ledger has no record of rivet loading it — a MERGE would rewrite someone \
              else's rows. Drop or rename it, or point the export at another table"
+        )),
+        (ObjectKind::Table, Ownership::Unreadable) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the load ledger could not be \
+             read to confirm rivet loaded it. This is NOT the stateless case — a ledger is \
+             configured and the query failed, so a MERGE may rewrite someone else's rows and the \
+             record that would prove otherwise is unavailable. Fix the state backend and re-run; \
+             nothing was merged and the buffer is untouched"
         )),
         (ObjectKind::Table, Ownership::Unknown) => CompactGate::Note(format!(
             "  note: `{base_fqtn}` exists and there is no load ledger to confirm rivet loaded it \
@@ -1153,6 +1220,11 @@ pub(crate) mod tests {
         appended: RefCell<Vec<String>>,
         views: RefCell<Vec<String>>,
         kinds: RefCell<std::collections::HashMap<String, ObjectKind>>,
+        /// Make `object_kind` FAIL — the shape a 503, a quota error or expired
+        /// credentials takes at a metadata probe. `kinds` can only say what an object
+        /// IS; it cannot say "the warehouse would not answer", which is the case that
+        /// decides whether a stop is recorded as a refusal or as a failure.
+        pub(crate) kind_error: Option<String>,
         counts: RefCell<std::collections::HashMap<String, u64>>,
         overlap: Option<(u64, u64)>,
         prior_changes: bool,
@@ -1162,6 +1234,19 @@ pub(crate) mod tests {
         /// A warehouse without shape control (the Snowflake shape).
         shapeless: bool,
         calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeLoader {
+        /// A loader whose metadata probe will not ANSWER — a 503, a quota error, an
+        /// expired credential. Distinct from every `kinds` entry, which can only say
+        /// what an object IS; the difference decides whether a stop is journaled as a
+        /// refusal or as a failure, and only the failure forges ownership.
+        pub(crate) fn probe_fails(reason: &str) -> Self {
+            Self {
+                kind_error: Some(reason.to_string()),
+                ..Default::default()
+            }
+        }
     }
 
     impl ShapeControl for FakeLoader {
@@ -1202,6 +1287,9 @@ pub(crate) mod tests {
             Ok(self.prior_changes)
         }
         fn object_kind(&self, table: &str) -> Result<ObjectKind> {
+            if let Some(e) = &self.kind_error {
+                bail!("{e}");
+            }
             Ok(self
                 .kinds
                 .borrow()
@@ -1561,6 +1649,42 @@ pub(crate) mod tests {
         let f = full_load_left(5);
         load_incremental_as(&f, Ownership::Unknown).unwrap();
         assert_eq!(calls(&f), ["adopt t", "append t"]);
+    }
+
+    /// A ledger that cannot ANSWER is not a ledger that is ABSENT.
+    ///
+    /// The pair above and below is the whole point: `Unknown` — the operator ran
+    /// without a state DB — takes the table over on its shape and is unchanged here.
+    /// `Unreadable` is the state where a ledger IS configured and its query failed,
+    /// so the record that would have said `Foreign` is exactly what is missing. Both
+    /// arrived at this function as `Unknown` until the probe became tri-state, which
+    /// is why one failed `SELECT COUNT(*)` could license overwriting a foreign table.
+    ///
+    /// RED against `Err(_) => Ownership::Unknown` at the two probe sites: with that
+    /// mapping this call succeeds and the loader records `adopt`/`append`.
+    #[test]
+    fn an_unreadable_ledger_refuses_where_an_absent_one_proceeds() {
+        let f = full_load_left(5);
+        let err = load_incremental_as(&f, Ownership::Unreadable)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NOT the stateless case"),
+            "the refusal must distinguish the two empty answers, or it reads as the \
+             stateless note it replaced: {err}"
+        );
+        assert!(
+            calls(&f).is_empty(),
+            "and it must stop BEFORE the warehouse is touched: {:?}",
+            calls(&f)
+        );
+
+        // The whole-table path takes the same probe, so it refuses too — while the
+        // stateless run one line below it still proceeds.
+        assert!(
+            full_load(&full_load_left(5), Ownership::Unreadable).is_err(),
+            "a full load overwrites; an unreadable ledger must not license that"
+        );
     }
 
     fn full_load(f: &FakeLoader, ownership: Ownership) -> Result<LoadReport> {
@@ -2347,6 +2471,28 @@ mod compact_gate_tests {
         };
         assert!(note.contains("no load ledger"), "{note}");
 
+        // An UNREADABLE ledger is not an ABSENT one, and the two must not share the
+        // Note arm: `Unknown` means the operator chose to run without a ledger, while
+        // `Unreadable` means the ledger that would have said "foreign" is the thing
+        // that broke. Both used to arrive here as `Unknown`.
+        let unreadable = compact_gate(
+            ObjectKind::Table,
+            Ownership::Unreadable,
+            "p.d.t",
+            "p.d.t__changes",
+        );
+        assert!(
+            matches!(unreadable, CompactGate::Refuse(_)),
+            "an unreadable ledger must REFUSE, never proceed like a stateless run: {unreadable:?}"
+        );
+        let CompactGate::Refuse(msg) = &unreadable else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains("NOT the stateless case"),
+            "the refusal must say which of the two empty answers this is: {msg}"
+        );
+
         for (kind, ownership, wanted) in [
             (
                 ObjectKind::Absent,
@@ -2364,6 +2510,11 @@ mod compact_gate_tests {
                 Ownership::Foreign,
                 "no record of rivet loading it",
             ),
+            (
+                ObjectKind::Table,
+                Ownership::Unreadable,
+                "could not be read",
+            ),
         ] {
             let gate = compact_gate(kind, ownership, "p.d.t", "p.d.t__changes");
             let CompactGate::Refuse(msg) = gate else {
@@ -2375,5 +2526,38 @@ mod compact_gate_tests {
                 "the refusal names both tables: {msg}"
             );
         }
+    }
+
+    /// The VIEW refusal names the layout lever that actually DECIDES.
+    ///
+    /// It offered two escapes and the non-destructive one was inert on exactly the
+    /// configs rivet generates: `cdc_layout` matches a WRITTEN `load.layout:` before
+    /// it consults `cdc.backfill:`, and `rivet init` writes `layout: base_buffer` for
+    /// every compactable export. So "remove `cdc.backfill:` from the export" returned
+    /// this same refusal, and the only instruction that worked was the destructive
+    /// one — drop the view. On a `mode: incremental` export it was worse than inert:
+    /// a `cdc:` block is a config-load error there, so the key named cannot exist.
+    ///
+    /// This pins the SPELLINGS, not a fragment both would satisfy — the key with its
+    /// underscore and the block it lives in — because the assertion that let the
+    /// `--allow-source-drift` message stay wrong for months was one loose enough to
+    /// admit either form.
+    #[test]
+    fn the_view_refusal_names_the_written_layout_key_that_overrides_the_derived_one() {
+        let gate = compact_gate(ObjectKind::View, Ownership::Own, "p.d.t", "p.d.t__changes");
+        let CompactGate::Refuse(msg) = gate else {
+            panic!("a VIEW base must refuse: {gate:?}")
+        };
+        assert!(
+            msg.contains("`load.layout: log_view`"),
+            "the non-destructive escape must name the key that WINS, with its block and \
+             its underscore — a message naming only `cdc.backfill:` sends the operator \
+             to a no-op on every generated config: {msg}"
+        );
+        assert!(
+            msg.contains("WINS over `cdc.backfill:`"),
+            "and it must say WHICH lever wins, or the reader cannot tell why removing \
+             the other one changed nothing: {msg}"
+        );
     }
 }
