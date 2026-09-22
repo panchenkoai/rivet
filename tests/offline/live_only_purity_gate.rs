@@ -96,6 +96,18 @@ impl Decisions {
 /// pure function next door plus its unit test, which is what the six
 /// extractions this ledger was born from ended up as.
 const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
+    // ── qualified exclusions (`Type::f`, `<impl Tr for T>::f`) ─────────────
+    // Visible to this gate since 2026-09-23: the parser read only a bare leading
+    // identifier, so every qualified whole-function exclusion was skipped and
+    // these bodies were never counted. Entered at their counts that day.
+    ("src/bin/seed/mssql.rs::fill", 0, 0, 0, 1),
+    ("src/load/bigquery/mod.rs::append_changelog", 0, 0, 1, 0),
+    ("src/load/bigquery/mod.rs::compact", 0, 0, 0, 1),
+    ("src/load/bigquery/mod.rs::rebuild_changelog", 0, 0, 0, 1),
+    ("src/source/cdc/sink.rs::flush", 0, 0, 0, 1),
+    ("src/source/mssql/cdc.rs::fill", 1, 0, 1, 3),
+    ("src/source/mysql/cdc.rs::fill", 0, 1, 4, 0),
+    ("src/source/postgres/cdc.rs::fill", 1, 2, 4, 2),
     // ── the export RUNNERS ───────────────────────────────────────────────
     // The three big-table runners each own their execution loop, and each loop
     // is dense with pagination/plan arithmetic. These are the ceilings most
@@ -225,14 +237,11 @@ fn live_only_functions() -> Vec<(String, Option<String>)> {
         let Some(rest) = pat.strip_prefix("replace ") else {
             continue;
         };
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if name.is_empty() {
+        let (path, tail) = split_path(rest);
+        let name: String = path.rsplit("::").next().unwrap_or(path).to_string();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
-        let tail = &rest[name.len()..];
         // `replace <fn> -> <ret> with <val>` / `replace <fn> with <val>`. The
         // `-> ` and `with ` spellings are cargo-mutants', not ours.
         let ret = if let Some(after) = tail.strip_prefix(" -> ") {
@@ -268,6 +277,20 @@ fn live_only_functions() -> Vec<(String, Option<String>)> {
     out.sort();
     out.dedup();
     out
+}
+
+/// The item path of a stub entry (`f`, `Type::f`, `<impl Tr for T>::f`) and what follows it.
+fn split_path(rest: &str) -> (&str, &str) {
+    let mut depth = 0i32;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ' ' if depth == 0 => return (&rest[..i], &rest[i..]),
+            _ => {}
+        }
+    }
+    (rest, "")
 }
 
 // ── reading Rust source without being fooled by it ───────────────────────
@@ -882,7 +905,14 @@ fn the_decision_scanner_counts_operators_not_syntax() {
 fn only_whole_function_exclusions_are_read_as_live_only_claims() {
     let real = live_only_functions();
     let names: Vec<&str> = real.iter().map(|(n, _)| n.as_str()).collect();
-    for expect in ["run_pool", "check", "density_probe", "pg_run_export"] {
+    for expect in [
+        "run_pool",
+        "check",
+        "density_probe",
+        "pg_run_export",
+        "append_renamed",
+        "materialize",
+    ] {
         assert!(
             names.contains(&expect),
             "`{expect}` is excluded wholesale in .cargo/mutants.toml but this gate did not \
