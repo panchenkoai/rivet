@@ -1790,6 +1790,62 @@ mod tests {
         }
     }
 
+    /// Several writers migrating ONE database at once all succeed.
+    ///
+    /// Idempotence is not concurrency safety, and until now only the first was
+    /// held: `migration_is_idempotent` migrates TWICE on ONE connection, which the
+    /// race cannot reach. The guard is `BEGIN IMMEDIATE` in [`migrate`], taken
+    /// before the version is read; without it every thread reads version 0 and
+    /// applies the whole ladder, which measured failures in five rounds out of five
+    /// (`no such table: file_manifest`, `already another table or index with this
+    /// name: file_log`, `duplicate column name: files_committed`). That measurement
+    /// lived only in a comment — nothing would have noticed the guard's removal.
+    ///
+    /// FILE-backed, not `:memory:`, because an in-memory database is private to its
+    /// own connection: the race does not exist there at all, which is exactly why
+    /// the existing tests could not express it. The barrier makes the overlap real
+    /// rather than hoped for — four writers, the count the original measurement used.
+    #[test]
+    fn several_writers_migrating_one_database_at_once_all_succeed() {
+        const WRITERS: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let start = std::sync::Barrier::new(WRITERS);
+
+        let results: Vec<Result<()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        let conn = open_connection(&db)?;
+                        // Open first, then line up: the contention under test is the
+                        // MIGRATION, not the file open.
+                        start.wait();
+                        migrate(&conn)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a writer thread"))
+                .collect()
+        });
+
+        for (i, r) in results.iter().enumerate() {
+            assert!(
+                r.is_ok(),
+                "writer {i} of {WRITERS} failed to migrate a shared database: {:?}",
+                r.as_ref().err()
+            );
+        }
+        let conn = open_connection(&db).unwrap();
+        assert_eq!(
+            get_current_version(&conn),
+            SCHEMA_VERSION,
+            "the ladder must end at the current version exactly once, however many \
+             writers raced to apply it"
+        );
+    }
+
     #[test]
     fn legacy_db_gets_upgraded() {
         let conn = Connection::open_in_memory().unwrap();

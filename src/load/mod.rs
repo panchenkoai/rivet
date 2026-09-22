@@ -341,9 +341,10 @@ impl JobWaitTimeout {
         Self {
             message: format!(
                 "bigquery: stopped waiting for job `{job_id}` after {seconds}s — the job may \
-                 still be RUNNING in BigQuery, so check it there (INFORMATION_SCHEMA.JOBS, \
-                 label `rivet_table`) before re-running: an append mode that re-consumes the \
-                 same runs would double them"
+                 still be RUNNING in BigQuery, so check it there before re-running: \
+                 SELECT state, error_result FROM `region-<your dataset's region>`.\
+                 INFORMATION_SCHEMA.JOBS WHERE job_id = '{job_id}'. An append mode that \
+                 re-consumes the same runs would double them"
             ),
         }
     }

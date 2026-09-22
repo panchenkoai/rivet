@@ -46,8 +46,17 @@ impl GcsStore {
     }
 
     fn wrap(async_op: Operator) -> Result<Self> {
+        // CAPPED, because a store is built PER LOAD ITEM, not per run: the pin's
+        // manifest listing, the `LoadJob`, and the orphan GC each open their own,
+        // and `rivet load --pool N` runs N of those at once. Uncapped,
+        // `new_multi_thread` takes one worker thread per CORE, so a 16-worker load
+        // on a 12-core host held on the order of two hundred OS threads where the
+        // sequential loop held one runtime at a time. These ops are IO-bound calls
+        // into opendal — two workers serve them, the same cap the Mongo source
+        // already settled on.
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .map_err(|e| anyhow::anyhow!("failed to create tokio runtime for GCS ops: {e}"))?,

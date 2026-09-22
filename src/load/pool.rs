@@ -7,13 +7,26 @@
 //! per-table lease. There is therefore no `parallel_safe` notion here, and none is
 //! missing.
 //!
-//! That disjointness is not free — it is held up by `plan::reject_duplicate_target_
-//! tables`, which refuses at PLAN time two exports resolving to one warehouse object
-//! (and, for non-`Full` modes, to one `<table>__changes` buffer). Remove or weaken
-//! that refusal — or add a mode where several exports deliberately share one object —
-//! and this pool turns a formerly sequential success into an intermittent "lease is
-//! held", decided by whichever worker got there first. There is no eligibility hook
-//! here to express that; it would need one, or a pre-split of `plans`.
+//! That disjointness is not free, and it is held up on ONE side only. The warehouse
+//! OBJECT is guarded: `plan::reject_duplicate_target_tables` refuses at PLAN time two
+//! exports resolving to one table (and, for non-`Full` modes, to one
+//! `<table>__changes` buffer). Remove or weaken that refusal — or add a mode where
+//! several exports deliberately share one object — and this pool turns a formerly
+//! sequential success into an intermittent "lease is held", decided by whichever
+//! worker got there first. There is no eligibility hook here to express that; it
+//! would need one, or a pre-split of `plans`.
+//!
+//! The destination PREFIX is NOT guarded, and the difference matters because
+//! `cleanup_target` runs OUTSIDE the per-table lease in all four load paths.
+//! `reject_duplicate_target_tables` compares warehouse objects and never looks at
+//! `gcs_prefix`, and `plan::resolve_load_prefix` passes the operator's literal
+//! through — it expands `{export}`/`{table}` when written and refuses only the
+//! day-specific and run-specific tokens. Two exports with different `table:` and a
+//! hand-written IDENTICAL prefix therefore pass the plan-time refusal, share a
+//! folder, and can be cleaned concurrently. What keeps this off the floor today is
+//! `rivet init`, which writes a per-table `exports/<segment>/` prefix
+//! (`yaml_scaffold::table_export_prefix`), so a GENERATED config cannot collide —
+//! a hand-edited one can.
 //!
 //! Split out of [`super::orchestrate`] so the SCHEDULING is graded: `run_loads`
 //! is a live-only body (its whole-function mutants are excluded — nothing in an
@@ -76,14 +89,26 @@ pub(crate) fn effective_pool(requested: Option<usize>, items: usize) -> usize {
 pub(crate) fn pool_ceiling_warning(
     requested: Option<usize>,
     items: usize,
-    sqlite_state: bool,
+    ledger: LedgerKind,
 ) -> Option<String> {
     let asked = requested?;
     if asked <= MAX_POOL {
         return None;
     }
     let running = effective_pool(requested, items);
-    if sqlite_state {
+    if ledger == LedgerKind::Absent {
+        // No ledger at all — the parent's own open failed, so this run opens ZERO
+        // state connections and neither backend bound applies. Quoting Postgres
+        // `max_connections` here (which a two-valued flag did, by folding "absent"
+        // into "not SQLite") points at a database the run will never touch.
+        return Some(format!(
+            "--pool {asked} exceeds the ceiling of {MAX_POOL}; running {running} worker(s). \
+             This run has NO state ledger — its open failed above — so no ledger bound \
+             applies; what remains is the warehouse's own: BigQuery allows 100 concurrent \
+             interactive queries per PROJECT, shared with everything else running there."
+        ));
+    }
+    if ledger == LedgerKind::Sqlite {
         // Said plainly, because on SQLite the limit is not a quota that could be
         // raised — it is the storage engine. Telling an operator "capped" without
         // telling them WHY, or what to do instead, invites them to keep raising a
@@ -105,6 +130,20 @@ pub(crate) fn pool_ceiling_warning(
          own budget as well: BigQuery allows 100 concurrent interactive queries per PROJECT, \
          shared with everything else running there."
     ))
+}
+
+/// Which ledger the workers will open — including having NONE.
+///
+/// Three-valued on purpose. A `bool` for "is it SQLite" flattens the case where the
+/// PARENT's own open failed: `state_ref` is then `None`, the flag reads `false`, and
+/// the warning quotes Postgres `max_connections` at a run that will not open a single
+/// ledger connection. That is the same absent-vs-errored flattening the tri-state
+/// [`crate::load::orchestrate`] already fixed one layer up for the re-baseline guard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LedgerKind {
+    Sqlite,
+    Postgres,
+    Absent,
 }
 
 /// Whether a worker that has no ledger must REFUSE its table rather than load it.
@@ -145,7 +184,7 @@ pub(crate) fn run_workers<T, W, E, I, F, P>(
     workers: usize,
     init: I,
     work: F,
-    on_panic: P,
+    on_lost: P,
 ) -> Vec<Result<(), E>>
 where
     T: Sync,
@@ -159,7 +198,18 @@ where
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                let resource = init();
+                // `init` is caught TOO, not just `work`. It opens a state store, so
+                // it is not panic-free by construction, and a panic here unwinds
+                // straight through `thread::scope` — discarding every result the
+                // other workers had already recorded, which is the exact loss the
+                // catch below exists to prevent. This worker then simply retires;
+                // its share of the queue is taken by the survivors, and if EVERY
+                // worker retires the fill-in after the join still answers for each
+                // item rather than returning a short vector.
+                let Ok(resource) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&init))
+                else {
+                    return;
+                };
                 while let Some((i, item)) = take_next(&next, items) {
                     // A PANIC in one item must not discard what the others already
                     // did. Unwinding out of `thread::scope` skips the fold entirely,
@@ -172,13 +222,28 @@ where
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         work(&resource, i, item)
                     }))
-                    .unwrap_or_else(|_| Err(on_panic(item)));
+                    .unwrap_or_else(|_| Err(on_lost(item)));
                     done.lock().unwrap().push((i, outcome));
                 }
             });
         }
     });
     let mut out = done.into_inner().unwrap();
+    // EVERY item gets an answer, even one no worker ever reached — a `init` panic
+    // that retires a worker (or all of them) must not silently return a SHORTER
+    // vector than the caller handed in: the caller folds these into the run's
+    // failures, so a missing entry reads as a table that quietly succeeded.
+    // Unconditional, with no `out.len() < items.len()` guard in front: the loop is
+    // already a no-op when nothing is missing, and the guard was a DECISION whose
+    // `<`/`<=` forms cannot be told apart — `out.len()` never exceeds `items.len()`
+    // (each index is pushed at most once), so the two differ only where the body
+    // does nothing. Deleting it is better than excusing it in `mutants.toml`.
+    let seen: std::collections::HashSet<usize> = out.iter().map(|(i, _)| *i).collect();
+    for (i, item) in items.iter().enumerate() {
+        if !seen.contains(&i) {
+            out.push((i, Err(on_lost(item))));
+        }
+    }
     out.sort_by_key(|(i, _)| *i);
     out.into_iter().map(|(_, outcome)| outcome).collect()
 }
@@ -186,6 +251,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `init` that panics retires its worker WITHOUT losing anyone's results,
+    /// and every item is still answered.
+    ///
+    /// `catch_unwind` used to wrap `work` only, so a panic in `init` — which opens a
+    /// state store and is not panic-free by construction — unwound through
+    /// `thread::scope` and discarded every result already recorded. Both halves are
+    /// asserted because each fails differently: with ALL inits panicking the old
+    /// shape aborted the run, and a naive fix that merely returns early would hand
+    /// the caller a SHORTER vector, which folds as "those tables quietly succeeded".
+    #[test]
+    fn an_init_that_panics_loses_no_result_and_leaves_no_item_unanswered() {
+        let items: Vec<usize> = (0..5).collect();
+
+        // Every worker's init panics: nothing is ever taken from the queue, and the
+        // fill-in must still answer for each item.
+        let out = run_workers(
+            &items,
+            3,
+            || panic!("init blew up"),
+            |_: &(), _, _| Ok::<(), String>(()),
+            |item| format!("item {item} unanswered"),
+        );
+        assert_eq!(
+            out.len(),
+            items.len(),
+            "a dead init must not shorten the result vector — a missing entry folds \
+             as a table that quietly succeeded"
+        );
+        assert!(
+            out.iter().all(|r| r.is_err()),
+            "an item no worker could reach is a FAILURE, not a silent success"
+        );
+
+        // Only the FIRST worker's init panics: the survivors drain the queue, so
+        // every item is answered exactly once and none is answered twice.
+        let inits = AtomicUsize::new(0);
+        let out = run_workers(
+            &items,
+            3,
+            || {
+                if inits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("the first init blew up");
+                }
+            },
+            |_: &(), _, _| Ok::<(), String>(()),
+            |item| format!("item {item} unanswered"),
+        );
+        assert_eq!(
+            out.len(),
+            items.len(),
+            "one dead worker, still one answer each"
+        );
+        assert!(
+            out.iter().all(|r| r.is_ok()),
+            "the survivors take the retired worker's share, so nothing is refused"
+        );
+    }
 
     /// The ceiling warning fires only when the ASK exceeds it, and names both bounds.
     ///
@@ -195,15 +318,29 @@ mod tests {
     #[test]
     fn the_ceiling_warns_only_above_it_and_says_what_to_do_per_backend() {
         assert!(
-            pool_ceiling_warning(None, 50, false).is_none(),
+            pool_ceiling_warning(None, 50, LedgerKind::Postgres).is_none(),
             "no request, no warning"
         );
         assert!(
-            pool_ceiling_warning(Some(MAX_POOL), 500, false).is_none(),
+            pool_ceiling_warning(Some(MAX_POOL), 500, LedgerKind::Postgres).is_none(),
             "asking for exactly the ceiling is allowed, not excessive"
         );
 
-        let pg = pool_ceiling_warning(Some(MAX_POOL + 1), 500, false)
+        // No ledger at all: neither backend bound applies, and naming one points the
+        // operator at a database this run will never open. The two-valued flag this
+        // replaced folded `Absent` into the Postgres arm.
+        let none = pool_ceiling_warning(Some(MAX_POOL + 1), 500, LedgerKind::Absent)
+            .expect("the ceiling still binds without a ledger");
+        assert!(
+            none.contains("NO state ledger") && !none.contains("max_connections"),
+            "a run with no ledger must not be sent to a state DB's limits: {none}"
+        );
+        assert!(
+            none.contains("BigQuery"),
+            "the warehouse budget is the one that still applies: {none}"
+        );
+
+        let pg = pool_ceiling_warning(Some(MAX_POOL + 1), 500, LedgerKind::Postgres)
             .expect("one over the ceiling must warn");
         assert!(
             pg.contains(&(MAX_POOL + 1).to_string()),
@@ -215,7 +352,7 @@ mod tests {
              the error arrives from a database the operator was not thinking about: {pg}"
         );
 
-        let lite = pool_ceiling_warning(Some(MAX_POOL + 1), 500, true)
+        let lite = pool_ceiling_warning(Some(MAX_POOL + 1), 500, LedgerKind::Sqlite)
             .expect("the SQLite ledger must warn too");
         assert!(
             lite.contains("ONE writer"),

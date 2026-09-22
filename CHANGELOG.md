@@ -71,6 +71,68 @@
   extraction was verified the only way that counts: a scoped mutation run over the
   two functions reports 16 mutants, 16 caught.
 
+- **A roast of the parallel-load branch, axis by axis.** Six findings, each named
+  by the axis that could see it, and five candidates that turned out to be nothing
+  (recorded because clearing them is the work too).
+
+  *Diff scope.* The fix that told a worker it "degrades to the stateless path" was
+  half-applied: the sibling comment forty lines below still said it, beside code
+  that refuses instead. And `run_workers` caught panics from `work` but NOT from
+  `init` — which opens a state store, so it is not panic-free by construction — so
+  a panic there unwound through `thread::scope` and discarded every result the
+  other workers had already recorded. `init` is caught now, its worker retires,
+  and every item still gets an answer: a naive early return would have handed the
+  caller a SHORTER vector, which folds as "those tables quietly succeeded".
+
+  *Layer seam.* `rivet compact` could print **"2 of 1 compacted table(s) failed"**:
+  the attempt counter was incremented after the ledger-refusal check, so a refused
+  table entered the numerator and not the denominator. The sequential loop could
+  not reach that state — it had no refusal — so the pool introduced it. And
+  `pool_ceiling_warning` took a two-valued "is it SQLite" flag for a three-valued
+  reality: when the parent's own open FAILS there is no ledger at all, and the
+  warning quoted Postgres `max_connections` at a run that opens zero state
+  connections. It now takes a `LedgerKind` with an `Absent` arm.
+
+  *Message truth.* The new job-wait timeout told operators to look in
+  `INFORMATION_SCHEMA.JOBS` — a name that does not resolve as written, since the
+  view needs its region qualifier. It now prints the query to run. The fill-in path
+  above reused the panic message, so a table no worker ever reached was reported as
+  having PANICKED, inviting a bug report about code that never ran.
+
+  *Absence.* Both migration guards — Postgres's advisory lock and SQLite's `BEGIN
+  IMMEDIATE` — were born from measurements recorded in their own comments (four
+  concurrent exports; three of four dead on PG, five rounds of five failing on
+  SQLite) and **neither had a test**. Idempotence is not concurrency safety, and
+  the existing `migration_is_idempotent` migrates twice on ONE connection, which
+  the race cannot reach; the offline tests use `:memory:`, where a second writer
+  cannot exist. The pool leans on those guards sixteen times harder, so
+  `several_writers_migrating_one_database_at_once_all_succeed` now holds the SQLite
+  one: a file-backed DB, four writers, a barrier so the overlap is real.
+
+  Cleared, not fixed: orphan GC skipping a failed table and a failure being printed
+  twice (both identical to the sequential loop); the compact leg carrying no
+  `ledger_errored` (nothing consumes it there); the warehouse loader (built per
+  item, so no cache or label leaks between a worker's tables); and a ledger-refused
+  table leaving no `load_run` row (the refusal happens because there is no ledger to
+  write it with). The pool's own doc now says which half of its disjointness
+  argument is guarded: the warehouse object is, the destination PREFIX is not, and
+  what keeps that off the floor is `rivet init` writing a per-table prefix.
+
+  *Whole subsystem.* The GCS store builds a tokio runtime PER INSTANCE, and a load
+  opens one per ITEM — six sites on the production path, five of them in the load
+  orchestrator (the pin's manifest listing, the orphan GC, and each of the three
+  `LoadJob` constructions) plus the footer-batching read. Uncapped,
+  `new_multi_thread` takes one worker thread per
+  CORE, so `--pool 16` on a 12-core host held on the order of two hundred OS
+  threads where the sequential loop held one runtime at a time. These are IO-bound
+  calls into opendal, so the runtime is now capped at two workers — the cap the
+  Mongo source already settled on, and the only one that existed in the tree.
+  Nothing here corrupts data: it is scheduling pressure, which a small container
+  feels as collapse or a thread-limit failure, and no test saw it because the
+  fixtures are tiny and the machine was never saturated. The export path builds the
+  same runtime but is NOT in this blast radius — it is constructed once per
+  destination (three sites in `destination/mod.rs`), not once per item.
+
 ## 0.27.0 — 2026-09-21
 
 - **The cheat sheet was driven end to end, and corrected where it and the product

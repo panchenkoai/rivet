@@ -105,19 +105,24 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // sequential loop had one of each.
     let parent_had_state = state.is_some();
     drop(state);
-    let sqlite_state = matches!(state_ref, Some(StateRef::Sqlite(_)));
-    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), sqlite_state) {
+    let ledger = match &state_ref {
+        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
+        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
+        None => load::pool::LedgerKind::Absent,
+    };
+    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), ledger) {
         eprintln!("  warning: {w}");
     }
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
-        // A worker that cannot reconnect degrades to the stateless path AND carries
-        // the ERRORED half of the tri-state, exactly as the parent's own open does
-        // above. A bare `.ok()` here would conflate a per-worker DB blip with
-        // absent-by-design — the conflation round-9 already paid for, where the
-        // re-baseline guard note-and-proceeds a doomed post-gap baseline on the
-        // very host whose ledger just blipped.
+        // A worker that cannot reconnect carries the ERRORED half of the tri-state
+        // and is REFUSED by the work closure below — it does not degrade to the
+        // stateless path, which is reachable only through the parent's own open
+        // failing before any worker existed. A bare `.ok()` here would conflate a
+        // per-worker DB blip with absent-by-design — the conflation round-9 already
+        // paid for, where the re-baseline guard note-and-proceeds a doomed post-gap
+        // baseline on the very host whose ledger just blipped.
         || match state_ref.as_ref() {
             None => (None, ledger_errored),
             Some(r) => match StateStore::open_at_ref(r) {
@@ -265,10 +270,15 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // A panic becomes THIS table's failure, not the run's silent end. Named as
         // a bug on the way out: catching it must not disguise an abort as an
         // ordinary load error.
+        // Two ways a table ends up with no outcome of its own, and the text must
+        // fit BOTH: its load panicked, or no worker survived to take it (an `init`
+        // that panicked retires its worker). Naming only the panic sent an operator
+        // to report a bug in a table where nothing had run at all.
         |plan| {
             anyhow::anyhow!(
-                "load '{}' PANICKED — reported as this table's failure so every other \
-                 table still aggregates; the panic itself is a bug, please report it",
+                "load '{}' did not complete — it PANICKED, or no worker was left to \
+                 take it. Reported as this table's failure so every other table still \
+                 aggregates; either cause is a bug, please report it",
                 plan.table
             )
         },
@@ -1479,8 +1489,12 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     // had one of each.
     let parent_had_state = state.is_some();
     drop(state);
-    let sqlite_state = matches!(state_ref, Some(StateRef::Sqlite(_)));
-    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), sqlite_state) {
+    let ledger = match &state_ref {
+        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
+        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
+        None => load::pool::LedgerKind::Absent,
+    };
+    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), ledger) {
         eprintln!("  warning: {w}");
     }
     let outcomes = load::pool::run_workers(
@@ -1504,6 +1518,15 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 eprintln!("  compact [{}]: skipped — {why}", plan.table);
                 return Ok(());
             }
+            // Counted BEFORE the refusal below, not after: a refused table IS an
+            // attempt — the run took it up and then refused it — and it becomes a
+            // FAILURE in the fold. Counting it only on the far side of the refusal
+            // let the numerator include tables the denominator did not, so a run
+            // that refused two of three printed "2 of 1 compacted table(s) failed".
+            // The sequential loop could not reach that state: it had no refusal, so
+            // `n <= attempted` held by construction. A table the skip gate above
+            // dropped is still NOT an attempt, which is why this sits below it.
+            attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // AFTER the skip gate on purpose: a table this run would not compact
             // anyway needs no ledger, so refusing it would be noise. One that WOULD
             // compact must not proceed without a lease — `rivet load` may hold it,
@@ -1517,7 +1540,6 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                     plan.table
                 );
             }
-            attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let load_id = format!("{run_id}:{}", plan.table);
             let outcome = (|| -> Result<()> {
                 let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
@@ -1598,8 +1620,9 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         },
         |plan| {
             anyhow::anyhow!(
-                "compact '{}' PANICKED — reported as this table's failure so every other \
-                 table still aggregates; the panic itself is a bug, please report it",
+                "compact '{}' did not complete — it PANICKED, or no worker was left to \
+                 take it. Reported as this table's failure so every other table still \
+                 aggregates; either cause is a bug, please report it",
                 plan.table
             )
         },
@@ -1617,6 +1640,12 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     match failures.len() {
         0 => Ok(()),
         1 => Err(failures.pop().unwrap()),
+        // COVERAGE, stated rather than implied: nothing calls `run_compacts` but
+        // `dispatch`, and no test — offline or live — drives this aggregate. The
+        // `n <= attempted` fix above is therefore correct by READING only. A unit
+        // test over the formatter would grade correct logic on inputs the supplier
+        // never produces (the ordering INSIDE the worker is the defect surface), so
+        // the honest close is a live compact whose ledger drops mid-run.
         n => anyhow::bail!(
             "{n} of {attempted} compacted table(s) failed: {}",
             failures
