@@ -717,19 +717,8 @@ pub fn init(
     };
     if !needs_cursor.is_empty() {
         eprintln!(
-            "rivet: {} export(s) have no timestamp column, so `{}` cannot give them a \
-             `{}:` — the config will NOT load until you set one for each \
-             (search for `{}`), or re-run init excluding them (`--exclude {}`): {}",
-            needs_cursor.len(),
-            mode_override.unwrap_or("this mode"),
-            if mode_override == Some("time_window") {
-                "time_column"
-            } else {
-                "cursor_column"
-            },
-            yaml_scaffold::INIT_CURSOR_REVIEW_MARKER,
-            needs_cursor.join(" "),
-            needs_cursor.join(", "),
+            "{}",
+            cursor_missing_message(&needs_cursor, mode_override, table.is_none())
         );
     }
     let runnable = needs_cursor.is_empty();
@@ -1088,6 +1077,31 @@ fn mark_mssql_catalog_exact(info: &mut TableInfo) {
         k: 0,
         w: 0,
     });
+}
+
+/// The line naming every export init could not give a cursor, with the ways out that apply to this invocation.
+fn cursor_missing_message(names: &[String], mode: Option<&str>, whole_schema: bool) -> String {
+    let key = if mode == Some("time_window") {
+        "time_column"
+    } else {
+        "cursor_column"
+    };
+    let way_out = if whole_schema {
+        format!(
+            ", or re-run init excluding them (`--exclude {}`)",
+            names.join(" ")
+        )
+    } else {
+        ", or re-run init with another `--mode`".to_string()
+    };
+    format!(
+        "rivet: {} export(s) have no timestamp column, so `{}` cannot give them a `{key}:` — \
+         the config will NOT load until you set one for each (search for `{}`){way_out}: {}",
+        names.len(),
+        mode.unwrap_or("this mode"),
+        yaml_scaffold::INIT_CURSOR_REVIEW_MARKER,
+        names.join(", "),
+    )
 }
 
 /// One line per informational marker, naming every export that carries it.
@@ -1529,6 +1543,22 @@ mod tests {
     }
 
     /// Every export that needs a cursor is named at once, read from the scaffold text.
+    #[test]
+    fn the_cursor_message_offers_exclude_only_to_a_whole_schema_init() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let schema = cursor_missing_message(&names, Some("incremental"), true);
+        assert!(schema.contains("(`--exclude a b`)"), "{schema}");
+        let one = cursor_missing_message(&names[..1], Some("time_window"), false);
+        assert!(
+            !one.contains("--exclude"),
+            "`--exclude` is ignored with `--table`: {one}"
+        );
+        assert!(
+            one.contains("`time_column:`") && one.contains("another `--mode`"),
+            "{one}"
+        );
+    }
+
     #[test]
     fn exports_needing_a_cursor_names_every_one_of_them() {
         use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_marked};

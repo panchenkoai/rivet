@@ -117,9 +117,8 @@ pub(crate) fn pool_ceiling_warning(
             "--pool {asked} exceeds the ceiling of {MAX_POOL}; running {running} worker(s). \
              On a SQLite ledger rivet cannot usefully go higher in any case: WAL gives many \
              readers but exactly ONE writer, so workers queue on the write lock and stop \
-             gaining past that point. If you want more parallelism than this, move the state \
-             to Postgres (set RIVET_STATE_URL) — there the bound is `max_connections`, not a \
-             single writer."
+             gaining past that point. The ceiling is {MAX_POOL} on every backend: a Postgres \
+             state store removes the single writer, not the ceiling."
         ));
     }
     Some(format!(
@@ -376,13 +375,13 @@ mod tests {
         let lite = pool_ceiling_warning(Some(MAX_POOL + 1), 500, LedgerKind::Sqlite)
             .expect("the SQLite ledger must warn too");
         assert!(
-            lite.contains("ONE writer"),
-            "on SQLite the limit is the storage engine, not a quota — say so: {lite}"
+            lite.contains(&format!("The ceiling is {MAX_POOL} on every backend"))
+                && !lite.contains("RIVET_STATE_URL"),
+            "moving the state to Postgres buys no workers past the ceiling: {lite}"
         );
         assert!(
-            lite.contains("RIVET_STATE_URL"),
-            "and say what to do instead, or the operator keeps raising a number that \
-             cannot help: {lite}"
+            lite.contains("ONE writer"),
+            "on SQLite the limit is the storage engine, not a quota — say so: {lite}"
         );
     }
 

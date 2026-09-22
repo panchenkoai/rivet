@@ -744,6 +744,7 @@ fn build_plans_keyed(
         let (renames, rename_warnings) =
             fold_lookalike_columns(&export.name, load, &mut specs, |file, latin| {
                 source_rename_action(cfg.source.source_type, source_table, file, latin)
+                    + &config_keys_note(export, file)
             })?;
 
         // The meta columns rivet writes at EXTRACTION are in every Parquet part
@@ -813,8 +814,18 @@ fn build_plans_keyed(
         let recorded_pk: Option<Vec<String>> = keys
             .get(&(export.name.clone(), unit))
             .map(|k| k.iter().map(|c| folded(c)).collect());
-        let (pk, cluster_by) =
+        let (pk, mut cluster_by) =
             resolve_keys(&export.name, &eff_load, recorded_pk.as_deref(), &specs, fit)?;
+        let mut rename_warnings = rename_warnings;
+        if matches!(eff_load.cluster_by, KeyColumns::Auto) {
+            for col in unclustered_renames(&mut cluster_by, &renames) {
+                rename_warnings.push(format!(
+                    "  note: export `{}`: `{col}` is left out of the automatic clustering — \
+                     a renamed column cannot shape the staging table the rename goes through",
+                    export.name
+                ));
+            }
+        }
         let partition = resolve_partition(&export.name, &eff_load, mode, &specs, fit)?;
         refuse_renamed_shape_column(&export.name, &renames, partition.as_ref(), &cluster_by)?;
         let clustering = match eff_load.cluster_by {
@@ -940,6 +951,32 @@ fn fold_lookalike_columns(
     Ok((renames, warnings))
 }
 
+/// The export's own config keys that name `file` and must be renamed with it; empty when none do.
+fn config_keys_note(export: &crate::config::ExportConfig, file: &str) -> String {
+    let mut keys: Vec<&str> = [
+        ("cursor_column", export.cursor_column.as_deref()),
+        ("chunk_column", export.chunk_column.as_deref()),
+        ("chunk_by_key", export.chunk_by_key.as_deref()),
+    ]
+    .into_iter()
+    .filter(|(_, v)| *v == Some(file))
+    .map(|(k, _)| k)
+    .collect();
+    if export.columns.contains_key(file) {
+        keys.push("columns");
+    }
+    if keys.is_empty() {
+        return String::new();
+    }
+    format!(
+        " — and rename it in the export's {} in the same edit, or the next `rivet run` fails",
+        keys.iter()
+            .map(|k| format!("`{k}:`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// The statement that renames `file` to `latin` on the source, or the alias for a query export.
 fn source_rename_action(
     source: crate::config::SourceType,
@@ -958,16 +995,34 @@ fn source_rename_action(
     };
     let qualified = table.split('.').map(quote).collect::<Vec<_>>().join(".");
     match source {
-        SourceType::Postgres | SourceType::Mysql => format!(
+        SourceType::Postgres => format!(
             "ALTER TABLE {qualified} RENAME COLUMN {} TO {};",
             quote(file),
             quote(latin)
         ),
-        SourceType::Mssql => format!("EXEC sp_rename N'{table}.{file}', N'{latin}', N'COLUMN';"),
+        SourceType::Mysql => format!(
+            "ALTER TABLE {qualified} RENAME COLUMN {f} TO {l}; (MySQL 8.0.3+; on 5.7: ALTER \
+             TABLE {qualified} CHANGE {f} {l} <its full column definition>;)",
+            f = quote(file),
+            l = quote(latin)
+        ),
+        SourceType::Mssql => format!(
+            "EXEC sp_rename N'{table}.{file}', N'{latin}', N'COLUMN'; (on a table enabled for \
+             change data capture, disable its capture instance first and re-enable it after)"
+        ),
         SourceType::Mongo => {
             format!("db.{table}.updateMany({{}}, {{$rename: {{\"{file}\": \"{latin}\"}}}})")
         }
     }
+}
+
+/// Drops renamed columns from an automatic clustering, returning the ones dropped.
+fn unclustered_renames(cluster_by: &mut Vec<String>, renames: &[Rename]) -> Vec<String> {
+    let (dropped, kept) = std::mem::take(cluster_by)
+        .into_iter()
+        .partition(|c| renames.iter().any(|(_, latin)| latin == c));
+    *cluster_by = kept;
+    dropped
 }
 
 /// Refuses a partition or cluster column that is itself renamed: the staging table the rename needs cannot be shaped on it.
@@ -1253,6 +1308,7 @@ fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
         if !matches!(mode, LoadMode::Full) {
             objects.push(format!("{t}__changes"));
             objects.push(format!("{t}__changes__staging"));
+            objects.push(format!("{t}__changes__merging"));
         }
         for o in objects {
             if let Some(prior) = seen.insert(o.clone(), t) {
@@ -2499,9 +2555,33 @@ load:
         let mut keys = RecordedKeys::new();
         keys.insert(("purchases".into(), None), vec!["\u{456}d".into()]);
         let auto = lookalike_cfg("auto");
-        let err = build_plans_keyed(
+        let auto_plan = build_plans_keyed(
             &auto,
             auto.load.as_ref().unwrap(),
+            reports(),
+            &keys,
+            SpecFit::Strict,
+        )
+        .expect("an automatic clustering leaves the renamed key out instead of refusing")
+        .pop()
+        .unwrap();
+        assert!(
+            auto_plan.clustering.columns().is_empty(),
+            "{:?}",
+            auto_plan.clustering
+        );
+        assert!(
+            auto_plan
+                .rename_warnings
+                .iter()
+                .any(|w| w.contains("`id` is left out of the automatic clustering")),
+            "{:?}",
+            auto_plan.rename_warnings
+        );
+        let written = lookalike_cfg("[id]");
+        let err = build_plans_keyed(
+            &written,
+            written.load.as_ref().unwrap(),
             reports(),
             &keys,
             SpecFit::Strict,
@@ -2510,7 +2590,7 @@ load:
         .to_string();
         assert!(
             err.contains("`id` partitions or clusters"),
-            "auto clusters on the renamed key: {err}"
+            "a WRITTEN clustering on the renamed key is still refused: {err}"
         );
         let cfg = lookalike_cfg("none");
         let plan = build_plans_keyed(
@@ -2617,17 +2697,27 @@ load:
             .unwrap();
         assert_eq!(plan.cursor_column.as_deref(), Some("updated_at"));
         assert_eq!(plan.pk, vec!["id".to_string()]);
+        assert!(
+            plan.rename_warnings.iter().any(|w| w.ends_with(
+                "— and rename it in the export's `cursor_column:` in the same edit, or the next \
+                 `rivet run` fails"
+            )),
+            "{:?}",
+            plan.rename_warnings
+        );
     }
 
     #[test]
-    fn an_append_load_reserves_the_staging_table_its_rename_creates() {
-        let err = reject_duplicate_target_tables(&[
-            ("orders", LoadMode::Incremental),
-            ("orders__changes__staging", LoadMode::Full),
-        ])
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("orders__changes__staging"), "{err}");
+    fn an_append_load_reserves_the_staging_and_merging_tables_it_creates() {
+        for name in ["orders__changes__staging", "orders__changes__merging"] {
+            let err = reject_duplicate_target_tables(&[
+                ("orders", LoadMode::Incremental),
+                (name, LoadMode::Full),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(name), "{err}");
+        }
     }
 
     #[test]
@@ -2660,7 +2750,9 @@ load:
         let act = |src, table| source_rename_action(src, table, "\u{441}omment", "comment");
         assert_eq!(
             act(SourceType::Mysql, Some("shop.purchases")),
-            "ALTER TABLE `shop`.`purchases` RENAME COLUMN `\u{441}omment` TO `comment`;"
+            "ALTER TABLE `shop`.`purchases` RENAME COLUMN `\u{441}omment` TO `comment`; (MySQL \
+             8.0.3+; on 5.7: ALTER TABLE `shop`.`purchases` CHANGE `\u{441}omment` `comment` \
+             <its full column definition>;)"
         );
         assert_eq!(
             act(SourceType::Postgres, Some("purchases")),
@@ -2668,7 +2760,9 @@ load:
         );
         assert_eq!(
             act(SourceType::Mssql, Some("dbo.purchases")),
-            "EXEC sp_rename N'dbo.purchases.\u{441}omment', N'comment', N'COLUMN';"
+            "EXEC sp_rename N'dbo.purchases.\u{441}omment', N'comment', N'COLUMN'; (on a \
+             table enabled for change data capture, disable its capture instance first and \
+             re-enable it after)"
         );
         assert_eq!(
             act(SourceType::Mongo, Some("purchases")),
