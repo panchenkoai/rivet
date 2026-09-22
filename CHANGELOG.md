@@ -109,6 +109,20 @@
   `several_writers_migrating_one_database_at_once_all_succeed` now holds the SQLite
   one: a file-backed DB, four writers, a barrier so the overlap is real.
 
+  The Postgres half followed, once it was clear the stand could hold it:
+  `pg_several_writers_migrating_one_database_at_once_all_succeed` races four
+  writers through `StateStore::open_at_ref` — the seam the pool's workers use,
+  which migrates inside — against a database created FRESH for the test. Fresh is
+  the entire fixture: migrating an already-migrated database is a no-op ladder, so
+  the writers never contend and the test would pass against a DELETED lock. Its
+  oracle is two-sided because the guard fails two ways — every writer returns `Ok`,
+  AND no version has duplicate rows in `rivet_schema_version`, which is the
+  double-apply signature that survives both clients reporting success. RED-proven
+  by replacing the `pg_advisory_lock` call with `SELECT 1`: writer 0 of 4 dies with
+  `state(pg): create version table: db error`, the same failure the guard's comment
+  had recorded from four concurrent exports — now reproduced by a test rather than
+  remembered by a comment.
+
   Cleared, not fixed: orphan GC skipping a failed table and a failure being printed
   twice (both identical to the sequential loop); the compact leg carrying no
   `ledger_errored` (nothing consumes it there); the warehouse loader (built per

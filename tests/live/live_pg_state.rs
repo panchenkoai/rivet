@@ -411,3 +411,140 @@ fn pg_load_spec_round_trips() {
         None
     );
 }
+
+/// A database created for one test and dropped when it ends, however it ends.
+struct ScratchDb {
+    admin_url: String,
+    name: String,
+}
+
+impl ScratchDb {
+    /// `CREATE DATABASE` on the server `admin_url` points at, returning `None`
+    /// when the url is not one this can take apart.
+    fn create(admin_url: &str, name: &str) -> Option<Self> {
+        admin_url.rsplit_once('/')?;
+        let mut admin = postgres::Client::connect(admin_url, postgres::NoTls).ok()?;
+        let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE);"));
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name};"))
+            .unwrap_or_else(|e| panic!("creating the scratch database {name}: {e:#}"));
+        Some(Self {
+            admin_url: admin_url.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    fn url(&self) -> String {
+        let (base, _) = self.admin_url.rsplit_once('/').expect("checked in create");
+        format!("{base}/{}", self.name)
+    }
+}
+
+impl Drop for ScratchDb {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = postgres::Client::connect(&self.admin_url, postgres::NoTls) {
+            let _ = admin.batch_execute(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE);",
+                self.name
+            ));
+        }
+    }
+}
+
+/// PARITY, and the half the roast left open: several writers migrating ONE
+/// Postgres state database at once all succeed.
+///
+/// The SQLite sibling (`several_writers_migrating_one_database_at_once_all_succeed`,
+/// `src/state/mod.rs`) can live inline because its race fits in a tempdir. This one
+/// needs the stand, which is exactly why it was missing while the guard it grades —
+/// `pg_advisory_lock(PG_MIGRATION_LOCK)` in `migrate_pg` — carried a MEASUREMENT in
+/// its own comment and no test: four concurrent exports against an empty schema,
+/// three of the four dead at the very first statement with `state(pg): create
+/// version table`. `rivet load --pool 16` leans on it sixteen times harder.
+///
+/// Two fixture facts decide whether this grades anything at all:
+///
+/// 1. **The database must be FRESH.** Migrating an already-migrated database is a
+///    no-op ladder, so the writers never contend and the test passes against a
+///    deleted lock. Hence the scratch database rather than the gate's own, which
+///    has been migrated since the stand came up.
+/// 2. **Open, THEN line up.** The barrier sits after `Client::connect` so the
+///    contention under test is the MIGRATION, not the TCP handshake.
+///
+/// The oracle is two-sided because the guard fails in two directions. All four
+/// writers returning `Ok` is the first side. The second is the version ladder
+/// itself: `migrate_pg_locked` reads `MAX(version)` and INSERTS a row per applied
+/// migration, so two clients that both read version N and both applied N+1 leave
+/// TWO rows for N+1 — a duplicate is the signature of the double-apply the lock
+/// exists to prevent, and it survives even when both clients report success.
+#[test]
+#[ignore]
+fn pg_several_writers_migrating_one_database_at_once_all_succeed() {
+    use rivet::state::{StateRef, StateStore};
+    const WRITERS: usize = 4;
+
+    let Ok(admin_url) = std::env::var("RIVET_TEST_STATE_URL") else {
+        return;
+    };
+    if !admin_url.starts_with("postgres") {
+        return;
+    }
+    let name = format!(
+        "rivet_migrace_{}",
+        chrono::Utc::now().timestamp_micros().unsigned_abs()
+    );
+    let Some(scratch) = ScratchDb::create(&admin_url, &name) else {
+        return;
+    };
+    let url = scratch.url();
+
+    let start = std::sync::Barrier::new(WRITERS);
+    let results: Vec<anyhow::Result<()>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let url = url.clone();
+                let start = &start;
+                s.spawn(move || {
+                    // Line up AFTER the connect, so the overlap is the migration.
+                    let conn = postgres::Client::connect(&url, postgres::NoTls)
+                        .map_err(|e| anyhow::anyhow!("connect: {e:#}"))?;
+                    drop(conn);
+                    start.wait();
+                    // `open_at_ref` is the seam the pool's workers use, and it
+                    // migrates inside — so this races the real entry point, not a
+                    // private helper.
+                    StateStore::open_at_ref(&StateRef::Postgres(url.clone())).map(|_| ())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a writer thread"))
+            .collect()
+    });
+
+    for (i, r) in results.iter().enumerate() {
+        assert!(
+            r.is_ok(),
+            "writer {i} of {WRITERS} failed to migrate a shared Postgres state database: {:?}",
+            r.as_ref().err()
+        );
+    }
+
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).expect("read the ladder back");
+    let dupes: Vec<(i64, i64)> = check
+        .query(
+            "SELECT version, COUNT(*) FROM rivet_schema_version \
+             GROUP BY version HAVING COUNT(*) > 1 ORDER BY version",
+            &[],
+        )
+        .expect("group the version ladder")
+        .iter()
+        .map(|r| (r.get(0), r.get::<_, i64>(1)))
+        .collect();
+    assert!(
+        dupes.is_empty(),
+        "every migration must be applied exactly ONCE however many writers raced; \
+         these versions have duplicate rows (version, times applied): {dupes:?}"
+    );
+}
