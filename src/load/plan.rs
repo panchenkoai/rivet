@@ -1046,7 +1046,23 @@ pub(crate) fn base_type(target_type: &str) -> String {
 fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
     let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
     for (t, mode) in plans {
-        let mut objects = vec![t.to_string()];
+        // Every warehouse name a load can CREATE belongs here, not just the target.
+        // `__staging` is the third: a whole-table pass whose Parquet exceeds one
+        // job's partition budget lands through `<t>__staging` — `DROP TABLE IF
+        // EXISTS`, refill, CLONE onto the target, `DROP TABLE` — and none of it is
+        // behind `ensure_own`, which gates the TARGET fqtn only. So a source table
+        // literally named `orders__staging` beside `orders` was destroyed by
+        // `orders`' own load, silently, both exports exiting 0. `__staging` is an
+        // ordinary schema name (dbt's package prefixes produce it), so this is a
+        // naming collision, not an exotic identifier.
+        //
+        // Reserved under EVERY mode, deliberately: `materialize` is reached from
+        // `load_one` (full), `load_one_incremental` (the first pass) AND
+        // `load_one_cdc_base` (the baseline leg), so the staging name is not
+        // full-only. A config holding both names is already broken today — the
+        // destruction happens whenever the sibling's load splits into batches — so
+        // refusing it loudly costs nothing that was working.
+        let mut objects = vec![t.to_string(), format!("{t}__staging")];
         if !matches!(mode, LoadMode::Full) {
             objects.push(format!("{t}__changes"));
         }
@@ -1868,6 +1884,49 @@ load:
         // Two append exports on different tables occupy four distinct objects.
         assert!(
             reject_duplicate_target_tables(&[("orders", Cdc), ("events", Incremental)]).is_ok()
+        );
+    }
+
+    /// `<table>__staging` is a warehouse name a load CREATES, so it is reserved too.
+    ///
+    /// A whole-table pass whose Parquet exceeds one job's partition budget lands
+    /// through `<t>__staging`: `DROP TABLE IF EXISTS`, refill, CLONE onto the target,
+    /// `DROP TABLE`. None of that is behind `ensure_own` — that gates the TARGET fqtn
+    /// — so a source table literally named `orders__staging` beside `orders` was
+    /// destroyed by `orders`' own load, with both exports exiting 0. It is an ordinary
+    /// schema name (dbt's package prefixes produce exactly this), not an exotic
+    /// identifier.
+    ///
+    /// EVERY mode, deliberately. The hunt scoped this to `full`; reading the callers
+    /// says otherwise — `materialize` is reached from `load_one` (full),
+    /// `load_one_incremental` (the first pass) and `load_one_cdc_base` (the baseline
+    /// leg) alike, so a full-only reservation would leave two of the three paths able
+    /// to destroy the sibling.
+    ///
+    /// RED against dropping `format!("{t}__staging")` from the object list.
+    #[test]
+    fn reject_duplicate_target_tables_reserves_the_staging_name_in_every_mode() {
+        use LoadMode::{Cdc, Full, Incremental};
+        for mode in [Full, Incremental, Cdc] {
+            let err =
+                reject_duplicate_target_tables(&[("orders", mode), ("orders__staging", Full)])
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("orders__staging"),
+                "{mode:?}: the staging name a load creates must collide with an export \
+                 that targets it: {err}"
+            );
+            // Order-independent, like its `__changes` sibling.
+            assert!(
+                reject_duplicate_target_tables(&[("orders__staging", Full), ("orders", mode)])
+                    .is_err(),
+                "{mode:?}: order-independent"
+            );
+        }
+        // And it does not invent collisions between unrelated tables.
+        assert!(
+            reject_duplicate_target_tables(&[("orders", Full), ("events__staging", Full)]).is_ok()
         );
     }
 
