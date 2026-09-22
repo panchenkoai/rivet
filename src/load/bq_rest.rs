@@ -530,7 +530,7 @@ fn shared_adc_source(
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     static SOURCES: OnceLock<Mutex<HashMap<String, Arc<BlockingAdcTokenSource>>>> = OnceLock::new();
-    let key = format!("{}|{}", creds.credential_kind(), creds.principal());
+    let key = creds.cache_key();
     let mut sources = SOURCES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -965,21 +965,21 @@ mod tests {
     /// Clients built for different tables share one token source per principal.
     #[test]
     fn clients_for_one_principal_share_one_token_source() {
-        let adc = |id: &str| {
+        let adc = |refresh: &str| {
             crate::destination::gcs_auth::parse_adc_file(&format!(
-                r#"{{"type":"authorized_user","client_id":"{id}","client_secret":"s","refresh_token":"r"}}"#
+                r#"{{"type":"authorized_user","client_id":"gcloud-shared-client","client_secret":"s","refresh_token":"{refresh}"}}"#
             ))
             .unwrap()
             .unwrap()
         };
         let http = reqwest::blocking::Client::new();
-        let a = super::shared_adc_source(adc("shared-principal"), &http);
-        let b = super::shared_adc_source(adc("shared-principal"), &http);
-        let other = super::shared_adc_source(adc("another-principal"), &http);
-        assert!(std::sync::Arc::ptr_eq(&a, &b), "one principal, one cache");
+        let a = super::shared_adc_source(adc("user-a-refresh"), &http);
+        let b = super::shared_adc_source(adc("user-a-refresh"), &http);
+        let other = super::shared_adc_source(adc("user-b-refresh"), &http);
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "one identity, one cache");
         assert!(
             !std::sync::Arc::ptr_eq(&a, &other),
-            "two principals never share a token"
+            "two gcloud users share the OAuth client id and must still not share a token"
         );
     }
 

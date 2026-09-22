@@ -188,6 +188,20 @@ impl AdcCredentials {
         }
     }
 
+    /// A key that tells two identities apart even when they share a public principal (every `gcloud` user login shares one OAuth client id); never logged.
+    pub(crate) fn cache_key(&self) -> String {
+        let secret = match self {
+            Self::User(u) => u.refresh_token.as_bytes(),
+            Self::ServiceAccount(sa) => sa.private_key_pem.as_bytes(),
+        };
+        format!(
+            "{}|{}|{:016x}",
+            self.credential_kind(),
+            self.principal(),
+            xxhash_rust::xxh3::xxh3_64(secret)
+        )
+    }
+
     /// The project billed for API quota, when the credential names one. A
     /// service account is billable on its own, so it never does — and it must
     /// not be given a fabricated one (see
