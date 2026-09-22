@@ -665,6 +665,59 @@ fn cleanup_target<'a>(
     }
 }
 
+/// [`cleanup_target`], plus the PREFIX lease the delete has to hold while it runs.
+///
+/// The table lease dies with `execute_load`'s frame, and the cleanup runs AFTER
+/// that — so load A could finish, release the table, and only then wipe the prefix,
+/// while load B of the SAME table had already taken the freed lease and begun
+/// reading the manifests A was about to delete. A scheduler whose cycles overlap is
+/// all it takes; `prefix_has_active_run` cannot see it, because it reads
+/// `run_status`, which only EXTRACT runs write.
+///
+/// A separate PREFIX lease rather than a longer table lease, deliberately: widening
+/// the table lease would hold it across network deletes and lengthen the window in
+/// which `rivet compact` is refused, for a resource compact never touches.
+///
+/// Every answer but "held" cancels the delete. Stateless is the exception and stays
+/// as it was — there is no lease to take and no second rivet to coordinate with, so
+/// refusing there would break the documented stateless path for nothing.
+fn cleanup_target_leased<'a>(
+    plan: &'a load::plan::LoadPlan,
+    store: &'a crate::destination::gcs::GcsStore,
+    state: Option<&'a StateStore>,
+) -> (
+    Option<(&'a crate::destination::gcs::GcsStore, &'a str)>,
+    Option<crate::state::LoadLease<'a>>,
+) {
+    let target = cleanup_target(plan, store, state);
+    if target.is_none() {
+        return (None, None);
+    }
+    let Some(s) = state else {
+        return (target, None);
+    };
+    match s.try_load_lease(&plan.gcs_prefix) {
+        Ok(Some(lease)) => (target, Some(lease)),
+        Ok(None) => {
+            eprintln!(
+                "  cleanup [{}]: SKIPPED — another rivet holds {} right now. The load itself \
+                 succeeded; only the staged Parquet is left in place, and the next load with \
+                 `cleanup_source` removes it.",
+                plan.table, plan.gcs_prefix
+            );
+            (None, None)
+        }
+        Err(e) => {
+            eprintln!(
+                "  cleanup [{}]: SKIPPED — could not take the prefix lease on {} ({e:#}). \
+                 Not deleting what cannot be confirmed idle; the load itself succeeded.",
+                plan.table, plan.gcs_prefix
+            );
+            (None, None)
+        }
+    }
+}
+
 /// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):
 /// delete staged `.parquet` no `Success` manifest references — an interrupted
 /// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
@@ -1432,7 +1485,7 @@ fn load_one_cdc_base(
             if let Some(uris) = buffer_uris(stream_uris) {
                 let manifests: Vec<_> = stream.iter().map(|(_, m)| m.clone()).collect();
                 let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
-                let cleanup = cleanup_target(plan, store, state);
+                let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
                 let r = load::run_load_buffer(
                     loader,
                     &plan.table,
@@ -2286,7 +2339,7 @@ fn load_one_cdc(
             }
             // The driver gates the appended delta against the manifests' summed
             // `row_count` and cleans up (only) after the gate passes.
-            let cleanup = cleanup_target(plan, store, state);
+            let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
             let report = load::run_load_cdc(
                 loader,
                 &plan.table,
@@ -2524,10 +2577,10 @@ fn load_one_incremental(
                     first.1.run_id,
                     loader.fqtn(&plan.table)
                 );
-                let cleanup = if has_deltas {
-                    None
+                let (cleanup, _prefix_lease) = if has_deltas {
+                    (None, None)
                 } else {
-                    cleanup_target(plan, store, state)
+                    cleanup_target_leased(plan, store, state)
                 };
                 // The base carries the delete flag as DATA, like a CDC baseline:
                 // the buffer's tombstones flip it, and the column must exist from
@@ -2563,7 +2616,7 @@ fn load_one_incremental(
                 } else {
                     inputs.ownership
                 };
-                let cleanup = cleanup_target(plan, store, state);
+                let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
                 let r = if base_and_buffer {
                     load::run_load_buffer(
                         loader,
@@ -2642,7 +2695,7 @@ fn load_one(
             );
         },
         |loader, store, inputs, _legs| {
-            let cleanup = cleanup_target(plan, store, state);
+            let (cleanup, _prefix_lease) = cleanup_target_leased(plan, store, state);
             let report = load::run_load(
                 loader,
                 &plan.table,
@@ -4077,6 +4130,63 @@ mod live_only_decisions {
             cleanup_target(&plan, &store, Some(&live)).is_none(),
             "a run is writing here — the recursive delete must be refused"
         );
+    }
+
+    /// The recursive delete holds a PREFIX lease, and skips when it cannot get one.
+    ///
+    /// The table lease dies with `execute_load`'s frame and the cleanup runs after
+    /// it, so load A could finish, release the table, and only then wipe the prefix —
+    /// while load B of the SAME table had already taken the freed lease and begun
+    /// reading the manifests A was about to delete. A scheduler whose cycles overlap
+    /// is all it takes, and `prefix_has_active_run` cannot see it: that reads
+    /// `run_status`, which only EXTRACT runs write.
+    ///
+    /// A SEPARATE prefix lease rather than a longer table lease, deliberately —
+    /// widening the table lease would hold it across network deletes and lengthen the
+    /// window in which `rivet compact` is refused, for a resource compact never
+    /// touches.
+    ///
+    /// RED against calling `cleanup_target` directly at the five production sites.
+    #[test]
+    fn the_cleanup_delete_takes_a_prefix_lease_and_skips_when_another_rivet_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        let state = StateStore::open_in_memory().unwrap();
+        let mut plan = plan_at(LoadMode::Full, prefix);
+        plan.load.cleanup_source = true;
+
+        // Idle: the delete proceeds AND the lease is held while it does.
+        let (target, lease) = cleanup_target_leased(&plan, &store, Some(&state));
+        assert_eq!(target.map(|(_, p)| p), Some(prefix));
+        assert!(
+            lease.is_some(),
+            "the delete must HOLD the prefix, not merely check it"
+        );
+
+        // Held by someone else: no delete. The load itself already succeeded, so
+        // leaving the staged Parquet is the safe half of the trade.
+        let (blocked, no_lease) = cleanup_target_leased(&plan, &store, Some(&state));
+        assert!(
+            blocked.is_none() && no_lease.is_none(),
+            "a prefix another rivet holds must not be wiped: {:?}",
+            blocked.map(|(_, p)| p)
+        );
+
+        // Released with the holder, as every rivet lease is.
+        drop(lease);
+        let (again, _) = cleanup_target_leased(&plan, &store, Some(&state));
+        assert_eq!(
+            again.map(|(_, p)| p),
+            Some(prefix),
+            "the lease is released with its holder — the next load cleans up normally"
+        );
+
+        // Stateless is unchanged: no lease to take, no second rivet to coordinate
+        // with, and refusing would break the documented stateless path for nothing.
+        let (stateless, none) = cleanup_target_leased(&plan, &store, None);
+        assert_eq!(stateless.map(|(_, p)| p), Some(prefix));
+        assert!(none.is_none());
     }
 
     /// Orphan GC over a real store, both directions. Kills `replace
