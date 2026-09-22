@@ -131,16 +131,15 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // paid for, where the re-baseline guard note-and-proceeds a doomed post-gap
         // baseline on the very host whose ledger just blipped.
         || match state_ref.as_ref() {
-            None => (None, ledger_errored),
+            None => Some((None, ledger_errored)),
             Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => (Some(s), ledger_errored),
+                Ok(s) => Some((Some(s), ledger_errored)),
                 Err(e) => {
                     eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); \
-                         its table is REFUSED below — the run started WITH a ledger, \
-                         so this worker may not load unleased and unrecorded"
+                        "  warning: state store unavailable to this worker ({e:#}); it takes \
+                         no table — the other workers load the queue"
                     );
-                    (None, true)
+                    None
                 }
             },
         },
@@ -283,9 +282,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // to report a bug in a table where nothing had run at all.
         |plan| {
             anyhow::anyhow!(
-                "load '{}' did not complete — it PANICKED, or no worker was left to \
-                 take it. Reported as this table's failure so every other table still \
-                 aggregates; either cause is a bug, please report it",
+                "load '{}' did not complete — it PANICKED (a bug, please report it), or \
+                 no worker was left to take it (each one panicked or could not reopen the \
+                 state ledger — see the warnings above). Reported as this table's failure \
+                 so every other table still aggregates",
                 plan.table
             )
         },
@@ -1751,13 +1751,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
         || match state_ref.as_ref() {
-            None => None,
+            None => Some(None),
             Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => Some(s),
+                Ok(s) => Some(Some(s)),
                 Err(e) => {
                     eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); \
-                         its table is REFUSED below unless this run would skip it anyway"
+                        "  warning: state store unavailable to this worker ({e:#}); it takes \
+                         no table — the other workers compact the queue"
                     );
                     None
                 }
@@ -1893,9 +1893,10 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         },
         |plan| {
             anyhow::anyhow!(
-                "compact '{}' did not complete — it PANICKED, or no worker was left to \
-                 take it. Reported as this table's failure so every other table still \
-                 aggregates; either cause is a bug, please report it",
+                "compact '{}' did not complete — it PANICKED (a bug, please report it), or \
+                 no worker was left to take it (each one panicked or could not reopen the \
+                 state ledger — see the warnings above). Reported as this table's failure \
+                 so every other table still aggregates",
                 plan.table
             )
         },

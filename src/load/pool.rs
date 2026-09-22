@@ -190,7 +190,7 @@ pub(crate) fn run_workers<T, W, E, I, F, P>(
 where
     T: Sync,
     E: Send,
-    I: Fn() -> W + Sync,
+    I: Fn() -> Option<W> + Sync,
     F: Fn(&W, usize, &T) -> Result<(), E> + Sync,
     P: Fn(&T) -> E + Sync,
 {
@@ -207,7 +207,8 @@ where
                 // its share of the queue is taken by the survivors, and if EVERY
                 // worker retires the fill-in after the join still answers for each
                 // item rather than returning a short vector.
-                let Ok(resource) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&init))
+                let Ok(Some(resource)) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(&init))
                 else {
                     return;
                 };
@@ -263,6 +264,24 @@ mod tests {
     /// shape aborted the run, and a naive fix that merely returns early would hand
     /// the caller a SHORTER vector, which folds as "those tables quietly succeeded".
     #[test]
+    fn a_worker_whose_init_declines_takes_nothing_and_the_others_drain_the_queue() {
+        let items: Vec<usize> = (0..20).collect();
+        let inits = AtomicUsize::new(0);
+        let out = run_workers(
+            &items,
+            3,
+            || (inits.fetch_add(1, Ordering::SeqCst) != 0).then_some(()),
+            |_: &(), _, _| Ok::<(), String>(()),
+            |item| format!("item {item} unanswered"),
+        );
+        assert_eq!(out.len(), items.len());
+        assert!(
+            out.iter().all(Result::is_ok),
+            "the declined worker must not answer for any item: {out:?}"
+        );
+    }
+
+    #[test]
     fn an_init_that_panics_loses_no_result_and_leaves_no_item_unanswered() {
         let items: Vec<usize> = (0..5).collect();
 
@@ -296,6 +315,7 @@ mod tests {
                 if inits.fetch_add(1, Ordering::SeqCst) == 0 {
                     panic!("the first init blew up");
                 }
+                Some(())
             },
             |_: &(), _, _| Ok::<(), String>(()),
             |item| format!("item {item} unanswered"),
@@ -456,7 +476,7 @@ mod tests {
             let out = run_workers(
                 &items,
                 effective_pool(Some(workers), items.len()),
-                || (),
+                || Some(()),
                 |_, i, item| {
                     assert_eq!(i, *item, "the index must address its own item");
                     seen.lock().unwrap().push(i);
@@ -488,7 +508,7 @@ mod tests {
         let out = run_workers(
             &items,
             2,
-            || (),
+            || Some(()),
             |_, i, _| {
                 ran.lock().unwrap().push(i);
                 if i % 2 == 0 {
@@ -533,7 +553,7 @@ mod tests {
         let out = run_workers(
             &items,
             2,
-            || (),
+            || Some(()),
             |_, i, _| {
                 if i == 1 {
                     one_is_done.store(true, Ordering::Release);
@@ -563,7 +583,7 @@ mod tests {
         run_workers(
             &items,
             effective_pool(Some(1), items.len()),
-            || (),
+            || Some(()),
             |_, i, _| {
                 order.lock().unwrap().push(i);
                 Ok::<(), String>(())
@@ -590,6 +610,7 @@ mod tests {
             3,
             || {
                 inits.fetch_add(1, Ordering::Relaxed);
+                Some(())
             },
             |_, _, _| Ok::<(), String>(()),
             |item| format!("item {item} panicked"),
@@ -608,7 +629,7 @@ mod tests {
         let out = run_workers(
             &items,
             effective_pool(Some(4), items.len()),
-            || (),
+            || Some(()),
             |_, _, _| Ok::<(), String>(()),
             |item| format!("item {item} panicked"),
         );
@@ -636,7 +657,7 @@ mod tests {
         let out = run_workers(
             &items,
             2,
-            || (),
+            || Some(()),
             |_, i, _| {
                 if i == 3 {
                     panic!("boom in item 3");
