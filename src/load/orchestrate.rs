@@ -1224,6 +1224,11 @@ impl LoadCtx<'_> {
     fn record_skip(&self) {
         self.record(&[], 0, "success");
     }
+
+    /// About to touch the warehouse. Survives only a process that DIED here.
+    fn record_writing(&self) {
+        self.record(&[], 0, "writing");
+    }
     /// The load errored after consuming `run_ids`.
     #[cfg(test)]
     fn record_failed(&self, run_ids: &[String]) {
@@ -1322,8 +1327,21 @@ fn execute_load<R>(
     // disposable buffer takes no partition, so its files are not its business.
     let budgeted = budgeted_uris(job.plan.layout, &inputs.runs, &inputs.uris);
     let (rows, report) = match load::before_write(partition_budget_ok(store, job.plan, &budgeted))
-        .and_then(|()| run(&**loader, store, &inputs, &mut legs))
-    {
+        .and_then(|()| {
+            // The crash marker, written between the LAST pre-write check and the
+            // write itself. Without it a load killed after the warehouse write and
+            // before its closing row left NO row at all, so `has_load_attempt`
+            // answered false and the table rivet had just created read as FOREIGN —
+            // refused for ever, on a remedy ("drop or rename it") that tells the
+            // operator to destroy their own data. It bites the FIRST-ever load into
+            // a table, since after that some row always exists.
+            //
+            // It is replaced, never accumulated: the closing row shares this
+            // `load_id`, so the ledger still holds exactly one audit row per load and
+            // a `writing` row can only survive a process that died.
+            ctx.record_writing();
+            run(&**loader, store, &inputs, &mut legs)
+        }) {
         Ok(v) => v,
         Err(e) => {
             let remaining = remaining_run_ids(&inputs.source_run_ids, &legs.consumed);
@@ -3143,6 +3161,75 @@ mod live_only_decisions {
         let boom = anyhow::anyhow!("count validation failed");
         assert_eq!(closing_status(&boom, &[]), "failed");
         assert_eq!(closing_status(&boom, &["run-a".to_string()]), "failed");
+    }
+
+    /// A `LoadCtx` over an arbitrary target — the sibling helper in the other test
+    /// module is pinned to one table, and the ownership question is per-table.
+    fn ctx_for<'a>(state: &'a StateStore, load_id: &'a str, target: &'a str) -> LoadCtx<'a> {
+        LoadCtx {
+            state: Some(state),
+            load_id,
+            export_name: "orders",
+            target_fqtn: target,
+            warehouse: "bigquery",
+            mode: LoadMode::Cdc,
+            source_prefix: "gs://b/exports/orders/",
+            source_ident: String::new(),
+            active_at_fetch: Some(Default::default()),
+            marker_active: Default::default(),
+        }
+    }
+
+    /// A load killed mid-write leaves evidence, so its table is not disowned.
+    ///
+    /// The window is between the warehouse write and the closing ledger row. With no
+    /// row at all, `has_load_attempt` answers false, the table rivet JUST CREATED
+    /// reads as `Foreign`, and the refusal tells the operator to "drop or rename it"
+    /// — their own data. It bites the FIRST-ever load into a table; after that some
+    /// row always exists, which is why it hid.
+    ///
+    /// `writing` counts for the same reason `failed` does: both mean rivet may have
+    /// touched the table. It is REPLACED by the closing row on every path that
+    /// survives — same `load_id` — so the ledger still holds exactly one audit row
+    /// per load, and a `writing` row can only be seen after a process died.
+    #[test]
+    fn a_crash_between_the_write_and_the_ledger_row_does_not_disown_the_table() {
+        let state = StateStore::open_in_memory().unwrap();
+        let target = "p.d.orders";
+        let ctx = ctx_for(&state, "load-crash", target);
+
+        assert!(
+            !state.has_load_attempt(target).unwrap(),
+            "nothing has touched it yet"
+        );
+
+        // …the process dies here, right after the warehouse write.
+        ctx.record_writing();
+        assert!(
+            state.has_load_attempt(target).unwrap(),
+            "a load that reached the warehouse must leave the table rivet's own, or the \
+             retry is refused for ever with no remedy but dropping the data"
+        );
+        assert_eq!(
+            state.recent_loads(Some(target), 10).unwrap().len(),
+            1,
+            "one audit row, as always"
+        );
+
+        // A survivor REPLACES the marker, so `writing` is never the resting state.
+        ctx.record(&["r1".to_string()], 7, "success");
+        let loads = state.recent_loads(Some(target), 10).unwrap();
+        assert_eq!(loads.len(), 1, "still one row: the marker was replaced");
+        assert_eq!(loads[0].status, "success");
+
+        // And a stop BEFORE any write still disowns nothing it should not: a fresh
+        // target whose only row is `refused` is not rivet's own.
+        let other = "p.d.untouched";
+        ctx_for(&state, "load-refused", other).record(&[], 0, "refused");
+        assert!(
+            !state.has_load_attempt(other).unwrap(),
+            "a refusal is a stop before the write and must not claim the table"
+        );
     }
 
     /// COMPACT's pre-merge stops are refusals too — the sibling of
