@@ -284,6 +284,108 @@ fn a_generated_config_drives_run_load_compact_into_the_warehouse_mssql() {
     warehouse_chain(SqlEngine::Mssql, "init_chain_ms");
 }
 
+/// A compaction whose job died after renaming the buffer to `<t>__changes__merging`
+/// leaves rows in no base and no buffer; the next `compact` must merge them and drop
+/// the leftover. The dead job is reproduced by making that rename by hand.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_compaction_left_half_done_is_finished_by_the_next_one() {
+    let Some(bq) = BqLive::from_env("init_merging") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _table_guard) = e.create(
+        "init_merging",
+        "id BIGINT PRIMARY KEY, v TEXT NOT NULL, changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(1,10) g"
+    ));
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "incremental",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
+    let changes = format!("{export}__changes");
+    let merging = format!("{export}__changes__merging");
+    let _bq_guard = bq.cleanup(&[&export, &changes, &merging]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+    let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
+
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    e.exec(&format!(
+        "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(11,12) g"
+    ));
+    e.exec(&format!(
+        "UPDATE {table} SET v = 'upd3', changed_at = now() WHERE id = 3"
+    ));
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(bq.read_bq_count(&changes), "3", "the delta is buffered");
+    let renamed = std::process::Command::new("bq")
+        .arg(format!("--project_id={}", bq.project))
+        .args(["query", "--use_legacy_sql=false"])
+        .arg(format!(
+            "ALTER TABLE {} RENAME TO `{merging}`",
+            fq(&changes)
+        ))
+        .output()
+        .expect("`bq query` must run");
+    assert!(
+        renamed.status.success(),
+        "the dead job's rename could not be reproduced: {}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the dead job took the buffer's name"
+    );
+
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("left over from a compaction"), "{said}");
+    assert!(
+        said.contains("COMPACT OK"),
+        "the recovered merge is reported as work: {said}"
+    );
+    assert!(
+        bq.read_bq_table_type(&merging).is_none(),
+        "the leftover is dropped"
+    );
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNTIF(id = 3 AND v = 'upd3') AS updated FROM {}",
+        fq(&export)
+    ));
+    assert_eq!(
+        rows[0]["n"].as_str(),
+        Some("12"),
+        "the two inserts reached the base"
+    );
+    assert_eq!(
+        rows[0]["updated"].as_str(),
+        Some("1"),
+        "the UPDATE reached the base"
+    );
+}
+
 /// One export init cannot give a cursor must not cost the others their recorded key:
 /// a whole-schema `--mode incremental` scaffold over a stamped table and a stamp-less
 /// one records BOTH primary keys (recording used to validate the whole config first,
