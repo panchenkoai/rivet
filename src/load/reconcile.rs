@@ -103,6 +103,25 @@ pub fn fetch_manifests_keyed(
         .map(dedupe_by_run_id)
 }
 
+/// Is the object at `key` STILL a `running` marker, read now rather than from the
+/// census snapshot?
+///
+/// The marker sweep classifies from `keyed`, which the CALLER fetched, and deletes
+/// after the parquet pass — a gap wide enough for run R to finish and PUT its
+/// TERMINAL manifest over the same key. The sweep would then delete a `Success`
+/// manifest, and the parts it declared become unmanifested, which the very next gc
+/// collects as debris. A PUT that lands AFTER the delete merely recreates the key
+/// and is harmless, so the window — not the classification — is the defect.
+///
+/// Unreadable or unparseable answers `false`: this decides a DELETE, so anything
+/// short of "I can see it is still a live marker" must spare it.
+fn still_a_running_marker(store: &GcsStore, key: &str) -> bool {
+    store.read(key).is_ok_and(|bytes| {
+        serde_json::from_slice::<RunManifest>(&bytes)
+            .is_ok_and(|m| m.status == ManifestStatus::Running)
+    })
+}
+
 /// Full `gs://` URIs of the parquet to load for `new` (the not-yet-loaded run
 /// manifests), preferring each manifest's own parts over a blanket listing.
 /// See [`select_load_keys`] for the selection rule.
@@ -310,6 +329,12 @@ pub fn gc_orphans(
         let dead_by_ledger = dead_marker_run_ids.contains(&run.manifest.run_id);
         if run.manifest.status == ManifestStatus::Running
             && (census.superseded(run) || dead_by_ledger)
+            // Re-read at the LAST moment. Everything above was decided from a
+            // snapshot the caller took before the parquet pass, and the run may
+            // have finished since — writing its TERMINAL manifest over this very
+            // key. Deleting that loses a `Success` manifest, and the parts it
+            // declared become unmanifested debris the next gc collects.
+            && still_a_running_marker(store, run.key)
         {
             removed_bytes += store.stat_size(run.key).unwrap_or(0);
             store.remove(run.key)?;
@@ -1657,14 +1682,12 @@ mod tests {
         // plain overlap, either could be live — NEITHER marker is swept, because
         // deleting a live run's marker mid-flight destroys the one signal that
         // protects its unmanifested parts from the next cross-host gc.
-        let (store, _g) = fs_store(&[
-            ("base/manifest-r1.json", b"{}".to_vec()), // superseded running marker
-            ("base/manifest-r2.json", b"{}".to_vec()), // the successor's manifest
-        ]);
-        let r1 = running("r1", "2026-01-01T00:00:01Z");
+        let r1 = running("r1", "2026-01-01T00:00:01Z"); // superseded running marker
         let mut ok = manifest("r2", 10, Some(10)); // Success, same export
         ok.started_at = "2026-01-01T00:00:02Z".into();
         let r2 = ("base/manifest-r2.json".to_string(), ok);
+        // Real bodies, not `{}`: the sweep re-reads before deleting.
+        let (store, _g) = fs_store(&[planted(&r1), planted(&r2)]);
         let (removed, _) =
             gc_orphans(&store, "gs://b/base", &[r1, r2], true, &Default::default()).unwrap();
         assert_eq!(removed, 1, "only the superseded running marker is removed");
@@ -1703,14 +1726,14 @@ mod tests {
     /// ledger still calls running (or an empty set — the stateless caller)
     /// keeps the conservative supersession-only sweep. RED against removing
     /// `|| dead_by_ledger`.
+
     #[test]
     fn the_sweep_retires_a_running_marker_whose_ledger_row_is_terminal() {
-        let (store, _g) = fs_store(&[
-            ("base/manifest-r1.json", b"{}".to_vec()),
-            ("base/manifest-r2.json", b"{}".to_vec()),
-        ]);
         let r1 = running("r1", "2026-01-01T00:00:01Z");
         let r2 = running("r2", "2026-01-01T00:00:02Z");
+        // Planted as their REAL bodies: the sweep re-reads the object before it
+        // deletes, so a `{}` placeholder would describe a key the product never wrote.
+        let (store, _g) = fs_store(&[planted(&r1), planted(&r2)]);
         let dead = std::collections::HashSet::from(["r1".to_string()]);
         let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true, &dead).unwrap();
         assert_eq!(removed, 1, "only the ledger-terminal marker is swept");
@@ -1719,6 +1742,47 @@ mod tests {
         assert!(
             left.iter().any(|k| k.ends_with("manifest-r2.json")),
             "a marker the ledger still calls running survives"
+        );
+    }
+
+    /// A marker that FINISHED between the census and the sweep is spared.
+    ///
+    /// gc classifies from `keyed`, which the CALLER fetched, and deletes at the end —
+    /// after the parquet pass, which is the slow part. That gap is wide enough for run
+    /// R to finish and PUT its TERMINAL manifest over the same key, and the sweep
+    /// would then delete a `Success` manifest. The parts it declared become
+    /// unmanifested, and the very next gc collects them as crash debris. A PUT that
+    /// lands AFTER the delete merely recreates the key and is harmless — so the WINDOW
+    /// is the defect, not the classification, and the only fix is to read at the last
+    /// moment rather than to reason harder from the snapshot.
+    ///
+    /// The fixture is the race itself: the census says `Running` (the stale view) and
+    /// the object says `Success` (what is there now). RED against deleting on the
+    /// snapshot's word.
+    #[test]
+    fn the_sweep_spares_a_marker_that_finished_after_the_census_was_taken() {
+        let stale = running("r1", "2026-01-01T00:00:01Z");
+        // What the run actually wrote while gc was busy with the parquet pass.
+        let mut done = manifest("r1", 10, Some(10));
+        done.started_at = "2026-01-01T00:00:01Z".into();
+        let (store, _g) =
+            fs_store(&[("base/manifest-r1.json", serde_json::to_vec(&done).unwrap())]);
+
+        let dead = std::collections::HashSet::from(["r1".to_string()]);
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[stale], true, &dead).unwrap();
+
+        assert_eq!(
+            removed, 0,
+            "the ledger says terminal and the SNAPSHOT says running — but the object is \
+             now a Success manifest, and deleting it orphans every part it declares"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("manifest-r1.json")),
+            "the terminal manifest survives"
         );
     }
 
@@ -2078,6 +2142,17 @@ mod tests {
         }
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         (store, dir)
+    }
+
+    /// The `(key, body)` pair for a census entry — the object the product would
+    /// really have written at that key.
+    ///
+    /// Planting `{}` instead describes a state rivet cannot produce: a key whose
+    /// body disagrees with the manifest the census carries for it. That went
+    /// unnoticed while nothing read the body, and stopped being harmless the moment
+    /// the marker sweep began re-reading it before deleting.
+    fn planted(entry: &(String, RunManifest)) -> (&str, Vec<u8>) {
+        (entry.0.as_str(), serde_json::to_vec(&entry.1).unwrap())
     }
 
     fn manifest_bytes(run: &str, rows: i64, source: Option<i64>) -> Vec<u8> {
