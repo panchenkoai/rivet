@@ -219,9 +219,27 @@ fn meta_spec(name: &str, ty: &str) -> TargetColumnSpec {
 }
 
 /// The soft-delete flag column the view exposes: `true` when the latest change
-/// for a PK was a delete. In rivet's reserved `__` namespace so it can never
-/// collide with a source column (a plain `is_deleted` might).
+/// for a PK was a delete. In rivet's reserved `__` namespace so a plain
+/// `is_deleted` source column cannot collide with it — see
+/// [`is_reserved_column`], which is what makes "reserved" true rather than
+/// merely intended.
 pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
+
+/// Every name rivet OWNS in a changelog or base+buffer table.
+///
+/// The vocabulary lived in two places — [`is_meta_column`]'s three names and
+/// [`DELETE_FLAG_COLUMN`] — and neither was ever checked against the SOURCE's
+/// columns, while this constant's own doc claimed the `__` namespace meant a
+/// collision "can never" happen. Nothing enforced that. A source column named
+/// `__op`/`__pos`/`__seq` is filtered straight out of a MERGE's carried set by
+/// `is_meta_column`, so its values vanish; one named `__is_deleted` is worse,
+/// because `merge_inputs` infers the tombstone arm from that name being PRESENT
+/// and so turns soft-delete semantics on for a column the source owns.
+///
+/// One predicate owns the whole vocabulary now, and `check_spec_fit` asks it.
+pub(crate) fn is_reserved_column(name: &str) -> bool {
+    is_meta_column(name) || name == DELETE_FLAG_COLUMN
+}
 
 /// The base table's delete flag as a column spec, appended to the source columns
 /// of a base-and-buffer load (the baseline Parquet carries it as `false`).

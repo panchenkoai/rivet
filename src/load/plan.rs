@@ -563,6 +563,34 @@ const NOT_A_COLUMN: &str = "is not a column of the export";
 /// The strict fit check a deferred plan still owes: every key, clustering and
 /// partition column is a column of the spec it is typed from.
 pub fn check_spec_fit(plan: &LoadPlan) -> Result<()> {
+    // A delta mode writes a changelog or a base+buffer table, and BOTH carry rivet's
+    // reserved `__` columns. A SOURCE column of the same name is silently destructive
+    // there and in two different ways: `__op`/`__pos`/`__seq` are filtered out of a
+    // MERGE's carried set by `is_meta_column`, so their values vanish; `__is_deleted`
+    // is worse, because `merge_inputs` reads that name being PRESENT as "this table
+    // has soft-delete semantics" and turns the tombstone arm on for a column the
+    // source owns. `DELETE_FLAG_COLUMN`'s own doc claimed the `__` namespace meant a
+    // collision "can never" happen — this is what makes that true.
+    //
+    // `full` is exempt: it overwrites with source columns only and never builds the
+    // vocabulary, so refusing there would break configs that work.
+    if !matches!(plan.mode, LoadMode::Full)
+        && let Some(s) = plan
+            .specs
+            .iter()
+            .find(|s| crate::load::cdc::is_reserved_column(&s.column_name))
+    {
+        bail!(
+            "export `{}`: the source has a column named `{}`, which is a name rivet OWNS in \
+             a `{}` load's changelog and base tables. Its values would not survive the merge \
+             (and `__is_deleted` would switch on soft-delete semantics for rows the source \
+             controls). Rename or exclude the column in the export's query, or load this \
+             table with `mode: full`, where rivet builds no such columns.",
+            plan.export_name,
+            s.column_name,
+            plan.mode.ledger_str(),
+        );
+    }
     let has = |c: &str| plan.specs.iter().any(|s| s.column_name == c);
     if let Some(m) = plan.pk.iter().find(|c| !has(c)) {
         bail!(
@@ -1416,6 +1444,75 @@ load:
             .pop()
             .unwrap();
         check_spec_fit(&fitted).expect("nothing owed");
+
+        // A SOURCE column in rivet's reserved `__` vocabulary is refused on a delta
+        // mode — see `a_source_column_in_rivets_reserved_namespace_is_refused` for why
+        // silence here is destructive. Reuses this plan rather than rebuilding one.
+        for name in ["__op", "__pos", "__seq", "__is_deleted"] {
+            let mut clashing = fitted.clone();
+            clashing.mode = LoadMode::Cdc;
+            clashing.specs.push(crate::load::cdc::flag_spec(
+                crate::load::cdc::Warehouse::BigQuery,
+            ));
+            clashing.specs.last_mut().unwrap().column_name = name.to_string();
+            let err = check_spec_fit(&clashing).unwrap_err().to_string();
+            assert!(
+                err.contains(name) && err.contains("rivet OWNS"),
+                "`{name}` must be refused by name: {err}"
+            );
+            // `full` builds none of that vocabulary, so it must stay loadable.
+            clashing.mode = LoadMode::Full;
+            check_spec_fit(&clashing).unwrap_or_else(|e| {
+                panic!("a full load overwrites with source columns only — `{name}` is just a column there: {e}")
+            });
+        }
+
+        // NON-VACUITY: rivet's OWN enrich columns live in the `_rivet_` namespace, not
+        // `__`, and must never trip this. Without this arm the guard could refuse every
+        // delta plan rivet itself builds and the loop above would still pass.
+        let mut enriched = fitted.clone();
+        enriched.mode = LoadMode::Cdc;
+        enriched.specs.push(crate::load::cdc::flag_spec(
+            crate::load::cdc::Warehouse::BigQuery,
+        ));
+        enriched.specs.last_mut().unwrap().column_name = crate::enrich::COL_ROW_HASH.to_string();
+        check_spec_fit(&enriched)
+            .expect("`_rivet_row_hash` is rivet's own enrich column, a different namespace");
+    }
+
+    /// The reserved `__` vocabulary is one predicate, and it holds all four names.
+    ///
+    /// It used to live in two places — `is_meta_column`'s three and
+    /// `DELETE_FLAG_COLUMN` — and neither was ever compared against the SOURCE's
+    /// columns, while `DELETE_FLAG_COLUMN`'s own doc claimed a collision "can never"
+    /// happen. A comment beside a thing is not a guard.
+    ///
+    /// The two harms differ, which is why all four are refused rather than just the
+    /// flag: `__op`/`__pos`/`__seq` are filtered out of a MERGE's carried set by
+    /// `is_meta_column`, so a source column of that name loses its VALUES silently;
+    /// `__is_deleted` instead makes `merge_inputs` infer soft-delete SEMANTICS for a
+    /// column the source controls.
+    #[test]
+    fn a_source_column_in_rivets_reserved_namespace_is_refused() {
+        use crate::load::cdc::is_reserved_column;
+        for owned in ["__op", "__pos", "__seq", "__is_deleted"] {
+            assert!(is_reserved_column(owned), "{owned} is rivet's");
+        }
+        for theirs in [
+            "id",
+            "is_deleted",
+            "op",
+            "_op",
+            "__opx",
+            "_rivet_row_hash",
+            "_rivet_exported_at",
+        ] {
+            assert!(
+                !is_reserved_column(theirs),
+                "{theirs} belongs to the source (or to the `_rivet_` enrich namespace) \
+                 and must stay loadable"
+            );
+        }
     }
 
     #[test]
