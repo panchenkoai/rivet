@@ -284,6 +284,48 @@ fn a_generated_config_drives_run_load_compact_into_the_warehouse_mssql() {
     warehouse_chain(SqlEngine::Mssql, "init_chain_ms");
 }
 
+/// One export init cannot give a cursor must not cost the others their recorded key:
+/// a whole-schema `--mode incremental` scaffold over a stamped table and a stamp-less
+/// one records BOTH primary keys (recording used to validate the whole config first,
+/// and the stamp-less export's missing `cursor_column:` left every export keyless).
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_export_init_cannot_give_a_cursor_does_not_cost_the_others_their_key() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (stamped, _g1) = e.create(
+        "init_keys_stamped",
+        "id BIGINT PRIMARY KEY, changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    let (stampless, _g2) = e.create("init_keys_stampless", "code TEXT PRIMARY KEY, v TEXT");
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg = dir.path().join("rivet.yaml");
+    let out = run_rivet(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--schema",
+        "public",
+        "--include",
+        &stamped,
+        &stampless,
+        "--mode",
+        "incremental",
+        "--output",
+        cfg.to_str().unwrap(),
+    ]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "rivet init failed:\n{said}");
+    assert!(
+        said.contains(&stampless) && said.contains("have no timestamp column"),
+        "the fixture must really leave one export without a cursor: {said}"
+    );
+    let state = StateDb::next_to_config(&cfg);
+    let key = |t: &str| state.load_spec(t, None).and_then(|(_, k)| k);
+    assert_eq!(key(&stamped), Some(vec!["id".to_string()]));
+    assert_eq!(key(&stampless), Some(vec!["code".to_string()]));
+}
+
 /// A source column spelled with a Cyrillic look-alike (`сomment`, U+0441) lands as
 /// `comment` through the base load, the buffer append and the compaction, with no
 /// NULL anywhere: BigQuery matches Parquet columns by name, so a rename that only
