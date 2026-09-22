@@ -1199,6 +1199,46 @@ pub fn plan_compact_merges(
 /// Partitions one MERGE statement may touch (BigQuery's cap per DML statement).
 pub const MERGE_PARTITION_CAP: usize = 4000;
 
+/// Rename the LIVE buffer out of the way as the script's first act.
+///
+/// The scripted compaction is ONE BigQuery job, and a BigQuery job OUTLIVES the
+/// client that submitted it. So a compact killed after submission kept running
+/// server-side while its LEASE — a `flock` sidecar or a session advisory lock —
+/// died with the process. `rivet load` then took that lease, appended into
+/// `<t>__changes`, and MARKED THOSE RUNS LOADED; the abandoned script's trailing
+/// `DROP TABLE <t>__changes` destroyed them, and a marked-loaded run is never
+/// read again. Silent loss, and no clock or timeout can see it.
+///
+/// Renaming first closes it by CONSTRUCTION rather than by timing: after the
+/// rename the live name is free, `append_changelog` recreates it on its next use
+/// ("Idempotent: created once, appended forever"), and the abandoned script goes
+/// on to merge and drop a table nothing else writes to.
+///
+/// The name is DETERMINISTIC, which is what makes recovery possible — a job that
+/// dies BETWEEN the rename and the drop leaves rows that only a later compact can
+/// find. It must merge that table FIRST; see `compact`'s recovery step. A
+/// run-unique name would make each such leftover invisible instead.
+#[derive(Clone, Copy)]
+pub struct CompactRename<'a> {
+    /// The live buffer, fully qualified — what the script renames AWAY.
+    pub from_fqtn: &'a str,
+    /// The bare table name it becomes. Bare because BigQuery's `RENAME TO` takes
+    /// an unqualified name, and passed in rather than parsed out of the fqtn
+    /// because a table name may itself contain a dot.
+    pub to_bare: &'a str,
+}
+
+/// The `ALTER TABLE … RENAME TO …` line, or nothing on the recovery pass.
+///
+/// It lands AFTER the `DECLARE`s: BigQuery requires variable declarations at the
+/// start of a script, so the rename cannot be literally first — only first among
+/// the statements that touch a table, which is what matters.
+fn rename_stmt(rename: Option<CompactRename<'_>>) -> String {
+    rename.map_or_else(String::new, |r| {
+        format!("ALTER TABLE `{}` RENAME TO `{}`;\n", r.from_fqtn, r.to_bare)
+    })
+}
+
 /// ONE multi-statement job that compacts a base whose partition key is a DAY
 /// column — or no key at all — and drops the buffer: the probe, the MERGEs and
 /// the DROP are statements of one script, so a cycle costs one round trip and one
@@ -1211,12 +1251,14 @@ pub const MERGE_PARTITION_CAP: usize = 4000;
 pub fn compact_script_sql(
     base_fqtn: &str,
     changes_fqtn: &str,
+    rename: Option<CompactRename<'_>>,
     specs: &[TargetColumnSpec],
     pk: &[String],
     order: impl Into<CompactOrder>,
     day_column: Option<&str>,
 ) -> String {
     let order = order.into();
+    let rename = rename_stmt(rename);
     let (columns, pk_refs, deleted_flag) = merge_inputs(specs, pk);
     let merge = |filter: &MergeFilter| {
         compact_merge_filtered_sql(
@@ -1232,6 +1274,7 @@ pub fn compact_script_sql(
     let Some(col) = day_column else {
         return format!(
             "DECLARE n INT64 DEFAULT 0;\n\
+             {rename}\
              SET n = (SELECT COUNT(*) FROM `{changes_fqtn}`);\n\
              IF n > 0 THEN\n{merge_all}\nEND IF;\n\
              DROP TABLE `{changes_fqtn}`;\n\
@@ -1255,6 +1298,7 @@ pub fn compact_script_sql(
          DECLARE chunk ARRAY<DATE>;\n\
          DECLARE i INT64 DEFAULT 0;\n\
          DECLARE jobs INT64 DEFAULT 0;\n\
+         {rename}\
          SET (n, null_keys) = (SELECT AS STRUCT COUNT(*), COUNTIF(`{col}` IS NULL) FROM `{changes_fqtn}`);\n\
          SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM ({touched}));\n\
          WHILE i < ARRAY_LENGTH(days) DO\n\
@@ -1276,6 +1320,87 @@ mod compact_tests {
     use super::*;
     use crate::load::plan::{Granularity, PartitionKey};
 
+    /// The script renames the LIVE buffer away first, and never drops it by name.
+    ///
+    /// A BigQuery job outlives the client that submitted it; a `flock` sidecar or a
+    /// session advisory lock does not. So a compact killed after submission kept
+    /// merging server-side while its lease died, `rivet load` took that lease,
+    /// appended into `<t>__changes` and MARKED THOSE RUNS LOADED — and the abandoned
+    /// script's trailing `DROP TABLE <t>__changes` destroyed them. A marked-loaded run
+    /// is never read again, so the loss is silent and no timeout can see it.
+    ///
+    /// The fix is structural, not a timing window narrowed: once the live name is
+    /// renamed away, `append_changelog` recreates it for the next load and the
+    /// abandoned script goes on to drop a table nothing else writes to.
+    ///
+    /// The load-bearing assertion is the NEGATIVE one — the live name must appear
+    /// EXACTLY once, in the rename, and never in the DROP. Asserting that the rename
+    /// is present would pass just as well on a script that renamed and then dropped
+    /// the live buffer anyway.
+    ///
+    /// SCOPE, stated because it is a real gap rather than an oversight: this pins the
+    /// BUILDER. Whether the ADAPTER hands it the merging name and the rename — rather
+    /// than the live name and `None`, which is the pre-fix shape and compiles fine —
+    /// is not graded offline. There is no seam that captures the SQL `compact` sends
+    /// without a live BigQuery (`bq_rest`'s stub listener covers the REST transport,
+    /// not the loader's statements), so the argument wiring is covered only by the
+    /// live compaction cells.
+    #[test]
+    fn the_compaction_script_renames_the_live_buffer_away_before_it_merges() {
+        let script = |rename| {
+            compact_script_sql(
+                "p.d.t",
+                "p.d.t__changes__merging",
+                rename,
+                &specs(),
+                &["id".to_string()],
+                SourceEngine::MySql,
+                Some("created_at"),
+            )
+        };
+        let renaming = script(Some(CompactRename {
+            from_fqtn: "p.d.t__changes",
+            to_bare: "t__changes__merging",
+        }));
+
+        assert!(
+            renaming.contains("ALTER TABLE `p.d.t__changes` RENAME TO `t__changes__merging`;"),
+            "the live buffer is renamed away: {renaming}"
+        );
+        assert_eq!(
+            renaming.matches("`p.d.t__changes`").count(),
+            1,
+            "the LIVE name may appear only in the rename — every later statement must \
+             work on the merging table, or an abandoned job still destroys a buffer a \
+             concurrent load has refilled: {renaming}"
+        );
+        assert!(
+            renaming.contains("DROP TABLE `p.d.t__changes__merging`;"),
+            "and the DROP takes the renamed table: {renaming}"
+        );
+        // The rename must precede every statement that touches a table. It cannot be
+        // literally first — BigQuery requires DECLAREs at the top of a script.
+        let alter = renaming.find("ALTER TABLE").expect("the rename");
+        for stmt in ["SET (n, null_keys)", "MERGE", "DROP TABLE"] {
+            assert!(
+                renaming.find(stmt).expect(stmt) > alter,
+                "`{stmt}` must come after the rename: {renaming}"
+            );
+        }
+
+        // RECOVERY pass: the table was renamed by the run that died, so there is
+        // nothing left to rename and the script must emit no ALTER at all.
+        let recovering = script(None);
+        assert!(
+            !recovering.contains("ALTER TABLE"),
+            "a recovery pass merges an ALREADY-renamed table: {recovering}"
+        );
+        assert!(
+            recovering.contains("DROP TABLE `p.d.t__changes__merging`;"),
+            "and still drops it when done: {recovering}"
+        );
+    }
+
     /// The day-key script: one job — probe, chunked `IN UNNEST(chunk)` MERGEs (≤ 4,000
     /// days each, the base pruned to exactly those days), the NULL-keyed pass, the
     /// DROP, and the `(changes_rows, merge_jobs)` row last. No key: one unbounded
@@ -1285,6 +1410,7 @@ mod compact_tests {
         let s = compact_script_sql(
             "p.d.t",
             "p.d.t__changes",
+            None,
             &specs(),
             &["id".to_string()],
             SourceEngine::MySql,
@@ -1340,6 +1466,7 @@ mod compact_tests {
         let plain = compact_script_sql(
             "p.d.t",
             "p.d.t__changes",
+            None,
             &specs(),
             &["id".to_string()],
             SourceEngine::MySql,
@@ -1363,6 +1490,7 @@ mod compact_tests {
         let utc = compact_script_sql(
             "p.d.t",
             "p.d.t__changes",
+            None,
             &[
                 meta_spec("id", "INT64"),
                 meta_spec("created_at", "TIMESTAMP"),
@@ -1383,6 +1511,7 @@ mod compact_tests {
         let hostile = compact_script_sql(
             "p.d.my-orders",
             "p.d.my-orders__changes",
+            None,
             &[meta_spec("order", "INT64"), meta_spec("created_at", "DATE")],
             &["order".to_string()],
             SourceEngine::Postgres,
@@ -1825,6 +1954,7 @@ mod compact_column_tests {
         let s = compact_script_sql(
             "p.d.t",
             "p.d.t__changes",
+            None,
             &specs,
             &["id".to_string()],
             SourceEngine::MySql,
@@ -1903,6 +2033,7 @@ mod compact_flag_tests {
             compact_script_sql(
                 "p.d.t",
                 "p.d.t__changes",
+                None,
                 specs,
                 &["id".to_string()],
                 SourceEngine::MySql,
