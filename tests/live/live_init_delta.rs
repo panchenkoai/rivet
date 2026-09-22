@@ -284,6 +284,118 @@ fn a_generated_config_drives_run_load_compact_into_the_warehouse_mssql() {
     warehouse_chain(SqlEngine::Mssql, "init_chain_ms");
 }
 
+/// A source column spelled with a Cyrillic look-alike (`сomment`, U+0441) lands as
+/// `comment` through the base load, the buffer append and the compaction, with no
+/// NULL anywhere: BigQuery matches Parquet columns by name, so a rename that only
+/// edited the declared schema would load the column NULL with every count green.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_cyrillic_lookalike_column_lands_under_its_latin_name_with_every_value() {
+    let Some(bq) = BqLive::from_env("init_lookalike") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _table_guard) = e.create(
+        "init_lookalike",
+        "id BIGINT PRIMARY KEY, \"\u{441}omment\" TEXT NOT NULL, \
+         changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} (id, \"\u{441}omment\") SELECT g, 'c'||g FROM generate_series(1,10) g"
+    ));
+
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "incremental",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
+    let changes = format!("{export}__changes");
+    let _bq_guard = bq.cleanup(&[&export, &changes]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+    let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
+    let columns = |t: &str| {
+        bq.read_bq_rows(&format!(
+            "SELECT column_name FROM `{}.{}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{t}'",
+            bq.project, bq.dataset
+        ))
+        .iter()
+        .filter_map(|r| r["column_name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+    };
+    let nulls = |t: &str| {
+        bq.read_bq_rows(&format!(
+            "SELECT COUNT(*) AS n, COUNTIF(comment IS NULL) AS nul FROM {}",
+            fq(t)
+        ))[0]
+            .clone()
+    };
+
+    rivet_ok(&["run", "-c", cfg], &db);
+    let said = rivet_ok(&["load", "-c", cfg], &[]);
+    assert!(
+        said.contains("loads as `comment`"),
+        "the rename is announced: {said}"
+    );
+    let base_cols = columns(&export);
+    assert!(
+        base_cols.iter().any(|c| c == "comment") && !base_cols.iter().any(|c| c == "\u{441}omment"),
+        "the base carries the Latin name only: {base_cols:?}"
+    );
+    let base = nulls(&export);
+    assert_eq!(
+        (base["n"].as_str(), base["nul"].as_str()),
+        (Some("10"), Some("0"))
+    );
+
+    e.exec(&format!(
+        "INSERT INTO {table} (id, \"\u{441}omment\") SELECT g, 'c'||g FROM generate_series(11,15) g"
+    ));
+    e.exec(&format!(
+        "UPDATE {table} SET \"\u{441}omment\" = 'upd3', changed_at = now() WHERE id = 3"
+    ));
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    let buffered = nulls(&changes);
+    assert_eq!(
+        (buffered["n"].as_str(), buffered["nul"].as_str()),
+        (Some("6"), Some("0")),
+        "the renamed append carries every value into the buffer"
+    );
+
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("COMPACT OK"), "{said}");
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNTIF(comment IS NULL) AS nul, \
+         COUNTIF(id = 3 AND comment = 'upd3') AS updated FROM {}",
+        fq(&export)
+    ));
+    assert_eq!(rows[0]["n"].as_str(), Some("15"));
+    assert_eq!(rows[0]["nul"].as_str(), Some("0"));
+    assert_eq!(
+        rows[0]["updated"].as_str(),
+        Some("1"),
+        "the UPDATE reached the base"
+    );
+}
+
 // ── batch: incremental ────────────────────────────────────────────────────
 
 #[test]

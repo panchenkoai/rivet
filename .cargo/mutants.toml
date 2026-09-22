@@ -640,6 +640,9 @@ exclude_re = [
     # (`partition_budget::plan_load_batches`), the row it parses
     # (`bq_rest::parse_first_row`). Live: live_load_spec, live_cdc_compact,
     # live_load_partition_batches, the `warehouse_layout` / `partner_shape` gate cells.
+    # The look-alike rename path (materialize's RENAME step, `append_renamed`):
+    # live_init_delta::a_cyrillic_lookalike_column_lands_under_its_latin_name_with_every_value,
+    # RED against a dropped RENAME and against a stubbed `append_renamed`.
     "replace BigQueryLoader::batches -> Result<Vec<Vec<String>>>",
     "replace BigQueryLoader::count_rows -> Result<u64>",
     "replace <impl TargetLoader for BigQueryLoader>::materialize -> Result<u64>",

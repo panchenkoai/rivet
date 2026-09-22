@@ -2,7 +2,7 @@
 
 Run 1 takes everything, run 2 takes only the delta, on the file the product itself
 scaffolds: `init --bigquery-project/--bigquery-dataset` emits the `load:` section, then
-`run → load → compact` lands the base and its buffer in the warehouse. Six cells,
+`run → load → compact` lands the base and its buffer in the warehouse. Seven cells,
 each a Rig test over a generated config:
 
   * batch on PostgreSQL / MySQL / SQL Server — init picks the cursor (the SQL Server
@@ -11,6 +11,8 @@ each a Rig test over a generated config:
   * an incremental export: run 1 = every row, run 2 = the delta only;
   * a single-table CDC scaffold: run 1 captures NOTHING (the anchor), run 2 the changes;
   * a multi-table `backfill: auto` scaffold: run 1 every baseline, run 2 the changes.
+  * a source column spelled with a Cyrillic look-alike (`сomment`): it lands as `comment`
+    through the base load, the buffer append and the compaction, with no NULL.
 
 The two init flags no blessed cell carries (`--bigquery-project`, `--bigquery-dataset`)
 are exercised here, which is what their `FLAG_EXCUSED` entries point at. Oracles are
@@ -30,6 +32,7 @@ CELLS = {
     "a_generated_incremental_config_takes_everything_then_only_the_delta": "delta:incremental",
     "a_generated_single_table_cdc_config_takes_no_baseline_only_later_changes": "delta:cdc-single",
     "a_generated_multi_table_cdc_config_takes_every_baseline_then_only_the_delta": "delta:cdc-multi",
+    "a_cyrillic_lookalike_column_lands_under_its_latin_name_with_every_value": "warehouse:lookalike",
 }
 
 
