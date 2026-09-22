@@ -415,7 +415,21 @@ pub(crate) fn connect_source(
     url: &str,
     tls: Option<&crate::config::TlsConfig>,
 ) -> Result<Box<dyn source::Source>> {
-    Ok(match config.source.source_type {
+    connect_source_of(config.source.source_type, url, tls)
+}
+
+/// [`connect_source`] by the one thing it actually needs.
+///
+/// The `&Config` form reads exactly one field, so a caller that has the TYPE but no
+/// valid config had to produce one — and `Config::load` VALIDATES. That is how
+/// `record_primary_keys` came to bail on the whole config, and so record no key for
+/// ANY export, when a single export was invalid.
+pub(crate) fn connect_source_of(
+    source_type: SourceType,
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+) -> Result<Box<dyn source::Source>> {
+    Ok(match source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
             url, tls,
         )?),

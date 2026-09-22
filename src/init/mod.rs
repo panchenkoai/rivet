@@ -497,6 +497,23 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
     }
 }
 
+/// [`source_type`] as the enum the rest of the tree speaks.
+///
+/// Same derivation, one place: init reads the engine from the URL everywhere else, so
+/// a caller that needs the typed form should not have to re-load and re-VALIDATE the
+/// config to get it — which is exactly the trap `record_primary_keys` fell into.
+pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceType> {
+    use crate::config::SourceType;
+    Ok(match source_type(source_url)? {
+        "postgres" => SourceType::Postgres,
+        "mysql" => SourceType::Mysql,
+        "mssql" => SourceType::Mssql,
+        // `source_type` returns these four and nothing else; a fifth would fail to
+        // compile here rather than silently pick an engine.
+        _ => SourceType::Mongo,
+    })
+}
+
 /// Default SQL Server schema when the user passes a bare table name.
 /// [`yaml_scaffold::parse_table`] defaults an unqualified table to `public`
 /// (the PostgreSQL default); SQL Server's is `dbo`, so the mssql arm rewrites a
@@ -1340,24 +1357,77 @@ fn record_primary_keys(
     if snapshots.is_empty() {
         return;
     }
-    let recorded = (|| -> Result<()> {
-        let config = crate::config::Config::load(config_path)?;
-        let store = crate::state::StateStore::open(config_path)?;
-        let mut src = crate::preflight::type_report::connect_source(&config, source_url, tls)?;
-        for s in snapshots {
-            let relation = relation_for_key(
-                &config.source.source_type,
-                s.source_schema.as_deref(),
-                &s.source_table,
-            );
-            if let Some(pk) = src.primary_key(&relation)? {
-                store.record_primary_key(&s.export_name, None, &pk)?;
+    // NOT `Config::load`. That VALIDATES the whole config, so one export the scaffold
+    // could not complete — `--mode incremental` forced onto a table with no cursor
+    // candidate, which init writes with a `# REVIEW:` comment — returned before the
+    // loop below recorded ANY key. Measured on a 62-table schema: 63 exports, 0 keys.
+    // The operator then got a complete-LOOKING config whose `pk: auto` resolves to
+    // nothing, and the failure surfaced much later at `rivet load` as a refusal about
+    // PRIMARY KEYS — pointing at `load.pk`, three steps from the cause.
+    //
+    // Nothing here needs a validated config. The source TYPE is derived from the URL,
+    // exactly as the rest of init derives it, and the snapshots carry their own
+    // schema/table. This mirrors `record_strategy_snapshots` twenty lines above, which
+    // has always degraded per item instead of all-or-nothing.
+    let kind = match source_type_of(source_url) {
+        Ok(k) => k,
+        Err(e) => {
+            log::debug!("init: primary keys skipped (unreadable source url): {e:#}");
+            return;
+        }
+    };
+    let store = match crate::state::StateStore::open(config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("init: source primary keys not recorded (state store unavailable): {e:#}");
+            return;
+        }
+    };
+    let mut src = match crate::preflight::type_report::connect_source_of(kind, source_url, tls) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("init: source primary keys not recorded (source unreachable): {e:#}");
+            return;
+        }
+    };
+    // PER EXPORT from here: one table rivet cannot read a key for must not cost the
+    // other sixty-one theirs.
+    let mut failed: Vec<&str> = Vec::new();
+    for s in snapshots {
+        let relation = relation_for_key(&kind, s.source_schema.as_deref(), &s.source_table);
+        match src.primary_key(&relation) {
+            Ok(Some(pk)) => {
+                if let Err(e) = store.record_primary_key(&s.export_name, None, &pk) {
+                    log::debug!(
+                        "init: primary key for '{}' not written: {e:#}",
+                        s.export_name
+                    );
+                    failed.push(&s.export_name);
+                }
+            }
+            // No key is ORDINARY — a view, a `query:` export, a keyless table. The
+            // load says so in its own words when it needs one.
+            Ok(None) => {}
+            Err(e) => {
+                log::debug!(
+                    "init: primary key for '{}' unreadable: {e:#}",
+                    s.export_name
+                );
+                failed.push(&s.export_name);
             }
         }
-        Ok(())
-    })();
-    if let Err(e) = recorded {
-        log::warn!("init: source primary keys not recorded for `rivet load`: {e:#}");
+    }
+    // Every offender at once. Naming the first one only makes finding N of them take N
+    // init runs, which is how three cursor-less tables were discovered one at a time.
+    if !failed.is_empty() {
+        log::warn!(
+            "init: source primary keys not recorded for {} of {} export(s) — `rivet load` \
+             will refuse those with `pk: auto` until you declare `pk:` in their `load:` \
+             block: {}",
+            failed.len(),
+            snapshots.len(),
+            failed.join(", ")
+        );
     }
 }
 
@@ -1380,6 +1450,79 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+    /// Recording primary keys must not re-load and re-VALIDATE the config.
+    ///
+    /// `record_primary_keys` opened with `Config::load(config_path)?`, which validates
+    /// the whole file — so ONE export the scaffold could not complete (`--mode
+    /// incremental` forced onto a table with no cursor candidate, which init writes
+    /// with a `# REVIEW:` comment) returned before the loop recorded ANY key.
+    ///
+    /// Measured A/B on a 62-table schema, identical flags, the binary the only
+    /// variable: `c4684d8c` wrote 63 exports and **0** keys; the fix writes 63 exports
+    /// and **59** — exactly the tables that have a primary key. The operator's symptom
+    /// was a complete-LOOKING config whose `pk: auto` resolved to nothing, failing much
+    /// later at `rivet load` with a refusal about PRIMARY KEYS — three steps from the
+    /// cause.
+    ///
+    /// This is source-shaped for the reason `destructive_delete_gate` is: the defect is
+    /// a LOCAL wiring choice, and the behavioural half needs a live source. It fails
+    /// while `Config::load` is back in that function.
+    #[test]
+    fn recording_primary_keys_does_not_validate_the_whole_config() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("fn record_primary_keys(")
+            .nth(1)
+            .expect("record_primary_keys still exists")
+            .split("\nfn ")
+            .next()
+            .expect("its body");
+
+        // The CALL, with its paren — not the name. The first version of this assertion
+        // tripped on the comment inside the function that explains why the call is
+        // gone, which is the source-guard version of an assertion loose enough to
+        // admit both spellings.
+        assert!(
+            !body.contains("Config::load("),
+            "record_primary_keys must not VALIDATE the config to record keys — one \
+             invalid export then costs every export its key. The source type comes \
+             from the URL (`source_type_of`), as everywhere else in init."
+        );
+        assert!(
+            body.contains("connect_source_of"),
+            "it should take the source by TYPE, not by a config it had to load"
+        );
+        // Per-export isolation: the loop must not `?` out of the whole function on one
+        // unreadable key. `record_strategy_snapshots` twenty lines above is the model.
+        assert!(
+            body.contains("failed.push"),
+            "one table rivet cannot read a key for must not cost the others theirs — \
+             collect the offenders and name them ALL, since reporting only the first \
+             makes finding N of them take N init runs"
+        );
+    }
+
+    /// The URL is the one source of truth for the engine, in both spellings.
+    #[test]
+    fn source_type_of_agrees_with_the_string_form_it_mirrors() {
+        use crate::config::SourceType;
+        for (url, want_str, want_enum) in [
+            ("postgresql://h/db", "postgres", SourceType::Postgres),
+            ("postgres://h/db", "postgres", SourceType::Postgres),
+            ("mysql://h/db", "mysql", SourceType::Mysql),
+            ("sqlserver://h/db", "mssql", SourceType::Mssql),
+            ("mssql://h/db", "mssql", SourceType::Mssql),
+            ("mongodb://h/db", "mongo", SourceType::Mongo),
+        ] {
+            assert_eq!(super::source_type(url).unwrap(), want_str, "{url}");
+            assert_eq!(super::source_type_of(url).unwrap(), want_enum, "{url}");
+        }
+        assert!(
+            super::source_type_of("redis://h").is_err(),
+            "an unsupported scheme must not silently resolve to an engine"
+        );
+    }
+
     /// SQL Server's temporal types are `datetime2`, `datetimeoffset` and
     /// `smalldatetime` — none EQUAL to `datetime`, which is all the predicate
     /// admitted. A `changed_at DATETIME2(6)` therefore scored zero as a cursor
