@@ -481,15 +481,34 @@ fn id_types_collide(lo: &Bson, hi: &Bson) -> bool {
     }
 }
 
-/// The shared downstream-guidance tail of the heterogeneous-`_id` warning (batch
-/// full scan and CDC both emit it). The flat `_id` column renders different BSON
-/// types to possibly-colliding text, so a warehouse merge keyed on `_id` conflates
-/// distinct documents — the typed value is always in `document._id`.
+/// The shared tail of the heterogeneous-`_id` warning (batch full scan and CDC
+/// both emit it): what to do about a collection whose `_id` mixes BSON type
+/// brackets.
+///
+/// TWO audiences, and they were conflated until now. A reader writing their OWN
+/// SQL over the change log really can key on the typed, lossless `document._id`
+/// — that is what this said, and for them it is still true.
+///
+/// But `rivet compact` took ownership of the MERGE, and rivet's own `load.pk`
+/// CANNOT accept that name: `check_spec_fit` refuses a pk column the export does
+/// not have, and the load-time identifier gate refuses anything that is not
+/// `[A-Za-z_][A-Za-z0-9_]*` — a dot fails both. So the one remediation this
+/// printed was, for rivet itself, impossible to follow, and the shape it warns
+/// about is exactly the shape a `layout: base_buffer` load produces.
+///
+/// `mode: full` is the escape that works: a whole-table pass runs no MERGE, so
+/// nothing keys on the flat `_id` at all.
 pub(super) fn hetero_id_guidance() -> &'static str {
     "the flat `_id` column renders different BSON types to possibly-colliding text \
-     (int 1001 and string \"1001\" both become \"1001\"), so a downstream merge keyed \
-     on `_id` conflates distinct documents — key on the typed `document._id` instead \
-     (see docs/reference/mongodb.md#consuming-in-the-warehouse)"
+     (int 1001 and string \"1001\" both become \"1001\"), so a merge keyed on `_id` \
+     conflates distinct documents. In YOUR OWN queries over the change log, key on the \
+     typed `document._id` (see docs/reference/mongodb.md#consuming-in-the-warehouse). \
+     RIVET'S OWN compaction cannot: `load.pk` takes plain identifiers only \
+     ([A-Za-z_][A-Za-z0-9_]*), so `document._id` is refused both when the plan is built \
+     and again at load time, and a `layout: base_buffer` load of this collection would \
+     MERGE on the lossy flat `_id` and then drop the buffer that distinguished the \
+     documents. Until the `_id` types are uniform, load this collection with \
+     `mode: full` — a whole-table pass runs no MERGE at all"
 }
 
 fn encode_id_cursor(id: &Bson) -> String {
