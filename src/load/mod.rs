@@ -1220,6 +1220,11 @@ pub(crate) mod tests {
         appended: RefCell<Vec<String>>,
         views: RefCell<Vec<String>>,
         kinds: RefCell<std::collections::HashMap<String, ObjectKind>>,
+        /// Make `object_kind` FAIL — the shape a 503, a quota error or expired
+        /// credentials takes at a metadata probe. `kinds` can only say what an object
+        /// IS; it cannot say "the warehouse would not answer", which is the case that
+        /// decides whether a stop is recorded as a refusal or as a failure.
+        pub(crate) kind_error: Option<String>,
         counts: RefCell<std::collections::HashMap<String, u64>>,
         overlap: Option<(u64, u64)>,
         prior_changes: bool,
@@ -1229,6 +1234,19 @@ pub(crate) mod tests {
         /// A warehouse without shape control (the Snowflake shape).
         shapeless: bool,
         calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeLoader {
+        /// A loader whose metadata probe will not ANSWER — a 503, a quota error, an
+        /// expired credential. Distinct from every `kinds` entry, which can only say
+        /// what an object IS; the difference decides whether a stop is journaled as a
+        /// refusal or as a failure, and only the failure forges ownership.
+        pub(crate) fn probe_fails(reason: &str) -> Self {
+            Self {
+                kind_error: Some(reason.to_string()),
+                ..Default::default()
+            }
+        }
     }
 
     impl ShapeControl for FakeLoader {
@@ -1269,6 +1287,9 @@ pub(crate) mod tests {
             Ok(self.prior_changes)
         }
         fn object_kind(&self, table: &str) -> Result<ObjectKind> {
+            if let Some(e) = &self.kind_error {
+                bail!("{e}");
+            }
             Ok(self
                 .kinds
                 .borrow()
