@@ -173,8 +173,9 @@ fn take_next<'a, T>(next: &AtomicUsize, items: &'a [T]) -> Option<(usize, &'a T)
 ///
 /// `init` runs once per worker thread, not once per item: the per-worker
 /// resource (a load's own `StateStore`) is opened as many times as there are
-/// workers, so the one-worker default opens exactly one — as the sequential loop
-/// always did.
+/// workers — so `--pool 1` opens exactly one, as the sequential loop always did,
+/// and the [`DEFAULT_POOL`] of 16 opens up to sixteen. Per WORKER, not per item,
+/// is the guarantee; it is a ceiling on connections, not a promise of one.
 ///
 /// Fault isolation is the contract this exists to keep: a failing item is
 /// recorded and the worker takes the next one, so one poisoned table can never
@@ -572,7 +573,9 @@ mod tests {
         assert_eq!(
             order.into_inner().unwrap(),
             (0..5).collect::<Vec<_>>(),
-            "the default pool must keep running tables one after another"
+            "`--pool 1` must keep running tables one after another — the doc above \
+             says why this asks for the single worker EXPLICITLY, and this message \
+             said \"the default pool\" until the same pass that fixed the doc"
         );
     }
 

@@ -187,10 +187,11 @@ pub enum Commands {
     ///
     /// The native column schema, target table, partition, and source URIs are
     /// all derived from the config's top-level `load:` block — nothing is
-    /// hand-typed. A multi-table config loads every export into the shared
-    /// target, one after another. Column types come from the state DB, recorded
-    /// by each export's last successful `rivet run`; the load never connects to
-    /// the source.
+    /// hand-typed. A multi-table config loads its exports into the shared target
+    /// on a POOL of up to 16 worker threads, capped at the number of tables;
+    /// `--pool 1` is the strictly sequential pass. Column types come from the
+    /// state DB, recorded by each export's last successful `rivet run`; the load
+    /// never connects to the source.
     Load {
         /// Path to YAML config file — extraction PLUS a top-level `load:` block.
         /// ONE file drives both the export and the load: the mode

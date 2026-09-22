@@ -22,7 +22,8 @@ pub struct LoadArgs {
     pub run_id: Option<String>,
     /// Rebuild a change log whose partition differs from the config (ADR-0034 D5).
     pub rebuild_changelog: bool,
-    /// Worker threads to load the config's tables on; `None` is one after another.
+    /// Worker threads to load the config's tables on; `None` takes the default
+    /// pool (16, capped at the table count), not a sequential pass.
     pub pool: Option<usize>,
 }
 
@@ -30,13 +31,15 @@ pub struct LoadArgs {
 pub struct CompactArgs {
     pub config: String,
     pub run_id: Option<String>,
-    /// Worker threads to merge the config's tables on; `None` is one after another.
+    /// Worker threads to merge the config's tables on; `None` takes the default
+    /// pool (16, capped at the table count), not a sequential pass.
     pub pool: Option<usize>,
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
 /// declares the target once, and each export resolves to a table. A multi-table
-/// config loads every export into the shared target, one after another.
+/// config loads its exports into the shared target on a pool of up to 16
+/// workers, capped at the table count; `--pool 1` is the sequential pass.
 pub fn run_loads(args: LoadArgs) -> Result<()> {
     let plans = load::plan::plan_loads(&args.config)?;
     // One run id for the whole invocation, shared across every table — so warehouse
@@ -86,14 +89,18 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // "never attempted". The durable trigger is a per-table PERMANENT error
     // raised before the run closure (`open_store`, `prepare_load` — which carries
     // `ensure_single_export` and `reconcile`), so one poisoned prefix starved
-    // every other table, every cycle, indefinitely. The CLI reference already
-    // promised "loads every export into the shared target, one after another".
+    // every other table, every cycle, indefinitely. That starvation is what the
+    // per-table fold below exists to prevent — one table's permanent error must
+    // not decide the fate of the rest.
     let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
     // Each worker RECONNECTS to the backend the parent already resolved instead
     // of re-resolving `RIVET_STATE_URL` per table — `open_at_ref` is the path the
     // state ref exists for — and it costs one connection per WORKER, not per
-    // table, so the one-worker default opens exactly one, as this loop always
-    // did. A worker whose reconnect fails does NOT degrade to the stateless path:
+    // table. Read that as a CEILING, not a reassurance: the default pool is 16,
+    // so a plain `rivet load` over sixteen-or-more tables opens sixteen ledger
+    // connections where the pre-pool loop opened one. That is the upgrade-visible
+    // cost, and `pool_ceiling_warning` is what tells the operator about it.
+    // A worker whose reconnect fails does NOT degrade to the stateless path:
     // `state_ref` is `Some` only when the parent's own open SUCCEEDED, so the
     // refusal below always fires for it. Stateless is reachable only through the
     // parent's degradation above, where no worker ever had a ledger to lose.
@@ -238,8 +245,8 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                 // error would print credentials unredacted.
                 //
                 // Said HERE, from the worker, so a pooled run reports a table when it
-                // fails rather than after every other table has finished — the
-                // one-worker default keeps the order it always had. The aggregate
+                // fails rather than after every other table has finished — and at
+                // `--pool 1` that is the order the sequential loop always had. The aggregate
                 // still folds in CONFIG order (the pool returns results by item), and
                 // that is what keeps the chosen representative stable: `max_by_key`
                 // returns the LAST maximum, so a completion-ordered fold would pick a

@@ -167,7 +167,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
 Load an export's Parquet into a warehouse (BigQuery / Snowflake)
 
-The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads every export into the shared target, one after another. Column types come from the state DB, recorded by each export's last successful `rivet run`; the load never connects to the source.
+The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads its exports into the shared target on a POOL of up to 16 worker threads, capped at the number of tables; `--pool 1` is the strictly sequential pass. Column types come from the state DB, recorded by each export's last successful `rivet run`; the load never connects to the source.
 
 **Usage:** `rivet load [OPTIONS] --config <CONFIG>`
 
