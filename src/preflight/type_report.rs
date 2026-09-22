@@ -119,16 +119,6 @@ fn report_units(
     }
 }
 
-/// Collect type mappings for one export from a live connection — **one report
-/// per unit**: one for an ordinary export, one PER TABLE for a multiplex
-/// `tables:` CDC stream (see [`report_units`]).
-///
-/// The fan-out lives here rather than at each caller because both callers need
-/// it and neither can be trusted to re-derive it: `rivet check --target` renders
-/// these documents and `rivet load` PLANS from them, so a caller that saw one
-/// document per export would load N tables into one warehouse table (or, before
-/// #252, fail outright). One connection serves every table — a 154-table
-/// multiplex must not open 154 of them.
 /// The `columns:` overrides that apply to ONE resolver unit.
 ///
 /// Extracted from [`collect_reports`] so the rule is observable WITHOUT a live
@@ -215,6 +205,16 @@ pub(crate) fn unresolved_capture_is_fatal(
     on_unresolved == OnUnresolvedCapture::Fail && !degrade_is_unambiguous(configured)
 }
 
+/// Collect type mappings for one export from a live connection — **one report
+/// per unit**: one for an ordinary export, one PER TABLE for a multiplex
+/// `tables:` CDC stream (see [`report_units`]).
+///
+/// The fan-out lives here rather than at each caller because both callers need
+/// it and neither can be trusted to re-derive it: `rivet check --target` renders
+/// these documents and `rivet load` PLANS from them, so a caller that saw one
+/// document per export would load N tables into one warehouse table (or, before
+/// #252, fail outright). One connection serves every table — a 154-table
+/// multiplex must not open 154 of them.
 pub fn collect_reports(
     config: &Config,
     export: &ExportConfig,
