@@ -988,11 +988,23 @@ fn prepare_load(
         .first()
         .map(|(_, m)| crate::manifest::identity_source(m))
         .unwrap_or_default();
+    // A ledger that cannot ANSWER is not a ledger that is ABSENT. This arm read
+    // `Err(_) => Unknown` and discarded the error unlogged, which downgraded a true
+    // `Foreign` — the refusal — into proceed-with-a-note, so one failed `SELECT
+    // COUNT(*)` licensed a `mode: full` OVERWRITE of a table rivet has no record of
+    // loading. Same class as the ledger READ below, and the `Err(_) => true` at the
+    // gc callsite shows the direction was a real choice: there it fails SAFE.
     let ownership = match state {
         Some(s) => match s.has_load_attempt(target_fqtn) {
             Ok(true) => load::Ownership::Own,
             Ok(false) => load::Ownership::Foreign,
-            Err(_) => load::Ownership::Unknown,
+            Err(e) => {
+                log::warn!(
+                    "load: the ownership probe for {target_fqtn} failed ({e:#}) — refusing rather \
+                     than treating it as a stateless load"
+                );
+                load::Ownership::Unreadable
+            }
         },
         None => load::Ownership::Unknown,
     };
@@ -1484,11 +1496,20 @@ fn compact_gate_of(
         return Ok(());
     }
     let base_fqtn = loader.fqtn(table);
+    // See the sibling in `prepare_load`: an UNANSWERABLE ledger must not read as an
+    // ABSENT one, or a failed probe turns compact's `Foreign` refusal into a note and
+    // the MERGE rewrites someone else's rows.
     let ownership = match state {
         Some(s) => match s.has_load_attempt(&base_fqtn) {
             Ok(true) => load::Ownership::Own,
             Ok(false) => load::Ownership::Foreign,
-            Err(_) => load::Ownership::Unknown,
+            Err(e) => {
+                log::warn!(
+                    "compact: the ownership probe for {base_fqtn} failed ({e:#}) — refusing \
+                     rather than treating it as a stateless compact"
+                );
+                load::Ownership::Unreadable
+            }
         },
         None => load::Ownership::Unknown,
     };

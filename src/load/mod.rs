@@ -428,8 +428,14 @@ pub(crate) fn refused(reason: String) -> anyhow::Error {
 pub enum Ownership {
     Own,
     Foreign,
-    /// No ledger to ask (a stateless load).
+    /// No ledger to ask (a stateless load) — absent BY DESIGN, so proceed with a note.
     Unknown,
+    /// A ledger exists and could NOT ANSWER. Never the same as having none: the
+    /// table may well be someone else's, and the ledger that would have said so
+    /// is the thing that broke. Treating this as [`Unknown`](Ownership::Unknown)
+    /// turned the `Foreign` REFUSAL into proceed-with-a-note, so a transient state
+    /// backend error silently licensed overwriting a foreign table.
+    Unreadable,
 }
 
 /// Refuse to touch a table rivet did not load; without a ledger, proceed with a note.
@@ -440,6 +446,13 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
             "refusing to {verb} `{fqtn}`: it exists, and this state DB's load ledger has no \
              record of rivet loading it — it may hold someone else's data. Drop or rename it, \
              or load into another table"
+        ),
+        Ownership::Unreadable => bail!(
+            "refusing to {verb} `{fqtn}`: it exists, and the load ledger could not be read to \
+             confirm rivet loaded it. This is NOT the stateless case — a ledger is configured \
+             and the query failed, so the table may hold someone else's data and the record \
+             that would prove otherwise is unavailable. Fix the state backend and re-run; \
+             nothing was written"
         ),
         Ownership::Unknown => {
             eprintln!(
@@ -496,6 +509,13 @@ pub(crate) fn compact_gate(
             "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
              DB's load ledger has no record of rivet loading it — a MERGE would rewrite someone \
              else's rows. Drop or rename it, or point the export at another table"
+        )),
+        (ObjectKind::Table, Ownership::Unreadable) => CompactGate::Refuse(format!(
+            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the load ledger could not be \
+             read to confirm rivet loaded it. This is NOT the stateless case — a ledger is \
+             configured and the query failed, so a MERGE may rewrite someone else's rows and the \
+             record that would prove otherwise is unavailable. Fix the state backend and re-run; \
+             nothing was merged and the buffer is untouched"
         )),
         (ObjectKind::Table, Ownership::Unknown) => CompactGate::Note(format!(
             "  note: `{base_fqtn}` exists and there is no load ledger to confirm rivet loaded it \
@@ -1600,6 +1620,42 @@ pub(crate) mod tests {
         assert_eq!(calls(&f), ["adopt t", "append t"]);
     }
 
+    /// A ledger that cannot ANSWER is not a ledger that is ABSENT.
+    ///
+    /// The pair above and below is the whole point: `Unknown` — the operator ran
+    /// without a state DB — takes the table over on its shape and is unchanged here.
+    /// `Unreadable` is the state where a ledger IS configured and its query failed,
+    /// so the record that would have said `Foreign` is exactly what is missing. Both
+    /// arrived at this function as `Unknown` until the probe became tri-state, which
+    /// is why one failed `SELECT COUNT(*)` could license overwriting a foreign table.
+    ///
+    /// RED against `Err(_) => Ownership::Unknown` at the two probe sites: with that
+    /// mapping this call succeeds and the loader records `adopt`/`append`.
+    #[test]
+    fn an_unreadable_ledger_refuses_where_an_absent_one_proceeds() {
+        let f = full_load_left(5);
+        let err = load_incremental_as(&f, Ownership::Unreadable)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NOT the stateless case"),
+            "the refusal must distinguish the two empty answers, or it reads as the \
+             stateless note it replaced: {err}"
+        );
+        assert!(
+            calls(&f).is_empty(),
+            "and it must stop BEFORE the warehouse is touched: {:?}",
+            calls(&f)
+        );
+
+        // The whole-table path takes the same probe, so it refuses too — while the
+        // stateless run one line below it still proceeds.
+        assert!(
+            full_load(&full_load_left(5), Ownership::Unreadable).is_err(),
+            "a full load overwrites; an unreadable ledger must not license that"
+        );
+    }
+
     fn full_load(f: &FakeLoader, ownership: Ownership) -> Result<LoadReport> {
         run_load(
             f,
@@ -2384,6 +2440,28 @@ mod compact_gate_tests {
         };
         assert!(note.contains("no load ledger"), "{note}");
 
+        // An UNREADABLE ledger is not an ABSENT one, and the two must not share the
+        // Note arm: `Unknown` means the operator chose to run without a ledger, while
+        // `Unreadable` means the ledger that would have said "foreign" is the thing
+        // that broke. Both used to arrive here as `Unknown`.
+        let unreadable = compact_gate(
+            ObjectKind::Table,
+            Ownership::Unreadable,
+            "p.d.t",
+            "p.d.t__changes",
+        );
+        assert!(
+            matches!(unreadable, CompactGate::Refuse(_)),
+            "an unreadable ledger must REFUSE, never proceed like a stateless run: {unreadable:?}"
+        );
+        let CompactGate::Refuse(msg) = &unreadable else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains("NOT the stateless case"),
+            "the refusal must say which of the two empty answers this is: {msg}"
+        );
+
         for (kind, ownership, wanted) in [
             (
                 ObjectKind::Absent,
@@ -2400,6 +2478,11 @@ mod compact_gate_tests {
                 ObjectKind::Table,
                 Ownership::Foreign,
                 "no record of rivet loading it",
+            ),
+            (
+                ObjectKind::Table,
+                Ownership::Unreadable,
+                "could not be read",
             ),
         ] {
             let gate = compact_gate(kind, ownership, "p.d.t", "p.d.t__changes");
