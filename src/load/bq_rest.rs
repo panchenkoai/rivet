@@ -108,7 +108,7 @@ enum Auth {
     /// ADC credentials — `authorized_user` (refresh_token grant) or a
     /// `service_account` key file (RS256 jwt-bearer grant), both minted in
     /// process through the shared `gcs_auth` seam.
-    Adc(BlockingAdcTokenSource),
+    Adc(std::sync::Arc<BlockingAdcTokenSource>),
     /// Documented fallback for the credential shapes rivet has no in-process
     /// minting path for: `external_account` / workload identity (needs an STS
     /// exchange against a provider rivet does not model) and GCE/GKE metadata
@@ -498,6 +498,26 @@ pub(crate) enum TokenSourceKind {
     GcloudCli,
 }
 
+/// The ADC token source for this principal, shared by every client in the process.
+fn shared_adc_source(
+    creds: gcs_auth::AdcCredentials,
+    http: &reqwest::blocking::Client,
+) -> std::sync::Arc<BlockingAdcTokenSource> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SOURCES: OnceLock<Mutex<HashMap<String, Arc<BlockingAdcTokenSource>>>> = OnceLock::new();
+    let key = format!("{}|{}", creds.credential_kind(), creds.principal());
+    let mut sources = SOURCES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("shared ADC source map poisoned");
+    Arc::clone(
+        sources
+            .entry(key)
+            .or_insert_with(|| Arc::new(BlockingAdcTokenSource::new(creds, http.clone()))),
+    )
+}
+
 impl Auth {
     fn resolve(http: &reqwest::blocking::Client) -> Result<Self> {
         let static_token = std::env::var("RIVET_BQ_ACCESS_TOKEN").ok();
@@ -517,10 +537,7 @@ impl Auth {
                 static_token.expect("a Static choice implies a token"),
             ))),
             TokenSourceKind::Adc => {
-                let src = BlockingAdcTokenSource::new(
-                    adc.expect("an Adc choice implies credentials"),
-                    http.clone(),
-                );
+                let src = shared_adc_source(adc.expect("an Adc choice implies credentials"), http);
                 // Say WHICH identity the jobs will run as, at resolution time.
                 // A load that silently acts as a different principal than the
                 // operator configured is an audit trail that reads as fiction
@@ -895,6 +912,27 @@ fn is_table(meta: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Clients built for different tables share one token source per principal.
+    #[test]
+    fn clients_for_one_principal_share_one_token_source() {
+        let adc = |id: &str| {
+            crate::destination::gcs_auth::parse_adc_file(&format!(
+                r#"{{"type":"authorized_user","client_id":"{id}","client_secret":"s","refresh_token":"r"}}"#
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let http = reqwest::blocking::Client::new();
+        let a = super::shared_adc_source(adc("shared-principal"), &http);
+        let b = super::shared_adc_source(adc("shared-principal"), &http);
+        let other = super::shared_adc_source(adc("another-principal"), &http);
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "one principal, one cache");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &other),
+            "two principals never share a token"
+        );
+    }
+
     use super::*;
 
     /// The compaction probe reads one row of mixed cells: text stays text, a
