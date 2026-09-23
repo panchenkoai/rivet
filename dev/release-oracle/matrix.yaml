@@ -120,7 +120,7 @@ scenarios:
     what: "the feat/parallel-keyset fan-out end-to-end: users 150K exported with mode:chunked + chunk_by_key:id + parallel:4 must (a) lose/dup ZERO rows vs the DuckDB read of the parts (same independent oracle as integrity_types) AND (b) actually FAN OUT — >=2 distinct pk_w{ridx} worker parts, proving parallel:N engaged and did not silently degrade to sequential keyset (which integrity_types/load already exercise)."
     applies: [postgres, mysql, mssql]   # mongo parallel:N is the separate _id-range reader (mongo_parallel), not SQL keyset
   - id: load
-    what: "load the manifested parts into each store {s3/minio, gcs/fake-gcs, azure/azurite} and read them back: warehouse/reread count == summed manifest row_count (the count gate), and the id-set round-trips."
+    what: "load the manifested parts into each store {s3/minio, gcs/fake-gcs, azure/azurite} and read them back: the DECLARED parts' row count == the source's, then DuckDB attaches the source and compares every value, source strictly CAST to the parquet type, EXCEPT ALL both ways (Mongo: `document` unpacked into the source columns)."
     applies: [postgres, mysql, mssql, mongo]
 
   - id: gc_survival

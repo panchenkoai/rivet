@@ -477,6 +477,15 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
     so it silently used the caller's value in the batch path and aborted under
     `set -u` in the CDC path. A Python parameter cannot be shadowed that way.)
     """
+    parts = store_parts(store, bucket, prefix, work)
+    if parts is None:
+        return ""
+    preamble, rel = parts
+    return _duckdb_list(f"{preamble}SELECT count(*) FROM {rel}")
+
+
+def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, str] | None:
+    """(DuckDB preamble, relation) over the parts the store's manifests DECLARE, or None when the store holds none or its client is absent."""
     dl = work / f"dl_{store}_{random.randint(0, 32767)}"
     if store == "s3":
         # DECLARED, not globbed. The prefix is read twice: once for the manifests
@@ -493,11 +502,9 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
         )
         names = [ln.strip() for ln in paths.splitlines() if ln.strip()]
         if not names:
-            return ""
+            return None
         lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)
-        return _duckdb_list(
-            S3_HTTPFS_PREAMBLE + f"SELECT count(*) FROM read_parquet([{lst}])"
-        )
+        return S3_HTTPFS_PREAMBLE, f"read_parquet([{lst}])"
     if store == "gcs":
         # No gsutil needed — the fake-gcs JSON API is enough, and it keeps the
         # readback independent of rivet.
@@ -514,12 +521,12 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
         except ValueError:
             pulled = 0
         if pulled <= 0:
-            return ""
+            return None
         src = _declared_read(dl, ".parquet")
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
+        return ("", f"read_parquet({src})") if src else None
     if store == "azure":
         if not have("az"):
-            return ""
+            return None
         dl.mkdir(parents=True, exist_ok=True)
         run(
             [
@@ -531,8 +538,8 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
             ]
         )
         src = _declared_read(dl, ".parquet")
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
-    return ""
+        return ("", f"read_parquet({src})") if src else None
+    return None
 
 
 def store_dest(store: str, bucket: str, prefix: str) -> str | None:
@@ -1061,10 +1068,26 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
             _first_match(out, r"error|fail"),
         )
         return
-    n = store_readback(store, bucket, prefix, work_dir())
+    parts = store_parts(store, bucket, prefix, work_dir())
+    n = _duckdb_list(f"{parts[0]}SELECT count(*) FROM {parts[1]}") if parts else ""
     scnt = _source_count_distinct(engine, url, "users", "id").split(" ")[0]
     if n and n == scnt:
-        _passed(led, engine, tag, "load", store, f"load→{store} gcloud-verified {n} rows", n)
+        from .value_diff import compare_to_parquet
+
+        try:
+            bad, missing = compare_to_parquet(engine, url, "users", *parts)
+        except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL, never a pass
+            _failed(led, engine, tag, "load", store, f"load→{store} value oracle failed: {e}", "oracle-error")
+            return
+        if bad or missing:
+            _failed(
+                led, engine, tag, "load", store,
+                f"load→{store} {n} rows but values differ from the SOURCE: {bad} row(s) each way, "
+                f"missing columns {missing}", f"values:{bad}",
+            )
+        else:
+            _passed(led, engine, tag, "load", store,
+                    f"load→{store} {n} rows, every value equal to the source (DuckDB)", n)
     elif not n:
         # An EMPTY readback is a delivery failure, not an absent tool, on the stores that
         # need no extra CLI: s3 (DuckDB httpfs) and gcs (the JSON-API pull) are always

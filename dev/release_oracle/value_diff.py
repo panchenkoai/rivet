@@ -184,7 +184,53 @@ def source_attach(engine: str, url: str) -> tuple[dict, str]:
         return {"mysql": dsn}, f"my.{db}"
     if engine == "mssql":
         return {"mssql": "mssql://" + url.split("://", 1)[1]}, "ms.dbo"
+    if engine == "mongo":
+        return {"mongo": f"mongodb://{u.netloc}"}, f"mg.{db}"
     raise ValueError(f"no DuckDB source attach for {engine}")
+
+
+def tuple_mismatches(ora, source: str, dest: str) -> tuple[int, list[str]]:
+    """(rows differing both ways, source columns absent at the destination), the source strictly CAST to the destination's column types — never TRY_CAST, which would read an uncastable value as NULL."""
+    dst_types = {r[0]: r[1] for r in ora.db.sql(f"DESCRIBE SELECT * FROM {dest}").fetchall()}
+    src_cols = [r[0] for r in ora.db.sql(f"DESCRIBE SELECT * FROM {source}").fetchall()]
+    shared = [c for c in src_cols if c in dst_types]
+    missing = [c for c in src_cols if c not in dst_types]
+    s_proj = ", ".join(f'CAST("{c}" AS {dst_types[c]}) AS "{c}"' for c in shared)
+    d_proj = ", ".join(f'"{c}"' for c in shared)
+    n = ora.db.sql(
+        f"WITH s AS (SELECT {s_proj} FROM {source}), d AS (SELECT {d_proj} FROM {dest}) "
+        "SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM d)) + "
+        "(SELECT count(*) FROM (SELECT * FROM d EXCEPT ALL SELECT * FROM s))"
+    ).fetchone()[0]
+    return n, missing
+
+
+def mongo_document_columns(ora, source: str, dest: str) -> str:
+    """`dest` (rivet's `_id` + extended-JSON `document`) unpacked into the source's columns and types, so `tuple_mismatches` can compare them."""
+    cols = ora.db.sql(f"DESCRIBE SELECT * FROM {source}").fetchall()
+    proj = []
+    for name, typ, *_ in cols:
+        if name == "_id":
+            proj.append(f'CAST("_id" AS {typ}) AS "_id"')
+            continue
+        cell = f"document->'{name}'"
+        text = f"""CASE WHEN json_type({cell}) = 'OBJECT' THEN {cell}->>'$."$date"' ELSE document->>'{name}' END"""
+        proj.append(f'CAST({text} AS {typ}) AS "{name}"')
+    return f"(SELECT {', '.join(proj)} FROM {dest})"
+
+
+def compare_to_parquet(engine: str, url: str, table: str, preamble: str, dest: str) -> tuple[int, list[str]]:
+    """`tuple_mismatches` between the source table and a parquet relation (`preamble` sets up its store)."""
+    from .duck import Oracle
+
+    attach, prefix = source_attach(engine, url)
+    with Oracle(**attach) as ora:
+        if preamble:
+            ora.db.sql(preamble)
+        source = f"{prefix}.{table}"
+        if engine == "mongo":
+            dest = mongo_document_columns(ora, source, dest)
+        return tuple_mismatches(ora, source, dest)
 
 
 def compare_to_bigquery(engine: str, url: str, dataset: str, table: str) -> tuple[int, list[str]]:
