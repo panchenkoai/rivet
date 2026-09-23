@@ -754,13 +754,17 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # Clean both ends. Reported, because a cleanup that silently fails leaves
     # the next run measuring a union.
     run(["bq", "--project_id", proj, "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
-    d2 = run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    # Likewise the prefix: `rm` exits non-zero both on a transient error and when nothing is left, so list it afterwards.
+    left = run(["gcloud", "storage", "ls", "-r", f"gs://{bucket}/{pfx}/**"])
+    listed = [ln for ln in left.stdout.splitlines() if ln.strip().startswith("gs://")]
+    prefix_empty = (left.ok and not listed) or "matched no objects" in (left.stderr or "")
     # `bq rm -f` exits 0 whether it deleted a table or found none, so its exit
     # status cannot answer "is it gone" — this cell reported a clean cleanup
     # while dropping a table that never existed. Ask afterwards instead.
     still = run(["bq", "--project_id", proj, "show", "-d", f"{proj}:{dset}"])
-    _stage(led, engine, tag, "bigquery", "bq-cleanup", not still.ok and d2.ok,
-           f"dataset absent after drop={not still.ok}, prefix removed={d2.ok}")
+    _stage(led, engine, tag, "bigquery", "bq-cleanup", not still.ok and prefix_empty,
+           f"dataset absent after drop={not still.ok}, prefix empty after rm={prefix_empty}")
 
 
 def verify_blessed_path(
