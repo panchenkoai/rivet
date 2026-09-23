@@ -833,6 +833,22 @@ impl Config {
     /// destination auth, compression, and the mode/chunk matrix. Takes `&self`
     /// because effective tuning merges the source-level block.
     fn validate_export(&self, export: &ExportConfig) -> crate::error::Result<()> {
+        self.validate_export_names(export)?;
+        self.validate_export_partition(export)?;
+        self.validate_export_sizing(export)?;
+        self.validate_export_source(export)?;
+        self.validate_export_destination(export)?;
+        self.validate_export_output(export)?;
+        self.validate_export_mode(export)?;
+        self.validate_export_mode_knobs(export)?;
+        self.validate_export_column_overrides(export)?;
+        self.validate_export_cdc(export)?;
+        self.validate_export_chunk_by_days(export)?;
+        Ok(())
+    }
+
+    /// Export and table names are safe path segments; a declared row-hash set fits one table.
+    fn validate_export_names(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // V5: `name` is keyed into output paths, file logs, and on-disk state,
         // yet is otherwise free-form. A traversal (`../../etc/x`), absolute or
         // slash-bearing (`/abs/x`, `sub/dir`), leading-dot, or NUL-bearing name
@@ -887,7 +903,11 @@ impl Config {
                 export.name
             );
         }
+        Ok(())
+    }
 
+    /// `partition_by` static rules and prefix shapes.
+    fn validate_export_partition(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // Round-2 audit #15/#16/#6: partition_by has purely-static rules (mode
         // compatibility, the `{partition}` token, a filename-safe column name) that
         // only lived in the run-time expansion step, so `rivet check` gave a false
@@ -995,7 +1015,11 @@ impl Config {
                 );
             }
         }
+        Ok(())
+    }
 
+    /// Chunk-size and memory-budget knobs do not contradict each other.
+    fn validate_export_sizing(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // Round-2 audit #17: chunk_size_memory_mb is documented mutually exclusive
         // with an explicit chunk_size — build.rs takes the memory budget and
         // silently drops chunk_size when both are set, mirroring the batch_size pair.
@@ -1028,7 +1052,11 @@ impl Config {
                 export.name
             );
         }
+        Ok(())
+    }
 
+    /// Exactly one source selector (`table`/`tables`/`query`/`query_file`), each well-formed.
+    fn validate_export_source(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // Before the generic exactly-one counting: the `table:`/`tables:` pair
         // gets its specific message (the generic one doesn't mention `tables`).
         if export.table.is_some() && export.tables.is_some() {
@@ -1088,6 +1116,11 @@ impl Config {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Destination endpoint, path and credentials are safe and complete.
+    fn validate_export_destination(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // V2/V12: a custom cloud `endpoint` is handed straight to the opendal
         // S3/GCS/Azure builder with no validation, so a committed config can
         // silently redirect every upload to an attacker host (exfiltration) or
@@ -1211,7 +1244,11 @@ impl Config {
                 cred_path
             );
         }
+        Ok(())
+    }
 
+    /// Output file size and compression level are in range.
+    fn validate_export_output(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if let Some(ref size_str) = export.max_file_size {
             parse_file_size(size_str).map_err(|_| {
                 anyhow::anyhow!(
@@ -1253,7 +1290,11 @@ impl Config {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Each mode's own requirements (and `settle`, an incremental-only knob).
+    fn validate_export_mode(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if export.settle.is_some() && export.mode != ExportMode::Incremental {
             anyhow::bail!(
                 "export '{}': `settle` requires `mode: incremental` — it bounds the incremental \
@@ -1483,6 +1524,11 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    /// Knobs that only apply to another mode are refused, not silently ignored.
+    fn validate_export_mode_knobs(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if export.tables.is_some() && export.mode != ExportMode::Cdc {
             anyhow::bail!(
                 "export '{}': `tables:` is only valid with `mode: cdc` (batch exports \
@@ -1565,7 +1611,11 @@ impl Config {
                 export.name
             );
         }
+        Ok(())
+    }
 
+    /// Table-qualified `columns:` override keys name a captured table.
+    fn validate_export_column_overrides(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // Table-qualified `columns:` override keys ("table.column"): the named
         // table must be one this export captures — a typo must fail at load,
         // never silently miss its target. Bare keys stay export-wide.
@@ -1599,7 +1649,11 @@ impl Config {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// CDC baselines, checkpoints and resume anchors.
+    fn validate_export_cdc(&self, export: &ExportConfig) -> crate::error::Result<()> {
         // A baseline (`initial: snapshot` or `backfill:`) writes each table's
         // snapshot under the reserved sub-prefix `snapshot/` — a table actually
         // NAMED "snapshot" would share a prefix with another table's marker.
@@ -1754,7 +1808,11 @@ impl Config {
         // has one reading; see `a_mongo_dotted_name_never_splits_into_a_schema_
         // qualifier` and `mongo_cdc_accepts_a_dotted_collection_name_because_the_
         // router_addresses_it`.)
+        Ok(())
+    }
 
+    /// `chunk_by_days` is a chunked-mode knob with a positive value.
+    fn validate_export_chunk_by_days(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if let Some(days) = export.chunk_by_days {
             if export.mode != ExportMode::Chunked {
                 anyhow::bail!(
