@@ -394,8 +394,9 @@ fn build_array(
                     Some(other) if !is_null_cell(other) => anyhow::bail!(
                         "column `{column}` is declared text (`columns: {column}: string`) but SQL \
                          Server sends it as {} — rivet does not convert it, and writing it as NULL \
-                         would lose every value. Convert it on the server instead: select \
-                         CAST({column} AS nvarchar(max)) AS {column} in the export's `query:`",
+                         would lose every value. Remove the `string` override: rivet reads this \
+                         type natively. (A server-side CAST to nvarchar rounds float, money and \
+                         datetime.)",
                         cell_type_name(other)
                     ),
                     _ => b.append_null(),
@@ -554,8 +555,9 @@ fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
             "mssql money value {v} exceeds the range representable without precision loss \
              (|value| ≥ 2^53 ÷ 10^{scale} ≈ {:.3e}). tiberius decodes MONEY as f64, so this \
              value was already rounded before rivet read it — it cannot be recovered here. \
-             Convert it to text on the server to keep the exact digits: select \
-             CAST(<name> AS nvarchar(40)) AS <name> in the export's `query:`",
+             Convert it to text on the server with all four decimals: select \
+             CONVERT(nvarchar(40), <name>, 2) AS <name> in the export's `query:` (a plain \
+             CAST keeps only two).",
             9_007_199_254_740_992.0 / 10f64.powi(scale as i32),
         );
     }

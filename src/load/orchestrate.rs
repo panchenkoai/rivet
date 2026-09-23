@@ -434,6 +434,7 @@ fn pin_plan_to_its_run(
             plan.table, plan.export_name
         )
     })?;
+    retyped.refused()?;
     retyped.pinned_run = Some((run_id, finished_at));
     Ok(retyped)
 }
@@ -532,9 +533,9 @@ fn respelled_refusal(
          still unloaded, and one load cannot read both spellings: BigQuery matches Parquet \
          columns by name, so the older files would load that column as NULL. Nothing was \
          loaded and nothing is lost — every run stays staged. rivet cannot load the two \
-         spellings in one pass yet: load the older run(s) by hand (their files carry the old \
-         spelling; declare the column under the new one), then delete their manifest(s) so \
-         this table loads again."
+         spellings in one pass yet. To clear it by hand: load the older run(s)' files into a \
+         scratch table declaring the column under its OLD spelling, rename it there, append \
+         those rows to the warehouse table, and only then delete those runs' manifest(s)."
     ))
 }
 

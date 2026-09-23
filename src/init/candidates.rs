@@ -80,7 +80,12 @@ pub(super) fn suggest_cursor_fallback(info: &TableInfo) -> Option<String> {
     }
     info.columns
         .iter()
-        .find(|c| !c.is_nullable && is_timestamp_type(&c.data_type) && c.name != primary.column)
+        .find(|c| {
+            !c.is_nullable
+                && is_timestamp_type(&c.data_type)
+                && !super::is_coarse_stamp_type(&c.data_type)
+                && c.name != primary.column
+        })
         .map(|c| c.name.clone())
 }
 
@@ -133,6 +138,29 @@ mod tests {
             total_bytes: None,
             columns: cols,
         }
+    }
+
+    #[test]
+    fn a_day_stamp_is_never_the_coalesce_fallback_either() {
+        let dated = table(vec![
+            col("id", "int", true, false),
+            col("updated_at", "timestamp", false, true),
+            col("d", "date", false, false),
+        ]);
+        assert_eq!(
+            suggest_cursor_fallback(&dated),
+            None,
+            "COALESCE(updated_at, d) puts a later NULL-stamped row at midnight, below the watermark"
+        );
+        let stamped = table(vec![
+            col("id", "int", true, false),
+            col("updated_at", "timestamp", false, true),
+            col("created_at", "timestamp", false, false),
+        ]);
+        assert_eq!(
+            suggest_cursor_fallback(&stamped).as_deref(),
+            Some("created_at")
+        );
     }
 
     #[test]

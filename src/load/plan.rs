@@ -1025,7 +1025,8 @@ fn source_rename_action(
         ),
         SourceType::Mssql => format!(
             "EXEC sp_rename N'{table}.{file}', N'{latin}', N'COLUMN'; (on a table enabled for \
-             change data capture, disable its capture instance first and re-enable it after)"
+             change data capture: let `rivet run` drain the stream first — disabling the \
+             capture instance drops its change table — then rename, re-enable, and re-snapshot)"
         ),
         SourceType::Mongo => {
             format!("db.{table}.updateMany({{}}, {{$rename: {{\"{file}\": \"{latin}\"}}}})")
@@ -2822,8 +2823,9 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
         assert_eq!(
             act(SourceType::Mssql, Some("dbo.purchases")),
             "EXEC sp_rename N'dbo.purchases.\u{441}omment', N'comment', N'COLUMN'; (on a \
-             table enabled for change data capture, disable its capture instance first and \
-             re-enable it after)"
+             table enabled for change data capture: let `rivet run` drain the stream first — \
+             disabling the capture instance drops its change table — then rename, re-enable, \
+             and re-snapshot)"
         );
         assert_eq!(
             act(SourceType::Mongo, Some("purchases")),

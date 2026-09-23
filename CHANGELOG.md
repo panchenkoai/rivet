@@ -20,13 +20,9 @@
     for the old sequential pass), so their output interleaves across tables.
   - SQL Server: a column declared `columns: <col>: string` whose server type is not
     text used to export as NULL in every row with status success; it now fails
-    naming the column and the server-side `CAST(... AS nvarchar(max))` to use.
+    naming the column (drop the override: rivet reads these types natively).
   - `rivet init` on MongoDB leaves views and time-series collections out (their
     scans cannot keep a cursor open) and names them.
-  - The per-table load lease file name now carries a hash of the table, so
-    table names that differ only by case or non-ASCII letters no longer share a
-    lock. A 0.27 and a new `rivet load` running at the same moment on one state DB
-    do not see each other's lease.
 
 - **`rivet init` records every export's primary key, even when one export cannot
   be given a cursor.** Recording validated the whole generated config first, so a
