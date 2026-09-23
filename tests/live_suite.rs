@@ -203,6 +203,8 @@ mod live_resume;
 mod live_retry_and_faults;
 #[path = "live/live_schema_drift.rs"]
 mod live_schema_drift;
+#[path = "live/live_shape_drift.rs"]
+mod live_shape_drift;
 #[path = "live/live_shared_state_same_name.rs"]
 mod live_shared_state_same_name;
 #[path = "live/live_source_parity_sweep.rs"]

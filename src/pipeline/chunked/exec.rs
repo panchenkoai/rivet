@@ -168,16 +168,14 @@ pub(crate) fn run_chunked_sequential(
                 file_name: None,
             });
         }
-        // ADR-0028: feed this chunk's Form-B checksums into the run ledger (empty
-        // for a zero-row chunk — a no-op); the seam harvests once, at the
-        // dispatcher. Deliberately NOT the full sink drain: chunked runs its
-        // drift gate PRE-chunk from type_mappings (ADR-0021), so feeding the
-        // sink schema here would make the seam re-check post-run and overwrite
-        // the pre-chunk verdict.
-        summary.ledger.contribute_checksums(
+        // ADR-0028: feed this chunk's shape bytes and Form-B checksums into the run
+        // ledger (both empty for a zero-row chunk); the seam applies them once.
+        // Shape only, no schema: chunked runs its drift gate PRE-chunk from
+        // type_mappings (ADR-0021), and a fed schema would re-run it post-run.
+        summary.ledger.observe(sink.take_shape());
+        sink.drain_integrity_into(
             super::super::commit::UnitId::Chunk(i as i64),
-            &std::mem::take(&mut sink.column_checksums),
-            sink.checksum_key(),
+            &mut summary.ledger,
         );
     }
 
@@ -247,12 +245,14 @@ pub(crate) fn run_chunked_parallel(
     // accumulated worker-side — record_part bumps them in the drain.
     let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
         std::sync::Mutex::new(Vec::new());
-    // Form B: each worker pushes its chunk's per-column checksums here; the parent
-    // XOR-combines them run-wide post-join (order-independent) and harvests once, so
-    // a parallel chunked manifest records Form B like single mode.
-    #[allow(clippy::type_complexity)]
+    // Each worker pushes its chunk's Form-B checksums and shape bytes here; the
+    // parent feeds them to the run ledger post-join (order-independent).
     let checksums_shared: std::sync::Mutex<
-        Vec<(i64, std::collections::BTreeMap<String, u64>, Option<String>)>,
+        Vec<(
+            i64,
+            super::super::commit::UnitChecksums,
+            super::super::commit::Observations,
+        )>,
     > = std::sync::Mutex::new(Vec::new());
     // Schema fingerprint captured by whichever worker resolves the dest
     // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
@@ -402,14 +402,12 @@ pub(crate) fn run_chunked_parallel(
                             records.push((rec, i as i64));
                         }
                         drop(records);
-                        // Form B: hand this chunk's checksums to the parent to XOR-combine.
-                        let key = sink.checksum_key();
                         // ADR-0029: tagged with the chunk — the same unit the
                         // parent's `record_part` drain records these parts under.
                         poison::lock_recover(checksums_shared).push((
                             i as i64,
-                            std::mem::take(&mut sink.column_checksums),
-                            key,
+                            sink.take_checksums(),
+                            sink.take_shape(),
                         ));
                     }
 
@@ -483,12 +481,11 @@ pub(crate) fn run_chunked_parallel(
     // (order-independent merge) under the SAME chunk unit the drain above
     // recorded that chunk's parts with; the seam harvests once, at the
     // dispatcher, and computes the coverage itself.
-    for (chunk_index, part, key) in poison::into_recover(checksums_shared) {
-        summary.ledger.contribute_checksums(
-            super::super::commit::UnitId::Chunk(chunk_index),
-            &part,
-            key,
-        );
+    for (chunk_index, checksums, shape) in poison::into_recover(checksums_shared) {
+        summary.ledger.observe(shape);
+        summary
+            .ledger
+            .contribute(super::super::commit::UnitId::Chunk(chunk_index), checksums);
     }
 
     log::info!(

@@ -119,6 +119,36 @@ pub(crate) struct Observations {
     pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
 }
 
+impl Observations {
+    /// Fold another sink's observations in: first schema wins, shape max-merges.
+    pub(in crate::pipeline) fn merge(&mut self, other: Observations) {
+        if self.drift_schema.is_none() {
+            self.drift_schema = other.drift_schema;
+        }
+        for (col, len) in other.column_max_bytes {
+            let e = self.column_max_bytes.entry(col).or_insert(0);
+            *e = (*e).max(len);
+        }
+    }
+}
+
+/// One commit unit's Form-B checksums and the key column they are keyed to.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnitChecksums {
+    pub(in crate::pipeline) sums: std::collections::BTreeMap<String, u64>,
+    pub(in crate::pipeline) key: Option<String>,
+}
+
+impl UnitChecksums {
+    /// Fold another sink's checksums into this unit (commutative; first key wins).
+    pub(in crate::pipeline) fn absorb(&mut self, other: UnitChecksums) {
+        accumulate_column_checksums(&mut self.sums, &other.sums);
+        if self.key.is_none() {
+            self.key = other.key;
+        }
+    }
+}
+
 /// ADR-0029 half 2 — the integrity record, which is only meaningful as a set
 /// covering EXACTLY the parts the manifest lists.
 ///
@@ -175,27 +205,14 @@ pub(crate) struct CommitLedger {
 }
 
 impl CommitLedger {
-    /// First-wins schema note (idempotent run-wide, like the fingerprint pin).
-    /// An OBSERVATION: feed it as soon as a schema is in hand, above any bail.
-    pub(in crate::pipeline) fn note_schema(&mut self, schema: &arrow::datatypes::Schema) {
-        if self.observed.drift_schema.is_none() {
-            self.observed.drift_schema = Some(schema.clone());
-        }
+    /// Feed what a runner SAW. Eager: call it above any bail (ADR-0029).
+    pub(in crate::pipeline) fn observe(&mut self, o: Observations) {
+        self.observed.merge(o);
     }
 
-    /// Max-merge one sink's observed per-column byte lengths. An OBSERVATION.
-    pub(in crate::pipeline) fn merge_shape(
-        &mut self,
-        max_bytes: &std::collections::HashMap<String, u64>,
-    ) {
-        for (col, len) in max_bytes {
-            let e = self
-                .observed
-                .column_max_bytes
-                .entry(col.clone())
-                .or_insert(0);
-            *e = (*e).max(*len);
-        }
+    /// Contribute one COMMITTED unit's checksums (see [`Self::contribute_checksums`]).
+    pub(in crate::pipeline) fn contribute(&mut self, unit: UnitId, c: UnitChecksums) {
+        self.contribute_checksums(unit, &c.sums, c.key);
     }
 
     /// ADR-0029: contribute one COMMITTED unit's Form-B checksums, keyed by the
@@ -712,15 +729,19 @@ mod tests {
         // first-wins schema: the second (drifted) schema must NOT replace it.
         let a = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let b = Schema::new(vec![Field::new("other", DataType::Utf8, true)]);
-        led.note_schema(&a);
-        led.note_schema(&b);
+        let obs = |sc: &Schema| Observations {
+            drift_schema: Some(sc.clone()),
+            ..Default::default()
+        };
+        led.observe(obs(&a));
+        led.observe(obs(&b));
         assert_eq!(
             led.observed
                 .drift_schema
                 .as_ref()
                 .map(|s| s.field(0).name().clone()),
             Some("id".to_string()),
-            "note_schema is first-wins — a later page/worker schema must not replace the run's"
+            "observe is first-wins on the schema — a later page/worker schema must not replace the run's"
         );
 
         // first-Some-wins key: a None feed leaves it open for a later Some.
@@ -752,8 +773,12 @@ mod tests {
         // shape is max-merge: order-independent, the larger observation wins.
         let s1: std::collections::HashMap<String, u64> = [("t".to_string(), 100u64)].into();
         let s2: std::collections::HashMap<String, u64> = [("t".to_string(), 40u64)].into();
-        led.merge_shape(&s1);
-        led.merge_shape(&s2);
+        for column_max_bytes in [s1, s2] {
+            led.observe(Observations {
+                column_max_bytes,
+                ..Default::default()
+            });
+        }
         assert_eq!(led.observed.column_max_bytes.get("t"), Some(&100u64));
     }
 

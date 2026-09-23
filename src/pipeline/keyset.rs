@@ -106,17 +106,14 @@ fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
 pub(crate) struct KeysetPage {
     pub(crate) parts: Vec<super::commit::PartRecord>,
     pub(crate) rows: usize,
-    pub(crate) schema: Option<arrow::datatypes::Schema>,
+    /// What this page's sink SAW: dest schema (run fingerprint) + column max bytes.
+    pub(crate) observed: super::commit::Observations,
     pub(crate) next_cursor: Option<String>,
     /// First observed key of this page (the run floor when it is page 1 of
     /// range 0) — recorded so cursor_min lands in the metrics (#151).
     pub(crate) first_cursor: Option<String>,
-    /// This page's sink's per-column Form B value checksums — XOR-combined
-    /// run-wide by `run_keyset` so the finalize manifest records Form B (previously
-    /// dropped here, making `rivet validate`'s re-read a no-op on keyset exports).
-    pub(crate) column_checksums: std::collections::BTreeMap<String, u64>,
-    /// The key-column name the checksums are keyed on (constant across pages).
-    pub(crate) checksum_key_column: Option<String>,
+    /// This page's sink's Form-B value checksums and their key column.
+    pub(crate) checksums: super::commit::UnitChecksums,
 }
 
 /// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
@@ -178,7 +175,7 @@ pub(crate) fn read_keyset_page_bounded(
     if rows == 0 {
         return Ok(None); // range exhausted, or an exact-multiple last page
     }
-    let schema = sink.dest_schema.as_deref().cloned();
+    let observed = sink.take_observations();
     // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
     // write_sink_parts drains every part the sink produced — the final temp file
     // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
@@ -188,17 +185,15 @@ pub(crate) fn read_keyset_page_bounded(
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
     )?;
-    let checksum_key_column = sink.checksum_key();
     Ok(Some(KeysetPage {
         parts,
         rows,
-        schema,
+        observed,
         // The source's own lossless token (Mongo BSON `_id`) when it reported
         // one, else the column-extracted string (every SQL engine).
         next_cursor: sink.effective_cursor(),
         first_cursor: sink.first_cursor_value.clone(),
-        column_checksums: std::mem::take(&mut sink.column_checksums),
-        checksum_key_column,
+        checksums: sink.take_checksums(),
     }))
 }
 
@@ -571,14 +566,8 @@ fn run_keyset_parallel(
     #[allow(clippy::type_complexity)]
     let parts_mx: Mutex<Vec<(usize, super::commit::PartRecord)>> = Mutex::new(Vec::new());
     #[allow(clippy::type_complexity)]
-    let checksums_mx: Mutex<
-        Vec<(
-            usize,
-            std::collections::BTreeMap<String, u64>,
-            Option<String>,
-        )>,
-    > = Mutex::new(Vec::new());
-    let fingerprint: std::sync::OnceLock<arrow::datatypes::Schema> = std::sync::OnceLock::new();
+    let checksums_mx: Mutex<Vec<(usize, super::commit::UnitChecksums)>> = Mutex::new(Vec::new());
+    let observed: Mutex<super::commit::Observations> = Mutex::new(Default::default());
     // Per-range high-water key, indexed by range_index (done ranges stay None —
     // they are not re-run). cursor_high = the highest populated range's max; on a
     // RESUME this reflects the RE-RUN ranges only (a range already `done` pre-crash
@@ -620,7 +609,7 @@ fn run_keyset_parallel(
                 &rows,
                 &parts_mx,
                 &checksums_mx,
-                &fingerprint,
+                &observed,
                 &range_max,
                 &errors,
             );
@@ -653,10 +642,7 @@ fn run_keyset_parallel(
                 // Parts this range committed — recorded to file_log atomically with
                 // its `done` flip at completion (checkpoint only).
                 let mut range_parts: Vec<crate::state::KeysetRangePart> = Vec::new();
-                let mut local_checks: Vec<(
-                    std::collections::BTreeMap<String, u64>,
-                    Option<String>,
-                )> = Vec::new();
+                let mut local_checks: Vec<super::commit::UnitChecksums> = Vec::new();
                 loop {
                     // #152: one permit per page (guard releases at the end of
                     // THIS iteration on every path), so the governor sheds
@@ -720,9 +706,7 @@ fn run_keyset_parallel(
                     };
                     let Some(page) = page else { break };
                     rows_r.fetch_add(page.rows as i64, Ordering::Relaxed);
-                    if let Some(sc) = &page.schema {
-                        let _ = fp_r.set(sc.clone());
-                    }
+                    fp_r.lock().unwrap().merge(page.observed);
                     rmax = page.next_cursor.clone().or(rmax);
                     for p in &page.parts {
                         range_parts.push(crate::state::KeysetRangePart {
@@ -752,7 +736,7 @@ fn run_keyset_parallel(
                         .lock()
                         .unwrap()
                         .extend(page.parts.into_iter().map(|p| (ridx, p)));
-                    local_checks.push((page.column_checksums, page.checksum_key_column));
+                    local_checks.push(page.checksums);
                     let last_page = page.rows < page_size;
                     if !last_page {
                         match page.next_cursor {
@@ -832,7 +816,7 @@ fn run_keyset_parallel(
                 checks_r
                     .lock()
                     .unwrap()
-                    .extend(local_checks.into_iter().map(|(m, k)| (ridx, m, k)));
+                    .extend(local_checks.into_iter().map(|c| (ridx, c)));
             });
         }
     });
@@ -905,9 +889,7 @@ fn run_keyset_parallel(
     // open-time baseline onto a Failed manifest listing parts whose parquet
     // carries the observed schema. The seam pins the fingerprint on BOTH paths
     // and runs the drift gate only on success.
-    if let Some(sc) = fingerprint.get() {
-        summary.ledger.note_schema(sc);
-    }
+    summary.ledger.observe(observed.into_inner().unwrap());
 
     if !errs.is_empty() {
         anyhow::bail!(
@@ -943,10 +925,10 @@ fn run_keyset_parallel(
     // under the SAME `UnitId::Range` its parts were recorded with (commit-gated —
     // a failed range published none, and the seam then sees the shortfall itself
     // instead of being told about it). The seam harvests once.
-    for (ridx, m, k) in checksums_mx.into_inner().unwrap() {
+    for (ridx, c) in checksums_mx.into_inner().unwrap() {
         summary
             .ledger
-            .contribute_checksums(super::commit::UnitId::Range(ridx as i64), &m, k);
+            .contribute(super::commit::UnitId::Range(ridx as i64), c);
     }
 
     log::info!(
@@ -1162,7 +1144,7 @@ pub(crate) fn run_keyset(
             seek_tag(last.as_deref()),
             ext
         );
-        let Some(page) = read_keyset_page(
+        let Some(mut page) = read_keyset_page(
             src,
             plan,
             &key_plan,
@@ -1191,16 +1173,13 @@ pub(crate) fn run_keyset(
         // ADR-0028: feed the run ledger from this page — the seam
         // (`finalize::finalize_export`) pins the fingerprint, runs the drift
         // gate and harvests Form B once, at the dispatcher. No application here.
-        if let Some(sc) = &page.schema {
-            summary.ledger.note_schema(sc);
-        }
+        summary.ledger.observe(std::mem::take(&mut page.observed));
         // ADR-0029: the sequential runner's commit unit is the PAGE — this feed
         // and the `record_part` calls below are the same loop iteration over the
         // same page, so the two sets agree by construction.
-        summary.ledger.contribute_checksums(
+        summary.ledger.contribute(
             super::commit::UnitId::Page(pages as i64),
-            &page.column_checksums,
-            page.checksum_key_column.clone(),
+            std::mem::take(&mut page.checksums),
         );
         if plan.validate {
             summary.validated = Some(true);

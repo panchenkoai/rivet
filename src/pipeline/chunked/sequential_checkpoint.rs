@@ -29,16 +29,7 @@ use crate::state::StateStore;
 
 use super::math::build_chunk_query_sql;
 
-/// One chunk's result: (rows, part records, this chunk's Form B per-column
-/// checksums, the checksum key-column name). The runner XOR-combines the checksums
-/// run-wide so the checkpoint (resumable) chunked path records Form B like the
-/// non-checkpoint exec path (the graph-surfaced runner-bypass this closes).
-type ChunkOutcome = (
-    usize,
-    Vec<super::super::commit::PartRecord>,
-    std::collections::BTreeMap<String, u64>,
-    Option<String>,
-);
+use super::ChunkOutcome;
 
 /// Returns `(rows, parts)` — one [`PartRecord`] per written part: empty for
 /// an empty chunk, several when `max_file_size` rotation split the chunk.
@@ -103,7 +94,7 @@ fn export_one_chunk_range(
     }
 
     if sink.total_rows == 0 {
-        return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
+        return Ok((0, Vec::new(), Default::default(), Default::default()));
     }
 
     // Per-chunk writer: the cross-shape guard already fired at run start
@@ -124,9 +115,8 @@ fn export_one_chunk_range(
         summary.validated = Some(true);
     }
 
-    let key = sink.checksum_key();
     let rows = sink.total_rows;
-    Ok((rows, recs, std::mem::take(&mut sink.column_checksums), key))
+    Ok((rows, recs, sink.take_checksums(), sink.take_shape()))
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors export_one_chunk_range's arity for retry wrapping
@@ -377,18 +367,18 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             ),
         };
         match chunk_result {
-            Ok((rows, parts, chunk_checksums, key)) => {
+            Ok((rows, parts, chunk_checksums, chunk_shape)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
-                // ADR-0028: feed the run ledger; the seam harvests once, at
-                // the dispatcher (chunked's drift gate stays pre-chunk, ADR-0021,
-                // so no schema is fed here).
-                // ADR-0029: contributed under the chunk this loop iteration
-                // just committed — the unit its record_part calls use below.
-                summary.ledger.contribute_checksums(
+                // ADR-0028: feed the run ledger; the seam applies it once, at
+                // the dispatcher (shape only — chunked's drift gate stays
+                // pre-chunk, ADR-0021). ADR-0029: contributed under the chunk
+                // this loop iteration just committed — the unit its record_part
+                // calls use below.
+                summary.ledger.observe(chunk_shape);
+                summary.ledger.contribute(
                     super::super::commit::UnitId::Chunk(chunk_index),
-                    &chunk_checksums,
-                    key,
+                    chunk_checksums,
                 );
                 // Shared commit path for the non-empty branch (I2/M1 + counters
                 // + ChunkCompleted journal + I7 file-log + fault hooks).

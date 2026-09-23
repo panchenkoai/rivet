@@ -99,13 +99,7 @@ pub(crate) fn run_mongo_parallel(
                     // any part it wrote is genuinely unknown here (the orphan-GC
                     // case, not a countable part).
                     (
-                        WorkerOutput {
-                            rows: 0,
-                            parts: Vec::new(),
-                            schema: None,
-                            column_checksums: std::collections::BTreeMap::new(),
-                            checksum_key_column: None,
-                        },
+                        WorkerOutput::default(),
                         Err(anyhow::anyhow!("mongo parallel worker panicked")),
                     )
                 })
@@ -131,18 +125,14 @@ pub(crate) fn run_mongo_parallel(
         // ADR-0028: feed the run ledger per worker — the seam pins the
         // fingerprint, runs the drift gate and harvests Form B once, at the
         // dispatcher. No application in this runner.
-        if let Some(sc) = &out.schema {
-            summary.ledger.note_schema(sc);
-        }
+        summary.ledger.observe(out.observed);
         // ADR-0029: the worker RANGE is this runner's commit unit, and a worker
         // hands back what it made durable even when it failed part-way — so the
         // feed and the record_part drain below pair on the same unit and a
         // failed worker's parts are covered by the checksums it did compute.
-        summary.ledger.contribute_checksums(
-            commit::UnitId::Chunk(w as i64),
-            &out.column_checksums,
-            out.checksum_key_column,
-        );
+        summary
+            .ledger
+            .contribute(commit::UnitId::Chunk(w as i64), out.checksums);
         if plan.validate && out.rows > 0 {
             summary.validated = Some(true);
         }
@@ -181,14 +171,14 @@ pub(crate) fn run_mongo_parallel(
     Ok(())
 }
 
+#[derive(Default)]
 struct WorkerOutput {
     rows: i64,
     parts: Vec<commit::PartRecord>,
-    schema: Option<arrow::datatypes::Schema>,
-    /// This worker's XOR-combined per-column Form B checksums (main thread folds
-    /// them run-wide across workers so the finalize manifest records Form B).
-    column_checksums: std::collections::BTreeMap<String, u64>,
-    checksum_key_column: Option<String>,
+    /// What this worker's pages SAW (schema + column max bytes), merged.
+    observed: commit::Observations,
+    /// This worker's Form-B checksums, folded across its pages.
+    checksums: commit::UnitChecksums,
 }
 
 /// Runs one `_id` range and ALWAYS hands back what it made durable, even when it
@@ -215,13 +205,7 @@ fn range_worker(
     dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
     ext: &str,
 ) -> (WorkerOutput, Result<()>) {
-    let mut out = WorkerOutput {
-        rows: 0,
-        parts: Vec::new(),
-        schema: None,
-        column_checksums: std::collections::BTreeMap::new(),
-        checksum_key_column: None,
-    };
+    let mut out = WorkerOutput::default();
     let res = range_worker_pages(
         url, plan, key_plan, kp, stamp, worker, lo, hi, dest, ext, &mut out,
     );
@@ -279,14 +263,9 @@ fn range_worker_pages(
             break;
         };
         out.rows += p.rows as i64;
-        if out.schema.is_none() {
-            out.schema = p.schema;
-        }
+        out.observed.merge(p.observed);
         out.parts.extend(p.parts);
-        super::commit::accumulate_column_checksums(&mut out.column_checksums, &p.column_checksums);
-        if out.checksum_key_column.is_none() {
-            out.checksum_key_column = p.checksum_key_column;
-        }
+        out.checksums.absorb(p.checksums);
         page += 1;
 
         if p.rows < kp.chunk_size {

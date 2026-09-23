@@ -87,9 +87,7 @@ pub(super) fn finalize_export(
     }
 
     // Epic 8: data shape drift — warn when string/binary columns grow beyond
-    // threshold. Applied wherever a runner fed shape bytes (today the single
-    // sink tracks them; a runner that starts feeding them gets the warn for
-    // free — born `na`, per ADR-0028).
+    // threshold. Every runner feeds its sinks' shape bytes into the ledger.
     if plan.shape_drift_warn_factor > 0.0
         && !ledger.observed.column_max_bytes.is_empty()
         && let Some(st) = state
@@ -1191,7 +1189,10 @@ mod tests {
         let mut summary = crate::pipeline::summary::RunSummary::default();
         summary
             .ledger
-            .note_schema(&Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            .observe(crate::pipeline::commit::Observations {
+                drift_schema: Some(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                ..Default::default()
+            });
         summary.ledger.contribute_checksums(
             crate::pipeline::commit::UnitId::Run,
             &[("id".to_string(), 5u64)].into(),
@@ -1284,7 +1285,12 @@ mod tests {
         let mut plan = fin_plan(dir.path());
         plan.shape_drift_warn_factor = 2.0;
         let mut summary = crate::pipeline::summary::RunSummary::default();
-        summary.ledger.merge_shape(&shape_of(100));
+        summary
+            .ledger
+            .observe(crate::pipeline::commit::Observations {
+                column_max_bytes: shape_of(100),
+                ..Default::default()
+            });
         finalize_export(&plan, Some(&state), &mut summary).unwrap();
         assert!(
             warned(&summary),
@@ -1297,7 +1303,12 @@ mod tests {
         let mut plan = fin_plan(dir.path());
         plan.shape_drift_warn_factor = 0.0;
         let mut summary = crate::pipeline::summary::RunSummary::default();
-        summary.ledger.merge_shape(&shape_of(100_000));
+        summary
+            .ledger
+            .observe(crate::pipeline::commit::Observations {
+                column_max_bytes: shape_of(100_000),
+                ..Default::default()
+            });
         finalize_export(&plan, Some(&state), &mut summary).unwrap();
         assert!(
             !warned(&summary),

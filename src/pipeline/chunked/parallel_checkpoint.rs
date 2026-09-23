@@ -30,15 +30,7 @@ use crate::{format, resource};
 
 use super::math::build_chunk_query_sql;
 
-/// One chunk's worker result: (rows, part records, this chunk's Form B per-column
-/// checksums, the checksum key-column name). Named so the retry/export closures
-/// don't trip clippy::type_complexity on the 4-tuple.
-type ChunkOutcome = (
-    usize,
-    Vec<super::super::commit::PartRecord>,
-    std::collections::BTreeMap<String, u64>,
-    Option<String>,
-);
+use super::ChunkOutcome;
 
 pub(crate) fn run_chunked_parallel_checkpoint(
     config_path: &str,
@@ -174,9 +166,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // Form B: each worker pushes its chunk's checksums here; the parent XOR-combines
     // them run-wide post-join and harvests once — so the CHECKPOINT parallel path
     // records Form B like exec.rs's parallel path (graph-surfaced runner-bypass).
-    #[allow(clippy::type_complexity)]
     let checksums_shared: std::sync::Mutex<
-        Vec<(i64, std::collections::BTreeMap<String, u64>, Option<String>)>,
+        Vec<(
+            i64,
+            super::super::commit::UnitChecksums,
+            super::super::commit::Observations,
+        )>,
     > = std::sync::Mutex::new(Vec::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
@@ -393,7 +388,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         .set(crate::state::schema_fingerprint(&columns));
                                 }
                                 if sink.total_rows == 0 {
-                                    return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
+                                    return Ok((0, Vec::new(), Default::default(), Default::default()));
                                 }
                                 let fmt = format::create_format(
                                     plan_w.format,
@@ -419,12 +414,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         super::super::commit::part_indexed_name(&base, idx, count)
                                     },
                                 )?;
-                                let key = sink.checksum_key();
                                 Ok((
                                     sink.total_rows,
                                     recs,
-                                    std::mem::take(&mut sink.column_checksums),
-                                    key,
+                                    sink.take_checksums(),
+                                    sink.take_shape(),
                                 ))
                             })();
 
@@ -460,7 +454,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         Ok(()) => result,
                     };
                     match result {
-                        Ok((rows, parts, chunk_checksums, chunk_key)) => {
+                        Ok((rows, parts, chunk_checksums, chunk_shape)) => {
                             agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
                             // Non-empty chunk: write file_log NOW (per-chunk
                             // durable manifest — the recovery flows in
@@ -539,7 +533,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 poison::lock_recover(checksums_shared).push((
                                     chunk_index,
                                     chunk_checksums,
-                                    chunk_key,
+                                    chunk_shape,
                                 ));
                                 Some(first)
                             };
@@ -656,12 +650,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // the SAME chunk unit the drain above recorded that chunk's parts with; the
     // seam harvests once, at the dispatcher, before finalize writes the manifest,
     // and computes the coverage rather than trusting this feed's order.
-    for (chunk_index, part, key) in poison::into_recover(checksums_shared) {
-        summary.ledger.contribute_checksums(
-            super::super::commit::UnitId::Chunk(chunk_index),
-            &part,
-            key,
-        );
+    for (chunk_index, checksums, shape) in poison::into_recover(checksums_shared) {
+        summary.ledger.observe(shape);
+        summary
+            .ledger
+            .contribute(super::super::commit::UnitId::Chunk(chunk_index), checksums);
     }
 
     state.finalize_chunk_run_completed(&run_id)?;
