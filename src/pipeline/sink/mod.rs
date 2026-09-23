@@ -189,6 +189,10 @@ impl PartBudget {
     /// to load outright, and that must not first be discovered at load time.
     fn resolve(&mut self, dest_schema: &arrow::datatypes::Schema) {
         self.col = None;
+        // A zero-row run declares an empty schema: there is no part to budget, and nothing is missing.
+        if dest_schema.fields().is_empty() {
+            return;
+        }
         if let Some(r) = self.rollover.clone() {
             match dest_schema.field_with_name(&r.column) {
                 Ok(field) => match partition_unit_of(field.data_type()) {

@@ -30,14 +30,30 @@ pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Resu
 /// List the user collections in the URL's database, skipping the internal
 /// `system.*` namespaces so the scaffold never emits an export for them.
 pub(super) fn list_tables(session: &MongoSession) -> Result<Vec<String>> {
-    let names = session.block_on(async {
-        session
-            .client()
-            .database(session.db())
-            .list_collection_names()
-            .await
-    })?;
-    Ok(names
+    let db = session.client().database(session.db());
+    let all = session.block_on(db.list_collection_names().into_future())?;
+    let plain = session.block_on(
+        db.list_collection_names()
+            .filter(mongodb::bson::doc! { "type": "collection" })
+            .into_future(),
+    )?;
+    let skipped: Vec<&String> = all
+        .iter()
+        .filter(|n| !n.starts_with("system.") && !plain.contains(n))
+        .collect();
+    if !skipped.is_empty() {
+        eprintln!(
+            "rivet: {} view(s)/time-series collection(s) left out — a scan of them cannot keep \
+             its cursor open (noCursorTimeout); export their source collections instead: {}",
+            skipped.len(),
+            skipped
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(plain
         .into_iter()
         .filter(|n| !n.starts_with("system."))
         .collect())

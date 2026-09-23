@@ -25,7 +25,12 @@ impl Drop for LoadLease<'_> {
 
 /// The sidecar an SQLite-state lease locks: beside the DB file, one per table.
 fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
-    let token = crate::manifest::file_token(key);
+    // The readable token is lossy (case, non-ASCII); the hash keeps distinct keys on distinct files.
+    let token = format!(
+        "{}-{:016x}",
+        crate::manifest::file_token(key),
+        xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+    );
     if db.to_string_lossy() == ":memory:" {
         return std::env::temp_dir().join(format!("rivet-{}-{token}.lease", std::process::id()));
     }
@@ -78,6 +83,23 @@ impl StateStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn keys_a_lossy_token_would_merge_get_their_own_lease_file() {
+        let db = std::path::Path::new("/tmp/state.db");
+        let paths = [
+            "p.d.Orders",
+            "p.d.orders",
+            "p.d.\u{437}\u{430}\u{43a}",
+            "p.d.\u{442}\u{43e}\u{432}",
+        ]
+        .map(|k| lease_path(db, k).to_string_lossy().to_lowercase());
+        for (i, a) in paths.iter().enumerate() {
+            for b in &paths[i + 1..] {
+                assert_ne!(a, b, "one flock would make one table refuse the other");
+            }
+        }
+    }
+
     /// Two loads of one table: the second is refused while the first holds the
     /// lease, and admitted once it is dropped — no timer, no cleanup step.
     #[test]
@@ -113,9 +135,13 @@ mod lease_path_tests {
             std::path::Path::new("/tmp/rivet-x/.rivet_state.db"),
             "p.d.orders",
         );
-        assert_eq!(
-            beside,
-            std::path::Path::new("/tmp/rivet-x/.rivet_state.db.lease-p.d.orders")
+        assert_eq!(beside.parent(), Some(std::path::Path::new("/tmp/rivet-x")));
+        assert!(
+            beside
+                .to_string_lossy()
+                .starts_with("/tmp/rivet-x/.rivet_state.db.lease-p.d.orders-"),
+            "{}",
+            beside.display()
         );
         let mem = lease_path(std::path::Path::new(":memory:"), "p.d.orders");
         assert!(mem.starts_with(std::env::temp_dir()), "{mem:?}");
