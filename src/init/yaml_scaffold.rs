@@ -468,12 +468,14 @@ fn quote_ident(part: &str, source_type: &str) -> String {
     }
 }
 
-fn quote_relation(qualified: &str, source_type: &str) -> String {
-    qualified
-        .split('.')
-        .map(|p| quote_ident(p, source_type))
-        .collect::<Vec<_>>()
-        .join(".")
+/// The quoted relation an export of `info` reads, quoted per part before the parts are joined, so a dot inside a name stays inside it.
+fn quote_relation(info: &TableInfo, source_type: &str) -> String {
+    let table = quote_ident(&info.table, source_type);
+    if qualified_table_of(info, source_type) == info.table {
+        table
+    } else {
+        format!("{}.{table}", quote_ident(&info.schema, source_type))
+    }
 }
 
 fn is_simple_pg_ident(s: &str) -> bool {
@@ -527,6 +529,18 @@ pub(crate) const INIT_INSERT_ONLY_MARKER: &str = "NOTE: insert-only cursor";
 
 /// Marks a forced `chunked` export written as `full` because the table has no key to page by.
 pub(crate) const INIT_NO_CHUNK_KEY_MARKER: &str = "NOTE: no chunk key";
+
+/// Every table the scaffold left out, named by its `# SKIPPED` comment, in config order.
+pub(crate) fn skipped_tables(config_text: &str) -> Vec<String> {
+    config_text
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("# SKIPPED "))
+        .filter_map(|rest| {
+            let rest = rest.strip_prefix("collection ").unwrap_or(rest);
+            rest.split(':').next().map(|n| n.trim().to_string())
+        })
+        .collect()
+}
 
 /// Every export whose block carries `marker`, in config order.
 pub(crate) fn exports_marked(config_text: &str, marker: &str) -> Vec<String> {
@@ -761,10 +775,7 @@ fn export_block_lines(
         // wrong rows with every check green (both live-proven on the stand).
         lines.push("    query: >".to_string());
         lines.push(format!("      SELECT {col_list}"));
-        lines.push(format!(
-            "      FROM {}",
-            quote_relation(&qualified_table, source_type)
-        ));
+        lines.push(format!("      FROM {}", quote_relation(info, source_type)));
     }
     // Inline rationale above `mode:` so the operator can see *why* this
     // mode got picked, not just *what*. Easy to delete; the suggestion
@@ -1363,12 +1374,29 @@ mod tests {
         assert!(is_simple_pg_ident("public.orders"));
         assert!(!is_simple_pg_ident("public.CaseTwin"));
         assert!(!is_simple_pg_ident("Orders"));
+        let rel = |schema: &str, table: &str, st: &str| {
+            let info = TableInfo {
+                density: None,
+                schema: schema.into(),
+                table: table.into(),
+                row_estimate: 0,
+                total_bytes: None,
+                columns: vec![],
+            };
+            quote_relation(&info, st)
+        };
         assert_eq!(
-            quote_relation("public.CaseTwin", "postgres"),
-            "\"public\".\"CaseTwin\""
+            rel("sales", "CaseTwin", "postgres"),
+            "\"sales\".\"CaseTwin\""
         );
-        assert_eq!(quote_relation("Db.Weird", "mysql"), "`Db`.`Weird`");
-        assert_eq!(quote_relation("dbo.Order", "mssql"), "[dbo].[Order]");
+        assert_eq!(rel("public", "CaseTwin", "postgres"), "\"CaseTwin\"");
+        assert_eq!(rel("dbo", "Order", "mssql"), "[dbo].[Order]");
+        assert_eq!(
+            rel("shop", "a.t", "mysql"),
+            "`a.t`",
+            "a MySQL table is addressed bare, and its own dot stays inside the quotes"
+        );
+        assert_eq!(rel("dbo", "dot.t", "mssql"), "[dbo].[dot.t]");
     }
 
     use super::*;

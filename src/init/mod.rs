@@ -1106,6 +1106,15 @@ fn cursor_missing_message(names: &[String], mode: Option<&str>, whole_schema: bo
 
 /// One line per informational marker, naming every export that carries it.
 fn warn_marked_exports(text: &str) {
+    let skipped = yaml_scaffold::skipped_tables(text);
+    if !skipped.is_empty() {
+        eprintln!(
+            "rivet: {} table(s) were left out of the config — see the `# SKIPPED` comments \
+             for why: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
     for (marker, what) in [
         (
             yaml_scaffold::INIT_INSERT_ONLY_MARKER,
@@ -1543,6 +1552,18 @@ mod tests {
     }
 
     /// Every export that needs a cursor is named at once, read from the scaffold text.
+    #[test]
+    fn every_skipped_table_is_named_from_its_comment() {
+        let cfg = "exports:\n  # SKIPPED Orders: its name cannot be a `table:` shortcut\n  \
+                   #   (wrapped)\n  - name: kept\n  # SKIPPED collection user-events: its name \
+                   cannot pass the `table:`\n";
+        assert_eq!(
+            yaml_scaffold::skipped_tables(cfg),
+            vec!["Orders".to_string(), "user-events".to_string()]
+        );
+        assert!(yaml_scaffold::skipped_tables("exports:\n  - name: a\n").is_empty());
+    }
+
     #[test]
     fn the_cursor_message_offers_exclude_only_to_a_whole_schema_init() {
         let names = vec!["a".to_string(), "b".to_string()];

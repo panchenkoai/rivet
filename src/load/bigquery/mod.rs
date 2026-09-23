@@ -406,6 +406,19 @@ impl TargetLoader for BigQueryLoader {
         let options = creation_options(existing.is_none(), self.partition.as_ref());
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
+        if uris.is_empty() {
+            eprintln!("  note: the newest run exported 0 rows — `{target}` is emptied to match");
+            let sql = build_empty_table_sql(
+                &target,
+                existing.is_some(),
+                &build_schema(specs),
+                self.partition_expr(),
+                cluster,
+                options.as_deref(),
+            );
+            self.run_sql(&sql, "load", table)?;
+            return self.count_rows(table);
+        }
         let batches = self.batches(uris, self.partition.as_ref())?;
         // One job with nothing to rename OVERWRITES the target directly; anything else
         // goes through staging below (`loads_directly`).
@@ -887,14 +900,14 @@ pub(crate) fn partition_expr(
             let t = column_type(column)?;
             let g = granularity.as_sql();
             let expr = match (t.as_str(), granularity) {
-                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC({column}, {g})"),
-                ("DATETIME", _) => format!("DATETIME_TRUNC({column}, {g})"),
-                ("DATE", Granularity::Day) => column.clone(),
+                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC(`{column}`, {g})"),
+                ("DATETIME", _) => format!("DATETIME_TRUNC(`{column}`, {g})"),
+                ("DATE", Granularity::Day) => format!("`{column}`"),
                 ("DATE", Granularity::Hour) => bail!(
                     "export `{export}`: `{column}` is a DATE, which has no hours — partition it \
                      by day, month or year"
                 ),
-                ("DATE", _) => format!("DATE_TRUNC({column}, {g})"),
+                ("DATE", _) => format!("DATE_TRUNC(`{column}`, {g})"),
                 _ => bail!(
                     "export `{export}`: cannot partition on `{column}` ({t}); BigQuery partitions \
                      a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`"
@@ -927,7 +940,7 @@ pub(crate) fn partition_expr(
                     end: *end,
                     interval: *interval,
                 },
-                format!("RANGE_BUCKET({column}, GENERATE_ARRAY({start}, {end}, {interval}))"),
+                format!("RANGE_BUCKET(`{column}`, GENERATE_ARRAY({start}, {end}, {interval}))"),
             )
         }
         PartitionForm::Ingestion(g) => {

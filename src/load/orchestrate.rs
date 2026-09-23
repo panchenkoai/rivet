@@ -461,6 +461,27 @@ fn late_runs_refusal(
     })
 }
 
+/// The typo warning for a prefix with no manifests — unless the ledger says runs were loaded from it, which `cleanup_source` then emptied.
+fn empty_prefix_note(
+    table: &str,
+    prefix: &str,
+    empty: bool,
+    loaded: &std::collections::HashSet<String>,
+) -> Option<String> {
+    (empty && loaded.is_empty()).then(|| {
+        format!(
+            "  load [{table}]: found NO manifests under {prefix} — nothing was ever staged \
+             here. If an export should have landed, check the prefix for typos \
+             (a wrong prefix reads as permanently 'up to date')."
+        )
+    })
+}
+
+/// Whether a load whose runs resolve to no files is a no-op: yes for an append (nothing changed), never for a full load, whose newest run says the table is now empty.
+fn nothing_to_load(mode: load::plan::LoadMode, no_files: bool) -> bool {
+    no_files && mode != load::plan::LoadMode::Full
+}
+
 /// The runs listed after `pinned` in a newest-first listing; none when it is absent.
 fn runs_older_than<'a>(
     newest_first: &'a [(String, String)],
@@ -988,14 +1009,6 @@ fn prepare_load(
     // for BOTH "all runs consumed" and "this prefix holds NOTHING" — and the
     // second is what a typo'd/mis-encoded prefix produces, forever, exit 0.
     // Say the empty-prefix truth before the optimistic line.
-    if keyed.is_empty() {
-        eprintln!(
-            "  load [{}]: found NO manifests under {} — nothing was ever staged \
-             here. If an export should have landed, check the prefix for typos \
-             (a wrong prefix reads as permanently 'up to date').",
-            plan.table, plan.gcs_prefix
-        );
-    }
     // Refuse a prefix shared by two exports BEFORE selecting/summing/cleaning:
     // the load sums every manifest here and cleanup wipes the prefix recursively,
     // so a shared base prefix would cross-contaminate the count and delete a
@@ -1033,6 +1046,10 @@ fn prepare_load(
         },
         None => std::collections::HashSet::new(),
     };
+    if let Some(note) = empty_prefix_note(&plan.table, &plan.gcs_prefix, keyed.is_empty(), &loaded)
+    {
+        eprintln!("{note}");
+    }
     // Counted BEFORE `select_runs` takes `keyed` by value: when the selection comes
     // back empty, this is the only thing that can say WHY. `Ok(None)` is overloaded
     // across four states — every run consumed, a prefix holding nothing (said
@@ -1109,7 +1126,7 @@ fn prepare_load(
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
     let source_run_ids: Vec<String> = new.iter().map(|(_, m)| m.run_id.clone()).collect();
-    if uris.is_empty() {
+    if nothing_to_load(plan.mode, uris.is_empty()) {
         // Unloaded manifests that resolve to NO files: runs that legitimately
         // produced nothing (a CDC cycle with no changes, the anchor cycle of
         // `initial: snapshot`). That is "up to date", not an error — the loader
@@ -3607,6 +3624,37 @@ mod live_only_decisions {
         assert_eq!(ids(super::runs_older_than(&runs, "r3")), ["r2", "r1"]);
         assert!(super::runs_older_than(&runs, "r1").is_empty());
         assert!(super::runs_older_than(&runs, "gone").is_empty());
+    }
+
+    #[test]
+    fn an_empty_prefix_is_a_typo_warning_only_when_nothing_was_ever_loaded_from_it() {
+        let none = std::collections::HashSet::new();
+        let loaded: std::collections::HashSet<String> = ["r1".to_string()].into();
+        assert!(
+            super::empty_prefix_note("t", "gs://b/p/", true, &none)
+                .is_some_and(|n| n.contains("check the prefix for typos"))
+        );
+        assert_eq!(
+            super::empty_prefix_note("t", "gs://b/p/", true, &loaded),
+            None,
+            "loaded then cleaned by cleanup_source is not a typo"
+        );
+        assert_eq!(
+            super::empty_prefix_note("t", "gs://b/p/", false, &none),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_newest_run_empties_a_full_load_and_is_a_no_op_for_an_append() {
+        use load::plan::LoadMode;
+        assert!(
+            !super::nothing_to_load(LoadMode::Full, true),
+            "the table is now empty"
+        );
+        assert!(super::nothing_to_load(LoadMode::Incremental, true));
+        assert!(super::nothing_to_load(LoadMode::Cdc, true));
+        assert!(!super::nothing_to_load(LoadMode::Cdc, false));
     }
 
     #[test]

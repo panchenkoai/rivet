@@ -284,6 +284,22 @@ pub(super) fn loads_directly(renames: &[Rename], batches: &[Vec<String>]) -> boo
     renames.is_empty() && batches.len() <= 1
 }
 
+/// The free statement that leaves `fqtn` empty: `TRUNCATE` when it exists, else `CREATE` with the load's shape.
+pub(super) fn build_empty_table_sql(
+    fqtn: &str,
+    exists: bool,
+    schema: &str,
+    partition_expr: Option<&str>,
+    cluster_by: &[String],
+    options: Option<&str>,
+) -> String {
+    if exists {
+        return format!("TRUNCATE TABLE `{fqtn}`;");
+    }
+    let clauses = table_shape_clauses(partition_expr, cluster_by, options);
+    format!("CREATE TABLE `{fqtn}` (\n{schema}\n){clauses};")
+}
+
 /// A free `LOAD DATA` batch-load statement declaring the native `schema`, so
 /// BigQuery coerces the Parquet to native types on load.
 pub(super) fn build_load_data_sql(

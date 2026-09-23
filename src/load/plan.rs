@@ -2978,22 +2978,22 @@ load:
         ];
         let expr = |block: serde_json::Value| resolve_bq(block, &specs).unwrap().unwrap().expr;
         let col = |c: &str, g: &str| serde_json::json!({ "column": c, "granularity": g });
-        assert_eq!(expr(col("ts", "hour")), "TIMESTAMP_TRUNC(ts, HOUR)");
-        assert_eq!(expr(col("ts", "day")), "TIMESTAMP_TRUNC(ts, DAY)");
-        assert_eq!(expr(col("ts", "month")), "TIMESTAMP_TRUNC(ts, MONTH)");
-        assert_eq!(expr(col("ts", "year")), "TIMESTAMP_TRUNC(ts, YEAR)");
-        assert_eq!(expr(col("dt", "hour")), "DATETIME_TRUNC(dt, HOUR)");
-        assert_eq!(expr(col("dt", "day")), "DATETIME_TRUNC(dt, DAY)");
-        assert_eq!(expr(col("dt", "month")), "DATETIME_TRUNC(dt, MONTH)");
-        assert_eq!(expr(col("dt", "year")), "DATETIME_TRUNC(dt, YEAR)");
-        assert_eq!(expr(col("d", "day")), "d");
-        assert_eq!(expr(col("d", "month")), "DATE_TRUNC(d, MONTH)");
-        assert_eq!(expr(col("d", "year")), "DATE_TRUNC(d, YEAR)");
+        assert_eq!(expr(col("ts", "hour")), "TIMESTAMP_TRUNC(`ts`, HOUR)");
+        assert_eq!(expr(col("ts", "day")), "TIMESTAMP_TRUNC(`ts`, DAY)");
+        assert_eq!(expr(col("ts", "month")), "TIMESTAMP_TRUNC(`ts`, MONTH)");
+        assert_eq!(expr(col("ts", "year")), "TIMESTAMP_TRUNC(`ts`, YEAR)");
+        assert_eq!(expr(col("dt", "hour")), "DATETIME_TRUNC(`dt`, HOUR)");
+        assert_eq!(expr(col("dt", "day")), "DATETIME_TRUNC(`dt`, DAY)");
+        assert_eq!(expr(col("dt", "month")), "DATETIME_TRUNC(`dt`, MONTH)");
+        assert_eq!(expr(col("dt", "year")), "DATETIME_TRUNC(`dt`, YEAR)");
+        assert_eq!(expr(col("d", "day")), "`d`");
+        assert_eq!(expr(col("d", "month")), "DATE_TRUNC(`d`, MONTH)");
+        assert_eq!(expr(col("d", "year")), "DATE_TRUNC(`d`, YEAR)");
         assert_eq!(
             expr(
                 serde_json::json!({ "range": { "column": "n", "start": 0, "end": 100, "interval": 5 } })
             ),
-            "RANGE_BUCKET(n, GENERATE_ARRAY(0, 100, 5))"
+            "RANGE_BUCKET(`n`, GENERATE_ARRAY(0, 100, 5))"
         );
         assert_eq!(
             expr(serde_json::json!({ "ingestion": "hour" })),

@@ -2,7 +2,7 @@
 
 Run 1 takes everything, run 2 takes only the delta, on the file the product itself
 scaffolds: `init --bigquery-project/--bigquery-dataset` emits the `load:` section, then
-`run → load → compact` lands the base and its buffer in the warehouse. Nine cells,
+`run → load → compact` lands the base and its buffer in the warehouse. Ten cells,
 each a Rig test over a generated config:
 
   * batch on PostgreSQL / MySQL / SQL Server — init picks the cursor (the SQL Server
@@ -17,6 +17,7 @@ each a Rig test over a generated config:
     its primary key recorded.
   * a compaction whose job died after renaming the buffer to `__changes__merging`: the
     next `compact` merges the leftover into the base and drops it.
+  * a full load whose source was emptied: the warehouse table is emptied too.
 
 The two init flags no blessed cell carries (`--bigquery-project`, `--bigquery-dataset`)
 are exercised here, which is what their `FLAG_EXCUSED` entries point at. Oracles are
@@ -39,6 +40,7 @@ CELLS = {
     "a_cyrillic_lookalike_column_lands_under_its_latin_name_with_every_value": "warehouse:lookalike",
     "an_export_init_cannot_give_a_cursor_does_not_cost_the_others_their_key": "keys:per-export",
     "a_compaction_left_half_done_is_finished_by_the_next_one": "compact:leftover",
+    "a_full_load_of_an_emptied_source_empties_the_warehouse_table": "full:emptied",
 }
 
 

@@ -176,6 +176,12 @@ impl TargetLoader for SnowflakeLoader {
     }
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
+        if uris.is_empty() {
+            bail!(
+                "the newest run of `{table}` exported 0 rows; emptying a Snowflake table to match \
+                 is not supported yet — TRUNCATE it by hand, or keep the previous rows knowingly"
+            );
+        }
         let sql = self.build_materialize_sql(table, specs, uris)?;
         let result = self.run_snow(&sql)?;
         // ponytail: rows via COUNT(*); can become the COPY's `rows_loaded`

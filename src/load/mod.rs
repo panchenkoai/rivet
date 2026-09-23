@@ -776,9 +776,6 @@ fn whole_table_preflight(
     uris: &[String],
     ownership: Ownership,
 ) -> Result<()> {
-    if uris.is_empty() {
-        bail!("no Parquet URIs to load into `{table}`");
-    }
     ensure_safe_load_uris(uris)?;
     validate_specs(table, specs)?;
     ensure_overwritable(loader, table, ownership)
@@ -2047,25 +2044,39 @@ pub(crate) mod tests {
     const PREFIX: &str = "gs://b/p";
     const REL: &str = "p";
 
+    /// A full load whose newest run exported nothing hands the loader an empty file list,
+    /// and the count gate still holds the table to the run's own total.
     #[test]
-    fn empty_uris_bail_before_materialize() {
-        let f = FakeLoader {
-            rows: 10,
+    fn an_empty_file_list_reaches_the_loader_and_the_count_gate_still_applies() {
+        let empty = FakeLoader::default();
+        run_load(
+            &empty,
+            "t",
+            &spec(TargetStatus::Ok),
+            &[],
+            Some(0),
+            None,
+            Ownership::Own,
+        )
+        .expect("an empty newest run empties the table");
+        assert_eq!(*empty.materialized.borrow(), ["t"]);
+        let stale = FakeLoader {
+            rows: 3,
             ..Default::default()
         };
         assert!(
             run_load(
-                &f,
+                &stale,
                 "t",
                 &spec(TargetStatus::Ok),
                 &[],
-                Some(10),
+                Some(0),
                 None,
                 Ownership::Own
             )
-            .is_err()
+            .is_err(),
+            "a table left holding rows the run says are gone fails the gate"
         );
-        assert!(f.materialized.borrow().is_empty());
     }
 
     #[test]

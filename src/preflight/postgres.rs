@@ -272,7 +272,12 @@ pub(crate) fn table_from_simple_query(query: &str) -> Option<&str> {
                         query.as_bytes()[idx - 1],
                         b' ' | b'\t' | b'\n' | b'\r' | b')'
                     );
-                if head_ok && rest.len() >= 5 && rest[..4].eq_ignore_ascii_case("from") {
+                if head_ok
+                    && rest.len() >= 5
+                    && rest
+                        .get(..4)
+                        .is_some_and(|w| w.eq_ignore_ascii_case("from"))
+                {
                     let after = rest[4..].chars().next();
                     if matches!(after, Some(c) if c.is_whitespace() || c == '(') {
                         // skip 'from' + whitespace
@@ -673,6 +678,15 @@ mod tests {
         assert_eq!(
             table_from_simple_query("SELECT (SELECT max(x) FROM events)"),
             None
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_survives_a_non_ascii_column_name() {
+        assert_eq!(
+            table_from_simple_query("SELECT \"id\", \"\u{434}\u{430}\u{442}\u{430}\" FROM orders"),
+            Some("orders"),
+            "a multi-byte column must not split a char at the FROM probe"
         );
     }
 

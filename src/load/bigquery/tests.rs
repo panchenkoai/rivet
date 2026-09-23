@@ -1354,3 +1354,22 @@ fn only_one_job_with_nothing_to_rename_loads_straight_into_the_target() {
         "a rename needs the staging table"
     );
 }
+
+#[test]
+fn an_empty_full_load_truncates_an_existing_table_and_creates_a_missing_one() {
+    assert_eq!(
+        build_empty_table_sql("p.d.t", true, "  `id` INT64", Some("DATE(ts)"), &[], None),
+        "TRUNCATE TABLE `p.d.t`;"
+    );
+    assert_eq!(
+        build_empty_table_sql(
+            "p.d.t",
+            false,
+            "  `id` INT64",
+            None,
+            &["id".to_string()],
+            None
+        ),
+        "CREATE TABLE `p.d.t` (\n  `id` INT64\n)\nCLUSTER BY `id`;"
+    );
+}

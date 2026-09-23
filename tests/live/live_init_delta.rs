@@ -284,6 +284,63 @@ fn a_generated_config_drives_run_load_compact_into_the_warehouse_mssql() {
     warehouse_chain(SqlEngine::Mssql, "init_chain_ms");
 }
 
+/// A full load whose newest run exported 0 rows (the source was emptied) empties the
+/// warehouse table; it used to report "up to date" and keep serving the deleted rows.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_full_load_of_an_emptied_source_empties_the_warehouse_table() {
+    let Some(bq) = BqLive::from_env("init_emptied") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _table_guard) = e.create("init_emptied", "id BIGINT PRIMARY KEY, v TEXT NOT NULL");
+    e.exec(&format!(
+        "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(1,5) g"
+    ));
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "full",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
+    let _bq_guard = bq.cleanup(&[&export]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(bq.read_bq_count(&export), "5");
+
+    e.exec(&format!("TRUNCATE {table}"));
+    rivet_ok(&["run", "-c", cfg], &db);
+    let said = rivet_ok(&["load", "-c", cfg], &[]);
+    assert!(
+        !said.contains("LOAD SKIP"),
+        "an emptied source is not 'up to date': {said}"
+    );
+    assert_eq!(
+        bq.read_bq_count(&export),
+        "0",
+        "the warehouse table matches the source's latest snapshot, which is empty"
+    );
+}
+
 /// A compaction whose job died after renaming the buffer to `<t>__changes__merging`
 /// leaves rows in no base and no buffer; the next `compact` must merge them and drop
 /// the leftover. The dead job is reproduced by making that rename by hand.
