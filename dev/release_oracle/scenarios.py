@@ -494,41 +494,34 @@ def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, 
             return None
         lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)
         return S3_HTTPFS_PREAMBLE, f"read_parquet([{lst}])"
-    if store == "gcs":
-        # No gsutil needed — the fake-gcs JSON API is enough, and it keeps the
-        # readback independent of rivet.
-        dl.mkdir(parents=True, exist_ok=True)
-        # `--all` because the manifests ARE the oracle here: the default mode pulls
-        # only parquet and flattens it to `part_N.parquet`, which cannot answer what
-        # the run declared and breaks the names a manifest uses.
-        got = run(
-            [PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket, prefix,
-             str(dl), "--all"]
-        ).stdout.strip()
-        try:
-            pulled = int(got)
-        except ValueError:
-            pulled = 0
-        if pulled <= 0:
-            return None
-        src = _declared_read(dl, ".parquet")
-        return ("", f"read_parquet({src})") if src else None
-    if store == "azure":
-        if not have("az"):
-            return None
-        dl.mkdir(parents=True, exist_ok=True)
-        run(
-            [
-                "az", "storage", "blob", "download-batch",
-                "--connection-string", AZURITE_CONN,
-                "-s", bucket,
-                "--pattern", f"{prefix}/*",
-                "-d", str(dl),
-            ]
-        )
+    if store in ("gcs", "azure") and pull_prefix(store, bucket, prefix, dl):
         src = _declared_read(dl, ".parquet")
         return ("", f"read_parquet({src})") if src else None
     return None
+
+
+def pull_prefix(store: str, bucket: str, prefix: str, dest: Path) -> bool:
+    """Download a store prefix WHOLE into `dest` (manifests included) with the store's own client; False when the client is absent or nothing came down."""
+    dest.mkdir(parents=True, exist_ok=True)
+    if store == "s3":
+        if not have("mc"):
+            return False
+        run(["mc", "alias", "set", "rivetgate", "http://127.0.0.1:9000",
+             MINIO_ACCESS_KEY, MINIO_SECRET_KEY])
+        return run(["mc", "cp", "--recursive", f"rivetgate/{bucket}/{prefix}/", str(dest)]).ok
+    if store == "gcs":
+        # `--all`: the default mode pulls only parquet, renamed `part_N.parquet`,
+        # which cannot answer what the run declared.
+        got = run([PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket,
+                   prefix, str(dest), "--all"]).stdout.strip()
+        return got.isdigit() and int(got) > 0
+    if store == "azure":
+        if not have("az"):
+            return False
+        run(["az", "storage", "blob", "download-batch", "--connection-string", AZURITE_CONN,
+             "-s", bucket, "--pattern", f"{prefix}/*", "-d", str(dest)])
+        return any(dest.iterdir())
+    return False
 
 
 def store_dest(store: str, bucket: str, prefix: str) -> str | None:
@@ -578,43 +571,40 @@ def _store_env(url: str) -> dict[str, str]:
 
 
 # ── source-side oracles ──────────────────────────────────────────────────────
-def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> str:
-    """`"<count> <distinct>"` from the client inside the container publishing `url`'s port — never a sibling version's container; empty when none does."""
+def source_query(engine: str, url: str, query: str) -> str:
+    """First line `query` prints through the engine's own client in the container publishing `url`'s port (a shell expression on mongo); "" when none does."""
     port = port_of(url)
     container = container_for_port(port) if port else None
     if container is None:
         return ""
     if engine == "postgres":
-        return docker_exec(
-            container, "psql", "-U", "rivet", "-d", "rivet", "-tA",
-            "-c", f"SELECT count(*)||' '||count(DISTINCT {id_col}) FROM {table}",
-        ).stdout.strip()
-    if engine == "mysql":
-        return docker_exec(
-            container, "mysql", "-urivet", "-privet", "rivet", "-N",
-            "-e", f"SELECT CONCAT(count(*),' ',count(DISTINCT {id_col})) FROM {table}",
-        ).stdout.strip()
-    if engine == "mssql":
-        out = docker_exec(
-            container, "/opt/mssql-tools18/bin/sqlcmd",
-            "-S", "localhost", "-U", "sa", "-P", "Rivet_Passw0rd!", "-d", "rivet",
-            "-C", "-h", "-1", "-W",
-            "-Q", f"SET NOCOUNT ON; SELECT CONCAT(count(*),' ',count(DISTINCT {id_col})) FROM {table}",
-        ).stdout
-        return out.replace("\r", "").strip()
-    if engine == "mongo":
-        # mongo:4.4 ships the legacy `mongo` shell, 5.0+ ships `mongosh`. Pick
-        # whichever the container actually has, or the count comes back as an OCI
-        # "executable not found" string and the gate false-fails on good data.
-        shell = mongo_shell(container)
-        # countDocuments({}) NOT countDocuments() — the legacy 4.4 shell rejects
-        # the no-arg form ("match filter must be an expression in an object").
-        return docker_exec(
-            container, shell, "mongodb://127.0.0.1:27017/rivet", "--quiet",
-            "--eval",
-            f"print(db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length)",
-        ).stdout.strip()
-    return ""
+        argv = ["psql", "-U", "rivet", "-d", "rivet", "-tA", "-c", query]
+    elif engine == "mysql":
+        argv = ["mysql", "-urivet", "-privet", "rivet", "-N", "-e", query]
+    elif engine == "mssql":
+        argv = ["/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa",
+                "-P", "Rivet_Passw0rd!", "-d", "rivet", "-h", "-1", "-W",
+                "-Q", f"SET NOCOUNT ON; {query}"]
+    elif engine == "mongo":
+        # countDocuments({}) not countDocuments(): the legacy 4.4 shell rejects the no-arg form.
+        argv = [mongo_shell(container), "mongodb://127.0.0.1:27017/rivet", "--quiet",
+                "--eval", f"print({query})"]
+    else:
+        return ""
+    out = docker_exec(container, *argv).stdout.replace("\r", "").strip()
+    return out.splitlines()[0].strip() if out else ""
+
+
+def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> str:
+    """`"<count> <distinct>"` from the source engine's own client; empty when no container serves `url`."""
+    concat = f"SELECT CONCAT(count(*),' ',count(DISTINCT {id_col})) FROM {table}"
+    query = {
+        "postgres": f"SELECT count(*)||' '||count(DISTINCT {id_col}) FROM {table}",
+        "mysql": concat,
+        "mssql": concat,
+        "mongo": f"db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length",
+    }.get(engine)
+    return source_query(engine, url, query) if query else ""
 
 
 def mongo_shell(container: str) -> str:

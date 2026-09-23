@@ -144,6 +144,10 @@ class Ledger:
         finally:
             self._spans.append((name, time.perf_counter() - t0))
 
+    def record_span(self, name: str, seconds: float) -> None:
+        """Record a wall-clock measured by the caller (a step between two marks)."""
+        self._spans.append((name, seconds))
+
     def buffered_child(self) -> "Ledger":
         """A sub-ledger that BUFFERS output (for one parallel engine). Its cells +
         buffered lines are folded back with `flush_into` after the engine finishes."""
@@ -246,6 +250,21 @@ class Ledger:
                     mx_name, mx = max(members, key=lambda p: p[1])
                     print(f"  {tot / 60.0:6.1f} min  {key:22} n={len(members):<3} "
                           f"mean={tot / len(members):4.1f}s  max={mx:4.1f}s ({mx_name.split(maxsplit=3)[-1]})")
+                print()
+            # Per-STEP rollup across every cell: "step <engine> <stage> <store>"
+            # spans, grouped by stage × store — which step of the chain the
+            # matrix's time actually goes to.
+            steps = [(n, d) for n, d in self._spans if n.startswith("step ")]
+            if steps:
+                by: dict[str, list[float]] = {}
+                for n, d in steps:
+                    _, _eng, stage, store = n.split(maxsplit=3)
+                    by.setdefault(f"{stage} {store}", []).append(d)
+                self.phase("Timing — chain steps per stage×store (summed over every cell and engine)")
+                for key in sorted(by, key=lambda k: sum(by[k]), reverse=True):
+                    ds = by[key]
+                    print(f"  {sum(ds) / 60.0:6.1f} min  {key:28} n={len(ds):<4} "
+                          f"mean={sum(ds) / len(ds):5.1f}s  max={max(ds):5.1f}s")
                 print()
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))

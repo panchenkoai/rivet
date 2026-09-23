@@ -51,6 +51,7 @@ class Oracle:
         mssql: str | None = None,
         mongo: str | None = None,
         gcs: bool = False,
+        state: str | None = None,
     ) -> None:
         self.db = duckdb.connect()
         self.project: str | None = None
@@ -74,6 +75,11 @@ class Oracle:
         if postgres:
             self.db.sql("INSTALL postgres; LOAD postgres;")
             self.db.sql(f"ATTACH '{postgres}' AS pg (TYPE postgres, READ_ONLY)")
+        if state:
+            # rivet's state DB: a Postgres URL, else a SQLite file path.
+            kind = "postgres" if state.startswith("postgres") else "sqlite"
+            self.db.sql(f"INSTALL {kind}; LOAD {kind};")
+            self.db.sql(f"ATTACH '{state}' AS st (TYPE {kind}, READ_ONLY)")
         if bigquery:
             target = bq_target()
             if target is None:

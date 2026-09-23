@@ -66,7 +66,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import blessed_path, cdc, scenarios
+from . import blessed_path, cdc, gcp, scenarios
 from ..pytools import registry
 from .core import (
     run,
@@ -364,10 +364,18 @@ def _why(p) -> str:
     return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
+#: (engine, cell label, tag) → when the cell's previous stage ended; a stage's
+#: duration is the time since that mark.
+_STEP_MARK: dict[tuple[str, str, str], float] = {}
+
+
 def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str) -> bool:
     """Record one stage. Every stage is its own row — a chain that dies at `plan`
     must leave `apply` as SKIP "not reached", never absent: in a 200-row report an
     absent cell reads as not-applicable."""
+    key, now = (cell.engine, cell.label, tag), time.perf_counter()
+    led.record_span(f"step {cell.engine} {stage} {cell.store}", now - _STEP_MARK.get(key, now))
+    _STEP_MARK[key] = now
     name = f"flow:{stage}"
     msg = f"{cell.engine} {cell.label} · {stage}"
     if ok:
@@ -613,28 +621,7 @@ def _pull(store: str, bucket: str, prefix: str, work: Path) -> Path | None:
     """Bring a cloud prefix down whole — manifests included, not just parquet."""
     dl = work / f"pull_{store}"
     shutil.rmtree(dl, ignore_errors=True)
-    dl.mkdir(parents=True, exist_ok=True)
-    if store == "s3":
-        if not have("mc"):
-            return None
-        alias = "rivetgate"
-        run(["mc", "alias", "set", alias, "http://127.0.0.1:9000",
-             scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY])
-        p = run(["mc", "cp", "--recursive", f"{alias}/{bucket}/{prefix}/", str(dl)])
-        return dl if p.ok else None
-    if store == "gcs":
-        # The emulator's JSON API is enough, and it keeps the pull independent
-        # of rivet — the same helper `store_readback` uses.
-        # `--all`: the manifests are the point. The default mode pulls only
-        # parquet and renames it `part_N.parquet`, which cannot answer "what did
-        # this run declare".
-        got = run([scenarios.PY, str(scenarios._asset("lib/gcs_pull.py")),
-                   "http://127.0.0.1:4443", bucket, prefix, str(dl), "--all"]).stdout.strip()
-        try:
-            return dl if int(got) > 0 else None
-        except ValueError:
-            return None
-    return None
+    return dl if scenarios.pull_prefix(store, bucket, prefix, dl) else None
 
 
 def _flow_rows(path: Path) -> int:
@@ -742,6 +729,7 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
 def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                cdc_block: str, tag: str = "live") -> None:
     """Walk one cell's whole chain, recording a row per stage."""
+    _STEP_MARK[(cell.engine, cell.label, tag)] = time.perf_counter()
     # NOT re-bound here. `tag` is the engine version, passed in — a literal
     # "flow" at this line shadowed the parameter and made the version-scoped
     # prefix inert while looking correct at its definition. Twice, in two
@@ -1116,9 +1104,9 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
                     "batch/gcs cells; a change stream has no batch load and the other "
                     "stores are covered by their own readback")
         return
-    if not have("bq") or not proj:
+    if not have("gcloud") or not proj:
         led.skipped(cell.engine, tag, "flow:load", cell.store,
-                    f"{cell.engine} {cell.label} · load — no `bq` CLI or no project "
+                    f"{cell.engine} {cell.label} · load — no `gcloud` (the REST token) or no project "
                     "(set BQ_ORACLE_PROJECT); the emulator cannot stand in, a warehouse "
                     "must read the real bucket")
         return
@@ -1140,11 +1128,12 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # Clear both sides first. A leftover table makes the next count a union of
     # two loads, and a gate that accumulates state stops measuring the run in
     # front of it.
-    run(["bq", "--project_id", proj, "mk", "-f", "--dataset", f"{proj}:{dset}"])
-    run(["bq", "--project_id", proj, "rm", "-f", "-t", f"{proj}:{dset}.{tbl}"])
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    gcp.bq_ensure_dataset(proj, dset)
+    gcp.bq_delete_table(proj, dset, tbl)
+    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
 
-    e = rivet("run", "-c", str(lcfg), env=env, timeout=scenarios.NO_TIMEOUT)
+    with led.span(f"step {cell.engine} load·export {cell.store}"):
+        e = rivet("run", "-c", str(lcfg), env=env, timeout=scenarios.NO_TIMEOUT)
     if not e.ok:
         _stage(led, cell, tag, "load", False, f"export to real gcs failed: {_why(e)}")
         return
@@ -1171,29 +1160,30 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     )
     # No `--rivet-bin`: the load resolves types IN PROCESS now (the flag existed
     # only to pin which binary the `rivet check` subprocess was, and is gone).
-    p = rivet("load", "-c", str(lcfg),
-              "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
+    with led.span(f"step {cell.engine} load·rivet_load {cell.store}"):
+        p = rivet("load", "-c", str(lcfg),
+                  "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
     if not p.ok:
         _stage(led, cell, tag, "load", False, f"exit={p.returncode} {_why(p)}")
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
         return
 
     # BigQuery's own count, decoded by Google's parquet reader.
-    q = run(["bq", "--project_id", proj, "query", "--nouse_legacy_sql", "--format", "csv",
-             f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`"]).stdout.strip().splitlines()
-    got = int(q[-1]) if q and q[-1].strip().isdigit() else -1
-    want = blessed_path._source_rows(cell.engine, url, cell.table)
-    lok, ldetail = _load_rows(cell, work, state_url, load_id, tbl)
+    with led.span(f"step {cell.engine} load·verify {cell.store}"):
+        q = gcp.bq_scalar(proj, f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`")
+        got = int(q) if q is not None and q.isdigit() else -1
+        want = blessed_path._source_rows(cell.engine, url, cell.table)
+        lok, ldetail = _load_rows(cell, work, state_url, load_id, tbl)
     _stage(led, cell, tag, "load", got == want and got > 0 and lok,
            f"bigquery={got} source={want} · ledger {ldetail}")
 
     # Cleanup is part of the cycle: the cell's own dataset goes, verified by a show that fails.
-    run(["bq", "--project_id", proj, "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
-    gone = run(["bq", "--project_id", proj, "show", "-d", f"{proj}:{dset}"])
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-    _stage(led, cell, tag, "load:cleanup", not gone.ok,
-           "cell dataset dropped (verified by a show that fails)"
-           if not gone.ok else "the dataset is STILL THERE after rm — the next run's count "
+    gcp.bq_delete_dataset(proj, dset)
+    still_there = gcp.bq_dataset_exists(proj, dset)
+    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+    _stage(led, cell, tag, "load:cleanup", not still_there,
+           "cell dataset dropped (verified by a GET that 404s)"
+           if not still_there else "the dataset is STILL THERE after rm — the next run's count "
            "would be a union of two loads")
 
 

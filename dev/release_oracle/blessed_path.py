@@ -211,40 +211,9 @@ def _parquet_rows_and_files(path: Path) -> tuple[int, int]:
 
 
 def _source_rows(engine: str, url: str, table: str) -> int:
-    """Row count from the source engine's OWN client, resolved by the URL's port.
-
-    `scenarios._source_count_distinct` finds the gate's own `rivet-oracle-eng-*`
-    containers by name; pointed at a dev stand it returns "" and the oracle then
-    SKIPs — correct, but it never compares. `container_for_port` resolves
-    whichever container actually serves the URL under test, so the same walk
-    works on the gate's containers and on a local stand. -1 means unresolvable,
-    which the caller turns into a SKIP, never into agreement."""
-    port = port_of(url)
-    c = container_for_port(port) if port else None
-    if not c:
-        return -1
-    if engine == "postgres":
-        out = docker_exec(c, "psql", "-U", "rivet", "-d", "rivet", "-tA",
-                          "-c", f"SELECT count(*) FROM {table}").stdout.strip()
-    elif engine == "mysql":
-        out = docker_exec(c, "mysql", "-urivet", "-privet", "rivet", "-N",
-                          "-e", f"SELECT count(*) FROM {table}").stdout.strip()
-    elif engine == "mssql":
-        out = docker_exec(c, "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost",
-                          "-U", "sa", "-P", "Rivet_Passw0rd!", "-d", "rivet",
-                          "-h-1", "-W", "-Q",
-                          f"SET NOCOUNT ON; SELECT count(*) FROM {table}").stdout.strip()
-    elif engine == "mongo":
-        # `mongosh` does not exist on 4.4 — see `scenarios.mongo_shell`. Asking
-        # for it there returned nothing, which this function turned into -1 and
-        # the oracle read as "source unreachable", SKIPping the comparison on the
-        # oldest gridded version. `countDocuments({})` and not the no-arg form:
-        # the legacy shell rejects it.
-        out = docker_exec(c, scenarios.mongo_shell(c), "--quiet", "rivet", "--eval",
-                          f"print(db.{table}.countDocuments({{}}))").stdout.strip()
-    else:
-        return -1
-    head = out.splitlines()[0].strip() if out else ""
+    """Row count from the source engine's own client (`scenarios.source_query`); -1 when unresolvable, which the caller SKIPs, never agrees with."""
+    query = f"db.{table}.countDocuments({{}})" if engine == "mongo" else f"SELECT count(*) FROM {table}"
+    head = scenarios.source_query(engine, url, query)
     return int(head) if head.isdigit() else -1
 
 
