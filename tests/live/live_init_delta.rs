@@ -354,7 +354,9 @@ fn a_compaction_left_half_done_is_finished_by_the_next_one() {
     e.alive();
     let (table, _table_guard) = e.create(
         "init_merging",
-        "id BIGINT PRIMARY KEY, v TEXT NOT NULL, changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+        // `t` and `s` are the aliases the compaction SQL once used; BigQuery resolved them to these columns.
+        "id BIGINT PRIMARY KEY, v TEXT NOT NULL, t TEXT, s TEXT, \
+         changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
     );
     e.exec(&format!(
         "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(1,10) g"

@@ -266,10 +266,10 @@ pub struct RangeBound {
     pub all_hi_exclusive: String,
 }
 
-/// `T.k = S.k AND …` over the key columns.
+/// `__rivet_t.k = __rivet_s.k AND …` over the key columns.
 fn key_join(pk: &[&str]) -> String {
     pk.iter()
-        .map(|k| format!("T.`{k}` = S.`{k}`"))
+        .map(|k| format!("__rivet_t.`{k}` = __rivet_s.`{k}`"))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -287,13 +287,13 @@ fn touched_values_sql(
     let (own, base) = match as_date {
         Some(ty) => (
             date_of(&format!("`{column}`"), ty),
-            date_of(&format!("T.`{column}`"), ty),
+            date_of(&format!("__rivet_t.`{column}`"), ty),
         ),
-        None => (format!("`{column}`"), format!("T.`{column}`")),
+        None => (format!("`{column}`"), format!("__rivet_t.`{column}`")),
     };
     format!(
-        "SELECT {own} AS v FROM `{changes_fqtn}` UNION ALL SELECT {base} FROM `{base_fqtn}` AS T \
-         WHERE EXISTS (SELECT 1 FROM `{changes_fqtn}` AS S WHERE {})",
+        "SELECT {own} AS v FROM `{changes_fqtn}` UNION ALL SELECT {base} FROM `{base_fqtn}` AS __rivet_t \
+         WHERE EXISTS (SELECT 1 FROM `{changes_fqtn}` AS __rivet_s WHERE {})",
         key_join(pk)
     )
 }
@@ -421,7 +421,7 @@ pub fn compact_merge_sql(
 
 /// Which of the buffer's WINNERS one MERGE takes, and the matching constant
 /// predicate on the base so BigQuery prunes it. `Days` names a script variable
-/// (`ARRAY<DATE>`) — measured: `DATE(T.col) IN UNNEST(var)` reads only the listed
+/// (`ARRAY<DATE>`) — measured: `DATE(__rivet_t.col) IN UNNEST(var)` reads only the listed
 /// partitions (172 bytes against 48 KB for the MIN..MAX range on the same buffer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeFilter {
@@ -519,12 +519,12 @@ pub fn compact_merge_filtered_sql(
     // NULL-keyed winners match the base by key alone: their partition is unknown.
     let on_bound = match filter {
         MergeFilter::NullKeys(_) => String::new(),
-        other => other.predicate("T"),
+        other => other.predicate("__rivet_t"),
     };
     let flag = |rendered: String| deleted_flag.then_some(rendered);
     let set = columns
         .iter()
-        .map(|c| format!("`{c}` = S.`{c}`"))
+        .map(|c| format!("`{c}` = __rivet_s.`{c}`"))
         .chain(flag(format!("`{DELETE_FLAG_COLUMN}` = FALSE")))
         .collect::<Vec<_>>()
         .join(", ");
@@ -536,7 +536,7 @@ pub fn compact_merge_filtered_sql(
         .join(", ");
     let insert_vals = columns
         .iter()
-        .map(|c| format!("S.`{c}`"))
+        .map(|c| format!("__rivet_s.`{c}`"))
         .chain(flag("FALSE".to_string()))
         .collect::<Vec<_>>()
         .join(", ");
@@ -546,22 +546,22 @@ pub fn compact_merge_filtered_sql(
     // upsert arm overwrote the live row with the delete's key-only image.
     let tombstone = if deleted_flag {
         format!(
-            "WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n"
+            "WHEN MATCHED AND __rivet_s.__op = 'delete' THEN UPDATE SET `{DELETE_FLAG_COLUMN}` = TRUE\n"
         )
     } else {
-        "WHEN MATCHED AND S.__op = 'delete' THEN DELETE\n".to_string()
+        "WHEN MATCHED AND __rivet_s.__op = 'delete' THEN DELETE\n".to_string()
     };
     format!(
-        "MERGE `{base_fqtn}` AS T\n\
+        "MERGE `{base_fqtn}` AS __rivet_t\n\
          USING (\n\
          \x20 SELECT * EXCEPT (__rn) FROM (\n\
          \x20   SELECT *, ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order}) AS __rn\n\
          \x20   FROM `{changes_fqtn}`\n\
          \x20 ) WHERE __rn = 1{source_filter}\n\
-         ) AS S\n\
+         ) AS __rivet_s\n\
          ON {on_keys}{on_bound}\n\
          {tombstone}WHEN MATCHED THEN UPDATE SET {set}\n\
-         WHEN NOT MATCHED AND COALESCE(S.__op, '') != 'delete' THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
+         WHEN NOT MATCHED AND COALESCE(__rivet_s.__op, '') != 'delete' THEN INSERT ({insert_cols}) VALUES ({insert_vals});"
     )
 }
 
@@ -1427,8 +1427,8 @@ mod compact_tests {
             s.contains(
                 "SET days = (SELECT IFNULL(ARRAY_AGG(DISTINCT v IGNORE NULLS), []) FROM (\
                  SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL \
-                 SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS \
-                 (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)));"
+                 SELECT DATE(__rivet_t.`created_at`) FROM `p.d.t` AS __rivet_t WHERE EXISTS \
+                 (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE __rivet_t.`id` = __rivet_s.`id`)));"
             ),
             "the days are the buffer's AND the base's for the buffer's keys: {s}"
         );
@@ -1443,7 +1443,7 @@ mod compact_tests {
         assert!(
             s.contains(") WHERE __rn = 1 AND DATE(`created_at`) IN UNNEST(chunk)")
                 && s.contains(
-                    "ON T.`id` = S.`id` AND (DATE(T.`created_at`) IN UNNEST(days) OR T.`created_at` IS NULL)"
+                    "ON __rivet_t.`id` = __rivet_s.`id` AND (DATE(__rivet_t.`created_at`) IN UNNEST(days) OR __rivet_t.`created_at` IS NULL)"
                 ),
             "winners filtered by the chunk, the base pruned to EVERY touched day plus the \
              NULL partition — never to the chunk alone: {s}"
@@ -1451,7 +1451,9 @@ mod compact_tests {
         assert!(
             s.contains("IF null_keys > 0 THEN")
                 && s.contains(") WHERE __rn = 1 AND `created_at` IS NULL")
-                && s.contains("ON T.`id` = S.`id`\nWHEN MATCHED AND S.__op = 'delete'"),
+                && s.contains(
+                    "ON __rivet_t.`id` = __rivet_s.`id`\nWHEN MATCHED AND __rivet_s.__op = 'delete'"
+                ),
             "NULL-keyed winners merge by key alone: {s}"
         );
         let drop = s.find("DROP TABLE `p.d.t__changes`;").expect("the drop");
@@ -1473,10 +1475,13 @@ mod compact_tests {
             None,
         );
         assert!(
-            plain.contains("IF n > 0 THEN\nMERGE `p.d.t` AS T"),
+            plain.contains("IF n > 0 THEN\nMERGE `p.d.t` AS __rivet_t"),
             "{plain}"
         );
-        assert!(plain.contains("ON T.`id` = S.`id`\n"), "unbounded: {plain}");
+        assert!(
+            plain.contains("ON __rivet_t.`id` = __rivet_s.`id`\n"),
+            "unbounded: {plain}"
+        );
         assert!(!plain.contains("UNNEST"), "{plain}");
         assert!(
             plain.ends_with("SELECT n AS changes_rows, IF(n > 0, 1, 0) AS merge_jobs;"),
@@ -1500,9 +1505,9 @@ mod compact_tests {
             Some("created_at"),
         );
         assert!(
-            utc.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`, 'UTC') FROM `p.d.t` AS T")
+            utc.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(__rivet_t.`created_at`, 'UTC') FROM `p.d.t` AS __rivet_t")
                 && utc.contains(") WHERE __rn = 1 AND DATE(`created_at`, 'UTC') IN UNNEST(chunk)")
-                && utc.contains("ON T.`id` = S.`id` AND (DATE(T.`created_at`, 'UTC') IN UNNEST(days) OR T.`created_at` IS NULL)"),
+                && utc.contains("ON __rivet_t.`id` = __rivet_s.`id` AND (DATE(__rivet_t.`created_at`, 'UTC') IN UNNEST(days) OR __rivet_t.`created_at` IS NULL)"),
             "{utc}"
         );
 
@@ -1517,13 +1522,18 @@ mod compact_tests {
             SourceEngine::Postgres,
             Some("created_at"),
         );
-        assert!(hostile.contains("MERGE `p.d.my-orders` AS T"), "{hostile}");
+        assert!(
+            hostile.contains("MERGE `p.d.my-orders` AS __rivet_t"),
+            "{hostile}"
+        );
         assert!(
             hostile.contains("PARTITION BY `order` ORDER BY"),
             "{hostile}"
         );
         assert!(
-            hostile.contains("ON T.`order` = S.`order` AND (DATE(T.`created_at`)"),
+            hostile.contains(
+                "ON __rivet_t.`order` = __rivet_s.`order` AND (DATE(__rivet_t.`created_at`)"
+            ),
             "{hostile}"
         );
         assert!(
@@ -1588,7 +1598,7 @@ mod compact_tests {
             "a key with no range (every row's key NULL) merges once, unbounded"
         );
         assert!(
-            all_null_keys[0].contains("ON T.`id` = S.`id`\n"),
+            all_null_keys[0].contains("ON __rivet_t.`id` = __rivet_s.`id`\n"),
             "{}",
             all_null_keys[0]
         );
@@ -1614,12 +1624,12 @@ mod compact_tests {
         let none = plan(None, &probe(7, "", "", 0));
         assert_eq!(none.len(), 1);
         assert!(
-            none[0].contains("ON T.`id` = S.`id`\n"),
+            none[0].contains("ON __rivet_t.`id` = __rivet_s.`id`\n"),
             "unbounded: {}",
             none[0]
         );
         assert!(
-            none[0].contains("SET `id` = S.`id`, `v` = S.`v`, `created_at` = S.`created_at`, `__is_deleted` = FALSE"),
+            none[0].contains("SET `id` = __rivet_s.`id`, `v` = __rivet_s.`v`, `created_at` = __rivet_s.`created_at`, `__is_deleted` = FALSE"),
             "the flag is set, never copied from the buffer: {}",
             none[0]
         );
@@ -1639,7 +1649,7 @@ mod compact_tests {
         // Both windows bound the BASE by the whole touched range: a key whose value
         // moved from the first window into the second sits in the base under the old
         // value, and a base bound by the winner's window alone re-inserted it.
-        let base_bound = "ON T.`id` = S.`id` AND (T.`created_at` >= DATETIME '2000-01-01T00:00:00' AND T.`created_at` < DATETIME '2013-09-09T00:00:00' OR T.`created_at` IS NULL)";
+        let base_bound = "ON __rivet_t.`id` = __rivet_s.`id` AND (__rivet_t.`created_at` >= DATETIME '2000-01-01T00:00:00' AND __rivet_t.`created_at` < DATETIME '2013-09-09T00:00:00' OR __rivet_t.`created_at` IS NULL)";
         assert!(
             two[0].contains(base_bound) && two[1].contains(base_bound),
             "{}\n{}",
@@ -1682,7 +1692,11 @@ mod compact_tests {
         // window reaches: one unbounded MERGE, not a million windows up to it.
         let stray = plan(Some(&range), &probe(5, "0", "4000000000", 0));
         assert_eq!(stray.len(), 1, "{stray:?}");
-        assert!(stray[0].contains("ON T.`id` = S.`id`\n"), "{}", stray[0]);
+        assert!(
+            stray[0].contains("ON __rivet_t.`id` = __rivet_s.`id`\n"),
+            "{}",
+            stray[0]
+        );
 
         // The warehouse's last day has no successor: a `9999-12-31` sentinel (the SCD
         // "end of time", a legal value) must not render `DATE '+10000-01-01'` — a hard
@@ -1692,7 +1706,7 @@ mod compact_tests {
         assert!(
             !eot[0].contains("10000")
                 && eot[0].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '9999-01-01T00:00:00'\n")
-                && eot[0].contains("ON T.`id` = S.`id` AND (T.`created_at` >= DATETIME '9999-01-01T00:00:00' OR T.`created_at` IS NULL)"),
+                && eot[0].contains("ON __rivet_t.`id` = __rivet_s.`id` AND (__rivet_t.`created_at` >= DATETIME '9999-01-01T00:00:00' OR __rivet_t.`created_at` IS NULL)"),
             "no upper bound past the last day: {}",
             eot[0]
         );
@@ -1707,7 +1721,7 @@ mod compact_tests {
         let range_nulls = plan(Some(&range), &probe(2, "", "", 2));
         assert_eq!(range_nulls.len(), 1);
         assert!(
-            range_nulls[0].contains("ON T.`id` = S.`id`\n"),
+            range_nulls[0].contains("ON __rivet_t.`id` = __rivet_s.`id`\n"),
             "{}",
             range_nulls[0]
         );
@@ -1754,28 +1768,28 @@ mod compact_tests {
             None,
             true,
         );
-        assert!(sql.starts_with("MERGE `p.d.orders` AS T"), "{sql}");
+        assert!(sql.starts_with("MERGE `p.d.orders` AS __rivet_t"), "{sql}");
         assert!(sql.contains("PARTITION BY `id` ORDER BY"), "{sql}");
         assert!(
             sql.contains("FROM `p.d.orders__changes`\n  ) WHERE __rn = 1 AND `created_at` >= DATE '2000-01-01' AND `created_at` < DATE '2010-12-14'"),
             "the buffer side is bounded AFTER ranking, on the winner: {sql}"
         );
         assert!(
-            sql.contains("ON T.`id` = S.`id` AND (T.`created_at` >= DATE '2000-01-01' AND T.`created_at` < DATE '2010-12-14' OR T.`created_at` IS NULL)"),
+            sql.contains("ON __rivet_t.`id` = __rivet_s.`id` AND (__rivet_t.`created_at` >= DATE '2000-01-01' AND __rivet_t.`created_at` < DATE '2010-12-14' OR __rivet_t.`created_at` IS NULL)"),
             "the base side is bounded by the same constants, plus its NULL partition: {sql}"
         );
         assert!(
             sql.contains(
-                "WHEN MATCHED AND S.__op = 'delete' THEN UPDATE SET `__is_deleted` = TRUE"
+                "WHEN MATCHED AND __rivet_s.__op = 'delete' THEN UPDATE SET `__is_deleted` = TRUE"
             ),
             "a tombstone flags, never deletes: {sql}"
         );
         assert!(
-            sql.contains("WHEN MATCHED THEN UPDATE SET `id` = S.`id`, `v` = S.`v`, `created_at` = S.`created_at`, `__is_deleted` = FALSE"),
+            sql.contains("WHEN MATCHED THEN UPDATE SET `id` = __rivet_s.`id`, `v` = __rivet_s.`v`, `created_at` = __rivet_s.`created_at`, `__is_deleted` = FALSE"),
             "an update refreshes the values and un-flags: {sql}"
         );
         assert!(
-            sql.contains("WHEN NOT MATCHED AND COALESCE(S.__op, '') != 'delete' THEN INSERT (`id`, `v`, `created_at`, `__is_deleted`) VALUES (S.`id`, S.`v`, S.`created_at`, FALSE)"),
+            sql.contains("WHEN NOT MATCHED AND COALESCE(__rivet_s.__op, '') != 'delete' THEN INSERT (`id`, `v`, `created_at`, `__is_deleted`) VALUES (__rivet_s.`id`, __rivet_s.`v`, __rivet_s.`created_at`, FALSE)"),
             "an insert lands live; a delete of an unknown key inserts nothing: {sql}"
         );
         assert!(
@@ -1809,7 +1823,7 @@ mod compact_tests {
              dated never merges here as well: {sql}"
         );
         assert!(
-            sql.contains("ON T.`id` = S.`id`\n"),
+            sql.contains("ON __rivet_t.`id` = __rivet_s.`id`\n"),
             "no bound on the base: {sql}"
         );
     }
@@ -1861,7 +1875,7 @@ mod compact_tests {
             Some("DATETIME"),
         );
         assert!(
-            t.contains("SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`) FROM `p.d.t` AS T WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS S WHERE T.`id` = S.`id`)")
+            t.contains("SELECT DATE(`created_at`) AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(__rivet_t.`created_at`) FROM `p.d.t` AS __rivet_t WHERE EXISTS (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE __rivet_t.`id` = __rivet_s.`id`)")
                 && t.contains("MIN(v)")
                 && t.contains("(SELECT COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`) AS null_keys"),
             "the range covers the base's rows of the buffer's keys, the NULL count is the buffer's: {t}"
@@ -1878,12 +1892,12 @@ mod compact_tests {
             Some("TIMESTAMP"),
         );
         assert!(
-            ts.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(T.`created_at`, 'UTC') FROM `p.d.t` AS T"),
+            ts.contains("SELECT DATE(`created_at`, 'UTC') AS v FROM `p.d.t__changes` UNION ALL SELECT DATE(__rivet_t.`created_at`, 'UTC') FROM `p.d.t` AS __rivet_t"),
             "{ts}"
         );
         let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), None);
         assert!(
-            r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT T.`bucket` FROM `p.d.t` AS T")
+            r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT __rivet_t.`bucket` FROM `p.d.t` AS __rivet_t")
                 && !r.contains("DATE("),
             "{r}"
         );
@@ -1935,8 +1949,8 @@ mod compact_column_tests {
         .expect("a plan");
         assert_eq!(plans.len(), 1, "146,098 days at 1,460,000 per window");
         assert!(
-            plans[0].contains("T.`created_at` >= DATETIME '1600-01-01T00:00:00'")
-                && plans[0].contains("T.`created_at` < DATETIME '2000-01-02T00:00:00'"),
+            plans[0].contains("__rivet_t.`created_at` >= DATETIME '1600-01-01T00:00:00'")
+                && plans[0].contains("__rivet_t.`created_at` < DATETIME '2000-01-02T00:00:00'"),
             "the one window covers the whole span: {}",
             plans[0]
         );
@@ -1961,21 +1975,23 @@ mod compact_column_tests {
             None,
         );
         assert!(
-            s.contains("SET `id` = S.`id`, `v` = S.`v`, `__is_deleted` = FALSE"),
+            s.contains("SET `id` = __rivet_s.`id`, `v` = __rivet_s.`v`, `__is_deleted` = FALSE"),
             "data columns, then the flag the merge sets: {s}"
         );
         assert!(
-            s.contains("INSERT (`id`, `v`, `__is_deleted`) VALUES (S.`id`, S.`v`, FALSE)"),
+            s.contains(
+                "INSERT (`id`, `v`, `__is_deleted`) VALUES (__rivet_s.`id`, __rivet_s.`v`, FALSE)"
+            ),
             "{s}"
         );
         for meta in ["__op", "__pos", "__seq"] {
             assert!(
-                !s.contains(&format!("`{meta}` = S.`{meta}`")),
+                !s.contains(&format!("`{meta}` = __rivet_s.`{meta}`")),
                 "the buffer's {meta} must not land in the base: {s}"
             );
         }
         assert!(
-            !s.contains("`__is_deleted` = S.`__is_deleted`"),
+            !s.contains("`__is_deleted` = __rivet_s.`__is_deleted`"),
             "the flag is the merge's decision, not a copied column: {s}"
         );
     }
@@ -2053,14 +2069,15 @@ mod compact_flag_tests {
             "the column is named nowhere when the base has none: {without}"
         );
         assert!(
-            without.contains("WHEN MATCHED AND S.__op = 'delete' THEN DELETE\n")
+            without.contains("WHEN MATCHED AND __rivet_s.__op = 'delete' THEN DELETE\n")
                 && !without.contains("THEN UPDATE SET `__is_deleted`"),
             "no flag, no tombstone to write — a delete DELETES, never falls through to the \
              upsert with its key-only image: {without}"
         );
         assert!(
-            without.contains("WHEN MATCHED THEN UPDATE SET `id` = S.`id`, `v` = S.`v`\n")
-                && without.contains("INSERT (`id`, `v`) VALUES (S.`id`, S.`v`)"),
+            without.contains(
+                "WHEN MATCHED THEN UPDATE SET `id` = __rivet_s.`id`, `v` = __rivet_s.`v`\n"
+            ) && without.contains("INSERT (`id`, `v`) VALUES (__rivet_s.`id`, __rivet_s.`v`)"),
             "the data columns still upsert: {without}"
         );
     }
