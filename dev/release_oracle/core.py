@@ -322,6 +322,11 @@ def docker_exec(container: str, *args: str, stdin: str | None = None, **kw) -> P
 
 
 def have(tool: str) -> bool:
+    """Is `tool` usable — for `duckdb`, the uv-pinned package the harness runs (dev/pytools/duckcli.py), never a binary on PATH."""
+    if tool == "duckdb":
+        import importlib.util
+
+        return importlib.util.find_spec("duckdb") is not None
     return shutil.which(tool) is not None
 
 

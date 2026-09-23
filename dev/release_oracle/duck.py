@@ -26,9 +26,6 @@ import duckdb
 BQ_PROJECT_ENV = "BQ_ORACLE_PROJECT"
 BQ_DATASET_ENV = "BQ_ORACLE_DATASET"
 
-#: Local stand DSNs, matching docker-compose.yaml.
-MYSQL_DSN = "host=127.0.0.1 port=3306 user=rivet password=rivet database=rivet"
-POSTGRES_DSN = "host=127.0.0.1 port=5432 user=rivet password=rivet dbname=rivet"
 
 
 def bq_target() -> tuple[str, str] | None:
@@ -51,9 +48,26 @@ class Oracle:
         bigquery: bool = False,
         mysql: str | None = None,
         postgres: str | None = None,
+        mssql: str | None = None,
+        mongo: str | None = None,
+        gcs: bool = False,
     ) -> None:
         self.db = duckdb.connect()
         self.project: str | None = None
+        if gcs:
+            import subprocess
+
+            token = subprocess.run(
+                ["gcloud", "auth", "print-access-token"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            self.db.sql("INSTALL httpfs; LOAD httpfs;")
+            self.db.sql(f"CREATE SECRET gcs_adc (TYPE gcs, BEARER_TOKEN '{token}')")
+        if mssql:
+            self.db.sql("INSTALL mssql FROM community; LOAD mssql;")
+            self.db.sql(f"ATTACH '{mssql}' AS ms (TYPE mssql, READ_ONLY)")
+        if mongo:
+            self.db.sql("INSTALL mongo FROM community; LOAD mongo;")
+            self.db.sql(f"ATTACH '{mongo}' AS mg (TYPE mongo, READ_ONLY)")
         if mysql:
             self.db.sql("INSTALL mysql; LOAD mysql;")
             self.db.sql(f"ATTACH '{mysql}' AS my (TYPE mysql, READ_ONLY)")

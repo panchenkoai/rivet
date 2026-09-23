@@ -82,6 +82,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from ..pytools import registry
 from .core import (Ledger, cell_gate, cell_parallel, container_for_port, docker_exec,
                    have, port_of, run, rivet)
 from . import scenarios
@@ -706,7 +707,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # when that process ends"), on 5 cells: postgres 13/14/17, mongo 5/6. The guard
     # was right; the gate handed two concurrent processes one warehouse table. The
     # work dir and bucket prefix below already carried the tag; this did not.
-    dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+    dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
             + f"_{engine}_{tag.replace('.', '_')}")
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:
@@ -752,14 +753,18 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
 
     # Clean both ends. Reported, because a cleanup that silently fails leaves
     # the next run measuring a union.
-    run(["bq", "--project_id", proj, "rm", "-f", "-t", f"{proj}:{dset}.{tbl}"])
-    d2 = run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    run(["bq", "--project_id", proj, "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
+    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    # Likewise the prefix: `rm` exits non-zero both on a transient error and when nothing is left, so list it afterwards.
+    left = run(["gcloud", "storage", "ls", "-r", f"gs://{bucket}/{pfx}/**"])
+    listed = [ln for ln in left.stdout.splitlines() if ln.strip().startswith("gs://")]
+    prefix_empty = (left.ok and not listed) or "matched no objects" in (left.stderr or "")
     # `bq rm -f` exits 0 whether it deleted a table or found none, so its exit
     # status cannot answer "is it gone" — this cell reported a clean cleanup
     # while dropping a table that never existed. Ask afterwards instead.
-    still = run(["bq", "--project_id", proj, "show", "-t", f"{proj}:{dset}.{tbl}"])
-    _stage(led, engine, tag, "bigquery", "bq-cleanup", not still.ok and d2.ok,
-           f"table absent after drop={not still.ok}, prefix removed={d2.ok}")
+    still = run(["bq", "--project_id", proj, "show", "-d", f"{proj}:{dset}"])
+    _stage(led, engine, tag, "bigquery", "bq-cleanup", not still.ok and prefix_empty,
+           f"dataset absent after drop={not still.ok}, prefix empty after rm={prefix_empty}")
 
 
 def verify_blessed_path(

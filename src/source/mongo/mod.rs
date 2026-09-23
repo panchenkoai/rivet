@@ -159,6 +159,21 @@ impl MongoSession {
     }
 }
 
+/// The refusal for a collection the database does not list; `None` when it exists or the listing was not allowed (a role without `listCollections`).
+fn missing_collection_refusal(
+    db: &str,
+    collection: &str,
+    listed: Option<Vec<String>>,
+) -> Option<String> {
+    listed.filter(|names| names.is_empty()).map(|_| {
+        format!(
+            "MongoDB collection `{db}.{collection}` does not exist — an export of it would \
+             succeed with 0 rows and a full load would then empty the warehouse table. Check \
+             the `table:` name (a dotted collection name is written whole)."
+        )
+    })
+}
+
 /// MongoDB source over a [`MongoSession`], carrying the resolved `source.mongo:`
 /// read options `export` applies.
 pub struct MongoSource {
@@ -612,13 +627,22 @@ impl Source for MongoSource {
                 request.query
             )
         })?;
+        let db = self.session.client().database(self.session.db());
+        let listed = self.session.block_on(
+            db.list_collection_names()
+                .filter(doc! { "name": coll_name })
+                .into_future(),
+        );
+        if let Some(refusal) = missing_collection_refusal(self.session.db(), coll_name, listed.ok())
+        {
+            anyhow::bail!("{refusal}");
+        }
         let schema = blob_schema();
         sink.on_schema(schema.clone())?;
 
         // `readConcern: snapshot` must ride the collection handle; a plain scan
         // uses the default handle. The scalar opts are copied into locals so the
         // async scan closure doesn't borrow `self`.
-        let db = self.session.client().database(self.session.db());
         let coll = if self.snapshot {
             db.collection_with_options::<Document>(
                 coll_name,
@@ -960,6 +984,25 @@ pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_collection_the_database_does_not_list_is_refused() {
+        let refusal = missing_collection_refusal("rivet", "orderz", Some(vec![]))
+            .expect("an empty listing for the exact name means the collection is missing");
+        assert!(
+            refusal.contains("`rivet.orderz` does not exist"),
+            "{refusal}"
+        );
+        assert_eq!(
+            missing_collection_refusal("rivet", "orders", Some(vec!["orders".into()])),
+            None
+        );
+        assert_eq!(
+            missing_collection_refusal("rivet", "orders", None),
+            None,
+            "a role without listCollections is not evidence of absence"
+        );
+    }
     use mongodb::bson::oid::ObjectId;
 
     // W4: the byte-cap multiplications had no exact-value test — `mb * 1024 *

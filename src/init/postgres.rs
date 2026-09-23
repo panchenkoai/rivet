@@ -112,7 +112,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
          FROM pg_index i
          JOIN pg_attribute a ON a.attrelid = i.indrelid
              AND a.attnum = ANY(i.indkey)
-         WHERE i.indrelid = to_regclass($1 || '.' || $2)
+         WHERE i.indrelid = to_regclass(quote_ident($1) || '.' || quote_ident($2))
            AND i.indrelid IS NOT NULL
            AND i.indisprimary",
         &[&schema, &table],
@@ -128,7 +128,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
          FROM pg_index i
          JOIN pg_attribute a ON a.attrelid = i.indrelid
              AND a.attnum = ANY(i.indkey)
-         WHERE i.indrelid = to_regclass($1 || '.' || $2)
+         WHERE i.indrelid = to_regclass(quote_ident($1) || '.' || quote_ident($2))
            AND i.indrelid IS NOT NULL",
         &[&schema, &table],
     )?;

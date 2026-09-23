@@ -90,8 +90,10 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // an honest "unknown" rather than guessing the wrong relation. Resolved from
     // the RENDERED query (not `preflight_base_table`'s configured-`table:` first
     // order) because the MSSQL catalog probes key on the emitted relation.
-    let base_table =
-        strip_select_star_from(base_query).or_else(|| table_from_simple_query(base_query));
+    let base_table_owned = strip_select_star_from(base_query)
+        .map(std::borrow::Cow::Borrowed)
+        .or_else(|| table_from_simple_query(base_query));
+    let base_table = base_table_owned.as_deref();
 
     // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
     // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
@@ -407,17 +409,22 @@ mod tests {
     // the single base relation so the partition-stats / index probes describe
     // the real table — never a 1-row stub or the wrong relation.
 
-    fn base_table_of(q: &str) -> Option<&str> {
-        strip_select_star_from(q).or_else(|| table_from_simple_query(q))
+    fn base_table_of(q: &str) -> Option<String> {
+        strip_select_star_from(q)
+            .map(str::to_string)
+            .or_else(|| table_from_simple_query(q).map(|t| t.into_owned()))
     }
 
     #[test]
     fn base_table_from_select_star_shortcut() {
         assert_eq!(
-            base_table_of("SELECT * FROM dbo.orders"),
+            base_table_of("SELECT * FROM dbo.orders").as_deref(),
             Some("dbo.orders")
         );
-        assert_eq!(base_table_of("SELECT * FROM orders"), Some("orders"));
+        assert_eq!(
+            base_table_of("SELECT * FROM orders").as_deref(),
+            Some("orders")
+        );
     }
 
     #[test]
@@ -426,7 +433,7 @@ mod tests {
         // qualified relation). `strip_select_star_from` rejects it (not `*`),
         // so the `table_from_simple_query` fallback must recover the relation.
         let q = "SELECT id, user_id, product FROM dbo.orders";
-        assert_eq!(base_table_of(q), Some("dbo.orders"));
+        assert_eq!(base_table_of(q).as_deref(), Some("dbo.orders"));
     }
 
     #[test]

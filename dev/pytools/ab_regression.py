@@ -76,6 +76,7 @@ import sys
 from pathlib import Path
 
 from .shell import Fail, have, main as shell_main, run, tcp_open
+from .duckcli import ARGV as DUCKDB
 
 # ── the stand this harness talks to ────────────────────────────────────────────
 PG = os.environ.get("RIVET_AB_PG_URL", "postgresql://rivet:rivet@127.0.0.1:5432/rivet")
@@ -146,7 +147,7 @@ def duckdb_rows(d: Path) -> int:
     findings and only one of them is a fixture problem."""
     if not any(d.rglob("*.parquet")):
         return 0
-    r = sh(["duckdb", "-noheader", "-list", "-c",
+    r = sh([*DUCKDB, "-noheader", "-list", "-c",
             f"SELECT count(*) FROM read_parquet('{d}/**/*.parquet');"], timeout=600)
     try:
         return int(r.stdout.strip().splitlines()[-1])
@@ -472,10 +473,10 @@ def preflight(old_raw: str, new_raw: str) -> tuple[Path, Path]:
     """
     print("== preflight")
     problems: list[str] = []
-    for tool, hint in (("docker", "the dev stand runs in docker"),
-                       ("duckdb", "brew install duckdb — it is the INDEPENDENT readback")):
-        if not have(tool):
-            problems.append(f"`{tool}` is not on PATH ({hint})")
+    if not have("docker"):
+        problems.append("`docker` is not on PATH (the dev stand runs in docker)")
+    if not have("duckdb"):
+        problems.append("the pinned duckdb package is not importable (run through `uv run`) — it is the INDEPENDENT readback")
     old, new = _binary("old", old_raw, problems), _binary("new", new_raw, problems)
     if old == new:
         print("   ! old and new are the SAME binary — this is the harness self-test "

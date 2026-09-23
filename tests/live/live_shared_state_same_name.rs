@@ -52,7 +52,7 @@ fn state_url() -> Option<String> {
 /// A per-engine dataset, recreated empty, so four same-named exports can each
 /// own their table and a crashed earlier invocation leaves nothing behind.
 fn dataset_for(bq: &BqLive, engine: &str) -> BqLive {
-    let dataset = format!("rivet_same_{engine}");
+    let dataset = stand_bq_tmp(&format!("same_{engine}"));
     let bq_cmd = |args: &[&str]| {
         std::process::Command::new("bq")
             .arg(format!("--project_id={}", bq.project))
@@ -77,6 +77,7 @@ fn dataset_for(bq: &BqLive, engine: &str) -> BqLive {
         dataset,
         bucket: bq.bucket.clone(),
         prefix: format!("{}/{engine}", bq.prefix),
+        owned: true,
     }
 }
 

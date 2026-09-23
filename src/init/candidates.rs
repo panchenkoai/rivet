@@ -19,10 +19,13 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
         let mut reasons: Vec<CursorCandidateReason> = Vec::new();
         let mut score: i32 = 0;
 
+        if super::is_tombstone_stamp(&col.name) {
+            continue;
+        }
         if is_timestamp_type(&col.data_type) {
             reasons.push(CursorCandidateReason::TimestampType);
             score += 40;
-        } else if is_integer_type(&col.data_type) && col.is_primary_key {
+        } else if is_integer_type(&col.data_type) && info.single_pk_column() == Some(&col.name) {
             // Integer PK is a usable surrogate cursor (monotonic ids).
             reasons.push(CursorCandidateReason::IntegerMonotonic);
             reasons.push(CursorCandidateReason::PrimaryKey);
@@ -68,13 +71,21 @@ pub(super) fn cursor_candidates(info: &TableInfo) -> Vec<CursorCandidate> {
 /// - the best cursor candidate is nullable (so coalesce actually helps), AND
 /// - a *different* NOT-NULL timestamp column exists.
 pub(super) fn suggest_cursor_fallback(info: &TableInfo) -> Option<String> {
-    let primary = info.cursor_candidates().into_iter().next()?;
+    let primary = info
+        .cursor_candidates()
+        .into_iter()
+        .find(|c| !super::is_coarse_stamp_type(&c.data_type))?;
     if !primary.is_nullable {
         return None;
     }
     info.columns
         .iter()
-        .find(|c| !c.is_nullable && is_timestamp_type(&c.data_type) && c.name != primary.column)
+        .find(|c| {
+            !c.is_nullable
+                && is_timestamp_type(&c.data_type)
+                && !super::is_coarse_stamp_type(&c.data_type)
+                && c.name != primary.column
+        })
         .map(|c| c.name.clone())
 }
 
@@ -127,6 +138,61 @@ mod tests {
             total_bytes: None,
             columns: cols,
         }
+    }
+
+    #[test]
+    fn a_day_stamp_is_never_the_coalesce_fallback_either() {
+        let dated = table(vec![
+            col("id", "int", true, false),
+            col("updated_at", "timestamp", false, true),
+            col("d", "date", false, false),
+        ]);
+        assert_eq!(
+            suggest_cursor_fallback(&dated),
+            None,
+            "COALESCE(updated_at, d) puts a later NULL-stamped row at midnight, below the watermark"
+        );
+        let stamped = table(vec![
+            col("id", "int", true, false),
+            col("updated_at", "timestamp", false, true),
+            col("created_at", "timestamp", false, false),
+        ]);
+        assert_eq!(
+            suggest_cursor_fallback(&stamped).as_deref(),
+            Some("created_at")
+        );
+    }
+
+    #[test]
+    fn a_day_or_minute_stamp_and_a_composite_key_part_are_never_the_cursor() {
+        let composite_dated = table(vec![
+            col("a", "int", true, false),
+            col("b", "int", true, false),
+            col("dt", "date", false, false),
+        ]);
+        assert_eq!(
+            composite_dated.chosen_cursor_column(),
+            None,
+            "`dt > '2026-01-03'` skips a later insert dated 2026-01-03; `a` repeats under a composite key"
+        );
+        let minute = table(vec![
+            col("id", "int", true, false),
+            col("sdt", "smalldatetime", false, false),
+        ]);
+        assert_eq!(minute.chosen_cursor_column().as_deref(), Some("id"));
+        let stamped = table(vec![
+            col("dt", "date", false, false),
+            col("changed_at", "datetime2", false, false),
+        ]);
+        assert_eq!(
+            stamped.chosen_cursor_column().as_deref(),
+            Some("changed_at")
+        );
+        assert_eq!(
+            composite_dated.chosen_time_column().as_deref(),
+            Some("dt"),
+            "a day window may still read a DATE"
+        );
     }
 
     #[test]

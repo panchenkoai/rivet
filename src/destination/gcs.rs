@@ -46,21 +46,9 @@ impl GcsStore {
     }
 
     fn wrap(async_op: Operator) -> Result<Self> {
-        // CAPPED, because a store is built PER LOAD ITEM, not per run: the pin's
-        // manifest listing, the `LoadJob`, and the orphan GC each open their own,
-        // and `rivet load --pool N` runs N of those at once. Uncapped,
-        // `new_multi_thread` takes one worker thread per CORE, so a 16-worker load
-        // on a 12-core host held on the order of two hundred OS threads where the
-        // sequential loop held one runtime at a time. These ops are IO-bound calls
-        // into opendal — two workers serve them, the same cap the Mongo source
-        // already settled on.
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to create tokio runtime for GCS ops: {e}"))?,
-        );
+        // ONE runtime for every store: a store is built per load item and `--pool N`
+        // drops them while other workers reuse the global HTTP pool's connections.
+        let runtime = super::cloud::io_runtime()?;
         let _guard = runtime.enter();
         // Retry transient HTTP failures (5xx / 429 / hyper-reqwest blips) on the
         // LOAD/read path too — the export path (CloudDestination) applies this
@@ -149,6 +137,12 @@ impl GcsStore {
         Self::wrap(Operator::new(opendal::services::Fs::default().root(root))?.finish())
     }
 
+    /// The runtime this store drives its operator on.
+    #[cfg(test)]
+    pub(crate) fn runtime(&self) -> &Arc<tokio::runtime::Runtime> {
+        &self._runtime
+    }
+
     /// Write `bytes` to the bucket-relative `path`. The load store is otherwise
     /// read/list/delete-only; this is a test-only seam for STAGING objects into a
     /// live/emulated bucket (the fake-gcs-server contract test seeds manifests +
@@ -169,7 +163,6 @@ pub type GcsDestination = CloudDestination<GcsBackend>;
 pub struct GcsBackend;
 
 impl CloudBackend for GcsBackend {
-    const RUNTIME_LABEL: &'static str = "GCS";
     const SCHEME: &'static str = "gs";
 
     fn build_operator(config: &DestinationConfig) -> Result<Operator> {
@@ -219,6 +212,21 @@ impl CloudBackend for GcsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_store_drives_its_operator_on_the_one_process_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let a = GcsStore::open_fs(root).unwrap();
+        let b = GcsStore::open_fs(root).unwrap();
+        assert!(
+            Arc::ptr_eq(a.runtime(), b.runtime()),
+            "a runtime per store drops pooled HTTP connections another worker still uses"
+        );
+        drop(a);
+        b.list_files("")
+            .expect("a dropped sibling store must not take the runtime with it");
+    }
 
     /// Write `bytes` to `root/rel`, creating parent dirs — a stand-in for objects
     /// landing under a bucket prefix.

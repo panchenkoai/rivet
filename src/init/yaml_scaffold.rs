@@ -468,12 +468,14 @@ fn quote_ident(part: &str, source_type: &str) -> String {
     }
 }
 
-fn quote_relation(qualified: &str, source_type: &str) -> String {
-    qualified
-        .split('.')
-        .map(|p| quote_ident(p, source_type))
-        .collect::<Vec<_>>()
-        .join(".")
+/// The quoted relation an export of `info` reads, quoted per part before the parts are joined, so a dot inside a name stays inside it.
+fn quote_relation(info: &TableInfo, source_type: &str) -> String {
+    let table = quote_ident(&info.table, source_type);
+    if qualified_table_of(info, source_type) == info.table {
+        table
+    } else {
+        format!("{}.{table}", quote_ident(&info.schema, source_type))
+    }
 }
 
 fn is_simple_pg_ident(s: &str) -> bool {
@@ -517,6 +519,44 @@ const INIT_UNBOUNDED_DECIMAL_DEFAULT_SCALE: u32 = 18;
 
 /// Present on generated `columns:` lines that use the default above — `rivet init` reminds on stderr.
 pub(crate) const INIT_DECIMAL_REVIEW_MARKER: &str = "# REVIEW:";
+
+/// Marker left where a delta mode needs a cursor and no timestamp column exists.
+pub(crate) const INIT_CURSOR_REVIEW_MARKER: &str = "REVIEW: no timestamp column detected";
+
+/// Every export the scaffold could not give a cursor column, by name.
+/// Marks an incremental export whose cursor does not move when a row is updated.
+pub(crate) const INIT_INSERT_ONLY_MARKER: &str = "NOTE: insert-only cursor";
+
+/// Marks a forced `chunked` export written as `full` because the table has no key to page by.
+pub(crate) const INIT_NO_CHUNK_KEY_MARKER: &str = "NOTE: no chunk key";
+
+/// Every table the scaffold left out, named by its `# SKIPPED` comment, in config order.
+pub(crate) fn skipped_tables(config_text: &str) -> Vec<String> {
+    config_text
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("# SKIPPED "))
+        .filter_map(|rest| {
+            let rest = rest.strip_prefix("collection ").unwrap_or(rest);
+            rest.split(':').next().map(|n| n.trim().to_string())
+        })
+        .collect()
+}
+
+/// Every export whose block carries `marker`, in config order.
+pub(crate) fn exports_marked(config_text: &str, marker: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<&str> = None;
+    for line in config_text.lines() {
+        if let Some(rest) = line.strip_prefix("  - name: ") {
+            current = Some(rest.trim());
+        } else if line.contains(marker)
+            && let Some(name) = current.take()
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
 
 fn init_default_decimal_yaml_line(col_name: &str) -> String {
     format!(
@@ -612,6 +652,38 @@ fn load_block_lines(dest: &InitYamlDestination, compactable: bool) -> Vec<String
     lines
 }
 
+/// The relation name an export of `info` addresses on `source_type`.
+fn qualified_table_of(info: &TableInfo, source_type: &str) -> String {
+    // Mongo: `info.schema` is the database and the export targets the bare
+    // collection name (the URL already selects the database), so it is never
+    // qualified — same as a MySQL table or a PG `public` table.
+    if info.schema == "public" || source_type == "mysql" || source_type == "mongo" {
+        info.table.clone()
+    } else {
+        format!("{}.{}", info.schema, info.table)
+    }
+}
+
+/// Whether `info` can be exported through the `table:` shortcut on `source_type`, which keyset requires.
+pub(crate) fn table_form_ok(info: &TableInfo, source_type: &str) -> bool {
+    // Which names may become an UNQUOTED `table:` per engine (round-8): PG
+    // case-folds unquoted idents, so only a name that IS its own fold is safe
+    // there; MySQL/MSSQL do not fold; Mongo's `table:` is a ROUTING string and
+    // the ONLY form Mongo accepts. MIRRORS `validate_table_shortcut_ident`
+    // (round-9): diverging from the config gate produced DOA scaffolds twice.
+    let qualified = qualified_table_of(info, source_type);
+    let shape_ok = table_shortcut_shape_ok(&qualified);
+    match source_type {
+        "postgres" => shape_ok && is_simple_pg_ident(&qualified),
+        _ => shape_ok,
+    }
+}
+
+/// Whether a `chunked` export of `info` has no key to page by, given whether keyset's `table:` form is available.
+pub(crate) fn chunk_key_missing(info: &TableInfo, keyset_form: bool) -> bool {
+    info.best_chunk_column().is_none() && !(keyset_form && info.keysettable_pk_column().is_some())
+}
+
 fn export_block_lines(
     info: &TableInfo,
     source_type: &str,
@@ -632,15 +704,7 @@ fn export_block_lines(
         .map(|c| quote_ident(c, source_type))
         .collect::<Vec<_>>()
         .join(", ");
-    let qualified_table =
-        if info.schema == "public" || source_type == "mysql" || source_type == "mongo" {
-            // Mongo: `info.schema` is the database and the export targets the bare
-            // collection name (the URL already selects the database), so it is never
-            // qualified — same as a MySQL table or a PG `public` table.
-            info.table.clone()
-        } else {
-            format!("{}.{}", info.schema, info.table)
-        };
+    let qualified_table = qualified_table_of(info, source_type);
 
     // CDC reads the transaction log, not a query — a wholly different block
     // (no cursor/chunk/meta_columns; engine-specific stream knobs instead).
@@ -673,18 +737,10 @@ fn export_block_lines(
     // diverging from the config gate's produced DOA scaffolds twice — a
     // >2-segment name the scaffold accepted and the validator refused, and a
     // hyphenated Mongo collection whose two refusals pointed at each other.
-    let shortcut_shape_ok = table_shortcut_shape_ok(&qualified_table);
-    let table_form_safe = match source_type {
-        "postgres" => shortcut_shape_ok && is_simple_pg_ident(&qualified_table),
-        // Mongo has ONLY the table: form — a name the gate cannot pass is
-        // unexportable in any form; the caller emits a commented-out block
-        // with the reason instead of a DOA config (round-9: `user-events`'s
-        // two refusals pointed at each other).
-        "mongo" => shortcut_shape_ok,
-        _ => shortcut_shape_ok,
-    };
-    let table_form_safe = table_form_safe || recipe;
+    let table_form_safe = table_form_ok(info, source_type) || recipe;
     let is_keyset = mode == "chunked" && info.single_pk_column().is_some() && table_form_safe;
+    let no_chunk_key = mode == "chunked" && chunk_key_missing(info, table_form_safe);
+    let mode = if no_chunk_key { "full" } else { mode };
     if source_type == "mongo" && !table_form_safe {
         // Unexportable in ANY form today: `table:` is Mongo's only export form
         // and the config gate refuses this name (while its "use query:" remedy
@@ -719,15 +775,19 @@ fn export_block_lines(
         // wrong rows with every check green (both live-proven on the stand).
         lines.push("    query: >".to_string());
         lines.push(format!("      SELECT {col_list}"));
-        lines.push(format!(
-            "      FROM {}",
-            quote_relation(&qualified_table, source_type)
-        ));
+        lines.push(format!("      FROM {}", quote_relation(info, source_type)));
     }
     // Inline rationale above `mode:` so the operator can see *why* this
     // mode got picked, not just *what*. Easy to delete; the suggestion
     // is documentation, not a contract.
-    lines.push(format!("    # {}", info.mode_rationale(mode)));
+    if no_chunk_key {
+        lines.push(format!(
+            "    # {INIT_NO_CHUNK_KEY_MARKER} — chunked needs an integer column or a keysettable \
+             primary key, and this table has neither; written as a full scan"
+        ));
+    } else {
+        lines.push(format!("    # {}", info.mode_rationale(mode)));
+    }
     lines.push(format!("    mode: {mode}"));
 
     match mode {
@@ -762,7 +822,9 @@ fn export_block_lines(
                 );
             } else {
                 // No single-column PK → range chunk on the best integer column.
-                let chunk_col = info.best_chunk_column().unwrap_or("id");
+                let chunk_col = info
+                    .best_chunk_column()
+                    .expect("no_chunk_key downgrades a keyless table to full");
                 let parallel =
                     suggest_parallel(info.row_estimate, info.avg_row_bytes(), source_type);
                 lines.push(format!(
@@ -812,6 +874,12 @@ fn export_block_lines(
                     "    cursor_column: {}",
                     yaml_quote_if_needed(&cursor)
                 ));
+                if !super::is_mutation_stamp(&cursor) {
+                    lines.push(format!(
+                        "    # {INIT_INSERT_ONLY_MARKER} — '{cursor}' does not change when a row \
+                         is updated, so updates to existing rows are never captured"
+                    ));
+                }
                 // If the chosen cursor is NULLABLE and a not-null sibling exists,
                 // scaffold coalesce mode — otherwise `WHERE cursor > $last` skips
                 // every NULL-cursor row (roast 2026-08-09, #173).
@@ -831,10 +899,9 @@ fn export_block_lines(
             // the honest signal. The snapshot records None here too — they agree
             // (bug hunt 2026-08-08: the old literal fallback diverged from the
             // snapshot's None and named a phantom column).
-            None => lines.push(
-                "    # REVIEW: no timestamp column detected — set cursor_column: <col> manually"
-                    .to_string(),
-            ),
+            None => lines.push(format!(
+                "    # {INIT_CURSOR_REVIEW_MARKER} — set cursor_column: <col> manually"
+            )),
         },
         "time_window" => {
             // time_window REQUIRES time_column (+ days_window) — omitting them
@@ -846,10 +913,9 @@ fn export_block_lines(
             // compared to a timestamp window at run time (bug hunt 2026-08-09).
             match info.chosen_time_column() {
                 Some(ts) => lines.push(format!("    time_column: {}", yaml_quote_if_needed(&ts))),
-                None => lines.push(
-                    "    # REVIEW: no timestamp column detected — set time_column: <col> manually"
-                        .to_string(),
-                ),
+                None => lines.push(format!(
+                    "    # {INIT_CURSOR_REVIEW_MARKER} — set time_column: <col> manually"
+                )),
             }
             lines.push(
                 "    days_window: 7  # export the last N days on each run (half-open window; tune to your retention)"
@@ -941,7 +1007,7 @@ omitting differ per engine — see cdc.md)",
         // One id per export: two exports sharing a replica id evict each other's
         // binlog connection, so the per-table scaffold counts up from the first.
         "mysql" => lines.push(format!(
-            "      server_id: {}  # unique replica id; source needs binlog_format=ROW + a REPLICATION SLAVE grant",
+            "      server_id: {}  # unique replica id; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants",
             4271 + ordinal
         )),
         // PostgreSQL accepts only lowercase letters, digits and `_` in a slot name:
@@ -1028,7 +1094,7 @@ fn cdc_multiplex_export_lines(
                 "      checkpoint: ./cdc/{name}.ckpt  # one resume position for the whole stream"
             ));
             lines.push(
-                "      server_id: 4271  # ONE replica id for the stream; source needs binlog_format=ROW + a REPLICATION SLAVE grant"
+                "      server_id: 4271  # ONE replica id for the stream; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants"
                     .to_string(),
             );
         }
@@ -1308,12 +1374,29 @@ mod tests {
         assert!(is_simple_pg_ident("public.orders"));
         assert!(!is_simple_pg_ident("public.CaseTwin"));
         assert!(!is_simple_pg_ident("Orders"));
+        let rel = |schema: &str, table: &str, st: &str| {
+            let info = TableInfo {
+                density: None,
+                schema: schema.into(),
+                table: table.into(),
+                row_estimate: 0,
+                total_bytes: None,
+                columns: vec![],
+            };
+            quote_relation(&info, st)
+        };
         assert_eq!(
-            quote_relation("public.CaseTwin", "postgres"),
-            "\"public\".\"CaseTwin\""
+            rel("sales", "CaseTwin", "postgres"),
+            "\"sales\".\"CaseTwin\""
         );
-        assert_eq!(quote_relation("Db.Weird", "mysql"), "`Db`.`Weird`");
-        assert_eq!(quote_relation("dbo.Order", "mssql"), "[dbo].[Order]");
+        assert_eq!(rel("public", "CaseTwin", "postgres"), "\"CaseTwin\"");
+        assert_eq!(rel("dbo", "Order", "mssql"), "[dbo].[Order]");
+        assert_eq!(
+            rel("shop", "a.t", "mysql"),
+            "`a.t`",
+            "a MySQL table is addressed bare, and its own dot stays inside the quotes"
+        );
+        assert_eq!(rel("dbo", "dot.t", "mssql"), "[dbo].[dot.t]");
     }
 
     use super::*;
@@ -1428,6 +1511,44 @@ mod tests {
         assert_eq!(memory_capped_parallel(4, 4096, 2048), 4);
         // Never below 1 even with an absurd budget.
         assert_eq!(memory_capped_parallel(4, 65_536, 1), 1);
+    }
+
+    /// The relation `rivet check` recovers from init's OWN `query:` block, per engine — the shape its catalog probes key on.
+    #[test]
+    fn check_recovers_the_relation_from_the_query_init_writes() {
+        let dest = InitYamlDestination::default();
+        let cases = [
+            ("mssql", "dbo", "full", "dbo.rivet_type_matrix"),
+            ("mysql", "shop", "full", "rivet_type_matrix"),
+            ("postgres", "public", "incremental", "rivet_type_matrix"),
+        ];
+        for (engine, schema, mode, want) in cases {
+            let mut info = make_table(vec![col("id", "bigint"), col("updated_at", "timestamp")]);
+            info.schema = schema.into();
+            info.table = "rivet_type_matrix".into();
+            let block = export_block_lines(&info, engine, &dest, Some(mode), false, 0).join("\n");
+            let query: String = block
+                .lines()
+                .skip_while(|l| !l.trim_start().starts_with("query:"))
+                .skip(1)
+                .take_while(|l| l.starts_with("      "))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                !query.is_empty(),
+                "{engine}: init must write a query: block here:\n{block}"
+            );
+            let got = crate::preflight::table_from_simple_query(&query).map(|c| c.into_owned());
+            let got = got.map(|t| {
+                if want.contains('.') {
+                    t
+                } else {
+                    t.rsplit('.').next().unwrap().to_string()
+                }
+            });
+            assert_eq!(got.as_deref(), Some(want), "{engine}: {query}");
+        }
     }
 
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
@@ -1692,7 +1813,7 @@ mod tests {
             None,
         )
         .expect("scaffold");
-        let snap_col = decided_strategy(&info, Some("incremental")).key_column;
+        let snap_col = decided_strategy(&info, Some("incremental"), true).key_column;
         // Extract the cursor_column the YAML rendered.
         let rendered = yaml
             .lines()
@@ -1723,7 +1844,7 @@ mod tests {
             "no timestamp ⇒ no phantom cursor_column, just a REVIEW note:\n{yaml2}"
         );
         assert_eq!(
-            decided_strategy(&bare, Some("incremental")).key_column,
+            decided_strategy(&bare, Some("incremental"), true).key_column,
             None
         );
     }
@@ -2674,14 +2795,20 @@ pub(crate) struct DecidedStrategy {
 pub(crate) fn decided_strategy(
     info: &crate::init::TableInfo,
     mode_override: Option<&str>,
+    keyset_form: bool,
 ) -> DecidedStrategy {
     let mode = mode_override
         .map(str::to_string)
         .unwrap_or_else(|| info.suggest_mode().to_string());
+    let mode = if mode == "chunked" && chunk_key_missing(info, keyset_form) {
+        "full".to_string()
+    } else {
+        mode
+    };
     match mode.as_str() {
         "chunked" => {
             let size = info.suggest_chunk_size() as i64;
-            if let Some(pk) = info.keysettable_pk_column() {
+            if let Some(pk) = info.keysettable_pk_column().filter(|_| keyset_form) {
                 DecidedStrategy {
                     mode,
                     kind: "keyset",

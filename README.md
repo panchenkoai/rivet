@@ -334,9 +334,11 @@ make test-live                           # sweep stale fixtures, then run offlin
 ```
 
 A killed live run (slow-timeout / Ctrl-C) skips the per-test table cleanup, so `make test-live` first
-runs `make sweep-test-db` to drop any `<prefix>_<pid>_<counter>` fixtures a prior interrupted run left in
-the shared `rivet` database. `make sweep-test-db` is safe to run by hand anytime — it only matches those
-ephemeral fixtures, never the `init.sql` / `seed.rs` seeded tables.
+runs `make sweep-test-db` to drop any `<prefix>_<pid>_<counter>` object (tables, PostgreSQL slots, Mongo
+databases and collections) whose `<pid>` is no longer running, on every source in `dev/stand/registry.yaml`.
+It is safe to run by hand anytime, even beside a live run: a running process's objects are never touched.
+`make sweep-test-cloud` also drops leftover disposable BigQuery datasets (`rivet_tmp_*`); run it only when
+no gate or live run is in flight. The registry is the one list of stand endpoints and dataset names.
 
 The offline integration tests are consolidated into single binaries (`tests/offline_suite.rs`,
 `tests/live_suite.rs`) to keep link time down. **Run them with nextest, not plain `cargo test`** — the

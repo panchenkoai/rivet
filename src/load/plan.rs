@@ -260,6 +260,30 @@ pub struct LoadPlan {
     /// defaults ON there and OFF for a query-based export; `load.deleted_flag`
     /// decides when written.
     pub deleted_flag: bool,
+    /// Columns whose Parquet name has Cyrillic look-alikes, as (file name, warehouse name).
+    pub renames: Vec<Rename>,
+    /// One warning per renamed column, naming the fix to run on the source.
+    pub rename_warnings: Vec<String>,
+    /// Why this table cannot load, found at plan time; the table fails alone, the others still load.
+    pub refusal: Option<String>,
+}
+
+impl LoadPlan {
+    /// This table's plan-time refusal, as its own error.
+    pub fn refused(&self) -> Result<()> {
+        match &self.refusal {
+            Some(why) => bail!("{why}"),
+            None => Ok(()),
+        }
+    }
+
+    /// The spec's column names as the Parquet carries them, before any look-alike rename.
+    pub fn file_column_names(&self) -> Vec<String> {
+        self.specs
+            .iter()
+            .map(|s| file_name(&self.renames, &s.column_name).to_string())
+            .collect()
+    }
 }
 
 /// The clustering columns of the table a load writes, and where they came from: a
@@ -726,6 +750,14 @@ fn build_plans_keyed(
             })
             .collect::<Result<_>>()?;
 
+        let source_table = unit.as_deref().or(export.table.as_deref());
+        let fold = fold_lookalike_columns(&export.name, load, &mut specs, |file, latin| {
+            source_rename_action(cfg.source.source_type, source_table, file, latin)
+                + &config_keys_note(export, file)
+        });
+        let mut refusal = fold.as_ref().err().map(|e| format!("{e:#}"));
+        let (renames, rename_warnings) = fold.unwrap_or_default();
+
         // The meta columns rivet writes at EXTRACTION are in every Parquet part
         // but absent from the column report, which the type resolver builds from
         // the SOURCE catalog. Without a spec the created table simply lacks the
@@ -790,14 +822,27 @@ fn build_plans_keyed(
         // multiplex stream — that table's block. One overlay, shared with the readers the
         // extract calls, so both sides answer the same question the same way.
         let eff_load = overlay(load, export, unit.as_deref());
-        let (pk, cluster_by) = resolve_keys(
-            &export.name,
-            &eff_load,
-            keys.get(&(export.name.clone(), unit)).map(Vec::as_slice),
-            &specs,
-            fit,
-        )?;
+        let recorded_pk: Option<Vec<String>> = keys
+            .get(&(export.name.clone(), unit))
+            .map(|k| k.iter().map(|c| folded(c)).collect());
+        let (pk, mut cluster_by) =
+            resolve_keys(&export.name, &eff_load, recorded_pk.as_deref(), &specs, fit)?;
+        let mut rename_warnings = rename_warnings;
+        if matches!(eff_load.cluster_by, KeyColumns::Auto) {
+            for col in unclustered_renames(&mut cluster_by, &renames) {
+                rename_warnings.push(format!(
+                    "  note: export `{}`: `{col}` is left out of the automatic clustering — \
+                     a renamed column cannot shape the staging table the rename goes through",
+                    export.name
+                ));
+            }
+        }
         let partition = resolve_partition(&export.name, &eff_load, mode, &specs, fit)?;
+        refusal = refusal.or_else(|| {
+            refuse_renamed_shape_column(&export.name, &renames, partition.as_ref(), &cluster_by)
+                .err()
+                .map(|e| format!("{e:#}"))
+        });
         let clustering = match eff_load.cluster_by {
             KeyColumns::Auto => Clustering::Auto(cluster_by),
             _ => Clustering::Written(cluster_by),
@@ -818,10 +863,13 @@ fn build_plans_keyed(
                 .unwrap_or(matches!(mode, LoadMode::Cdc)),
             load: eff_load,
             mode,
-            cursor_column: export.cursor_column.clone(),
+            cursor_column: export.cursor_column.as_deref().map(folded),
             pk,
             clustering,
             pinned_run: None,
+            renames,
+            rename_warnings,
+            refusal,
         });
     }
     reject_duplicate_target_tables(
@@ -831,6 +879,190 @@ fn build_plans_keyed(
             .collect::<Vec<_>>(),
     )?;
     Ok(plans)
+}
+
+/// A column's (Parquet name, warehouse name).
+pub type Rename = (String, String);
+
+/// The Parquet name of warehouse column `column`.
+pub(crate) fn file_name<'a>(renames: &'a [Rename], column: &'a str) -> &'a str {
+    renames
+        .iter()
+        .find(|(_, latin)| latin == column)
+        .map_or(column, |(file, _)| file.as_str())
+}
+
+/// `name` with its Cyrillic look-alikes made Latin, or unchanged when no fold applies.
+fn folded(name: &str) -> String {
+    super::latin_fold(name).unwrap_or_else(|| name.to_string())
+}
+
+/// Columns an older run spelled so that BigQuery (case-blind) cannot match them to the pinned run's, though they fold to one name, as (older, pinned).
+pub fn lookalike_spelling_changes(pinned: &[&str], older: &[&str]) -> Vec<(String, String)> {
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    older
+        .iter()
+        .filter(|o| !pinned.iter().any(|p| same(p, o)))
+        .filter_map(|o| {
+            let f = folded(o);
+            pinned
+                .iter()
+                .find(|p| same(&folded(p), &f))
+                .map(|p| (o.to_string(), p.to_string()))
+        })
+        .collect()
+}
+
+/// Renames each column whose Cyrillic look-alikes fold to a plain identifier, warning once per column.
+fn fold_lookalike_columns(
+    export: &str,
+    load: &LoadSection,
+    specs: &mut [TargetColumnSpec],
+    action: impl Fn(&str, &str) -> String,
+) -> Result<(Vec<Rename>, Vec<String>)> {
+    let mut renames = Vec::new();
+    for spec in specs.iter_mut() {
+        if let Some(latin) = super::latin_fold(&spec.column_name) {
+            renames.push((
+                std::mem::replace(&mut spec.column_name, latin.clone()),
+                latin,
+            ));
+        }
+    }
+    if renames.is_empty() {
+        return Ok((renames, Vec::new()));
+    }
+    if !matches!(load.target, LoadTarget::Bigquery { .. }) {
+        bail!(
+            "export `{export}`: column(s) {} have Cyrillic look-alike letters; only a BigQuery \
+             load renames them — rename them in the source",
+            renames
+                .iter()
+                .map(|(f, _)| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for (file, latin) in &renames {
+        let clash = specs
+            .iter()
+            .filter(|s| s.column_name.eq_ignore_ascii_case(latin))
+            .count();
+        if clash > 1 {
+            bail!(
+                "export `{export}`: column `{file}` has Cyrillic look-alike letters and would load \
+                 as `{latin}`, which another column already is — rename one of them in the source"
+            );
+        }
+    }
+    let warnings = renames
+        .iter()
+        .map(|(file, latin)| {
+            format!(
+                "  warning: export `{export}`: column `{file}` has Cyrillic look-alike letters — it \
+                 loads as `{latin}`. Fix it at the source once every run already exported is loaded: {}",
+                action(file, latin)
+            )
+        })
+        .collect();
+    Ok((renames, warnings))
+}
+
+/// The export's own config keys that name `file` and must be renamed with it; empty when none do.
+fn config_keys_note(export: &crate::config::ExportConfig, file: &str) -> String {
+    let mut keys: Vec<&str> = [
+        ("cursor_column", export.cursor_column.as_deref()),
+        ("chunk_column", export.chunk_column.as_deref()),
+        ("chunk_by_key", export.chunk_by_key.as_deref()),
+    ]
+    .into_iter()
+    .filter(|(_, v)| *v == Some(file))
+    .map(|(k, _)| k)
+    .collect();
+    if export.columns.contains_key(file) {
+        keys.push("columns");
+    }
+    if keys.is_empty() {
+        return String::new();
+    }
+    format!(
+        " — and rename it in the export's {} in the same edit, or the next `rivet run` fails",
+        keys.iter()
+            .map(|k| format!("`{k}:`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The statement that renames `file` to `latin` on the source, or the alias for a query export.
+fn source_rename_action(
+    source: crate::config::SourceType,
+    table: Option<&str>,
+    file: &str,
+    latin: &str,
+) -> String {
+    use crate::config::SourceType;
+    let quote = |id: &str| match source {
+        SourceType::Mysql => format!("`{id}`"),
+        SourceType::Mssql => format!("[{id}]"),
+        SourceType::Postgres | SourceType::Mongo => format!("\"{id}\""),
+    };
+    let Some(table) = table else {
+        return format!("alias it in the export's query: {} AS {latin}", quote(file));
+    };
+    let qualified = table.split('.').map(quote).collect::<Vec<_>>().join(".");
+    match source {
+        SourceType::Postgres => format!(
+            "ALTER TABLE {qualified} RENAME COLUMN {} TO {};",
+            quote(file),
+            quote(latin)
+        ),
+        SourceType::Mysql => format!(
+            "ALTER TABLE {qualified} RENAME COLUMN {f} TO {l}; (MySQL 8.0.3+; on 5.7: ALTER \
+             TABLE {qualified} CHANGE {f} {l} <its full column definition>;)",
+            f = quote(file),
+            l = quote(latin)
+        ),
+        SourceType::Mssql => format!(
+            "EXEC sp_rename N'{table}.{file}', N'{latin}', N'COLUMN'; (on a table enabled for \
+             change data capture: let `rivet run` drain the stream first — disabling the \
+             capture instance drops its change table — then rename, re-enable, and re-snapshot)"
+        ),
+        SourceType::Mongo => {
+            format!("db.{table}.updateMany({{}}, {{$rename: {{\"{file}\": \"{latin}\"}}}})")
+        }
+    }
+}
+
+/// Drops renamed columns from an automatic clustering, returning the ones dropped.
+fn unclustered_renames(cluster_by: &mut Vec<String>, renames: &[Rename]) -> Vec<String> {
+    let (dropped, kept) = std::mem::take(cluster_by)
+        .into_iter()
+        .partition(|c| renames.iter().any(|(_, latin)| latin == c));
+    *cluster_by = kept;
+    dropped
+}
+
+/// Refuses a partition or cluster column that is itself renamed: the staging table the rename needs cannot be shaped on it.
+fn refuse_renamed_shape_column(
+    export: &str,
+    renames: &[(String, String)],
+    partition: Option<&TablePartition>,
+    cluster_by: &[String],
+) -> Result<()> {
+    let shaped = partition
+        .and_then(|p| p.key.column())
+        .into_iter()
+        .chain(cluster_by.iter().map(String::as_str));
+    for col in shaped {
+        if let Some((file, _)) = renames.iter().find(|(_, latin)| latin == col) {
+            bail!(
+                "export `{export}`: `{col}` partitions or clusters the table but its source \
+                 column `{file}` has Cyrillic look-alike letters — rename it in the source, or, when it only clusters, set `cluster_by:` in the export's `load:` block to other columns or `none`"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `plan` rebuilt from `spec` — the columns and key ONE run recorded — instead of
@@ -893,7 +1125,7 @@ fn resolve_keys(
     fit: SpecFit,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let pk = match &load.pk {
-        KeyColumns::Columns(cols) => cols.clone(),
+        KeyColumns::Columns(cols) => cols.iter().map(|c| folded(c)).collect(),
         KeyColumns::Auto => recorded.map(<[String]>::to_vec).unwrap_or_default(),
         KeyColumns::None => Vec::new(),
     };
@@ -1093,6 +1325,8 @@ fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
         let mut objects = vec![t.to_string(), format!("{t}__staging")];
         if !matches!(mode, LoadMode::Full) {
             objects.push(format!("{t}__changes"));
+            objects.push(format!("{t}__changes__staging"));
+            objects.push(format!("{t}__changes__merging"));
         }
         for o in objects {
             if let Some(prior) = seen.insert(o.clone(), t) {
@@ -2303,6 +2537,327 @@ load:
         }
     }
 
+    fn lookalike_cfg(cluster: &str) -> crate::config::Config {
+        crate::config::Config::from_yaml(&format!(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: purchases
+    table: purchases
+    mode: full
+    format: parquet
+    destination: {{ type: gcs, bucket: b, prefix: pa/ }}
+load:
+  target: bigquery
+  project: p
+  dataset: d
+  cluster_by: {cluster}
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cyrillic_lookalike_column_and_key_plan_under_their_latin_names() {
+        let reports = || {
+            vec![report(
+                "purchases",
+                vec![
+                    col("\u{456}d", TargetStatus::Ok),
+                    col("\u{441}omment", TargetStatus::Ok),
+                ],
+            )]
+        };
+        let mut keys = RecordedKeys::new();
+        keys.insert(("purchases".into(), None), vec!["\u{456}d".into()]);
+        let auto = lookalike_cfg("auto");
+        let auto_plan = build_plans_keyed(
+            &auto,
+            auto.load.as_ref().unwrap(),
+            reports(),
+            &keys,
+            SpecFit::Strict,
+        )
+        .expect("an automatic clustering leaves the renamed key out instead of refusing")
+        .pop()
+        .unwrap();
+        assert!(
+            auto_plan.clustering.columns().is_empty(),
+            "{:?}",
+            auto_plan.clustering
+        );
+        assert!(
+            auto_plan
+                .rename_warnings
+                .iter()
+                .any(|w| w.contains("`id` is left out of the automatic clustering")),
+            "{:?}",
+            auto_plan.rename_warnings
+        );
+        let written = lookalike_cfg("[id]");
+        let err = build_plans_keyed(
+            &written,
+            written.load.as_ref().unwrap(),
+            reports(),
+            &keys,
+            SpecFit::Strict,
+        )
+        .expect("a refusal is the table's own, never the whole config's")
+        .pop()
+        .unwrap()
+        .refused()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("`id` partitions or clusters"),
+            "a WRITTEN clustering on the renamed key is still refused: {err}"
+        );
+        let cfg = lookalike_cfg("none");
+        let plan = build_plans_keyed(
+            &cfg,
+            cfg.load.as_ref().unwrap(),
+            reports(),
+            &keys,
+            SpecFit::Strict,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let names: Vec<&str> = plan.specs.iter().map(|s| s.column_name.as_str()).collect();
+        assert!(names.starts_with(&["id", "comment"]), "{names:?}");
+        assert!(
+            plan.rename_warnings[1]
+                .contains("loads as `comment`. Fix it at the source once every run already exported is loaded: ALTER TABLE"),
+            "{:?}",
+            plan.rename_warnings
+        );
+        assert_eq!(
+            plan.file_column_names()[..2],
+            ["\u{456}d".to_string(), "\u{441}omment".to_string()],
+            "the drift check compares the Parquet's own names"
+        );
+        assert_eq!(
+            plan.renames,
+            vec![
+                ("\u{456}d".to_string(), "id".to_string()),
+                ("\u{441}omment".to_string(), "comment".to_string())
+            ]
+        );
+        assert_eq!(
+            plan.pk,
+            vec!["id".to_string()],
+            "the recorded key folds with its column"
+        );
+    }
+
+    #[test]
+    fn a_table_refused_at_plan_time_fails_alone() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - { name: clash, table: clash, mode: full, format: parquet, destination: { type: gcs, bucket: b, prefix: c/ } }
+  - { name: fine, table: fine, mode: full, format: parquet, destination: { type: gcs, bucket: b, prefix: f/ } }
+load: { target: bigquery, project: p, dataset: d, cluster_by: none }
+"#,
+        )
+        .unwrap();
+        let reports = vec![
+            report(
+                "clash",
+                vec![
+                    col("comment", TargetStatus::Ok),
+                    col("\u{441}omment", TargetStatus::Ok),
+                ],
+            ),
+            report("fine", vec![col("id", TargetStatus::Ok)]),
+        ];
+        let plans = build_plans(&cfg, cfg.load.as_ref().unwrap(), reports)
+            .expect("one table's refusal must not abort the others' load");
+        assert!(
+            plans[0].refused().is_err(),
+            "the colliding fold refuses its own table"
+        );
+        assert!(plans[1].refused().is_ok(), "the other table still loads");
+    }
+
+    #[test]
+    fn a_lookalike_fold_that_collides_or_targets_snowflake_is_refused() {
+        let mut clash = vec![spec_named("comment"), spec_named("\u{441}omment")];
+        let err = fold_lookalike_columns(
+            "e",
+            &load_with("bigquery", serde_json::json!({})),
+            &mut clash,
+            no_action,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("another column already is"), "{err}");
+
+        let mut one = vec![spec_named("\u{441}omment")];
+        let err = fold_lookalike_columns(
+            "e",
+            &load_with("snowflake", serde_json::json!({})),
+            &mut one,
+            no_action,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only a BigQuery load renames them"), "{err}");
+
+        let mut plain = vec![spec_named("comment")];
+        assert!(
+            fold_lookalike_columns(
+                "e",
+                &load_with("snowflake", serde_json::json!({})),
+                &mut plain,
+                no_action
+            )
+            .unwrap()
+            .0
+            .is_empty(),
+            "a load with nothing to rename is untouched on every target"
+        );
+    }
+
+    #[test]
+    fn a_config_written_cursor_and_key_fold_with_their_columns() {
+        let cfg = crate::config::Config::from_yaml(
+            "source: { type: postgres, url: \"postgresql://localhost/test\" }\n\
+             exports:\n\
+             \x20 - name: purchases\n\
+             \x20   query: \"SELECT 1\"\n\
+             \x20   mode: incremental\n\
+             \x20   cursor_column: \"upd\u{430}ted_at\"\n\
+             \x20   format: parquet\n\
+             \x20   destination: { type: gcs, bucket: b, prefix: pa/ }\n\
+             \x20   load: { pk: [\"\u{456}d\"], cluster_by: none }\n\
+             load: { target: bigquery, project: p, dataset: d }\n",
+        )
+        .unwrap();
+        let reports = vec![report(
+            "purchases",
+            vec![
+                col("\u{456}d", TargetStatus::Ok),
+                ts_col("upd\u{430}ted_at"),
+            ],
+        )];
+        let plan = build_plans(&cfg, cfg.load.as_ref().unwrap(), reports)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(plan.cursor_column.as_deref(), Some("updated_at"));
+        assert_eq!(plan.pk, vec!["id".to_string()]);
+        assert!(
+            plan.rename_warnings.iter().any(|w| w.ends_with(
+                "— and rename it in the export's `cursor_column:` in the same edit, or the next \
+                 `rivet run` fails"
+            )),
+            "{:?}",
+            plan.rename_warnings
+        );
+    }
+
+    #[test]
+    fn an_append_load_reserves_the_staging_and_merging_tables_it_creates() {
+        for name in ["orders__changes__staging", "orders__changes__merging"] {
+            let err = reject_duplicate_target_tables(&[
+                ("orders", LoadMode::Incremental),
+                (name, LoadMode::Full),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(name), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_column_two_runs_spell_differently_is_named_in_either_direction() {
+        let cyr = "\u{441}ity";
+        assert_eq!(
+            lookalike_spelling_changes(&["id", "city"], &["id", cyr]),
+            vec![(cyr.to_string(), "city".to_string())],
+            "renamed at the source after the older run"
+        );
+        assert_eq!(
+            lookalike_spelling_changes(&["id", cyr], &["id", "city"]),
+            vec![("city".to_string(), cyr.to_string())],
+            "the other way round: the pinned run carries the look-alike"
+        );
+        assert!(lookalike_spelling_changes(&["id", "city"], &["id", "city"]).is_empty());
+        assert_eq!(
+            lookalike_spelling_changes(&["City"], &[cyr]),
+            vec![(cyr.to_string(), "City".to_string())],
+            "BigQuery matches case-blind, so a case change on top of the fold still loads NULL"
+        );
+        assert!(
+            lookalike_spelling_changes(&["City"], &["city"]).is_empty(),
+            "a case-only change BigQuery matches anyway is not a respelling"
+        );
+        assert!(
+            lookalike_spelling_changes(&["id", "city", "added"], &["id", "dropped"]).is_empty(),
+            "an added or dropped column is drift, not a respelling"
+        );
+    }
+
+    fn no_action(_: &str, _: &str) -> String {
+        String::new()
+    }
+
+    #[test]
+    fn the_warning_names_the_rename_to_run_on_each_source() {
+        use crate::config::SourceType;
+        let act = |src, table| source_rename_action(src, table, "\u{441}omment", "comment");
+        assert_eq!(
+            act(SourceType::Mysql, Some("shop.purchases")),
+            "ALTER TABLE `shop`.`purchases` RENAME COLUMN `\u{441}omment` TO `comment`; (MySQL \
+             8.0.3+; on 5.7: ALTER TABLE `shop`.`purchases` CHANGE `\u{441}omment` `comment` \
+             <its full column definition>;)"
+        );
+        assert_eq!(
+            act(SourceType::Postgres, Some("purchases")),
+            "ALTER TABLE \"purchases\" RENAME COLUMN \"\u{441}omment\" TO \"comment\";"
+        );
+        assert_eq!(
+            act(SourceType::Mssql, Some("dbo.purchases")),
+            "EXEC sp_rename N'dbo.purchases.\u{441}omment', N'comment', N'COLUMN'; (on a \
+             table enabled for change data capture: let `rivet run` drain the stream first — \
+             disabling the capture instance drops its change table — then rename, re-enable, \
+             and re-snapshot)"
+        );
+        assert_eq!(
+            act(SourceType::Mongo, Some("purchases")),
+            "db.purchases.updateMany({}, {$rename: {\"\u{441}omment\": \"comment\"}})"
+        );
+        assert_eq!(
+            act(SourceType::Mysql, None),
+            "alias it in the export's query: `\u{441}omment` AS comment"
+        );
+    }
+
+    #[test]
+    fn a_renamed_column_may_not_partition_or_cluster_the_table() {
+        let renames = vec![("\u{441}reated".to_string(), "created".to_string())];
+        let err = refuse_renamed_shape_column("e", &renames, None, &cols(&["created"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`created` partitions or clusters"), "{err}");
+        assert!(refuse_renamed_shape_column("e", &renames, None, &cols(&["id"])).is_ok());
+    }
+
+    fn spec_named(name: &str) -> TargetColumnSpec {
+        TargetColumnSpec {
+            column_name: name.into(),
+            target_type: "STRING".into(),
+            autoload_type: "STRING".into(),
+            status: TargetStatus::Ok,
+            note: None,
+            cast_sql: None,
+        }
+    }
+
     fn load_with(target: &str, extra: serde_json::Value) -> LoadSection {
         let mut v = match target {
             "snowflake" => serde_json::json!({
@@ -2476,22 +3031,22 @@ load:
         ];
         let expr = |block: serde_json::Value| resolve_bq(block, &specs).unwrap().unwrap().expr;
         let col = |c: &str, g: &str| serde_json::json!({ "column": c, "granularity": g });
-        assert_eq!(expr(col("ts", "hour")), "TIMESTAMP_TRUNC(ts, HOUR)");
-        assert_eq!(expr(col("ts", "day")), "TIMESTAMP_TRUNC(ts, DAY)");
-        assert_eq!(expr(col("ts", "month")), "TIMESTAMP_TRUNC(ts, MONTH)");
-        assert_eq!(expr(col("ts", "year")), "TIMESTAMP_TRUNC(ts, YEAR)");
-        assert_eq!(expr(col("dt", "hour")), "DATETIME_TRUNC(dt, HOUR)");
-        assert_eq!(expr(col("dt", "day")), "DATETIME_TRUNC(dt, DAY)");
-        assert_eq!(expr(col("dt", "month")), "DATETIME_TRUNC(dt, MONTH)");
-        assert_eq!(expr(col("dt", "year")), "DATETIME_TRUNC(dt, YEAR)");
-        assert_eq!(expr(col("d", "day")), "d");
-        assert_eq!(expr(col("d", "month")), "DATE_TRUNC(d, MONTH)");
-        assert_eq!(expr(col("d", "year")), "DATE_TRUNC(d, YEAR)");
+        assert_eq!(expr(col("ts", "hour")), "TIMESTAMP_TRUNC(`ts`, HOUR)");
+        assert_eq!(expr(col("ts", "day")), "TIMESTAMP_TRUNC(`ts`, DAY)");
+        assert_eq!(expr(col("ts", "month")), "TIMESTAMP_TRUNC(`ts`, MONTH)");
+        assert_eq!(expr(col("ts", "year")), "TIMESTAMP_TRUNC(`ts`, YEAR)");
+        assert_eq!(expr(col("dt", "hour")), "DATETIME_TRUNC(`dt`, HOUR)");
+        assert_eq!(expr(col("dt", "day")), "DATETIME_TRUNC(`dt`, DAY)");
+        assert_eq!(expr(col("dt", "month")), "DATETIME_TRUNC(`dt`, MONTH)");
+        assert_eq!(expr(col("dt", "year")), "DATETIME_TRUNC(`dt`, YEAR)");
+        assert_eq!(expr(col("d", "day")), "`d`");
+        assert_eq!(expr(col("d", "month")), "DATE_TRUNC(`d`, MONTH)");
+        assert_eq!(expr(col("d", "year")), "DATE_TRUNC(`d`, YEAR)");
         assert_eq!(
             expr(
                 serde_json::json!({ "range": { "column": "n", "start": 0, "end": 100, "interval": 5 } })
             ),
-            "RANGE_BUCKET(n, GENERATE_ARRAY(0, 100, 5))"
+            "RANGE_BUCKET(`n`, GENERATE_ARRAY(0, 100, 5))"
         );
         assert_eq!(
             expr(serde_json::json!({ "ingestion": "hour" })),

@@ -108,7 +108,7 @@ enum Auth {
     /// ADC credentials — `authorized_user` (refresh_token grant) or a
     /// `service_account` key file (RS256 jwt-bearer grant), both minted in
     /// process through the shared `gcs_auth` seam.
-    Adc(BlockingAdcTokenSource),
+    Adc(std::sync::Arc<BlockingAdcTokenSource>),
     /// Documented fallback for the credential shapes rivet has no in-process
     /// minting path for: `external_account` / workload identity (needs an STS
     /// exchange against a provider rivet does not model) and GCE/GKE metadata
@@ -293,6 +293,30 @@ impl BigQueryApi {
             self.location.as_deref(),
             &job_id,
         );
+        self.insert_job(&job_id, &body)
+    }
+
+    /// Append every row of `dataset.source` to `dataset.dest` with a copy job, which BigQuery does not bill.
+    pub(crate) fn copy_append(
+        &self,
+        dataset: &str,
+        source: &str,
+        dest: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        let job_id = new_job_id();
+        let body = copy_append_job_body(
+            (&self.project, dataset, source, dest),
+            labels,
+            self.location.as_deref(),
+            &job_id,
+        );
+        let job_ref = self.settle(self.insert_job(&job_id, &body)?)?;
+        Ok(job_ref.job_id)
+    }
+
+    /// `jobs.insert` of `body` under `job_id`, retried on a transient answer.
+    fn insert_job(&self, job_id: &str, body: &Value) -> Result<Value> {
         let url = format!(
             "{}/bigquery/v2/projects/{}/jobs",
             self.endpoint, self.project
@@ -302,11 +326,11 @@ impl BigQueryApi {
             if should_back_off(attempt) {
                 std::thread::sleep(poll_interval(attempt));
             }
-            let sent = self.authorized(self.http.post(&url))?.json(&body).send();
+            let sent = self.authorized(self.http.post(&url))?.json(body).send();
             match sent {
                 Ok(resp) => match insert_outcome(resp.status().as_u16()) {
                     InsertOutcome::Answered => return self.read_json(resp, "jobs.insert"),
-                    InsertOutcome::AlreadyExists => return self.fetch_inserted(&job_id),
+                    InsertOutcome::AlreadyExists => return self.fetch_inserted(job_id),
                     InsertOutcome::Transient => {
                         last = anyhow::anyhow!(
                             "BigQuery replied HTTP {} (transient)",
@@ -498,6 +522,26 @@ pub(crate) enum TokenSourceKind {
     GcloudCli,
 }
 
+/// The ADC token source for this principal, shared by every client in the process.
+fn shared_adc_source(
+    creds: gcs_auth::AdcCredentials,
+    http: &reqwest::blocking::Client,
+) -> std::sync::Arc<BlockingAdcTokenSource> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SOURCES: OnceLock<Mutex<HashMap<String, Arc<BlockingAdcTokenSource>>>> = OnceLock::new();
+    let key = creds.cache_key();
+    let mut sources = SOURCES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("shared ADC source map poisoned");
+    Arc::clone(
+        sources
+            .entry(key)
+            .or_insert_with(|| Arc::new(BlockingAdcTokenSource::new(creds, http.clone()))),
+    )
+}
+
 impl Auth {
     fn resolve(http: &reqwest::blocking::Client) -> Result<Self> {
         let static_token = std::env::var("RIVET_BQ_ACCESS_TOKEN").ok();
@@ -517,10 +561,7 @@ impl Auth {
                 static_token.expect("a Static choice implies a token"),
             ))),
             TokenSourceKind::Adc => {
-                let src = BlockingAdcTokenSource::new(
-                    adc.expect("an Adc choice implies credentials"),
-                    http.clone(),
-                );
+                let src = shared_adc_source(adc.expect("an Adc choice implies credentials"), http);
                 // Say WHICH identity the jobs will run as, at resolution time.
                 // A load that silently acts as a different principal than the
                 // operator configured is an audit trail that reads as fiction
@@ -624,6 +665,32 @@ pub(crate) fn query_job_body(
     let mut body = json!({
         "configuration": {
             "query": { "query": sql, "useLegacySql": false },
+            "labels": labels,
+        },
+        "jobReference": { "projectId": project, "jobId": job_id },
+    });
+    if let Some(loc) = location {
+        body["jobReference"]["location"] = json!(loc);
+    }
+    body
+}
+
+/// The `jobs.insert` body for a copy job appending `(project, dataset, source, dest)`'s source into its dest.
+pub(crate) fn copy_append_job_body(
+    (project, dataset, source, dest): (&str, &str, &str, &str),
+    labels: &BTreeMap<String, String>,
+    location: Option<&str>,
+    job_id: &str,
+) -> Value {
+    let table = |t: &str| json!({ "projectId": project, "datasetId": dataset, "tableId": t });
+    let mut body = json!({
+        "configuration": {
+            "copy": {
+                "sourceTable": table(source),
+                "destinationTable": table(dest),
+                "writeDisposition": "WRITE_APPEND",
+                "createDisposition": "CREATE_NEVER",
+            },
             "labels": labels,
         },
         "jobReference": { "projectId": project, "jobId": job_id },
@@ -895,6 +962,27 @@ fn is_table(meta: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Clients built for different tables share one token source per principal.
+    #[test]
+    fn clients_for_one_principal_share_one_token_source() {
+        let adc = |refresh: &str| {
+            crate::destination::gcs_auth::parse_adc_file(&format!(
+                r#"{{"type":"authorized_user","client_id":"gcloud-shared-client","client_secret":"s","refresh_token":"{refresh}"}}"#
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let http = reqwest::blocking::Client::new();
+        let a = super::shared_adc_source(adc("user-a-refresh"), &http);
+        let b = super::shared_adc_source(adc("user-a-refresh"), &http);
+        let other = super::shared_adc_source(adc("user-b-refresh"), &http);
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "one identity, one cache");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &other),
+            "two gcloud users share the OAuth client id and must still not share a token"
+        );
+    }
+
     use super::*;
 
     /// The compaction probe reads one row of mixed cells: text stays text, a
@@ -981,6 +1069,33 @@ mod tests {
         assert_eq!(b["jobReference"]["jobId"], "rivet_1");
         assert_eq!(b["jobReference"]["projectId"], "proj");
         assert!(b["jobReference"].get("location").is_none(), "{b}");
+    }
+
+    #[test]
+    fn a_copy_job_appends_into_an_existing_table_and_never_creates_one() {
+        let b = copy_append_job_body(
+            ("proj", "ds", "t__changes__staging", "t__changes"),
+            &labels(),
+            Some("EU"),
+            "rivet_3",
+        );
+        let copy = &b["configuration"]["copy"];
+        assert_eq!(
+            copy["sourceTable"],
+            json!({"projectId": "proj", "datasetId": "ds", "tableId": "t__changes__staging"})
+        );
+        assert_eq!(
+            copy["destinationTable"],
+            json!({"projectId": "proj", "datasetId": "ds", "tableId": "t__changes"})
+        );
+        assert_eq!(
+            copy["writeDisposition"], "WRITE_APPEND",
+            "a truncate would drop the buffer"
+        );
+        assert_eq!(copy["createDisposition"], "CREATE_NEVER");
+        assert_eq!(b["configuration"]["labels"]["rivet_op"], "load");
+        assert_eq!(b["jobReference"]["jobId"], "rivet_3");
+        assert_eq!(b["jobReference"]["location"], "EU");
     }
 
     #[test]

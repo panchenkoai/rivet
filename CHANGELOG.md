@@ -2,6 +2,85 @@
 
 ## Unreleased
 
+## 0.28.0 — 2026-09-23
+
+- **Behaviour changes an operator upgrading from 0.27 will see.**
+  - A `mode: full` load whose newest run exported 0 rows (the source was emptied)
+    now EMPTIES the warehouse table (a free `TRUNCATE`, or a `CREATE` when there is
+    none); 0.27 printed `LOAD SKIP: up to date` and kept serving the deleted rows.
+    Runs that declare rows but whose Parquet is gone refuse before any write, as
+    before. Snowflake refuses the empty case by name (`TRUNCATE` by hand).
+  - A MongoDB export of a collection that does not exist now fails (exit 1);
+    0.27 reported success with 0 rows. `rivet init --table a.b` on MongoDB now
+    scaffolds the collection `a.b`, not `b`.
+  - `rivet init` no longer picks a `DATE` / `smalldatetime` column, or one column
+    of a composite primary key, as the incremental cursor: a strict `>` on them
+    skips rows inserted later in the watermark's day/minute or under the same key
+    prefix. Existing configs are not rewritten — check any `cursor_column:` that
+    names such a column.
+  - `rivet load` / `rivet compact` run 16 tables at once by default (`--pool 1`
+    for the old sequential pass), so their output interleaves across tables.
+  - **BigQuery: a UUID column (PostgreSQL `uuid`, SQL Server `uniqueidentifier`)
+    now lands as `BYTES`** — the 16 bytes, as BigQuery autoloads them (it has no
+    UUID type); render text in a view with `TO_HEX(col)`. 0.27 declared it
+    `STRING` and stored the same 16 bytes as unreadable text. A `full` load
+    replaces the column type by itself. A base-and-buffer base table loaded by
+    0.27 must be migrated once before the next `rivet compact` (which otherwise
+    fails loudly, keeping the buffer), with its own partition and clustering:
+    `CREATE OR REPLACE TABLE t PARTITION BY … CLUSTER BY … AS SELECT * REPLACE
+    (CAST(uid AS BYTES) AS uid) FROM t` — lossless, the bytes are intact.
+  - SQL Server: a column declared `columns: <col>: string` whose server type is not
+    text used to export as NULL in every row with status success; it now fails
+    naming the column (drop the override: rivet reads these types natively).
+  - `rivet init` on MongoDB leaves views and time-series collections out (their
+    scans cannot keep a cursor open) and names them.
+
+- **`rivet check` / `rivet plan` read the relation `rivet init` writes.** init
+  quotes the table in its `query:` form (`[dbo].[t]`, `` `t` ``, `"public"."t"`),
+  and the diagnostics only understood bare names — so every such export lost its
+  catalog row estimate and its index probe: a small table read `DEGRADED`, and an
+  indexed chunk column `No index detected`. The measured row count they prefer
+  over the catalog is now taken only from a run of the same engine into the same
+  destination: on a shared state store a same-named export of another source
+  (another engine, another prefix) used to supply the figure.
+
+- **`rivet init` records every export's primary key, even when one export cannot
+  be given a cursor.** Recording validated the whole generated config first, so a
+  single cursor-less table (common under `--mode incremental`) left EVERY export
+  without the key `load.pk: auto` resolves against, and the load then refused three
+  steps from the cause. Keys are now read per export. Init also names every export
+  it could not give a `cursor_column:` / `time_column:` in one line (with
+  `--exclude` offered only where it applies), and stops printing "Next steps" that
+  cannot run on the file it just wrote.
+
+- **`rivet init --mode` writes only what the table can do.** A forced `chunked` on
+  a table with no integer column and no keysettable primary key wrote
+  `chunk_column: id` whether or not `id` existed; it is now written as `mode: full`
+  and named. Soft-delete stamps (`deleted_at` and friends, NULL on every live row)
+  are never a cursor, time column or partition key. An incremental cursor that does
+  not move on UPDATE (`id`, `created_at`) is marked in the YAML and every such
+  export is listed, since updated rows are never re-exported. The strategy recorded
+  in the state DB now agrees with the YAML for tables that cannot use the `table:`
+  form (a mixed-case PostgreSQL name).
+
+- **One BigQuery access token per identity per run, not per table.** Concurrent
+  first callers used to mint one token each, and every table built its own token
+  source; a 60-table compaction hit an ADC timeout. Minting is single-flight and the
+  source is shared per identity (keyed so two `gcloud` users never share one).
+
+- **A column named with Cyrillic look-alike letters loads under its Latin name.**
+  `сomment` (Cyrillic с) used to refuse the whole BigQuery load. The load now folds
+  such names, warns once per table with the statement to run at the source (per
+  engine, including the MySQL 5.7 form and the SQL Server CDC caveat, and the
+  export's own config keys that must change with it), and loads through a staging
+  table under the file's name, renamed and cloned (base) or appended with a free
+  copy job (buffer): BigQuery matches Parquet columns by name, so declaring the new
+  name alone loads the column NULL. `rivet check --target bigquery` grades such a
+  column `warn`. Refused, loudly: a fold that collides with another column, a
+  renamed column that partitions or is written into `cluster_by`, a non-BigQuery
+  target, and pending runs that spell the column both ways (the older run's files
+  would load NULL).
+
 - **`rivet load` and `rivet compact` can work the config's tables in parallel.**
   `--pool N` runs the per-table loop on N worker threads instead of one after
   another: every freeing worker takes the next table, so one slow table no longer
@@ -22,8 +101,8 @@
   the rest keep loading) and so is the per-table lease, so `rivet load` and
   `rivet compact` still refuse a table the other holds. Each worker opens its own state handle by reconnecting to the
   backend the parent already resolved (`open_at_ref`) — once per WORKER, not per
-  table — and a worker that cannot reconnect says so and carries the ERRORED half
-  of the tri-state rather than passing for absent-by-design.
+  table — and a worker that cannot reconnect says so and retires, rather than
+  passing for absent-by-design.
 
   The scheduling lives in a generic executor (`src/load/pool.rs`) rather than in
   the orchestrator, because `run_loads` / `run_compacts` are live-only bodies that
@@ -35,14 +114,13 @@
   returns the LAST maximum, so a completion-ordered fold would have reported a
   different error out of a tie on each run of the same failing config.
 
-- **A worker that loses the state ledger now says what it will actually do.** The
-  warning printed when a pool worker could not reopen the ledger said it was
-  "loading without a ledger", and the code then REFUSED the table a few frames
-  later. The claim was wrong every time it could appear: the warning is only
-  reachable when the parent's own open SUCCEEDED, which is precisely the case the
-  refusal covers, so it never once described what happened. Both legs (`rivet
-  load` and `rivet compact`) now name the refusal, and the comment above the pool
-  that described the same path as degrading to the stateless path went with it.
+- **A pool worker that cannot reopen the state ledger takes no table.** It used to
+  stay in the queue and refuse every table it took in microseconds, while the
+  healthy workers sat in BigQuery jobs, so one refused connection (a Postgres state
+  DB near `max_connections`, the default `--pool 16`) refused most of a large cycle.
+  It now retires before taking anything and the other workers drain the queue; if
+  every worker retires, each table still gets its own failure, and that message no
+  longer calls a state-backend outage a bug.
 
 - **A BigQuery job that never finishes now ends the wait instead of the run.**
   `await_job` polled `for attempt in 0..` with no ceiling, no `jobTimeoutMs` on the

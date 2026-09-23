@@ -96,7 +96,35 @@ impl ExportTarget {
         if input.fidelity.is_unsafe_for_strict_mode() && spec.status == TargetStatus::Ok {
             spec.status = TargetStatus::Warn;
         }
+        self.grade_column_name(&mut spec);
         spec
+    }
+
+    /// Flags a column name `rivet load` renames (BigQuery look-alikes) or refuses.
+    fn grade_column_name(self, spec: &mut TargetColumnSpec) {
+        if !matches!(self, ExportTarget::BigQuery | ExportTarget::Snowflake)
+            || crate::load::is_safe_load_ident(&spec.column_name)
+        {
+            return;
+        }
+        let (status, note) = match crate::load::latin_fold(&spec.column_name) {
+            Some(latin) if self == ExportTarget::BigQuery => (
+                TargetStatus::Warn,
+                format!("Cyrillic look-alike letters: loads as `{latin}`"),
+            ),
+            _ => (
+                TargetStatus::Fail,
+                "not a plain identifier: `rivet load` refuses it — rename it in the source"
+                    .to_string(),
+            ),
+        };
+        if spec.status != TargetStatus::Fail {
+            spec.status = status;
+        }
+        spec.note = Some(match spec.note.take() {
+            Some(n) => format!("{note}; {n}"),
+            None => note,
+        });
     }
 
     /// Resolve a whole table's worth of columns, one spec per column in order.
@@ -406,15 +434,11 @@ mod bigquery {
                  with PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col)) after load",
                 Some("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING({col}))"),
             ),
-            // UUID rides as FixedSizeBinary(16) + UUIDType; BigQuery has no UUID
-            // type and autoloads it as 16-byte BYTES (verified). Native is
-            // STRING (canonical text).
-            RivetType::Uuid => Resolved::diverge(
-                "STRING",
+            // BigQuery has no UUID type: the landing zone keeps the 16 bytes; consumers render text in a view.
+            RivetType::Uuid => Resolved::warn(
                 "BYTES",
-                "UUID autoloads as 16-byte BYTES in BigQuery; recover hex text with TO_HEX(col) \
-                 after load (or keep BYTES)",
-                Some("TO_HEX({col})"),
+                "BigQuery has no UUID type: the column lands as its 16 bytes; render the text in \
+                 a view with TO_HEX(col)",
             ),
             RivetType::Interval => Resolved::ok("STRING"),
             RivetType::List { inner } => list(inner),
@@ -818,6 +842,29 @@ mod tests {
     fn bq(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::BigQuery.resolve_column(input(rt))
     }
+
+    #[test]
+    fn check_names_the_lookalike_rename_and_the_name_load_refuses() {
+        let named = |target: ExportTarget, name: &str| {
+            target.resolve_column(TargetInput {
+                column_name: name,
+                ..input(&RivetType::String)
+            })
+        };
+        let folded = named(ExportTarget::BigQuery, "\u{441}omment");
+        assert_eq!(folded.status, TargetStatus::Warn);
+        assert!(folded.note.unwrap().contains("loads as `comment`"));
+        assert_eq!(
+            named(ExportTarget::Snowflake, "\u{441}omment").status,
+            TargetStatus::Fail
+        );
+        assert_eq!(
+            named(ExportTarget::BigQuery, "\u{438}\u{43c}\u{44f}").status,
+            TargetStatus::Fail
+        );
+        let plain = named(ExportTarget::BigQuery, "comment");
+        assert_eq!((plain.status, plain.note), (TargetStatus::Ok, None));
+    }
     fn duck(rt: &RivetType) -> TargetColumnSpec {
         ExportTarget::DuckDb.resolve_column(input(rt))
     }
@@ -875,15 +922,15 @@ mod tests {
     // ── dispatch on RivetType, not Arrow — the headline fix ──────────────────
 
     #[test]
-    fn bq_uuid_resolves_not_fails() {
-        // The old arrow-dispatch `bq_compat` hard-failed UUID (FixedSizeBinary
-        // had no arm). Now it resolves on RivetType: native STRING, BYTES on
-        // autoload.
+    fn bq_uuid_lands_as_the_bytes_it_autoloads_as() {
+        // Declared STRING, the 16 bytes landed as invalid text: unreadable, and the
+        // TO_HEX(col) hint did not compile against a STRING column.
         let s = bq(&RivetType::Uuid);
-        assert_eq!(s.target_type, "STRING");
+        assert_eq!(s.target_type, "BYTES");
         assert_eq!(s.autoload_type, "BYTES");
         assert_eq!(s.status, TargetStatus::Warn);
-        assert!(s.cast_sql.unwrap().contains("c"));
+        assert!(s.note.unwrap().contains("TO_HEX(col)"));
+        assert_eq!(s.cast_sql, None, "nothing diverges, so nothing to recover");
     }
 
     #[test]
@@ -1112,7 +1159,6 @@ mod tests {
                 .unwrap()
                 .contains("PARSE_JSON")
         );
-        assert!(bq(&RivetType::Uuid).cast_sql.unwrap().contains("TO_HEX"));
         let naive = RivetType::Timestamp {
             unit: super::super::TimeUnit::Microsecond,
             timezone: None,
@@ -1133,7 +1179,7 @@ mod tests {
         // NOTE: List is NOT here — arrays load natively as ARRAY<STRUCT<item T>>
         // (target == autoload, a warn), so they are no longer a divergence. See
         // `bq_list_declares_loadable_array_struct_item_ddl`.
-        let cases = [RivetType::Json, RivetType::Uuid, RivetType::UInt64, naive];
+        let cases = [RivetType::Json, RivetType::UInt64, naive];
         for rt in cases {
             let s = bq(&rt);
             assert_ne!(s.autoload_type, s.target_type, "case must diverge: {rt:?}");
@@ -1398,7 +1444,10 @@ mod tests {
         // The post-load casts that actually recover native types (verified live
         // against BigQuery — a declared-type load is rejected, a cast is not).
         assert!(sql.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
-        assert!(sql.contains("TO_HEX(uid) AS uid"));
+        assert!(
+            !sql.contains("AS uid"),
+            "uuid lands as the BYTES it autoloads as: no cast"
+        );
         assert!(sql.contains("DATETIME(created_at) AS created_at"));
         // Arrays load natively as ARRAY<STRUCT<item T>> (== autoload), so they are
         // NOT recovered — no cast, no flatten (the warn note documents the optional
@@ -1478,7 +1527,10 @@ mod tests {
         assert!(body.contains("  id,") && !body.contains("AS id"));
         assert!(body.contains("  amount,") && !body.contains("AS amount"));
         assert!(body.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
-        assert!(body.contains("TO_HEX(uid) AS uid"));
+        assert!(
+            !body.contains("AS uid"),
+            "uuid is BYTES on both sides: passthrough"
+        );
         assert!(body.contains("DATETIME(created_at) AS created_at"));
         // tags (array) loads natively as ARRAY<STRUCT<item T>> → passthrough, not cast
         // (projected once — asserted by the count/contains checks above).

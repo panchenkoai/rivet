@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import blessed_path, cdc, scenarios
+from ..pytools import registry
 from .core import (
     run,
     Ledger,
@@ -662,38 +663,10 @@ def _flow_rows(path: Path) -> int:
 
 
 def _manifest_files(prefix: Path) -> list[str] | None:
-    """Absolute paths of the parts the manifest DECLARES, or None if unmanifested.
-
-    On a `repeat` cell there are several manifest copies (one per run, immutable)
-    plus the canonical last-writer-wins pointer. The union across the COPIES is
-    the readable dataset — reading only `manifest.json` would report the last
-    run's parts as the whole, which is exactly how a sidecar clobber stays
-    invisible.
-    """
-    copies = sorted(prefix.rglob("manifest-*.json"))
-    docs = copies or ([prefix / "manifest.json"] if (prefix / "manifest.json").is_file() else [])
-    if not docs:
+    """Absolute paths of the parts the SUCCESS manifests under `prefix` declare, or None when there is no manifest at all."""
+    if not any(prefix.rglob("manifest-*.json")) and not (prefix / "manifest.json").is_file():
         return None
-    out: list[str] = []
-    for d in docs:
-        try:
-            art = json.loads(d.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        for f in art.get("parts", []) or []:
-            # A part the manifest lists but marks non-committed is not delivered
-            # data; counting it would report an in-flight row as an outcome.
-            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
-                continue
-            name = f.get("path") or f.get("name") if isinstance(f, dict) else f
-            if not name:
-                continue
-            cand = Path(name)
-            if not cand.is_absolute():
-                cand = d.parent / cand
-            if cand.is_file():
-                out.append(str(cand))
-    return sorted(set(out))
+    return scenarios._manifest_declared_parts(prefix)
 
 
 def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live") -> None:
@@ -1135,7 +1108,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # rivet's lease guard on `rivet_blessed_postgres_repeat_gcs_postgres.users` and
     # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
-    dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+    dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
             + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
@@ -1214,15 +1187,13 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     _stage(led, cell, tag, "load", got == want and got > 0 and lok,
            f"bigquery={got} source={want} · ledger {ldetail}")
 
-    # Cleanup is part of the cycle. `bq rm -f` exits 0 whether or not the table
-    # existed, so its exit code is not evidence — the drop is verified by asking
-    # for the table afterwards.
-    run(["bq", "--project_id", proj, "rm", "-f", "-t", f"{proj}:{dset}.{tbl}"])
-    gone = run(["bq", "--project_id", proj, "show", "-t", f"{proj}:{dset}.{tbl}"])
+    # Cleanup is part of the cycle: the cell's own dataset goes, verified by a show that fails.
+    run(["bq", "--project_id", proj, "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
+    gone = run(["bq", "--project_id", proj, "show", "-d", f"{proj}:{dset}"])
     run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
     _stage(led, cell, tag, "load:cleanup", not gone.ok,
-           "warehouse table dropped (verified by a show that fails)"
-           if not gone.ok else "the table is STILL THERE after rm — the next run's count "
+           "cell dataset dropped (verified by a show that fails)"
+           if not gone.ok else "the dataset is STILL THERE after rm — the next run's count "
            "would be a union of two loads")
 
 

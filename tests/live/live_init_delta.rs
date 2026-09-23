@@ -284,6 +284,320 @@ fn a_generated_config_drives_run_load_compact_into_the_warehouse_mssql() {
     warehouse_chain(SqlEngine::Mssql, "init_chain_ms");
 }
 
+/// A full load whose newest run exported 0 rows (the source was emptied) empties the
+/// warehouse table; it used to report "up to date" and keep serving the deleted rows.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_full_load_of_an_emptied_source_empties_the_warehouse_table() {
+    let Some(bq) = BqLive::from_env("init_emptied") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _table_guard) = e.create("init_emptied", "id BIGINT PRIMARY KEY, v TEXT NOT NULL");
+    e.exec(&format!(
+        "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(1,5) g"
+    ));
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "full",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
+    let _bq_guard = bq.cleanup(&[&export]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(bq.read_bq_count(&export), "5");
+
+    e.exec(&format!("TRUNCATE {table}"));
+    rivet_ok(&["run", "-c", cfg], &db);
+    let said = rivet_ok(&["load", "-c", cfg], &[]);
+    assert!(
+        !said.contains("LOAD SKIP"),
+        "an emptied source is not 'up to date': {said}"
+    );
+    assert_eq!(
+        bq.read_bq_count(&export),
+        "0",
+        "the warehouse table matches the source's latest snapshot, which is empty"
+    );
+}
+
+/// A compaction whose job died after renaming the buffer to `<t>__changes__merging`
+/// leaves rows in no base and no buffer; the next `compact` must merge them and drop
+/// the leftover. The dead job is reproduced by making that rename by hand.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_compaction_left_half_done_is_finished_by_the_next_one() {
+    let Some(bq) = BqLive::from_env("init_merging") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _table_guard) = e.create(
+        "init_merging",
+        // `t` and `s` are the aliases the compaction SQL once used; BigQuery resolved them to these columns.
+        "id BIGINT PRIMARY KEY, v TEXT NOT NULL, t TEXT, s TEXT, \
+         changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(1,10) g"
+    ));
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "incremental",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
+    let changes = format!("{export}__changes");
+    let merging = format!("{export}__changes__merging");
+    let _bq_guard = bq.cleanup(&[&export, &changes, &merging]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+    let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
+
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    e.exec(&format!(
+        "INSERT INTO {table} (id, v) SELECT g, 'v'||g FROM generate_series(11,12) g"
+    ));
+    e.exec(&format!(
+        "UPDATE {table} SET v = 'upd3', changed_at = now() WHERE id = 3"
+    ));
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    assert_eq!(bq.read_bq_count(&changes), "3", "the delta is buffered");
+    let renamed = std::process::Command::new("bq")
+        .arg(format!("--project_id={}", bq.project))
+        .args(["query", "--use_legacy_sql=false"])
+        .arg(format!(
+            "ALTER TABLE {} RENAME TO `{merging}`",
+            fq(&changes)
+        ))
+        .output()
+        .expect("`bq query` must run");
+    assert!(
+        renamed.status.success(),
+        "the dead job's rename could not be reproduced: {}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the dead job took the buffer's name"
+    );
+
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("left over from a compaction"), "{said}");
+    assert!(
+        said.contains("COMPACT OK"),
+        "the recovered merge is reported as work: {said}"
+    );
+    assert!(
+        bq.read_bq_table_type(&merging).is_none(),
+        "the leftover is dropped"
+    );
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNTIF(id = 3 AND v = 'upd3') AS updated FROM {}",
+        fq(&export)
+    ));
+    assert_eq!(
+        rows[0]["n"].as_str(),
+        Some("12"),
+        "the two inserts reached the base"
+    );
+    assert_eq!(
+        rows[0]["updated"].as_str(),
+        Some("1"),
+        "the UPDATE reached the base"
+    );
+}
+
+/// One export init cannot give a cursor must not cost the others their recorded key:
+/// a whole-schema `--mode incremental` scaffold over a stamped table and a stamp-less
+/// one records BOTH primary keys (recording used to validate the whole config first,
+/// and the stamp-less export's missing `cursor_column:` left every export keyless).
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_export_init_cannot_give_a_cursor_does_not_cost_the_others_their_key() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (stamped, _g1) = e.create(
+        "init_keys_stamped",
+        "id BIGINT PRIMARY KEY, changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    let (stampless, _g2) = e.create("init_keys_stampless", "code TEXT PRIMARY KEY, v TEXT");
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg = dir.path().join("rivet.yaml");
+    let out = run_rivet(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--schema",
+        "public",
+        "--include",
+        &stamped,
+        &stampless,
+        "--mode",
+        "incremental",
+        "--output",
+        cfg.to_str().unwrap(),
+    ]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "rivet init failed:\n{said}");
+    assert!(
+        said.contains(&stampless) && said.contains("have no timestamp column"),
+        "the fixture must really leave one export without a cursor: {said}"
+    );
+    let key = |t: &str| recorded_primary_key(&cfg, t);
+    assert_eq!(key(&stamped), Some(vec!["id".to_string()]));
+    assert_eq!(key(&stampless), Some(vec!["code".to_string()]));
+}
+
+/// A source column spelled with a Cyrillic look-alike (`сomment`, U+0441) lands as
+/// `comment` through the base load, the buffer append and the compaction, with no
+/// NULL anywhere: BigQuery matches Parquet columns by name, so a rename that only
+/// edited the declared schema would load the column NULL with every count green.
+#[test]
+#[ignore = "live: requires docker compose postgres + BigQuery creds"]
+fn a_cyrillic_lookalike_column_lands_under_its_latin_name_with_every_value() {
+    let Some(bq) = BqLive::from_env("init_lookalike") else {
+        return;
+    };
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _table_guard) = e.create(
+        "init_lookalike",
+        "id BIGINT PRIMARY KEY, \"\u{441}omment\" TEXT NOT NULL, \
+         changed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} (id, \"\u{441}omment\") SELECT g, 'c'||g FROM generate_series(1,10) g"
+    ));
+
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    init_ok(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        &table,
+        "--mode",
+        "incremental",
+        "--bigquery-project",
+        &bq.project,
+        "--bigquery-dataset",
+        &bq.dataset,
+        "--gcs-bucket",
+        &bq.bucket,
+        "--output",
+        cfg,
+    ]);
+    let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
+    let changes = format!("{export}__changes");
+    let _bq_guard = bq.cleanup(&[&export, &changes]);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let db = [("DATABASE_URL", POSTGRES_URL)];
+    let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
+    let columns = |t: &str| {
+        bq.read_bq_rows(&format!(
+            "SELECT column_name FROM `{}.{}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{t}'",
+            bq.project, bq.dataset
+        ))
+        .iter()
+        .filter_map(|r| r["column_name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+    };
+    let nulls = |t: &str| {
+        bq.read_bq_rows(&format!(
+            "SELECT COUNT(*) AS n, COUNTIF(comment IS NULL) AS nul FROM {}",
+            fq(t)
+        ))[0]
+            .clone()
+    };
+
+    rivet_ok(&["run", "-c", cfg], &db);
+    let said = rivet_ok(&["load", "-c", cfg], &[]);
+    assert!(
+        said.contains("loads as `comment`"),
+        "the rename is announced: {said}"
+    );
+    let base_cols = columns(&export);
+    assert!(
+        base_cols.iter().any(|c| c == "comment") && !base_cols.iter().any(|c| c == "\u{441}omment"),
+        "the base carries the Latin name only: {base_cols:?}"
+    );
+    let base = nulls(&export);
+    assert_eq!(
+        (base["n"].as_str(), base["nul"].as_str()),
+        (Some("10"), Some("0"))
+    );
+
+    e.exec(&format!(
+        "INSERT INTO {table} (id, \"\u{441}omment\") SELECT g, 'c'||g FROM generate_series(11,15) g"
+    ));
+    e.exec(&format!(
+        "UPDATE {table} SET \"\u{441}omment\" = 'upd3', changed_at = now() WHERE id = 3"
+    ));
+    rivet_ok(&["run", "-c", cfg], &db);
+    rivet_ok(&["load", "-c", cfg], &[]);
+    let buffered = nulls(&changes);
+    assert_eq!(
+        (buffered["n"].as_str(), buffered["nul"].as_str()),
+        (Some("6"), Some("0")),
+        "the renamed append carries every value into the buffer"
+    );
+
+    let said = rivet_ok(&["compact", "-c", cfg], &[]);
+    assert!(said.contains("COMPACT OK"), "{said}");
+    let rows = bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n, COUNTIF(comment IS NULL) AS nul, \
+         COUNTIF(id = 3 AND comment = 'upd3') AS updated FROM {}",
+        fq(&export)
+    ));
+    assert_eq!(rows[0]["n"].as_str(), Some("15"));
+    assert_eq!(rows[0]["nul"].as_str(), Some("0"));
+    assert_eq!(
+        rows[0]["updated"].as_str(),
+        Some("1"),
+        "the UPDATE reached the base"
+    );
+}
+
 // ── batch: incremental ────────────────────────────────────────────────────
 
 #[test]

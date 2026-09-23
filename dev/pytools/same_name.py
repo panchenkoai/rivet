@@ -33,6 +33,13 @@ import sys
 import time
 from pathlib import Path
 
+if __package__:
+    from . import registry
+    from .duckcli import ARGV as DUCKDB
+else:  # run as a plain script: its own directory is on sys.path
+    import registry  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
+
 ROOT = Path(__file__).resolve().parents[2]
 RIVET = os.environ.get("RIVET_BIN", str(ROOT / "target" / "release" / "rivet"))
 STATE_URL = os.environ.get(
@@ -40,7 +47,7 @@ STATE_URL = os.environ.get(
 )
 BUCKET = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
 BQ_PROJECT = os.environ.get("BQ_ORACLE_PROJECT", "rivet-data-tool")
-BQ_DATASET = os.environ.get("BQ_ORACLE_DATASET", "rivet_e2e")
+BQ_DATASET = os.environ.get("BQ_ORACLE_DATASET") or registry.load()["bigquery"]["e2e"]
 
 TABLE = "same_name_probe"
 #: One export NAME for both sources — the whole point.
@@ -59,7 +66,7 @@ def sh(argv, env=None, timeout=900):
 
 
 def duckdb(sql: str) -> str:
-    return sh(["duckdb", "-noheader", "-list", "-c", sql], timeout=600).stdout.strip()
+    return sh([*DUCKDB, "-noheader", "-list", "-c", sql], timeout=600).stdout.strip()
 
 
 def seed() -> bool:

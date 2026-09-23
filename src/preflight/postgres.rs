@@ -50,7 +50,8 @@ fn diagnose_pg(
 ) -> Result<ExportDiagnostic> {
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    let base_table = preflight_base_table(export, base_query);
+    let base_table_owned = preflight_base_table(export, base_query);
+    let base_table = base_table_owned.as_deref();
 
     // The planner auto-resolves an UNSET chunked chunk_column to the single-integer PK
     // (build_plan), and `auto_pk_probe_target` is that gate — so range_col / the strategy
@@ -254,8 +255,10 @@ fn get_cursor_range_pg(
 ///
 /// Exists because `rivet init` generates `query: SELECT cols FROM tbl`
 /// (not `table: tbl`) to lock the column list, so the index probe needs
-/// to recover the table name from the rendered query.
-pub(crate) fn table_from_simple_query(query: &str) -> Option<&str> {
+/// to recover the table name from the rendered query. init QUOTES that name
+/// per engine (`[dbo].[t]`, `"public"."t"`, `` `t` ``), so quoted segments are
+/// read and returned UNQUOTED — the catalog probes compare names as literals.
+pub(crate) fn table_from_simple_query(query: &str) -> Option<std::borrow::Cow<'_, str>> {
     // Walk tokens after the first FROM that is *not* inside parens.
     let mut depth = 0u32;
     let mut chars = query.char_indices().peekable();
@@ -272,7 +275,12 @@ pub(crate) fn table_from_simple_query(query: &str) -> Option<&str> {
                         query.as_bytes()[idx - 1],
                         b' ' | b'\t' | b'\n' | b'\r' | b')'
                     );
-                if head_ok && rest.len() >= 5 && rest[..4].eq_ignore_ascii_case("from") {
+                if head_ok
+                    && rest.len() >= 5
+                    && rest
+                        .get(..4)
+                        .is_some_and(|w| w.eq_ignore_ascii_case("from"))
+                {
                     let after = rest[4..].chars().next();
                     if matches!(after, Some(c) if c.is_whitespace() || c == '(') {
                         // skip 'from' + whitespace
@@ -281,22 +289,8 @@ pub(crate) fn table_from_simple_query(query: &str) -> Option<&str> {
                         while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                             j += 1;
                         }
-                        // Read one identifier (with optional `schema.` prefix);
-                        // reject anything with quotes / subquery / comma.
-                        let id_start = j;
-                        while j < bytes.len() {
-                            let b = bytes[j];
-                            let id_char = b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
-                            if id_char {
-                                j += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        if j == id_start {
-                            return None;
-                        }
-                        let token = &query[id_start..j];
+                        let (token, end) = scan_relation(query, j)?;
+                        j = end;
                         // Reject only when this is genuinely multi-relation:
                         //   `FROM users JOIN orders …`  ← any JOIN flavor
                         //   `FROM users, orders`         ← comma list
@@ -343,6 +337,69 @@ pub(crate) fn table_from_simple_query(query: &str) -> Option<&str> {
         let _ = chars.peek();
     }
     None
+}
+
+/// The dotted relation name starting at byte `start`, unquoted, and the byte after it; `None` for no name or a quoted segment holding a `.`.
+fn scan_relation(query: &str, start: usize) -> Option<(std::borrow::Cow<'_, str>, usize)> {
+    let bytes = query.as_bytes();
+    let (mut j, mut segments, mut quoted) = (start, Vec::<String>::new(), false);
+    loop {
+        let close = match bytes.get(j) {
+            Some(b'"') => Some(b'"'),
+            Some(b'[') => Some(b']'),
+            Some(b'`') => Some(b'`'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            let mut seg = Vec::new();
+            j += 1;
+            loop {
+                match bytes.get(j) {
+                    None => return None,
+                    Some(&b) if b == close && bytes.get(j + 1) == Some(&close) => {
+                        seg.push(b);
+                        j += 2;
+                    }
+                    Some(&b) if b == close => {
+                        j += 1;
+                        break;
+                    }
+                    Some(&b) => {
+                        seg.push(b);
+                        j += 1;
+                    }
+                }
+            }
+            let seg = String::from_utf8(seg).ok()?;
+            if seg.is_empty() || seg.contains('.') {
+                return None;
+            }
+            segments.push(seg);
+            quoted = true;
+        } else {
+            let from = j;
+            while bytes
+                .get(j)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                j += 1;
+            }
+            if j == from {
+                return None;
+            }
+            segments.push(query[from..j].to_string());
+        }
+        if bytes.get(j) == Some(&b'.') {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    Some(if quoted {
+        (std::borrow::Cow::Owned(segments.join(".")), j)
+    } else {
+        (std::borrow::Cow::Borrowed(&query[start..j]), j)
+    })
 }
 
 /// True when `column` is the leading key of a `btree` index on `table`.
@@ -556,7 +613,7 @@ mod tests {
     #[test]
     fn table_from_simple_query_bare_select() {
         assert_eq!(
-            table_from_simple_query("SELECT id, name FROM users"),
+            table_from_simple_query("SELECT id, name FROM users").as_deref(),
             Some("users")
         );
     }
@@ -564,7 +621,7 @@ mod tests {
     #[test]
     fn table_from_simple_query_schema_qualified() {
         assert_eq!(
-            table_from_simple_query("SELECT * FROM public.orders"),
+            table_from_simple_query("SELECT * FROM public.orders").as_deref(),
             Some("public.orders")
         );
     }
@@ -576,17 +633,17 @@ mod tests {
         // make sure the parser tolerates that exact shape.
         let q =
             "\nSELECT id, name, email, age, balance,\n  is_active, bio, created_at\nFROM users\n";
-        assert_eq!(table_from_simple_query(q), Some("users"));
+        assert_eq!(table_from_simple_query(q).as_deref(), Some("users"));
     }
 
     #[test]
     fn table_from_simple_query_case_insensitive_keyword() {
         assert_eq!(
-            table_from_simple_query("select * from Users"),
+            table_from_simple_query("select * from Users").as_deref(),
             Some("Users")
         );
         assert_eq!(
-            table_from_simple_query("Select * From users"),
+            table_from_simple_query("Select * From users").as_deref(),
             Some("users")
         );
     }
@@ -596,10 +653,13 @@ mod tests {
         // Multi-relation queries must fall back to the EXPLAIN heuristic —
         // catalog probing one of the tables would mislead the verdict.
         assert_eq!(
-            table_from_simple_query("SELECT * FROM users JOIN orders USING (id)"),
+            table_from_simple_query("SELECT * FROM users JOIN orders USING (id)").as_deref(),
             None
         );
-        assert_eq!(table_from_simple_query("SELECT * FROM users, orders"), None);
+        assert_eq!(
+            table_from_simple_query("SELECT * FROM users, orders").as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -608,11 +668,11 @@ mod tests {
         // with a local alias — the table is still `users`, which is what
         // the catalog probe needs to index-check. Aliases are harmless.
         assert_eq!(
-            table_from_simple_query("SELECT * FROM users u"),
+            table_from_simple_query("SELECT * FROM users u").as_deref(),
             Some("users")
         );
         assert_eq!(
-            table_from_simple_query("SELECT * FROM users AS u"),
+            table_from_simple_query("SELECT * FROM users AS u").as_deref(),
             Some("users")
         );
     }
@@ -622,15 +682,15 @@ mod tests {
         // WHERE / ORDER BY / LIMIT don't change the relation; the table
         // before them is still the one to probe.
         assert_eq!(
-            table_from_simple_query("SELECT * FROM users WHERE id > 0"),
+            table_from_simple_query("SELECT * FROM users WHERE id > 0").as_deref(),
             Some("users")
         );
         assert_eq!(
-            table_from_simple_query("SELECT * FROM users ORDER BY id"),
+            table_from_simple_query("SELECT * FROM users ORDER BY id").as_deref(),
             Some("users")
         );
         assert_eq!(
-            table_from_simple_query("SELECT * FROM users LIMIT 100"),
+            table_from_simple_query("SELECT * FROM users LIMIT 100").as_deref(),
             Some("users")
         );
     }
@@ -649,7 +709,7 @@ mod tests {
         ] {
             let q = format!("SELECT * FROM users {kw} orders ON users.id = orders.user_id");
             assert_eq!(
-                table_from_simple_query(&q),
+                table_from_simple_query(&q).as_deref(),
                 None,
                 "{kw}: should reject multi-relation"
             );
@@ -662,7 +722,7 @@ mod tests {
         // is inside parens (depth>0), so the parser should reach the outer
         // `FROM users`.
         assert_eq!(
-            table_from_simple_query("SELECT (SELECT max(x) FROM events) FROM users"),
+            table_from_simple_query("SELECT (SELECT max(x) FROM events) FROM users").as_deref(),
             Some("users")
         );
     }
@@ -677,11 +737,21 @@ mod tests {
     }
 
     #[test]
+    fn table_from_simple_query_survives_a_non_ascii_column_name() {
+        assert_eq!(
+            table_from_simple_query("SELECT \"id\", \"\u{434}\u{430}\u{442}\u{430}\" FROM orders")
+                .as_deref(),
+            Some("orders"),
+            "a multi-byte column must not split a char at the FROM probe"
+        );
+    }
+
+    #[test]
     fn table_from_simple_query_handles_no_from_clause() {
         // `SELECT 1` — preflight uses this as the fallback when the user
         // hasn't supplied a query yet. Must not crash, must return None.
-        assert_eq!(table_from_simple_query("SELECT 1"), None);
-        assert_eq!(table_from_simple_query(""), None);
+        assert_eq!(table_from_simple_query("SELECT 1").as_deref(), None);
+        assert_eq!(table_from_simple_query("").as_deref(), None);
     }
 
     // ── regression: `table:` shortcut must NOT preflight the "SELECT 1" stub ──
@@ -710,7 +780,7 @@ mod tests {
             crate::pipeline::chunked::strip_select_star_from(&base),
             Some("orders")
         );
-        assert_eq!(table_from_simple_query(&base), Some("orders"));
+        assert_eq!(table_from_simple_query(&base).as_deref(), Some("orders"));
     }
 
     #[test]
@@ -742,14 +812,50 @@ mod tests {
     }
 
     #[test]
-    fn table_from_simple_query_rejects_quoted_identifier() {
-        // `FROM "User Table"` — the parser only accepts bare identifier
-        // chars (alnum / _ / .), so a double-quoted name returns None and
-        // the catalog probe falls back to the EXPLAIN hint. Conservative
-        // — quoted identifiers are uncommon in `rivet init` output.
+    fn table_from_simple_query_reads_every_engines_quoting_unquoted() {
+        let t = |q: &str| table_from_simple_query(q).map(|c| c.into_owned());
         assert_eq!(
-            table_from_simple_query("SELECT * FROM \"User Table\""),
-            None
+            t("SELECT [id] FROM [dbo].[rivet_type_matrix]").as_deref(),
+            Some("dbo.rivet_type_matrix")
         );
+        assert_eq!(
+            t("SELECT \"id\" FROM \"public\".\"orders\"").as_deref(),
+            Some("public.orders")
+        );
+        assert_eq!(
+            t("SELECT `id` FROM `shop`.`orders` WHERE `id` > 0").as_deref(),
+            Some("shop.orders")
+        );
+        assert_eq!(
+            t("SELECT * FROM \"User Table\"").as_deref(),
+            Some("User Table")
+        );
+        assert_eq!(
+            t("SELECT * FROM [a]]b]").as_deref(),
+            Some("a]b"),
+            "a doubled closer is an escaped one"
+        );
+        assert_eq!(t("SELECT * FROM \"a\"\"b\"").as_deref(), Some("a\"b"));
+        assert_eq!(
+            t("SELECT * FROM [dbo].[orders] AS o").as_deref(),
+            Some("dbo.orders")
+        );
+    }
+
+    #[test]
+    fn table_from_simple_query_refuses_what_it_cannot_name_exactly() {
+        let t = |q: &str| table_from_simple_query(q).map(|c| c.into_owned());
+        assert_eq!(
+            t("SELECT * FROM \"my.table\""),
+            None,
+            "a dot inside quotes would split wrong later"
+        );
+        assert_eq!(
+            t("SELECT * FROM [dbo].[orders"),
+            None,
+            "an unterminated quote is not a name"
+        );
+        assert_eq!(t("SELECT * FROM []"), None);
+        assert_eq!(t("SELECT * FROM [dbo].[a] JOIN [dbo].[b] ON 1 = 1"), None);
     }
 }

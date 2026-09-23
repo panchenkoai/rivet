@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DUCKDB = [sys.executable, str(ROOT / "dev" / "pytools" / "duckcli.py")]
 OUT = ROOT / "dev" / "bench" / ".smoke-out"
 # Prefer the worktree build (has the mongo source); fall back to PATH rivet.
 RIVET_BIN = (str(ROOT / "target/release/rivet")
@@ -309,7 +310,7 @@ def sh(cmd, **kw):
 def parquet_rows(path: Path) -> int:
     """Row count across path (a file or a dir of *.parquet), via the duckdb CLI."""
     glob = str(path / "**/*.parquet") if path.is_dir() else str(path)
-    r = sh(["duckdb", "-noheader", "-list", "-c",
+    r = sh([*DUCKDB, "-noheader", "-list", "-c",
             f"SELECT count(*) FROM read_parquet('{glob}')"])
     m = re.search(r"\d+", r.stdout or "")
     return int(m.group()) if m else -1
@@ -538,7 +539,7 @@ def parquet_families(path: Path) -> dict:
     files = list(path.rglob("*.parquet")) if path.is_dir() else [path]
     if not files:
         return {}
-    r = sh(["duckdb", "-noheader", "-list", "-c",
+    r = sh([*DUCKDB, "-noheader", "-list", "-c",
             f"SELECT column_name||'='||column_type FROM "
             f"(DESCRIBE SELECT * FROM read_parquet('{files[0]}'))"])
     return {c: family(t) for c, t in col_types(r.stdout.strip().splitlines()).items()}
@@ -622,7 +623,7 @@ def a_duckdb(table, dest: Path):
         f"{ENG['duckdb_attach']}; "
         f"COPY (SELECT * FROM src.{table}) TO '{out}' (FORMAT parquet, COMPRESSION zstd);"
     )
-    return out, lambda: timed(["duckdb", "-c", sql])
+    return out, lambda: timed([*DUCKDB, "-c", sql])
 
 
 # clickhouse's brew cask is an unsigned Apple-Silicon binary; if `which` misses

@@ -114,6 +114,8 @@ mod scenario_artifact_matrix_guard;
 mod schema_drift;
 #[path = "offline/schema_evolution.rs"]
 mod schema_evolution;
+#[path = "offline/stand_registry_guard.rs"]
+mod stand_registry_guard;
 #[path = "offline/state_compat.rs"]
 mod state_compat;
 #[path = "offline/time_window.rs"]

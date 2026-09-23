@@ -137,10 +137,30 @@ pub fn select_load_uris(
         .into_iter()
         .filter(|k| k.ends_with(".parquet"))
         .collect();
+    let missing = runs_with_missing_parts(new, &all_parquet);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "run(s) {} declare parts that are no longer under {gcs_prefix} — refusing to load \
+             rather than guess which files are theirs (the prefix may hold other runs' parts \
+             or crash leftovers). Re-run the export, then load.",
+            missing.join(", ")
+        );
+    }
     Ok(select_load_keys(new, &all_parquet)
         .into_iter()
         .map(|k| format!("gs://{bucket}/{k}"))
         .collect())
+}
+
+/// The runs whose manifest declares parts of which none is present.
+fn runs_with_missing_parts(new: &[(String, RunManifest)], all_parquet: &[String]) -> Vec<String> {
+    let present: std::collections::HashSet<&str> = all_parquet.iter().map(String::as_str).collect();
+    new.iter()
+        .filter(|(key, m)| {
+            !m.parts.is_empty() && !resolve_parts(key, m).any(|p| present.contains(p.as_str()))
+        })
+        .map(|(_, m)| m.run_id.clone())
+        .collect()
 }
 
 /// The bucket-relative part keys a manifest declares, each resolved against the
@@ -1350,6 +1370,15 @@ mod tests {
             all,
             "unresolvable part → blanket fallback"
         );
+    }
+
+    #[test]
+    fn a_run_whose_declared_parts_are_all_gone_is_named_not_replaced_by_the_listing() {
+        let all = vec!["base/older-run.parquet".to_string()];
+        let gone = vec![keyed("base/manifest-r2.json", "r2", "r2-000.parquet")];
+        assert_eq!(runs_with_missing_parts(&gone, &all), ["r2"]);
+        let present = vec![keyed("base/manifest-r1.json", "r1", "older-run.parquet")];
+        assert!(runs_with_missing_parts(&present, &all).is_empty());
     }
 
     #[test]

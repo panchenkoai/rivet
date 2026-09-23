@@ -134,6 +134,8 @@ pub struct BigQueryLoader {
     /// (the offline `materialize` refusal tests build one and never reach the
     /// network).
     api: Arc<OnceLock<BigQueryApi>>,
+    /// Columns loaded under their Parquet name and renamed after, as (file name, warehouse name).
+    renames: Vec<crate::load::plan::Rename>,
 }
 
 impl BigQueryLoader {
@@ -147,6 +149,7 @@ impl BigQueryLoader {
             layout: crate::load::plan::CdcLayout::LogAndView,
             footer_source: None,
             api: Arc::new(OnceLock::new()),
+            renames: Vec::new(),
         }
     }
 
@@ -167,6 +170,50 @@ impl BigQueryLoader {
     pub fn batched_by_footers(mut self, dest: crate::config::DestinationConfig) -> Self {
         self.footer_source = Some(dest);
         self
+    }
+
+    /// Load these columns under their Parquet name and rename them to the warehouse name.
+    pub fn renamed(mut self, renames: Vec<crate::load::plan::Rename>) -> Self {
+        self.renames = renames;
+        self
+    }
+
+    /// Append `batches` to `changes` one job at a time: load a staging table under the file names, rename, then a free copy job.
+    fn append_renamed(
+        &self,
+        changes: &str,
+        specs: &[TargetColumnSpec],
+        batches: &[Vec<String>],
+        partition: Option<&TablePartition>,
+    ) -> Result<()> {
+        let staging = format!("{changes}__staging");
+        let staging_fqtn = self.fqtn(&staging);
+        let schema = build_file_schema(specs, &self.renames);
+        let partition_expr = partition.map(|p| p.expr.as_str());
+        let drop = format!("DROP TABLE IF EXISTS `{staging_fqtn}`;");
+        for batch in batches {
+            self.run_sql(&drop, "load", changes)?;
+            let load = build_load_data_sql(
+                &staging_fqtn,
+                true,
+                &schema,
+                partition_expr,
+                self.cluster_by(),
+                None,
+                batch,
+            );
+            self.run_sql(&load, "load", changes)?;
+            if let Some(rename) = build_rename_columns_sql(&staging_fqtn, &self.renames) {
+                self.run_sql(&rename, "load", changes)?;
+            }
+            self.api()?.copy_append(
+                &self.dataset,
+                &staging,
+                changes,
+                &self.labels("load", changes),
+            )?;
+        }
+        self.run_sql(&drop, "load", changes)
     }
 
     /// The CDC layout the load writes (see the field).
@@ -348,7 +395,7 @@ impl TargetLoader for BigQueryLoader {
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
         self.check_cluster_by()?;
         let target = self.fqtn(table);
-        let schema = build_schema(specs);
+        let schema = build_file_schema(specs, &self.renames);
 
         // ONE free path: declaring each column's native `target_type` inline in
         // LOAD DATA makes BigQuery coerce the Parquet on load — JSON, DATETIME,
@@ -359,11 +406,23 @@ impl TargetLoader for BigQueryLoader {
         let options = creation_options(existing.is_none(), self.partition.as_ref());
         let cluster = table_clustering(&self.clustering, existing.as_ref());
         check_cluster_columns(cluster)?;
+        if uris.is_empty() {
+            eprintln!("  note: the newest run exported 0 rows — `{target}` is emptied to match");
+            let sql = build_empty_table_sql(
+                &target,
+                existing.is_some(),
+                &build_schema(specs),
+                self.partition_expr(),
+                cluster,
+                options.as_deref(),
+            );
+            self.run_sql(&sql, "load", table)?;
+            return self.count_rows(table);
+        }
         let batches = self.batches(uris, self.partition.as_ref())?;
-        // One job (or nothing to pack) OVERWRITES the target directly; several go
-        // through staging below. A pattern, not a count compare: this body is
-        // live-only and its decisions are graded here by shape, not by mutation.
-        if matches!(batches.as_slice(), [] | [_]) {
+        // One job with nothing to rename OVERWRITES the target directly; anything else
+        // goes through staging below (`loads_directly`).
+        if loads_directly(&self.renames, &batches) {
             let sql = build_load_data_sql(
                 &target,
                 true,
@@ -418,6 +477,9 @@ impl TargetLoader for BigQueryLoader {
                     build_load_data_sql(&staging_fqtn, false, &schema, None, &[], None, batch);
                 self.run_sql(&sql, "load", table)?;
             }
+        }
+        if let Some(rename) = build_rename_columns_sql(&staging_fqtn, &self.renames) {
+            self.run_sql(&rename, "load", table)?;
         }
         self.run_sql(&build_clone_sql(&target, &staging_fqtn), "load", table)?;
         self.run_sql(&format!("DROP TABLE `{staging_fqtn}`;"), "load", table)?;
@@ -511,9 +573,14 @@ impl TargetLoader for BigQueryLoader {
                 crate::load::partition_budget::MAX_PARTITIONS_PER_JOB
             );
         }
-        for batch in &batches {
-            let load = build_load_data_sql(&changes_fqtn, false, &schema, None, &[], None, batch);
-            self.run_sql(&load, "load", &changes)?;
+        if self.renames.is_empty() {
+            for batch in &batches {
+                let load =
+                    build_load_data_sql(&changes_fqtn, false, &schema, None, &[], None, batch);
+                self.run_sql(&load, "load", &changes)?;
+            }
+        } else {
+            self.append_renamed(&changes, &full, &batches, log_partition_decl)?;
         }
         let after = self.count_rows(&changes)?;
         Ok(after.saturating_sub(before))
@@ -576,8 +643,9 @@ impl TargetLoader for BigQueryLoader {
         let mut recovered_jobs = 0usize;
         if crate::load::before_write(api.table_metadata(&self.dataset, &merging))?.is_some() {
             eprintln!(
-                "  note: `{merging_fqtn}` is left over from a compaction whose job did not \
-                 finish — merging it before this run's buffer"
+                "  note: `{merging_fqtn}` is left over from a compaction that did not complete \
+                 (its job died, or its MERGE failed — see that compact's error) — merging it \
+                 before this run's buffer"
             );
             let script = compact_script_sql(
                 &base,
@@ -833,14 +901,14 @@ pub(crate) fn partition_expr(
             let t = column_type(column)?;
             let g = granularity.as_sql();
             let expr = match (t.as_str(), granularity) {
-                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC({column}, {g})"),
-                ("DATETIME", _) => format!("DATETIME_TRUNC({column}, {g})"),
-                ("DATE", Granularity::Day) => column.clone(),
+                ("TIMESTAMP", _) => format!("TIMESTAMP_TRUNC(`{column}`, {g})"),
+                ("DATETIME", _) => format!("DATETIME_TRUNC(`{column}`, {g})"),
+                ("DATE", Granularity::Day) => format!("`{column}`"),
                 ("DATE", Granularity::Hour) => bail!(
                     "export `{export}`: `{column}` is a DATE, which has no hours — partition it \
                      by day, month or year"
                 ),
-                ("DATE", _) => format!("DATE_TRUNC({column}, {g})"),
+                ("DATE", _) => format!("DATE_TRUNC(`{column}`, {g})"),
                 _ => bail!(
                     "export `{export}`: cannot partition on `{column}` ({t}); BigQuery partitions \
                      a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`"
@@ -873,7 +941,7 @@ pub(crate) fn partition_expr(
                     end: *end,
                     interval: *interval,
                 },
-                format!("RANGE_BUCKET({column}, GENERATE_ARRAY({start}, {end}, {interval}))"),
+                format!("RANGE_BUCKET(`{column}`, GENERATE_ARRAY({start}, {end}, {interval}))"),
             )
         }
         PartitionForm::Ingestion(g) => {

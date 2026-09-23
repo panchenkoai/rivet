@@ -24,6 +24,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 // ── Axes (the matrix columns × the mode encoded in the scenario id) ──────────
@@ -54,10 +55,16 @@ pub enum Mode {
     Cdc,
 }
 
-const PG_CLIENT: &[&str] = &["psql", "-U", "rivet", "-d", "rivet_bench", "-tAc"];
-const MY_CLIENT: &[&str] = &["mysql", "-uroot", "-privet", "rivet_bench", "-N", "-e"];
-/// The BigQuery dataset every matrix load targets.
-const MATRIX_DATASET: &str = "rivet_matrix";
+#[path = "../common/registry.rs"]
+mod registry;
+use registry::{stand_bench_db, stand_bq_e2e, stand_container, stand_host_port};
+
+static PG_CLIENT: LazyLock<[&str; 6]> =
+    LazyLock::new(|| ["psql", "-U", "rivet", "-d", stand_bench_db(), "-tAc"]);
+static MY_CLIENT: LazyLock<[&str; 6]> =
+    LazyLock::new(|| ["mysql", "-uroot", "-privet", stand_bench_db(), "-N", "-e"]);
+static MY_SCHEMA_QUAL: LazyLock<String> =
+    LazyLock::new(|| format!("table_schema='{}' AND ", stand_bench_db()));
 
 /// The resolved `(engine, mode)` target — the single home for per-engine truth
 /// (batch vs the CDC-enabled instance, its container, seed flags, CDC config
@@ -87,9 +94,9 @@ impl Lane {
         match (engine, mode) {
             (Postgres, Batch) => Lane {
                 source_type: "postgres",
-                host_port: "127.0.0.1:5432",
-                container: "rivet-postgres-1",
-                client: PG_CLIENT,
+                host_port: stand_host_port("postgres"),
+                container: stand_container("postgres"),
+                client: &*PG_CLIENT,
                 seed_target: Some("postgres"),
                 seed_url_flag: "--pg-url",
                 cdc_field: "",
@@ -98,9 +105,9 @@ impl Lane {
             },
             (Postgres, Cdc) => Lane {
                 source_type: "postgres",
-                host_port: "127.0.0.1:5434",
-                container: "rivet-postgres-cdc-1",
-                client: PG_CLIENT,
+                host_port: stand_host_port("postgres_cdc"),
+                container: stand_container("postgres_cdc"),
+                client: &*PG_CLIENT,
                 seed_target: Some("postgres"),
                 seed_url_flag: "--pg-url",
                 cdc_field: "      slot: rivet_matrix_soak\n",
@@ -109,39 +116,31 @@ impl Lane {
             },
             (Mysql, Batch) => Lane {
                 source_type: "mysql",
-                host_port: "127.0.0.1:3306",
-                container: "rivet-mysql-1",
-                client: MY_CLIENT,
+                host_port: stand_host_port("mysql"),
+                container: stand_container("mysql"),
+                client: &*MY_CLIENT,
                 seed_target: Some("mysql"),
                 seed_url_flag: "--mysql-url",
                 cdc_field: "",
-                schema_qual: "table_schema='rivet_bench' AND ",
+                schema_qual: MY_SCHEMA_QUAL.as_str(),
                 sep: '\t',
             },
             (Mysql, Cdc) => Lane {
                 source_type: "mysql",
-                host_port: "127.0.0.1:3307",
-                container: "rivet-mysql-cdc-1",
-                client: MY_CLIENT,
+                host_port: stand_host_port("mysql_cdc"),
+                container: stand_container("mysql_cdc"),
+                client: &*MY_CLIENT,
                 seed_target: Some("mysql"),
                 seed_url_flag: "--mysql-url",
                 cdc_field: "      server_id: 47010\n",
-                schema_qual: "table_schema='rivet_bench' AND ",
+                schema_qual: MY_SCHEMA_QUAL.as_str(),
                 sep: '\t',
             },
             // Targeting is known; SQL-dialect + CDC fields fill in as these wire up.
             (Mssql, m) => Lane {
                 source_type: "mssql",
-                host_port: if m == Cdc {
-                    "127.0.0.1:1434"
-                } else {
-                    "127.0.0.1:1433"
-                },
-                container: if m == Cdc {
-                    "rivet-mssql-cdc-1"
-                } else {
-                    "rivet-mssql-1"
-                },
+                host_port: stand_host_port(if m == Cdc { "mssql_cdc" } else { "mssql" }),
+                container: stand_container(if m == Cdc { "mssql_cdc" } else { "mssql" }),
                 client: &[],
                 seed_target: Some("sqlserver"),
                 seed_url_flag: "--mssql-url",
@@ -151,16 +150,8 @@ impl Lane {
             },
             (Mongo, m) => Lane {
                 source_type: "mongo",
-                host_port: if m == Cdc {
-                    "127.0.0.1:27018"
-                } else {
-                    "127.0.0.1:27017"
-                },
-                container: if m == Cdc {
-                    "rivet-mongo-rs-1"
-                } else {
-                    "rivet-mongo-1"
-                },
+                host_port: stand_host_port(if m == Cdc { "mongo_rs" } else { "mongo" }),
+                container: stand_container(if m == Cdc { "mongo_rs" } else { "mongo" }),
                 client: &[],
                 seed_target: None,
                 seed_url_flag: "",
@@ -216,6 +207,10 @@ pub enum WarehouseOracle {
     DistinctId,
     /// Warehouse column type family == the resolved source semantic type.
     TypeFidelity,
+    /// Every value in the warehouse == the source, read by DuckDB on both sides
+    /// (`dev/release_oracle/value_diff.py`, the release gate's own comparer). Batch
+    /// BigQuery cells only: a CDC table holds history, not the source's current state.
+    Values,
     /// After a `cleanup_source` load, the GCS staging prefix holds NO objects —
     /// the cleanup side-effect (bucket wiped), not just that the data survived
     /// it. A cleanup that silently didn't run passes the data oracles but fails
@@ -553,7 +548,7 @@ impl Verification {
         let env = HarnessEnv::load()?;
         let work = TempWork::new("rivet-mongo-cdc")?;
         let coll = self.fixture.table.clone();
-        let db = "rivet_bench";
+        let db = stand_bench_db();
 
         // Fresh collection + two documents.
         self.mongosh(
@@ -638,7 +633,7 @@ impl Verification {
         let work = TempWork::new("rivet-mongo-batch")?;
         let coll = self.fixture.table.clone();
         let n = self.fixture.rows;
-        let db = "rivet_bench";
+        let db = stand_bench_db();
 
         // Fresh collection with N docs (PK `_id` 1..=N).
         self.mongosh(
@@ -845,10 +840,10 @@ impl Verification {
                  destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n\
                  load:\n  target: bigquery\n  project: {project}\n  dataset: {dataset}\n  \
                  pk: [id]\n  cleanup_source: true\n",
-                url = self.lane().url("rivet_bench"),
+                url = self.lane().url(stand_bench_db()),
                 bucket = env.gcs_bucket,
                 project = env.bq_project()?,
-                dataset = MATRIX_DATASET,
+                dataset = stand_bq_e2e(),
             ),
         );
         run(
@@ -911,7 +906,7 @@ impl Verification {
         match self.engine {
             Engine::Postgres | Engine::Mysql => self.seed_backfill_table(table, n),
             Engine::Mongo => self.mongosh(
-                "rivet_bench",
+                stand_bench_db(),
                 &format!(
                     "db.{table}.drop(); let d = []; \
                      for (let i = 1; i <= {n}; i++) d.push({{_id: i, v: 'orig-' + i}}); \
@@ -938,7 +933,7 @@ impl Verification {
                 Ok(())
             }
             Engine::Mongo => self.mongosh(
-                "rivet_bench",
+                stand_bench_db(),
                 &format!(
                     "db.{table}.insertOne({{_id: {}, v: 'brand-new'}}); \
                      db.{table}.updateOne({{_id: 1}}, {{$set: {{v: 'changed-after-snapshot'}}}}); \
@@ -1152,7 +1147,7 @@ impl Verification {
                 self.engine
             );
         };
-        let db = "rivet_bench";
+        let db = stand_bench_db();
         run(
             Command::new("cargo")
                 .current_dir(&env.oss_dir)
@@ -1241,7 +1236,7 @@ impl Verification {
     /// `database.schema.table`.
     fn warehouse_table_ref(&self, env: &HarnessEnv, table: &str) -> Result<String> {
         Ok(match self.warehouse {
-            Warehouse::BigQuery => format!("{}.{MATRIX_DATASET}.{table}", env.bq_project()?),
+            Warehouse::BigQuery => format!("{}.{}.{table}", env.bq_project()?, stand_bq_e2e()),
             Warehouse::Snowflake => {
                 let sf = env.sf()?;
                 format!("{}.{}.{}", sf.database, sf.schema, table)
@@ -1255,9 +1250,10 @@ impl Verification {
         let changes = format!("{table}__changes");
         let objects = match self.warehouse {
             Warehouse::BigQuery => bq_rows(&format!(
-                "SELECT table_name, table_type FROM `{}.{MATRIX_DATASET}`.INFORMATION_SCHEMA.TABLES \
+                "SELECT table_name, table_type FROM `{}.{}`.INFORMATION_SCHEMA.TABLES \
                  WHERE table_name IN ('{table}', '{changes}')",
-                env.bq_project()?
+                env.bq_project()?,
+                stand_bq_e2e()
             ))?,
             Warehouse::Snowflake => {
                 let sf = env.sf()?;
@@ -1395,6 +1391,7 @@ impl Verification {
                 }
                 Ok(OracleOutcome::Pass)
             }
+            WarehouseOracle::Values => self.values_match_source(wh_table),
             // StagingWiped inspects the GCS prefix, not the warehouse table, so the
             // runner dispatches it to `staging_wiped(&gcs_prefix)` directly (it holds
             // the prefix; `evaluate` does not). Reaching here means a runner forgot
@@ -1403,6 +1400,52 @@ impl Verification {
                 bail!("StagingWiped must be dispatched via staging_wiped(), not evaluate()")
             }
         }
+    }
+
+    /// Values of the loaded table against the source, through the gate's DuckDB comparer.
+    fn values_match_source(&self, wh_table: &str) -> Result<OracleOutcome> {
+        if self.warehouse != Warehouse::BigQuery || self.mode != Mode::Batch {
+            bail!(
+                "Values is a batch BigQuery oracle; declared on {:?} {:?}",
+                self.warehouse,
+                self.mode
+            );
+        }
+        let [project, dataset, table] = wh_table.split('.').collect::<Vec<_>>()[..] else {
+            bail!("Values: `{wh_table}` is not project.dataset.table");
+        };
+        let out = capture(
+            Command::new("uv")
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .env("BQ_ORACLE_PROJECT", project)
+                .env("BQ_ORACLE_DATASET", dataset)
+                .args([
+                    "run",
+                    "python",
+                    "-m",
+                    "dev.release_oracle.value_diff",
+                    "bigquery",
+                ])
+                .args([
+                    self.engine.source_type(),
+                    &self.url(stand_bench_db()),
+                    dataset,
+                ])
+                .args([self.fixture.table.as_str(), table]),
+            "value_diff bigquery",
+        )?;
+        let v: serde_json::Value = serde_json::from_str(out.lines().last().unwrap_or_default())
+            .with_context(|| format!("value_diff printed no JSON: {out}"))?;
+        let diffs = v["diffs"].as_array().cloned().unwrap_or_default();
+        Ok(match (v["rows"].as_i64(), diffs.is_empty()) {
+            (Some(0) | None, _) => OracleOutcome::Fail {
+                detail: format!("values: the warehouse read back no rows: {v}"),
+            },
+            (_, true) => OracleOutcome::Pass,
+            (_, false) => OracleOutcome::Fail {
+                detail: format!("values differ from the source: {diffs:?}"),
+            },
+        })
     }
 
     /// This verification's resolved [`Lane`] — the single home for targeting.
@@ -1556,7 +1599,7 @@ impl Verification {
             Warehouse::BigQuery => format!(
                 "load:\n  target: bigquery\n  project: {project}\n  dataset: {dataset}\n  cleanup_source: true\n",
                 project = env.bq_project()?,
-                dataset = MATRIX_DATASET,
+                dataset = stand_bq_e2e(),
             ),
             Warehouse::Snowflake => {
                 let sf = env.sf()?;
@@ -1627,7 +1670,7 @@ impl Verification {
              destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n\
              {load_block}",
             ty = lane.source_type,
-            url = lane.url("rivet_bench"),
+            url = lane.url(stand_bench_db()),
             mode = mode,
             cdc_fields = cdc_fields,
             bucket = env.gcs_bucket,

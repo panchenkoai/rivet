@@ -6,13 +6,12 @@ It automates the manual pre-release dogfood into one deterministic, repeatable
 run: every **engine** at every pinned **version** is brought up from a clean
 image, seeded from the canonical seed, and put through every **scenario** against
 the local object-store fakes (MinIO=S3, fake-gcs=GCS, Azurite=Azure), then a final
-**BigQuery** stage checked against a committed golden.
+**BigQuery** stage checked value by value against the source database.
 
 ```
 make release-oracle                 # full gate (local stage + BigQuery if creds set)
 python3 -m dev.release_oracle --no-cloud        # local stage only
 python3 -m dev.release_oracle --engines postgres,mysql
-python3 -m dev.release_oracle --bless-bigquery-golden   # re-capture the BQ golden (on purpose)
 ```
 
 ## What it checks (per engine × version)
@@ -20,8 +19,8 @@ python3 -m dev.release_oracle --bless-bigquery-golden   # re-capture the BQ gold
 | scenario | asserts |
 |---|---|
 | **verdicts** | `init` picks the right strategy for **every seed AND garbage table** (both, per engine), checked against a committed golden (`golden/verdicts.json`): clean-PK seeds → **keyset**, `orders_sparse` → full, garbage `decimal_key` → full-bail, `ref_id_history` → range (non-unique), `unindexed_id` → **not** keyset (name-trap), `bigint_pk` → keyset; **zero** phantom heavy-chunk warnings. PG/MSSQL garbage lives in schema `ext` (a second init); MySQL in the same DB. Mongo → full. |
-| **integrity+types** | (1) users 150K loss/dup: source count+distinct == DuckDB read of the parts. (2) a per-engine DuckDB **golden** (`golden/duckdb_type_matrix.json`) with **two fidelity arguments per type matrix**: `<tmt>` = PARQUET readback (binary/typed — decimal, uuid, timestamp, enum) and `<tmt>__csv` = CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null; an array column CSV can't represent records a *refusal* sentinel, itself the guarantee of no silent lossy array→CSV). Both read by DuckDB, never rivet. |
-| **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source. A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
+| **integrity+types** | (1) users 150K loss/dup: source count+distinct == DuckDB read of the parts. (2) `<tmt>` = the PARQUET readback compared **value by value to the source table** in one DuckDB session (`value_diff.compare_rows_to_parquet` — decimal, uuid, timestamp, enum, arrays, float4; no golden) and `<tmt>__csv` = a per-engine DuckDB **golden** (`golden/duckdb_type_matrix.json`) of the CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null; an array column CSV can't represent records a *refusal* sentinel, itself the guarantee of no silent lossy array→CSV). Both read by DuckDB, never rivet. |
+| **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source, then one DuckDB session attaches the source and compares **every value** of the declared parts (`value_diff.compare_to_parquet`; Mongo's `document` JSON is unpacked into the source's columns). A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
 | **gc_survival** | the concurrent-extract bucket-erasure guard (spare an in-flight part while a run is active, delete a true orphan). Runs in the BigQuery stage (needs a warehouse load target). |
 
 ## CDC end-to-end stage (all engines, independent oracle)
@@ -86,7 +85,7 @@ verdict.
 RIVET_PREV_RELEASE_BIN      /path/to/DOWNLOADED release binary   # REQUIRED for a release run: regression + differential + field replay (absent ⇒ FAIL, not SKIP); also the scale baseline
 RIVET_REGRESSION_SOURCE_URL postgresql://…                       # a PG the cell may seed regr_probe into
 RIVET_SCALE_<ENGINE>_URL    …                                    # batch-tier DBs, per engine
-BQ_ORACLE_PROJECT           …                                    # BigQuery golden stage
+BQ_ORACLE_PROJECT           …                                    # BigQuery stage
 BQ_ORACLE_DATASET           …                                    # one dataset PER SOURCE is derived from this
 ```
 
@@ -274,16 +273,22 @@ RED-proven: corrupting a part the prev release wrote reddens the format check (c
 `validate` no longer PASSES); a genuinely slower binary (a debug build, ~1.5×) reddens
 the perf check below its slowdown.
 
-## Final stage — BigQuery golden
+## Final stage — BigQuery
 
 The only non-emulator stage, and the load goes through rivet on BOTH legs:
 `rivet run` stages the type-matrix parts to a **real GCS bucket** → `rivet load`
-loads them GCS→BigQuery → `bq query` (gcloud, an INDEPENDENT reader) reads them
-back → **every column value is compared to `golden/bigquery_type_matrix.json`**,
-the blessed warehouse-side representation of a full rivet→Parquet→BigQuery
-round-trip of all types. That golden makes the stage **deterministic**: a diff
-means rivet's type export or BigQuery's Parquet mapping changed, and the release
-stops until the golden is re-blessed on purpose.
+loads them GCS→BigQuery → one DuckDB session attaches the **source database** and
+BigQuery (community `bigquery` extension) and **compares every column value**
+(`dev/release_oracle/value_diff.py`). The expected value is the source, never a
+golden blessed from rivet's output — that golden froze rivet's own
+UUID-as-unreadable-STRING as "expected" from 0.22 to 0.27. A STRING column holding
+non-UTF-8 bytes fails before any value is compared.
+
+The **chain** cell then counts the same run at every point it passes through, in one DuckDB
+session (`value_diff.chain_census`): the source, the Success manifests, the Parquet **footers** of
+the declared parts in real GCS (httpfs, bearer token from `gcloud auth print-access-token`), rivet's
+ledger (`export_metrics`, `file_log`, `load_run`) and BigQuery. All seven counts must be equal, the
+manifests must name one run, and the bucket must hold exactly the declared parts.
 
 Set `BQ_ORACLE_PROJECT` + `BQ_ORACLE_DATASET` (with ADC) to run it. Absent creds →
 the stage is **SKIP**, never a silent pass — but a real release build must run it
@@ -309,20 +314,19 @@ python3 -m dev.release_oracle  # the driver (orchestration loop); --bless-local 
 lib/cfg.py               # matrix query interface (dependency-free — no PyYAML)
 dev/release_oracle/scenarios.py         # the scenario implementations (verdicts / integrity_types / load / gc)
 dev/release_oracle/regression.py        # the three previous-release stages (format+perf, differential, field replay)
-dev/release_oracle/bigquery.py          # the BigQuery golden stage (rivet run → GCS, rivet load → BQ, bq query)
+dev/release_oracle/bigquery.py          # the BigQuery stage (rivet run → GCS, rivet load → BQ)
+dev/release_oracle/value_diff.py        # source vs warehouse, value by value, through DuckDB
 dev/pytools/ab_regression.py            # the differential harness the gate drives (also runnable standalone)
 dev/pytools/field_replay.py             # the field-symptom replay harness (four criteria, fixed in the file)
 lib/parse_verdicts.py    # parse `rivet check` → {table: {strategy, verdict}}
 lib/gcs_pull.py          # independent fake-gcs readback (no gsutil needed)
 lib/normalize_bq.py      # canonicalize a read-back for the golden diff
 golden/verdicts.json               # blessed strategy+verdict of every seed+garbage table per engine
-golden/duckdb_type_matrix.json     # blessed per-engine type + CSV-fidelity round-trip (local oracle)
-golden/bigquery_type_matrix.json   # blessed BQ round-trip of the type-matrix (final stage)
+golden/duckdb_type_matrix.json     # blessed per-engine CSV-fidelity round-trip (local oracle)
 ```
 
 Re-bless the local goldens (verdicts + DuckDB type/fidelity) on purpose with
-`python3 -m dev.release_oracle --bless-local`; the BQ golden with
-`python3 -m dev.release_oracle --bless-bigquery-golden`.
+`python3 -m dev.release_oracle --bless-local`.
 
 Requires: docker, the `rivet` release binary, `duckdb`, `python3` (stdlib only),
 and — for the final stage — `bq` + ADC + a real GCS staging bucket

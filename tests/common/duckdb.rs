@@ -603,6 +603,10 @@ pub struct RowCensus {
     /// paid for that once (751 rows / 750 distinct on a keyset retry).
     pub source_distinct: Option<i64>,
     pub delivered_distinct: Option<i64>,
+    /// Rows whose VALUES differ, both directions, when a key is given — source cast to the parquet's type.
+    pub value_mismatches: Option<i64>,
+    /// Source columns the delivered parquet does not carry at all.
+    pub missing_columns: Vec<String>,
 }
 
 impl RowCensus {
@@ -620,7 +624,10 @@ impl RowCensus {
             (Some(sd), Some(dd)) => sd == self.source && dd == self.delivered && sd == dd,
             _ => true,
         };
-        counts && no_dupes
+        counts
+            && no_dupes
+            && self.value_mismatches.is_none_or(|n| n == 0)
+            && self.missing_columns.is_empty()
     }
 }
 
@@ -696,6 +703,14 @@ pub fn duckdb_row_census(
         load = engine.load_sql(),
     );
     let v = duckdb_run_sql_json(&sql);
+    let (value_mismatches, missing_columns) = match key {
+        Some(_) => {
+            let prelude = format!("{} {attach}", engine.load_sql());
+            let (n, missing) = value_leg(&prelude, &from, dest_glob);
+            (Some(n), missing)
+        }
+        None => (None, Vec::new()),
+    };
     assert!(
         !v["rows"].as_array().is_none_or(Vec::is_empty),
         "the census query returned nothing. If the error mentions a 404 for `{}`, \
@@ -720,7 +735,61 @@ pub fn duckdb_row_census(
         manifest: n(4),
         source_distinct: opt(5),
         delivered_distinct: opt(6),
+        value_mismatches,
+        missing_columns,
     }
+}
+
+/// (differing rows both ways, source columns absent at the destination) — a strict CAST, never TRY_CAST, so an uncastable value fails loud instead of reading as NULL.
+fn value_leg(prelude: &str, from: &str, dest_glob: &str) -> (i64, Vec<String>) {
+    let describe = |rel: &str| -> Vec<(String, String)> {
+        let v = duckdb_run_sql_json(&format!("{prelude} DESCRIBE SELECT * FROM {rel}"));
+        v["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                (
+                    r[0].as_str().unwrap_or_default().to_string(),
+                    r[1].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let dest = format!("read_parquet('{dest_glob}')");
+    let src_cols = describe(from);
+    let dst_cols = describe(&dest);
+    assert!(
+        !src_cols.is_empty() && !dst_cols.is_empty(),
+        "value leg could not describe both sides: source {src_cols:?}, destination {dst_cols:?}"
+    );
+    let (mut shared, mut missing) = (Vec::new(), Vec::new());
+    for (name, _) in &src_cols {
+        match dst_cols.iter().find(|(d, _)| d == name) {
+            Some((_, ty)) => shared.push((name.clone(), ty.clone())),
+            None => missing.push(name.clone()),
+        }
+    }
+    let s_proj = shared
+        .iter()
+        .map(|(c, t)| format!("CAST(\"{c}\" AS {t}) AS \"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let d_proj = shared
+        .iter()
+        .map(|(c, _)| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let v = duckdb_run_sql_json(&format!(
+        "{prelude} WITH s AS (SELECT {s_proj} FROM {from}), d AS (SELECT {d_proj} FROM {dest}) \
+         SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT ALL SELECT * FROM d)) + \
+                (SELECT count(*) FROM (SELECT * FROM d EXCEPT ALL SELECT * FROM s))"
+    ));
+    let n = v["rows"][0][0]
+        .as_str()
+        .and_then(|x| x.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("value leg returned no count: {v}"));
+    (n, missing)
 }
 
 /// SQL that lets the oracle read a BUCKET EMULATOR directly — MinIO today, and any

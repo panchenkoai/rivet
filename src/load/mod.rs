@@ -572,12 +572,57 @@ fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Owners
 /// without quoting: `[A-Za-z_][A-Za-z0-9_]*`. Round-5: column names are
 /// SOURCE-derived and spliced raw into executed warehouse SQL (build_schema,
 /// build_copy_select, …), so a name outside this set is an injection vector.
-fn is_safe_load_ident(s: &str) -> bool {
+pub(crate) fn is_safe_load_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The Latin letter a Cyrillic letter is drawn identically to, if any.
+fn latin_lookalike(c: char) -> Option<char> {
+    Some(match c {
+        'а' => 'a',
+        'е' => 'e',
+        'о' => 'o',
+        'р' => 'p',
+        'с' => 'c',
+        'у' => 'y',
+        'х' => 'x',
+        'і' => 'i',
+        'ј' => 'j',
+        'ѕ' => 's',
+        'ԁ' => 'd',
+        'һ' => 'h',
+        'А' => 'A',
+        'В' => 'B',
+        'Е' => 'E',
+        'К' => 'K',
+        'М' => 'M',
+        'Н' => 'H',
+        'О' => 'O',
+        'Р' => 'P',
+        'С' => 'C',
+        'Т' => 'T',
+        'Х' => 'X',
+        'І' => 'I',
+        'Ј' => 'J',
+        'Ѕ' => 'S',
+        _ => return None,
+    })
+}
+
+/// The plain identifier `name` becomes with its Cyrillic look-alikes made Latin; `None` when it needs no fold or no fold makes it plain.
+pub(crate) fn latin_fold(name: &str) -> Option<String> {
+    if is_safe_load_ident(name) {
+        return None;
+    }
+    let folded: String = name
+        .chars()
+        .map(|c| latin_lookalike(c).unwrap_or(c))
+        .collect();
+    is_safe_load_ident(&folded).then_some(folded)
 }
 
 /// Refuse any Parquet URI that can't be splice-safely single-quoted into the
@@ -642,7 +687,8 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
             bail!(
                 "cannot load `{table}`: column name `{}` is not a plain SQL identifier \
                  ([A-Za-z_][A-Za-z0-9_]*) — the warehouse loader splices it into DDL/COPY. \
-                 Rename or alias the column in the export query.",
+                 Rename the column in the source, or alias it in the export's `query:` \
+                 (a CDC export has no query to alias it in).",
                 s.column_name.escape_default()
             );
         }
@@ -700,7 +746,14 @@ pub fn run_load(
     cleanup: Option<(&GcsStore, &str)>,
     ownership: Ownership,
 ) -> Result<LoadReport> {
-    before_write(whole_table_preflight(loader, table, specs, uris, ownership))?;
+    before_write(whole_table_preflight(
+        loader,
+        table,
+        specs,
+        uris,
+        expected_rows,
+        ownership,
+    ))?;
 
     let rows_loaded = loader.materialize(table, specs, uris)?;
 
@@ -728,10 +781,16 @@ fn whole_table_preflight(
     table: &str,
     specs: &[TargetColumnSpec],
     uris: &[String],
+    expected_rows: Option<u64>,
     ownership: Ownership,
 ) -> Result<()> {
-    if uris.is_empty() {
-        bail!("no Parquet URIs to load into `{table}`");
+    if uris.is_empty() && expected_rows != Some(0) {
+        bail!(
+            "no Parquet files to load into `{table}`, though its runs declare {} row(s) — \
+             refusing rather than emptying the table. The staged parts are gone (a bucket \
+             lifecycle rule or a manual cleanup?): re-run the export, then load.",
+            expected_rows.map_or_else(|| "an unknown number of".to_string(), |n| n.to_string())
+        );
     }
     ensure_safe_load_uris(uris)?;
     validate_specs(table, specs)?;
@@ -1158,7 +1217,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
                 run_id,
             )
             .batched_by_footers(plan.destination.clone())
-            .layout(plan.layout),
+            .layout(plan.layout)
+            .renamed(plan.renames.clone()),
         ),
         LoadTarget::Snowflake {
             connection,
@@ -1209,6 +1269,19 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_name_that_is_plain_once_its_cyrillic_lookalikes_are_latin_folds() {
+        assert_eq!(latin_fold("\u{441}omment").as_deref(), Some("comment"));
+        assert_eq!(latin_fold("\u{421}\u{410}\u{422}").as_deref(), Some("CAT"));
+        assert_eq!(latin_fold("comment"), None, "a plain name needs no fold");
+        assert_eq!(
+            latin_fold("\u{438}\u{43c}\u{44f}"),
+            None,
+            "a Cyrillic word is not a look-alike"
+        );
+        assert_eq!(latin_fold("\u{441}omment x"), None, "a fold must end plain");
+    }
     use std::cell::RefCell;
 
     /// Records every call and returns a canned row count — the seam the driver's
@@ -1987,25 +2060,63 @@ pub(crate) mod tests {
     const PREFIX: &str = "gs://b/p";
     const REL: &str = "p";
 
+    /// Runs that declare rows but whose files are gone must never empty the table.
     #[test]
-    fn empty_uris_bail_before_materialize() {
-        let f = FakeLoader {
-            rows: 10,
-            ..Default::default()
-        };
-        assert!(
-            run_load(
+    fn missing_files_for_declared_rows_refuse_before_any_write() {
+        for expected in [Some(50), None] {
+            let f = FakeLoader::default();
+            let err = run_load(
                 &f,
                 "t",
                 &spec(TargetStatus::Ok),
                 &[],
-                Some(10),
+                expected,
+                None,
+                Ownership::Own,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("refusing rather than emptying the table"),
+                "{err}"
+            );
+            assert!(f.materialized.borrow().is_empty(), "nothing may be written");
+        }
+    }
+
+    /// A full load whose newest run exported nothing hands the loader an empty file list,
+    /// and the count gate still holds the table to the run's own total.
+    #[test]
+    fn an_empty_file_list_reaches_the_loader_and_the_count_gate_still_applies() {
+        let empty = FakeLoader::default();
+        run_load(
+            &empty,
+            "t",
+            &spec(TargetStatus::Ok),
+            &[],
+            Some(0),
+            None,
+            Ownership::Own,
+        )
+        .expect("an empty newest run empties the table");
+        assert_eq!(*empty.materialized.borrow(), ["t"]);
+        let stale = FakeLoader {
+            rows: 3,
+            ..Default::default()
+        };
+        assert!(
+            run_load(
+                &stale,
+                "t",
+                &spec(TargetStatus::Ok),
+                &[],
+                Some(0),
                 None,
                 Ownership::Own
             )
-            .is_err()
+            .is_err(),
+            "a table left holding rows the run says are gone fails the gate"
         );
-        assert!(f.materialized.borrow().is_empty());
     }
 
     #[test]

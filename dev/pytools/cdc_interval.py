@@ -96,9 +96,11 @@ from typing import Callable
 
 if __package__:
     from . import shell
+    from .duckcli import ARGV as DUCKDB
 else:  # executed as a plain script: `python3 dev/pytools/cdc_interval.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import shell  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 # ── the ten-table heat spectrum ────────────────────────────────────────────────
 # The point of the spectrum is that ONE stream with ONE checkpoint has to serve
@@ -420,7 +422,7 @@ def duckdb_csv(sql: str, *, log: Log | None) -> str:
     count and reported as a data mismatch. Same value, but now the duckdb error
     is announced instead of only appended to the progress log.
     """
-    p = shell.run(["duckdb", "-noheader", "-csv", "-c", sql], timeout=None)
+    p = shell.run([*DUCKDB, "-noheader", "-csv", "-c", sql], timeout=None)
     if log is not None:
         log.append_raw(p.stderr)
     if not p.ok:

@@ -42,6 +42,7 @@ fn warehouse_cell_heavy_content_batch_pg() {
             WarehouseOracle::DistinctId,
             WarehouseOracle::NullProfile,
             WarehouseOracle::TypeFidelity,
+            WarehouseOracle::Values,
         ])
         .expect("pipeline"),
     );
@@ -96,6 +97,7 @@ fn warehouse_cell_smoke_batch_mysql() {
             WarehouseOracle::DistinctId,
             WarehouseOracle::NullProfile,
             WarehouseOracle::TypeFidelity,
+            WarehouseOracle::Values,
             // The cleanup side-effect: this cell loads with cleanup_source: true,
             // so the staging bucket must be empty afterward.
             WarehouseOracle::StagingWiped,

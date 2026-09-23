@@ -10,11 +10,12 @@ pub struct BqLive {
     pub dataset: String,
     pub bucket: String,
     pub prefix: String,
+    /// The test created `dataset`, so dropping this drops it (with the GCS prefix).
+    pub owned: bool,
 }
 
 impl BqLive {
-    /// `BIGQUERY_TEST_PROJECT` + `RIVET_TEST_GCS_BUCKET` (+ `RIVET_TEST_BQ_DATASET`, default
-    /// `rivet_e2e`), or `None` with a skip note.
+    /// `BIGQUERY_TEST_PROJECT` + `RIVET_TEST_GCS_BUCKET`, or `None` with a skip note; the dataset is this test's own disposable one unless `RIVET_TEST_BQ_DATASET` names a shared one.
     pub fn from_env(label: &str) -> Option<Self> {
         let (Ok(project), Ok(bucket)) = (
             std::env::var("BIGQUERY_TEST_PROJECT"),
@@ -25,11 +26,40 @@ impl BqLive {
             ));
             return None;
         };
+        let unique = super::unique_name(label);
+        let (dataset, owned) = match std::env::var("RIVET_TEST_BQ_DATASET") {
+            Ok(shared) => (shared, false),
+            Err(_) => {
+                let safe: String = unique
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let dataset = super::registry::stand_bq_tmp(&safe);
+                let out = Command::new("timeout")
+                    .args(["120", "bq"])
+                    .arg(format!("--project_id={project}"))
+                    .arg(format!(
+                        "--location={}",
+                        super::registry::stand_bq_location()
+                    ))
+                    .args(["mk", "-f", "--dataset"])
+                    .arg(format!("{project}:{dataset}"))
+                    .output()
+                    .expect("`bq mk` must run");
+                assert!(
+                    out.status.success(),
+                    "bq mk {dataset}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                (dataset, true)
+            }
+        };
         Some(Self {
             project,
-            dataset: std::env::var("RIVET_TEST_BQ_DATASET").unwrap_or_else(|_| "rivet_e2e".into()),
+            dataset,
             bucket,
-            prefix: format!("rivet-live/{}", super::unique_name(label)),
+            prefix: format!("rivet-live/{unique}"),
+            owned,
         })
     }
 
@@ -236,6 +266,24 @@ impl BqLive {
             tables: tables.iter().map(|t| t.to_string()).collect(),
             gcs: format!("gs://{}/{}/**", self.bucket, self.prefix),
         }
+    }
+}
+
+impl Drop for BqLive {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        let _ = Command::new("timeout")
+            .args(["120", "bq"])
+            .arg(format!("--project_id={}", self.project))
+            .args(["rm", "-r", "-f", "--dataset"])
+            .arg(format!("{}:{}", self.project, self.dataset))
+            .output();
+        let _ = Command::new("timeout")
+            .args(["300", "gcloud", "storage", "rm", "-r", "--quiet"])
+            .arg(format!("gs://{}/{}/**", self.bucket, self.prefix))
+            .output();
     }
 }
 

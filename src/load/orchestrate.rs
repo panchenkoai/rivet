@@ -131,16 +131,15 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // paid for, where the re-baseline guard note-and-proceeds a doomed post-gap
         // baseline on the very host whose ledger just blipped.
         || match state_ref.as_ref() {
-            None => (None, ledger_errored),
+            None => Some((None, ledger_errored)),
             Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => (Some(s), ledger_errored),
+                Ok(s) => Some((Some(s), ledger_errored)),
                 Err(e) => {
                     eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); \
-                         its table is REFUSED below — the run started WITH a ledger, \
-                         so this worker may not load unleased and unrecorded"
+                        "  warning: state store unavailable to this worker ({e:#}); it takes \
+                         no table — the other workers load the queue"
                     );
-                    (None, true)
+                    None
                 }
             },
         },
@@ -283,9 +282,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // to report a bug in a table where nothing had run at all.
         |plan| {
             anyhow::anyhow!(
-                "load '{}' did not complete — it PANICKED, or no worker was left to \
-                 take it. Reported as this table's failure so every other table still \
-                 aggregates; either cause is a bug, please report it",
+                "load '{}' did not complete — it PANICKED (a bug, please report it), or \
+                 no worker was left to take it (each one panicked or could not reopen the \
+                 state ledger — see the warnings above). Reported as this table's failure \
+                 so every other table still aggregates",
                 plan.table
             )
         },
@@ -324,6 +324,7 @@ fn pin_plan_to_its_run(
     cfg: &crate::config::Config,
     op: &str,
 ) -> Result<load::plan::LoadPlan> {
+    plan.refused()?;
     // The by-name plan was built with its fit DEFERRED (`SpecFit::Deferred`), so
     // a path that keeps it owes the strict check the pin would have done.
     let unpinned = |why: &str| {
@@ -402,6 +403,24 @@ fn pin_plan_to_its_run(
     if let Some(note) = skipped_runs_note(&plan.table, &run_id, &skipped) {
         eprintln!("{note}");
     }
+    let pinned_names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
+    let loaded = s
+        .loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table))
+        .unwrap_or_default();
+    let mut respelled: Vec<(String, String, String)> = Vec::new();
+    for older in runs_loaded_with_the_pin(op, plan.mode, &newest_first, &run_id, &loaded) {
+        if let Ok(Some(o)) =
+            s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), older)
+        {
+            let names: Vec<&str> = o.columns.iter().map(|c| c.name.as_str()).collect();
+            for (was, now) in load::plan::lookalike_spelling_changes(&pinned_names, &names) {
+                respelled.push((older.to_string(), was, now));
+            }
+        }
+    }
+    if let Some(refusal) = respelled_refusal(&plan.table, &run_id, &respelled) {
+        anyhow::bail!("{refusal}");
+    }
     let Some(target) = crate::types::target::ExportTarget::parse(plan.load.target.name()) else {
         return unpinned("unknown load target");
     };
@@ -415,6 +434,7 @@ fn pin_plan_to_its_run(
             plan.table, plan.export_name
         )
     })?;
+    retyped.refused()?;
     retyped.pinned_run = Some((run_id, finished_at));
     Ok(retyped)
 }
@@ -441,6 +461,82 @@ fn late_runs_refusal(
             late.join(", ")
         )
     })
+}
+
+/// The typo warning for a prefix with no manifests — unless the ledger says runs were loaded from it, which `cleanup_source` then emptied.
+fn empty_prefix_note(
+    table: &str,
+    prefix: &str,
+    empty: bool,
+    loaded: &std::collections::HashSet<String>,
+) -> Option<String> {
+    (empty && loaded.is_empty()).then(|| {
+        format!(
+            "  load [{table}]: found NO manifests under {prefix} — nothing was ever staged \
+             here. If an export should have landed, check the prefix for typos \
+             (a wrong prefix reads as permanently 'up to date')."
+        )
+    })
+}
+
+/// Whether a load whose runs resolve to no files is a no-op: yes for an append (nothing changed), never for a full load, whose newest run says the table is now empty.
+fn nothing_to_load(mode: load::plan::LoadMode, no_files: bool) -> bool {
+    no_files && mode != load::plan::LoadMode::Full
+}
+
+/// The runs listed after `pinned` in a newest-first listing; none when it is absent.
+fn runs_older_than<'a>(
+    newest_first: &'a [(String, String)],
+    pinned: &str,
+) -> &'a [(String, String)] {
+    let start = newest_first
+        .iter()
+        .position(|(_, id)| id == pinned)
+        .map_or(newest_first.len(), |i| i + 1);
+    &newest_first[start..]
+}
+
+/// The older runs this load will read alongside the pinned one: none for a compact (it reads only the landed buffer) or a full load (only the newest run), and never one already loaded.
+fn runs_loaded_with_the_pin<'a>(
+    op: &str,
+    mode: load::plan::LoadMode,
+    newest_first: &'a [(String, String)],
+    pinned: &str,
+    loaded: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
+    if op == "compact" || mode == load::plan::LoadMode::Full {
+        return Vec::new();
+    }
+    runs_older_than(newest_first, pinned)
+        .iter()
+        .map(|(_, id)| id.as_str())
+        .filter(|id| !loaded.contains(*id))
+        .collect()
+}
+
+/// The refusal for pending runs that spell a column differently from the run the load is typed from; `None` when none do.
+fn respelled_refusal(
+    table: &str,
+    pinned: &str,
+    respelled: &[(String, String, String)],
+) -> Option<String> {
+    if respelled.is_empty() {
+        return None;
+    }
+    let list = respelled
+        .iter()
+        .map(|(run, was, now)| format!("run {run} wrote `{was}` where run {pinned} writes `{now}`"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "load [{table}]: {list}. The source column was renamed while the older run(s) were \
+         still unloaded, and one load cannot read both spellings: BigQuery matches Parquet \
+         columns by name, so the older files would load that column as NULL. Nothing was \
+         loaded and nothing is lost — every run stays staged. rivet cannot load the two \
+         spellings in one pass yet. To clear it by hand: load the older run(s)' files into a \
+         scratch table declaring the column under its OLD spelling, rename it there, append \
+         those rows to the warehouse table, and only then delete those runs' manifest(s)."
+    ))
 }
 
 /// The refusal when another `rivet load` or `rivet compact` holds the table's lease —
@@ -918,14 +1014,6 @@ fn prepare_load(
     // for BOTH "all runs consumed" and "this prefix holds NOTHING" — and the
     // second is what a typo'd/mis-encoded prefix produces, forever, exit 0.
     // Say the empty-prefix truth before the optimistic line.
-    if keyed.is_empty() {
-        eprintln!(
-            "  load [{}]: found NO manifests under {} — nothing was ever staged \
-             here. If an export should have landed, check the prefix for typos \
-             (a wrong prefix reads as permanently 'up to date').",
-            plan.table, plan.gcs_prefix
-        );
-    }
     // Refuse a prefix shared by two exports BEFORE selecting/summing/cleaning:
     // the load sums every manifest here and cleanup wipes the prefix recursively,
     // so a shared base prefix would cross-contaminate the count and delete a
@@ -963,6 +1051,10 @@ fn prepare_load(
         },
         None => std::collections::HashSet::new(),
     };
+    if let Some(note) = empty_prefix_note(&plan.table, &plan.gcs_prefix, keyed.is_empty(), &loaded)
+    {
+        eprintln!("{note}");
+    }
     // Counted BEFORE `select_runs` takes `keyed` by value: when the selection comes
     // back empty, this is the only thing that can say WHY. `Ok(None)` is overloaded
     // across four states — every run consumed, a prefix holding nothing (said
@@ -1030,14 +1122,16 @@ fn prepare_load(
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
     // Best-effort column-drift check (only manifests with Form B record
     // column names — a checksum-less prefix yields no notes, silently-honest).
-    let spec_names: Vec<String> = plan.specs.iter().map(|s| s.column_name.clone()).collect();
-    for note in spec_manifest_column_drift(&spec_names, &manifests) {
+    for warning in &plan.rename_warnings {
+        eprintln!("{warning}");
+    }
+    for note in spec_manifest_column_drift(&plan.file_column_names(), &manifests) {
         eprintln!("{note}");
     }
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
     let source_run_ids: Vec<String> = new.iter().map(|(_, m)| m.run_id.clone()).collect();
-    if uris.is_empty() {
+    if nothing_to_load(plan.mode, uris.is_empty()) {
         // Unloaded manifests that resolve to NO files: runs that legitimately
         // produced nothing (a CDC cycle with no changes, the anchor cycle of
         // `initial: snapshot`). That is "up to date", not an error — the loader
@@ -1749,13 +1843,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
         || match state_ref.as_ref() {
-            None => None,
+            None => Some(None),
             Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => Some(s),
+                Ok(s) => Some(Some(s)),
                 Err(e) => {
                     eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); \
-                         its table is REFUSED below unless this run would skip it anyway"
+                        "  warning: state store unavailable to this worker ({e:#}); it takes \
+                         no table — the other workers compact the queue"
                     );
                     None
                 }
@@ -1891,9 +1985,10 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         },
         |plan| {
             anyhow::anyhow!(
-                "compact '{}' did not complete — it PANICKED, or no worker was left to \
-                 take it. Reported as this table's failure so every other table still \
-                 aggregates; either cause is a bug, please report it",
+                "compact '{}' did not complete — it PANICKED (a bug, please report it), or \
+                 no worker was left to take it (each one panicked or could not reopen the \
+                 state ledger — see the warnings above). Reported as this table's failure \
+                 so every other table still aggregates",
                 plan.table
             )
         },
@@ -1907,7 +2002,9 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             failures.push(e);
         }
     }
-    let attempted = attempted.load(std::sync::atomic::Ordering::Relaxed);
+    let attempted = attempted
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(failures.len());
     match failures.len() {
         0 => Ok(()),
         1 => Err(failures.pop().unwrap()),
@@ -2767,6 +2864,9 @@ mod load_ledger_tests {
         use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
         let plan = LoadPlan {
             deleted_flag: false,
+            renames: Vec::new(),
+            rename_warnings: Vec::new(),
+            refusal: None,
             export_name: "c1".into(),
             unit: None,
             table: "content_items".into(),
@@ -2969,6 +3069,9 @@ mod load_ledger_tests {
         let state = StateStore::open_in_memory().unwrap();
         let plan = LoadPlan {
             deleted_flag: false,
+            renames: Vec::new(),
+            rename_warnings: Vec::new(),
+            refusal: None,
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),
@@ -3520,6 +3623,113 @@ mod live_only_decisions {
     }
 
     #[test]
+    fn only_the_runs_older_than_the_pin_are_compared() {
+        let runs: Vec<(String, String)> = ["r3", "r2", "r1"]
+            .iter()
+            .map(|r| (String::new(), r.to_string()))
+            .collect();
+        let ids = |v: &[(String, String)]| v.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(super::runs_older_than(&runs, "r2")), ["r1"]);
+        assert_eq!(ids(super::runs_older_than(&runs, "r3")), ["r2", "r1"]);
+        assert!(super::runs_older_than(&runs, "r1").is_empty());
+        assert!(super::runs_older_than(&runs, "gone").is_empty());
+    }
+
+    #[test]
+    fn an_empty_prefix_is_a_typo_warning_only_when_nothing_was_ever_loaded_from_it() {
+        let none = std::collections::HashSet::new();
+        let loaded: std::collections::HashSet<String> = ["r1".to_string()].into();
+        assert!(
+            super::empty_prefix_note("t", "gs://b/p/", true, &none)
+                .is_some_and(|n| n.contains("check the prefix for typos"))
+        );
+        assert_eq!(
+            super::empty_prefix_note("t", "gs://b/p/", true, &loaded),
+            None,
+            "loaded then cleaned by cleanup_source is not a typo"
+        );
+        assert_eq!(
+            super::empty_prefix_note("t", "gs://b/p/", false, &none),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_newest_run_empties_a_full_load_and_is_a_no_op_for_an_append() {
+        use load::plan::LoadMode;
+        assert!(
+            !super::nothing_to_load(LoadMode::Full, true),
+            "the table is now empty"
+        );
+        assert!(super::nothing_to_load(LoadMode::Incremental, true));
+        assert!(super::nothing_to_load(LoadMode::Cdc, true));
+        assert!(!super::nothing_to_load(LoadMode::Cdc, false));
+    }
+
+    #[test]
+    fn only_unloaded_runs_of_an_append_load_are_compared_with_the_pin() {
+        use load::plan::LoadMode;
+        let runs: Vec<(String, String)> = ["r3", "r2", "r1"]
+            .iter()
+            .map(|r| (String::new(), r.to_string()))
+            .collect();
+        let loaded: std::collections::HashSet<String> = ["r1".to_string()].into();
+        assert_eq!(
+            super::runs_loaded_with_the_pin("load", LoadMode::Incremental, &runs, "r3", &loaded),
+            ["r2"],
+            "r1 already landed: its spelling cannot load NULL any more"
+        );
+        assert_eq!(
+            super::runs_loaded_with_the_pin(
+                "load",
+                LoadMode::Cdc,
+                &runs,
+                "r3",
+                &Default::default()
+            ),
+            ["r2", "r1"]
+        );
+        assert!(
+            super::runs_loaded_with_the_pin(
+                "load",
+                LoadMode::Full,
+                &runs,
+                "r3",
+                &Default::default()
+            )
+            .is_empty(),
+            "a full load reads only the newest run"
+        );
+        assert!(
+            super::runs_loaded_with_the_pin(
+                "compact",
+                LoadMode::Cdc,
+                &runs,
+                "r3",
+                &Default::default()
+            )
+            .is_empty(),
+            "compact merges the landed buffer and reads no pending run"
+        );
+    }
+
+    #[test]
+    fn the_respelling_refusal_names_each_run_and_both_spellings() {
+        assert_eq!(super::respelled_refusal("orders", "r2", &[]), None);
+        let msg = super::respelled_refusal(
+            "orders",
+            "r2",
+            &[("r1".into(), "\u{441}ity".into(), "city".into())],
+        )
+        .expect("a respelled run is refused");
+        assert!(
+            msg.starts_with("load [orders]: run r1 wrote `\u{441}ity` where run r2 writes `city`."),
+            "{msg}"
+        );
+        assert!(msg.contains("Nothing was loaded"), "{msg}");
+    }
+
+    #[test]
     fn the_pin_names_the_newer_runs_it_passed_over_and_stays_quiet_otherwise() {
         assert_eq!(super::skipped_runs_note("orders", "r1", &[]), None);
         let note = super::skipped_runs_note("orders", "r1", &["r3", "r2"]).expect("named");
@@ -3583,6 +3793,9 @@ mod live_only_decisions {
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         LoadPlan {
             deleted_flag: false,
+            renames: Vec::new(),
+            rename_warnings: Vec::new(),
+            refusal: None,
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),

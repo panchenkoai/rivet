@@ -8,7 +8,7 @@
 # installed some other way).
 PY ?= uv run python
 
-.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo seed-garbage seed-garbage-postgres seed-garbage-mysql seed-garbage-mssql
+.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db sweep-test-cloud test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo seed-garbage seed-garbage-postgres seed-garbage-mysql seed-garbage-mssql
 
 # PR-fast: offline type-mapping contracts (no docker).
 test-types:
@@ -63,7 +63,11 @@ test-types-snowflake:
 # anytime — only touches those fixtures, never the init.sql / seed.rs tables.
 # Best-effort per engine: a down service is skipped. See dev/pytools/sweep.py.
 sweep-test-db:
-	python3 -m dev.pytools.sweep test-cruft
+	$(PY) -m dev.pytools.sweep test-cruft
+
+# Also drops every disposable BigQuery dataset (rivet_tmp_*) — never while a gate or live run is in flight.
+sweep-test-cloud:
+	$(PY) -m dev.pytools.sweep test-cruft --bigquery
 
 # Full live suite under nextest (per-test isolation), sweeping stale fixtures
 # FIRST so an interrupted prior run never pollutes the shared `rivet` DB.
@@ -231,7 +235,7 @@ RIVET_CONC_SRC_CONTAINER  ?= rivet-postgres-1
 # the BigQuery legs SKIP with that reason, which is correct on a machine with no
 # warehouse.
 BQ_ORACLE_PROJECT         ?= $(shell gcloud config get-value project 2>/dev/null)
-BQ_ORACLE_DATASET         ?= rivet_blessed
+BQ_ORACLE_DATASET         ?= rivet_tmp_gate
 BQ_ORACLE_BUCKET          ?= rivet_data_test
 # OUTSIDE target/: the oracle's first act is `cargo clean` (the gate builds the
 # binary it grades), which silently deleted a baseline downloaded into

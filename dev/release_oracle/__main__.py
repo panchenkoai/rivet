@@ -8,7 +8,6 @@ the BigQuery golden stage. GREEN everywhere ⇒ releasable.
     python3 -m dev.release_oracle --engines postgres,mysql
     python3 -m dev.release_oracle --no-cloud             # local stage only
     python3 -m dev.release_oracle --keep                 # leave containers up
-    python3 -m dev.release_oracle --bless-bigquery-golden
 
 Every check is PASS only when it RAN and MATCHED; a down service or absent
 credential is SKIP (never a silent pass). Exit 0 iff no non-skipped cell failed —
@@ -291,7 +290,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--state-url", default="",
                     help="state backend for EVERY cell (default: SQLite beside each config). "
                          "A gate pass grades ONE backend; run it twice to grade both.")
-    ap.add_argument("--bless-bigquery-golden", action="store_true")
     ap.add_argument("--bless-local", action="store_true", help="re-capture verdict + duckdb-type goldens (implies --no-cloud)")
     ap.add_argument("--bless-cdc", action="store_true", help="re-capture the cdc state-snapshot golden")
     ap.add_argument("--bless-gifs", action="store_true",
@@ -816,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rivet binary not found at {rivet_bin()} (build --release or set RIVET_BIN)", file=sys.stderr)
         return 2
     if not have("duckdb"):
-        print("duckdb not on PATH (needed for the integrity oracle)", file=sys.stderr)
+        print("the pinned duckdb package is not importable — run the gate through `uv run` (make does)", file=sys.stderr)
         return 2
     # Fail LOUD on the host-side mongo seed dependency, and only when mongo is in
     # scope: a python3 that cannot import pymongo otherwise turns every mongo
@@ -889,8 +887,7 @@ def main(argv: list[str] | None = None) -> int:
             # passes, and honouring the result) landed here and NOT there, so the
             # BQ stage's mysql leg still hit the initdb race and recorded
             # `SKIP seed` where the previous run had a PASS. One definition now.
-            bigquery.run_bigquery_golden(led, bless=ns.bless_bigquery_golden,
-                                         keep=ns.keep, parallel=ns.engine_parallel,
+            bigquery.run_bigquery_golden(led, keep=ns.keep, parallel=ns.engine_parallel,
                                          bring_up=bring_up, seed_engine=seed_engine)
         rc = led.report()
         # A run that graded nothing against the previous release has to say so

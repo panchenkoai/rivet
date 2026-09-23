@@ -50,9 +50,11 @@ from pathlib import Path
 try:
     from .core import Ledger, have, run
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
+    from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, have, run  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
+    DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = ["verify_concurrent_writers_share_a_prefix"]
 
@@ -173,7 +175,7 @@ def _run_writers(cfgs: list[Path], state_url: str | None) -> tuple[list[int], st
 def _duckdb_count(glob: str, preamble: str = "") -> int | None:
     if not have("duckdb"):
         return None
-    p = run(["duckdb", "-noheader", "-list", "-c", f"{preamble}SELECT count(*) FROM read_parquet('{glob}')"])
+    p = run([*DUCKDB, "-noheader", "-list", "-c", f"{preamble}SELECT count(*) FROM read_parquet('{glob}')"])
     try:
         return int(p.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):

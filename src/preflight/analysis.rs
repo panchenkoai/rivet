@@ -161,10 +161,11 @@ pub(crate) fn strategy_probes_index(export: &ExportConfig) -> bool {
 pub(crate) fn preflight_base_table<'a>(
     export: &'a ExportConfig,
     base_query: &'a str,
-) -> Option<&'a str> {
+) -> Option<std::borrow::Cow<'a, str>> {
     export
         .table
         .as_deref()
+        .map(std::borrow::Cow::Borrowed)
         .or_else(|| super::postgres::table_from_simple_query(base_query))
 }
 
@@ -246,9 +247,28 @@ pub(crate) fn choose_row_estimate(
 /// Overlay the state store's freshest successful actual onto a diagnostic —
 /// the one place `check`/`plan` swap catalog for measured, so the two surfaces
 /// cannot drift (#149). Best-effort: an unreadable store keeps the catalog.
+/// Whether a measured run read THIS export's source: same engine, and — when the ledger knows the run's
+/// destination — the same destination. An export NAME is not an identity on a shared state store.
+fn measured_this_source(
+    m: &crate::state::ExportMetric,
+    export: &ExportConfig,
+    source: crate::config::SourceType,
+    state: &crate::state::StateStore,
+) -> bool {
+    if m.source_type.as_deref() != Some(source.ledger_label().as_str()) {
+        return false;
+    }
+    let want = crate::pipeline::destination_uri_for_manifest(&export.destination);
+    match m.run_id.as_deref().map(|id| state.run_prefix_of(id)) {
+        Some(Ok(Some(prefix))) => prefix == want,
+        _ => true,
+    }
+}
+
 pub(crate) fn overlay_measured_rows(
     diag: &mut super::ExportDiagnostic,
     export: &ExportConfig,
+    source: crate::config::SourceType,
     state: &crate::state::StateStore,
 ) {
     // A measured `total_rows` is the TABLE SIZE only when the run read the whole
@@ -267,7 +287,7 @@ pub(crate) fn overlay_measured_rows(
         .ok()
         .and_then(|ms| {
             ms.into_iter()
-                .find(|m| m.status == "success")
+                .find(|m| m.status == "success" && measured_this_source(m, export, source, state))
                 .and_then(|m| {
                     chrono::DateTime::parse_from_rfc3339(&m.run_at)
                         .ok()
@@ -1251,6 +1271,98 @@ mod tests {
         assert_eq!(src, "catalog estimate");
     }
 
+    fn scope_diag() -> super::super::ExportDiagnostic {
+        super::super::ExportDiagnostic {
+            export_name: "rivet_type_matrix".into(),
+            strategy: "full-scan".into(),
+            mode: "full".into(),
+            cursor_column: None,
+            row_estimate: None,
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: false,
+            verdict: super::super::HealthVerdict::Degraded,
+            warnings: Vec::new(),
+            recommended_profile: "balanced",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
+        }
+    }
+
+    fn scope_state(engine: &str, run_prefix: Option<&str>) -> crate::state::StateStore {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "rivet_type_matrix".into(),
+                run_id: "foreign".into(),
+                total_rows: 4,
+                status: "success".into(),
+                source_type: Some(engine.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        if let Some(prefix) = run_prefix {
+            state
+                .begin_run(
+                    "foreign",
+                    "rivet_type_matrix",
+                    prefix,
+                    "2026-09-23T14:00:00Z",
+                )
+                .unwrap();
+        }
+        state
+    }
+
+    /// A same-named run of ANOTHER engine on a shared state store is not this export's measurement.
+    #[test]
+    fn overlay_ignores_a_same_named_run_of_another_engine() {
+        let export = cfg("table: rivet_type_matrix\nmode: full\n");
+        let mut diag = scope_diag();
+        overlay_measured_rows(
+            &mut diag,
+            &export,
+            crate::config::SourceType::Mssql,
+            &scope_state("postgres", None),
+        );
+        assert_eq!(
+            diag.row_estimate, None,
+            "a postgres run must not size an mssql table: {:?}",
+            diag.row_source
+        );
+    }
+
+    /// A same-engine run the ledger records under ANOTHER destination is another config's measurement.
+    #[test]
+    fn overlay_ignores_a_same_named_run_into_another_destination() {
+        let export = cfg("table: rivet_type_matrix\nmode: full\n");
+        let mut diag = scope_diag();
+        let state = scope_state("mssql", Some("file:///elsewhere/rivet_type_matrix/"));
+        overlay_measured_rows(&mut diag, &export, crate::config::SourceType::Mssql, &state);
+        assert_eq!(diag.row_estimate, None, "{:?}", diag.row_source);
+    }
+
+    /// The same engine into the same destination is this export's own measurement.
+    #[test]
+    fn overlay_uses_the_run_of_the_same_engine_and_destination() {
+        let export = cfg("table: rivet_type_matrix\nmode: full\n");
+        let want = crate::pipeline::destination_uri_for_manifest(&export.destination);
+        let mut diag = scope_diag();
+        overlay_measured_rows(
+            &mut diag,
+            &export,
+            crate::config::SourceType::Mssql,
+            &scope_state("mssql", Some(&want)),
+        );
+        assert_eq!(diag.row_estimate, Some(4));
+    }
+
     /// The overlay through a REAL state store (RED against a catalog-only
     /// path): a recorded success replaces the diagnostic's catalog figure and
     /// the label names the source — the field 2.5x lie, ended.
@@ -1259,6 +1371,7 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().unwrap();
         state
             .record_metric_full(&crate::state::MetricRow {
+                source_type: Some("postgres".into()),
                 export_name: "versioned_giant".into(),
                 run_id: "r1".into(),
                 total_rows: 835_700_000,
@@ -1290,7 +1403,12 @@ mod tests {
         let export = cfg("table: t\nmode: chunked\nchunk_column: id\nchunk_size: 100000\n");
         // Seed a profile as if computed from the CATALOG (small) estimate.
         diag.recommended_profile = "fast";
-        overlay_measured_rows(&mut diag, &export, &state);
+        overlay_measured_rows(
+            &mut diag,
+            &export,
+            crate::config::SourceType::Postgres,
+            &state,
+        );
         assert_eq!(diag.row_estimate, Some(835_700_000), "measured must win");
         // A2: the profile must be RECOMPUTED from the measured 835M (a huge table
         // is not "fast") — before the fix it kept the catalog-derived value.
@@ -1318,6 +1436,7 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().unwrap();
         state
             .record_metric_full(&crate::state::MetricRow {
+                source_type: Some("postgres".into()),
                 export_name: "big_chunked".into(),
                 run_id: "r1".into(),
                 total_rows: 10_000_000, // > 5M → parallel-memory-risk fires
@@ -1348,7 +1467,12 @@ mod tests {
             chunk_max: None,
             db_max_connections: None,
         };
-        overlay_measured_rows(&mut diag, &export, &state);
+        overlay_measured_rows(
+            &mut diag,
+            &export,
+            crate::config::SourceType::Postgres,
+            &state,
+        );
         assert_eq!(diag.row_estimate, Some(10_000_000));
         assert!(
             diag.warnings
@@ -1367,6 +1491,7 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().unwrap();
         state
             .record_metric_full(&crate::state::MetricRow {
+                source_type: Some("postgres".into()),
                 export_name: "mongo_coll".into(),
                 run_id: "r1".into(),
                 total_rows: 12_000_000,
@@ -1396,7 +1521,12 @@ mod tests {
             db_max_connections: None,
         };
         let export = cfg("table: coll\nmode: full\n");
-        overlay_measured_rows(&mut diag, &export, &state);
+        overlay_measured_rows(
+            &mut diag,
+            &export,
+            crate::config::SourceType::Postgres,
+            &state,
+        );
         assert_eq!(
             diag.row_estimate,
             Some(12_000_000),
@@ -1423,6 +1553,7 @@ mod tests {
         // A quiet incremental night: a successful run that captured ZERO rows.
         state
             .record_metric_full(&crate::state::MetricRow {
+                source_type: Some("postgres".into()),
                 export_name: "big_incremental".into(),
                 run_id: "r1".into(),
                 total_rows: 0,
@@ -1452,7 +1583,12 @@ mod tests {
             db_max_connections: None,
         };
         let export = cfg("table: t\nmode: incremental\ncursor_column: updated_at\n");
-        overlay_measured_rows(&mut diag, &export, &state);
+        overlay_measured_rows(
+            &mut diag,
+            &export,
+            crate::config::SourceType::Postgres,
+            &state,
+        );
         assert_eq!(
             diag.row_estimate,
             Some(300_000_000),

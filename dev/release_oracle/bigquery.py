@@ -1,26 +1,12 @@
-"""Release-oracle BigQuery golden stage — the real-cloud final oracle.
+"""Release-oracle BigQuery stage — the real-cloud final oracle.
 
-Port of `dev/release-oracle/lib/bigquery.sh`.
-
-Everything before this stage runs against local fakes (MinIO / fake-gcs /
-Azurite) or a local warehouse. This one runs against the real thing, and is made
-DETERMINISTIC by a per-engine checked-in golden rather than by fuzzy count
-checks.
-
-For every SQL engine (postgres / mysql / mssql — Mongo has no type matrix, it is
-full-scan only) the round trip goes through rivet on BOTH legs: `rivet run`
-stages that engine's `rivet_type_matrix` to a REAL GCS bucket, `rivet load`
-loads it GCS → BigQuery, and then `bq query` — gcloud, an INDEPENDENT reader,
-not rivet re-reading its own output — pulls it back as JSON. Every column value
-is compared to `golden/bigquery_type_matrix.json`, keyed
-`{engine: {table: [rows]}}`. Any divergence fails the release, because what
-moved is either rivet's type export or BigQuery's Parquet mapping, and both are
-silent: decimal precision, TIMESTAMP instants, BYTES, NUMERIC-widened unsigned
-ints and JSON all survive a row count unharmed.
-
-RE-BLESSING IS AN EXPLICIT OPT-IN (`--bless-bigquery-golden` → `bless=True`).
-A normal run only ever READS the golden; nothing here overwrites it as a side
-effect. A gate that silently re-captures its own baseline cannot fail.
+For every SQL engine (postgres / mysql / mssql — Mongo has no type matrix) the round
+trip goes through rivet on BOTH legs: `rivet run` stages that engine's
+`rivet_type_matrix` to a REAL GCS bucket and `rivet load` loads it into BigQuery.
+The expected value is the SOURCE table, never a golden blessed from rivet's output:
+one DuckDB session attaches the source and BigQuery and compares every column value
+(`value_diff.compare_to_bigquery`). The golden this replaced froze rivet's own
+UUID-as-unreadable-STRING as "expected" from 0.22 to 0.27.
 """
 
 from __future__ import annotations
@@ -36,7 +22,6 @@ from .core import (
     ROOT,
     Ledger,
     Proc,
-    Status,
     docker,
     docker_exec,
     engine_container,
@@ -53,7 +38,6 @@ from .core import (
 _BASH_HERE = ROOT / "dev" / "release-oracle"
 _LIB = _BASH_HERE / "lib"
 _MATRIX_YAML = _BASH_HERE / "matrix.yaml"
-GOLDEN = _BASH_HERE / "golden" / "bigquery_type_matrix.json"
 
 # Ports this stage owns, distinct from the main engine loop's so a BQ run can
 # share a machine with one.
@@ -73,40 +57,55 @@ def _matrix_cfg(*args: str) -> str:
     return p.stdout.strip()
 
 
-def _duckdb_cross_read(led: Ledger, engine: str, dset: str, table: str, bq_json: str) -> None:
-    """Read the loaded table a SECOND way — DuckDB's bigquery extension — and compare.
+def _grade_chain(led: Ledger, engine: str, url: str, table: str, bucket: str, pfx: str,
+                 config: Path, dset: str) -> None:
+    """Source, manifest, GCS parquet footers, rivet's ledger and BigQuery must agree for the run just loaded — one DuckDB session."""
+    from .value_diff import chain_census, chain_disagreements
 
-    `bq` (the CLI the read-back above uses) and DuckDB are two independent
-    readers of one warehouse table. Agreement is worth little by itself; a
-    DISAGREEMENT is the finding, because it says one of the two readers — or the
-    load beneath them — is wrong, and a single reader can never tell you that.
+    state = os.environ.get("RIVET_STATE_URL", "")
+    if not state.startswith("postgres"):
+        state = str(config.with_name(".rivet_state.db"))  # rivet keeps its state beside the config
+    try:
+        c = chain_census(engine, url, table, bucket, pfx, state, dset, table)
+    except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL, never a pass
+        led.failed("bigquery", engine, "chain", "-", f"chain[{engine}]: oracle failed: {e}", "oracle-error")
+        return
+    bad = chain_disagreements(c)
+    if bad:
+        led.failed("bigquery", engine, "chain", "-", f"chain[{engine}]: " + "; ".join(bad), "disagree")
+    else:
+        led.passed("bigquery", engine, "chain", "-",
+                   f"chain[{engine}]: source = manifest = GCS footers = metrics = file_log = "
+                   f"load_run = BigQuery = {c['source']} rows, run {c['run_ids'][0]}, no undeclared parts")
 
-    This leg ADDS a reader, it does not replace the grading `bq` already did:
-    an absent credential or a machine without the community extension is a SKIP
-    that names which, never a silent pass. The import is lazy on purpose — the
-    gate's `--self-test` runs on a bare interpreter and must not need duckdb.
-    """
-    from .duck import Oracle, bq_target  # lazy: --self-test imports no duckdb
+
+def _grade_against_source(led: Ledger, engine: str, url: str, dset: str, table: str) -> None:
+    """Every column of the loaded table against the SOURCE row, both read by DuckDB; a golden rivet wrote would grade change, not correctness."""
+    from .duck import bq_target
+    from .value_diff import compare_to_bigquery
 
     if bq_target() is None:
-        return  # the caller already reported the missing credential
-    n_bq = len(json.loads(bq_json)) if bq_json.strip() else 0
-    try:
-        with Oracle(bigquery=True) as ora:
-            n_duck = ora.scalar(f"SELECT count(*) FROM bq.{dset}.{table}")
-    except Exception as e:  # noqa: BLE001 — a reader that cannot open is a SKIP, not a gate stop
-        led.skipped("bigquery", engine, "duckdb-cross-read", "-",
-                    f"BigQuery[{engine}]: DuckDB reader unavailable — {str(e).splitlines()[0][:120]}",
-                    "no duckdb")
+        led.skipped("bigquery", engine, "golden", "-",
+                    "BigQuery: the DuckDB oracle needs BQ_ORACLE_PROJECT and BQ_ORACLE_DATASET",
+                    "no creds")
         return
-    if n_duck == n_bq:
-        led.passed("bigquery", engine, "duckdb-cross-read", "-",
-                   f"BigQuery[{engine}]: two independent readers agree on {n_bq} row(s)")
+    try:
+        rows, diffs = compare_to_bigquery(engine, url, dset, table)
+    except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL, never a pass
+        led.failed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}]: the DuckDB oracle could not compare — {str(e).splitlines()[0][:160]}",
+                   "oracle")
+        return
+    if diffs:
+        led.failed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}] differs from the SOURCE: " + " | ".join(diffs)[:600], "diverged")
+    elif rows == 0:
+        led.failed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}]: the warehouse table is empty — the oracle compared nothing",
+                   "empty-readback")
     else:
-        led.failed("bigquery", engine, "duckdb-cross-read", "-",
-                   f"BigQuery[{engine}]: readers DISAGREE — bq says {n_bq} row(s), "
-                   f"DuckDB says {n_duck} on {dset}.{table}")
-
+        led.passed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}]: {rows} row(s), every column equal to the source (DuckDB on both sides)")
 
 def _work_dir() -> Path:
     """The driver exports `WORK` for the whole run; make our own if it did not."""
@@ -213,22 +212,6 @@ def _seed_engine(engine: str, tag: str, url: str) -> str:
 
 
 # ── the stage ──────────────────────────────────────────────────────────────────
-def _load_golden() -> dict:
-    """The checked-in golden, or {} when it has never been blessed."""
-    if not GOLDEN.exists():
-        return {}
-    try:
-        return json.loads(GOLDEN.read_text())
-    except json.JSONDecodeError:
-        return {}
-
-
-def _canon(doc: object) -> str:
-    """Both sides of the comparison go through the SAME serializer, so a diff can
-    only mean a real value change — never key order."""
-    return json.dumps(doc, sort_keys=True)
-
-
 # ── load_pool ────────────────────────────────────────────────────────────────
 # Sixteen, because that is BOTH `MAX_POOL` and today's `DEFAULT_POOL`: the cell
 # is meant to exercise the pool at its full declared width, not at a width that
@@ -639,19 +622,17 @@ def _bq_one_engine(
     bucket: str,
     matrix: str,
     work: Path,
-    bless: bool,
     keep: bool,
     up: Callable[..., str | None],
     seed: Callable[..., str],
-) -> dict | None:
-    """One engine's whole BQ leg: export → load → read back → compare → clean up.
+) -> None:
+    """One engine's whole BQ leg: export → load → compare to the source → clean up.
 
     Fully self-contained PER ENGINE — its own dataset (`{dset}_{engine}`), GCS prefix
     (`bq/{engine}`), config, and container — which is exactly why the outer loop can
     run these concurrently (the per-dataset fix below removed the shared-table hazard
     the old sequential-only comment warned about). Records its rows/spans into `led`
-    (a buffered child under parallelism) and returns the blessed rows (bless mode) or
-    None. The `bq {engine}: run/load/readback` spans answer whether the load and the
+    (a buffered child under parallelism). The `bq {engine}: run/load/readback` spans answer whether the load and the
     read-back SELECT actually speed up under parallelism or are BQ-rate-limited."""
     versions = _matrix_cfg("versions", engine).splitlines()
     fields = versions[0].split() if versions else []
@@ -702,6 +683,8 @@ def _bq_one_engine(
     # Clear the prefix first: a leftover part from an earlier run would be loaded
     # alongside this one's and the read-back would compare a union.
     run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    # And the table: a run killed before its cleanup strands it, and a fresh state DB refuses to overwrite it.
+    run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
 
     got = ""
     child = {"ORACLE_URL": url}
@@ -712,12 +695,11 @@ def _bq_one_engine(
         with led.span(f"bq {engine}: load"):
             lp = rivet("load", "-c", str(cfgf), env=child, timeout=None)
     if rp.ok and lp is not None and lp.ok:
-        with led.span(f"bq {engine}: readback"):
-            q = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql",
-                     "--format=prettyjson",
-                     f"SELECT * FROM `{proj}.{eng_dset}.{exp}` ORDER BY id"], timeout=None)
-            got = run(["python3", str(_LIB / "normalize_bq.py")], stdin=q.stdout).stdout.strip()
-            _duckdb_cross_read(led, engine, eng_dset, exp, q.stdout)
+        with led.span(f"bq {engine}: source-vs-warehouse"):
+            _grade_against_source(led, engine, url, eng_dset, exp)
+            got = "loaded"
+        with led.span(f"bq {engine}: chain"):
+            _grade_chain(led, engine, url, exp, bucket, pfx, cfgf, eng_dset)
     else:
         failed_proc = rp if not rp.ok else lp
         leg = "run" if not rp.ok else "load"
@@ -742,41 +724,15 @@ def _bq_one_engine(
                              child=child, engine=engine, url=url)
 
     run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-    run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
     if not keep:
+        run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", f"{proj}:{eng_dset}"])
         docker("rm", "-fv", engine_container(engine, _TAG))
-    if not got:
-        # A read-back that returns NOTHING after a SUCCESSFUL run+load is a failure of
-        # the INDEPENDENT oracle (Google's parquet reader via bq query), not a no-op —
-        # it used to record no row at all, so absence read as green. The run/load-failed
-        # path already recorded its FAIL above; only this (rp.ok and lp.ok) path did not.
-        if rp.ok and lp is not None and lp.ok:
-            led.failed("bigquery", engine, "golden", "-",
-                       f"BigQuery[{engine}]: run+load OK but the bq read-back returned nothing "
-                       f"({eng_dset}.{exp} empty) — the independent oracle saw zero rows",
-                       "empty-readback")
-        return None
-
-    if bless:
-        rows = json.loads(got)
-        led.passed("bigquery", engine, "golden", "-",
-                   f"BigQuery[{engine}] blessed ({len(rows)} rows)", "blessed")
-        return rows
-    want = _load_golden().get(engine, {}).get(matrix)
-    if want is not None and _canon(json.loads(got)) == _canon(want):
-        led.ok(f"BigQuery[{engine}] matches golden")
-        led.add("bigquery", engine, "golden", "-", Status.PASS)
-    else:
-        led.failed("bigquery", engine, "golden", "-",
-                   f"BigQuery[{engine}] DIVERGED from golden — "
-                   "rivet type export or BQ mapping changed", "diverged")
     return None
 
 
 def run_bigquery_golden(
     led: Ledger,
     *,
-    bless: bool = False,
     keep: bool = False,
     parallel: int = 1,
     bring_up: Callable[..., str | None] | None = None,
@@ -805,22 +761,17 @@ def run_bigquery_golden(
     bucket = os.environ.get("BQ_ORACLE_BUCKET") or "rivet_data_test"
     matrix = _matrix_cfg("bq", "tables")  # the single comprehensive matrix name
     work = _work_dir()
-    blessed: dict[str, dict[str, object]] = {}
 
     engines = [e for e in _matrix_cfg("engines").split()
                if e != "mongo" and _PORTS.get(e) is not None]  # mongo: no type matrix
 
-    def collect(engine: str, rows: dict | None) -> None:
-        if rows is not None:
-            blessed.setdefault(engine, {})[matrix] = rows
-
     kw = dict(proj=proj, dset=dset, bucket=bucket, matrix=matrix, work=work,
-              bless=bless, keep=keep, up=_up, seed=_seed)
+              keep=keep, up=_up, seed=_seed)
     cap = max(1, parallel)
     if cap == 1 or len(engines) <= 1:
         for engine in engines:
             with led.span(f"bq {engine}: engine-total"):
-                collect(engine, _bq_one_engine(led, engine, **kw))
+                _bq_one_engine(led, engine, **kw)
     else:
         # Each engine's leg is independent (own dataset/prefix/config/container), so
         # race them — same buffered-child pattern as the engine matrix, so an engine's
@@ -831,25 +782,12 @@ def run_bigquery_golden(
         from concurrent.futures import ThreadPoolExecutor
         subs = {e: led.buffered_child() for e in engines}
 
-        def run_one(engine: str) -> tuple[str, dict | None]:
+        def run_one(engine: str) -> None:
             with subs[engine].span(f"bq {engine}: engine-total"):
-                return engine, _bq_one_engine(subs[engine], engine, **kw)
+                _bq_one_engine(subs[engine], engine, **kw)
 
         workers = min(cap, len(engines))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            results = list(ex.map(run_one, engines))
+            list(ex.map(run_one, engines))
         for engine in engines:  # deterministic order, not completion order
             subs[engine].flush_into(led)
-        for engine, rows in results:
-            collect(engine, rows)
-
-    if bless:
-        # The opt-in write, and the only one. NOTE (bash behaviour, kept): this
-        # REPLACES the file with just the engines that produced a read-back this
-        # invocation, so blessing while one engine is down drops that engine's
-        # entry — and the next normal run then reports it DIVERGED. Bless with
-        # every engine healthy.
-        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        GOLDEN.write_text(json.dumps(blessed, indent=2, sort_keys=True) + "\n")
-        led.passed("bigquery", "-", "golden", "-",
-                   f"BLESSED BQ golden (per engine) → {GOLDEN}", "blessed")

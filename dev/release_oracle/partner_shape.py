@@ -36,6 +36,7 @@ import shutil
 from pathlib import Path
 
 from .cdc import _mysql, _psql
+from ..pytools import registry
 from .core import Ledger, have, rivet, run
 from .scenarios import NO_TIMEOUT, work_dir
 
@@ -164,7 +165,7 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     slug = f"{work_dir().name}-{os.getpid()}"
-    dset = f"rivet_partner_{engine}"
+    dset = registry.bq_tmp(f"partner_{engine}")
     pfx = f"partner/{engine}/{slug}"
     # init names the stream `cdc` (MySQL) / `public_cdc` (PostgreSQL) → slot `rivet_<name>`.
     slot = "rivet_public_cdc" if engine == "postgres" else None
@@ -243,8 +244,6 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
              "; ".join(f"{t}: live={live} flagged={gone} source={src} sum(id) bq={bs} src={ss} buffer_left={buf}"
                        for t, (live, gone, src, bs, ss, buf) in got2.items()))
     finally:
-        for t in TABLES:
-            run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{proj}:{dset}.{t}"])
-            run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{proj}:{dset}.{t}__changes"])
+        run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
         run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
         _cleanup(engine, url, slot)

@@ -49,7 +49,9 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import HERE, ROOT, Ledger, Proc, Status, docker, docker_exec, have, rivet, rivet_bin, run
+    from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
+                       port_of, rivet, rivet_bin, run)
+    from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
@@ -57,13 +59,16 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         Ledger,
         Proc,
         Status,
+        container_for_port,
         docker,
         docker_exec,
         have,
+        port_of,
         rivet,
         rivet_bin,
         run,
     )
+    DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = [
     "run_scenarios",
@@ -236,7 +241,7 @@ def _duckdb_list(sql: str) -> str:
     `2>/dev/null`. The exit status is deliberately not consulted so the two
     implementations classify identically.
     """
-    return run(["duckdb", "-noheader", "-list", "-c", sql]).stdout.strip()
+    return run([*DUCKDB, "-noheader", "-list", "-c", sql]).stdout.strip()
 
 
 def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
@@ -304,6 +309,20 @@ def duckdb_allnull_cloud(store: str, bucket: str, prefix: str, work: Path) -> tu
     return (-1, -1)
 
 
+def success_part_names(doc: dict) -> list[str]:
+    """The committed part names a manifest delivers — none unless its `status` is `success` (the loader's rule; a failed/interrupted run's parts are gc candidates)."""
+    if str(doc.get("status") or "success").lower() != "success":
+        return []
+    out = []
+    for f in doc.get("parts") or []:
+        if isinstance(f, dict) and f.get("status") not in (None, "committed"):
+            continue
+        name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
+        if name:
+            out.append(str(name))
+    return out
+
+
 def _manifest_declared_parts(root: Path) -> list[str]:
     """Absolute paths of the parts the manifest(s) under `root` DECLARE as committed — the
     union across immutable manifest-*.json copies (plus the canonical manifest.json), i.e.
@@ -317,17 +336,7 @@ def _manifest_declared_parts(root: Path) -> list[str]:
             art = json.loads(d.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        # SUCCESS manifests only — the loader's rule (a failed/interrupted
-        # manifest's parts are gc candidates, not delivered data), mirroring
-        # tests/common's Rust + python resolvers (live-proven 2026-08-29).
-        if str(art.get("status") or "success").lower() != "success":
-            continue
-        for f in art.get("parts", []) or []:
-            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
-                continue
-            name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
-            if not name:
-                continue
+        for name in success_part_names(art):
             cand = Path(name)
             if not cand.is_absolute():
                 cand = d.parent / cand
@@ -396,7 +405,7 @@ def _duckdb_json_normalized(sql: str) -> str:
     normalize_bq.py sorts rows by `id` and sorts keys, so a golden diff means a
     real change in rivet's type export, never row/key-order noise.
     """
-    raw = run(["duckdb", "-json", "-c", sql]).stdout
+    raw = run([*DUCKDB, "-json", "-c", sql]).stdout
     if not raw.strip():
         return ""
     return run([PY, str(_asset("lib/normalize_bq.py"))], stdin=raw).stdout.strip()
@@ -427,19 +436,6 @@ def _golden_put(path: Path, engine: str, key: str, got: str) -> None:
     golden = _golden_load(path)
     golden.setdefault(engine, {})[key] = json.loads(got)
     path.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n")
-
-
-def _engine_container(engine: str) -> str | None:
-    """The running container for `engine`, ANY pinned version.
-
-    Found by name prefix rather than built from (engine, tag) because the callers
-    that need it do not carry the tag. Returns None instead of "" so no caller
-    can hand an empty name to `docker exec` ("invalid container name or ID").
-    """
-    for name in docker_names():
-        if name.startswith(f"rivet-oracle-eng-{engine}-"):
-            return name
-    return None
 
 
 def docker_names() -> list[str]:
@@ -477,6 +473,15 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
     so it silently used the caller's value in the batch path and aborted under
     `set -u` in the CDC path. A Python parameter cannot be shadowed that way.)
     """
+    parts = store_parts(store, bucket, prefix, work)
+    if parts is None:
+        return ""
+    preamble, rel = parts
+    return _duckdb_list(f"{preamble}SELECT count(*) FROM {rel}")
+
+
+def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, str] | None:
+    """(DuckDB preamble, relation) over the parts the store's manifests DECLARE, or None when the store holds none or its client is absent."""
     dl = work / f"dl_{store}_{random.randint(0, 32767)}"
     if store == "s3":
         # DECLARED, not globbed. The prefix is read twice: once for the manifests
@@ -485,19 +490,17 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
         # HOLD", and every caller of this helper compares the answer to the SOURCE
         # — so a run that under-declares its own delivery agreed with the source
         # while `rivet load` read short.
-        paths = _duckdb_list(
+        docs = _duckdb_list(
             S3_HTTPFS_PREAMBLE
-            + "SELECT DISTINCT p.path FROM ("
-            f"  SELECT unnest(parts) AS p FROM read_json_auto('s3://{bucket}/{prefix}/manifest-*.json')"
-            ") WHERE p.status IS NULL OR p.status = 'committed'"
+            + f"SELECT to_json(m) FROM read_json_auto('s3://{bucket}/{prefix}/manifest-*.json', "
+            "union_by_name = true) AS m"
         )
-        names = [ln.strip() for ln in paths.splitlines() if ln.strip()]
+        names = sorted({n for ln in docs.splitlines() if ln.strip()
+                        for n in success_part_names(json.loads(ln))})
         if not names:
-            return ""
+            return None
         lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)
-        return _duckdb_list(
-            S3_HTTPFS_PREAMBLE + f"SELECT count(*) FROM read_parquet([{lst}])"
-        )
+        return S3_HTTPFS_PREAMBLE, f"read_parquet([{lst}])"
     if store == "gcs":
         # No gsutil needed — the fake-gcs JSON API is enough, and it keeps the
         # readback independent of rivet.
@@ -514,12 +517,12 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
         except ValueError:
             pulled = 0
         if pulled <= 0:
-            return ""
+            return None
         src = _declared_read(dl, ".parquet")
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
+        return ("", f"read_parquet({src})") if src else None
     if store == "azure":
         if not have("az"):
-            return ""
+            return None
         dl.mkdir(parents=True, exist_ok=True)
         run(
             [
@@ -531,8 +534,8 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
             ]
         )
         src = _declared_read(dl, ".parquet")
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
-    return ""
+        return ("", f"read_parquet({src})") if src else None
+    return None
 
 
 def store_dest(store: str, bucket: str, prefix: str) -> str | None:
@@ -583,14 +586,9 @@ def _store_env(url: str) -> dict[str, str]:
 
 # ── source-side oracles ──────────────────────────────────────────────────────
 def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> str:
-    """`"<count> <distinct>"` straight from the source engine's own client.
-
-    `url` is unused (as in the bash): the container is found by name, and each
-    engine's in-container client already knows its credentials. Empty when the
-    container is gone — no `docker exec ""`.
-    """
-    del url
-    container = _engine_container(engine)
+    """`"<count> <distinct>"` from the client inside the container publishing `url`'s port — never a sibling version's container; empty when none does."""
+    port = port_of(url)
+    container = container_for_port(port) if port else None
     if container is None:
         return ""
     if engine == "postgres":
@@ -888,17 +886,19 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
         for tmt in ("rivet_type_matrix",):
             if _export_local(engine, url, tmt, out / tmt, "full").ok:
                 psrc = _declared_read(out / tmt, ".parquet")
-                got = (
-                    _duckdb_json_normalized(
-                        f"SELECT * FROM read_parquet({psrc}) ORDER BY id"
-                    )
-                    if psrc
-                    else ""
-                )
-                if not got:
+                if not psrc:
                     fails += f"{tmt}-readback "
-                elif not _fidelity_check(engine, tmt, got):
-                    fails += f"{tmt}-TYPE-DIVERGED "
+                else:
+                    # The source is the expected value — a golden rendered by one DuckDB version graded the reader, not rivet.
+                    from .value_diff import compare_rows_to_parquet
+
+                    try:
+                        n, diffs = compare_rows_to_parquet(engine, url, tmt, f"read_parquet({psrc})")
+                    except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL
+                        fails += f"{tmt}-oracle-error({str(e)[:160]}) "
+                    else:
+                        if not n or diffs:
+                            fails += f"{tmt}-VALUES-DIFFER(rows={n} {diffs[:2]}) "
             else:
                 fails += f"{tmt}-export "
 
@@ -954,7 +954,7 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     if not fails:
         _passed(
             led, engine, tag, "integrity_types", "-",
-            "integrity+types (loss/dup 0, type matrices match DuckDB golden)",
+            "integrity+types (loss/dup 0, type matrix values equal the source, CSV matches its golden)",
         )
     else:
         _failed(led, engine, tag, "integrity_types", "-", f"integrity+types: {fails}", fails)
@@ -1061,10 +1061,26 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
             _first_match(out, r"error|fail"),
         )
         return
-    n = store_readback(store, bucket, prefix, work_dir())
+    parts = store_parts(store, bucket, prefix, work_dir())
+    n = _duckdb_list(f"{parts[0]}SELECT count(*) FROM {parts[1]}") if parts else ""
     scnt = _source_count_distinct(engine, url, "users", "id").split(" ")[0]
     if n and n == scnt:
-        _passed(led, engine, tag, "load", store, f"load→{store} gcloud-verified {n} rows", n)
+        from .value_diff import compare_to_parquet
+
+        try:
+            bad, missing = compare_to_parquet(engine, url, "users", *parts)
+        except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL, never a pass
+            _failed(led, engine, tag, "load", store, f"load→{store} value oracle failed: {e}", "oracle-error")
+            return
+        if bad or missing:
+            _failed(
+                led, engine, tag, "load", store,
+                f"load→{store} {n} rows but values differ from the SOURCE: {bad} row(s) each way, "
+                f"missing columns {missing}", f"values:{bad}",
+            )
+        else:
+            _passed(led, engine, tag, "load", store,
+                    f"load→{store} {n} rows, every value equal to the source (DuckDB)", n)
     elif not n:
         # An EMPTY readback is a delivery failure, not an absent tool, on the stores that
         # need no extra CLI: s3 (DuckDB httpfs) and gcs (the JSON-API pull) are always
@@ -1511,11 +1527,15 @@ def verify_live_only_coverage(led: Ledger) -> None:
          "cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
         timeout=NO_TIMEOUT,
     )
-    (work_dir() / "live_only_cov.log").write_text(build.out)
+    # Kept outside the run's work dir, which the gate deletes — the message must name a file that exists.
+    log = ROOT / "target" / "gate-failures" / f"live_only_cov-{os.getpid()}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(build.out)
     if not build.ok:
         _failed(
             led, "infra", "live-only", "coverage", "-",
-            "live-only-cov: the instrumented offline battery FAILED (see live_only_cov.log)",
+            f"live-only-cov: the instrumented offline battery FAILED: "
+            f"{_first_match(build.out, r'FAIL|panicked|error')} · full output: {log}",
             _first_match(build.out, r"FAILED|error"),
         )
         return

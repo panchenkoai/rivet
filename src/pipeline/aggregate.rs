@@ -1304,6 +1304,7 @@ mod tests {
     fn metric(name: &str, status: &str) -> ExportMetric {
         ExportMetric {
             bytes_read: 0,
+            source_type: None,
             export_name: name.into(),
             run_id: Some(format!("{name}_run")),
             run_at: "2026-06-09T12:00:00+00:00".into(),

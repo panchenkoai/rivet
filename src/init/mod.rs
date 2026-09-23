@@ -125,8 +125,9 @@ impl TableInfo {
     /// 2026-08-08). This is that one picker.
     pub(crate) fn chosen_cursor_column(&self) -> Option<String> {
         crate::init::candidates::cursor_candidates(self)
-            .first()
-            .map(|c| c.column.clone())
+            .into_iter()
+            .find(|c| !is_coarse_stamp_type(&c.data_type))
+            .map(|c| c.column)
     }
 
     /// [`chosen_cursor_column`] RESTRICTED to a timestamp column — for
@@ -154,7 +155,7 @@ impl TableInfo {
         let ts: Vec<&ColumnInfo> = self
             .columns
             .iter()
-            .filter(|c| is_timestamp_type(&c.data_type))
+            .filter(|c| is_timestamp_type(&c.data_type) && !is_tombstone_stamp(&c.name))
             .collect();
         ts.iter()
             .find(|c| is_creation_stamp(&c.name))
@@ -167,7 +168,11 @@ impl TableInfo {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
             .iter()
-            .filter(|c| is_timestamp_type(&c.data_type))
+            .filter(|c| {
+                is_timestamp_type(&c.data_type)
+                    && !is_tombstone_stamp(&c.name)
+                    && !is_coarse_stamp_type(&c.data_type)
+            })
             .collect();
         ts_cols
             .iter()
@@ -193,6 +198,11 @@ impl TableInfo {
         is_keysettable_type(ty).then_some(pk)
     }
 
+    /// Whether the table has any key `chunked` can page by: an integer column or a keysettable PK.
+    pub(crate) fn has_chunk_key(&self) -> bool {
+        self.best_chunk_column().is_some() || self.keysettable_pk_column().is_some()
+    }
+
     /// Suggest extraction mode based on row count and available columns.
     pub(crate) fn suggest_mode(&self) -> &'static str {
         if self.row_estimate > 100_000 {
@@ -204,7 +214,7 @@ impl TableInfo {
             // unbounded scan that is not durability-safe on a large table (ADR-0020).
             // A decimal PK is NOT keysettable (planner refuses it), so it stays
             // `full` unless it also has an integer column to range-chunk.
-            if self.best_chunk_column().is_some() || self.keysettable_pk_column().is_some() {
+            if self.has_chunk_key() {
                 return "chunked";
             }
             if self.best_cursor_column().is_some() {
@@ -252,7 +262,7 @@ impl TableInfo {
                 // timestamp cursor exists (roast 2026-08-09: the incremental
                 // ARM below names chosen_, but this SUGGESTION must stay
                 // timestamp-gated, unlike an actual incremental export).
-                match self.best_cursor_column() {
+                match self.best_cursor_column().filter(|c| is_mutation_stamp(c)) {
                     Some(cursor) => format!(
                         "{base}. NOTE: chunked re-reads the whole table each run — for scheduled \
                          re-runs, `mode: incremental` on '{cursor}' pulls only changed rows"
@@ -391,6 +401,12 @@ fn is_integer_type(t: &str) -> bool {
     )
 }
 
+/// Whether the type holds only a day or a minute: a strict `>` cursor on it skips every row later inserted in the watermark's day or minute.
+pub(crate) fn is_coarse_stamp_type(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t == "date" || t.contains("smalldatetime")
+}
+
 fn is_timestamp_type(t: &str) -> bool {
     let t = t.to_lowercase();
     // `contains("datetime")`, not `== "datetime"`: SQL Server reports `datetime2`,
@@ -453,6 +469,14 @@ fn is_mutation_stamp(name: &str) -> bool {
     )
 }
 
+/// Whether the column name marks a soft delete: NULL on every live row, so it can never be a cursor.
+pub(crate) fn is_tombstone_stamp(name: &str) -> bool {
+    matches!(
+        stamp_key(name).as_str(),
+        "deletedat" | "deletedon" | "deleteddate" | "removedat" | "archivedat" | "purgedat"
+    )
+}
+
 /// Whether a column of this type can be a KEYSET (seek) key — i.e. the keyset
 /// cursor can read + compare it (`WHERE key > last ORDER BY key`). MUST mirror the
 /// planner's `keyset_keys` restriction (`source::TableIntrospection`): integer /
@@ -495,6 +519,17 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
             source_url
         )
     }
+}
+
+/// [`source_type`] as the enum the rest of the tree speaks.
+pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceType> {
+    use crate::config::SourceType;
+    Ok(match source_type(source_url)? {
+        "postgres" => SourceType::Postgres,
+        "mysql" => SourceType::Mysql,
+        "mssql" => SourceType::Mssql,
+        _ => SourceType::Mongo,
+    })
 }
 
 /// Default SQL Server schema when the user passes a bare table name.
@@ -685,6 +720,23 @@ pub fn init(
         }
     };
 
+    let needs_cursor = match format {
+        InitFormat::Yaml => {
+            yaml_scaffold::exports_marked(&text, yaml_scaffold::INIT_CURSOR_REVIEW_MARKER)
+        }
+        InitFormat::DiscoveryJson => Vec::new(),
+    };
+    if !needs_cursor.is_empty() {
+        eprintln!(
+            "{}",
+            cursor_missing_message(&needs_cursor, mode_override, table.is_none())
+        );
+    }
+    let runnable = needs_cursor.is_empty();
+    if matches!(format, InitFormat::Yaml) {
+        warn_marked_exports(&text);
+    }
+
     match output {
         Some(path) => {
             write_config_output(path, &text)?;
@@ -704,7 +756,7 @@ pub fn init(
             // Don't leave the user holding a cold artifact — show the path from
             // "I have a config" to "I have parquet files". Only for the YAML
             // scaffold (the discovery JSON isn't runnable).
-            if matches!(format, InitFormat::Yaml) {
+            if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
                     "{}",
                     next_steps_block(
@@ -722,7 +774,7 @@ pub fn init(
             // stdout stays pure (pipeable); the guidance still reaches the user
             // on stderr so `rivet init | tee rivet.yaml` isn't a dead end.
             print!("{text}");
-            if matches!(format, InitFormat::Yaml) {
+            if matches!(format, InitFormat::Yaml) && runnable {
                 eprint!(
                     "{}",
                     next_steps_block(
@@ -942,7 +994,8 @@ fn introspect_single_table(
             // — refuse rather than mislead; the database lives in the URL.
             reject_mongo_schema(schema_flag)?;
             let conn = mongo::connect(source_url, tls)?;
-            mongo::introspect(&conn, table_name)?
+            // The whole `--table`: a dot is part of a collection name, not a schema.
+            mongo::introspect(&conn, table)?
         }
         _ => unreachable!(),
     })
@@ -977,7 +1030,7 @@ fn init_yaml(
     if let Some(t) = table {
         let info = introspect_single_table(tls, source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
-        let snaps = vec![snapshot_of(&info, mode_override)];
+        let snaps = vec![snapshot_of(&info, mode_override, source_url)];
         let yaml = yaml_scaffold::generate_config(
             &info,
             source_url,
@@ -1007,7 +1060,7 @@ fn init_yaml(
     )?;
     let snaps = infos
         .iter()
-        .map(|i| snapshot_of(i, mode_override))
+        .map(|i| snapshot_of(i, mode_override, source_url))
         .collect();
     Ok((yaml, hint, snaps))
 }
@@ -1038,8 +1091,73 @@ fn mark_mssql_catalog_exact(info: &mut TableInfo) {
     });
 }
 
-fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::StrategySnapshot {
-    let d = yaml_scaffold::decided_strategy(info, mode_override);
+/// The line naming every export init could not give a cursor, with the ways out that apply to this invocation.
+fn cursor_missing_message(names: &[String], mode: Option<&str>, whole_schema: bool) -> String {
+    let key = if mode == Some("time_window") {
+        "time_column"
+    } else {
+        "cursor_column"
+    };
+    let way_out = if whole_schema {
+        format!(
+            ", or re-run init excluding them (`--exclude {}`)",
+            names.join(" ")
+        )
+    } else {
+        ", or re-run init with another `--mode`".to_string()
+    };
+    format!(
+        "rivet: {} export(s) have no timestamp column, so `{}` cannot give them a `{key}:` — \
+         the config will NOT load until you set one for each (search for `{}`){way_out}: {}",
+        names.len(),
+        mode.unwrap_or("this mode"),
+        yaml_scaffold::INIT_CURSOR_REVIEW_MARKER,
+        names.join(", "),
+    )
+}
+
+/// One line per informational marker, naming every export that carries it.
+fn warn_marked_exports(text: &str) {
+    let skipped = yaml_scaffold::skipped_tables(text);
+    if !skipped.is_empty() {
+        eprintln!(
+            "rivet: {} table(s) were left out of the config — see the `# SKIPPED` comments \
+             for why: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    for (marker, what) in [
+        (
+            yaml_scaffold::INIT_INSERT_ONLY_MARKER,
+            "use a cursor that does not change on UPDATE: updated rows are never re-exported \
+             (set `cursor_column:` to an updated_at-style column, or use `mode: cdc`)",
+        ),
+        (
+            yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER,
+            "have no integer column or keysettable primary key, so they were written as \
+             `mode: full` instead of `chunked`",
+        ),
+    ] {
+        let names = yaml_scaffold::exports_marked(text, marker);
+        if !names.is_empty() {
+            eprintln!(
+                "rivet: {} export(s) {what}: {}",
+                names.len(),
+                names.join(", ")
+            );
+        }
+    }
+}
+
+fn snapshot_of(
+    info: &TableInfo,
+    mode_override: Option<&str>,
+    source_url: &str,
+) -> crate::state::StrategySnapshot {
+    let keyset_form =
+        source_type(source_url).is_ok_and(|st| yaml_scaffold::table_form_ok(info, st));
+    let d = yaml_scaffold::decided_strategy(info, mode_override, keyset_form);
     crate::state::StrategySnapshot {
         export_name: info.table.clone(),
         source_schema: (!info.schema.is_empty()).then(|| info.schema.clone()),
@@ -1340,24 +1458,59 @@ fn record_primary_keys(
     if snapshots.is_empty() {
         return;
     }
-    let recorded = (|| -> Result<()> {
-        let config = crate::config::Config::load(config_path)?;
-        let store = crate::state::StateStore::open(config_path)?;
-        let mut src = crate::preflight::type_report::connect_source(&config, source_url, tls)?;
-        for s in snapshots {
-            let relation = relation_for_key(
-                &config.source.source_type,
-                s.source_schema.as_deref(),
-                &s.source_table,
-            );
-            if let Some(pk) = src.primary_key(&relation)? {
-                store.record_primary_key(&s.export_name, None, &pk)?;
+    let kind = match source_type_of(source_url) {
+        Ok(k) => k,
+        Err(e) => {
+            log::debug!("init: primary keys skipped (unreadable source url): {e:#}");
+            return;
+        }
+    };
+    let store = match crate::state::StateStore::open(config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("init: source primary keys not recorded (state store unavailable): {e:#}");
+            return;
+        }
+    };
+    let mut src = match crate::preflight::type_report::connect_source_of(kind, source_url, tls) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("init: source primary keys not recorded (source unreachable): {e:#}");
+            return;
+        }
+    };
+    let mut failed: Vec<&str> = Vec::new();
+    for s in snapshots {
+        let relation = relation_for_key(&kind, s.source_schema.as_deref(), &s.source_table);
+        match src.primary_key(&relation) {
+            Ok(Some(pk)) => {
+                if let Err(e) = store.record_primary_key(&s.export_name, None, &pk) {
+                    log::debug!(
+                        "init: primary key for '{}' not written: {e:#}",
+                        s.export_name
+                    );
+                    failed.push(&s.export_name);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::debug!(
+                    "init: primary key for '{}' unreadable: {e:#}",
+                    s.export_name
+                );
+                failed.push(&s.export_name);
             }
         }
-        Ok(())
-    })();
-    if let Err(e) = recorded {
-        log::warn!("init: source primary keys not recorded for `rivet load`: {e:#}");
+    }
+    if !failed.is_empty() {
+        log::warn!(
+            "init: source primary keys not recorded for {} of {} export(s) — `rivet load` \
+             will refuse those with `pk: auto` until you declare `pk:` in their `load:` \
+             block: {}",
+            failed.len(),
+            snapshots.len(),
+            failed.join(", ")
+        );
     }
 }
 
@@ -1380,6 +1533,111 @@ fn relation_for_key(
 
 #[cfg(test)]
 mod tests {
+    /// Recording primary keys must not re-load and re-VALIDATE the config.
+    #[test]
+    fn recording_primary_keys_does_not_validate_the_whole_config() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("fn record_primary_keys(")
+            .nth(1)
+            .expect("record_primary_keys still exists")
+            .split("\nfn ")
+            .next()
+            .expect("its body");
+
+        assert!(
+            !body.contains("Config::load("),
+            "record_primary_keys must not VALIDATE the config to record keys — one \
+             invalid export then costs every export its key. The source type comes \
+             from the URL (`source_type_of`), as everywhere else in init."
+        );
+        assert!(
+            body.contains("connect_source_of"),
+            "it should take the source by TYPE, not by a config it had to load"
+        );
+        assert!(
+            body.contains("failed.push"),
+            "one table rivet cannot read a key for must not cost the others theirs — \
+             collect the offenders and name them ALL, since reporting only the first \
+             makes finding N of them take N init runs"
+        );
+    }
+
+    /// Every export that needs a cursor is named at once, read from the scaffold text.
+    #[test]
+    fn every_skipped_table_is_named_from_its_comment() {
+        let cfg = "exports:\n  # SKIPPED Orders: its name cannot be a `table:` shortcut\n  \
+                   #   (wrapped)\n  - name: kept\n  # SKIPPED collection user-events: its name \
+                   cannot pass the `table:`\n";
+        assert_eq!(
+            yaml_scaffold::skipped_tables(cfg),
+            vec!["Orders".to_string(), "user-events".to_string()]
+        );
+        assert!(yaml_scaffold::skipped_tables("exports:\n  - name: a\n").is_empty());
+    }
+
+    #[test]
+    fn the_cursor_message_offers_exclude_only_to_a_whole_schema_init() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let schema = cursor_missing_message(&names, Some("incremental"), true);
+        assert!(schema.contains("(`--exclude a b`)"), "{schema}");
+        let one = cursor_missing_message(&names[..1], Some("time_window"), false);
+        assert!(
+            !one.contains("--exclude"),
+            "`--exclude` is ignored with `--table`: {one}"
+        );
+        assert!(
+            one.contains("`time_column:`") && one.contains("another `--mode`"),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn exports_needing_a_cursor_names_every_one_of_them() {
+        use super::yaml_scaffold::{INIT_CURSOR_REVIEW_MARKER, exports_marked};
+        let exports_needing_a_cursor = |t: &str| exports_marked(t, INIT_CURSOR_REVIEW_MARKER);
+        let cfg = format!(
+            "exports:\n\
+             \x20 - name: good_one\n    mode: incremental\n    cursor_column: updated_at\n\
+             \x20 - name: no_stamp_a\n    mode: incremental\n    # {m} — set cursor_column: <col> manually\n\
+             \x20 - name: also_good\n    mode: incremental\n    cursor_column: changed_at\n\
+             \x20 - name: no_stamp_b\n    mode: incremental\n    # {m} — set cursor_column: <col> manually\n",
+            m = INIT_CURSOR_REVIEW_MARKER
+        );
+        assert_eq!(
+            exports_needing_a_cursor(&cfg),
+            vec!["no_stamp_a".to_string(), "no_stamp_b".to_string()],
+            "every offender, in file order — naming only the first is what made \
+             finding three take three init runs"
+        );
+        assert!(
+            exports_needing_a_cursor("exports:\n  - name: fine\n    cursor_column: ts\n")
+                .is_empty(),
+            "a scaffold with no marker reports nothing"
+        );
+    }
+
+    /// The URL is the one source of truth for the engine, in both spellings.
+    #[test]
+    fn source_type_of_agrees_with_the_string_form_it_mirrors() {
+        use crate::config::SourceType;
+        for (url, want_str, want_enum) in [
+            ("postgresql://h/db", "postgres", SourceType::Postgres),
+            ("postgres://h/db", "postgres", SourceType::Postgres),
+            ("mysql://h/db", "mysql", SourceType::Mysql),
+            ("sqlserver://h/db", "mssql", SourceType::Mssql),
+            ("mssql://h/db", "mssql", SourceType::Mssql),
+            ("mongodb://h/db", "mongo", SourceType::Mongo),
+        ] {
+            assert_eq!(super::source_type(url).unwrap(), want_str, "{url}");
+            assert_eq!(super::source_type_of(url).unwrap(), want_enum, "{url}");
+        }
+        assert!(
+            super::source_type_of("redis://h").is_err(),
+            "an unsupported scheme must not silently resolve to an engine"
+        );
+    }
+
     /// SQL Server's temporal types are `datetime2`, `datetimeoffset` and
     /// `smalldatetime` — none EQUAL to `datetime`, which is all the predicate
     /// admitted. A `changed_at DATETIME2(6)` therefore scored zero as a cursor
@@ -2000,7 +2258,7 @@ mod tests {
             ),
         ];
         for (label, info) in cases {
-            let d = yaml_scaffold::decided_strategy(&info, None);
+            let d = yaml_scaffold::decided_strategy(&info, None, true);
             let yaml = yaml_scaffold::generate_config(
                 &info,
                 "postgresql://localhost/db",
@@ -2239,6 +2497,122 @@ mod tests {
         assert!(
             !yaml.contains("credentials_file"),
             "ADC / env key: YAML should omit credentials_file, got:\n{yaml}"
+        );
+    }
+
+    fn scaffold(info: &TableInfo, mode: Option<&str>) -> String {
+        let dest = InitYamlDestination {
+            gcs_bucket: None,
+            gcs_credentials_file: None,
+            s3_bucket: None,
+            s3_region: None,
+            bigquery_project: None,
+            bigquery_dataset: None,
+        };
+        yaml_scaffold::generate_config(
+            info,
+            "postgresql://localhost/db",
+            &super::SourceProvenance::Inline,
+            &dest,
+            mode,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn forced_chunked_on_a_keyless_table_is_written_as_full_not_a_phantom_id() {
+        let mut deleted_at = col("deleted_at", "timestamp", false);
+        deleted_at.is_nullable = true;
+        let info = make_table(
+            100,
+            vec![
+                col("email", "text", false),
+                deleted_at,
+                col("payload", "text", false),
+            ],
+        );
+        let yaml = scaffold(&info, Some("chunked"));
+        assert!(yaml.contains("    mode: full"), "got:\n{yaml}");
+        assert!(!yaml.contains("chunk_column"), "got:\n{yaml}");
+        assert_eq!(
+            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_NO_CHUNK_KEY_MARKER),
+            vec!["orders".to_string()]
+        );
+        let d = yaml_scaffold::decided_strategy(&info, Some("chunked"), true);
+        assert_eq!(
+            (d.mode.as_str(), d.kind),
+            ("full", "full"),
+            "snapshot agrees with the YAML"
+        );
+    }
+
+    #[test]
+    fn a_table_that_cannot_use_the_table_form_is_recorded_as_the_yaml_writes_it() {
+        let snapshot_kind = |info: &TableInfo| {
+            snapshot_of(info, Some("chunked"), "postgresql://localhost/db")
+                .strategy_kind
+                .unwrap()
+        };
+        let mut uuid_only =
+            make_table(100, vec![col("uid", "uuid", true), col("v", "text", false)]);
+        uuid_only.table = "Orders".into();
+        let yaml = scaffold(&uuid_only, Some("chunked"));
+        assert!(
+            yaml.contains("    mode: full"),
+            "no table: form, no keyset: {yaml}"
+        );
+        assert_eq!(snapshot_kind(&uuid_only), "full");
+
+        let mut with_int = make_table(
+            100,
+            vec![col("uid", "uuid", true), col("n", "bigint", false)],
+        );
+        with_int.table = "Orders".into();
+        let yaml = scaffold(&with_int, Some("chunked"));
+        assert!(yaml.contains("chunk_column: n"), "{yaml}");
+        assert_eq!(snapshot_kind(&with_int), "range");
+    }
+
+    #[test]
+    fn a_soft_delete_stamp_is_never_a_cursor_or_a_partition_key() {
+        let mut deleted_at = col("deleted_at", "timestamp", false);
+        deleted_at.is_nullable = true;
+        let only_tombstone = make_table(100, vec![col("email", "text", false), deleted_at.clone()]);
+        assert_eq!(only_tombstone.chosen_cursor_column(), None);
+        assert_eq!(only_tombstone.best_cursor_column(), None);
+        assert_eq!(only_tombstone.best_partition_column(), None);
+        let with_created = make_table(100, vec![deleted_at, col("created_at", "timestamp", false)]);
+        assert_eq!(
+            with_created.chosen_cursor_column().as_deref(),
+            Some("created_at")
+        );
+        assert_eq!(with_created.best_partition_column(), Some("created_at"));
+    }
+
+    #[test]
+    fn an_incremental_cursor_that_misses_updates_is_marked_insert_only() {
+        let by_id = make_table(
+            100,
+            vec![col("id", "bigint", true), col("v", "text", false)],
+        );
+        let yaml = scaffold(&by_id, Some("incremental"));
+        assert_eq!(
+            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_INSERT_ONLY_MARKER),
+            vec!["orders".to_string()],
+            "got:\n{yaml}"
+        );
+        let by_stamp = make_table(
+            100,
+            vec![
+                col("id", "bigint", true),
+                col("updated_at", "timestamp", false),
+            ],
+        );
+        let yaml = scaffold(&by_stamp, Some("incremental"));
+        assert!(
+            yaml_scaffold::exports_marked(&yaml, yaml_scaffold::INIT_INSERT_ONLY_MARKER).is_empty(),
+            "got:\n{yaml}"
         );
     }
 

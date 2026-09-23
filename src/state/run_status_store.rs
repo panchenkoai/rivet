@@ -125,6 +125,15 @@ impl StateStore {
             .next())
     }
 
+    /// The destination prefix one run recorded at its start, or `None` when the ledger never saw it.
+    pub fn run_prefix_of(&self, run_id: &str) -> Result<Option<String>> {
+        let sql = "SELECT prefix FROM run_status WHERE run_id = ?1";
+        Ok(self
+            .query(sql, &[run_id.into()], |r| r.text(0))?
+            .into_iter()
+            .next())
+    }
+
     /// The run-status rows, newest first — `rivet state runs`. `running_only`
     /// narrows to the rows that can freeze a prefix (gc/cleanup read them).
     pub fn recent_run_status(&self, last: usize, running_only: bool) -> Result<Vec<RunStatusRow>> {

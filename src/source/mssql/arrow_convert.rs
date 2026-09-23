@@ -25,6 +25,40 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use tiberius::{Column, ColumnData, ColumnType, Row};
 
+/// Whether a cell is SQL NULL, whatever its wire type.
+fn is_null_cell(c: &ColumnData<'_>) -> bool {
+    matches!(
+        c,
+        ColumnData::U8(None)
+            | ColumnData::I16(None)
+            | ColumnData::I32(None)
+            | ColumnData::I64(None)
+            | ColumnData::F32(None)
+            | ColumnData::F64(None)
+            | ColumnData::Bit(None)
+            | ColumnData::String(None)
+            | ColumnData::Guid(None)
+            | ColumnData::Binary(None)
+            | ColumnData::Numeric(None)
+            | ColumnData::Xml(None)
+            | ColumnData::DateTime(None)
+            | ColumnData::SmallDateTime(None)
+            | ColumnData::Time(None)
+            | ColumnData::Date(None)
+            | ColumnData::DateTime2(None)
+            | ColumnData::DateTimeOffset(None)
+    )
+}
+
+/// The wire type of a cell, for an error message.
+fn cell_type_name(c: &ColumnData<'_>) -> String {
+    format!("{c:?}")
+        .split('(')
+        .next()
+        .unwrap_or("?")
+        .to_string()
+}
+
 use crate::error::Result;
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
@@ -357,6 +391,14 @@ fn build_array(
                         value_within_ceiling(column, s.len(), max_value_bytes)?;
                         b.append_value(s.as_ref());
                     }
+                    Some(other) if !is_null_cell(other) => anyhow::bail!(
+                        "column `{column}` is declared text (`columns: {column}: string`) but SQL \
+                         Server sends it as {} — rivet does not convert it, and writing it as NULL \
+                         would lose every value. Remove the `string` override: rivet reads this \
+                         type natively. (A server-side CAST to nvarchar rounds float, money and \
+                         datetime.)",
+                        cell_type_name(other)
+                    ),
                     _ => b.append_null(),
                 }
             }
@@ -513,8 +555,9 @@ fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
             "mssql money value {v} exceeds the range representable without precision loss \
              (|value| ≥ 2^53 ÷ 10^{scale} ≈ {:.3e}). tiberius decodes MONEY as f64, so this \
              value was already rounded before rivet read it — it cannot be recovered here. \
-             Declare the column as text to preserve the exact digits, e.g. \
-             columns: <name>: string",
+             Convert it to text on the server with all four decimals: select \
+             CONVERT(nvarchar(40), <name>, 2) AS <name> in the export's `query:` (a plain \
+             CAST keeps only two).",
             9_007_199_254_740_992.0 / 10f64.powi(scale as i32),
         );
     }
@@ -717,6 +760,15 @@ impl crate::source::value_checksum::CellSource for MssqlCellSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_null_cell_is_null_whatever_its_wire_type() {
+        assert!(is_null_cell(&ColumnData::F64(None)));
+        assert!(is_null_cell(&ColumnData::DateTime2(None)));
+        assert!(!is_null_cell(&ColumnData::F64(Some(12.5))));
+        assert!(!is_null_cell(&ColumnData::I64(Some(0))));
+        assert_eq!(cell_type_name(&ColumnData::F64(Some(1.0))), "F64");
+    }
 
     // ROAST-RED mssql-rescale-loud: rescale_i128's down-scale arm does plain
     // integer division (`value / factor`), silently truncating non-zero

@@ -1,0 +1,33 @@
+# Every name the live tests, the harness and the release gate use on the stand and in the cloud.
+# Rust reads it through tests/common/registry.rs, Python through dev/pytools/registry.py;
+# tests/offline/stand_registry_guard.rs fails when a hard-coded copy drifts from it.
+
+# Objects a test creates carry this suffix (tests/common::unique_name): `<prefix>_<pid>_<n>`.
+# The sweep drops one only when <pid> is no longer a running process.
+test_object_suffix: '_([0-9]+)_[0-9]+$'
+
+sources:
+  postgres:     {container: rivet-postgres-1,     url: "postgresql://rivet:rivet@127.0.0.1:5432/rivet"}
+  postgres_cdc: {container: rivet-postgres-cdc-1, url: "postgresql://rivet:rivet@127.0.0.1:5434/rivet"}
+  mysql:        {container: rivet-mysql-1,        url: "mysql://rivet:rivet@127.0.0.1:3306/rivet"}
+  mysql_cdc:    {container: rivet-mysql-cdc-1,    url: "mysql://rivet:rivet@127.0.0.1:3307/rivet"}
+  mssql:        {container: rivet-mssql-1,        url: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet"}
+  mssql_cdc:    {container: rivet-mssql-cdc-1,    url: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet"}
+  mongo:        {container: rivet-mongo-1,        url: "mongodb://127.0.0.1:27017"}
+  mongo_rs:     {container: rivet-mongo-rs-1,     url: "mongodb://127.0.0.1:27018/?directConnection=true"}
+
+# Persistent databases on every source: `rivet` (tests, gate) and `rivet_bench` (the seeded
+# 1M-row harness fixture, expensive to rebuild). Nothing else is permanent.
+databases: [rivet, rivet_bench]
+
+bigquery:
+  project: rivet-data-tool
+  location: US
+  # The only permanent dataset: live tests and the harness, tables named per test.
+  e2e: rivet_e2e
+  # Every other dataset a test or gate cell creates starts with this; the sweep may drop
+  # them all (only when no gate or live run is in flight — it is opt-in).
+  tmp_prefix: rivet_tmp_
+
+gcs:
+  bucket: rivet_data_test

@@ -188,6 +188,20 @@ impl AdcCredentials {
         }
     }
 
+    /// A key that tells two identities apart even when they share a public principal (every `gcloud` user login shares one OAuth client id); never logged.
+    pub(crate) fn cache_key(&self) -> String {
+        let secret = match self {
+            Self::User(u) => u.refresh_token.as_bytes(),
+            Self::ServiceAccount(sa) => sa.private_key_pem.as_bytes(),
+        };
+        format!(
+            "{}|{}|{:016x}",
+            self.credential_kind(),
+            self.principal(),
+            xxhash_rust::xxh3::xxh3_64(secret)
+        )
+    }
+
     /// The project billed for API quota, when the credential names one. A
     /// service account is billable on its own, so it never does — and it must
     /// not be given a fabricated one (see
@@ -720,22 +734,26 @@ impl BlockingAdcTokenSource {
 
     /// A live access token: the cached one while it has more than
     /// [`REFRESH_THRESHOLD`] of life left, otherwise a fresh refresh_token grant.
+    /// A fresh token, minted at most once however many threads ask concurrently.
     pub(crate) fn access_token(&self) -> Result<Zeroizing<String>> {
-        if let Some(t) = self.cached(Instant::now()) {
-            return Ok(t);
-        }
-        self.mint()
-    }
-
-    fn cached(&self, now: Instant) -> Option<Zeroizing<String>> {
-        let cache = self.minted.lock().expect("ADC token cache poisoned");
-        cache
+        let mut cache = self.minted.lock().expect("ADC token cache poisoned");
+        if let Some(fresh) = cache
             .as_ref()
-            .filter(|c| token_still_fresh(c.minted_at, c.expires_in_secs, now))
-            .map(|c| c.token.clone())
+            .filter(|c| token_still_fresh(c.minted_at, c.expires_in_secs, Instant::now()))
+        {
+            return Ok(fresh.token.clone());
+        }
+        let (token, expires_in) = self.request_token()?;
+        *cache = Some(MintedAccessToken {
+            token: token.clone(),
+            minted_at: Instant::now(),
+            expires_in_secs: expires_in,
+        });
+        Ok(token)
     }
 
-    fn mint(&self) -> Result<Zeroizing<String>> {
+    /// One round trip to the token endpoint; the caller caches the result.
+    fn request_token(&self) -> Result<(Zeroizing<String>, u64)> {
         log::info!(
             "BigQuery: minting an access token from ADC {} credentials ({})",
             self.creds.credential_kind(),
@@ -759,16 +777,7 @@ impl BlockingAdcTokenSource {
 
         let payload = resp.text().context("reading token response")?;
         let (access_token, expires_in) = parse_token_response(&payload)?;
-        let token = Zeroizing::new(access_token);
-        {
-            let mut cache = self.minted.lock().expect("ADC token cache poisoned");
-            *cache = Some(MintedAccessToken {
-                token: token.clone(),
-                minted_at: Instant::now(),
-                expires_in_secs: expires_in,
-            });
-        }
-        Ok(token)
+        Ok((Zeroizing::new(access_token), expires_in))
     }
 }
 
@@ -1445,5 +1454,61 @@ qPSokX7fAC0Ku7S5xJe4XfPd
                        "subject_token_type":"urn:ietf:params:oauth:token-type:jwt",
                        "token_url":"https://sts.googleapis.com/v1/token"}"#;
         assert!(parse_adc_file(json).unwrap().is_none());
+    }
+
+    /// Concurrent callers on a cold cache mint ONE token, not one each.
+    #[test]
+    fn concurrent_callers_on_a_cold_cache_mint_exactly_one_token() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/token", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                served.fetch_add(1, Ordering::SeqCst);
+                // Slow enough that unsynchronised callers would overlap.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let body = r#"{"access_token":"tok","expires_in":3600}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let creds = parse_adc_file(&sa_json(Some(&uri), TEST_RSA_PKCS8_PEM))
+            .unwrap()
+            .unwrap();
+        let src = Arc::new(BlockingAdcTokenSource::new(
+            creds,
+            reqwest::blocking::Client::new(),
+        ));
+        const WORKERS: usize = 8;
+        let start = Arc::new(Barrier::new(WORKERS));
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let (src, start) = (Arc::clone(&src), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    src.access_token().map(|t| t.to_string())
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().unwrap(), "tok");
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "{WORKERS} concurrent callers on a cold cache must share one mint"
+        );
     }
 }
