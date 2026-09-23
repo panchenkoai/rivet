@@ -1507,6 +1507,29 @@ pub(super) fn run_mode_label(peak: usize, processes: bool) -> &'static str {
 /// So the split case CANCELS the pointer explicitly instead of going quiet. The
 /// plain case keeps the one-line message it always had — there is nothing
 /// pointing at the schedule to retract.
+/// Does this export DOMINATE the pool floor (more than its fair share of the
+/// predicted total across `m` slots) while being heavy (not `parallel_safe`)?
+fn dominates_as_heavy(predicted_secs: f64, total: f64, m: usize, parallel_safe: bool) -> bool {
+    predicted_secs > total / (m.max(1) as f64) && !parallel_safe
+}
+
+/// Signed error of the actual makespan against the prediction, in percent (0 when
+/// there was no prediction).
+fn makespan_error_pct(actual_secs: f64, predicted_secs: f64) -> f64 {
+    if predicted_secs > 0.0 {
+        (actual_secs - predicted_secs) / predicted_secs * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Is this a `--split` unit of the giant (its name under `unit_prefix`) that did
+/// NOT finish its share? `skipped` finished it: its range was empty.
+fn split_unit_failed(unit_prefix: Option<&str>, summary: &RunSummary, ok: bool) -> bool {
+    unit_prefix.is_some_and(|p| summary.export_name.starts_with(p))
+        && !(ok && matches!(summary.status.as_str(), "success" | "skipped"))
+}
+
 fn nothing_to_run_message(split_noticed: bool) -> String {
     let base = "apply --pool: nothing to run (no exports, or all complete)";
     if split_noticed {
@@ -1922,7 +1945,7 @@ pub(crate) fn run_pool(
                 match items
                     .iter()
                     .max_by(|a, b| a.predicted_secs.total_cmp(&b.predicted_secs))
-                    .filter(|l| l.predicted_secs > total / (m.max(1) as f64) && !l.parallel_safe)
+                    .filter(|l| dominates_as_heavy(l.predicted_secs, total, m, l.parallel_safe))
                 {
                     Some(l) => log::warn!(
                         "apply --pool --split: '{}' dominates the pool floor but is HEAVY (not \
@@ -2266,11 +2289,7 @@ pub(crate) fn run_pool(
         "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
         actual_secs / 60.0,
         predicted_secs / 60.0,
-        if predicted_secs > 0.0 {
-            (actual_secs - predicted_secs) / predicted_secs * 100.0
-        } else {
-            0.0
-        },
+        makespan_error_pct(actual_secs, predicted_secs),
     );
 
     let mut summaries: Vec<RunSummary> = Vec::new();
@@ -2284,10 +2303,7 @@ pub(crate) fn run_pool(
     // per-export concurrency label is MEASURED from (see [`pool_export_modes`]).
     let mut pool_windows: Vec<(String, i64, i64)> = Vec::with_capacity(summaries.capacity());
     for (res, summary, (start_ms, end_ms)) in collected.into_inner().unwrap() {
-        if let Some(pfx) = &unit_prefix
-            && summary.export_name.starts_with(pfx.as_str())
-            && (res.is_err() || summary.status != "success")
-        {
+        if split_unit_failed(unit_prefix.as_deref(), &summary, res.is_ok()) {
             split_units_all_ok = false;
         }
         if let Err(e) = res {
@@ -2425,6 +2441,66 @@ fn first_name_collision<'a>(
         .iter()
         .find(|u| existing.iter().any(|e| e.name == u.name))
         .map(|u| u.name.as_str())
+}
+
+#[cfg(test)]
+mod pool_decision_tests {
+    use super::{RunSummary, dominates_as_heavy, makespan_error_pct, split_unit_failed};
+
+    #[test]
+    fn a_heavy_export_dominates_only_above_its_fair_share() {
+        assert!(
+            dominates_as_heavy(60.0, 100.0, 2, false),
+            "60 > 100/2 and heavy"
+        );
+        assert!(
+            !dominates_as_heavy(60.0, 100.0, 2, true),
+            "parallel_safe never dominates"
+        );
+        assert!(
+            !dominates_as_heavy(50.0, 100.0, 2, false),
+            "exactly the fair share"
+        );
+        assert!(
+            dominates_as_heavy(2.0, 1.5, 0, false),
+            "m=0 is one slot, not a divide-by-zero"
+        );
+    }
+
+    #[test]
+    fn makespan_error_is_signed_and_zero_without_a_prediction() {
+        assert_eq!(makespan_error_pct(150.0, 100.0), 50.0);
+        assert_eq!(makespan_error_pct(50.0, 100.0), -50.0);
+        assert_eq!(makespan_error_pct(50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_skipped_split_unit_finished_its_share() {
+        let unit = |name: &str, status: &str| RunSummary {
+            export_name: name.into(),
+            status: status.into(),
+            ..Default::default()
+        };
+        let p = Some("orders#");
+        assert!(!split_unit_failed(p, &unit("orders#1", "success"), true));
+        assert!(
+            !split_unit_failed(p, &unit("orders#1", "skipped"), true),
+            "empty range"
+        );
+        assert!(split_unit_failed(p, &unit("orders#1", "failed"), true));
+        assert!(
+            split_unit_failed(p, &unit("orders#1", "success"), false),
+            "errored"
+        );
+        assert!(
+            !split_unit_failed(p, &unit("users", "failed"), false),
+            "not a unit"
+        );
+        assert!(
+            !split_unit_failed(None, &unit("orders#1", "failed"), false),
+            "no split"
+        );
+    }
 }
 
 #[cfg(test)]

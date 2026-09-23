@@ -133,7 +133,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // `delete ! in run_pool` and `replace == with != in run_pool` had to be
     // triaged as separate entries: this ledger is the list of such entries
     // waiting to be written.
-    ("src/pipeline/run.rs::run_pool", 7, 1, 6, 2),
+    ("src/pipeline/run.rs::run_pool", 4, 0, 5, 0),
     // The CDC job's baseline pairing (2026-09-17). Its one remaining `||` is
     // `state.snapshot_done(..)? || dest.head("_SUCCESS")?.is_some()` — two I/O
     // reads whose SHORT-CIRCUIT is the point (the object-store HEAD is skipped
