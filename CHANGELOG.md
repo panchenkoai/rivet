@@ -35,6 +35,15 @@
   - `rivet init` on MongoDB leaves views and time-series collections out (their
     scans cannot keep a cursor open) and names them.
 
+- **`rivet check` / `rivet plan` read the relation `rivet init` writes.** init
+  quotes the table in its `query:` form (`[dbo].[t]`, `` `t` ``, `"public"."t"`),
+  and the diagnostics only understood bare names — so every such export lost its
+  catalog row estimate and its index probe: a small table read `DEGRADED`, and an
+  indexed chunk column `No index detected`. The measured row count they prefer
+  over the catalog is now taken only from a run of the same engine into the same
+  destination: on a shared state store a same-named export of another source
+  (another engine, another prefix) used to supply the figure.
+
 - **`rivet init` records every export's primary key, even when one export cannot
   be given a cursor.** Recording validated the whole generated config first, so a
   single cursor-less table (common under `--mode incremental`) left EVERY export

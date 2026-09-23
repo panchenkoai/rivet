@@ -1513,6 +1513,44 @@ mod tests {
         assert_eq!(memory_capped_parallel(4, 65_536, 1), 1);
     }
 
+    /// The relation `rivet check` recovers from init's OWN `query:` block, per engine — the shape its catalog probes key on.
+    #[test]
+    fn check_recovers_the_relation_from_the_query_init_writes() {
+        let dest = InitYamlDestination::default();
+        let cases = [
+            ("mssql", "dbo", "full", "dbo.rivet_type_matrix"),
+            ("mysql", "shop", "full", "rivet_type_matrix"),
+            ("postgres", "public", "incremental", "rivet_type_matrix"),
+        ];
+        for (engine, schema, mode, want) in cases {
+            let mut info = make_table(vec![col("id", "bigint"), col("updated_at", "timestamp")]);
+            info.schema = schema.into();
+            info.table = "rivet_type_matrix".into();
+            let block = export_block_lines(&info, engine, &dest, Some(mode), false, 0).join("\n");
+            let query: String = block
+                .lines()
+                .skip_while(|l| !l.trim_start().starts_with("query:"))
+                .skip(1)
+                .take_while(|l| l.starts_with("      "))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                !query.is_empty(),
+                "{engine}: init must write a query: block here:\n{block}"
+            );
+            let got = crate::preflight::table_from_simple_query(&query).map(|c| c.into_owned());
+            let got = got.map(|t| {
+                if want.contains('.') {
+                    t
+                } else {
+                    t.rsplit('.').next().unwrap().to_string()
+                }
+            });
+            assert_eq!(got.as_deref(), Some(want), "{engine}: {query}");
+        }
+    }
+
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
             density: None,

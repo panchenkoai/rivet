@@ -17,6 +17,7 @@ pub(crate) mod chunked;
 mod cli;
 pub(crate) mod commit;
 mod finalize;
+pub(crate) use finalize::destination_uri_for_manifest;
 pub(crate) mod frame;
 mod governor;
 pub(crate) mod ipc;

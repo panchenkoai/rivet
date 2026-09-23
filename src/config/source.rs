@@ -507,6 +507,11 @@ impl SourceType {
     pub fn is_sql(self) -> bool {
         !matches!(self, SourceType::Mongo)
     }
+
+    /// The engine as `export_metrics.source_type` records it (`postgres`, `mysql`, `mssql`, `mongo`).
+    pub fn ledger_label(self) -> String {
+        format!("{self:?}").to_lowercase()
+    }
 }
 
 /// Locate `user[:password]@` userinfo inside a standard URL.

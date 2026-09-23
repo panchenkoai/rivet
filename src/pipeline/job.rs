@@ -276,7 +276,7 @@ fn build_metric_row(
         schema_fingerprint: summary.schema_fingerprint.clone(),
         chunk_size,
         parallel,
-        source_type: Some(format!("{:?}", plan.source.source_type).to_lowercase()),
+        source_type: Some(plan.source.source_type.ledger_label()),
         destination_type: Some(plan.destination.destination_type.label().to_string()),
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         longest_chunk_ms: summary.journal.longest_chunk_ms(),

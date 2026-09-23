@@ -6,6 +6,8 @@ mod analysis;
 #[cfg(test)]
 pub(crate) use analysis::diagnose_mode_str;
 pub(crate) use analysis::overlay_measured_rows;
+#[allow(unused_imports)] // the binary's `init` tests
+pub(crate) use postgres::table_from_simple_query;
 pub(crate) mod cdc_health;
 pub(crate) mod cursor_expr;
 mod doctor;
@@ -385,7 +387,7 @@ pub fn check(
     if let Ok(state) = crate::state::StateStore::open(config_path) {
         for d in &mut diagnostics {
             if let Some(e) = exports.iter().find(|e| e.name == d.export_name) {
-                analysis::overlay_measured_rows(d, e, &state);
+                analysis::overlay_measured_rows(d, e, config.source.source_type, &state);
             }
         }
     }

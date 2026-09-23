@@ -26,6 +26,8 @@ pub struct ExportMetric {
     pub schema_changed: Option<bool>,
     /// v23 — decoded bytes READ from the source (0 for pre-v23 rows).
     pub bytes_read: i64,
+    /// The engine the run read (`SourceType::ledger_label`); `None` on rows older than the column.
+    pub source_type: Option<String>,
 }
 
 /// Every column written to one `export_metrics` row.
@@ -326,10 +328,7 @@ impl StateStore {
         export_name: &str,
         exclude_run_id: &str,
     ) -> Result<Option<ExportMetric>> {
-        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
-                    status, error_message, tuning_profile, format, mode, \
-                    files_produced, bytes_written, retries, validated, schema_changed, \
-                    bytes_read";
+        let cols = METRIC_COLUMNS;
         Ok(self
             .query(
                 &format!(
@@ -351,10 +350,7 @@ impl StateStore {
     /// exactly during the degraded period the pool predictor and the
     /// run-over-run regression baseline exist for (bughunt 2026-08-13).
     pub fn get_last_success_metric(&self, export_name: &str) -> Result<Option<ExportMetric>> {
-        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
-                    status, error_message, tuning_profile, format, mode, \
-                    files_produced, bytes_written, retries, validated, schema_changed, \
-                    bytes_read";
+        let cols = METRIC_COLUMNS;
         Ok(self
             .query(
                 &format!(
@@ -376,10 +372,7 @@ impl StateStore {
     ) -> Result<Vec<ExportMetric>> {
         // One projection, written once for both backends (was duplicated per arm).
         let extract = metric_from_row;
-        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
-                    status, error_message, tuning_profile, format, mode, \
-                    files_produced, bytes_written, retries, validated, schema_changed, \
-                    bytes_read";
+        let cols = METRIC_COLUMNS;
         match export_name {
             Some(name) => self.query(
                 &format!(
@@ -399,6 +392,11 @@ impl StateStore {
 
 /// Shared row→struct projection for every `export_metrics` query, written once
 /// for both state backends.
+/// The columns [`metric_from_row`] reads by POSITION — one list for every query it projects.
+const METRIC_COLUMNS: &str = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
+    status, error_message, tuning_profile, format, mode, files_produced, bytes_written, retries, \
+    validated, schema_changed, bytes_read, source_type";
+
 fn metric_from_row(r: &dyn super::row::StateRow) -> ExportMetric {
     ExportMetric {
         export_name: r.text(0),
@@ -418,6 +416,7 @@ fn metric_from_row(r: &dyn super::row::StateRow) -> ExportMetric {
         validated: r.opt_bool(14),
         schema_changed: r.opt_bool(15),
         bytes_read: r.opt_i64(16).unwrap_or(0),
+        source_type: r.opt_text(17),
     }
 }
 

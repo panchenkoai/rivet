@@ -75,7 +75,8 @@ fn diagnose_mysql(
 
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    let base_table = preflight_base_table(export, base_query);
+    let base_table_owned = preflight_base_table(export, base_query);
+    let base_table = base_table_owned.as_deref();
     // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
     // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
     // probe target the SAME column, not a `?` placeholder on a PK-indexed table.
