@@ -299,16 +299,29 @@ def compare_to_bigquery(
     from .duck import Oracle
 
     attach, prefix = source_attach(engine, url)
-    warehouse = f"bq.{dataset}.{warehouse_table or table}"
     with Oracle(bigquery=True, **attach) as ora:
-        bad = invalid_text_columns(ora, warehouse)
-        if bad:
-            return 0, [f"STRING column(s) {bad} hold bytes that are not UTF-8 — unreadable as text"]
-        src = fetch(ora, source_select(ora, f"{prefix}.{table}"))
-        dst = fetch(ora, f"SELECT * FROM {warehouse} ORDER BY id")
-        padded = pg_padded_columns(ora, table) if engine == "postgres" else frozenset()
-        bits = mysql_bit_columns(ora, prefix.split(".", 1)[1], table) if engine == "mysql" else frozenset()
-        return len(dst), diff_rows(src, dst, padded=padded, bits=bits)
+        return _rows_against_source(ora, engine, prefix, table, f"bq.{dataset}.{warehouse_table or table}")
+
+
+def compare_rows_to_parquet(engine: str, url: str, table: str, parquet: str) -> tuple[int, list[str]]:
+    """(delivered rows, differences) between the source table and a `read_parquet(...)` relation, every value in canonical form."""
+    from .duck import Oracle
+
+    attach, prefix = source_attach(engine, url)
+    with Oracle(**attach) as ora:
+        return _rows_against_source(ora, engine, prefix, table, f"(SELECT * FROM {parquet})")
+
+
+def _rows_against_source(ora, engine: str, prefix: str, table: str, dest: str) -> tuple[int, list[str]]:
+    """`diff_rows` of the source table against `dest` in one session; unreadable text is a finding."""
+    bad = invalid_text_columns(ora, dest)
+    if bad:
+        return 0, [f"STRING column(s) {bad} hold bytes that are not UTF-8 — unreadable as text"]
+    src = fetch(ora, source_select(ora, f"{prefix}.{table}"))
+    dst = fetch(ora, f"SELECT * FROM {dest} ORDER BY id")
+    padded = pg_padded_columns(ora, table) if engine == "postgres" else frozenset()
+    bits = mysql_bit_columns(ora, prefix.split(".", 1)[1], table) if engine == "mysql" else frozenset()
+    return len(dst), diff_rows(src, dst, padded=padded, bits=bits)
 
 
 def _self_test() -> None:

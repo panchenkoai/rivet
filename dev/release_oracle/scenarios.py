@@ -886,17 +886,19 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
         for tmt in ("rivet_type_matrix",):
             if _export_local(engine, url, tmt, out / tmt, "full").ok:
                 psrc = _declared_read(out / tmt, ".parquet")
-                got = (
-                    _duckdb_json_normalized(
-                        f"SELECT * FROM read_parquet({psrc}) ORDER BY id"
-                    )
-                    if psrc
-                    else ""
-                )
-                if not got:
+                if not psrc:
                     fails += f"{tmt}-readback "
-                elif not _fidelity_check(engine, tmt, got):
-                    fails += f"{tmt}-TYPE-DIVERGED "
+                else:
+                    # The source is the expected value — a golden rendered by one DuckDB version graded the reader, not rivet.
+                    from .value_diff import compare_rows_to_parquet
+
+                    try:
+                        n, diffs = compare_rows_to_parquet(engine, url, tmt, f"read_parquet({psrc})")
+                    except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL
+                        fails += f"{tmt}-oracle-error({str(e)[:160]}) "
+                    else:
+                        if not n or diffs:
+                            fails += f"{tmt}-VALUES-DIFFER(rows={n} {diffs[:2]}) "
             else:
                 fails += f"{tmt}-export "
 
@@ -952,7 +954,7 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     if not fails:
         _passed(
             led, engine, tag, "integrity_types", "-",
-            "integrity+types (loss/dup 0, type matrices match DuckDB golden)",
+            "integrity+types (loss/dup 0, type matrix values equal the source, CSV matches its golden)",
         )
     else:
         _failed(led, engine, tag, "integrity_types", "-", f"integrity+types: {fails}", fails)

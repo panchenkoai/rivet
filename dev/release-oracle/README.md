@@ -19,7 +19,7 @@ python3 -m dev.release_oracle --engines postgres,mysql
 | scenario | asserts |
 |---|---|
 | **verdicts** | `init` picks the right strategy for **every seed AND garbage table** (both, per engine), checked against a committed golden (`golden/verdicts.json`): clean-PK seeds → **keyset**, `orders_sparse` → full, garbage `decimal_key` → full-bail, `ref_id_history` → range (non-unique), `unindexed_id` → **not** keyset (name-trap), `bigint_pk` → keyset; **zero** phantom heavy-chunk warnings. PG/MSSQL garbage lives in schema `ext` (a second init); MySQL in the same DB. Mongo → full. |
-| **integrity+types** | (1) users 150K loss/dup: source count+distinct == DuckDB read of the parts. (2) a per-engine DuckDB **golden** (`golden/duckdb_type_matrix.json`) with **two fidelity arguments per type matrix**: `<tmt>` = PARQUET readback (binary/typed — decimal, uuid, timestamp, enum) and `<tmt>__csv` = CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null; an array column CSV can't represent records a *refusal* sentinel, itself the guarantee of no silent lossy array→CSV). Both read by DuckDB, never rivet. |
+| **integrity+types** | (1) users 150K loss/dup: source count+distinct == DuckDB read of the parts. (2) `<tmt>` = the PARQUET readback compared **value by value to the source table** in one DuckDB session (`value_diff.compare_rows_to_parquet` — decimal, uuid, timestamp, enum, arrays, float4; no golden) and `<tmt>__csv` = a per-engine DuckDB **golden** (`golden/duckdb_type_matrix.json`) of the CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null; an array column CSV can't represent records a *refusal* sentinel, itself the guarantee of no silent lossy array→CSV). Both read by DuckDB, never rivet. |
 | **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source, then one DuckDB session attaches the source and compares **every value** of the declared parts (`value_diff.compare_to_parquet`; Mongo's `document` JSON is unpacked into the source's columns). A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
 | **gc_survival** | the concurrent-extract bucket-erasure guard (spare an in-flight part while a run is active, delete a true orphan). Runs in the BigQuery stage (needs a warehouse load target). |
 
@@ -322,7 +322,7 @@ lib/parse_verdicts.py    # parse `rivet check` → {table: {strategy, verdict}}
 lib/gcs_pull.py          # independent fake-gcs readback (no gsutil needed)
 lib/normalize_bq.py      # canonicalize a read-back for the golden diff
 golden/verdicts.json               # blessed strategy+verdict of every seed+garbage table per engine
-golden/duckdb_type_matrix.json     # blessed per-engine type + CSV-fidelity round-trip (local oracle)
+golden/duckdb_type_matrix.json     # blessed per-engine CSV-fidelity round-trip (local oracle)
 ```
 
 Re-bless the local goldens (verdicts + DuckDB type/fidelity) on purpose with

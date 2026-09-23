@@ -113,7 +113,7 @@ scenarios:
     applies: [postgres, mysql, mssql, mongo]
 
   - id: integrity_types
-    what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS a per-engine DuckDB GOLDEN with TWO fidelity arguments per type matrix: <tmt> = PARQUET readback (binary/typed path — decimal precision, uuid, timestamp, enum) and <tmt>__csv = CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only."
+    what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS two fidelity arguments per type matrix: <tmt> = the PARQUET readback compared value by value to the SOURCE table (value_diff.compare_rows_to_parquet — decimal precision, uuid, timestamp, enum, arrays, float4; no golden) and <tmt>__csv = a per-engine DuckDB GOLDEN of the CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only."
     applies: [postgres, mysql, mssql, mongo]
 
   - id: keyset_parallel
