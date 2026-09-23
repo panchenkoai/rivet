@@ -59,6 +59,7 @@ try:  # imported as part of the package
         docker_exec,
         port_of,
         rivet,
+        rivet_bin,
         wait_until,
     )
 except ImportError:  # run directly out of dev/release_oracle/
@@ -72,6 +73,7 @@ except ImportError:  # run directly out of dev/release_oracle/
         docker_exec,
         port_of,
         rivet,
+        rivet_bin,
         wait_until,
     )
 
@@ -1120,7 +1122,21 @@ def verify_cdc_differential(led: "Ledger") -> None:
         return
 
     led.phase("CDC differential [rivet vs Debezium] (same window, compared in DuckDB)")
-    for eng in ("postgres", "mysql", "mssql", "mongo"):
+    engines = ("postgres", "mysql", "mssql", "mongo")
+    # Engines in parallel, scenarios in order within one: each engine has its own
+    # source server and its own table name, so the reference containers never collide.
+    children = {eng: led.buffered_child() for eng in engines}
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(engines)) as ex:
+        list(ex.map(lambda eng: _differential_engine(children[eng], eng, runner), engines))
+    for eng in engines:
+        children[eng].flush_into(led)
+
+
+def _differential_engine(led: "Ledger", eng: str, runner: Path) -> None:
+    """Every differential scenario for one engine, in order, graded into `led`."""
+    with led.span(f"differential {eng}"):
         for scen in _DIFFERENTIAL_SCENARIOS:
             # The timeout is a GRADED outcome, never an uncaught exception: a hung
             # harness (rivet run has no inner timeout; a bound regression hangs it)
@@ -1129,9 +1145,13 @@ def verify_cdc_differential(led: "Ledger") -> None:
             # row, the one failure mode with no SKIP path. Directly contradicted
             # the design statement two branches below.
             try:
+                # RIVET_BIN: the release binary this gate grades — run.py's own default
+                # is `./target/debug/rivet`, a different artifact.
                 r = subprocess.run(
-                    [sys.executable, str(runner), "--engine", eng, "--scenario", scen],
+                    [sys.executable, str(runner), "--engine", eng, "--scenario", scen,
+                     "--table", f"oracle_t_{eng}"],
                     capture_output=True, text=True, timeout=900,
+                    env={**os.environ, "RIVET_BIN": str(rivet_bin())},
                 )
             except subprocess.TimeoutExpired as t:
                 led.failed(eng, "cdc", f"differential:{scen}", "-",

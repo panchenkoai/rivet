@@ -331,13 +331,15 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
         shutil.rmtree(stale, ignore_errors=True)
     for lock in Path("/tmp").glob(".rivet_cdc_sweep*.lock"):
         lock.unlink(missing_ok=True)
-    if fast:
-        # Delete ONLY the poison directory; cargo's honest fingerprints do the rest.
-        shutil.rmtree(ROOT / "target" / "package", ignore_errors=True)
-    elif not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
+    # `target/package` is the one known liar either way. Full mode also rebuilds the
+    # RELEASE profile — the binary this gate grades — from nothing; the test and
+    # coverage profiles keep their caches (cargo's fingerprints grade them honestly,
+    # and wiping them cost every later cargo stage a cold build).
+    shutil.rmtree(ROOT / "target" / "package", ignore_errors=True)
+    if not fast and not run(["cargo", "clean", "--release"], cwd=ROOT, timeout=600).ok:
         led.failed("-", "-", "clean_tree", "-",
-                   "clean tree: `cargo clean` failed — the gate cannot vouch for the binary it "
-                   "is about to grade")
+                   "clean tree: `cargo clean --release` failed — the gate cannot vouch for "
+                   "the binary it is about to grade")
         return False
     build = run(["cargo", "build", "--release"], cwd=ROOT, timeout=3600)
     if not build.ok or not rivet_bin().is_file():
@@ -348,7 +350,8 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
         )
         return False
     how = ("target/package removed (fast: cargo fingerprints trusted, binary=HEAD)"
-           if fast else "target/ removed and the release binary rebuilt from nothing")
+           if fast else "release profile + target/package removed and the release binary "
+           "rebuilt from nothing")
     led.passed(
         "-", "-", "clean_tree", "-",
         f"clean tree: {how} ({rivet_bin()})",

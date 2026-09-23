@@ -117,3 +117,11 @@ def gcs_delete_prefix(bucket: str, prefix: str) -> int:
         page = b.get("nextPageToken", "")
         if not page:
             return n
+
+
+def gcs_delete_prefixes(bucket: str, prefixes: list[str]) -> int:
+    """`gcs_delete_prefix` over several independent prefixes at once; the total deleted."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(16, len(prefixes) or 1)) as ex:
+        return sum(ex.map(lambda p: gcs_delete_prefix(bucket, p), prefixes))

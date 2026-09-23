@@ -16,7 +16,7 @@ Rig against the gate's binary, so the oracles are the test's: the source, `bq`,
 and the state DB read with a plain Postgres client.
 
 SKIP — never a silent pass — without cargo, the Postgres state URL, the BigQuery
-project/bucket or the `bq` CLI.
+project/bucket or `gcloud` (the REST token).
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     proj = os.environ.get("BQ_ORACLE_PROJECT") or run(["gcloud", "config", "get-value", "project"]).stdout.strip()
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     missing = [w for w, ok in (
-        ("cargo", have("cargo")), ("bq", have("bq")),
+        ("cargo", have("cargo")), ("gcloud", have("gcloud")),
         ("Postgres state URL", state.startswith("postgres")), ("BigQuery project", bool(proj)),
     ) if not ok]
     if missing:

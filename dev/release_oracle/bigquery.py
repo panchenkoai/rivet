@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import gcp
 from .core import (
     ROOT,
     Ledger,
@@ -323,11 +324,9 @@ def verify_load_pool(led: Ledger, *, proj: str, dset: str, bucket: str, work: Pa
     # A leftover prefix from an earlier gate run would be loaded alongside this
     # one's and the read-back would compare a union. init fixes the prefix at
     # `exports/<table>/`, so the wipe is by table name rather than by a token.
-    for t in tables:
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/exports/{t}"], timeout=300)
-    run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", pool_dset], timeout=600)
-    run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{pool_dset}"],
-        timeout=600)
+    gcp.gcs_delete_prefixes(bucket, [f"exports/{t}/" for t in tables])
+    gcp.bq_delete_dataset(proj, pool_dset)
+    gcp.bq_ensure_dataset(proj, pool_dset)
 
     cfg = work / f"load_pool_{engine}.yaml"
     gen = rivet("init", "--source-env", "ORACLE_URL",
@@ -447,9 +446,8 @@ def verify_load_pool(led: Ledger, *, proj: str, dset: str, bucket: str, work: Pa
                f"history shows {peak} of {len(spans)} LOAD_DATA jobs in flight at once",
                f"peak={peak}/{len(spans)}")
 
-    run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", pool_dset], timeout=600)
-    for t in tables:
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/exports/{t}"], timeout=300)
+    gcp.bq_delete_dataset(proj, pool_dset)
+    gcp.gcs_delete_prefixes(bucket, [f"exports/{t}/" for t in tables])
     docker_exec(name, "psql", "-U", "rivet", "-d", "rivet", "-q",
                 stdin="".join(f"DROP TABLE IF EXISTS {t};" for t in tables), timeout=600)
 
@@ -661,7 +659,7 @@ def _bq_one_engine(
     # independent and the ownership guard stays ARMED. This independence is what makes
     # the outer loop safe to parallelise.
     eng_dset = f"{dset}_{engine}"
-    run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{eng_dset}"])
+    gcp.bq_ensure_dataset(proj, eng_dset)
     pfx = f"release-oracle/bq/{engine}"
     cfgf = work / f"bqload_{engine}.yaml"
     cfgf.write_text(
@@ -682,9 +680,9 @@ def _bq_one_engine(
 
     # Clear the prefix first: a leftover part from an earlier run would be loaded
     # alongside this one's and the read-back would compare a union.
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
     # And the table: a run killed before its cleanup strands it, and a fresh state DB refuses to overwrite it.
-    run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
+    gcp.bq_delete_table(proj, eng_dset, exp)
 
     got = ""
     child = {"ORACLE_URL": url}
@@ -723,9 +721,9 @@ def _bq_one_engine(
             verify_load_pool(led, proj=proj, dset=dset, bucket=bucket, work=work,
                              child=child, engine=engine, url=url)
 
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
     if not keep:
-        run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", f"{proj}:{eng_dset}"])
+        gcp.bq_delete_dataset(proj, eng_dset)
         docker("rm", "-fv", engine_container(engine, _TAG))
     return None
 
