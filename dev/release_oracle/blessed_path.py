@@ -707,7 +707,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # when that process ends"), on 5 cells: postgres 13/14/17, mongo 5/6. The guard
     # was right; the gate handed two concurrent processes one warehouse table. The
     # work dir and bucket prefix below already carried the tag; this did not.
-    dset = (os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate")
+    dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
             + f"_{engine}_{tag.replace('.', '_')}")
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:

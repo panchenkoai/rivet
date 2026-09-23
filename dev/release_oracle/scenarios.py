@@ -49,7 +49,8 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import HERE, ROOT, Ledger, Proc, Status, docker, docker_exec, have, rivet, rivet_bin, run
+    from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
+                       port_of, rivet, rivet_bin, run)
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
@@ -57,9 +58,11 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         Ledger,
         Proc,
         Status,
+        container_for_port,
         docker,
         docker_exec,
         have,
+        port_of,
         rivet,
         rivet_bin,
         run,
@@ -429,19 +432,6 @@ def _golden_put(path: Path, engine: str, key: str, got: str) -> None:
     path.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n")
 
 
-def _engine_container(engine: str) -> str | None:
-    """The running container for `engine`, ANY pinned version.
-
-    Found by name prefix rather than built from (engine, tag) because the callers
-    that need it do not carry the tag. Returns None instead of "" so no caller
-    can hand an empty name to `docker exec` ("invalid container name or ID").
-    """
-    for name in docker_names():
-        if name.startswith(f"rivet-oracle-eng-{engine}-"):
-            return name
-    return None
-
-
 def docker_names() -> list[str]:
     return docker("ps", "--format", "{{.Names}}").stdout.split()
 
@@ -590,14 +580,9 @@ def _store_env(url: str) -> dict[str, str]:
 
 # ── source-side oracles ──────────────────────────────────────────────────────
 def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> str:
-    """`"<count> <distinct>"` straight from the source engine's own client.
-
-    `url` is unused (as in the bash): the container is found by name, and each
-    engine's in-container client already knows its credentials. Empty when the
-    container is gone — no `docker exec ""`.
-    """
-    del url
-    container = _engine_container(engine)
+    """`"<count> <distinct>"` from the client inside the container publishing `url`'s port — never a sibling version's container; empty when none does."""
+    port = port_of(url)
+    container = container_for_port(port) if port else None
     if container is None:
         return ""
     if engine == "postgres":
@@ -1534,11 +1519,15 @@ def verify_live_only_coverage(led: Ledger) -> None:
          "cargo", "llvm-cov", "nextest", "--lcov", "--output-path", str(lcov)],
         timeout=NO_TIMEOUT,
     )
-    (work_dir() / "live_only_cov.log").write_text(build.out)
+    # Kept outside the run's work dir, which the gate deletes — the message must name a file that exists.
+    log = ROOT / "target" / "gate-failures" / f"live_only_cov-{os.getpid()}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(build.out)
     if not build.ok:
         _failed(
             led, "infra", "live-only", "coverage", "-",
-            "live-only-cov: the instrumented offline battery FAILED (see live_only_cov.log)",
+            f"live-only-cov: the instrumented offline battery FAILED: "
+            f"{_first_match(build.out, r'FAIL|panicked|error')} · full output: {log}",
             _first_match(build.out, r"FAILED|error"),
         )
         return

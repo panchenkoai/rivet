@@ -1136,7 +1136,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # rivet's lease guard on `rivet_blessed_postgres_repeat_gcs_postgres.users` and
     # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
-    dset = (os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate")
+    dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
             + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
