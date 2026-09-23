@@ -994,7 +994,8 @@ fn introspect_single_table(
             // — refuse rather than mislead; the database lives in the URL.
             reject_mongo_schema(schema_flag)?;
             let conn = mongo::connect(source_url, tls)?;
-            mongo::introspect(&conn, table_name)?
+            // The whole `--table`: a dot is part of a collection name, not a schema.
+            mongo::introspect(&conn, table)?
         }
         _ => unreachable!(),
     })
