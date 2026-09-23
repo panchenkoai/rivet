@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.28.0 — 2026-09-23
+
 - **Behaviour changes an operator upgrading from 0.27 will see.**
   - A `mode: full` load whose newest run exported 0 rows (the source was emptied)
     now EMPTIES the warehouse table (a free `TRUNCATE`, or a `CREATE` when there is
