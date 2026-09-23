@@ -447,16 +447,6 @@ impl RunSummary {
         self
     }
 
-    /// Test-only setter — record `files_committed` so resume-hint logic
-    /// (`pipeline::report`) can detect the "failed run with committed files"
-    /// path that produces a resume command.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn with_files_committed(mut self, n: usize) -> Self {
-        self.files_committed = n;
-        self
-    }
-
     /// Test-only setter — replace the recorded manifest parts (and adjust
     /// `total_rows` / `bytes_written` / `files_produced` to keep them
     /// consistent with the parts list, the way real production code does).

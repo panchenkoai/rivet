@@ -1,5 +1,5 @@
-//! Drift-guard for the coverage ledgers — `docs/chunking-matrix.yaml` and
-//! `docs/behaviour-matrix.yaml` (see [`MATRICES`]).
+//! Drift-guard for every coverage ledger in `docs/*-matrix.yaml` listed in
+//! [`MATRICES`] — not only the chunking one the file is named after.
 //!
 //! The sparse-key footgun shipped because a whole guard had ZERO engine-level
 //! tests and nobody noticed. This guard makes the ledgers self-protecting:

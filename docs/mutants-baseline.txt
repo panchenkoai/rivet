@@ -1318,7 +1318,7 @@ src/types/target.rs:96:70: replace == with != in ExportTarget::resolve_column
 # ACCEPTED, one verdict for the whole set: every entry is the stderr RENDERING
 # path — `print` -> `render_compact` -> `format_block` -> `*_row` — or a
 # `#[doc(hidden)] #[allow(dead_code)]` builder (`with_status`,
-# `with_files_committed`, `with_manifest_parts`) that production never reaches.
+# `with_manifest_parts`) that production never reaches.
 # The machine-readable artifact does not pass through any of them: `summary.json`
 # is serialized from the struct's fields (`src/pipeline/report.rs:195`), so a
 # mutation here can change a line an operator READS, never a value a consumer
@@ -1330,7 +1330,6 @@ src/pipeline/summary.rs:378:15: replace == with != in RunSummary::with_status
 src/pipeline/summary.rs:378:28: replace || with && in RunSummary::with_status
 src/pipeline/summary.rs:378:33: replace == with != in RunSummary::with_status
 src/pipeline/summary.rs:378:46: replace && with || in RunSummary::with_status
-src/pipeline/summary.rs:395:9: replace RunSummary::with_files_committed -> Self with Default::default()
 src/pipeline/summary.rs:405:9: replace RunSummary::with_manifest_parts -> Self with Default::default()
 src/pipeline/summary.rs:438:9: replace RunSummary::print with ()
 src/pipeline/summary.rs:461:9: replace RunSummary::print_stderr_block with ()
