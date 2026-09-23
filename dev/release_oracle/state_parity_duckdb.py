@@ -47,6 +47,7 @@ import shutil
 from pathlib import Path
 
 from .core import Ledger, have, run
+from ..pytools.duckcli import ARGV as DUCKDB
 
 # Written by the STORE, not by a run — the migration bookkeeping table is
 # `schema_version` on SQLite and `rivet_schema_version` on Postgres. Two names
@@ -77,7 +78,7 @@ def _duck(sql: str) -> tuple[str, bool]:
     """Run one DuckDB script; return (stdout, ok). The exit status is carried
     because an unreadable store must not read as an empty one — the defect this
     gate had in `concurrency._psql_state` and still has in `state_parity._psql`."""
-    p = run(["duckdb", "-noheader", "-list", "-c", sql])
+    p = run([*DUCKDB, "-noheader", "-list", "-c", sql])
     return (p.stdout.strip(), p.ok)
 
 

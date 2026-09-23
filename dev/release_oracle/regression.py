@@ -66,6 +66,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import scenarios
+from ..pytools.duckcli import ARGV as DUCKDB
 from ..pytools.ab_regression import (
     CASE_TIMEOUT as _AB_CASE_TIMEOUT,
     RIVET_RUNS_TOTAL as _AB_CHILD_RUNS,
@@ -676,7 +677,7 @@ INSERT INTO regr_probe SELECT g, md5(g::text), (g%1000)+0.25, '2025-01-01'::time
     # run's manifest names. A glob would also read parts it abandoned.
     _src = scenarios._declared_read(pe / "out", ".parquet")
     duck = run([
-        "duckdb", "-noheader", "-list", "-c",
+        *DUCKDB, "-noheader", "-list", "-c",
         f"SELECT count(*) FROM read_parquet({_src})",
     ]) if _src else None
     dcnt = duck.stdout.strip() if duck else ""

@@ -49,6 +49,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "dev"))
+from pytools.duckcli import ARGV as DUCKDB  # noqa: E402
 
 STATE_URL = os.environ.get(
     "RIVET_SWEEP_STATE_URL", "postgresql://rivet:rivet@localhost:5433/rivet_state"
@@ -267,7 +268,7 @@ def psql_state(sql: str) -> str:
 
 
 def duckdb(sql: str) -> str:
-    return sh(["duckdb", "-noheader", "-list", "-c", sql]).stdout.strip()
+    return sh([*DUCKDB, "-noheader", "-list", "-c", sql]).stdout.strip()
 
 
 def owned_by(export: str) -> str:

@@ -298,7 +298,7 @@ def source_parity(binary: str | Path | None = None) -> int:
             f"rivet not at {spelled} (cargo build --bin rivet, or set RIVET=)", code=2
         )
     if not shell.have("duckdb"):
-        raise shell.Fail("duckdb CLI not on PATH", code=2)
+        raise shell.Fail("the pinned duckdb package is not importable — run through `uv run`", code=2)
 
     t = Tally()
     out = Path(tempfile.mkdtemp(prefix="rivet-parity-batch-"))

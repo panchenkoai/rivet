@@ -50,6 +50,7 @@ from typing import Callable
 
 try:  # imported as part of the package
     from . import scenarios
+    from ..pytools.duckcli import ARGV as DUCKDB
     from .core import (
         HERE,
         ROOT,
@@ -510,7 +511,7 @@ def _duckdb(sql: str) -> str:
     """DuckDB as the INDEPENDENT reader. Empty output ⇒ no reader / no parts."""
     if not have("duckdb"):
         return ""
-    return run(["duckdb", "-noheader", "-list", "-c", sql]).stdout.strip()
+    return run([*DUCKDB, "-noheader", "-list", "-c", sql]).stdout.strip()
 
 
 def _store_readback(store: str, bkt: str, pfx: str, work: Path) -> str:

@@ -247,12 +247,12 @@ def chain_census(
         else:
             ora.db.sql(f"INSTALL sqlite; LOAD sqlite; ATTACH '{state}' AS st (TYPE sqlite, READ_ONLY)")
         mans = fetch(ora, f"SELECT * FROM read_json_auto('{root}/manifest-*.json', union_by_name = true)")
+        from .scenarios import success_part_names
+
         ok = [m for m in mans if str(m.get("status") or "success").lower() == "success"]
         run_ids = sorted({m["run_id"] for m in ok})
         declared = sorted({
-            p["path"] if str(p["path"]).startswith("gs://") else f"{root}/{p['path']}"
-            for m in ok for p in (m.get("parts") or [])
-            if str(p.get("status") or "committed") == "committed"
+            n if n.startswith("gs://") else f"{root}/{n}" for m in ok for n in success_part_names(m)
         })
         held = sorted(r[0] for r in ora.db.sql(f"SELECT file FROM glob('{root}/**/*.parquet')").fetchall())
         in_list = ", ".join(f"'{r}'" for r in run_ids) or "NULL"
@@ -342,6 +342,12 @@ def _self_test() -> None:
     assert chain_disagreements({**good, "undeclared": ["x"]})
     assert chain_disagreements({**good, "run_ids": []})
     assert chain_disagreements({**good, **{k: 0 for k in good if k not in ("run_ids", "undeclared", "missing")}})
+    from .scenarios import success_part_names
+
+    parts = [{"path": "a.parquet", "status": "committed"}, {"path": "b.parquet", "status": "rejected"}]
+    assert success_part_names({"status": "success", "parts": parts}) == ["a.parquet"]
+    for st in ("failed", "interrupted", "running", "Failed"):
+        assert success_part_names({"status": st, "parts": parts}) == [], f"a {st} manifest delivers nothing"
     print("value_diff self-test ok")
 
 

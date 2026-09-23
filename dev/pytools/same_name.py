@@ -35,8 +35,10 @@ from pathlib import Path
 
 if __package__:
     from . import registry
+    from .duckcli import ARGV as DUCKDB
 else:  # run as a plain script: its own directory is on sys.path
     import registry  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parents[2]
 RIVET = os.environ.get("RIVET_BIN", str(ROOT / "target" / "release" / "rivet"))
@@ -64,7 +66,7 @@ def sh(argv, env=None, timeout=900):
 
 
 def duckdb(sql: str) -> str:
-    return sh(["duckdb", "-noheader", "-list", "-c", sql], timeout=600).stdout.strip()
+    return sh([*DUCKDB, "-noheader", "-list", "-c", sql], timeout=600).stdout.strip()
 
 
 def seed() -> bool:

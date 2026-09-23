@@ -814,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rivet binary not found at {rivet_bin()} (build --release or set RIVET_BIN)", file=sys.stderr)
         return 2
     if not have("duckdb"):
-        print("duckdb not on PATH (needed for the integrity oracle)", file=sys.stderr)
+        print("the pinned duckdb package is not importable — run the gate through `uv run` (make does)", file=sys.stderr)
         return 2
     # Fail LOUD on the host-side mongo seed dependency, and only when mongo is in
     # scope: a python3 that cannot import pymongo otherwise turns every mongo

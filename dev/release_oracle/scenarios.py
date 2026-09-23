@@ -51,6 +51,7 @@ from tempfile import mkdtemp
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
                        port_of, rivet, rivet_bin, run)
+    from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
@@ -67,6 +68,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         rivet_bin,
         run,
     )
+    DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = [
     "run_scenarios",
@@ -239,7 +241,7 @@ def _duckdb_list(sql: str) -> str:
     `2>/dev/null`. The exit status is deliberately not consulted so the two
     implementations classify identically.
     """
-    return run(["duckdb", "-noheader", "-list", "-c", sql]).stdout.strip()
+    return run([*DUCKDB, "-noheader", "-list", "-c", sql]).stdout.strip()
 
 
 def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
@@ -307,6 +309,20 @@ def duckdb_allnull_cloud(store: str, bucket: str, prefix: str, work: Path) -> tu
     return (-1, -1)
 
 
+def success_part_names(doc: dict) -> list[str]:
+    """The committed part names a manifest delivers — none unless its `status` is `success` (the loader's rule; a failed/interrupted run's parts are gc candidates)."""
+    if str(doc.get("status") or "success").lower() != "success":
+        return []
+    out = []
+    for f in doc.get("parts") or []:
+        if isinstance(f, dict) and f.get("status") not in (None, "committed"):
+            continue
+        name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
+        if name:
+            out.append(str(name))
+    return out
+
+
 def _manifest_declared_parts(root: Path) -> list[str]:
     """Absolute paths of the parts the manifest(s) under `root` DECLARE as committed — the
     union across immutable manifest-*.json copies (plus the canonical manifest.json), i.e.
@@ -320,17 +336,7 @@ def _manifest_declared_parts(root: Path) -> list[str]:
             art = json.loads(d.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        # SUCCESS manifests only — the loader's rule (a failed/interrupted
-        # manifest's parts are gc candidates, not delivered data), mirroring
-        # tests/common's Rust + python resolvers (live-proven 2026-08-29).
-        if str(art.get("status") or "success").lower() != "success":
-            continue
-        for f in art.get("parts", []) or []:
-            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
-                continue
-            name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
-            if not name:
-                continue
+        for name in success_part_names(art):
             cand = Path(name)
             if not cand.is_absolute():
                 cand = d.parent / cand
@@ -399,7 +405,7 @@ def _duckdb_json_normalized(sql: str) -> str:
     normalize_bq.py sorts rows by `id` and sorts keys, so a golden diff means a
     real change in rivet's type export, never row/key-order noise.
     """
-    raw = run(["duckdb", "-json", "-c", sql]).stdout
+    raw = run([*DUCKDB, "-json", "-c", sql]).stdout
     if not raw.strip():
         return ""
     return run([PY, str(_asset("lib/normalize_bq.py"))], stdin=raw).stdout.strip()
@@ -484,13 +490,13 @@ def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, 
         # HOLD", and every caller of this helper compares the answer to the SOURCE
         # — so a run that under-declares its own delivery agreed with the source
         # while `rivet load` read short.
-        paths = _duckdb_list(
+        docs = _duckdb_list(
             S3_HTTPFS_PREAMBLE
-            + "SELECT DISTINCT p.path FROM ("
-            f"  SELECT unnest(parts) AS p FROM read_json_auto('s3://{bucket}/{prefix}/manifest-*.json')"
-            ") WHERE p.status IS NULL OR p.status = 'committed'"
+            + f"SELECT to_json(m) FROM read_json_auto('s3://{bucket}/{prefix}/manifest-*.json', "
+            "union_by_name = true) AS m"
         )
-        names = [ln.strip() for ln in paths.splitlines() if ln.strip()]
+        names = sorted({n for ln in docs.splitlines() if ln.strip()
+                        for n in success_part_names(json.loads(ln))})
         if not names:
             return None
         lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)

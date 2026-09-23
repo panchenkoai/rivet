@@ -608,18 +608,19 @@ services:
       # version through 1.4.1, 200 from 1.5.0), and those two are what let the
       # independent oracle ATTACH all four source engines in ONE session instead
       # of only the two with core scanners.
-      # `pyarrow` is the third independent Parquet reader used by tests
-      # (alongside duckdb and clickhouse) — it is the reference Arrow
-      # implementation, so it sees field metadata and statistics exactly
-      # the way we wrote them.
-      - "pip install --quiet --disable-pip-version-check \
-           duckdb==1.5.0 pytz==2024.1 pyarrow==18.1.0 && \
+      # Versions come from the repo's uv.lock (one pin for the Python gate and this
+      # container), exported at start; `pyarrow` is the third independent Parquet reader.
+      - "pip install --quiet --disable-pip-version-check uv && \
+         uv export --directory /pin --frozen --no-hashes --no-emit-project > /tmp/req.txt && \
+         pip install --quiet --disable-pip-version-check -r /tmp/req.txt && \
          python -c 'import duckdb, pytz, pyarrow; print(\"duckdb\", duckdb.__version__, \"pyarrow\", pyarrow.__version__)' && \
          exec tail -f /dev/null"
     container_name: rivet-duckdb
     init: true
     volumes:
       - ./tests/.live-tmp:/work
+      - ./pyproject.toml:/pin/pyproject.toml:ro
+      - ./uv.lock:/pin/uv.lock:ro
     healthcheck:
       # Healthy once the python `duckdb` module imports — pip install finished.
       test: ["CMD", "python", "-c", "import duckdb; duckdb.sql('select 1')"]

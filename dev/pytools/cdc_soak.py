@@ -78,10 +78,12 @@ from typing import Callable, Sequence
 
 if __package__:
     from . import cdc_stand, shell
+    from .duckcli import ARGV as DUCKDB
 else:  # executed as a plain script: `python3 dev/pytools/cdc_soak.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import cdc_stand  # type: ignore[no-redef]
     import shell  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 ROOT = shell.ROOT
 
@@ -296,7 +298,7 @@ def ddv(query: str) -> str:
     """duckdb in `-list` mode. An empty string on failure, which then shows up as
     a MISMATCH — the sweep must never treat "could not read the destination" as
     agreement."""
-    p = shell.run(["duckdb", "-noheader", "-list", "-c", query], cwd=ROOT, timeout=None)
+    p = shell.run([*DUCKDB, "-noheader", "-list", "-c", query], cwd=ROOT, timeout=None)
     return p.stdout.strip() if p.ok else ""
 
 

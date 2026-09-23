@@ -16,6 +16,8 @@ Exit 0 = the two agree. Exit 1 = symmetric difference, printed both ways.
 """
 import argparse, glob, json, os, subprocess, sys, tempfile
 
+DUCKDB = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pytools", "duckcli.py")]
+
 
 def declared_parts(root: str) -> list[str]:
     """The parts a SUCCESS manifest declares as committed — mirrors
@@ -292,7 +294,7 @@ ORDER BY 2, 3, 1;
         f.write(sql)
         path = f.name
     try:
-        r = subprocess.run(["duckdb", "-box", "-c", f".read {path}"],
+        r = subprocess.run([*DUCKDB, "-box", "-c", f".read {path}"],
                            capture_output=True, text=True)
     finally:
         os.unlink(path)
@@ -317,7 +319,7 @@ ORDER BY 2, 3, 1;
     # EARLY, before a scenario is even applied); postgres/mongo emit no
     # schema events at all and were protected by the raw-line guard already.
     comparable = subprocess.run(
-        ["duckdb", "-noheader", "-list", "-c",
+        [*DUCKDB, "-noheader", "-list", "-c",
          sql.split("SELECT 'rivet-only'")[0] +
          "SELECT (SELECT count(*) FROM dbz) || ' ' || (SELECT count(*) FROM riv);"],
         capture_output=True, text=True)
@@ -344,7 +346,7 @@ ORDER BY 2, 3, 1;
         # every event on one key — and "AGREE over 1 pair" deserves to look
         # different from "AGREE over 40". Same reason the counts are printed at all.
         cnt = subprocess.run(
-            ["duckdb", "-noheader", "-list", "-c",
+            [*DUCKDB, "-noheader", "-list", "-c",
              sql.split("SELECT 'rivet-only'")[0] +
              "SELECT (SELECT count(*) FROM (SELECT DISTINCT * FROM riv)) || '/' || "
              "(SELECT count(*) FROM (SELECT DISTINCT * FROM dbz));"],

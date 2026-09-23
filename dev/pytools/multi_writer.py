@@ -43,8 +43,10 @@ from pathlib import Path
 
 if __package__:
     from . import registry
+    from .duckcli import ARGV as DUCKDB
 else:  # run as a plain script: its own directory is on sys.path
     import registry  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "dev"))
@@ -110,7 +112,7 @@ def psql_state(sql: str) -> str:
 
 
 def duckdb(sql: str) -> str:
-    return sh(["duckdb", "-noheader", "-list", "-c", sql], timeout=600).stdout.strip()
+    return sh([*DUCKDB, "-noheader", "-list", "-c", sql], timeout=600).stdout.strip()
 
 
 # ── seeding: the same logical table on every engine, disjoint id ranges ───────

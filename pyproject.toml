@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 # dev/release_oracle/duck.py).
 dependencies = [
     "duckdb==1.5.5",
+    # The third independent Parquet reader (the Rust live tests' rivet-duckdb container installs from this lock).
+    "pyarrow==18.1.0",
     "pymongo>=4,<5",
     "pytz==2025.2",
     "pyyaml>=6,<7",

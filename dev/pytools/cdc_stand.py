@@ -70,9 +70,11 @@ from typing import Sequence
 
 if __package__:
     from . import shell
+    from .duckcli import ARGV as DUCKDB
 else:  # executed as a plain script: `python3 dev/pytools/cdc_stand.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import shell  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 ROOT = shell.ROOT
 
@@ -348,7 +350,7 @@ def duckdb_scalar(query: str) -> str | None:
     The independent reader is the point: counting the drained rows with rivet's
     own manifest would make the check a self-oracle.
     """
-    p = shell.run(["duckdb", "-noheader", "-csv", "-c", query], cwd=ROOT, timeout=None)
+    p = shell.run([*DUCKDB, "-noheader", "-csv", "-c", query], cwd=ROOT, timeout=None)
     if not p.ok:
         return None
     value = p.stdout.strip()

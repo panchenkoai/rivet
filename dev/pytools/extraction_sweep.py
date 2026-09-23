@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DUCKDB = [sys.executable, str(ROOT / "dev" / "pytools" / "duckcli.py")]
 STATE_URL = os.environ.get(
     "RIVET_SWEEP_STATE_URL", "postgresql://rivet:rivet@localhost:5433/rivet_state"
 )
@@ -95,7 +96,7 @@ def psql_state(sql: str) -> str:
 
 
 def duckdb(sql: str) -> str:
-    p = sh(["duckdb", "-noheader", "-list", "-c", sql])
+    p = sh([*DUCKDB, "-noheader", "-list", "-c", sql])
     return p.stdout.strip()
 
 

@@ -79,9 +79,11 @@ from typing import Callable, Sequence
 
 try:  # `python3 -m dev.pytools.validate`
     from . import shell
+    from .duckcli import ARGV as DUCKDB
 except ImportError:  # `python3 dev/pytools/validate.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import shell  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 ROOT = shell.ROOT
 Fail = shell.Fail
@@ -151,7 +153,7 @@ def duck(sql: str) -> str:
     """The same scalar via DuckDB — an INDEPENDENT reader, which is the whole
     point: a value check whose `expected` comes from the code under test cannot
     catch the bug."""
-    p = run(["duckdb", "-noheader", "-list", "-c", sql], timeout=900)
+    p = run([*DUCKDB, "-noheader", "-list", "-c", sql], timeout=900)
     return "".join(p.stdout.split())
 
 
@@ -231,7 +233,8 @@ def preflight() -> str:
             f"rivet binary not executable: {RIVET}",
             hint="cargo build --release --bin rivet, or set $RIVET_BIN",
         )
-    shell.require("duckdb", hint="brew install duckdb — the independent read-back oracle")
+    if not shell.have("duckdb"):
+        raise shell.Fail("the pinned duckdb package is not importable — run through `uv run`", code=2)
     shell.require("docker", hint="the ext.* fixtures are read through the rivet-postgres-1 container")
     probe = docker_exec(PGC, "psql", "-U", "rivet", "-d", "rivet", "-tA", "-c", "SELECT 1",
                         timeout=60)

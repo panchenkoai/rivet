@@ -663,38 +663,10 @@ def _flow_rows(path: Path) -> int:
 
 
 def _manifest_files(prefix: Path) -> list[str] | None:
-    """Absolute paths of the parts the manifest DECLARES, or None if unmanifested.
-
-    On a `repeat` cell there are several manifest copies (one per run, immutable)
-    plus the canonical last-writer-wins pointer. The union across the COPIES is
-    the readable dataset — reading only `manifest.json` would report the last
-    run's parts as the whole, which is exactly how a sidecar clobber stays
-    invisible.
-    """
-    copies = sorted(prefix.rglob("manifest-*.json"))
-    docs = copies or ([prefix / "manifest.json"] if (prefix / "manifest.json").is_file() else [])
-    if not docs:
+    """Absolute paths of the parts the SUCCESS manifests under `prefix` declare, or None when there is no manifest at all."""
+    if not any(prefix.rglob("manifest-*.json")) and not (prefix / "manifest.json").is_file():
         return None
-    out: list[str] = []
-    for d in docs:
-        try:
-            art = json.loads(d.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        for f in art.get("parts", []) or []:
-            # A part the manifest lists but marks non-committed is not delivered
-            # data; counting it would report an in-flight row as an outcome.
-            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
-                continue
-            name = f.get("path") or f.get("name") if isinstance(f, dict) else f
-            if not name:
-                continue
-            cand = Path(name)
-            if not cand.is_absolute():
-                cand = d.parent / cand
-            if cand.is_file():
-                out.append(str(cand))
-    return sorted(set(out))
+    return scenarios._manifest_declared_parts(prefix)
 
 
 def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live") -> None:

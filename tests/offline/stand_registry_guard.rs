@@ -100,3 +100,28 @@ fn the_harness_names_no_endpoint_of_its_own() {
         "tests/harness/mod.rs must read hosts, ports and databases from dev/stand/registry.yaml"
     );
 }
+
+#[test]
+fn the_python_harness_runs_the_pinned_duckdb_never_a_binary_on_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all = Vec::new();
+    files(&root.join("dev"), &[".py"], &mut all);
+    let bare = regex::Regex::new(r#"[\[(,]\s*"duckdb"\s*,|which\(\s*"duckdb"\s*\)"#).unwrap();
+    let offenders: Vec<String> = all
+        .iter()
+        .filter(|f| !f.ends_with("dev/pytools/duckcli.py"))
+        .flat_map(|f| {
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            text.lines()
+                .enumerate()
+                .filter(|(_, l)| bare.is_match(l))
+                .map(|(n, _)| format!("{}:{}", f.strip_prefix(root).unwrap().display(), n + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "run DuckDB through dev/pytools/duckcli.py (`*DUCKDB`, the uv-pinned package), not the `duckdb` on PATH:\n{}",
+        offenders.join("\n")
+    );
+}

@@ -35,9 +35,11 @@ from pathlib import Path
 try:
     from .core import Ledger, have, rivet, run
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
+    from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, have, rivet, run  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
+    DUCKDB = [__import__("sys").executable, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = ["verify_corruption_is_detected"]
 
@@ -232,7 +234,7 @@ def _read_values(part: Path) -> str | None:
         return None
     p = run(
         [
-            "duckdb",
+            *DUCKDB,
             "-noheader",
             "-list",
             "-c",

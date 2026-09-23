@@ -112,10 +112,12 @@ from typing import Sequence
 
 if __package__:
     from . import cdc_stand, shell
+    from .duckcli import ARGV as DUCKDB
 else:  # executed as a plain script: `python3 dev/pytools/parallel_keyset.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import cdc_stand  # type: ignore[no-redef]
     import shell  # type: ignore[no-redef]
+    from duckcli import ARGV as DUCKDB  # type: ignore[no-redef]
 
 ROOT = shell.ROOT
 
@@ -195,7 +197,7 @@ def _duck_count(query: str) -> int | None:
     destination is unreadable" and "the destination has no rows" are different
     findings, and the bash could express only the second (as an aborted script).
     """
-    p = shell.run(["duckdb", "-noheader", "-list", "-c", query], cwd=ROOT, timeout=None)
+    p = shell.run([*DUCKDB, "-noheader", "-list", "-c", query], cwd=ROOT, timeout=None)
     if not p.ok:
         return None
     text = "".join(p.stdout.split())
@@ -427,7 +429,8 @@ def devbox_run(
     binary = _resolve_rivet(
         rivet_bin or os.environ.get("RIVET_BIN") or Path.home() / "rivet-golden/rivet"
     )
-    shell.require("duckdb", hint="verify() re-reads the parquet with duckdb")
+    if not shell.have("duckdb"):
+        raise shell.Fail("the pinned duckdb package is not importable — run through `uv run`", code=2)
 
     report_path = Path(
         report or os.environ.get("REPORT") or Path.home() / "rivet-golden/report.txt"
