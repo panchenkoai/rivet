@@ -65,12 +65,15 @@
 # NOT split (still collapsed, still tracked by the header above): chunked's own
 # sequential-vs-parallel pair inside each column, and keyset_sequential vs
 # keyset_parallel.
+# Kept collapsed again on 2026-09-23 (reviewed, not re-litigated): a split needs ~75
+# more cells restating that the families agree. Instead a row whose feature could
+# diverge per loop tests EVERY loop in its test file and names one per family here —
+# shape_drift_warn (tests/live/live_shape_drift.rs) and skip_empty_status
+# (tests/live/live_skip_empty.rs) each have eight.
 #
 # Three findings that are worth keeping, none of them a gap:
-#   * shape_drift_warn reads `absent` on six variants if you ask "is it applied", and
-#     `na` if you ask "should it be" — the `na` cells below are the honest answer, but
-#     note the distinction is DESIGN, not structure. It is the one row where a future
-#     reader could mistake the two.
+#   * shape_drift_warn: its `na` cells were retired 2026-09-23 — every commit loop now
+#     feeds its sinks' shape bytes, and the row's tests go RED on each variant.
 #   * durable_manifest_before_advance on keyset_parallel LOOKS absent at
 #     keyset.rs:716-722 (st.update before the manifest) and is not: the anchor+ranges
 #     persist first (keyset.rs:375-377), resume ignores the cursor (keyset.rs:323), and
@@ -105,7 +108,8 @@
 #
 # The ADR-0028 half is graded structurally rather than by more cells: the rows
 # below whose `na:` rests on "it runs ONCE at the finalize_export seam"
-# (schema_drift_gate, shape_drift_warn, value_checksum_form_b — the guard reads
+# (schema_drift_gate, value_checksum_form_b; shape_drift_warn cites the seam too,
+# with test cells since 2026-09-23 — the guard reads
 # that set from THIS file's `what:` prose, it is not hand-listed there) are honest
 # only while the seam has exactly one caller.
 # `the_export_tail_seam_has_one_caller_and_no_runner_re_applies_it` asserts that,
