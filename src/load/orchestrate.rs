@@ -403,14 +403,17 @@ fn pin_plan_to_its_run(
         eprintln!("{note}");
     }
     let pinned_names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
+    let loaded = s
+        .loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table))
+        .unwrap_or_default();
     let mut respelled: Vec<(String, String, String)> = Vec::new();
-    for (_, older) in runs_older_than(&newest_first, &run_id) {
+    for older in runs_loaded_with_the_pin(plan.mode, &newest_first, &run_id, &loaded) {
         if let Ok(Some(o)) =
             s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), older)
         {
             let names: Vec<&str> = o.columns.iter().map(|c| c.name.as_str()).collect();
             for (was, now) in load::plan::lookalike_spelling_changes(&pinned_names, &names) {
-                respelled.push((older.clone(), was, now));
+                respelled.push((older.to_string(), was, now));
             }
         }
     }
@@ -468,6 +471,23 @@ fn runs_older_than<'a>(
         .position(|(_, id)| id == pinned)
         .map_or(newest_first.len(), |i| i + 1);
     &newest_first[start..]
+}
+
+/// The older runs this load will read alongside the pinned one: none for a full load (it reads only the newest run), and never one already loaded.
+fn runs_loaded_with_the_pin<'a>(
+    mode: load::plan::LoadMode,
+    newest_first: &'a [(String, String)],
+    pinned: &str,
+    loaded: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
+    if mode == load::plan::LoadMode::Full {
+        return Vec::new();
+    }
+    runs_older_than(newest_first, pinned)
+        .iter()
+        .map(|(_, id)| id.as_str())
+        .filter(|id| !loaded.contains(*id))
+        .collect()
 }
 
 /// The refusal for pending runs that spell a column differently from the run the load is typed from; `None` when none do.
@@ -3587,6 +3607,30 @@ mod live_only_decisions {
         assert_eq!(ids(super::runs_older_than(&runs, "r3")), ["r2", "r1"]);
         assert!(super::runs_older_than(&runs, "r1").is_empty());
         assert!(super::runs_older_than(&runs, "gone").is_empty());
+    }
+
+    #[test]
+    fn only_unloaded_runs_of_an_append_load_are_compared_with_the_pin() {
+        use load::plan::LoadMode;
+        let runs: Vec<(String, String)> = ["r3", "r2", "r1"]
+            .iter()
+            .map(|r| (String::new(), r.to_string()))
+            .collect();
+        let loaded: std::collections::HashSet<String> = ["r1".to_string()].into();
+        assert_eq!(
+            super::runs_loaded_with_the_pin(LoadMode::Incremental, &runs, "r3", &loaded),
+            ["r2"],
+            "r1 already landed: its spelling cannot load NULL any more"
+        );
+        assert_eq!(
+            super::runs_loaded_with_the_pin(LoadMode::Cdc, &runs, "r3", &Default::default()),
+            ["r2", "r1"]
+        );
+        assert!(
+            super::runs_loaded_with_the_pin(LoadMode::Full, &runs, "r3", &Default::default())
+                .is_empty(),
+            "a full load reads only the newest run"
+        );
     }
 
     #[test]

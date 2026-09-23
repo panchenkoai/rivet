@@ -881,16 +881,17 @@ fn folded(name: &str) -> String {
     super::latin_fold(name).unwrap_or_else(|| name.to_string())
 }
 
-/// Columns an older run spelled differently from the pinned run but that load as one warehouse column, as (older, pinned).
+/// Columns an older run spelled so that BigQuery (case-blind) cannot match them to the pinned run's, though they fold to one name, as (older, pinned).
 pub fn lookalike_spelling_changes(pinned: &[&str], older: &[&str]) -> Vec<(String, String)> {
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
     older
         .iter()
-        .filter(|o| !pinned.contains(o))
+        .filter(|o| !pinned.iter().any(|p| same(p, o)))
         .filter_map(|o| {
             let f = folded(o);
             pinned
                 .iter()
-                .find(|p| folded(p) == f)
+                .find(|p| same(&folded(p), &f))
                 .map(|p| (o.to_string(), p.to_string()))
         })
         .collect()
@@ -2734,6 +2735,15 @@ load:
             "the other way round: the pinned run carries the look-alike"
         );
         assert!(lookalike_spelling_changes(&["id", "city"], &["id", "city"]).is_empty());
+        assert_eq!(
+            lookalike_spelling_changes(&["City"], &[cyr]),
+            vec![(cyr.to_string(), "City".to_string())],
+            "BigQuery matches case-blind, so a case change on top of the fold still loads NULL"
+        );
+        assert!(
+            lookalike_spelling_changes(&["City"], &["city"]).is_empty(),
+            "a case-only change BigQuery matches anyway is not a respelling"
+        );
         assert!(
             lookalike_spelling_changes(&["id", "city", "added"], &["id", "dropped"]).is_empty(),
             "an added or dropped column is drift, not a respelling"
