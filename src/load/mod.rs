@@ -746,7 +746,14 @@ pub fn run_load(
     cleanup: Option<(&GcsStore, &str)>,
     ownership: Ownership,
 ) -> Result<LoadReport> {
-    before_write(whole_table_preflight(loader, table, specs, uris, ownership))?;
+    before_write(whole_table_preflight(
+        loader,
+        table,
+        specs,
+        uris,
+        expected_rows,
+        ownership,
+    ))?;
 
     let rows_loaded = loader.materialize(table, specs, uris)?;
 
@@ -774,8 +781,17 @@ fn whole_table_preflight(
     table: &str,
     specs: &[TargetColumnSpec],
     uris: &[String],
+    expected_rows: Option<u64>,
     ownership: Ownership,
 ) -> Result<()> {
+    if uris.is_empty() && expected_rows != Some(0) {
+        bail!(
+            "no Parquet files to load into `{table}`, though its runs declare {} row(s) — \
+             refusing rather than emptying the table. The staged parts are gone (a bucket \
+             lifecycle rule or a manual cleanup?): re-run the export, then load.",
+            expected_rows.map_or_else(|| "an unknown number of".to_string(), |n| n.to_string())
+        );
+    }
     ensure_safe_load_uris(uris)?;
     validate_specs(table, specs)?;
     ensure_overwritable(loader, table, ownership)
@@ -2043,6 +2059,30 @@ pub(crate) mod tests {
     /// bucket-relative form the fs store is keyed by.
     const PREFIX: &str = "gs://b/p";
     const REL: &str = "p";
+
+    /// Runs that declare rows but whose files are gone must never empty the table.
+    #[test]
+    fn missing_files_for_declared_rows_refuse_before_any_write() {
+        for expected in [Some(50), None] {
+            let f = FakeLoader::default();
+            let err = run_load(
+                &f,
+                "t",
+                &spec(TargetStatus::Ok),
+                &[],
+                expected,
+                None,
+                Ownership::Own,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("refusing rather than emptying the table"),
+                "{err}"
+            );
+            assert!(f.materialized.borrow().is_empty(), "nothing may be written");
+        }
+    }
 
     /// A full load whose newest run exported nothing hands the loader an empty file list,
     /// and the count gate still holds the table to the run's own total.

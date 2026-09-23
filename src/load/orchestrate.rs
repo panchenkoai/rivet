@@ -408,7 +408,7 @@ fn pin_plan_to_its_run(
         .loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table))
         .unwrap_or_default();
     let mut respelled: Vec<(String, String, String)> = Vec::new();
-    for older in runs_loaded_with_the_pin(plan.mode, &newest_first, &run_id, &loaded) {
+    for older in runs_loaded_with_the_pin(op, plan.mode, &newest_first, &run_id, &loaded) {
         if let Ok(Some(o)) =
             s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), older)
         {
@@ -495,14 +495,15 @@ fn runs_older_than<'a>(
     &newest_first[start..]
 }
 
-/// The older runs this load will read alongside the pinned one: none for a full load (it reads only the newest run), and never one already loaded.
+/// The older runs this load will read alongside the pinned one: none for a compact (it reads only the landed buffer) or a full load (only the newest run), and never one already loaded.
 fn runs_loaded_with_the_pin<'a>(
+    op: &str,
     mode: load::plan::LoadMode,
     newest_first: &'a [(String, String)],
     pinned: &str,
     loaded: &std::collections::HashSet<String>,
 ) -> Vec<&'a str> {
-    if mode == load::plan::LoadMode::Full {
+    if op == "compact" || mode == load::plan::LoadMode::Full {
         return Vec::new();
     }
     runs_older_than(newest_first, pinned)
@@ -530,8 +531,10 @@ fn respelled_refusal(
         "load [{table}]: {list}. The source column was renamed while the older run(s) were \
          still unloaded, and one load cannot read both spellings: BigQuery matches Parquet \
          columns by name, so the older files would load that column as NULL. Nothing was \
-         loaded. Rename the source column back, run `rivet load` so the older run(s) land, \
-         then rename it again."
+         loaded and nothing is lost — every run stays staged. rivet cannot load the two \
+         spellings in one pass yet: load the older run(s) by hand (their files carry the old \
+         spelling; declare the column under the new one), then delete their manifest(s) so \
+         this table loads again."
     ))
 }
 
@@ -1998,7 +2001,9 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             failures.push(e);
         }
     }
-    let attempted = attempted.load(std::sync::atomic::Ordering::Relaxed);
+    let attempted = attempted
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(failures.len());
     match failures.len() {
         0 => Ok(()),
         1 => Err(failures.pop().unwrap()),
@@ -3669,18 +3674,41 @@ mod live_only_decisions {
             .collect();
         let loaded: std::collections::HashSet<String> = ["r1".to_string()].into();
         assert_eq!(
-            super::runs_loaded_with_the_pin(LoadMode::Incremental, &runs, "r3", &loaded),
+            super::runs_loaded_with_the_pin("load", LoadMode::Incremental, &runs, "r3", &loaded),
             ["r2"],
             "r1 already landed: its spelling cannot load NULL any more"
         );
         assert_eq!(
-            super::runs_loaded_with_the_pin(LoadMode::Cdc, &runs, "r3", &Default::default()),
+            super::runs_loaded_with_the_pin(
+                "load",
+                LoadMode::Cdc,
+                &runs,
+                "r3",
+                &Default::default()
+            ),
             ["r2", "r1"]
         );
         assert!(
-            super::runs_loaded_with_the_pin(LoadMode::Full, &runs, "r3", &Default::default())
-                .is_empty(),
+            super::runs_loaded_with_the_pin(
+                "load",
+                LoadMode::Full,
+                &runs,
+                "r3",
+                &Default::default()
+            )
+            .is_empty(),
             "a full load reads only the newest run"
+        );
+        assert!(
+            super::runs_loaded_with_the_pin(
+                "compact",
+                LoadMode::Cdc,
+                &runs,
+                "r3",
+                &Default::default()
+            )
+            .is_empty(),
+            "compact merges the landed buffer and reads no pending run"
         );
     }
 

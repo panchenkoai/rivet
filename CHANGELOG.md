@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Behaviour changes an operator upgrading from 0.27 will see.**
+  - A `mode: full` load whose newest run exported 0 rows (the source was emptied)
+    now EMPTIES the warehouse table (a free `TRUNCATE`, or a `CREATE` when there is
+    none); 0.27 printed `LOAD SKIP: up to date` and kept serving the deleted rows.
+    Runs that declare rows but whose Parquet is gone refuse before any write, as
+    before. Snowflake refuses the empty case by name (`TRUNCATE` by hand).
+  - A MongoDB export of a collection that does not exist now fails (exit 1);
+    0.27 reported success with 0 rows. `rivet init --table a.b` on MongoDB now
+    scaffolds the collection `a.b`, not `b`.
+  - `rivet init` no longer picks a `DATE` / `smalldatetime` column, or one column
+    of a composite primary key, as the incremental cursor: a strict `>` on them
+    skips rows inserted later in the watermark's day/minute or under the same key
+    prefix. Existing configs are not rewritten — check any `cursor_column:` that
+    names such a column.
+  - `rivet load` / `rivet compact` run 16 tables at once by default (`--pool 1`
+    for the old sequential pass), so their output interleaves across tables.
+
 - **`rivet init` records every export's primary key, even when one export cannot
   be given a cursor.** Recording validated the whole generated config first, so a
   single cursor-less table (common under `--mode incremental`) left EVERY export

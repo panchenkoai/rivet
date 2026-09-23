@@ -217,7 +217,7 @@ pub enum Commands {
         /// is unchanged — `rivet load` and `rivet compact` still refuse a table
         /// the other holds. Each worker opens its own ledger connection, so N is
         /// also N connections to the state backend; a worker that cannot reopen
-        /// the ledger REFUSES its table rather than loading it without a lease.
+        /// the ledger takes no table, and the other workers load the queue.
         /// Defaults to 16 — the ceiling — capped at the number of tables. Pass
         /// `--pool 1` for the strictly sequential pass.
         #[arg(long, value_name = "N")]
@@ -240,8 +240,8 @@ pub enum Commands {
         /// still isolates to itself, and the per-table lease is unchanged — a
         /// table `rivet load` holds is still refused. Each worker opens its own
         /// ledger connection, so N is also N connections to the state backend; a
-        /// worker that cannot reopen the ledger REFUSES its table rather than
-        /// compacting it without a lease. Defaults to 16 — the ceiling — capped
+        /// worker that cannot reopen the ledger takes no table, and the other
+        /// workers compact the queue. Defaults to 16 — the ceiling — capped
         /// at the number of tables. Pass `--pool 1` for the sequential pass.
         #[arg(long, value_name = "N")]
         pool: Option<usize>,

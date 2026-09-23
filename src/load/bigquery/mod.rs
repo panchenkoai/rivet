@@ -643,8 +643,9 @@ impl TargetLoader for BigQueryLoader {
         let mut recovered_jobs = 0usize;
         if crate::load::before_write(api.table_metadata(&self.dataset, &merging))?.is_some() {
             eprintln!(
-                "  note: `{merging_fqtn}` is left over from a compaction whose job did not \
-                 finish — merging it before this run's buffer"
+                "  note: `{merging_fqtn}` is left over from a compaction that did not complete \
+                 (its job died, or its MERGE failed — see that compact's error) — merging it \
+                 before this run's buffer"
             );
             let script = compact_script_sql(
                 &base,
