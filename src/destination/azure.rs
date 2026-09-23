@@ -165,7 +165,6 @@ fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing
 }
 
 impl CloudBackend for AzureBackend {
-    const RUNTIME_LABEL: &'static str = "Azure";
     const SCHEME: &'static str = "az";
 
     fn build_operator(config: &DestinationConfig) -> Result<Operator> {

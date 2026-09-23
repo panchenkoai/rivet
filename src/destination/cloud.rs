@@ -150,9 +150,6 @@ fn take_from(budget: &AtomicI64, size: i64) -> bool {
 /// operator and how to name itself in logs/errors. Everything else lives in
 /// [`CloudDestination`].
 pub(crate) trait CloudBackend {
-    /// Backend label interpolated into the tokio-runtime construction error
-    /// (`"S3"`, `"GCS"`, `"Azure"`).
-    const RUNTIME_LABEL: &'static str;
     /// URI scheme logged after a successful upload (`"s3"`, `"gs"`, `"az"`).
     const SCHEME: &'static str;
 
@@ -232,6 +229,22 @@ fn normalize_prefix(p: String) -> String {
     }
 }
 
+/// The one tokio runtime every object-store operator runs on: opendal sends through a process-global HTTP pool, and a pooled connection dies with the runtime that opened it.
+pub(crate) fn io_runtime() -> Result<Arc<tokio::runtime::Runtime>> {
+    static RUNTIME: std::sync::OnceLock<Arc<tokio::runtime::Runtime>> = std::sync::OnceLock::new();
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(Arc::clone(rt));
+    }
+    let built = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .thread_name("rivet-io")
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to create the object-store tokio runtime: {e}"))?,
+    );
+    Ok(Arc::clone(RUNTIME.get_or_init(|| built)))
+}
+
 impl<B: CloudBackend> CloudDestination<B> {
     pub fn new(config: &DestinationConfig) -> Result<Self> {
         Self::new_with_retries(config, DEFAULT_MAX_RETRIES)
@@ -247,18 +260,7 @@ impl<B: CloudBackend> CloudDestination<B> {
     /// transport error immediately. Default (export) behavior is unchanged —
     /// `new` still threads 5 here.
     pub fn new_with_retries(config: &DestinationConfig, max_times: usize) -> Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to create tokio runtime for {}: {}",
-                        B::RUNTIME_LABEL,
-                        e
-                    )
-                })?,
-        );
+        let runtime = io_runtime()?;
         let _guard = runtime.enter();
 
         // OpenDAL's `RetryLayer` retries individual HTTP calls on hyper /
