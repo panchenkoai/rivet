@@ -50,9 +50,18 @@ class Oracle:
         postgres: str | None = None,
         mssql: str | None = None,
         mongo: str | None = None,
+        gcs: bool = False,
     ) -> None:
         self.db = duckdb.connect()
         self.project: str | None = None
+        if gcs:
+            import subprocess
+
+            token = subprocess.run(
+                ["gcloud", "auth", "print-access-token"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            self.db.sql("INSTALL httpfs; LOAD httpfs;")
+            self.db.sql(f"CREATE SECRET gcs_adc (TYPE gcs, BEARER_TOKEN '{token}')")
         if mssql:
             self.db.sql("INSTALL mssql FROM community; LOAD mssql;")
             self.db.sql(f"ATTACH '{mssql}' AS ms (TYPE mssql, READ_ONLY)")

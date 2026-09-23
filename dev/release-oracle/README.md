@@ -284,6 +284,12 @@ golden blessed from rivet's output — that golden froze rivet's own
 UUID-as-unreadable-STRING as "expected" from 0.22 to 0.27. A STRING column holding
 non-UTF-8 bytes fails before any value is compared.
 
+The **chain** cell then counts the same run at every point it passes through, in one DuckDB
+session (`value_diff.chain_census`): the source, the Success manifests, the Parquet **footers** of
+the declared parts in real GCS (httpfs, bearer token from `gcloud auth print-access-token`), rivet's
+ledger (`export_metrics`, `file_log`, `load_run`) and BigQuery. All seven counts must be equal, the
+manifests must name one run, and the bucket must hold exactly the declared parts.
+
 Set `BQ_ORACLE_PROJECT` + `BQ_ORACLE_DATASET` (with ADC) to run it. Absent creds →
 the stage is **SKIP**, never a silent pass — but a real release build must run it
 green.

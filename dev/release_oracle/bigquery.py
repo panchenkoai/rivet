@@ -57,6 +57,28 @@ def _matrix_cfg(*args: str) -> str:
     return p.stdout.strip()
 
 
+def _grade_chain(led: Ledger, engine: str, url: str, table: str, bucket: str, pfx: str,
+                 work: Path, dset: str) -> None:
+    """Source, manifest, GCS parquet footers, rivet's ledger and BigQuery must agree for the run just loaded — one DuckDB session."""
+    from .value_diff import chain_census, chain_disagreements
+
+    state = os.environ.get("RIVET_STATE_URL", "")
+    if not state.startswith("postgres"):
+        state = str(work / ".rivet_state.db")
+    try:
+        c = chain_census(engine, url, table, bucket, pfx, state, dset, table)
+    except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL, never a pass
+        led.failed("bigquery", engine, "chain", "-", f"chain[{engine}]: oracle failed: {e}", "oracle-error")
+        return
+    bad = chain_disagreements(c)
+    if bad:
+        led.failed("bigquery", engine, "chain", "-", f"chain[{engine}]: " + "; ".join(bad), "disagree")
+    else:
+        led.passed("bigquery", engine, "chain", "-",
+                   f"chain[{engine}]: source = manifest = GCS footers = metrics = file_log = "
+                   f"load_run = BigQuery = {c['source']} rows, run {c['run_ids'][0]}, no undeclared parts")
+
+
 def _grade_against_source(led: Ledger, engine: str, url: str, dset: str, table: str) -> None:
     """Every column of the loaded table against the SOURCE row, both read by DuckDB; a golden rivet wrote would grade change, not correctness."""
     from .duck import bq_target
@@ -676,6 +698,8 @@ def _bq_one_engine(
         with led.span(f"bq {engine}: source-vs-warehouse"):
             _grade_against_source(led, engine, url, eng_dset, exp)
             got = "loaded"
+        with led.span(f"bq {engine}: chain"):
+            _grade_chain(led, engine, url, exp, bucket, pfx, work, eng_dset)
     else:
         failed_proc = rp if not rp.ok else lp
         leg = "run" if not rp.ok else "load"

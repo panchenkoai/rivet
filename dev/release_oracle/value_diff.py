@@ -233,6 +233,65 @@ def compare_to_parquet(engine: str, url: str, table: str, preamble: str, dest: s
         return tuple_mismatches(ora, source, dest)
 
 
+def chain_census(
+    engine: str, url: str, table: str, bucket: str, prefix: str, state: str, dataset: str, wh_table: str
+) -> dict:
+    """Source, declared manifests, parquet footers in GCS, rivet's ledger and BigQuery, counted in ONE DuckDB session for one run."""
+    from .duck import Oracle
+
+    attach, src_prefix = source_attach(engine, url)
+    root = f"gs://{bucket}/{prefix.strip('/')}"
+    with Oracle(bigquery=True, gcs=True, **attach) as ora:
+        if state.startswith("postgres"):
+            ora.db.sql(f"ATTACH '{state}' AS st (TYPE postgres, READ_ONLY)")
+        else:
+            ora.db.sql(f"INSTALL sqlite; LOAD sqlite; ATTACH '{state}' AS st (TYPE sqlite, READ_ONLY)")
+        mans = fetch(ora, f"SELECT * FROM read_json_auto('{root}/manifest-*.json', union_by_name = true)")
+        ok = [m for m in mans if str(m.get("status") or "success").lower() == "success"]
+        run_ids = sorted({m["run_id"] for m in ok})
+        declared = sorted({
+            p["path"] if str(p["path"]).startswith("gs://") else f"{root}/{p['path']}"
+            for m in ok for p in (m.get("parts") or [])
+            if str(p.get("status") or "committed") == "committed"
+        })
+        held = sorted(r[0] for r in ora.db.sql(f"SELECT file FROM glob('{root}/**/*.parquet')").fetchall())
+        in_list = ", ".join(f"'{r}'" for r in run_ids) or "NULL"
+        lst = ", ".join(f"'{d}'" for d in declared)
+        one = lambda sql: ora.db.sql(sql).fetchone()[0]  # noqa: E731
+        return {
+            "run_ids": run_ids,
+            "source": one(f"SELECT count(*) FROM {src_prefix}.{table}"),
+            "manifest": sum(int(m.get("row_count") or 0) for m in ok),
+            "footers": one(f"SELECT coalesce(sum(num_rows), 0) FROM parquet_file_metadata([{lst}])") if declared else 0,
+            "undeclared": sorted(set(held) - set(declared)),
+            "missing": sorted(set(declared) - set(held)),
+            "metrics": one(f"SELECT coalesce(sum(total_rows), 0) FROM st.export_metrics WHERE run_id IN ({in_list})"),
+            "file_log": one(f"SELECT coalesce(sum(row_count), 0) FROM st.file_log WHERE run_id IN ({in_list})"),
+            "loaded": one(
+                "SELECT coalesce(sum(rows_loaded), 0) FROM st.load_run WHERE "
+                + " OR ".join(f"source_run_ids LIKE '%{r}%'" for r in run_ids or ["\x00"])
+            ),
+            "warehouse": one(f"SELECT count(*) FROM bq.{dataset}.{wh_table}"),
+        }
+
+
+def chain_disagreements(c: dict) -> list[str]:
+    """What is wrong with a `chain_census`, empty when every point agrees."""
+    out = []
+    if len(c["run_ids"]) != 1:
+        out.append(f"expected ONE successful run's manifest, found {c['run_ids']}")
+    counts = {k: c[k] for k in ("source", "manifest", "footers", "metrics", "file_log", "loaded", "warehouse")}
+    if len(set(counts.values())) != 1:
+        out.append(f"counts disagree: {counts}")
+    if not c["source"]:
+        out.append("the source is empty — a census of nothing agrees with everything")
+    if c["undeclared"]:
+        out.append(f"parquet in the bucket that no manifest declares: {c['undeclared'][:3]}")
+    if c["missing"]:
+        out.append(f"parts a manifest declares that the bucket does not hold: {c['missing'][:3]}")
+    return out
+
+
 def compare_to_bigquery(
     engine: str, url: str, dataset: str, table: str, warehouse_table: str | None = None
 ) -> tuple[int, list[str]]:
@@ -275,6 +334,14 @@ def _self_test() -> None:
     assert not diff_rows([{"id": 1, "b": b"\xff"}], [{"id": 1, "b": 255}], bits=frozenset({"b"}))
     assert canon("00:00:00") == canon("PT0S"), "a zero interval read as clock text or as ISO is one value"
     assert canon("P1D") != canon("24:00:00"), "one day and 24 hours differ in PostgreSQL interval semantics"
+    good = {"run_ids": ["r"], "source": 3, "manifest": 3, "footers": 3, "metrics": 3, "file_log": 3,
+            "loaded": 3, "warehouse": 3, "undeclared": [], "missing": []}
+    assert not chain_disagreements(good)
+    for k in ("manifest", "footers", "metrics", "file_log", "loaded", "warehouse"):
+        assert chain_disagreements({**good, k: 4}), f"a wrong {k} must be a disagreement"
+    assert chain_disagreements({**good, "undeclared": ["x"]})
+    assert chain_disagreements({**good, "run_ids": []})
+    assert chain_disagreements({**good, **{k: 0 for k in good if k not in ("run_ids", "undeclared", "missing")}})
     print("value_diff self-test ok")
 
 

@@ -146,4 +146,4 @@ final:
     # ARRAY<STRUCT<item T>> (== REPEATED RECORD{item}), matching rivet_type_lab.
     # bo_pg_matrix_full — after the target.rs::list / from_files fix.
     tables: [rivet_type_matrix]
-    what: "rivet run → real GCS, rivet load → BigQuery, then DuckDB attaches the source AND BigQuery and compares EVERY column value (decimal precision, TIMESTAMP microseconds, BYTES, UUID as 16 bytes, NUMERIC-widened unsigned, JSON, intervals); a STRING holding non-UTF-8 bytes fails outright."
+    what: "rivet run → real GCS, rivet load → BigQuery, then DuckDB attaches the source AND BigQuery and compares EVERY column value (decimal precision, TIMESTAMP microseconds, BYTES, UUID as 16 bytes, NUMERIC-widened unsigned, JSON, intervals); a STRING holding non-UTF-8 bytes fails outright. Then the CHAIN cell, one DuckDB session for the run just loaded: source count = Success manifests' row_count = parquet FOOTERS of the declared parts read from real GCS = export_metrics = file_log = load_run.rows_loaded = BigQuery count, one run id, no undeclared or missing parts (value_diff.chain_census; each of the 8 points RED-proven by tampering it)."
