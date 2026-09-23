@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence, TypeVar
+from typing import Callable, Sequence, TypeVar
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -201,14 +201,6 @@ def require(tool: str, *, hint: str | None = None) -> str:
     if path is None:
         raise Fail(f"`{tool}` not found on PATH", hint=hint)
     return path
-
-
-def require_env(name: str, *, hint: str | None = None) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise Fail(f"${name} is not set", hint=hint)
-    return v
-
 
 def wait_until(
     check: Callable[[], bool], *, tries: int = 45, delay: float = 2.0, what: str = "condition"

@@ -1766,41 +1766,6 @@ STAGE_ORACLE = {
     "load:cleanup":    ("bq show",        "the table is really gone (rm -f exits 0 regardless)"),
 }
 
-
-def print_dag() -> str:
-    """Render the matrix as a DAG. Built from CHAIN/axes, never hand-drawn."""
-    L: list[str] = []
-    cells = cross_product(["postgres", "mysql", "mssql", "mongo"])
-    run_n = sum(1 for c in cells if c.na_reason() is None)
-    L.append("blessed flow — the whole user journey as one cross-product")
-    L.append("")
-    L.append("  AXES                                                cells")
-    L.append("  ────────────────────────────────────────────────────────")
-    for name, vals in (("engine", ["postgres", "mysql", "mssql", "mongo"]),
-                       ("pipeline", ["batch", "cdc"]),
-                       ("lifecycle", ["clean", "repeat", "resume"]),
-                       ("store", ["local", "s3", "gcs"]),
-                       ("state", ["sqlite", "postgres"])):
-        L.append(f"  {name:<10} {' × '.join(vals):<40} {len(vals):>3}")
-    L.append(f"  {'':<10} {'=':<40} {len(cells):>3} declared, "
-             f"{run_n} runnable, {len(cells) - run_n} na")
-    L.append("")
-    for pipe in ("batch", "cdc"):
-        L.append(f"  {pipe.upper()} chain")
-        L.append("  " + "─" * 74)
-        steps = [s for s in CHAIN[pipe]]
-        if pipe == "cdc":
-            steps.insert(steps.index("artifacts") + 1, "artifacts:checkpoint")
-        for i, st in enumerate(steps):
-            who, what = STAGE_ORACLE.get(st, ("?", "?"))
-            arm = "└─" if i == len(steps) - 1 else "├─"
-            L.append(f"   {arm} {st:<22} [{who:<14}] {what}")
-        L.append("")
-    L.append("  A stage that fails leaves every later stage as SKIP \"not reached\" —")
-    L.append("  an absent row in a 900-row report reads as not-applicable.")
-    return "\n".join(L)
-
-
 def main(argv: list[str] | None = None) -> int:
     """Standalone runner: the whole matrix, or only what last failed.
 

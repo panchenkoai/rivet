@@ -26,7 +26,7 @@ the canonical set of state-DB tables a CDC run populates. Both backends must mat
 it — a release that stops populating run_status (or drifts the schema) fails here.
 
 WHY THIS MODULE EXISTS IN PYTHON: of all the layers, this is the one the SHELL
-broke rather than the checks it makes — see `_store_readback` below. Every printed
+broke rather than the checks it makes (a bash 3.2 scoping bug emptied every CDC store readback). Every printed
 line and every recorded cell keeps the bash wording, so a CI log diff cannot tell
 the two implementations apart.
 """
@@ -50,7 +50,6 @@ from typing import Callable
 
 try:  # imported as part of the package
     from . import scenarios
-    from ..pytools.duckcli import ARGV as DUCKDB
     from .core import (
         HERE,
         ROOT,
@@ -58,10 +57,8 @@ try:  # imported as part of the package
         Proc,
         container_for_port,
         docker_exec,
-        have,
         port_of,
         rivet,
-        run,
         wait_until,
     )
 except ImportError:  # run directly out of dev/release_oracle/
@@ -73,10 +70,8 @@ except ImportError:  # run directly out of dev/release_oracle/
         Proc,
         container_for_port,
         docker_exec,
-        have,
         port_of,
         rivet,
-        run,
         wait_until,
     )
 
@@ -111,7 +106,7 @@ _STATE_TABLES = (
 
 # ── shared plumbing ───────────────────────────────────────────────────────────
 # cdc.sh was SOURCED into scenarios.sh and used its `cfg`, `_store_dest` and
-# `_store_readback`; the port keeps that layering — `scenarios` owns the one copy
+# `_store_readback`; the port keeps that layering (`scenarios.store_readback`) — `scenarios` owns the one copy
 # of each, so the CDC stage cannot drift from the batch stage's store handling.
 _cfg = scenarios.cfg
 _store_dest = scenarios.store_dest
@@ -506,33 +501,6 @@ def _s3_dest(bkt: str, pfx: str) -> str:
         raise RuntimeError("release-oracle: scenarios.store_dest has no s3 branch")
     return dest
 
-
-def _duckdb(sql: str) -> str:
-    """DuckDB as the INDEPENDENT reader. Empty output ⇒ no reader / no parts."""
-    if not have("duckdb"):
-        return ""
-    return run([*DUCKDB, "-noheader", "-list", "-c", sql]).stdout.strip()
-
-
-def _store_readback(store: str, bkt: str, pfx: str, work: Path) -> str:
-    """The row count the STORE actually holds, via its own protocol + DuckDB —
-    never rivet's `validate`, so a rivet READ bug cannot rubber-stamp its own
-    write. Empty ⇒ the reader is absent or the prefix holds nothing.
-
-    THIS CALL IS WHY THE PORT EXISTS. The bash `_store_readback` declared
-    `local store=$1 bkt=$2 pfx=$3 dl="$WORK/dl_${store}_$RANDOM"` on ONE line, and
-    macOS bash 3.2 expands a same-line `${store}` against the ENCLOSING scope
-    rather than the local just assigned. The batch-load caller HAD a `store`
-    local, so there it silently took the caller's value; THIS caller — the CDC
-    stage — has none, so under `set -u` the whole function ABORTED and returned an
-    empty count, which every engine then reported as `independent-readback[!=5]`.
-    The CDC layer of the go/no-go gate could therefore never pass. In Python a
-    parameter cannot resolve to a caller's variable, so the class of bug is gone
-    rather than fixed-per-site (the same gotcha needed fixing three times in bash).
-    """
-    return scenarios.store_readback(store, bkt, pfx, work)
-
-
 def _cdc_store_ids(store: str, bkt: str, pfx: str, idc: str, work) -> str:
     """The INDEPENDENT distinct id-set the store DELIVERS per its MANIFESTS (never rivet,
     never RAW parquet) — the crash-recovery completeness oracle. Raw `**/*.parquet` would
@@ -713,7 +681,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         spec.changes(url)
         before = _runs_seen()  # the key set this cell will subtract, see _state_populated
         rivet("run", "-c", str(cap.yaml))
-        n = _store_readback("s3", cap.bucket, cap.prefix, work)  # INDEPENDENT (DuckDB)
+        n = scenarios.store_readback("s3", cap.bucket, cap.prefix, work)  # INDEPENDENT (DuckDB)
         # Per-column null profile, independent of rivet: the change set writes typed
         # columns (amount numeric, meta jsonb), and a decode regression can null a WHOLE
         # captured column while n stays 5 and validate re-reads its own null parts green —

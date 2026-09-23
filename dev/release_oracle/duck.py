@@ -96,18 +96,6 @@ class Oracle:
         row = self.db.sql(sql).fetchone()
         return None if row is None else row[0]
 
-    def bq_query(self, sql: str) -> list[tuple]:
-        """Run NATIVE BigQuery SQL (INFORMATION_SCHEMA, `SAFE.`, …) through the extension.
-
-        `bq.<dataset>.<table>` reads go through DuckDB's own planner; this is the
-        door for the queries only BigQuery itself can answer.
-        """
-        if self.project is None:
-            raise RuntimeError("Oracle was built without bigquery=True")
-        return self.db.sql(
-            f"SELECT * FROM bigquery_query('{self.project}', $${sql}$$)"
-        ).fetchall()
-
     def close(self) -> None:
         """Release the session."""
         self.db.close()

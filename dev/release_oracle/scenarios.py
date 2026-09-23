@@ -146,13 +146,6 @@ NO_TIMEOUT: float | None = None
 # destination prefix).
 _WORK: Path | None = None
 
-
-def set_work_dir(path: Path) -> None:
-    global _WORK
-    _WORK = Path(path)
-    _WORK.mkdir(parents=True, exist_ok=True)
-
-
 def work_dir() -> Path:
     global _WORK
     if _WORK is None:
