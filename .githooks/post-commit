@@ -1,0 +1,6 @@
+#!/bin/sh
+# Rebuild the exact Rust call edges for code-review-graph in the background (~45 s).
+if [ -d .code-review-graph ] && command -v rust-analyzer >/dev/null 2>&1; then
+    (nohup python3 dev/pytools/rust_graph.py index >/dev/null 2>&1 &)
+fi
+exit 0
