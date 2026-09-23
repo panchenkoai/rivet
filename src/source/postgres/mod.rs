@@ -674,19 +674,15 @@ fn pg_run_export(
         // FETCH N below `work_mem × 0.7` so the cursor never spills:
         //   pg_row_bytes ≈ arrow_per_row × 1.2 ; safe = work_mem×0.7 / pg_row_bytes
         // The controller clamps it to the configured `batch_size`.
-        if !cap_applied
+        if wants_fetch_cap(cap_applied, row_count)
             && let Some(wm) = work_mem_bytes
-            && row_count > 0
         {
-            let arrow_bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
-            let arrow_per_row = (arrow_bytes / row_count).max(1);
-            let pg_per_row = ((arrow_per_row * 12) / 10).max(64);
-            let safe = (((wm as f64) * 0.7) as usize / pg_per_row).max(100);
-            let mut target = safe;
-            if let Some(mem_mb) = tuning.batch_size_memory_mb {
-                let arrow_target = (mem_mb * 1024 * 1024) / arrow_per_row;
-                target = target.min(arrow_target.max(100));
-            }
+            let (target, arrow_per_row, pg_per_row) = work_mem_fetch_cap(
+                crate::tuning::SourceTuning::batch_memory_bytes(&batch),
+                row_count,
+                wm,
+                tuning.batch_size_memory_mb,
+            );
             if let Some(new) = ctl.apply_memory_cap(target) {
                 log::info!(
                     "PG work_mem={} B, observed row={} B (arrow), pg≈{} B → FETCH N → {} (configured={})",
@@ -718,7 +714,7 @@ fn pg_run_export(
 
         log::info!("fetched {} rows so far...", total_rows);
 
-        if row_count < requested {
+        if is_short_fetch(row_count, requested) {
             break;
         }
         ctl.throttle(row_count);
@@ -1042,8 +1038,73 @@ fn catalog_numeric_to_decimal_params(precision: i32, scale: i32) -> Option<(u8, 
     Some((precision_u, scale_i))
 }
 
+/// Cap the FETCH size once, on the first batch that has rows to measure.
+fn wants_fetch_cap(cap_applied: bool, row_count: usize) -> bool {
+    !cap_applied && row_count > 0
+}
+
+/// FETCH size that keeps the cursor under `work_mem × 0.7`, from the first
+/// batch's observed width (pg row ≈ arrow row × 1.2, floored at 64 B), clamped
+/// to the arrow memory budget when set. Returns `(target, arrow_per_row, pg_per_row)`.
+fn work_mem_fetch_cap(
+    arrow_bytes: usize,
+    row_count: usize,
+    work_mem: i64,
+    batch_size_memory_mb: Option<usize>,
+) -> (usize, usize, usize) {
+    let arrow_per_row = (arrow_bytes / row_count).max(1);
+    let pg_per_row = ((arrow_per_row * 12) / 10).max(64);
+    let safe = (((work_mem as f64) * 0.7) as usize / pg_per_row).max(100);
+    let target = match batch_size_memory_mb {
+        Some(mb) => safe.min(((mb * 1024 * 1024) / arrow_per_row).max(100)),
+        None => safe,
+    };
+    (target, arrow_per_row, pg_per_row)
+}
+
+/// A FETCH that returned fewer rows than asked for drained the cursor.
+fn is_short_fetch(row_count: usize, requested: usize) -> bool {
+    row_count < requested
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_fetch_cap_applies_once_to_a_measurable_batch() {
+        use super::wants_fetch_cap;
+        assert!(wants_fetch_cap(false, 10));
+        assert!(!wants_fetch_cap(true, 10), "already applied");
+        assert!(!wants_fetch_cap(false, 0), "nothing to measure");
+    }
+
+    #[test]
+    fn the_fetch_cap_keeps_the_cursor_under_work_mem() {
+        use super::work_mem_fetch_cap;
+        // 1000 rows of 1000 arrow bytes: pg row 1200 B; 4 MiB × 0.7 / 1200 = 2446.
+        assert_eq!(
+            work_mem_fetch_cap(1_000_000, 1_000, 4 << 20, None),
+            (2446, 1000, 1200)
+        );
+        // A 1 MiB arrow budget clamps it to 1048 rows.
+        assert_eq!(
+            work_mem_fetch_cap(1_000_000, 1_000, 4 << 20, Some(1)).0,
+            1048
+        );
+        // Tiny rows floor the pg width at 64 B; a tiny work_mem floors the target at 100.
+        assert_eq!(work_mem_fetch_cap(10, 10, 4 << 20, None).1, 1);
+        assert_eq!(work_mem_fetch_cap(10, 10, 4 << 20, None).2, 64);
+        assert_eq!(work_mem_fetch_cap(1_000_000, 1_000, 1024, None).0, 100);
+    }
+
+    #[test]
+    fn a_short_fetch_drains_the_cursor() {
+        use super::is_short_fetch;
+        assert!(is_short_fetch(9, 10));
+        assert!(
+            !is_short_fetch(10, 10),
+            "a full fetch may have more behind it"
+        );
+    }
 
     /// The version branch of the checkpoint sampler, pinned offline.
     ///

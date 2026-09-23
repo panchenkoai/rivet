@@ -191,9 +191,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
     // inline decisions are graded per-diff by cargo-mutants now — a stronger
     // contract than this ceiling, which existed because they could not be.
-    ("src/init/mysql.rs::density_probe", 1, 0, 1, 2),
+    ("src/init/mysql.rs::density_probe", 0, 0, 1, 1),
     ("src/init/postgres.rs::density_probe", 0, 0, 1, 0),
-    ("src/source/postgres/mod.rs::pg_run_export", 2, 0, 2, 4),
+    ("src/source/postgres/mod.rs::pg_run_export", 1, 0, 1, 2),
     // ── preflight ────────────────────────────────────────────────────────
     // `check` diagnoses every export against a live source. The `==` in its
     // overlay export-match loop is already a named mutants.toml entry
