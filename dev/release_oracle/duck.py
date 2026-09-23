@@ -51,9 +51,17 @@ class Oracle:
         bigquery: bool = False,
         mysql: str | None = None,
         postgres: str | None = None,
+        mssql: str | None = None,
+        mongo: str | None = None,
     ) -> None:
         self.db = duckdb.connect()
         self.project: str | None = None
+        if mssql:
+            self.db.sql("INSTALL mssql FROM community; LOAD mssql;")
+            self.db.sql(f"ATTACH '{mssql}' AS ms (TYPE mssql, READ_ONLY)")
+        if mongo:
+            self.db.sql("INSTALL mongo FROM community; LOAD mongo;")
+            self.db.sql(f"ATTACH '{mongo}' AS mg (TYPE mongo, READ_ONLY)")
         if mysql:
             self.db.sql("INSTALL mysql; LOAD mysql;")
             self.db.sql(f"ATTACH '{mysql}' AS my (TYPE mysql, READ_ONLY)")

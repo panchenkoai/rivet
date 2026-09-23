@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "duckdb==1.5.5",
     "pymongo>=4,<5",
+    "pytz==2025.2",
     "pyyaml>=6,<7",
     # The independent row-hash oracle. Absent, `row_hash` SKIPs rather than
     # comparing rivet against itself — 15 of 23 cells skipped it in the
