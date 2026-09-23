@@ -1007,7 +1007,7 @@ omitting differ per engine — see cdc.md)",
         // One id per export: two exports sharing a replica id evict each other's
         // binlog connection, so the per-table scaffold counts up from the first.
         "mysql" => lines.push(format!(
-            "      server_id: {}  # unique replica id; source needs binlog_format=ROW + a REPLICATION SLAVE grant",
+            "      server_id: {}  # unique replica id; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants",
             4271 + ordinal
         )),
         // PostgreSQL accepts only lowercase letters, digits and `_` in a slot name:
@@ -1094,7 +1094,7 @@ fn cdc_multiplex_export_lines(
                 "      checkpoint: ./cdc/{name}.ckpt  # one resume position for the whole stream"
             ));
             lines.push(
-                "      server_id: 4271  # ONE replica id for the stream; source needs binlog_format=ROW + a REPLICATION SLAVE grant"
+                "      server_id: 4271  # ONE replica id for the stream; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants"
                     .to_string(),
             );
         }
