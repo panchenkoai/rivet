@@ -1084,6 +1084,15 @@ fn ok_status(skip_empty: bool, total_rows: i64, parts: usize) -> &'static str {
     }
 }
 
+/// The column a run with nothing new was waiting on: an incremental cursor, or the
+/// key a `keyset_incremental` run continues past.
+fn awaited_column(strategy: &ExtractionStrategy) -> Option<&str> {
+    match strategy {
+        ExtractionStrategy::Keyset(k) if k.incremental => Some(k.key_column.as_str()),
+        other => other.cursor_column(),
+    }
+}
+
 /// Why a `skip_empty` run wrote nothing, for the summary card and metrics.
 fn skip_reason(cursor_column: Option<&str>) -> String {
     match cursor_column {
@@ -1250,7 +1259,7 @@ fn execute_resolved_plan(
                 )
                 .into();
                 if summary.status == "skipped" {
-                    summary.skip_reason = Some(skip_reason(plan.strategy.cursor_column()));
+                    summary.skip_reason = Some(skip_reason(awaited_column(&plan.strategy)));
                     log::info!(
                         "export '{}': skipped (0 rows, skip_empty=true)",
                         plan.export_name
@@ -1967,6 +1976,28 @@ mod tests {
             "no new rows since cursor 'updated_at'"
         );
         assert_eq!(skip_reason(None), "source returned 0 rows");
+    }
+
+    #[test]
+    fn a_keyset_incremental_run_waits_on_its_key_a_full_keyset_on_nothing() {
+        use super::awaited_column;
+        use crate::plan::{ExtractionStrategy, KeysetPlan};
+        let keyset = |incremental| {
+            ExtractionStrategy::Keyset(KeysetPlan {
+                key_column: "id".into(),
+                chunk_size: 10,
+                checkpoint: true,
+                incremental,
+                parallel: 1,
+            })
+        };
+        assert_eq!(awaited_column(&keyset(true)), Some("id"));
+        assert_eq!(
+            awaited_column(&keyset(false)),
+            None,
+            "a full keyset pass awaits nothing"
+        );
+        assert_eq!(awaited_column(&ExtractionStrategy::Snapshot), None);
     }
 
     /// The resume/force policy as ONE truth table: the refuse-gate and the

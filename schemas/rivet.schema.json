@@ -691,7 +691,7 @@
           ]
         },
         "skip_empty": {
-          "description": "Record a run that delivers 0 rows as `skipped` (with a reason) instead of\n`success`, on every runner. No file is written for 0 rows either way.",
+          "description": "Record a batch run that delivers 0 rows as `skipped` (with a reason) instead\nof `success`, on every batch runner. No file is written for 0 rows either way,\nand a skipped run leaves the prefix describing the last run that delivered, so\na full load keeps the previous data. `mode: cdc` does not read it.",
           "type": "boolean",
           "default": false
         },
@@ -803,7 +803,7 @@
           "default": "warn"
         },
         "shape_drift_warn_factor": {
-          "description": "Growth-factor threshold for data shape drift warnings (Epic 8).\nWhen a string/binary column's max observed byte length in the current run\nexceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.\n`None` uses the default of 2.0. Set to `0.0` to disable shape tracking.\nApplies to every mode: multi-part runs compare the largest value any\nchunk, page or worker saw.",
+          "description": "Growth-factor threshold for data shape drift warnings (Epic 8).\nWhen a string/binary column's max observed byte length in the current run\nexceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.\n`None` uses the default of 2.0. Set to `0.0` to disable shape tracking.\nApplies to every batch mode — multi-part runs compare the largest value any\nchunk, page or worker saw. `mode: cdc` does not check it.",
           "type": [
             "number",
             "null"

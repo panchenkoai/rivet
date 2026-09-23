@@ -278,8 +278,10 @@ pub struct ExportConfig {
     pub compression: CompressionType,
     pub compression_level: Option<u32>,
     pub compression_profile: Option<CompressionProfile>,
-    /// Record a run that delivers 0 rows as `skipped` (with a reason) instead of
-    /// `success`, on every runner. No file is written for 0 rows either way.
+    /// Record a batch run that delivers 0 rows as `skipped` (with a reason) instead
+    /// of `success`, on every batch runner. No file is written for 0 rows either way,
+    /// and a skipped run leaves the prefix describing the last run that delivered, so
+    /// a full load keeps the previous data. `mode: cdc` does not read it.
     #[serde(default)]
     pub skip_empty: bool,
     pub destination: DestinationConfig,
@@ -386,8 +388,8 @@ pub struct ExportConfig {
     /// When a string/binary column's max observed byte length in the current run
     /// exceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.
     /// `None` uses the default of 2.0. Set to `0.0` to disable shape tracking.
-    /// Applies to every mode: multi-part runs compare the largest value any
-    /// chunk, page or worker saw.
+    /// Applies to every batch mode — multi-part runs compare the largest value any
+    /// chunk, page or worker saw. `mode: cdc` does not check it.
     #[serde(default)]
     pub shape_drift_warn_factor: Option<f64>,
 

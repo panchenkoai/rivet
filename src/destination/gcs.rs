@@ -101,31 +101,25 @@ impl GcsStore {
         Ok(self.op.read(path)?.to_vec())
     }
 
-    /// `parse(path, bytes)` over each object in `paths`, in order, read concurrently
-    /// (16 in flight). `bytes` is the object, or its first `cap + 1` bytes when it is
-    /// longer — one GET that stops streaming there — so at most 16 capped bodies are
-    /// alive at once however many paths there are.
-    pub(crate) fn read_capped_each<T>(
+    /// `parse(path, body)` over each object in `paths`, in order, 16 in flight. `body` is
+    /// the object's bytes, or `Err(size)` when its size is over `cap` — a stat decides
+    /// that before any byte of it is read, so an oversized object is never downloaded.
+    pub(crate) fn read_each_within<T>(
         &self,
         paths: &[String],
         cap: u64,
-        parse: impl Fn(&str, Vec<u8>) -> Result<T>,
+        parse: impl Fn(&str, std::result::Result<Vec<u8>, u64>) -> Result<T>,
     ) -> Result<Vec<T>> {
         use futures_util::{StreamExt, TryStreamExt};
         let (op, parse) = (&self.async_op, &parse);
         self._runtime.block_on(
             futures_util::stream::iter(paths)
                 .map(|p| async move {
-                    let mut chunks = op.reader(p).await?.into_bytes_stream(..).await?;
-                    let mut buf = Vec::new();
-                    while let Some(chunk) = chunks.try_next().await? {
-                        buf.extend_from_slice(&chunk);
-                        if buf.len() as u64 > cap {
-                            buf.truncate(cap as usize + 1);
-                            break;
-                        }
+                    let size = op.stat(p).await?.content_length();
+                    if size > cap {
+                        return parse(p, Err(size));
                     }
-                    parse(p, buf)
+                    parse(p, Ok(op.read(p).await?.to_vec()))
                 })
                 .buffered(16)
                 .try_collect(),
@@ -248,17 +242,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_capped_each_keeps_order_and_reads_at_most_cap_plus_one_bytes() {
+    fn read_each_within_keeps_order_and_never_reads_an_object_over_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("small"), b"abc").unwrap();
         std::fs::write(dir.path().join("big"), vec![b'x'; 100]).unwrap();
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         let paths = ["big".to_string(), "small".to_string()];
         let got = store
-            .read_capped_each(&paths, 10, |p, b| Ok((p.to_string(), b.len())))
+            .read_each_within(&paths, 10, |p, body| {
+                Ok((p.to_string(), body.map(|b| b.len())))
+            })
             .unwrap();
-        assert_eq!(got, vec![("big".into(), 11), ("small".into(), 3)]);
-        let none = store.read_capped_each(&[], 10, |_, b| Ok(b.len())).unwrap();
+        assert_eq!(got, vec![("big".into(), Err(100)), ("small".into(), Ok(3))]);
+        let none = store
+            .read_each_within(&[], 10, |_, b| Ok(b.is_ok()))
+            .unwrap();
         assert!(none.is_empty());
     }
 

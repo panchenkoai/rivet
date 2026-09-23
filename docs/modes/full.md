@@ -68,7 +68,7 @@ exports:
     mode: full
     format: parquet
     compression: zstd           # zstd (default), snappy, gzip, lz4, none
-    skip_empty: true            # don't create file if query returns 0 rows
+    skip_empty: true            # a 0-row run reports `skipped`, not `success`
     max_file_size: "512MB"      # split into multiple files if output exceeds this
     meta_columns:
       exported_at: true         # add _rivet_exported_at column
@@ -85,4 +85,4 @@ exports:
 
 **Output file is too large** -- Add `max_file_size: "256MB"` to split into parts.
 
-**Query returns 0 rows but file is still created** -- Add `skip_empty: true`.
+**A run that read 0 rows reports `success`** -- Add `skip_empty: true` to record it as `skipped`. No file is written for 0 rows either way, and a skipped run leaves the prefix describing the last run that delivered — so a later full `rivet load` keeps the previous data rather than emptying the table.

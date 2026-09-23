@@ -121,7 +121,7 @@ exports:
     mode: incremental
     cursor_column: updated_at
     format: parquet
-    skip_empty: true            # don't create file if no new rows
+    skip_empty: true            # a run with no new rows reports `skipped`
     meta_columns:
       exported_at: true         # add _rivet_exported_at for dedup downstream
     destination:
@@ -170,7 +170,7 @@ exports:
 
 **`the stored cursor ... was written for ...`** -- The export's cursor changed (a new `cursor_column`, or a keyset `chunk_by_key` export switched to incremental on another column). The old value means nothing for the new column; `rivet state reset --config ... --export <name>` starts the new cursor with a full pass.
 
-**No new rows but export still runs** -- Add `skip_empty: true` to avoid empty files.
+**A run with no new rows reports `success`** -- Add `skip_empty: true` to record it as `skipped` (no file is written for 0 rows either way).
 
 **Data appears duplicated across runs** -- Ensure `cursor_column` updates when rows are modified. If rows are updated without changing `updated_at`, they will be missed.
 

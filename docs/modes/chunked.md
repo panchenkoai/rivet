@@ -155,8 +155,8 @@ fresh `run_id` and timestamp suffix.
 
 If you want skip-on-no-change semantics, use **`mode: incremental`**
 with a `cursor_column` instead — that mode persists the cursor between
-runs and uses `skip_empty: true` to avoid emitting files when nothing
-new arrived.
+runs, and `skip_empty: true` records a run that found nothing new as
+`skipped`.
 
 ## Chunk sizing guidance
 
