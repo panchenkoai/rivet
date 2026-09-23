@@ -444,7 +444,7 @@ so native types are recovered with a **post-load transform, not a load schema**.
 | RivetType | BigQuery autoload | Native | Recovery (post-load) |
 |-----------|-------------------|--------|----------------------|
 | `json`    | `BYTES`           | `JSON` | `PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col))` |
-| `uuid`    | `BYTES` (16 raw)  | `STRING` | `TO_HEX(col)` |
+| `uuid`    | `BYTES` (16 raw)  | `BYTES` (BigQuery has no UUID type; `rivet load` keeps the bytes) | none — render text in a view: `TO_HEX(col)` |
 | `timestamp` (naive) | `TIMESTAMP` (instant) | `DATETIME` | `DATETIME(col)` |
 | `list<inner>` | `RECORD{item}` | `REPEATED inner` | load staging with `--parquet_enable_list_inference`, then `ARRAY(SELECT el.item FROM UNNEST(col) AS el)` |
 | `u_int64` | `INT64` (overflows > 2^63−1) | `NUMERIC` | none post-load — fix at source: `columns: { c: decimal(20,0) }` |

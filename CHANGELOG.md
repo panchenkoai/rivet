@@ -20,6 +20,15 @@
     names such a column.
   - `rivet load` / `rivet compact` run 16 tables at once by default (`--pool 1`
     for the old sequential pass), so their output interleaves across tables.
+  - **BigQuery: a UUID column (PostgreSQL `uuid`, SQL Server `uniqueidentifier`)
+    now lands as `BYTES`** — the 16 bytes, as BigQuery autoloads them (it has no
+    UUID type); render text in a view with `TO_HEX(col)`. 0.27 declared it
+    `STRING` and stored the same 16 bytes as unreadable text. A `full` load
+    replaces the column type by itself. A base-and-buffer base table loaded by
+    0.27 must be migrated once before the next `rivet compact` (which otherwise
+    fails loudly, keeping the buffer), with its own partition and clustering:
+    `CREATE OR REPLACE TABLE t PARTITION BY … CLUSTER BY … AS SELECT * REPLACE
+    (CAST(uid AS BYTES) AS uid) FROM t` — lossless, the bytes are intact.
   - SQL Server: a column declared `columns: <col>: string` whose server type is not
     text used to export as NULL in every row with status success; it now fails
     naming the column (drop the override: rivet reads these types natively).

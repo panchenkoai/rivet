@@ -90,7 +90,7 @@ scenarios:
   - id: uuid
     what: "UUID — autoloads as bytes on BQ/SF/CH, recover via TO_HEX/toUUID; DuckDB native"
     duckdb:     { test: duckdb_reads_everything_natively }
-    bigquery:   { test: bq_uuid_resolves_not_fails }
+    bigquery:   { test: bq_uuid_lands_as_the_bytes_it_autoloads_as }
     snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
     clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
 
