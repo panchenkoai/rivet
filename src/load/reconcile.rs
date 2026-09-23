@@ -81,25 +81,20 @@ pub fn fetch_manifests_keyed(
 ) -> Result<Vec<(String, RunManifest)>> {
     let (_, base) = crate::load::split_gs_uri(gcs_prefix)?;
     let keys = list_manifest_keys(store, base)?;
-    keys.into_iter()
-        .map(|key| {
-            // Round-5 (CWE-400): cap the manifest body before reading it whole into
-            // memory — a planted multi-GB manifest.json under the load prefix would
-            // otherwise OOM the loader. Mirrors the V21 cap the export-side manifest
-            // readers already enforce; this was the 4th, uncapped, read path.
-            let sz = store.stat_size(&key)?;
-            if sz > MANIFEST_MAX_BYTES {
+    // CWE-400: a manifest past the cap is refused, never read whole. One capped read
+    // per key, concurrently — a prefix keeps one copy per run it ever held.
+    store
+        .read_capped_each(&keys, MANIFEST_MAX_BYTES, |key, bytes| {
+            if bytes.len() as u64 > MANIFEST_MAX_BYTES {
                 bail!(
-                    "manifest {key} is {sz} bytes, over the {MANIFEST_MAX_BYTES}-byte cap — \
-                     refusing to read a possibly-hostile manifest into memory (CWE-400)"
+                    "manifest {key} is over the {MANIFEST_MAX_BYTES}-byte cap — refusing to \
+                     read a possibly-hostile manifest into memory (CWE-400)"
                 );
             }
-            let bytes = store.read(&key)?;
             let m = serde_json::from_slice::<RunManifest>(&bytes)
                 .with_context(|| format!("parsing manifest {key}"))?;
-            Ok((key, m))
+            Ok((key.to_string(), m))
         })
-        .collect::<Result<Vec<_>>>()
         .map(dedupe_by_run_id)
 }
 
@@ -2253,6 +2248,14 @@ mod tests {
             list_manifest_keys(&store, "base").unwrap(),
             vec!["base/manifest.json".to_string()]
         );
+    }
+
+    #[test]
+    fn fetch_manifests_keyed_refuses_a_manifest_over_the_cap() {
+        let big = vec![b' '; MANIFEST_MAX_BYTES as usize + 1];
+        let (store, _g) = fs_store(&[("base/manifest-r1.json", big)]);
+        let err = fetch_manifests_keyed(&store, "gs://my-bucket/base").unwrap_err();
+        assert!(format!("{err:#}").contains("CWE-400"), "{err:#}");
     }
 
     #[test]

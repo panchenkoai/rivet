@@ -36,6 +36,8 @@ fn dir_boundary(path: &str) -> String {
 pub(crate) struct GcsStore {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: opendal::blocking::Operator,
+    /// The same operator unwrapped, for reads issued concurrently.
+    async_op: Operator,
 }
 
 impl GcsStore {
@@ -63,10 +65,11 @@ impl GcsStore {
                 .with_jitter()
                 .with_notify(super::cloud::RivetRetryNotify),
         );
-        let op = opendal::blocking::Operator::new(async_op)?;
+        let op = opendal::blocking::Operator::new(async_op.clone())?;
         Ok(Self {
             _runtime: runtime,
             op,
+            async_op,
         })
     }
 
@@ -96,6 +99,37 @@ impl GcsStore {
     /// Raw bytes of the object at the bucket-relative `path`.
     pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>> {
         Ok(self.op.read(path)?.to_vec())
+    }
+
+    /// `parse(path, bytes)` over each object in `paths`, in order, read concurrently
+    /// (16 in flight). `bytes` is the object, or its first `cap + 1` bytes when it is
+    /// longer — one GET that stops streaming there — so at most 16 capped bodies are
+    /// alive at once however many paths there are.
+    pub(crate) fn read_capped_each<T>(
+        &self,
+        paths: &[String],
+        cap: u64,
+        parse: impl Fn(&str, Vec<u8>) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        use futures_util::{StreamExt, TryStreamExt};
+        let (op, parse) = (&self.async_op, &parse);
+        self._runtime.block_on(
+            futures_util::stream::iter(paths)
+                .map(|p| async move {
+                    let mut chunks = op.reader(p).await?.into_bytes_stream(..).await?;
+                    let mut buf = Vec::new();
+                    while let Some(chunk) = chunks.try_next().await? {
+                        buf.extend_from_slice(&chunk);
+                        if buf.len() as u64 > cap {
+                            buf.truncate(cap as usize + 1);
+                            break;
+                        }
+                    }
+                    parse(p, buf)
+                })
+                .buffered(16)
+                .try_collect(),
+        )
     }
 
     /// `len` bytes of the object at the bucket-relative `path`, from offset `start`.
@@ -212,6 +246,21 @@ impl CloudBackend for GcsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_capped_each_keeps_order_and_reads_at_most_cap_plus_one_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small"), b"abc").unwrap();
+        std::fs::write(dir.path().join("big"), vec![b'x'; 100]).unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let paths = ["big".to_string(), "small".to_string()];
+        let got = store
+            .read_capped_each(&paths, 10, |p, b| Ok((p.to_string(), b.len())))
+            .unwrap();
+        assert_eq!(got, vec![("big".into(), 11), ("small".into(), 3)]);
+        let none = store.read_capped_each(&[], 10, |_, b| Ok(b.len())).unwrap();
+        assert!(none.is_empty());
+    }
 
     #[test]
     fn every_store_drives_its_operator_on_the_one_process_runtime() {
