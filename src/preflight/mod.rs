@@ -254,7 +254,29 @@ struct TargetFailTally {
     any_fatal: bool,
 }
 
+/// What the run-wide type-report tally means for `rivet check`.
+#[derive(Debug, PartialEq, Eq)]
+enum TypeReportOutcome {
+    /// `--strict` and something is fatal: fail the check.
+    Fail,
+    /// Not strict, but a target refuses columns: say so after the table.
+    Note,
+    /// Nothing to add.
+    Clean,
+}
+
 impl TargetFailTally {
+    /// The outcome for this tally. The note is text, so `--json` never gets it.
+    fn outcome(&self, strict: bool, json_output: bool) -> TypeReportOutcome {
+        if strict && self.any_fatal {
+            TypeReportOutcome::Fail
+        } else if !strict && self.columns > 0 && !json_output {
+            TypeReportOutcome::Note
+        } else {
+            TypeReportOutcome::Clean
+        }
+    }
+
     /// Fold ONE export's reports in — all of them, `target` being the export's
     /// effective target (`None` when nothing was resolved against one, in which
     /// case a report can carry no target failure to count).
@@ -544,17 +566,20 @@ pub fn check(
             }
         }
 
-        if strict && tally.any_fatal {
-            anyhow::bail!("strict mode: unsafe type mappings found (see report above)");
-        } else if !strict && tally.columns > 0 && !json_output {
-            // The table showed "fail ✗" but rc is 0 — say so explicitly. Skipped
-            // under --json so NDJSON output stays one object per line.
-            clean = false;
-            println!();
-            println!(
-                "{}",
-                target_fail_note(tally.columns, tally.label.unwrap_or("target"))
-            );
+        match tally.outcome(strict, json_output) {
+            TypeReportOutcome::Fail => {
+                anyhow::bail!("strict mode: unsafe type mappings found (see report above)")
+            }
+            TypeReportOutcome::Note => {
+                // The table showed "fail ✗" but rc is 0 — say so explicitly.
+                clean = false;
+                println!();
+                println!(
+                    "{}",
+                    target_fail_note(tally.columns, tally.label.unwrap_or("target"))
+                );
+            }
+            TypeReportOutcome::Clean => {}
         }
     }
 
@@ -1030,6 +1055,24 @@ mod tests {
         // A clean export adds nothing and does not clear what came before.
         tally.add_export(Some(ExportTarget::BigQuery), &[empty_report("clean")]);
         assert_eq!(tally.columns, 7, "a clean export is a no-op, not a reset");
+
+        assert_eq!(tally.outcome(true, false), TypeReportOutcome::Fail);
+        assert_eq!(
+            tally.outcome(true, true),
+            TypeReportOutcome::Fail,
+            "--json still fails"
+        );
+        assert_eq!(tally.outcome(false, false), TypeReportOutcome::Note);
+        assert_eq!(
+            tally.outcome(false, true),
+            TypeReportOutcome::Clean,
+            "no text under --json"
+        );
+        assert_eq!(
+            TargetFailTally::default().outcome(false, false),
+            TypeReportOutcome::Clean,
+            "nothing refused, nothing to say"
+        );
 
         // No target resolved ⇒ nothing to refuse, whatever the report says.
         let mut untargeted = TargetFailTally::default();
