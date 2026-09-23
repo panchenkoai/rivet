@@ -87,7 +87,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` |  |  |
 | `compression_level` | `integer` |  |  |
 | `compression_profile` | `none` \| `fast` \| `balanced` \| `compact` |  |  |
-| `skip_empty` | `boolean` |  |  |
+| `skip_empty` | `boolean` |  | Record a run that delivers 0 rows as `skipped` (with a reason) instead of `success`, on every runner. No file is written for 0 rows either way. |
 | `destination` | [DestinationConfig](#destinationconfig) | **yes** |  |
 | `verify` | `size` \| `content` |  | Integrity depth required of `--validate` for this export's parts. `size` (default) accepts size-only verification; `content` requires every part's content MD5 to be checked against the store's listing (no download) and **fails** validation for any part that could only be size-verified — e.g. a part too large to upload as a single PUT (lower `max_file_size` so it fits), or a backend that exposes no checksum. |
 | `meta_columns` | [MetaColumns](#metacolumns) |  |  |

@@ -323,7 +323,7 @@ pub(super) fn finalize_manifest(
 
     // A HEALTHY no-op describes nothing, so it must not describe the prefix.
     //
-    // `"skipped"` is a real production status — `single.rs` sets it when a run
+    // `"skipped"` is a real production status — `job.rs::ok_status` sets it when a run
     // reads 0 rows under `skip_empty: true`, the ordinary outcome of an
     // incremental export with nothing new past the cursor. It used to fall
     // through the `_` arm below to `Interrupted`, and `write_manifest` then

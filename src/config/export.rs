@@ -278,6 +278,8 @@ pub struct ExportConfig {
     pub compression: CompressionType,
     pub compression_level: Option<u32>,
     pub compression_profile: Option<CompressionProfile>,
+    /// Record a run that delivers 0 rows as `skipped` (with a reason) instead of
+    /// `success`, on every runner. No file is written for 0 rows either way.
     #[serde(default)]
     pub skip_empty: bool,
     pub destination: DestinationConfig,

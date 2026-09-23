@@ -1062,9 +1062,8 @@ fn rerun_warning_applies(resume: bool, force: bool) -> bool {
 /// May a successful run promote its status to `success`?
 ///
 /// Only from the transient `running` the summary is BUILT with. A deeper layer
-/// may already have decided a terminal status — `single` writes `skipped` for
-/// an incremental run with nothing new — and overwriting that would report a
-/// run that moved no rows as a successful export. Pure, because the `==` it
+/// may already have decided a terminal status, and overwriting it would
+/// misreport the run. `skipped` is decided here, by [`ok_status`]. Pure, because the `==` it
 /// replaces was the one decision left ungraded in `execute_resolved_plan`
 /// after that body's whole-function mutation exclusion was lifted: measured
 /// 2026-08-29, `==`→`!=` MISSED the whole offline battery, and it inverts BOTH
@@ -1072,6 +1071,25 @@ fn rerun_warning_applies(resume: bool, force: bool) -> bool {
 /// relabelled `success`).
 fn promotes_to_success(current_status: &str) -> bool {
     current_status == "running"
+}
+
+/// Terminal status of a run whose runner returned Ok: `skipped` when `skip_empty`
+/// is set and it delivered nothing — no rows and no parts (a resume that only
+/// re-adopted earlier parts still delivered them), else `success`.
+fn ok_status(skip_empty: bool, total_rows: i64, parts: usize) -> &'static str {
+    if skip_empty && total_rows == 0 && parts == 0 {
+        "skipped"
+    } else {
+        "success"
+    }
+}
+
+/// Why a `skip_empty` run wrote nothing, for the summary card and metrics.
+fn skip_reason(cursor_column: Option<&str>) -> String {
+    match cursor_column {
+        Some(col) => format!("no new rows since cursor '{col}'"),
+        None => "source returned 0 rows".into(),
+    }
 }
 
 /// Does this export bypass the batch plan/strategy machinery for the dedicated
@@ -1225,7 +1243,19 @@ fn execute_resolved_plan(
     match &result {
         Ok(()) => {
             if promotes_to_success(&summary.status) {
-                summary.status = "success".into();
+                summary.status = ok_status(
+                    plan.skip_empty,
+                    summary.total_rows,
+                    summary.manifest_parts.len(),
+                )
+                .into();
+                if summary.status == "skipped" {
+                    summary.skip_reason = Some(skip_reason(plan.strategy.cursor_column()));
+                    log::info!(
+                        "export '{}': skipped (0 rows, skip_empty=true)",
+                        plan.export_name
+                    );
+                }
             }
         }
         Err(e) => {
@@ -1905,6 +1935,38 @@ mod tests {
                 "`{terminal}` is a decided status and must not be overwritten"
             );
         }
+    }
+
+    #[test]
+    fn skip_empty_skips_only_a_run_that_delivered_nothing() {
+        use super::ok_status;
+        assert_eq!(ok_status(true, 0, 0), "skipped");
+        assert_eq!(
+            ok_status(false, 0, 0),
+            "success",
+            "skip_empty off never skips"
+        );
+        assert_eq!(ok_status(true, 5, 1), "success", "rows were delivered");
+        assert_eq!(
+            ok_status(true, 0, 2),
+            "success",
+            "a resume re-adopted parts"
+        );
+        assert_eq!(
+            ok_status(true, 3, 0),
+            "success",
+            "rows counted, no parts yet"
+        );
+    }
+
+    #[test]
+    fn skip_reason_names_the_cursor_when_there_is_one() {
+        use super::skip_reason;
+        assert_eq!(
+            skip_reason(Some("updated_at")),
+            "no new rows since cursor 'updated_at'"
+        );
+        assert_eq!(skip_reason(None), "source returned 0 rows");
     }
 
     /// The resume/force policy as ONE truth table: the refuse-gate and the

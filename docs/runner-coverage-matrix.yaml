@@ -239,6 +239,14 @@ scenarios:
     keyset:         { test: shape_drift_warns_on_the_keyset_runner }
     mongo_parallel: { test: shape_drift_warns_on_the_mongo_parallel_runner }
 
+  - id: skip_empty_status
+    what: "skip_empty: a run that delivered nothing (0 rows, 0 manifest parts) is recorded `skipped` with a skip_reason instead of `success`. Decided once by job.rs::ok_status after the runner returns, so no runner re-implements it; each test exports an EMPTY source and reads the status back from export_metrics."
+    single:         { test: skip_empty_skips_on_the_single_runner }
+    chunked:        { test: skip_empty_skips_on_the_chunked_runner }
+    chunked_checkpoint: { test: skip_empty_skips_on_the_checkpoint_runner }
+    keyset:         { test: skip_empty_skips_on_the_keyset_runner }
+    mongo_parallel: { test: skip_empty_skips_on_the_mongo_parallel_runner }
+
   - id: value_checksum_form_b
     what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); since ADR-0028 every runner FEEDS them into summary.ledger and the HARVEST happens once at the finalize_export seam — no runner calls harvest itself (round-9 had fixed the computed-then-discarded bug per runner; the seam removes the per-runner call entirely). ADR-0029 then made the feed KEYED and the coverage COMPUTED: a runner contributes under a UnitId (its commit unit — Run for single, Chunk for chunked/checkpoint/mongo_parallel, Page for keyset-sequential, Range for keyset-PARALLEL, whose parts publish per page but whose checksums publish per committed range), commit::record_part registers the same UnitId for every manifest part, and the seam compares the two sets — full cover records, any uncovered or hydrated part suppresses. So the cells below grade MORE than before: each asserts its runner RECORDS column_checksums in the destination manifest, and a runner that paired its part and its checksum under different UnitIds now suppresses and turns its cell RED. The structural backstop grew the matching half — check_post_run_invariants rejects a state_backed success carrying column_checksums_short_cover (a part this run recorded whose unit contributed nothing, which on a SUCCESS can only be a mis-pairing), so the fail-safe-but-silent direction is loud on every runner under debug_assertions, the build live tests use."
     single:         { test: pg_type_matrix_value_checksum_guard }

@@ -375,24 +375,7 @@ pub(super) fn run_single_export(
     }
 
     if sink.total_rows == 0 {
-        if plan.skip_empty {
-            summary.status = "skipped".into();
-            // Attach a short, mode-specific reason so the operator can see
-            // *why* nothing was written, not just `status: skipped` with
-            // an empty surrounding. Incremental no-op is the common case
-            // (no rows past the recorded cursor); other modes get a
-            // generic 0-rows note.
-            summary.skip_reason = Some(match plan.strategy.cursor_column() {
-                Some(col) => format!("no new rows since cursor '{col}'"),
-                None => "source returned 0 rows".into(),
-            });
-            log::info!(
-                "export '{}': skipped (0 rows, skip_empty=true)",
-                plan.export_name
-            );
-        } else {
-            log::info!("export '{}': no data to export", plan.export_name);
-        }
+        log::info!("export '{}': no data to export", plan.export_name);
         return Ok(());
     }
 
@@ -698,7 +681,7 @@ mod tests {
 
     // ── zero-rows paths ───────────────────────────────────────────────────────
 
-    /// When there are 0 rows and skip_empty is false, run succeeds and status stays "running".
+    /// 0 rows: the runner succeeds and leaves the status to the dispatcher.
     #[test]
     fn zero_rows_no_skip_empty_succeeds() {
         let plan = minimal_plan();
@@ -706,40 +689,6 @@ mod tests {
         result.expect("0 rows without skip_empty should succeed");
         assert_eq!(summary.total_rows, 0);
         assert_ne!(summary.status, "skipped");
-    }
-
-    /// When skip_empty is true and source emits 0 rows, status is "skipped".
-    #[test]
-    fn zero_rows_with_skip_empty_sets_status_skipped() {
-        let mut plan = minimal_plan();
-        plan.skip_empty = true;
-        let (result, summary) = run(&mut EmptySource, &plan);
-        result.expect("skip_empty with 0 rows should succeed");
-        assert_eq!(summary.status, "skipped");
-        assert_eq!(summary.total_rows, 0);
-    }
-
-    /// When there are rows but skip_empty is true, skip_empty must NOT apply.
-    /// Verified without running the full pipeline: the early-return path only
-    /// triggers when `sink.total_rows == 0`, so any non-zero row count bypasses it.
-    /// (We only test the 0-row skip_empty path; the non-zero path needs a live dest.)
-    #[test]
-    fn skip_empty_semantics_zero_rows_only() {
-        // Confirmed by the skip_empty contract: `if sink.total_rows == 0 && skip_empty`.
-        // Non-zero rows cannot set status="skipped" — that branch is gated on total_rows==0.
-        // This test exists to document the invariant; the live behaviour is covered by
-        // live_harness_canary integration tests.
-        let mut plan_skip = minimal_plan();
-        plan_skip.skip_empty = true;
-        let (result_skip, summary_skip) = run(&mut EmptySource, &plan_skip);
-        result_skip.expect("skip_empty+0 rows must succeed");
-        assert_eq!(summary_skip.status, "skipped");
-
-        let mut plan_no_skip = minimal_plan();
-        plan_no_skip.skip_empty = false;
-        let (result_no_skip, summary_no_skip) = run(&mut EmptySource, &plan_no_skip);
-        result_no_skip.expect("no skip_empty+0 rows must succeed");
-        assert_ne!(summary_no_skip.status, "skipped");
     }
 
     // ── quality gate ──────────────────────────────────────────────────────────

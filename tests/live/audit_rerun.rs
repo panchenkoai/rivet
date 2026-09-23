@@ -283,3 +283,63 @@ fn audit_a_healthy_noop_run_does_not_invalidate_the_prefix() {
          untracked object.\n\nvalidate said:\n{text}"
     );
 }
+
+/// The same healthy no-op on the multi-part runners: a keyset export with
+/// `keyset_incremental` whose clean re-run finds no new key must leave a prefix
+/// that still verifies — `skip_empty` means the same thing on every runner.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn audit_a_healthy_noop_keyset_run_does_not_invalidate_the_prefix() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(10);
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(&format!("public.{}", table.name()))
+        .export_named(table.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 3")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("skip_empty: true")
+        .dest_path(out.path().to_path_buf());
+
+    let first = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
+    assert!(
+        first.status.success(),
+        "first run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let rows_after_first = duckdb_total_parquet_rows(out.path());
+    assert_eq!(
+        rows_after_first, 10,
+        "fixture is inert: run 1 must export all 10 rows"
+    );
+
+    let second = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
+    assert!(
+        second.status.success(),
+        "the no-op run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()),
+        rows_after_first,
+        "the no-op run changed the data on disk"
+    );
+
+    assert_eq!(
+        crate::live_skip_empty::latest_status(&rig, table.name()).0,
+        "skipped",
+        "a keyset re-run with no key past the anchor delivered nothing and must be skipped"
+    );
+
+    let v = rig.cli(&["validate"]);
+    assert!(
+        v.status.success(),
+        "after a HEALTHY no-op keyset run (no key past the anchor), the prefix no longer \
+         verifies.\n\nvalidate said:\n{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
