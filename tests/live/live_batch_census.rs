@@ -144,6 +144,67 @@ fn batch_census_distinct_leg_catches_a_duplicated_key_postgres() {
     let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
 }
 
+/// The VALUE leg bites: one cell rewritten in place leaves every count and DISTINCT equal and must still fail `agrees()`.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn batch_census_value_leg_catches_a_changed_cell_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("bcensus_val");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, v TEXT NOT NULL, amt NUMERIC(12,2), ts TIMESTAMPTZ);
+         INSERT INTO {table} SELECT g, 'v' || g, g * 1.25, TIMESTAMPTZ '2030-01-01 00:00:00.123456+00' + g * INTERVAL '1 second'
+           FROM generate_series(1, 100) g;"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .census_oracle()
+        .census_key("id");
+    rig.run_ok();
+    let clean = rig.row_census();
+    assert!(
+        clean.agrees(),
+        "precondition: the clean run agrees: {clean:?}"
+    );
+    assert_eq!(clean.value_mismatches, Some(0), "precondition: {clean:?}");
+
+    let parts = files_with_extension(&rig.out_dir(), "parquet");
+    let first = parts.first().expect("the run wrote a part");
+    let name = first.file_name().unwrap().to_string_lossy().into_owned();
+    let container = rig.oracle_container_out();
+    let _ = duckdb_run_sql_json(&format!(
+        "COPY (SELECT * REPLACE (CASE WHEN id = 7 THEN 'tampered' ELSE v END AS v) \
+               FROM read_parquet('{container}/{name}')) \
+         TO '{container}/{name}.rewritten' (FORMAT parquet)"
+    ));
+    std::fs::rename(first.with_extension("parquet.rewritten"), first)
+        .expect("swap in the rewritten part");
+
+    let bad = rig.row_census();
+    assert_eq!(
+        (
+            bad.source,
+            bad.delivered,
+            bad.metrics,
+            bad.file_log,
+            bad.manifest,
+            bad.delivered_distinct
+        ),
+        (100, 100, 100, 100, 100, Some(100)),
+        "the fixture must leave every count and DISTINCT equal: {bad:?}"
+    );
+    assert_eq!(bad.value_mismatches, Some(2), "one row each way: {bad:?}");
+    assert!(
+        !bad.agrees(),
+        "a changed value must fail the census: {bad:?}"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
 /// The MANIFEST leg BITES: a destination whose manifest declares a total the
 /// parquet does not hold must fail `agrees()`, even though every other leg
 /// still matches.
