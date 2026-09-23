@@ -361,7 +361,7 @@ pub(crate) fn inline_literal(source_type: SourceType, value: &str) -> String {
     match source_type {
         SourceType::Mysql => escape_mysql_literal(value),
         SourceType::Postgres => escape_pg_literal(value),
-        SourceType::Mssql => mssql_value_literal(value),
+        SourceType::Mssql => escape_mssql_literal(value),
         SourceType::Mongo => unreachable!(
             "inline_literal: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
         ),
@@ -398,42 +398,11 @@ fn cursor_rhs(source_type: SourceType, value: &str) -> (String, Option<String>) 
         // column type (same rationale as Postgres — the keyset/cursor column may
         // be int, datetime2, uniqueidentifier, …). No backslash escaping in
         // T-SQL; only `'` is doubled.
-        SourceType::Mssql => (mssql_value_literal(value), None),
+        SourceType::Mssql => (escape_mssql_literal(value), None),
         SourceType::Mongo => unreachable!(
             "cursor_rhs: MongoDB incremental cursor is not a SQL path (guarded by full-mode-only validation)"
         ),
     }
-}
-
-/// A T-SQL literal for a stored cursor/key value: a timestamp is cast to `datetime2(7)`, since `datetime` / `smalldatetime` refuse the six fractional digits rivet stores (Msg 241 / 295).
-fn mssql_value_literal(value: &str) -> String {
-    if is_timestamp_literal(value) {
-        format!("CAST({} AS datetime2(7))", escape_mssql_literal(value))
-    } else {
-        escape_mssql_literal(value)
-    }
-}
-
-/// Whether `v` is a `YYYY-MM-DDTHH:MM:SS[.f…]` timestamp as rivet stores cursor values.
-fn is_timestamp_literal(v: &str) -> bool {
-    let b = v.as_bytes();
-    let digits = |r: std::ops::Range<usize>| {
-        r.into_iter()
-            .all(|i| b.get(i).is_some_and(u8::is_ascii_digit))
-    };
-    b.len() >= 19
-        && digits(0..4)
-        && b[4] == b'-'
-        && digits(5..7)
-        && b[7] == b'-'
-        && digits(8..10)
-        && matches!(b[10], b'T' | b' ')
-        && digits(11..13)
-        && b[13] == b':'
-        && digits(14..16)
-        && b[16] == b':'
-        && digits(17..19)
-        && (b.len() == 19 || (b[19] == b'.' && b.len() > 20 && digits(20..b.len())))
 }
 
 /// Quote `s` as a T-SQL `N'…'` unicode string literal. SQL Server escapes only
@@ -491,35 +460,6 @@ pub(crate) fn escape_pg_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_stored_timestamp_reaches_sql_server_as_datetime2_and_anything_else_stays_a_string() {
-        assert_eq!(
-            inline_literal(SourceType::Mssql, "2026-01-03T00:00:00.000000"),
-            "CAST(N'2026-01-03T00:00:00.000000' AS datetime2(7))",
-            "a datetime column refuses six fractional digits in a plain N'' literal"
-        );
-        assert_eq!(
-            cursor_rhs(SourceType::Mssql, "2026-01-03T00:00:00").0,
-            "CAST(N'2026-01-03T00:00:00' AS datetime2(7))"
-        );
-        for plain in [
-            "250001",
-            "878d81ce-a269-4f0e-9d3a-2b6a7a1b2c3d",
-            "2026-01-03",
-            "O'Brien",
-        ] {
-            assert!(
-                !inline_literal(SourceType::Mssql, plain).starts_with("CAST"),
-                "{plain} is not a stored timestamp"
-            );
-        }
-        assert_eq!(
-            inline_literal(SourceType::Postgres, "2026-01-03T00:00:00.000000"),
-            "E'2026-01-03T00:00:00.000000'",
-            "only SQL Server gets the cast"
-        );
-    }
 
     fn cursor_with(val: Option<&str>) -> CursorState {
         CursorState {
