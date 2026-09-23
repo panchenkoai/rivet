@@ -26,7 +26,7 @@ use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
 use crate::source;
 use crate::state::StateStore;
-use crate::{destination, format, resource};
+use crate::{format, resource};
 
 use super::math::build_chunk_query_sql;
 
@@ -198,12 +198,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // (runner-bypass class). Now the guard rides in the only door to a
     // destination.
     let (shared_destination, _frame_ext) = crate::pipeline::frame::RunnerFrame::open_shared(plan)?;
-    destination::log_capabilities(
-        &plan.export_name,
-        &**shared_destination,
-        plan.destination.destination_type,
-        plan.tuning.max_retries,
-    );
 
     // OPT-2 adaptive concurrency governor, through the SHARED seam (identical wiring in
     // `chunked/exec.rs` and `keyset.rs`; #152). This runner shipped WITHOUT it, so

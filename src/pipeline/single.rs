@@ -12,7 +12,6 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
-use crate::destination;
 use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
@@ -407,14 +406,6 @@ pub(super) fn run_single_export(
     let frame = super::frame::RunnerFrame::open(plan)?;
     let (dest, ext) = (frame.dest, frame.ext);
     let ext = ext.as_str();
-
-    // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
-    destination::log_capabilities(
-        &plan.export_name,
-        dest.as_ref(),
-        plan.destination.destination_type,
-        plan.tuning.max_retries,
-    );
 
     let has_parts = sink.completed_parts.len() > 1;
     // Millisecond precision (matches keyset.rs / mongo_parallel.rs / cdc sink):

@@ -15,7 +15,7 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::{destination, format, resource};
+use crate::{format, resource};
 
 pub(crate) fn run_chunked_sequential(
     src: &mut dyn Source,
@@ -275,12 +275,6 @@ pub(crate) fn run_chunked_parallel(
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
     // (`dispatch task is gone: runtime dropped` from the HTTP client).
     let (shared_destination, _frame_ext) = crate::pipeline::frame::RunnerFrame::open_shared(plan)?;
-    destination::log_capabilities(
-        &plan.export_name,
-        &**shared_destination,
-        plan.destination.destination_type,
-        plan.tuning.max_retries,
-    );
 
     std::thread::scope(|s| {
         // Governor thread (shared seam): samples source pressure on its own monitoring connection

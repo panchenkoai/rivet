@@ -37,7 +37,8 @@ pub(crate) struct RunnerFrame {
 impl RunnerFrame {
     /// Create the destination, refuse a cross-shape prefix (a batch manifest
     /// must never clobber a CDC export's audit trail — finding #44), and
-    /// derive the part-file extension. Fails BEFORE the first part.
+    /// derive the part-file extension. Fails BEFORE the first part. Logs the
+    /// backend's capabilities once per run (ADR-0004) for every runner.
     pub(crate) fn open(plan: &ResolvedRunPlan) -> Result<Self> {
         // open == open_unguarded + the run-start cross-shape guard; sharing the
         // body keeps the two from drifting (roast 2026-08-09). The guard runs
@@ -45,6 +46,12 @@ impl RunnerFrame {
         // guard that a manifest read could observe.
         let frame = Self::open_unguarded(plan)?;
         crate::manifest::guard_manifest_mode(frame.dest.as_ref(), "batch")?;
+        destination::log_capabilities(
+            &plan.export_name,
+            frame.dest.as_ref(),
+            plan.destination.destination_type,
+            plan.tuning.max_retries,
+        );
         Ok(frame)
     }
 
