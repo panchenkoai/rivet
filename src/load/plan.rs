@@ -264,9 +264,19 @@ pub struct LoadPlan {
     pub renames: Vec<Rename>,
     /// One warning per renamed column, naming the fix to run on the source.
     pub rename_warnings: Vec<String>,
+    /// Why this table cannot load, found at plan time; the table fails alone, the others still load.
+    pub refusal: Option<String>,
 }
 
 impl LoadPlan {
+    /// This table's plan-time refusal, as its own error.
+    pub fn refused(&self) -> Result<()> {
+        match &self.refusal {
+            Some(why) => bail!("{why}"),
+            None => Ok(()),
+        }
+    }
+
     /// The spec's column names as the Parquet carries them, before any look-alike rename.
     pub fn file_column_names(&self) -> Vec<String> {
         self.specs
@@ -741,11 +751,12 @@ fn build_plans_keyed(
             .collect::<Result<_>>()?;
 
         let source_table = unit.as_deref().or(export.table.as_deref());
-        let (renames, rename_warnings) =
-            fold_lookalike_columns(&export.name, load, &mut specs, |file, latin| {
-                source_rename_action(cfg.source.source_type, source_table, file, latin)
-                    + &config_keys_note(export, file)
-            })?;
+        let fold = fold_lookalike_columns(&export.name, load, &mut specs, |file, latin| {
+            source_rename_action(cfg.source.source_type, source_table, file, latin)
+                + &config_keys_note(export, file)
+        });
+        let mut refusal = fold.as_ref().err().map(|e| format!("{e:#}"));
+        let (renames, rename_warnings) = fold.unwrap_or_default();
 
         // The meta columns rivet writes at EXTRACTION are in every Parquet part
         // but absent from the column report, which the type resolver builds from
@@ -827,7 +838,11 @@ fn build_plans_keyed(
             }
         }
         let partition = resolve_partition(&export.name, &eff_load, mode, &specs, fit)?;
-        refuse_renamed_shape_column(&export.name, &renames, partition.as_ref(), &cluster_by)?;
+        refusal = refusal.or_else(|| {
+            refuse_renamed_shape_column(&export.name, &renames, partition.as_ref(), &cluster_by)
+                .err()
+                .map(|e| format!("{e:#}"))
+        });
         let clustering = match eff_load.cluster_by {
             KeyColumns::Auto => Clustering::Auto(cluster_by),
             _ => Clustering::Written(cluster_by),
@@ -854,6 +869,7 @@ fn build_plans_keyed(
             pinned_run: None,
             renames,
             rename_warnings,
+            refusal,
         });
     }
     reject_duplicate_target_tables(
@@ -2587,6 +2603,10 @@ load:
             &keys,
             SpecFit::Strict,
         )
+        .expect("a refusal is the table's own, never the whole config's")
+        .pop()
+        .unwrap()
+        .refused()
         .unwrap_err()
         .to_string();
         assert!(
@@ -2629,6 +2649,37 @@ load:
             vec!["id".to_string()],
             "the recorded key folds with its column"
         );
+    }
+
+    #[test]
+    fn a_table_refused_at_plan_time_fails_alone() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - { name: clash, table: clash, mode: full, format: parquet, destination: { type: gcs, bucket: b, prefix: c/ } }
+  - { name: fine, table: fine, mode: full, format: parquet, destination: { type: gcs, bucket: b, prefix: f/ } }
+load: { target: bigquery, project: p, dataset: d, cluster_by: none }
+"#,
+        )
+        .unwrap();
+        let reports = vec![
+            report(
+                "clash",
+                vec![
+                    col("comment", TargetStatus::Ok),
+                    col("\u{441}omment", TargetStatus::Ok),
+                ],
+            ),
+            report("fine", vec![col("id", TargetStatus::Ok)]),
+        ];
+        let plans = build_plans(&cfg, cfg.load.as_ref().unwrap(), reports)
+            .expect("one table's refusal must not abort the others' load");
+        assert!(
+            plans[0].refused().is_err(),
+            "the colliding fold refuses its own table"
+        );
+        assert!(plans[1].refused().is_ok(), "the other table still loads");
     }
 
     #[test]

@@ -324,6 +324,7 @@ fn pin_plan_to_its_run(
     cfg: &crate::config::Config,
     op: &str,
 ) -> Result<load::plan::LoadPlan> {
+    plan.refused()?;
     // The by-name plan was built with its fit DEFERRED (`SpecFit::Deferred`), so
     // a path that keeps it owes the strict check the pin would have done.
     let unpinned = |why: &str| {
@@ -2859,6 +2860,7 @@ mod load_ledger_tests {
             deleted_flag: false,
             renames: Vec::new(),
             rename_warnings: Vec::new(),
+            refusal: None,
             export_name: "c1".into(),
             unit: None,
             table: "content_items".into(),
@@ -3063,6 +3065,7 @@ mod load_ledger_tests {
             deleted_flag: false,
             renames: Vec::new(),
             rename_warnings: Vec::new(),
+            refusal: None,
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),
@@ -3763,6 +3766,7 @@ mod live_only_decisions {
             deleted_flag: false,
             renames: Vec::new(),
             rename_warnings: Vec::new(),
+            refusal: None,
             export_name: "orders".into(),
             unit: None,
             table: "orders".into(),
