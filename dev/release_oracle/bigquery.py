@@ -58,13 +58,13 @@ def _matrix_cfg(*args: str) -> str:
 
 
 def _grade_chain(led: Ledger, engine: str, url: str, table: str, bucket: str, pfx: str,
-                 work: Path, dset: str) -> None:
+                 config: Path, dset: str) -> None:
     """Source, manifest, GCS parquet footers, rivet's ledger and BigQuery must agree for the run just loaded — one DuckDB session."""
     from .value_diff import chain_census, chain_disagreements
 
     state = os.environ.get("RIVET_STATE_URL", "")
     if not state.startswith("postgres"):
-        state = str(work / ".rivet_state.db")
+        state = str(config.with_name(".rivet_state.db"))  # rivet keeps its state beside the config
     try:
         c = chain_census(engine, url, table, bucket, pfx, state, dset, table)
     except Exception as e:  # noqa: BLE001 — an oracle that cannot read is a FAIL, never a pass
@@ -699,7 +699,7 @@ def _bq_one_engine(
             _grade_against_source(led, engine, url, eng_dset, exp)
             got = "loaded"
         with led.span(f"bq {engine}: chain"):
-            _grade_chain(led, engine, url, exp, bucket, pfx, work, eng_dset)
+            _grade_chain(led, engine, url, exp, bucket, pfx, cfgf, eng_dset)
     else:
         failed_proc = rp if not rp.ok else lp
         leg = "run" if not rp.ok else "load"
