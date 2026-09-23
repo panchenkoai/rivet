@@ -322,6 +322,33 @@ impl StateDb {
     }
 }
 
+/// The primary key recorded for `export`, from the backend rivet used: Postgres when
+/// `RIVET_STATE_URL` names one, else the SQLite file beside `cfg`.
+pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<String>> {
+    let pg = std::env::var("RIVET_STATE_URL")
+        .ok()
+        .filter(|u| u.starts_with("postgres"));
+    match pg {
+        Some(url) => {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_STATE_URL: {e}")
+            });
+            client
+                .query_opt(
+                    "SELECT primary_key_json FROM export_load_spec \
+                     WHERE export_name = $1 AND unit = ''",
+                    &[&export],
+                )
+                .expect("query export_load_spec")
+                .and_then(|r| r.get::<_, Option<String>>(0))
+                .map(|j| serde_json::from_str(&j).expect("primary_key_json is a JSON list"))
+        }
+        None => StateDb::next_to_config(cfg)
+            .load_spec(export, None)
+            .and_then(|(_, k)| k),
+    }
+}
+
 /// `load_run.status` for `target_table`, oldest first, from the backend the run
 /// USED: Postgres when `RIVET_STATE_URL` names one (the gate's Postgres pass sets
 /// it for every cell), else the SQLite file beside `cfg`. Reading the SQLite file

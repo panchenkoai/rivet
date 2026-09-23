@@ -481,8 +481,7 @@ fn an_export_init_cannot_give_a_cursor_does_not_cost_the_others_their_key() {
         said.contains(&stampless) && said.contains("have no timestamp column"),
         "the fixture must really leave one export without a cursor: {said}"
     );
-    let state = StateDb::next_to_config(&cfg);
-    let key = |t: &str| state.load_spec(t, None).and_then(|(_, k)| k);
+    let key = |t: &str| recorded_primary_key(&cfg, t);
     assert_eq!(key(&stamped), Some(vec!["id".to_string()]));
     assert_eq!(key(&stampless), Some(vec!["code".to_string()]));
 }
