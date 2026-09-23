@@ -125,8 +125,9 @@ impl TableInfo {
     /// 2026-08-08). This is that one picker.
     pub(crate) fn chosen_cursor_column(&self) -> Option<String> {
         crate::init::candidates::cursor_candidates(self)
-            .first()
-            .map(|c| c.column.clone())
+            .into_iter()
+            .find(|c| !is_coarse_stamp_type(&c.data_type))
+            .map(|c| c.column)
     }
 
     /// [`chosen_cursor_column`] RESTRICTED to a timestamp column — for
@@ -167,7 +168,11 @@ impl TableInfo {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
             .iter()
-            .filter(|c| is_timestamp_type(&c.data_type) && !is_tombstone_stamp(&c.name))
+            .filter(|c| {
+                is_timestamp_type(&c.data_type)
+                    && !is_tombstone_stamp(&c.name)
+                    && !is_coarse_stamp_type(&c.data_type)
+            })
             .collect();
         ts_cols
             .iter()
@@ -394,6 +399,12 @@ fn is_integer_type(t: &str) -> bool {
             | "tinyint"
             | "mediumint"
     )
+}
+
+/// Whether the type holds only a day or a minute: a strict `>` cursor on it skips every row later inserted in the watermark's day or minute.
+pub(crate) fn is_coarse_stamp_type(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t == "date" || t.contains("smalldatetime")
 }
 
 fn is_timestamp_type(t: &str) -> bool {
