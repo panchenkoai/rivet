@@ -439,12 +439,7 @@ fn run_keyset_parallel(
             "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
             plan.base_query
         ))?;
-        let advances = match (&anchor, &cur_max) {
-            (_, None) => false,                       // empty source
-            (None, Some(_)) => true,                  // no prior anchor → all rows new
-            (Some(a), Some(c)) => key_advances(a, c), // c strictly past a
-        };
-        if !advances {
+        if nothing_past_anchor(anchor.as_deref(), cur_max.as_deref()) {
             log::info!(
                 "export '{}': parallel keyset incremental — no new rows past the anchor, nothing to export",
                 plan.export_name
@@ -515,7 +510,7 @@ fn run_keyset_parallel(
     // range — the headline speed-up is silently absent. The usual cause is a key
     // type the boundary probe cannot render (e.g. a source that returns the key as
     // an unhandled type from query_scalar). warn, not info, so it is visible.
-    if parallel > 1 && total_ranges == 1 {
+    if fan_out_collapsed(parallel, total_ranges) {
         log::warn!(
             "export '{}': parallel keyset requested {} workers but sampled 0 boundaries — \
              running as a SINGLE worker. The key may be a type the boundary probe cannot \
@@ -737,7 +732,7 @@ fn run_keyset_parallel(
                         .unwrap()
                         .extend(page.parts.into_iter().map(|p| (ridx, p)));
                     local_checks.push(page.checksums);
-                    let last_page = page.rows < page_size;
+                    let last_page = is_last_page(page.rows, page_size);
                     if !last_page {
                         match page.next_cursor {
                             Some(v) => cursor = Some(v),
@@ -979,6 +974,43 @@ fn key_advances(anchor: &str, candidate: &str) -> bool {
     candidate > anchor
 }
 
+/// Is there nothing past the incremental anchor: an empty source, or a source
+/// max that does not advance it? No prior anchor means every row is new.
+fn nothing_past_anchor(anchor: Option<&str>, cur_max: Option<&str>) -> bool {
+    match (anchor, cur_max) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(c)) => !key_advances(a, c),
+    }
+}
+
+/// Did the sampler collapse a requested parallel fan-out to a single range?
+fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
+    parallel > 1 && total_ranges == 1
+}
+
+/// A short page means the key range is exhausted.
+fn is_last_page(rows: usize, page_size: usize) -> bool {
+    rows < page_size
+}
+
+/// Does a sequential keyset run seek from the persisted cursor (crash recovery,
+/// or `keyset_incremental`) rather than from the start of the key space?
+fn seeks_from_persisted_cursor(
+    checkpoint: bool,
+    recovering_crash: bool,
+    incremental: bool,
+) -> bool {
+    checkpoint && (recovering_crash || incremental)
+}
+
+/// Is the resume anchor released as soon as the data is complete? Only for a
+/// crash-recovery-only run: an incremental run keeps it until the manifest is
+/// written, or a crash in between would orphan the committed pages.
+fn releases_anchor_at_data_complete(checkpoint: bool, incremental: bool) -> bool {
+    checkpoint && !incremental
+}
+
 /// The `(lo, hi)` pairs of a sampled range list, for `persist_keyset_ranges`.
 fn lo_hi_pairs(
     ranges: &[(usize, Option<String>, Option<String>, bool)],
@@ -1048,17 +1080,18 @@ pub(crate) fn run_keyset(
     // tell that the prior run crashed (a flaky-link diagnosis signal).
     summary.resumed = recovering_crash;
 
-    let mut last: Option<String> = if kp.checkpoint && (recovering_crash || kp.incremental) {
-        match state {
-            Some(s) => {
-                s.get_owned(&plan.export_name, &kp.key_column)?
-                    .last_cursor_value
+    let mut last: Option<String> =
+        if seeks_from_persisted_cursor(kp.checkpoint, recovering_crash, kp.incremental) {
+            match state {
+                Some(s) => {
+                    s.get_owned(&plan.export_name, &kp.key_column)?
+                        .last_cursor_value
+                }
+                None => None,
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     // Forensics (v18): a resume's lower bound is the checkpoint it continues from
     // (None on a fresh run — keyset seeks forward from the start). cursor_high (the
     // max reached) is set at the loop exits below.
@@ -1246,7 +1279,7 @@ pub(crate) fn run_keyset(
 
         // A short page means the index range is exhausted — stop without an
         // extra empty round-trip.
-        if page.rows < kp.chunk_size {
+        if is_last_page(page.rows, kp.chunk_size) {
             // Forensics (v18): the final page's max key is the run's true high-water.
             // Record it BEFORE breaking — the loop stops without advancing `last`, so
             // a short tail page (e.g. the 3 u64 ids above i64::MAX) is captured yet
@@ -1300,8 +1333,7 @@ pub(crate) fn run_keyset(
     // mark (0 new rows) and never rehydrates those parts, so the manifest-
     // authoritative loader silently drops them. The anchor must survive until
     // finalize for the incremental path (job.rs clears it AFTER the manifest write).
-    if kp.checkpoint
-        && !kp.incremental
+    if releases_anchor_at_data_complete(kp.checkpoint, kp.incremental)
         && let Some(st) = state
     {
         st.clear_resume_run_id(&plan.export_name)?;
@@ -1435,6 +1467,70 @@ mod tests {
         // A `||`→`&&` slip in the keep-predicate would drop alnum too — pinned by the
         // all-safe case round-tripping unchanged.
         assert_eq!(sanitize_run_id("ABCabc012"), "ABCabc012");
+    }
+
+    #[test]
+    fn nothing_past_anchor_covers_empty_first_and_stale_sources() {
+        assert!(nothing_past_anchor(Some("5"), None), "empty source");
+        assert!(nothing_past_anchor(None, None), "empty source, no anchor");
+        assert!(
+            !nothing_past_anchor(None, Some("1")),
+            "no anchor: every row is new"
+        );
+        assert!(
+            !nothing_past_anchor(Some("999"), Some("1000")),
+            "numeric, not lexical"
+        );
+        assert!(
+            nothing_past_anchor(Some("1000"), Some("1000")),
+            "max == anchor"
+        );
+    }
+
+    #[test]
+    fn fan_out_collapses_only_when_parallel_was_asked_for() {
+        assert!(fan_out_collapsed(4, 1));
+        assert!(!fan_out_collapsed(1, 1), "sequential was asked for");
+        assert!(!fan_out_collapsed(4, 2));
+    }
+
+    #[test]
+    fn a_short_page_is_the_last() {
+        assert!(is_last_page(2, 3));
+        assert!(!is_last_page(3, 3), "a full page may have a successor");
+    }
+
+    #[test]
+    fn keyset_seeks_from_the_cursor_only_for_recovery_or_incremental() {
+        assert!(
+            seeks_from_persisted_cursor(true, true, false),
+            "crash recovery"
+        );
+        assert!(
+            seeks_from_persisted_cursor(true, false, true),
+            "keyset_incremental"
+        );
+        assert!(
+            !seeks_from_persisted_cursor(true, false, false),
+            "clean re-run: full pass"
+        );
+        assert!(
+            !seeks_from_persisted_cursor(false, true, true),
+            "no checkpoint, no cursor"
+        );
+    }
+
+    #[test]
+    fn only_a_crash_recovery_run_releases_its_anchor_at_data_complete() {
+        assert!(releases_anchor_at_data_complete(true, false));
+        assert!(
+            !releases_anchor_at_data_complete(true, true),
+            "incremental keeps it to finalize"
+        );
+        assert!(
+            !releases_anchor_at_data_complete(false, false),
+            "no checkpoint, no anchor"
+        );
     }
 
     // ── key_advances: numeric-aware strictly-past-anchor compare ─────────────

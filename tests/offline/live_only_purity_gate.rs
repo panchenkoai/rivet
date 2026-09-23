@@ -113,8 +113,8 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // is dense with pagination/plan arithmetic. These are the ceilings most
     // worth spending: the runner-bypass class in the process rules is precisely a
     // per-runner decision that no offline test grades.
-    ("src/pipeline/keyset.rs::run_keyset", 5, 1, 3, 2),
-    ("src/pipeline/keyset.rs::run_keyset_parallel", 8, 0, 4, 4),
+    ("src/pipeline/keyset.rs::run_keyset", 3, 0, 2, 1),
+    ("src/pipeline/keyset.rs::run_keyset_parallel", 7, 0, 3, 2),
     (
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
         1,
