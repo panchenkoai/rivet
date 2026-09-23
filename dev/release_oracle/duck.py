@@ -26,9 +26,6 @@ import duckdb
 BQ_PROJECT_ENV = "BQ_ORACLE_PROJECT"
 BQ_DATASET_ENV = "BQ_ORACLE_DATASET"
 
-#: Local stand DSNs, matching docker-compose.yaml.
-MYSQL_DSN = "host=127.0.0.1 port=3306 user=rivet password=rivet database=rivet"
-POSTGRES_DSN = "host=127.0.0.1 port=5432 user=rivet password=rivet dbname=rivet"
 
 
 def bq_target() -> tuple[str, str] | None:

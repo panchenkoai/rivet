@@ -17,13 +17,11 @@ Two ports that share a name and nothing else:
   bash precisely because each carried its own copy of `norm`/`chk`.
 
 * `dev/sweep-test-cruft.sh` → `test_cruft()`
-  Drops fixture tables left behind by INTERRUPTED live runs. Live tests name
-  fixtures `<prefix>_<pid>_<counter>` (`tests/common::unique_name`) and drop them
-  from an RAII guard that does NOT fire when the test PROCESS is killed (nextest
-  slow-timeout, SIGKILL, Ctrl-C — routine for the slow cloud suites). The
-  `_<digits>_<digits>` suffix is what makes this safe: the persistent fixtures
-  (users, orders, content_items, rivet_type_matrix, … from init.sql / seed.rs)
-  never carry it. Best-effort per engine; a service that is down is skipped.
+  Drops test objects left behind by INTERRUPTED live runs, on every source in
+  `dev/stand/registry.yaml` (tables, PG slots, Mongo databases and collections;
+  BigQuery with `--bigquery`). Live tests name objects `<prefix>_<pid>_<counter>`
+  (`tests/common::unique_name`); an object is dropped only when that pid is no
+  longer running, so a concurrent live run is never swept.
 
 Usage:
 
@@ -54,17 +52,6 @@ WHAT IS DELIBERATELY DIFFERENT FROM THE BASH (each one a bug it shipped):
    2**, the code that wrapper already documents as "a service down" and turns
    into a SKIP. A destination with no `.parquet` is likewise a named failure
    rather than an agreement.
-3. `test_cruft`'s PostgreSQL arm computed `n` in a `DO` block and `RAISE
-   NOTICE`d it into `>/dev/null 2>&1`, then printed a fixed "postgres: swept" —
-   the count it went to the trouble of keeping was discarded. The NOTICE is now
-   read back and reported (`postgres: swept (N stale fixtures dropped)`); the
-   `quote_ident` server-side quoting of the original is kept.
-4. `test_cruft`'s MySQL arm was `docker exec … -e "SELECT 'DROP …'" | docker exec
-   -i … mysql`, i.e. bug class 5: the verdict came from the LAST stage, so a
-   failed *generator* still printed "mysql: swept". The names are now fetched,
-   quoted and dropped in two separate checked steps, and a failure is reported
-   loudly instead of claimed as a sweep.
-
 KNOWN-WEAK ORACLE, kept as-is for fidelity: `norm()` (imported from `cdc_soak`)
 strips trailing zeros — `sed 's/0*$//'` — so the two sides can agree across
 engines that render decimals differently. It also means `1000` normalises to `1`,
@@ -76,7 +63,6 @@ change which cells fail.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -84,18 +70,19 @@ from pathlib import Path
 from typing import Sequence
 
 if __package__:
-    from . import cdc_soak, cdc_stand, shell
+    from . import cdc_soak, cdc_stand, registry, shell
 else:  # executed as a plain script: `python3 dev/pytools/sweep.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import cdc_soak  # type: ignore[no-redef]
     import cdc_stand  # type: ignore[no-redef]
+    import registry  # type: ignore[no-redef]
     import shell  # type: ignore[no-redef]
 
 ROOT = shell.ROOT
 
 USAGE = (
     "usage: dev/pytools/sweep.py source-parity [rivet-binary]\n"
-    "       dev/pytools/sweep.py test-cruft"
+    "       dev/pytools/sweep.py test-cruft [--bigquery]"
 )
 
 # The comparison core is the CDC sibling's, on purpose — one `norm`, one `chk`,
@@ -107,9 +94,9 @@ ddv = cdc_soak.ddv
 SWEEP_ROWS = cdc_soak.SWEEP_ROWS
 
 # ── batch stack (the OTHER ports than the cdc profile: 5432 / 3306 / 1433) ─────
-PG_URL = "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
-MY_URL = "mysql://rivet:rivet@127.0.0.1:3306/rivet"
-MS_URL = f"sqlserver://sa:{cdc_stand.SA_PASSWORD}@127.0.0.1:1433/rivet"
+PG_URL = registry.source("postgres")["url"]
+MY_URL = registry.source("mysql")["url"]
+MS_URL = registry.source("mssql")["url"]
 
 
 def export_parquet(t: Tally, rivet: Path, engine: str, url: str, query: str, out: Path) -> None:
@@ -338,114 +325,166 @@ def source_parity(binary: str | Path | None = None) -> int:
 
 
 # ══ dev/sweep-test-cruft.sh ════════════════════════════════════════════════════
-# unique_name suffix: `_<pid>_<counter>` at end of name. Both engines use the
-# same pattern; it is what keeps this sweep off the persistent fixtures.
-FIXTURE_PAT = "_[0-9]+_[0-9]+$"
+def _lines(p: shell.Proc) -> list[str]:
+    """Non-empty stripped stdout lines."""
+    return [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
 
-PG_CRUFT_CONTAINER = "rivet-postgres-1"
-MY_CRUFT_CONTAINER = "rivet-mysql-1"
 
-# Kept verbatim from the bash — the DROP is built server-side with
-# `quote_ident`, which is the safe way to name a table that came out of the
-# catalogue. Only the NOTICE's fate changes: it is read instead of discarded.
-PG_CRUFT_SQL = f"""DO $$
-DECLARE r RECORD; n int := 0;
-BEGIN
-  FOR r IN SELECT tablename FROM pg_tables
-           WHERE schemaname='public' AND tablename ~ '{FIXTURE_PAT}' LOOP
-    EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
-    n := n + 1;
-  END LOOP;
-  RAISE NOTICE 'postgres: dropped % stale fixtures', n;
-END $$;
+def _report(source: str, what: str, dropped: list[str], failed: list[str]) -> None:
+    """One line per source and object kind."""
+    print(f"  {source}: {len(dropped)} orphaned {what} dropped" + (f", {len(failed)} FAILED: {failed[:3]}" if failed else ""))
+
+
+def _pg_cruft(source: str, container: str, db: str) -> None:
+    """Orphaned tables and inactive replication slots on one PostgreSQL database."""
+    q = lambda sql: shell.docker_exec(container, *cdc_stand.psql_argv(sql, db=db), timeout=300)  # noqa: E731
+    listed = q("SELECT schemaname||'.'||tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')")
+    if not listed.ok:
+        return
+    dropped, failed = [], []
+    for fq in _lines(listed):
+        schema, name = fq.split(".", 1)
+        if registry.orphaned(name):
+            ident = '"' + schema.replace('"', '""') + '"."' + name.replace('"', '""') + '"'
+            (dropped if q(f"DROP TABLE IF EXISTS {ident} CASCADE").ok else failed).append(fq)
+    _report(f"{source}/{db}", "tables", dropped, failed)
+    slots = q("SELECT slot_name FROM pg_replication_slots WHERE NOT active")
+    dropped, failed = [], []
+    for slot in _lines(slots) if slots.ok else []:
+        if registry.orphaned(slot):
+            lit = slot.replace("'", "''")
+            (dropped if q(f"SELECT pg_drop_replication_slot('{lit}')").ok else failed).append(slot)
+    if dropped or failed:
+        _report(source, "replication slots", dropped, failed)
+
+
+def _my_cruft(source: str, container: str, db: str) -> None:
+    """Orphaned tables on one MySQL database."""
+    listed = shell.docker_exec(container, *cdc_stand.mysql_argv("SHOW TABLES", db=db), timeout=300)
+    if not listed.ok:
+        return
+    dropped, failed = [], []
+    for name in _lines(listed):
+        if registry.orphaned(name):
+            ok = shell.docker_exec(container, *cdc_stand.mysql_argv(f"DROP TABLE IF EXISTS {_my_quote(name)}", db=db)).ok
+            (dropped if ok else failed).append(name)
+    _report(f"{source}/{db}", "tables", dropped, failed)
+
+
+def _ms_cruft(source: str, container: str, db: str) -> None:
+    """Orphaned tables on one SQL Server database — CDC disabled BEFORE the drop, or the change table is orphaned."""
+    q = lambda sql: shell.docker_exec(container, *cdc_stand.sqlcmd_argv(sql, db=db, wide=True, nocount=True), timeout=300)  # noqa: E731
+    listed = q("SELECT s.name+'|'+t.name+'|'+CAST(t.is_tracked_by_cdc AS varchar) FROM sys.tables t "
+               "JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE s.name <> 'cdc' AND t.is_ms_shipped=0")
+    if not listed.ok:
+        return
+    dropped, failed = [], []
+    for row in _lines(listed):
+        parts = row.split("|")
+        if len(parts) != 3 or not registry.orphaned(parts[1]):
+            continue
+        schema, name, tracked = parts
+        sq, nq = schema.replace("'", "''"), name.replace("'", "''")
+        disable = (f"EXEC sys.sp_cdc_disable_table @source_schema=N'{sq}', @source_name=N'{nq}', "
+                   "@capture_instance=N'all'; ") if tracked == "1" else ""
+        ident = "[" + schema.replace("]", "]]") + "].[" + name.replace("]", "]]") + "]"
+        (dropped if q(f"{disable}DROP TABLE IF EXISTS {ident}").ok else failed).append(f"{schema}.{name}")
+    _report(f"{source}/{db}", "tables", dropped, failed)
+
+
+_MONGO_SWEEP_JS = """
+const keep = %s, orphan = new Set(%s);
+let dbs = 0, colls = 0;
+db.adminCommand({listDatabases: 1}).databases.forEach(d => {
+  if (orphan.has(d.name)) { db.getSiblingDB(d.name).dropDatabase(); dbs++; return; }
+  if (!keep.includes(d.name)) return;
+  db.getSiblingDB(d.name).getCollectionNames().forEach(c => {
+    if (orphan.has(d.name + "." + c)) { db.getSiblingDB(d.name).getCollection(c).drop(); colls++; }
+  });
+});
+print(dbs + " " + colls);
 """
 
-_NOTICE_N = re.compile(r"dropped\s+([0-9]+)\s+stale fixtures")
 
+def _mongo_cruft(source: str, container: str) -> None:
+    """Orphaned databases, and orphaned collections inside the persistent ones."""
+    import json
 
-def _container_up(name: str) -> bool:
-    """`docker exec <c> true 2>/dev/null` — the bash's liveness gate."""
-    return shell.docker_exec(name, "true", timeout=30).ok
-
-
-def _sweep_pg_cruft() -> None:
-    p = shell.docker_exec(
-        PG_CRUFT_CONTAINER,
-        "psql", "-U", "rivet", "-d", "rivet", "-q", "-v", "ON_ERROR_STOP=0",
-        stdin=PG_CRUFT_SQL,
-    )
-    m = _NOTICE_N.search(p.out)
-    if not p.ok:
-        tail = (p.stderr or p.stdout).strip().splitlines()
-        shell.warn(f"  postgres: sweep FAILED: {tail[-1] if tail else p.returncode}")
+    keep = registry.load()["databases"]
+    listing = shell.docker_exec(container, "mongosh", "--quiet", "--eval",
+        f"const k={json.dumps(keep)}; db.adminCommand({{listDatabases:1}}).databases.forEach(d => {{ print(d.name); "
+        "if (k.includes(d.name)) db.getSiblingDB(d.name).getCollectionNames().forEach(c => print(d.name + '.' + c)); });",
+        timeout=300)
+    if not listing.ok:
         return
-    n = m.group(1) if m else "?"
-    print(f"  postgres: swept ({n} stale fixtures dropped)")
+    orphan = [n for n in _lines(listing) if registry.orphaned(n.rsplit(".", 1)[-1])]
+    swept = shell.docker_exec(container, "mongosh", "--quiet", "--eval",
+                              _MONGO_SWEEP_JS % (json.dumps(keep), json.dumps(orphan)), timeout=900)
+    if not swept.ok:
+        shell.warn(f"  {source}: sweep FAILED: {(swept.stderr or swept.stdout).strip()[-200:]}")
+        return
+    dbs, colls = (_lines(swept)[-1].split() + ["?", "?"])[:2]
+    print(f"  {source}: {dbs} orphaned databases, {colls} orphaned collections dropped")
+
+
+def _bigquery_cruft() -> None:
+    """Every disposable (`tmp_prefix`) dataset, and orphaned tables in the permanent one — opt-in, never during a run."""
+    bq = registry.load()["bigquery"]
+    proj, tmp, e2e = bq["project"], bq["tmp_prefix"], bq["e2e"]
+    ls = shell.run(["bq", "ls", "--format=json", "--max_results=10000", f"{proj}:"], timeout=300)
+    if not ls.ok:
+        shell.warn(f"  bigquery: listing FAILED: {ls.stderr.strip()[-200:]}")
+        return
+    import json
+
+    names = [d["datasetReference"]["datasetId"] for d in json.loads(ls.stdout or "[]")]
+    dropped, failed = [], []
+    for name in names:
+        if name.startswith(tmp):
+            ok = shell.run(["bq", "rm", "-r", "-f", "-d", f"{proj}:{name}"], timeout=300).ok
+            (dropped if ok else failed).append(name)
+    _report("bigquery", f"datasets ({tmp}*)", dropped, failed)
+    tl = shell.run(["bq", "ls", "--format=json", "--max_results=100000", f"{proj}:{e2e}"], timeout=300)
+    dropped, failed = [], []
+    for t in json.loads(tl.stdout or "[]") if tl.ok else []:
+        name = t["tableReference"]["tableId"]
+        if registry.orphaned(name):
+            ok = shell.run(["bq", "rm", "-f", "-t", f"{proj}:{e2e}.{name}"], timeout=300).ok
+            (dropped if ok else failed).append(name)
+    _report(f"bigquery/{e2e}", "tables", dropped, failed)
 
 
 def _my_quote(name: str) -> str:
-    """MySQL identifier quoting: backticks, internal backticks doubled.
-
-    The bash built the DROP statements with `CONCAT` inside MySQL, which is
-    equally safe; doing it here is what lets the generator's exit status be
-    checked instead of being swallowed by the pipe's last stage.
-    """
+    """MySQL identifier quoting: backticks, internal backticks doubled."""
     return "`" + name.replace("`", "``") + "`"
 
 
-def _sweep_my_cruft() -> None:
-    listing = shell.docker_exec(
-        MY_CRUFT_CONTAINER,
-        *cdc_stand.mysql_argv(
-            "SELECT table_name FROM information_schema.tables "
-            f"WHERE table_schema='rivet' AND table_name REGEXP '{FIXTURE_PAT}'"
-        ),
-    )
-    if not listing.ok:
-        tail = (listing.stderr or listing.stdout).strip().splitlines()
-        shell.warn(f"  mysql: sweep FAILED (listing): {tail[-1] if tail else listing.returncode}")
-        return
-    names = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
-    if names:
-        script = "".join(f"DROP TABLE IF EXISTS {_my_quote(n)};\n" for n in names)
-        drop = shell.docker_exec(
-            MY_CRUFT_CONTAINER, "mysql", "-urivet", "-privet", "rivet", stdin=script
-        )
-        if not drop.ok:
-            tail = (drop.stderr or drop.stdout).strip().splitlines()
-            shell.warn(f"  mysql: sweep FAILED (drop): {tail[-1] if tail else drop.returncode}")
-            return
-    print(f"  mysql: swept ({len(names)} stale fixtures dropped)")
+def _container_up(name: str) -> bool:
+    """`docker exec <c> true` — the liveness gate."""
+    return shell.docker_exec(name, "true", timeout=30).ok
 
 
-def test_cruft() -> int:
-    """Drop stale `_<pid>_<counter>` fixtures on the batch engines.
+def test_cruft(bigquery: bool = False) -> int:
+    """Drop test objects whose creating process is gone, on every source in the stand registry.
 
-    Best-effort by design (the nextest setup script in `.config/nextest.toml`
-    runs it before every live run, and `make sweep-test-db` runs it by hand): a
-    down engine is skipped, a failed drop is reported loudly, and the exit code
-    stays 0 either way so a housekeeping hiccup never aborts the live suite.
-
-    SQL Server is still a follow-up, exactly as the bash left it: T-SQL has no
-    regex, so a precise `_<pid>_<counter>$` match needs PATINDEX gymnastics or a
-    CLR function, and a loose `LIKE` risks dropping a real fixture. The mssql
-    live suites leak far less (fewer, slower), so this is deferred rather than
-    done loosely.
+    Best-effort: a down container is skipped, a failed drop is reported, the exit code stays 0.
+    Objects of a live process are never touched, so a concurrent run is safe.
     """
-    print("sweep-test-cruft: dropping stale unique_name fixtures (suffix _<pid>_<counter>)")
-
-    if _container_up(PG_CRUFT_CONTAINER):
-        _sweep_pg_cruft()
-    else:
-        print("  postgres: not up — skipped")
-
-    if _container_up(MY_CRUFT_CONTAINER):
-        _sweep_my_cruft()
-    else:
-        print("  mysql: not up — skipped")
-
+    print("sweep-test-cruft: dropping objects `<prefix>_<pid>_<n>` whose pid is gone")
+    arms = {"postgres": _pg_cruft, "mysql": _my_cruft, "mssql": _ms_cruft}
+    for source, spec in registry.load()["sources"].items():
+        container = spec["container"]
+        if not _container_up(container):
+            print(f"  {source}: not up — skipped")
+            continue
+        if source.startswith("mongo"):
+            _mongo_cruft(source, container)
+            continue
+        for db in registry.load()["databases"]:
+            arms[source.split("_")[0]](source, container, db)
+    if bigquery:
+        _bigquery_cruft()
     _sweep_live_tmp()
-
     print("sweep-test-cruft: done")
     return 0
 
@@ -494,7 +533,7 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
     if cmd in ("source-parity", "source_parity", "parity"):
         return source_parity(rest[0] if rest else None)
     if cmd in ("test-cruft", "test_cruft", "cruft"):
-        return test_cruft()
+        return test_cruft(bigquery="--bigquery" in rest)
 
     print(USAGE)
     return 1

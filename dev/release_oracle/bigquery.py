@@ -700,8 +700,8 @@ def _bq_one_engine(
                              child=child, engine=engine, url=url)
 
     run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-    run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
     if not keep:
+        run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", f"{proj}:{eng_dset}"])
         docker("rm", "-fv", engine_container(engine, _TAG))
     return None
 

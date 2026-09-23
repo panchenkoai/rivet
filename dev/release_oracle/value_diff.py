@@ -233,12 +233,14 @@ def compare_to_parquet(engine: str, url: str, table: str, preamble: str, dest: s
         return tuple_mismatches(ora, source, dest)
 
 
-def compare_to_bigquery(engine: str, url: str, dataset: str, table: str) -> tuple[int, list[str]]:
-    """(warehouse rows, differences) between the source table and its BigQuery load, read by DuckDB on both sides."""
+def compare_to_bigquery(
+    engine: str, url: str, dataset: str, table: str, warehouse_table: str | None = None
+) -> tuple[int, list[str]]:
+    """(warehouse rows, differences) between the source table and its BigQuery load (`warehouse_table`, default the same name), read by DuckDB on both sides."""
     from .duck import Oracle
 
     attach, prefix = source_attach(engine, url)
-    warehouse = f"bq.{dataset}.{table}"
+    warehouse = f"bq.{dataset}.{warehouse_table or table}"
     with Oracle(bigquery=True, **attach) as ora:
         bad = invalid_text_columns(ora, warehouse)
         if bad:
@@ -276,5 +278,21 @@ def _self_test() -> None:
     print("value_diff self-test ok")
 
 
+def _cli(argv: list[str]) -> int:
+    """`bigquery <engine> <source-url> <dataset> <source-table> <warehouse-table>` → JSON `{rows, diffs}` on stdout."""
+    import sys
+
+    if argv[:1] != ["bigquery"] or len(argv) != 6:
+        print("usage: value_diff bigquery <engine> <url> <dataset> <table> <warehouse_table>", file=sys.stderr)
+        return 2
+    rows, diffs = compare_to_bigquery(*argv[1:])
+    print(json.dumps({"rows": rows, "diffs": diffs}))
+    return 0
+
+
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1:
+        raise SystemExit(_cli(sys.argv[1:]))
     _self_test()

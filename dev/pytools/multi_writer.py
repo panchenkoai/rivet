@@ -41,6 +41,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+if __package__:
+    from . import registry
+else:  # run as a plain script: its own directory is on sys.path
+    import registry  # type: ignore[no-redef]
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "dev"))
 
@@ -51,7 +56,7 @@ STATE_URL = os.environ.get(
 STATE_CONTAINER = os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1")
 BUCKET = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
 BQ_PROJECT = os.environ.get("BQ_ORACLE_PROJECT", "rivet-data-tool")
-BQ_DATASET = os.environ.get("BQ_ORACLE_DATASET", "rivet_e2e")
+BQ_DATASET = os.environ.get("BQ_ORACLE_DATASET") or registry.load()["bigquery"]["e2e"]
 
 #: Rows each engine contributes, and where its id range starts. Disjoint by
 #: construction — that is the whole oracle.

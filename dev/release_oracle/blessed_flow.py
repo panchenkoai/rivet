@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import blessed_path, cdc, scenarios
+from ..pytools import registry
 from .core import (
     run,
     Ledger,
@@ -1135,7 +1136,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # rivet's lease guard on `rivet_blessed_postgres_repeat_gcs_postgres.users` and
     # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
-    dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+    dset = (os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate")
             + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
@@ -1214,15 +1215,13 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     _stage(led, cell, tag, "load", got == want and got > 0 and lok,
            f"bigquery={got} source={want} · ledger {ldetail}")
 
-    # Cleanup is part of the cycle. `bq rm -f` exits 0 whether or not the table
-    # existed, so its exit code is not evidence — the drop is verified by asking
-    # for the table afterwards.
-    run(["bq", "--project_id", proj, "rm", "-f", "-t", f"{proj}:{dset}.{tbl}"])
-    gone = run(["bq", "--project_id", proj, "show", "-t", f"{proj}:{dset}.{tbl}"])
+    # Cleanup is part of the cycle: the cell's own dataset goes, verified by a show that fails.
+    run(["bq", "--project_id", proj, "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
+    gone = run(["bq", "--project_id", proj, "show", "-d", f"{proj}:{dset}"])
     run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
     _stage(led, cell, tag, "load:cleanup", not gone.ok,
-           "warehouse table dropped (verified by a show that fails)"
-           if not gone.ok else "the table is STILL THERE after rm — the next run's count "
+           "cell dataset dropped (verified by a show that fails)"
+           if not gone.ok else "the dataset is STILL THERE after rm — the next run's count "
            "would be a union of two loads")
 
 
