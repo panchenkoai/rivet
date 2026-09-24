@@ -777,7 +777,7 @@ fn oracle_class_census_is_pinned() {
 const PIN_INDEPENDENT: usize = 78;
 const PIN_SHARED_CODEC: usize = 73;
 const PIN_SELF_COUNTER: usize = 6;
-const PIN_PRESENCE: usize = 63;
+const PIN_PRESENCE: usize = 64;
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely

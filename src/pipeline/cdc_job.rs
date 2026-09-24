@@ -670,18 +670,20 @@ fn run_cdc_inner(
             Ok(d) => d,
             Err(e) => return (Vec::new(), Err(e)),
         };
-        // Finding #44, early check: refuse BEFORE the first part lands if the
-        // prefix belongs to the other pipeline shape (config error, fail the
-        // run cleanly — the write-seam guard stays as the backstop).
-        if let Err(e) = crate::manifest::guard_manifest_mode(dest.as_ref(), "cdc") {
-            return (Vec::new(), Err(e));
-        }
         let uri = dcfg
             .path
             .clone()
             .or_else(|| dcfg.prefix.clone())
             .unwrap_or_default();
         wired.push((t.clone(), dest, uri));
+    }
+    // Finding #44, early check: refuse BEFORE the first part lands if a prefix
+    // belongs to the other pipeline shape (config error, fail the run cleanly —
+    // the write-seam guard stays as the backstop). One read per table, fanned out.
+    if let Err(e) = crate::destination::for_each_concurrently(&wired, |(_, dest, _)| {
+        crate::manifest::guard_manifest_mode(dest.as_ref(), "cdc")
+    }) {
+        return (Vec::new(), Err(e));
     }
     // `columns:` type overrides, narrowed per table: bare keys apply to every
     // captured table; qualified keys ("table.column") only to theirs, winning

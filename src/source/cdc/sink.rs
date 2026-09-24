@@ -355,7 +355,7 @@ fn roll_all(
                 (s.out.dest, manifest)
             })
             .collect();
-        write_concurrently(&pending, |(dest, manifest)| {
+        crate::destination::for_each_concurrently(&pending, |(dest, manifest)| {
             write_manifest_without_success_marker(*dest, manifest).map(|_| ())
         })?;
         drop(pending);
@@ -624,7 +624,7 @@ pub(crate) fn run_to_files(
             .zip(&manifests)
             .map(|(s, m)| (s.out.dest, m))
             .collect();
-        write_concurrently(&jobs, |(dest, manifest)| {
+        crate::destination::for_each_concurrently(&jobs, |(dest, manifest)| {
             write_manifest(*dest, manifest).map(|_| ())
         })
         .err()
@@ -636,44 +636,6 @@ pub(crate) fn run_to_files(
         (Ok(()), Some(e)) => (manifests, Err(e)),
         (Ok(()), None) => (manifests, Ok(())),
     }
-}
-
-/// Object-store writes in flight at once per roll: enough to hide per-PUT latency, few enough to stay polite to the store.
-const MANIFEST_WRITERS: usize = 16;
-
-/// Apply `write` to every item on up to [`MANIFEST_WRITERS`] threads; after the first error no new item starts, and that error is returned.
-fn write_concurrently<T: Sync>(items: &[T], write: impl Fn(&T) -> Result<()> + Sync) -> Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..MANIFEST_WRITERS.min(items.len()) {
-            scope.spawn(|| {
-                loop {
-                    if first_err
-                        .lock()
-                        .expect("write error slot poisoned")
-                        .is_some()
-                    {
-                        break;
-                    }
-                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                        break;
-                    };
-                    if let Err(e) = write(item) {
-                        first_err
-                            .lock()
-                            .expect("write error slot poisoned")
-                            .get_or_insert(e);
-                    }
-                }
-            });
-        }
-    });
-    first_err
-        .into_inner()
-        .expect("write error slot poisoned")
-        .map_or(Ok(()), Err)
 }
 
 /// Build the sink schema once, on the first flush — refining decimal scales from
@@ -2834,32 +2796,6 @@ mod tests {
             4,
             "a gained a part on every roll, then the terminal"
         );
-    }
-
-    /// Manifest writes overlap: the first item can only finish once the second has started.
-    #[test]
-    fn write_concurrently_overlaps_writes_and_returns_the_first_error() {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let (tx, rx) = (std::sync::Mutex::new(tx), std::sync::Mutex::new(rx));
-        let items = [0, 1];
-        write_concurrently(&items, |&i| {
-            if i == 0 {
-                rx.lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .map_err(|_| anyhow::anyhow!("item 1 never ran while item 0 was in flight"))
-            } else {
-                tx.lock().unwrap().send(()).map_err(Into::into)
-            }
-        })
-        .expect("two writes must be in flight at once");
-
-        let err = write_concurrently(&[1, 2, 3], |&i| {
-            anyhow::ensure!(i != 2, "item {i} refused");
-            Ok(())
-        })
-        .expect_err("a failed write is the result");
-        assert!(err.to_string().contains("item 2 refused"), "{err}");
     }
 
     /// A failed TERMINAL manifest write is the run's OUTCOME — never a success
