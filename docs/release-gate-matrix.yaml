@@ -263,7 +263,7 @@ infra:
       probes toxiproxy :8474 itself and SKIPs loudly when down"
   - id: state_upgrade
     status: test
-    note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
+    note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/migrations.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
   - id: state_concurrency
     infra: postgres-state
     status: test

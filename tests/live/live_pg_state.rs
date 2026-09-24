@@ -455,7 +455,7 @@ impl Drop for ScratchDb {
 /// Postgres state database at once all succeed.
 ///
 /// The SQLite sibling (`several_writers_migrating_one_database_at_once_all_succeed`,
-/// `src/state/mod.rs`) can live inline because its race fits in a tempdir. This one
+/// `src/state/migrations.rs`) can live inline because its race fits in a tempdir. This one
 /// needs the stand, which is exactly why it was missing while the guard it grades —
 /// `pg_advisory_lock(PG_MIGRATION_LOCK)` in `migrate_pg` — carried a MEASUREMENT in
 /// its own comment and no test: four concurrent exports against an empty schema,
