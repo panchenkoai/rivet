@@ -12,6 +12,7 @@
 use crate::destination::gcs::GcsStore;
 use crate::types::target::{TargetColumnSpec, TargetStatus};
 use anyhow::{Context, Result, bail};
+use staging::maybe_cleanup;
 
 mod bigquery;
 mod bq_rest;
@@ -23,6 +24,7 @@ pub mod plan;
 pub(crate) mod pool;
 pub mod reconcile;
 mod snowflake;
+mod staging;
 
 pub use bigquery::BigQueryLoader;
 pub use snowflake::SnowflakeLoader;
@@ -638,26 +640,6 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     Ok(())
 }
 
-/// Clean up iff `cleanup` is `Some`, downgrading a failure to a warning — the
-/// data is loaded and gated, so a stuck delete must not fail the load. Cleanup
-/// runs the driver's own [`delete_under`] over an injected [`GcsStore`], so no
-/// adapter owns a delete path. Returns whether the source was actually cleaned.
-fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
-    match cleanup {
-        Some((store, prefix)) => match delete_under(store, prefix) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!(
-                    "warning: source cleanup failed (data is safely loaded): {}",
-                    crate::redact::redact_secrets(&format!("{e:#}"))
-                );
-                false
-            }
-        },
-        None => false,
-    }
-}
-
 /// **Batch load driver.** Materialize `table` from `uris`, gate the landed rows
 /// against `expected_rows` (the reconciled file count; `None` skips the gate),
 /// and — only after the gate passes — clean up the source via `cleanup`
@@ -1105,18 +1087,6 @@ pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
     Ok((bucket, key))
 }
 
-/// Recursively delete a whole export-dedicated `gs://…/` prefix through an
-/// injected [`GcsStore`] — the driver's post-gate source cleanup, over the same
-/// native opendal GCS client the export destination uses (no `gcloud`). Taking
-/// the store as an argument (rather than each adapter building one from a
-/// config) is what lets an fs-backed store exercise this delete offline.
-pub(crate) fn delete_under(store: &GcsStore, gs_prefix: &str) -> Result<()> {
-    let (_, rel) = split_gs_uri(gs_prefix)?;
-    store
-        .remove_all(rel)
-        .with_context(|| format!("source cleanup (recursive delete of {gs_prefix}) failed"))
-}
-
 /// Open the one [`GcsStore`] a load reuses for reconcile, URI listing, and
 /// post-gate cleanup — the single production constructor `cli::dispatch` calls.
 ///
@@ -1199,6 +1169,7 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::load::staging::delete_under;
 
     #[test]
     fn only_a_name_that_is_plain_once_its_cyrillic_lookalikes_are_latin_folds() {

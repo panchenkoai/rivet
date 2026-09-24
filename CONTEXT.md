@@ -80,8 +80,8 @@ The warehouse **adapter** — one per loading `ExportTarget` (`BigQuery`,
 returning the rows the load reported), `append_changelog` (append a CDC change
 log, returning rows appended), `warehouse` (the dialect handle so the driver
 builds the view SQL once), `create_view` (execute the driver-built
-current-state view SQL). Source-prefix cleanup is the driver's `maybe_cleanup`
-over a `GcsStore`, not an adapter method. Dialect and CLI (`bq` / `snow`) live
+current-state view SQL). Source-prefix cleanup is `maybe_cleanup` in the staged-prefix
+lifecycle (`load/staging.rs`) over a `GcsStore`, not an adapter method. Dialect and CLI (`bq` / `snow`) live
 *behind* it; every asymmetry —
 Snowflake's external stage, BigQuery's 4,000-partition batch split — stays inside
 the adapter.

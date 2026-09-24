@@ -400,7 +400,8 @@ exclude_re = [
     # mutants no longer compile (unviable, verified by hand — `non-exhaustive
     # patterns: LoadMode::Cdc not covered`) instead of surviving under a `_`.
     # The three guards on a DESTRUCTIVE delete — `prefix_has_active_run`,
-    # `cleanup_target`, `maybe_gc_orphans` — are deliberately NOT excluded: they
+    # `cleanup_target`, `maybe_gc_orphans`, since moved with the staged-prefix
+    # lifecycle into src/load/staging.rs — are deliberately NOT excluded: they
     # take the caller's store now and are unit-tested against a filesystem-backed
     # one (`GcsStore::open_fs`) plus an in-memory ledger, so their body stubs die
     # offline. A guard on a recursive delete should not be gradable only against

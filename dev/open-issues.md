@@ -103,8 +103,8 @@ ledger the only writer of the counters (`record_part` + `adopt_part`); regressio
 `a_resume_after_a_failed_run_reports_the_rows_it_adopted`, RED on the old Skip arm.
 
 ### P9. `cleanup_source` decides "no live run" before the warehouse copy and deletes after it — found by reading, NOT measured
-`cleanup_target_leased` (`src/load/orchestrate.rs`) asks `prefix_has_active_run` before
-`materialize`; the recursive `delete_under` runs in `maybe_cleanup` (`src/load/mod.rs`)
+`cleanup_target_leased` (`src/load/staging.rs`) asks `prefix_has_active_run` before
+`materialize`; the recursive `delete_under` runs in `maybe_cleanup` (`src/load/staging.rs`)
 after the copy and the count gate. An extract that STARTS during the copy writes its
 running marker and parts into a prefix that was already judged idle, and the delete takes
 them. The prefix lease covers load-vs-load only. Unverified: needs a live test that starts

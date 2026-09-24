@@ -174,7 +174,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // conflicting_source_ident, up_to_date_label, ledger_says_active,
     // prefix_is_active, cleanup_verdict, consumable_run_ids, active_run_note,
     // append_done_line / full_done_line), and the mode router was made
-    // exhaustive so its arm-deletion mutants stop compiling.
+    // exhaustive so its arm-deletion mutants stop compiling. The staged-prefix
+    // predicates (ledger_says_active, prefix_is_active, cleanup_verdict) have
+    // since moved with their guards into src/load/staging.rs.
     //
     // `prepare_load`'s two remaining `&&` are LET-CHAINS (`if let Some(s) =
     // state && let Some((_, m)) = keyed.first()`), not boolean decisions: the

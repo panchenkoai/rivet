@@ -39,13 +39,16 @@ use std::path::PathBuf;
 fn dispatch_src() -> String {
     // The load orchestrator (this gate's whole subject: cleanup_target,
     // maybe_gc_orphans, the CDC cleanup_source consumers) was evicted from
-    // dispatch.rs into src/load/orchestrate.rs (arch-roast 2026-08-21); the
-    // gate follows its subject. Both files are read so a consumer left in (or
-    // returned to) the router is still graded.
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/load/orchestrate.rs");
-    let p2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli/dispatch.rs");
+    // dispatch.rs into src/load/orchestrate.rs (arch-roast 2026-08-21), and the
+    // staged-prefix lifecycle from there into src/load/staging.rs; the gate
+    // follows its subject. The router is still read so a consumer left in (or
+    // returned to) it is still graded.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let p = root.join("src/load/orchestrate.rs");
+    let p2 = root.join("src/cli/dispatch.rs");
+    let p3 = root.join("src/load/staging.rs");
     let mut out = String::new();
-    for path in [&p, &p2] {
+    for path in [&p, &p2, &p3] {
         let all = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let clipped = match all.find("\n#[cfg(test)]") {
@@ -68,7 +71,10 @@ fn fn_bodies(src: &str) -> Vec<(String, String)> {
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
-        let is_fn = t.starts_with("fn ") || t.starts_with("pub fn ") || t.starts_with("async fn ");
+        let is_fn = t.starts_with("fn ")
+            || t.starts_with("pub fn ")
+            || t.starts_with("async fn ")
+            || (t.starts_with("pub(") && t.contains(") fn "));
         if !is_fn {
             i += 1;
             continue;
