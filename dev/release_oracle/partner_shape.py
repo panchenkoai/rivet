@@ -23,8 +23,8 @@ init consolidates into one stream):
    the 5-row baseline → `compact` → per table: live rows (`WHERE NOT
    __is_deleted`) == source == 7, one flagged tombstone, the buffer dropped.
 
-Oracles: the `bq` CLI (never rivet) and a re-query of the source. SKIP — never a
-silent pass — without the engine URL, the `bq` CLI or a project. Cleans up the
+Oracles: BigQuery over REST (`gcp.bq_scalar`, never rivet) and a re-query of the source. SKIP — never a
+silent pass — without the engine URL, `gcloud` (the REST token) or a project. Cleans up the
 warehouse tables, the GCS prefix, the source tables and (PostgreSQL) the slot.
 """
 

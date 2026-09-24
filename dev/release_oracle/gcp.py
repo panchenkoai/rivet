@@ -38,14 +38,15 @@ def _call(host: str, method: str, path: str, body: dict | None = None) -> tuple[
     """(status, parsed JSON body) for one request on this thread's connection to `host`."""
     conns = _local.__dict__.setdefault("conns", {})
     data = json.dumps(body).encode() if body is not None else None
-    refresh = False
-    # One retry each: a server-closed keep-alive (reconnect) or a 401 (token expired
-    # under us — re-fetch it).
-    for attempt in (0, 1):
+    refresh = reconnected = False
+    # One retry for each cause, independently: a server-closed keep-alive (reconnect)
+    # and a 401 (token expired under us — re-fetch it). The socket timeout sits well
+    # past BigQuery's 120 s long-poll so a slow query polls instead of erroring.
+    while True:
         headers = {"Authorization": f"Bearer {token(refresh)}"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        conn = conns.get(host) or http.client.HTTPSConnection(host, timeout=120)
+        conn = conns.get(host) or http.client.HTTPSConnection(host, timeout=300)
         conns[host] = conn
         try:
             conn.request(method, path, body=data, headers=headers)
@@ -54,17 +55,17 @@ def _call(host: str, method: str, path: str, body: dict | None = None) -> tuple[
         except (http.client.HTTPException, OSError):
             conn.close()
             conns.pop(host, None)
-            if attempt:
+            if reconnected:
                 raise
+            reconnected = True
             continue
-        if resp.status == 401 and not attempt:
+        if resp.status == 401 and not refresh:
             refresh = True
             continue
         try:
             return resp.status, (json.loads(raw) if raw else {})
         except json.JSONDecodeError:
             return resp.status, {"raw": raw[:500].decode(errors="replace")}
-    raise AssertionError("unreachable")
 
 
 def _bq(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
@@ -103,7 +104,7 @@ def bq_dataset_exists(project: str, dataset: str) -> bool:
 
 
 def bq_scalar(project: str, sql: str) -> str | None:
-    """First cell of a standard-SQL query, waited for; None only when it returned no rows.
+    """First cell of a standard-SQL query, waited for; None when no rows or a NULL cell.
 
     A failed query raises — it must never read as an empty answer (-1, "absent").
     """

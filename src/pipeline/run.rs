@@ -1494,19 +1494,6 @@ pub(super) fn run_mode_label(peak: usize, processes: bool) -> &'static str {
 /// from" in the same run whose accounting printed "N measured, 0 estimated" —
 /// one run, two contradictory honesty claims about the same exports (bughunt
 /// 2026-08-14).
-/// What `apply --pool` says when the `--resume` skip leaves nothing to run.
-///
-/// `split_noticed` is whether this run already emitted the `--split` notice,
-/// whose closing clause forward-references the predicted-makespan line. That
-/// line is printed BELOW the early return this message accompanies, so on a
-/// fully-complete `--split --resume` re-run the promise could never be kept:
-/// the operator was left looking for a line that does not exist — the dangling
-/// forward reference round 3 fixed for the harm line, on a different message
-/// (bughunt 2026-08-16).
-///
-/// So the split case CANCELS the pointer explicitly instead of going quiet. The
-/// plain case keeps the one-line message it always had — there is nothing
-/// pointing at the schedule to retract.
 /// Does this export DOMINATE the pool floor (more than its fair share of the
 /// predicted total across `m` slots) while being heavy (not `parallel_safe`)?
 fn dominates_as_heavy(predicted_secs: f64, total: f64, m: usize, parallel_safe: bool) -> bool {
@@ -1531,6 +1518,19 @@ fn split_unit_failed(unit_prefix: Option<&str>, summary: &RunSummary, ok: bool) 
         && !(ok && summary.status == "success")
 }
 
+/// What `apply --pool` says when the `--resume` skip leaves nothing to run.
+///
+/// `split_noticed` is whether this run already emitted the `--split` notice,
+/// whose closing clause forward-references the predicted-makespan line. That
+/// line is printed BELOW the early return this message accompanies, so on a
+/// fully-complete `--split --resume` re-run the promise could never be kept:
+/// the operator was left looking for a line that does not exist — the dangling
+/// forward reference round 3 fixed for the harm line, on a different message
+/// (bughunt 2026-08-16).
+///
+/// So the split case CANCELS the pointer explicitly instead of going quiet. The
+/// plain case keeps the one-line message it always had — there is nothing
+/// pointing at the schedule to retract.
 fn nothing_to_run_message(split_noticed: bool) -> String {
     let base = "apply --pool: nothing to run (no exports, or all complete)";
     if split_noticed {

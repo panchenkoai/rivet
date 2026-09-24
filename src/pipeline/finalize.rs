@@ -885,16 +885,6 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
     )
 }
 
-/// Project the `run_status` ledger's `running` row into the bucket as a
-/// schema-less MARKER manifest at run START. Written as the run-unique copy only
-/// (`manifest-<run_id>.json`) — NOT the canonical `manifest.json`, so a prior
-/// run's `_SUCCESS`/canonical pair never desyncs (the `SuccessMarkerStale` trap).
-/// A cross-boundary reader (Airflow, a foreign-host `rivet load`) then sees a
-/// LIVE run on the prefix via `fetch_manifests_keyed` and does NOT GC its
-/// in-flight parts. Cloud-only — a local export has no cross-host reader, and the
-/// state-store ledger already covers the co-located case. Best-effort: a marker
-/// write failure must never fail the run (gc still has the ledger). The terminal
-/// manifest at finalize OVERWRITES this same run-unique file.
 /// Delete the `running` marker written under `run_id` from a cloud prefix — one no
 /// terminal manifest replaced would otherwise say the prefix is live for ever
 /// (`cleanup_source` refused, gc sparing). Best-effort: the ledger is authoritative.
@@ -918,6 +908,16 @@ pub(super) fn retire_running_marker(plan: &ResolvedRunPlan, run_id: &str) {
     }
 }
 
+/// Project the `run_status` ledger's `running` row into the bucket as a
+/// schema-less MARKER manifest at run START. Written as the run-unique copy only
+/// (`manifest-<run_id>.json`) — NOT the canonical `manifest.json`, so a prior
+/// run's `_SUCCESS`/canonical pair never desyncs (the `SuccessMarkerStale` trap).
+/// A cross-boundary reader (Airflow, a foreign-host `rivet load`) then sees a
+/// LIVE run on the prefix via `fetch_manifests_keyed` and does NOT GC its
+/// in-flight parts. Cloud-only — a local export has no cross-host reader, and the
+/// state-store ledger already covers the co-located case. Best-effort: a marker
+/// write failure must never fail the run (gc still has the ledger). The terminal
+/// manifest at finalize OVERWRITES this same run-unique file.
 pub(super) fn write_running_manifest(
     plan: &ResolvedRunPlan,
     // The export FAMILY, passed by the caller — NOT `plan.export_name`. The two

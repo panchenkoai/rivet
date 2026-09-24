@@ -1173,19 +1173,21 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
         gcp.gcs_delete_prefix(bucket, f"{pfx}/")
         return
 
-    # BigQuery's own count, decoded by Google's parquet reader.
-    with led.span(f"step {cell.engine} load·verify {cell.store}"):
-        q = gcp.bq_scalar(proj, f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`")
-        got = int(q) if q is not None and q.isdigit() else -1
-        want = blessed_path._source_rows(cell.engine, url, cell.table)
-        lok, ldetail = _load_rows(cell, work, state_url, load_id, tbl)
-    _stage(led, cell, tag, "load", got == want and got > 0 and lok,
-           f"bigquery={got} source={want} · ledger {ldetail}")
-
-    # Cleanup is part of the cycle: the cell's own dataset goes, verified by a show that fails.
-    gcp.bq_delete_dataset(proj, dset)
-    still_there = gcp.bq_dataset_exists(proj, dset)
-    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+    # BigQuery's own count, decoded by Google's parquet reader. A raised read still
+    # drops the cell's dataset and prefix.
+    try:
+        with led.span(f"step {cell.engine} load·verify {cell.store}"):
+            q = gcp.bq_scalar(proj, f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`")
+            got = int(q) if q is not None and q.isdigit() else -1
+            want = blessed_path._source_rows(cell.engine, url, cell.table)
+            lok, ldetail = _load_rows(cell, work, state_url, load_id, tbl)
+        _stage(led, cell, tag, "load", got == want and got > 0 and lok,
+               f"bigquery={got} source={want} · ledger {ldetail}")
+    finally:
+        # Cleanup is part of the cycle: the cell's own dataset goes, verified by a GET.
+        gcp.bq_delete_dataset(proj, dset)
+        still_there = gcp.bq_dataset_exists(proj, dset)
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
     _stage(led, cell, tag, "load:cleanup", not still_there,
            "cell dataset dropped (verified by a GET that 404s)"
            if not still_there else "the dataset is STILL THERE after rm — the next run's count "
@@ -1738,28 +1740,6 @@ def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str) -> None:
          f"inertness · a run id that never ran → state refuses ({detail})",
          f"the state stage accepted a run id that never ran ({detail})")
 
-
-# ── the DAG, printed from the same data the executor walks ───────────────────
-#: What each stage asserts and WHO answers it. The oracle column is the point of
-#: the whole module: three different questions (rivet re-reads, DuckDB decodes,
-#: the source counts) and a chain that answers one of them is not verified.
-STAGE_ORACLE = {
-    "init":            ("rivet init",     "the config's SHAPE (exports, mode, dest kind, table)"),
-    "init:discover":   ("rivet init",     "the survey artifact: tables[] each with suggested_mode"),
-    "doctor":          ("rivet doctor",   "source + destination auth, CDC slot hygiene"),
-    "check":           ("rivet check",    "column types resolve; --strict admits no warning"),
-    "plan":            ("rivet plan",     "plan.json parses and names the export"),
-    "apply":           ("rivet apply",    "wave execution; resume cells crash FIRST (fault hook)"),
-    "run":             ("rivet run",      "cdc capture after an anchor run + real changes"),
-    "artifacts":       ("filesystem",     "parts, manifest.json, run-unique copies, _SUCCESS"),
-    "artifacts:checkpoint": ("filesystem", "the CDC resume anchor exists and is non-empty"),
-    "state":           ("state backend",  "export_metrics/file_log/run_status SCOPED to this run"),
-    "oracle":          ("DuckDB",         "rows in MANIFEST-DECLARED parts vs the source's own count"),
-    "validate":        ("rivet validate", "rivet re-reads its own output; then again ADDRESSED"),
-    "reconcile":       ("rivet run",      "destination count vs a fresh source count"),
-    "load":            ("BigQuery",       "a foreign reader decodes it; ledger has load_run"),
-    "load:cleanup":    ("bq show",        "the table is really gone (rm -f exits 0 regardless)"),
-}
 
 def main(argv: list[str] | None = None) -> int:
     """Standalone runner: the whole matrix, or only what last failed.

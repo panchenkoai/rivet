@@ -390,10 +390,14 @@ def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:
 
 
 # ── the release binary under test ──────────────────────────────────────────────
+def target_dir() -> Path:
+    """Cargo's target directory: $CARGO_TARGET_DIR (relative to the repo) when set."""
+    return ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
+
+
 def rivet_bin() -> Path:
-    """$RIVET_BIN, else the release binary cargo builds — under $CARGO_TARGET_DIR when set."""
-    target = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
-    return Path(os.environ.get("RIVET_BIN", target / "release" / "rivet"))
+    """$RIVET_BIN, else the release binary cargo builds under `target_dir()`."""
+    return Path(os.environ.get("RIVET_BIN", target_dir() / "release" / "rivet"))
 
 
 def release_bin_env() -> dict[str, str]:

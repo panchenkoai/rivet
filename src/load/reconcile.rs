@@ -81,13 +81,13 @@ pub fn fetch_manifests_keyed(
 ) -> Result<Vec<(String, RunManifest)>> {
     let (_, base) = crate::load::split_gs_uri(gcs_prefix)?;
     let keys = list_manifest_keys(store, base)?;
-    // CWE-400: a manifest over the cap is refused on its size, never downloaded. One
+    // CWE-400: a manifest over the cap is refused, never read past the cap. One
     // stat + read per key, 16 keys in flight — a prefix keeps one copy per run it held.
     store
         .read_each_within(&keys, MANIFEST_MAX_BYTES, |key, body| {
             let bytes = body.map_err(|sz| {
                 anyhow::anyhow!(
-                    "manifest {key} is {sz} bytes, over the {MANIFEST_MAX_BYTES}-byte cap — \
+                    "manifest {key} is at least {sz} bytes, over the {MANIFEST_MAX_BYTES}-byte cap — \
                      refusing to read a possibly-hostile manifest into memory (CWE-400)"
                 )
             })?;

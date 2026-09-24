@@ -42,7 +42,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, HERE, ROOT
+from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, target_dir, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
@@ -312,12 +312,12 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
     `cargo test` passes, a deliberate type error compiles clean. Stale artifacts
     from an interrupted run are the same class with a smaller blast radius.
 
-    So the gate starts by deleting the target directory and its own scratch, then
-    builds `--release` itself. It costs one full compile; it buys the guarantee
+    So the gate starts by deleting `target/package`, the release profile and its own
+    scratch, then builds `--release` itself: one release compile buys the guarantee
     that the binary every cell below exercises is the code in the tree.
 
     `fast=True` removes ONLY `target/package` — the exact directory the poison
-    lives in — instead of the whole `target/`. Cargo's own fingerprints are honest
+    lives in — and keeps the release profile. Cargo's own fingerprints are honest
     once that snapshot is gone (every freshness-lie this repo has hit was
     package-related), so the binary=HEAD guarantee holds while the dependency
     recompile is skipped. This is NOT a compilation cache: there is no external
@@ -335,7 +335,7 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
     # RELEASE profile — the binary this gate grades — from nothing; the test and
     # coverage profiles keep their caches (cargo's fingerprints grade them honestly,
     # and wiping them cost every later cargo stage a cold build).
-    shutil.rmtree(ROOT / "target" / "package", ignore_errors=True)
+    shutil.rmtree(target_dir() / "package", ignore_errors=True)
     if not fast and not run(["cargo", "clean", "--release"], cwd=ROOT, timeout=600).ok:
         led.failed("-", "-", "clean_tree", "-",
                    "clean tree: `cargo clean --release` failed — the gate cannot vouch for "
