@@ -192,6 +192,12 @@ pub trait Destination: Send + Sync {
         anyhow::bail!("head is not supported by this destination backend")
     }
 
+    /// Delete the object at `key` under the destination prefix; an absent key is Ok.
+    fn remove(&self, key: &str) -> Result<()> {
+        let _ = key;
+        anyhow::bail!("remove is not supported by this destination backend")
+    }
+
     /// Move `from` to `to` at the destination prefix.
     ///
     /// ADR-0012 M9 quarantine: a part the resume preamble can't reuse

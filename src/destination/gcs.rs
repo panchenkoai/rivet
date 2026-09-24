@@ -119,7 +119,10 @@ impl GcsStore {
                     if size > cap {
                         return parse(p, Err(size));
                     }
-                    parse(p, Ok(op.read(p).await?.to_vec()))
+                    // Read exactly the size the stat admitted: an object replaced by a
+                    // bigger one in between is truncated (and fails to parse), never
+                    // read unbounded.
+                    parse(p, Ok(op.read_with(p).range(0..size).await?.to_vec()))
                 })
                 .buffered(16)
                 .try_collect(),

@@ -347,6 +347,7 @@ pub(super) fn finalize_manifest(
             kind,
             summary.export_name
         );
+        retire_running_marker(plan, &summary.run_id);
         return None;
     }
 
@@ -895,6 +896,30 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
 /// state-store ledger already covers the co-located case. Best-effort: a marker
 /// write failure must never fail the run (gc still has the ledger). The terminal
 /// manifest at finalize OVERWRITES this same run-unique file.
+/// Delete this run's own `running` marker from a cloud prefix. A run that ends
+/// without a terminal manifest (a skipped run writes none) would otherwise leave
+/// the marker saying the prefix is live for ever — `cleanup_source` refused, gc
+/// sparing. Best-effort: the ledger is the authoritative run status.
+fn retire_running_marker(plan: &ResolvedRunPlan, run_id: &str) {
+    use crate::config::DestinationType;
+    if matches!(
+        plan.destination.destination_type,
+        DestinationType::Local | DestinationType::Stdout
+    ) {
+        return;
+    }
+    let key = crate::manifest::run_unique_manifest_name(run_id);
+    let removed = crate::destination::create_destination(&plan.destination)
+        .and_then(|dest| dest.remove(&key));
+    if let Err(e) = removed {
+        log::debug!(
+            "export '{}': could not retire the running marker {key} (not fatal; the ledger \
+             says the run ended): {e:#}",
+            plan.export_name
+        );
+    }
+}
+
 pub(super) fn write_running_manifest(
     plan: &ResolvedRunPlan,
     // The export FAMILY, passed by the caller — NOT `plan.export_name`. The two

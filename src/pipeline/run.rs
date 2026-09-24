@@ -1524,10 +1524,11 @@ fn makespan_error_pct(actual_secs: f64, predicted_secs: f64) -> f64 {
 }
 
 /// Is this a `--split` unit of the giant (its name under `unit_prefix`) that did
-/// NOT finish its share? `skipped` finished it: its range was empty.
+/// NOT finish its share? Only `success` finishes it — a unit writes its window's
+/// manifest (split::synthesize never lets it skip), and the Full load needs every one.
 fn split_unit_failed(unit_prefix: Option<&str>, summary: &RunSummary, ok: bool) -> bool {
     unit_prefix.is_some_and(|p| summary.export_name.starts_with(p))
-        && !(ok && matches!(summary.status.as_str(), "success" | "skipped"))
+        && !(ok && summary.status == "success")
 }
 
 fn nothing_to_run_message(split_noticed: bool) -> String {
@@ -2475,7 +2476,7 @@ mod pool_decision_tests {
     }
 
     #[test]
-    fn a_skipped_split_unit_finished_its_share() {
+    fn only_a_successful_split_unit_finished_its_share() {
         let unit = |name: &str, status: &str| RunSummary {
             export_name: name.into(),
             status: status.into(),
@@ -2484,8 +2485,8 @@ mod pool_decision_tests {
         let p = Some("orders#");
         assert!(!split_unit_failed(p, &unit("orders#1", "success"), true));
         assert!(
-            !split_unit_failed(p, &unit("orders#1", "skipped"), true),
-            "empty range"
+            split_unit_failed(p, &unit("orders#1", "skipped"), true),
+            "a skipped unit wrote no window manifest"
         );
         assert!(split_unit_failed(p, &unit("orders#1", "failed"), true));
         assert!(

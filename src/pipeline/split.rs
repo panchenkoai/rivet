@@ -128,6 +128,11 @@ pub(crate) fn synthesize(
             // skipped by the pool; never-started units run fresh. Crash-recovery only (never the
             // append-only keyset_incremental), so a clean re-run does a full pass over the window.
             e.chunk_checkpoint = true;
+            // NEVER inherit skip_empty: an empty window would be `skipped` and write no
+            // manifest, so its split_window would be missing and the Full load would
+            // refuse the prefix as an incoherent set of windows. An empty unit still
+            // completes with a 0-part manifest that records its window.
+            e.skip_empty = false;
             e.split = Some(SplitSynth {
                 parent: parent.clone(),
                 key_column: key_column.to_string(),
@@ -884,6 +889,24 @@ mod tests {
         assert_eq!(ranges[0], (None, Some("1000".into())));
         assert_eq!(ranges[1], (Some("1000".into()), Some("2000".into())));
         assert_eq!(ranges[2], (Some("2000".into()), None));
+    }
+
+    #[test]
+    fn a_split_unit_never_inherits_skip_empty() {
+        let base = {
+            let mut e = sample_export("daily");
+            e.mode = ExportMode::Full;
+            e.chunk_by_key = Some("id".into());
+            e.skip_empty = true;
+            e
+        };
+        for u in synthesize(&base, "id", &["1000".into()]) {
+            assert!(
+                !u.skip_empty,
+                "unit {} must write its window's manifest even when empty",
+                u.name
+            );
+        }
     }
 
     #[test]

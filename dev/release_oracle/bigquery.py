@@ -728,6 +728,16 @@ def _bq_one_engine(
     return None
 
 
+def _bq_one_engine_graded(led: Ledger, engine: str, **kw) -> None:
+    """`_bq_one_engine`, with an escaping error graded as this engine's FAIL — a cloud
+    call that raises must not take every other engine's graded rows down with it."""
+    try:
+        _bq_one_engine(led, engine, **kw)
+    except Exception as e:  # noqa: BLE001 — graded, never swallowed
+        led.failed(engine, "bq", "bigquery", "-", f"bigquery[{engine}]: stage raised: {e!r}"[:400],
+                   "raised")
+
+
 def run_bigquery_golden(
     led: Ledger,
     *,
@@ -769,7 +779,7 @@ def run_bigquery_golden(
     if cap == 1 or len(engines) <= 1:
         for engine in engines:
             with led.span(f"bq {engine}: engine-total"):
-                _bq_one_engine(led, engine, **kw)
+                _bq_one_engine_graded(led, engine, **kw)
     else:
         # Each engine's leg is independent (own dataset/prefix/config/container), so
         # race them — same buffered-child pattern as the engine matrix, so an engine's
@@ -782,7 +792,7 @@ def run_bigquery_golden(
 
         def run_one(engine: str) -> None:
             with subs[engine].span(f"bq {engine}: engine-total"):
-                _bq_one_engine(subs[engine], engine, **kw)
+                _bq_one_engine_graded(subs[engine], engine, **kw)
 
         workers = min(cap, len(engines))
         with ThreadPoolExecutor(max_workers=workers) as ex:

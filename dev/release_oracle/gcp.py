@@ -14,18 +14,20 @@ import threading
 import time
 import urllib.parse
 
-_TOKEN_TTL = 40 * 60  # access tokens live 60 min
+# gcloud hands back its CACHED token until that has under 5 min left, so a token
+# fetched now may expire in 5 min, not 60: re-ask every 4 (it costs ~0.3 s).
+_TOKEN_TTL = 4 * 60
 _token_lock = threading.Lock()
 _token: tuple[str, float] = ("", 0.0)
 _local = threading.local()
 
 
-def token() -> str:
-    """The `gcloud auth print-access-token` identity, fetched once per TTL."""
+def token(refresh: bool = False) -> str:
+    """The `gcloud auth print-access-token` identity, re-fetched per TTL or on `refresh`."""
     global _token
     with _token_lock:
         tok, at = _token
-        if not tok or time.monotonic() - at > _TOKEN_TTL:
+        if refresh or not tok or time.monotonic() - at > _TOKEN_TTL:
             tok = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True,
                                  text=True, check=True).stdout.strip()
             _token = (tok, time.monotonic())
@@ -36,22 +38,32 @@ def _call(host: str, method: str, path: str, body: dict | None = None) -> tuple[
     """(status, parsed JSON body) for one request on this thread's connection to `host`."""
     conns = _local.__dict__.setdefault("conns", {})
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": f"Bearer {token()}"}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    for attempt in (0, 1):  # a server-closed keep-alive fails once; reconnect and retry
+    refresh = False
+    # One retry each: a server-closed keep-alive (reconnect) or a 401 (token expired
+    # under us — re-fetch it).
+    for attempt in (0, 1):
+        headers = {"Authorization": f"Bearer {token(refresh)}"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
         conn = conns.get(host) or http.client.HTTPSConnection(host, timeout=120)
         conns[host] = conn
         try:
             conn.request(method, path, body=data, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else {})
         except (http.client.HTTPException, OSError):
             conn.close()
             conns.pop(host, None)
             if attempt:
                 raise
+            continue
+        if resp.status == 401 and not attempt:
+            refresh = True
+            continue
+        try:
+            return resp.status, (json.loads(raw) if raw else {})
+        except json.JSONDecodeError:
+            return resp.status, {"raw": raw[:500].decode(errors="replace")}
     raise AssertionError("unreachable")
 
 
@@ -91,10 +103,22 @@ def bq_dataset_exists(project: str, dataset: str) -> bool:
 
 
 def bq_scalar(project: str, sql: str) -> str | None:
-    """First cell of a standard-SQL query, or None when the query did not answer."""
+    """First cell of a standard-SQL query, waited for; None only when it returned no rows.
+
+    A failed query raises — it must never read as an empty answer (-1, "absent").
+    """
     st, b = _bq("POST", f"/projects/{project}/queries",
                 {"query": sql, "useLegacySql": False, "timeoutMs": 120_000})
-    if st != 200 or not b.get("jobComplete") or not b.get("rows"):
+    if st != 200:
+        raise RuntimeError(f"bigquery: query → {st} {b}\n{sql}")
+    job = b.get("jobReference", {})
+    while not b.get("jobComplete"):
+        loc = urllib.parse.quote(job.get("location", ""))
+        st, b = _bq("GET", f"/projects/{project}/queries/{job.get('jobId')}"
+                           f"?location={loc}&timeoutMs=120000")
+        if st != 200:
+            raise RuntimeError(f"bigquery: query results → {st} {b}\n{sql}")
+    if not b.get("rows"):
         return None
     return b["rows"][0]["f"][0]["v"]
 

@@ -21,46 +21,67 @@ fn http() -> &'static reqwest::blocking::Client {
     })
 }
 
-/// `gcloud auth print-access-token`, refreshed every 40 minutes (tokens live 60).
-fn token() -> String {
+/// `gcloud auth print-access-token`, re-asked every 4 minutes or on `refresh`: gcloud
+/// hands back its CACHED token until it has under 5 minutes left, so one fetched now
+/// may expire in 5, not 60. None when gcloud fails — never a poisoned lock.
+fn token(refresh: bool) -> Option<String> {
     static T: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
-    let mut slot = T.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    if let Some((tok, at)) = slot.as_ref()
-        && at.elapsed() < Duration::from_secs(40 * 60)
+    let mut slot = T
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !refresh
+        && let Some((tok, at)) = slot.as_ref()
+        && at.elapsed() < Duration::from_secs(4 * 60)
     {
-        return tok.clone();
+        return Some(tok.clone());
     }
     let out = Command::new("gcloud")
         .args(["auth", "print-access-token"])
         .output()
-        .expect("`gcloud auth print-access-token` must run");
-    assert!(
-        out.status.success(),
-        "gcloud token: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .ok()
+        .filter(|o| o.status.success())?;
     let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
     *slot = Some((tok.clone(), Instant::now()));
-    tok
+    Some(tok)
 }
 
-/// (status, JSON body) of one authorised request.
+/// (status, JSON body) of one authorised request, or None when it could not be made;
+/// a 401 re-asks gcloud for a token once. Never panics — the Drop cleanups use it.
+fn try_call(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> Option<(u16, serde_json::Value)> {
+    for refresh in [false, true] {
+        let mut req = http()
+            .request(method.clone(), url)
+            .bearer_auth(token(refresh)?);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().ok()?;
+        let status = resp.status().as_u16();
+        if status == 401 && !refresh {
+            continue;
+        }
+        let text = resp.text().unwrap_or_default();
+        return Some((
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+        ));
+    }
+    None
+}
+
+/// [`try_call`] for a test body: a request that cannot be made fails the test loudly.
 fn call(
     method: reqwest::Method,
     url: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
-    let mut req = http().request(method, url).bearer_auth(token());
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    let resp = req.send().unwrap_or_else(|e| panic!("{url}: {e}"));
-    let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
-    (
-        status,
-        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
-    )
+    try_call(method, url, body.as_ref())
+        .unwrap_or_else(|| panic!("{url}: no response (gcloud token or network)"))
 }
 
 /// A REST cell as `bq --format=json` renders it: scalars as strings, NULL as null,
@@ -188,13 +209,12 @@ fn gcs_delete_prefix(bucket: &str, prefix: &str) {
         if let Some(t) = &page_token {
             url.push_str(&format!("&pageToken={}", urlencode(t)));
         }
-        let (st, page) = call(reqwest::Method::GET, &url, None);
-        if st != 200 {
+        let Some((200, page)) = try_call(reqwest::Method::GET, &url, None) else {
             return;
-        }
+        };
         for item in page["items"].as_array().into_iter().flatten() {
             if let Some(name) = item["name"].as_str() {
-                let _ = call(
+                let _ = try_call(
                     reqwest::Method::DELETE,
                     &format!("{list}/{}", urlencode(name)),
                     None,
@@ -436,7 +456,7 @@ impl Drop for BqLive {
         if !self.owned {
             return;
         }
-        let _ = call(
+        let _ = try_call(
             reqwest::Method::DELETE,
             &format!(
                 "https://bigquery.googleapis.com/bigquery/v2/projects/{}/datasets/{}?deleteContents=true",
@@ -473,7 +493,7 @@ impl Drop for BqCleanup {
                 "https://bigquery.googleapis.com/bigquery/v2/projects/{}/datasets/{}/tables/{t}",
                 self.project, self.dataset
             );
-            let _ = call(reqwest::Method::DELETE, &url, None);
+            let _ = try_call(reqwest::Method::DELETE, &url, None);
         }
         gcs_delete_prefix(&self.bucket, &self.prefix);
     }

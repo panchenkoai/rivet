@@ -147,7 +147,11 @@ def verify_partner_shape(led: Ledger) -> None:
         if not url:
             led.skipped(engine, "partner", "shape", "gcs", f"partner[{engine}]: no {uvar}", "no url")
             continue
-        _one_engine(led, engine, url, proj, bucket)
+        try:
+            _one_engine(led, engine, url, proj, bucket)
+        except Exception as e:  # noqa: BLE001 — graded, never swallowed
+            led.failed(engine, "partner", "shape", "gcs",
+                       f"partner shape[{engine}]: stage raised: {e!r}"[:400], "raised")
 
 
 def _row(led: Ledger, engine: str, stage: str, ok: bool, detail: str) -> bool:
