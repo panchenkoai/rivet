@@ -61,6 +61,22 @@ every successful run.
 - **Fix direction:** fold it into a named pure function next to `ok_status`
   (`job.rs:1080-1088`) with a unit test.
 
+### P7. A CDC `initial: snapshot` on a not-yet-created Mongo collection is refused — since 0.28 (on main)
+The Mongo CDC stream WARNS on a configured collection the database does not hold, on
+purpose (`src/source/mongo/cdc.rs`, "capturing one that does not exist YET is a
+legitimate setup — start the stream, then let the app create it. Refusing would break
+that"). But the stream's `initial: snapshot` leg reads through the batch
+`MongoSource::export`, which since 0.28 REFUSES a missing collection
+(`missing_collection_refusal`) — so exactly the setup the stream promises to support
+fails as soon as `initial: snapshot` is on (measured: `export '<cdc>__snapshot_<coll>'
+failed: MongoDB collection … does not exist`).
+- **Recommendation:** the snapshot leg follows the STREAM's policy — warn, snapshot 0
+  rows — keyed on the leg's own marker (`ExportConfig::snapshot_parent`, set by
+  `cdc_job::synth_snapshot_export`), while a plain batch export keeps the refusal. The
+  refusal's harm (a 0-row full load emptying the warehouse) does not apply to a baseline
+  of a collection that has never existed, and a typo is already warned by the stream.
+- **Not done:** it changes shipped behaviour — a product decision, not a test fix.
+
 ### P5. A load whose statement landed but whose ledger row did not strands the table — pre-existing (on main)
 `live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job`
 cuts the state DB by a TIMER (1800 ms) mid `rivet load --pool`. Measured 2026-09-24:
@@ -91,8 +107,11 @@ green; RED-proven with the compact script's DROP removed. The doc's §5/§6 stil
 "the view" and were corrected too.
 Still open from the same run:
 `mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling` and two
-`live_mongo::*_empty_first_run_then_populated` (the missing-collection refusal fires on
-the empty first run the tests expect to succeed), `bigquery_hourly_partitions_over_the_
+`live_mongo::*_empty_first_run_then_populated` — **FIXED, stale tests**: they made
+"empty" by DROPPING the collection, which 0.28's missing-collection refusal now (rightly,
+for a batch export) refuses. They create an EMPTY collection instead
+(`MongoTest::create_empty_collection`); all three green. The dotted test's snapshot leg
+exposed a real contradiction, filed as P7. `bigquery_hourly_partitions_over_the_
 job_cap_are_refused_before_the_load`. Not caused by the refactor; each needs its own
 look — the doubled CDC append is the one to start with.
 
