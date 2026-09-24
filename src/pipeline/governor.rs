@@ -784,7 +784,8 @@ mod tests {
     /// silent no-op on the `chunk_checkpoint: true` + `parallel: N` shape
     /// `rivet init` scaffolds — and `plan.strategy.is_resumable()` is the only
     /// thing that routes a config to one runner or the other (job.rs:1042).
-    /// RED against deleting any of the four calls.
+    /// RED against deleting any of the four calls. The drain itself is `FanIn::finish`'s,
+    /// which drains the governor before anything that can bail.
     #[test]
     fn the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor() {
         let src = include_str!("chunked/parallel_checkpoint.rs");
@@ -794,22 +795,21 @@ mod tests {
              is silent on the shape `rivet init` scaffolds"
         );
         assert!(
-            src.contains("governor.spawn_into(s, &semaphore, &finished, parallel,"),
+            src.contains("governor.spawn_into(s, &semaphore, fan.finished(), parallel,"),
             "arming without spawning never resizes anything; `total` is the POOL SIZE here \
              (workers that exit), not the task count"
         );
         assert!(
-            src.contains("governor.drain_into(summary);"),
-            "the ParallelismAdjusted events must reach the run journal"
+            src.contains("Some(governor),"),
+            "the ParallelismAdjusted events must reach the run journal — FanIn::finish drains \
+             the governor it is handed, first"
         );
         assert!(
             src.contains("TaskPermit::acquire(semaphore)"),
             "a pool worker must take its permit PER TASK — one permit held for the worker's \
              whole life is a ceiling the governor can shrink with no effect"
         );
-        let drain = src
-            .find("governor.drain_into(summary);")
-            .expect("drain call site");
+        let drain = src.find("Some(governor),").expect("drain call site");
         let bail = src
             .find("parallel checkpoint worker errors")
             .expect("worker-error bail");

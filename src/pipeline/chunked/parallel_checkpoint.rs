@@ -16,11 +16,10 @@
 //! `ensure_chunk_checkpoint_plan`, `record_chunked_commit`) live in
 //! [`super`]. The sequential runner lives in [`super::sequential_checkpoint`].
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::super::{RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink};
-use super::poison;
 use super::{ChunkSource, chunked_plan, config_hint, ensure_chunk_checkpoint_plan};
 use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
@@ -152,26 +151,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // #4: reconnects across worker threads, folded into summary.reconnects after
     // the scope joins — the parallel analogue of the sequential runner's counter.
     let agg_reconnects = std::sync::atomic::AtomicU32::new(0);
-    let errors = std::sync::Mutex::new(Vec::<String>::new());
-    // PartRecords pushed by workers, drained post-scope through
-    // `commit::record_part` so I2/M1 + counters + journal + I7 + fault hooks
-    // live once in the seam. Before this, workers opened a fresh StateStore
-    // per chunk just to call `record_file` and *no one* populated
-    // `summary.manifest_parts` — so the cloud manifest (ADR-0012 M1) was
-    // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
-    // Tuple second is the chunk_index used by the ChunkCompleted journal.
-    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
-        std::sync::Mutex::new(Vec::new());
-    // Form B: each worker pushes its chunk's checksums here; the parent XOR-combines
-    // them run-wide post-join and harvests once — so the CHECKPOINT parallel path
-    // records Form B like exec.rs's parallel path (graph-surfaced runner-bypass).
-    let checksums_shared: std::sync::Mutex<
-        Vec<(
-            i64,
-            super::super::commit::UnitChecksums,
-            super::super::commit::Observations,
-        )>,
-    > = std::sync::Mutex::new(Vec::new());
+    // Parts, shapes, checksums and failures, drained post-join in FanIn's fixed order.
+    // The workers are spawned here, not through FanIn::spawn: this runner's crash
+    // hooks (`maybe_panic_at_chunk`) must still take the process down.
+    let fan = crate::pipeline::fan_in::FanIn::default();
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
     let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -208,7 +191,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // one permit per worker and never resizes, so no worker ever parks — the run behaves
     // exactly as it did before.
     let semaphore = resource::Semaphore::new(parallel.max(1));
-    let finished = AtomicUsize::new(0);
     let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
 
     std::thread::scope(|s| {
@@ -216,7 +198,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         // connection and resizes the permit ceiling within [floor, ceiling], self-terminating
         // once every pool worker has FINISHED (drained, errored, or panicked) so a failing
         // worker can't strand it and deadlock the scope.
-        governor.spawn_into(s, &semaphore, &finished, parallel, &plan.export_name);
+        governor.spawn_into(s, &semaphore, fan.finished(), parallel, &plan.export_name);
 
         for _ in 0..parallel {
             let state_ref = state_ref.clone();
@@ -224,9 +206,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_retries = &agg_retries;
             let agg_reconnects = &agg_reconnects;
-            let errors = &errors;
-            let file_records = &file_records;
-            let checksums_shared = &checksums_shared;
+            let fan_r = &fan;
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
@@ -236,13 +216,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let pb_w = pb_cp_handle.clone();
             let streamed_rows = std::sync::Arc::clone(&streamed_rows);
             let semaphore = &semaphore;
-            let finished = &finished;
 
             s.spawn(move || {
                 // Count this worker as FINISHED on every exit path (drained queue, claim
                 // error, unwinding panic) — the governor thread's only exit is
                 // `finished >= total`, so a missed bump hangs `thread::scope` forever.
-                let _finish = crate::pipeline::governor::WorkerFinished::new(finished);
+                let _finish = crate::pipeline::governor::WorkerFinished::new(fan_r.finished());
                 let shared_destination = shared_destination;
                 loop {
                     // One permit per claimed task, taken BEFORE the claim: a shed then
@@ -256,8 +235,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     ) {
                         Ok(c) => c,
                         Err(e) => {
-                            poison::lock_recover(errors)
-                                .push(format!("claim error: {:#}", e));
+                            fan_r.fail("claim error", format!("{e:#}"));
                             break;
                         }
                     };
@@ -519,19 +497,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 // loudly instead of being silently skipped on
                                 // resume.
                                 let first = parts[0].file_name.clone();
-                                let mut records = poison::lock_recover(file_records);
+                                // ADR-0029: the chunk is the commit unit its parts are
+                                // recorded under and its checksums enter with.
+                                let unit = super::super::commit::UnitId::Chunk(chunk_index);
                                 for rec in parts {
-                                    records.push((rec, chunk_index));
+                                    fan_r.part(unit, rec);
                                 }
-                                drop(records);
-                                // Form B: hand this chunk's checksums to the parent,
-                                // tagged with the chunk — ADR-0029's coverage unit,
-                                // the same one the parent's record_part drain uses.
-                                poison::lock_recover(checksums_shared).push((
-                                    chunk_index,
-                                    chunk_checksums,
-                                    chunk_shape,
-                                ));
+                                fan_r.observe(chunk_shape);
+                                fan_r.contribute(unit, chunk_checksums);
                                 Some(first)
                             };
                             // Mirror of the sequential checkpoint hooks (search for
@@ -566,8 +539,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     crate::pipeline::retry::is_transient(&e),
                                 )
                             });
-                            poison::lock_recover(errors)
-                                .push(format!("chunk {}: {}", chunk_index, msg));
+                            fan_r.fail(&format!("chunk {chunk_index}"), msg);
                         }
                     }
                 }
@@ -575,11 +547,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         }
     });
 
-    // Drain the governor's decisions (buffered off-thread) into the run journal — BEFORE the
-    // worker-error / pending-task bails below, so a FAILED run still journals its
-    // ParallelismAdjusted events. That ordering is the drift the keyset copy re-introduced
-    // once; it is why this is the shared seam's contract and not a local convention.
-    governor.drain_into(summary);
     summary.retries = summary
         .retries
         .saturating_add(agg_retries.load(Ordering::Relaxed));
@@ -593,38 +560,31 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         summary.schema_fingerprint = Some(fp);
     }
 
-    // Drain each worker-written part through the shared commit path: bumps
-    // bytes/files counters, adds the manifest part (ADR-0012 M1), journals
-    // ChunkCompleted, fires the after_file_write / after_manifest_update
-    // fault hooks. `state=None` because workers already wrote each chunk's
-    // file_log entry synchronously (the per-chunk durable manifest the
-    // recovery tests depend on); calling state.record_file again here would
-    // double-insert.
-    //
-    // Before this migration nothing populated `summary.manifest_parts` for
-    // parallel_checkpoint runs at all — the cloud manifest M1 contract was
-    // silently empty for every `parallel>1 + chunk_checkpoint:true` run.
-    for (rec, chunk_index) in poison::into_recover(file_records) {
-        super::super::commit::record_part(
-            plan,
-            summary,
-            None,
-            &rec,
-            super::super::commit::PartKind::Chunk { chunk_index },
-            super::super::commit::UnitId::Chunk(chunk_index),
-        );
-    }
+    // `file_log: None`: the workers already wrote each chunk's file_log row
+    // synchronously (ADR-0017 — the per-chunk durable record the recovery tests
+    // depend on), so the drain must not double-insert it.
+    let drained = fan.finish(
+        plan,
+        summary,
+        None,
+        Some(governor),
+        |_, unit| match unit {
+            super::super::commit::UnitId::Chunk(chunk_index) => {
+                super::super::commit::PartKind::Chunk { chunk_index }
+            }
+            other => unreachable!("chunked parts are recorded under a chunk unit, not {other:?}"),
+        },
+        |errs| {
+            anyhow::anyhow!(
+                "export '{}': parallel checkpoint worker errors:\n{}",
+                plan.export_name,
+                errs.join("\n")
+            )
+        },
+    );
     // After the drain: record_part is what counts the rows.
     pb_cp.finish(summary.total_rows);
-
-    let errs = poison::into_recover(errors);
-    if !errs.is_empty() {
-        anyhow::bail!(
-            "export '{}': parallel checkpoint worker errors:\n{}",
-            plan.export_name,
-            errs.join("\n")
-        );
-    }
+    drained?;
 
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
     if pending > 0 {
@@ -637,17 +597,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             config_hint(config_path),
             plan.export_name
         );
-    }
-
-    // ADR-0028/0029: feed every worker's chunk checksums into the run ledger under
-    // the SAME chunk unit the drain above recorded that chunk's parts with; the
-    // seam harvests once, at the dispatcher, before finalize writes the manifest,
-    // and computes the coverage rather than trusting this feed's order.
-    for (chunk_index, checksums, shape) in poison::into_recover(checksums_shared) {
-        summary.ledger.observe(shape);
-        summary
-            .ledger
-            .contribute(super::super::commit::UnitId::Chunk(chunk_index), checksums);
     }
 
     state.finalize_chunk_run_completed(&run_id)?;
