@@ -61,6 +61,38 @@ every successful run.
 - **Fix direction:** fold it into a named pure function next to `ok_status`
   (`job.rs:1080-1088`) with a unit test.
 
+### P5. A load whose statement landed but whose ledger row did not strands the table — pre-existing (on main)
+`live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job`
+cuts the state DB by a TIMER (1800 ms) mid `rivet load --pool`. Measured 2026-09-24:
+- main at 1800 ms: `0 of 6` tables existed at the cut, three runs out of three — the cut
+  landed BEFORE any BigQuery statement, so the test passed without reaching its subject;
+- this branch at 1800 ms: `1`, `4`, `5 of 6` — the faster manifest reads (8ebd2d2d) move
+  the cut into the window the test was written for, and it fails every time;
+- main with the cut moved to 2400 ms: `4 of 6`, and the SAME failure — the top-up refuses
+  `…: it exists, and this state DB's load ledger has no record of rivet loading it`.
+So the branch exposed this, it did not cause it: a table rivet itself loaded, whose ledger
+row the crash lost, is treated as foreign on every later run. The test's own comment
+names the recovery signal: rivet labels every job (`managed_by=rivet`, `rivet_table`,
+`rivet_run`), so the top-up can adopt a table whose last load job is its own.
+Second defect in the same test: a wall-clock kill point is calibrated to one build's
+speed (1800 ms vacuous on main, 2800 ms vacuous again) — drive the cut from a fault hook
+at "statement done, ledger row not yet written", not a timer.
+
+### P6. Failing on main AND the branch, same environment, isolated — pre-existing, not triaged
+Run 18-at-a-time-4 on both c6da13c5 and this branch; identical outcome:
+`full_cdc_cycle_{postgres,mysql,mssql,mongo}` and `partner_shape_three_tables_one_stream_
+{mysql,postgres}` (run 2 appends 10 rows where 5 changed — or live state 5 vs 7),
+`mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling` and two
+`live_mongo::*_empty_first_run_then_populated` (the missing-collection refusal fires on
+the empty first run the tests expect to succeed), `bigquery_hourly_partitions_over_the_
+job_cap_are_refused_before_the_load`. Not caused by the refactor; each needs its own
+look — the doubled CDC append is the one to start with.
+
+Environment-only failures in the same run (no code signal): Snowflake cells without
+`RIVET_SF_*`, `RIVET_BQ_TEST_*_URI` fixtures unset, the `rivet_test` dataset the BigQuery
+unit tests expect no longer exists (only `rivet_e2e` is permanent), a leftover
+`cdc_bf_mysql` table.
+
 ## Release gate / harness (Python)
 
 ### H1. Blessed-flow `repeat` / `resume` load cells are copies of `clean` — pre-existing — **DROPPED** (fix/open-issues-r3: ⊘ with the reason; the two-run / resumed-prefix load stays UNCOVERED)
@@ -134,6 +166,12 @@ and run.py now runs a positive control on the engines with a probe (MySQL, Mongo
 same comparison with the probe NOT excluded must DISAGREE, else `ORACLE-BLIND` fails the
 cell. RED-proven: with the glyph check restored, the control fails the run. Postgres and
 MSSQL have no probe, so no control there — the verdict code is shared and engine-free.
+
+### H9. The inertness baseline prints live under parallel versions — cosmetic
+`sc_not_inert` builds its baseline on a plain `Ledger()`, which prints as it goes while
+sibling versions print too: two `✓` lines glued into one, so counting ✓ lines in the log
+under-counts by the number of collisions (2 in the 626060c2 gate). The verdict is derived
+from ledger rows and is unaffected. Fix: a buffered baseline ledger.
 
 ## Unexplained / unverified
 
