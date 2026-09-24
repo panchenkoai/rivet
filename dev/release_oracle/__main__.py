@@ -95,12 +95,11 @@ def start_stores(led: Ledger) -> None:
 
     wait_until(lambda: scenarios.store_up("s3") or scenarios.store_up("gcs"), tries=15, delay=1.0)
 
-    # MinIO: its own client, run on the host network so 127.0.0.1 means the host.
-    run(["docker", "run", "--rm", "--network", "host", "--entrypoint", "sh",
-         "quay.io/minio/mc:latest", "-c",
-         f"mc alias set o http://127.0.0.1:9000 {scenarios.MINIO_ACCESS_KEY} "
-         f"{scenarios.MINIO_SECRET_KEY} >/dev/null 2>&1 && mc mb -p o/{BUCKET} >/dev/null 2>&1; true"],
-        timeout=180)
+    # MinIO: a signed REST PUT (the `mc` images are no longer public); 409 = already there.
+    from dev.pytools.e2e import s3_make_bucket
+
+    s3_make_bucket("http://127.0.0.1:9000", BUCKET,
+                   scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY)
 
     # fake-gcs: the JSON API, because an upload 404s until the bucket exists.
     import json as _json
