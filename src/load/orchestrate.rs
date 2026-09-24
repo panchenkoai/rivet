@@ -50,20 +50,15 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // truth for what's loaded, so cleanup is safe for every mode and retry is
     // DB-driven (the GCS listing is only a fallback). A state-DB problem must
     // never fail a load — degrade to the stateless path.
-    let (state, ledger_errored) = match StateStore::open(&args.config) {
-        Ok(s) => (Some(s), false),
-        Err(e) => {
-            eprintln!(
-                "  warning: state store unavailable ({e:#}); loading without a ledger \
-                 (no incremental skip / audit log)"
-            );
-            // The ERRORED half of the tri-state (round-9): `state=None` alone
-            // conflated a DB blip with absent-by-design, and the re-baseline
-            // guard then note-and-proceeded a doomed post-gap baseline on the
-            // very host whose ledger just blipped.
-            (None, true)
-        }
-    };
+    let state = open_state(
+        &args.config,
+        "loading without a ledger (no incremental skip / audit log)",
+    );
+    // The ERRORED half of the tri-state (round-9): `state=None` alone
+    // conflated a DB blip with absent-by-design, and the re-baseline
+    // guard then note-and-proceeded a doomed post-gap baseline on the
+    // very host whose ledger just blipped.
+    let ledger_errored = state.is_none();
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
     eprintln!(
         "{}: resolved {} table(s) → {} [run_id={}]: {}",
@@ -105,22 +100,12 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // `state_ref` is `Some` only when the parent's own open SUCCEEDED, so the
     // refusal below always fires for it. Stateless is reachable only through the
     // parent's degradation above, where no worker ever had a ledger to lose.
-    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
     // The parent store has done its job: it migrated the schema before any thread
     // starts (the order `pipeline/run.rs` uses) and handed over its `StateRef`.
     // Holding it left `--pool 1` with TWO connections and TWO migrations — on BOTH
     // backends, since the Postgres arm of `open_at_ref` migrates too — where the
     // sequential loop had one of each.
-    let parent_had_state = state.is_some();
-    drop(state);
-    let ledger = match &state_ref {
-        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
-        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
-        None => load::pool::LedgerKind::Absent,
-    };
-    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), ledger) {
-        eprintln!("  warning: {w}");
-    }
+    let (state_ref, parent_had_state) = hand_off_state(state, args.pool, plans.len());
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
@@ -131,19 +116,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // per-worker DB blip with absent-by-design — the conflation round-9 already
         // paid for, where the re-baseline guard note-and-proceeds a doomed post-gap
         // baseline on the very host whose ledger just blipped.
-        || match state_ref.as_ref() {
-            None => Some((None, ledger_errored)),
-            Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => Some((Some(s), ledger_errored)),
-                Err(e) => {
-                    eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); it takes \
-                         no table — the other workers load the queue"
-                    );
-                    None
-                }
-            },
-        },
+        || reconnect(state_ref.as_ref(), "load").map(|s| (s, ledger_errored)),
         |worker, _idx, plan| {
             let (state, ledger_errored) = (&worker.0, worker.1);
             // A worker that lost a ledger the RUN started with refuses its table.
@@ -281,25 +254,12 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // fit BOTH: its load panicked, or no worker survived to take it (an `init`
         // that panicked retires its worker). Naming only the panic sent an operator
         // to report a bug in a table where nothing had run at all.
-        |plan| {
-            anyhow::anyhow!(
-                "load '{}' did not complete — it PANICKED (a bug, please report it), or \
-                 no worker was left to take it (each one panicked or could not reopen the \
-                 state ledger — see the warnings above). Reported as this table's failure \
-                 so every other table still aggregates",
-                plan.table
-            )
-        },
+        |plan| no_outcome_error("load", &plan.table),
     );
     // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
     // the table, whatever order the workers finished in — so the representative
     // `aggregate_load_failures` picks out of a tie is the same on every run.
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    for outcome in outcomes {
-        if let Err(e) = outcome {
-            failures.push(e);
-        }
-    }
+    let failures = failures_of(outcomes);
     match aggregate_load_failures(failures) {
         Some(e) => Err(e),
         None => Ok(()),
@@ -606,6 +566,98 @@ pub(crate) fn aggregate_load_failures(mut failures: Vec<anyhow::Error>) -> Optio
         "{} load(s) failed; representative error follows (also: {others})",
         failures.len() + 1
     )))
+}
+
+/// The parent's state store, or `None` — warned, naming the `fallback` — when it cannot be opened.
+pub(super) fn open_state(config: &str, fallback: &str) -> Option<StateStore> {
+    match StateStore::open(config) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("  warning: state store unavailable ({e:#}); {fallback}");
+            None
+        }
+    }
+}
+
+/// Close the parent store and warn on the pool's connection ceiling; returns its `StateRef` and whether it had one.
+pub(super) fn hand_off_state(
+    state: Option<StateStore>,
+    pool: Option<usize>,
+    tables: usize,
+) -> (Option<StateRef>, bool) {
+    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
+    let parent_had_state = state.is_some();
+    drop(state);
+    let ledger = match &state_ref {
+        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
+        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
+        None => load::pool::LedgerKind::Absent,
+    };
+    if let Some(w) = load::pool::pool_ceiling_warning(pool, tables, ledger) {
+        eprintln!("  warning: {w}");
+    }
+    (state_ref, parent_had_state)
+}
+
+/// A worker's reconnect to the parent's backend: `Some(None)` when stateless, `None` (warned) when it failed.
+pub(super) fn reconnect(state_ref: Option<&StateRef>, verb: &str) -> Option<Option<StateStore>> {
+    match state_ref {
+        None => Some(None),
+        Some(r) => match StateStore::open_at_ref(r) {
+            Ok(s) => Some(Some(s)),
+            Err(e) => {
+                eprintln!(
+                    "  warning: state store unavailable to this worker ({e:#}); it takes \
+                     no table — the other workers {verb} the queue"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// The failure reported for a table that ended with no outcome of its own.
+pub(super) fn no_outcome_error(op: &str, table: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{op} '{table}' did not complete — it PANICKED (a bug, please report it), or \
+         no worker was left to take it (each one panicked or could not reopen the \
+         state ledger — see the warnings above). Reported as this table's failure \
+         so every other table still aggregates"
+    )
+}
+
+/// The failed outcomes, in the order the pool returned them.
+pub(super) fn failures_of(outcomes: Vec<Result<()>>) -> Vec<anyhow::Error> {
+    outcomes.into_iter().filter_map(Result::err).collect()
+}
+
+/// The table's lease (`None` when stateless); refuses when another load or compact holds it.
+pub(super) fn take_table_lease<'a>(
+    state: Option<&'a StateStore>,
+    target_fqtn: &str,
+) -> Result<Option<crate::state::LoadLease<'a>>> {
+    match state.map(|s| s.try_load_lease(target_fqtn)).transpose()? {
+        Some(None) => anyhow::bail!("{}", lease_busy_message(target_fqtn)),
+        held => Ok(held.flatten()),
+    }
+}
+
+/// Whether the ledger says rivet loaded `fqtn`; `Unreadable` (warned) when the probe fails.
+pub(super) fn ownership_of(state: Option<&StateStore>, fqtn: &str, op: &str) -> load::Ownership {
+    match state {
+        Some(s) => match s.has_load_attempt(fqtn) {
+            Ok(true) => load::Ownership::Own,
+            Ok(false) => load::Ownership::Foreign,
+            Err(e) => {
+                log::warn!(
+                    "{op}: the ownership probe for {fqtn} failed ({e:#}) — refusing rather \
+                     than treating it as a stateless {op}"
+                );
+                load::Ownership::Unreadable
+            }
+        },
+        None => load::Ownership::Unknown,
+    }
 }
 
 /// The resolved dedup key for an append mode (`cdc` / `incremental`); bails with a
@@ -1165,20 +1217,7 @@ fn prepare_load(
     // COUNT(*)` licensed a `mode: full` OVERWRITE of a table rivet has no record of
     // loading. Same class as the ledger READ below, and the `Err(_) => true` at the
     // gc callsite shows the direction was a real choice: there it fails SAFE.
-    let ownership = match state {
-        Some(s) => match s.has_load_attempt(target_fqtn) {
-            Ok(true) => load::Ownership::Own,
-            Ok(false) => load::Ownership::Foreign,
-            Err(e) => {
-                log::warn!(
-                    "load: the ownership probe for {target_fqtn} failed ({e:#}) — refusing rather \
-                     than treating it as a stateless load"
-                );
-                load::Ownership::Unreadable
-            }
-        },
-        None => load::Ownership::Unknown,
-    };
+    let ownership = ownership_of(state, target_fqtn, "load");
     Ok(Some(LoadInputs {
         integrity,
         uris,
@@ -1422,14 +1461,7 @@ fn execute_load<R>(
     let target_fqtn = loader.fqtn(&job.plan.table);
     // One load per table at a time: two concurrent loads both read the ledger
     // before either writes it and append the same runs twice.
-    let _lease = match job
-        .state
-        .map(|s| s.try_load_lease(&target_fqtn))
-        .transpose()?
-    {
-        Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
-        held => held.flatten(),
-    };
+    let _lease = take_table_lease(job.state, &target_fqtn)?;
     let mut ctx = LoadCtx {
         state: job.state,
         load_id: job.load_id,
@@ -1767,20 +1799,7 @@ fn compact_gate_of(
     // See the sibling in `prepare_load`: an UNANSWERABLE ledger must not read as an
     // ABSENT one, or a failed probe turns compact's `Foreign` refusal into a note and
     // the MERGE rewrites someone else's rows.
-    let ownership = match state {
-        Some(s) => match s.has_load_attempt(&base_fqtn) {
-            Ok(true) => load::Ownership::Own,
-            Ok(false) => load::Ownership::Foreign,
-            Err(e) => {
-                log::warn!(
-                    "compact: the ownership probe for {base_fqtn} failed ({e:#}) — refusing \
-                     rather than treating it as a stateless compact"
-                );
-                load::Ownership::Unreadable
-            }
-        },
-        None => load::Ownership::Unknown,
-    };
+    let ownership = ownership_of(state, &base_fqtn, "compact");
     match load::compact_gate(
         loader.object_kind(table)?,
         ownership,
@@ -1802,13 +1821,7 @@ fn compact_gate_of(
 pub fn run_compacts(args: CompactArgs) -> Result<()> {
     let plans = load::plan::plan_loads(&args.config)?;
     let run_id = resolve_run_id(args.run_id.clone());
-    let state = match StateStore::open(&args.config) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("  warning: state store unavailable ({e:#}); compacting without a ledger");
-            None
-        }
-    };
+    let state = open_state(&args.config, "compacting without a ledger");
     let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
     let engine = if needs_source_engine(&plans) {
         Some(load::plan::source_engine(&args.config)?)
@@ -1825,37 +1838,15 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     // while the sequential loop interleaved them with the work. Keeping the skip
     // INSIDE the worker keeps `--pool 1` printing exactly what it always printed.
     let attempted = std::sync::atomic::AtomicUsize::new(0);
-    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
     // Same as the load leg: the parent migrated the schema before any thread starts
     // and has handed over its `StateRef`. Holding it would leave `--pool 1` with TWO
     // connections and TWO migrations — on both backends — where the sequential loop
     // had one of each.
-    let parent_had_state = state.is_some();
-    drop(state);
-    let ledger = match &state_ref {
-        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
-        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
-        None => load::pool::LedgerKind::Absent,
-    };
-    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), ledger) {
-        eprintln!("  warning: {w}");
-    }
+    let (state_ref, parent_had_state) = hand_off_state(state, args.pool, plans.len());
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
-        || match state_ref.as_ref() {
-            None => Some(None),
-            Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => Some(Some(s)),
-                Err(e) => {
-                    eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); it takes \
-                         no table — the other workers compact the queue"
-                    );
-                    None
-                }
-            },
-        },
+        || reconnect(state_ref.as_ref(), "compact"),
         |state, _idx, plan| {
             if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
                 eprintln!("  compact [{}]: skipped — {why}", plan.table);
@@ -1888,14 +1879,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
                 let loader = load::build_loader(&pinned, &run_id);
                 let target_fqtn = loader.fqtn(&pinned.table);
-                let _lease = match state
-                    .as_ref()
-                    .map(|s| s.try_load_lease(&target_fqtn))
-                    .transpose()?
-                {
-                    Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
-                    held => held.flatten(),
-                };
+                let _lease = take_table_lease(state.as_ref(), &target_fqtn)?;
                 // The export's OWN mode, not a hardcoded label. Compact runs on
                 // `incremental` exports too — `compact_skip_reason` says so in as many
                 // words — and telling the operator of a `mode: incremental` config that
@@ -1984,25 +1968,12 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             }
             outcome.map_err(|e| e.context(format!("compact '{}'", plan.table)))
         },
-        |plan| {
-            anyhow::anyhow!(
-                "compact '{}' did not complete — it PANICKED (a bug, please report it), or \
-                 no worker was left to take it (each one panicked or could not reopen the \
-                 state ledger — see the warnings above). Reported as this table's failure \
-                 so every other table still aggregates",
-                plan.table
-            )
-        },
+        |plan| no_outcome_error("compact", &plan.table),
     );
     // Folded in CONFIG order, like the load leg: the pool returns one result per
     // table, indexed by the table, so the `|`-joined list below reads the same on
     // every run of the same failing config.
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    for outcome in outcomes {
-        if let Err(e) = outcome {
-            failures.push(e);
-        }
-    }
+    let mut failures = failures_of(outcomes);
     let attempted = attempted
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(failures.len());
