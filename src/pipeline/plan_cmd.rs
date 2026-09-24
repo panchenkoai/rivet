@@ -700,11 +700,10 @@ fn print_pool_estimate(
         &std::collections::HashMap::new(),
     );
     let items: Vec<super::pool::PoolItem> = predicted.iter().map(|(i, _)| i.clone()).collect();
-    let measured = predicted
-        .iter()
-        .filter(|(_, f)| matches!(f, super::pool::PredictedFrom::Measured(_)))
-        .count();
-    let estimated = predicted.len() - measured;
+    let classified: Vec<super::pool::PredictedFrom> =
+        predicted.iter().map(|(_, f)| f.clone()).collect();
+    let (measured, attempt_n, placeholder_n) = super::pool::classification_counts(&classified);
+    let estimated = attempt_n + placeholder_n;
     let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
     println!(
         "\n  Pool scheduler ({measured} measured, {estimated} estimated of {} export(s)):",
@@ -720,11 +719,8 @@ fn print_pool_estimate(
             floor / 60.0
         );
     }
-    if estimated > 0 {
-        println!(
-            "    prediction is a LOWER BOUND: {estimated} export(s) have no successful run to \
-             measure from — it tightens as runs complete"
-        );
+    if let Some(hedge) = super::pool::lower_bound_hedge(attempt_n, placeholder_n) {
+        println!("    {hedge}");
     }
     println!(
         "    (a bounded work-stealing pool; --annotate-waves packs the wave \

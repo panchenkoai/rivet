@@ -1473,20 +1473,6 @@ pub(super) fn run_mode_label(peak: usize, processes: bool) -> &'static str {
     }
 }
 
-/// The "prediction is a LOWER BOUND" line — or `None` when every prediction in
-/// the schedule rests on a real success.
-///
-/// ONE source for that claim, and it reads the RECONCILED classification
-/// (`pool::classification_counts` over the post-split `predict_items` sweep).
-/// The `--split` block cannot answer the question, because the only input it
-/// has is the SEED: unit names are stable across runs, so from run 2 onward
-/// each `{giant}#i` has history of its OWN that supersedes the seed
-/// (`pool::reconcile_split_seed`), while the giant is retained out of the run
-/// set and its rows stay frozen at the failure that motivated the split. A
-/// hedge derived there kept saying "the giant has no successful run to measure
-/// from" in the same run whose accounting printed "N measured, 0 estimated" —
-/// one run, two contradictory honesty claims about the same exports (bughunt
-/// 2026-08-14).
 /// Does this export DOMINATE the pool floor (more than its fair share of the
 /// predicted total across `m` slots) while being heavy (not `parallel_safe`)?
 fn dominates_as_heavy(predicted_secs: f64, total: f64, m: usize, parallel_safe: bool) -> bool {
@@ -1528,18 +1514,6 @@ fn nothing_to_run_message(split_noticed: bool) -> String {
     } else {
         base.to_string()
     }
-}
-
-fn lower_bound_hedge(attempt_n: usize, placeholder_n: usize) -> Option<String> {
-    let unmeasured = attempt_n + placeholder_n;
-    (unmeasured > 0).then(|| {
-        format!(
-            "        prediction is a LOWER BOUND: {unmeasured} export(s) have no successful run \
-             to measure from ({attempt_n} scheduled at a failed attempt's duration, \
-             {placeholder_n} at a {}s placeholder) — it tightens as runs complete",
-            super::pool::POOL_PLACEHOLDER_SECS as i64,
-        )
-    })
 }
 
 /// The run-window harm verdict, pure so the threshold and wording are
@@ -1889,8 +1863,8 @@ pub(crate) fn run_pool(
         attempt_n + placeholder_n,
     );
     // The ONE honesty claim about the wall, from the RECONCILED classification.
-    if let Some(hedge) = lower_bound_hedge(attempt_n, placeholder_n) {
-        println!("{hedge}");
+    if let Some(hedge) = super::pool::lower_bound_hedge(attempt_n, placeholder_n) {
+        println!("        {hedge}");
     }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
@@ -3110,63 +3084,6 @@ mod pool_harm_tests {
             !pool_body.contains("HarmWindow::"),
             "the pool must route its harm frame through `pool_harm_window`, not \
              construct a window from the invocation"
-        );
-    }
-
-    /// The run's "this wall is a LOWER BOUND" claim has exactly ONE source, and
-    /// it is the pure function fed the RECONCILED classification.
-    ///
-    /// The split block used to make the same claim from the pre-reconcile SEED,
-    /// so a steady-state split (giant frozen at a failed attempt; every
-    /// `{giant}#i` measured from run 1) printed the LOWER BOUND warn at start
-    /// and "N measured, 0 estimated" — with the hedge suppressed — 130 lines
-    /// later. One run, two contradictory honesty claims about the same exports.
-    ///
-    /// RED against restoring the `unit_from`-derived `wall_hedge` (the needle
-    /// count reads 2), and against a hedge that fires on a fully measured
-    /// schedule (`lower_bound_hedge(0, 0)` then returns `Some`).
-    #[test]
-    fn the_lower_bound_claim_has_one_source_and_reads_the_reconciled_counts() {
-        use super::lower_bound_hedge;
-        assert!(
-            lower_bound_hedge(0, 0).is_none(),
-            "a schedule resting entirely on successes is not a lower bound"
-        );
-        // ≥2 of each so the fold is a real fold and the two counts cannot be
-        // swapped without the assert noticing.
-        let hedge = lower_bound_hedge(2, 3).expect("5 unmeasured exports must hedge");
-        assert!(
-            hedge.contains("5 export(s)")
-                && hedge.contains("2 scheduled at a failed attempt")
-                && hedge.contains("3 at a"),
-            "the hedge must count both flavours of unmeasured: {hedge}"
-        );
-        // One claim in the product half, and it lives in the pure function —
-        // not in the split block, whose only input is the first-run seed.
-        let whole = include_str!("run.rs");
-        let src = &whole[..whole
-            .find("\n#[cfg(test)]")
-            .expect("run.rs has test modules")];
-        let code: String = src
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let needle = concat!("LOWER ", "BOUND");
-        assert_eq!(
-            code.matches(needle).count(),
-            1,
-            "the run must publish ONE honesty claim about its wall"
-        );
-        let at = code
-            .find(concat!("fn lower_bound", "_hedge"))
-            .expect("the pure hedge exists");
-        let until = code
-            .find("\npub(crate) fn run_pool(")
-            .expect("run_pool's signature moved — update the anchor");
-        assert!(
-            code[at..until].contains(needle),
-            "the claim must be made by the function fed the reconciled counts"
         );
     }
 }
