@@ -1270,6 +1270,16 @@ def failed_cells(path: Path | None = None) -> set[str]:
     return out
 
 
+_CDC_CLAIMS: dict[str, str] = {}
+_CDC_CLAIMS_LOCK = threading.Lock()
+
+
+def _claim_cdc_tag(engine: str, tag: str) -> str:
+    """The one version of `engine` that runs its CDC cells this gate: the first to ask."""
+    with _CDC_CLAIMS_LOCK:
+        return _CDC_CLAIMS.setdefault(engine, tag)
+
+
 def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
                     state_url: str = "", cdc_url: str = "",
                     only: set[str] | None = None) -> None:
@@ -1302,6 +1312,7 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
         verdicts = {}
 
     cdc_url = cdc_url or os.environ.get(f"RIVET_CDC_{engine.upper()}_URL", "")
+    cdc_tag = _claim_cdc_tag(engine, tag)
     # Skips are decided SEQUENTIALLY (no rivet, just a ledger row, kept in
     # declaration order); only the cells that actually run a chain go through the
     # pool, so no-op work never occupies a slot.
@@ -1318,6 +1329,11 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
                         f"{cell.engine} {cell.label} — not in this re-run's cell set")
             continue
         u = cdc_url if cell.pipeline == "cdc" else url
+        if cell.pipeline == "cdc" and u and cdc_tag != tag:
+            led.skipped(cell.engine, tag, "flow:chain", cell.store,
+                        f"{cell.engine} {cell.label} — graded under {engine} {cdc_tag}: CDC "
+                        f"cells run against the one CDC stand, not this version's container")
+            continue
         if not u:
             led.skipped(cell.engine, tag, "flow:chain", cell.store,
                         f"{cell.engine} {cell.label} — no RIVET_CDC_{engine.upper()}_URL "
