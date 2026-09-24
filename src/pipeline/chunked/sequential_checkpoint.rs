@@ -369,8 +369,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         };
         match chunk_result {
             Ok((rows, parts, chunk_checksums, chunk_shape)) => {
-                summary.total_rows += rows as i64;
-                pb.inc(summary.total_rows);
+                pb.inc(summary.total_rows + rows as i64);
                 // ADR-0028: feed the run ledger; the seam applies it once, at
                 // the dispatcher (shape only — chunked's drift gate stays
                 // pre-chunk, ADR-0021). ADR-0029: contributed under the chunk

@@ -401,7 +401,7 @@ fn run_keyset_parallel(
     state: Option<&StateStore>,
 ) -> Result<()> {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::Ordering;
 
     let kp = keyset_plan(plan);
     let key = kp.key_column.clone();
@@ -552,7 +552,6 @@ fn run_keyset_parallel(
     let fmt_label = plan.format.label();
     let cmp_label = plan.compression.label();
 
-    let rows = AtomicI64::new(0);
     // ADR-0029: both accumulators carry the RANGE index — the commit unit this
     // runner publishes checksums at. Parts are published per PAGE (durability
     // must reflect what is on disk, #200-1) while checksums are published per
@@ -600,14 +599,8 @@ fn run_keyset_parallel(
             let (plan_r, key_plan_r, ext_r, tag_r, key_r) =
                 (plan, &key_plan, &ext, run_tag.as_str(), key.as_str());
             let rfirst_r = &range_first;
-            let (rows_r, parts_r, checks_r, fp_r, rmax_r, errs_r) = (
-                &rows,
-                &parts_mx,
-                &checksums_mx,
-                &observed,
-                &range_max,
-                &errors,
-            );
+            let (parts_r, checks_r, fp_r, rmax_r, errs_r) =
+                (&parts_mx, &checksums_mx, &observed, &range_max, &errors);
             let (sref_r, rid_r, fmt_r, cmp_r) = (&state_ref, run_id.as_str(), fmt_label, cmp_label);
             let sem_r = &semaphore;
             let fin_r = &finished;
@@ -700,7 +693,6 @@ fn run_keyset_parallel(
                         }
                     };
                     let Some(page) = page else { break };
-                    rows_r.fetch_add(page.rows as i64, Ordering::Relaxed);
                     fp_r.lock().unwrap().merge(page.observed);
                     rmax = page.next_cursor.clone().or(rmax);
                     for p in &page.parts {
@@ -868,7 +860,6 @@ fn run_keyset_parallel(
             super::commit::UnitId::Range(*ridx as i64),
         );
     }
-    summary.total_rows += rows.into_inner();
 
     // #152: drain the governor's decisions into the journal BEFORE the error bail — the failure
     // path is EXACTLY where the back-off forensics matter (was the source under pressure when it
@@ -1219,11 +1210,8 @@ pub(crate) fn run_keyset(
         }
         // Record the parts FIRST, tracking whether EVERY part deduped. With v25 the cursor
         // reconcile (above) means a committed page is never re-read, so a dedup normally fires only
-        // in the mid-page-crash fallback (below); the counter must still not double-count a deduped
-        // re-read (rehydration already counted that page), or total_rows diverges from
-        // sum(manifest_parts) and trips the coherence invariant — so total_rows is added only when
-        // a page has a genuinely-new part.
-        let mut any_new_part = page.parts.is_empty();
+        // in the mid-page-crash fallback (below); `record_part` counts each part's rows once, so a
+        // deduped re-read of a rehydrated part adds nothing.
         let n_parts = page.parts.len();
         for (pi, rec) in page.parts.iter().enumerate() {
             // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
@@ -1236,7 +1224,7 @@ pub(crate) fn run_keyset(
             // high-water would falsely mark a mid-page crash "done" and DROP its uncommitted parts
             // (there is no per-part key to reconcile against — KeysetPage carries only next_cursor).
             let is_last = pi + 1 == n_parts;
-            let deduped = super::commit::record_part(
+            super::commit::record_part(
                 plan,
                 summary,
                 state,
@@ -1251,10 +1239,6 @@ pub(crate) fn run_keyset(
                 },
                 super::commit::UnitId::Page(pages as i64),
             );
-            any_new_part |= !deduped;
-        }
-        if any_new_part {
-            summary.total_rows += page.rows as i64;
         }
         // Persist the high-water mark AFTER the parts are durably committed, so a
         // resume continues from committed data (peek→flush→ack). The crash window

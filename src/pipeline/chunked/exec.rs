@@ -113,8 +113,7 @@ pub(crate) fn run_chunked_sequential(
             super::super::manifest_writer::record_run_schema_fingerprint(summary, s);
         }
 
-        summary.total_rows += sink.total_rows as i64;
-        pb.inc(summary.total_rows);
+        pb.inc(summary.total_rows + sink.total_rows as i64);
         log::info!(
             "export '{}': chunk {} -- {} rows",
             plan.export_name,
@@ -234,7 +233,6 @@ pub(crate) fn run_chunked_parallel(
     // chunk fails (the governor would loop forever waiting for a success count
     // that never arrives).
     let finished = AtomicUsize::new(0);
-    let agg_rows = std::sync::atomic::AtomicI64::new(0);
     // Rows streamed across ALL chunks (completed + in-flight) — drives the
     // per-batch progress feed so the bar ticks during a chunk's read.
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -302,7 +300,6 @@ pub(crate) fn run_chunked_parallel(
             let col = &cp.column;
             let completed = &completed;
             let finished = &finished;
-            let agg_rows = &agg_rows;
             let errors = &errors;
             let file_records = &file_records;
             let checksums_shared = &checksums_shared;
@@ -378,8 +375,6 @@ pub(crate) fn run_chunked_parallel(
                         let _ = shared_fingerprint.set(crate::state::schema_fingerprint(&columns));
                     }
 
-                    agg_rows.fetch_add(sink.total_rows as i64, Ordering::Relaxed);
-
                     if sink.total_rows > 0 {
                         let fmt = format::create_format(
                             plan_for_worker.format,
@@ -436,9 +431,6 @@ pub(crate) fn run_chunked_parallel(
         }
     });
 
-    // Accumulate onto any pre-existing base (0 for this non-checkpoint path, but
-    // the shared seam keeps every parallel runner clobber-free by construction).
-    super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
     pb.finish(summary.total_rows);
 
     // Drain governor decisions (recorded off-thread) into the run journal — BEFORE any error

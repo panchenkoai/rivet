@@ -121,7 +121,6 @@ pub(crate) fn run_mongo_parallel(
         if let Err(e) = res {
             errs.push(format!("worker {w}: {e}"));
         }
-        summary.total_rows += out.rows;
         // ADR-0028: feed the run ledger per worker — the seam pins the
         // fingerprint, runs the drift gate and harvests Form B once, at the
         // dispatcher. No application in this runner.

@@ -266,30 +266,29 @@ pub(crate) fn rehydrate_manifest_parts_probed(
             }
         }
         next_id += 1;
-        summary.manifest_parts.push(crate::manifest::ManifestPart {
-            part_id: next_id,
-            path: f.file_name,
-            rows: f.row_count,
-            size_bytes: f.bytes.max(0) as u64,
-            // fingerprint/md5 aren't in file_log; an EMPTY md5 degrades `rivet
-            // validate` to a size-only check (the real bytes now match), so the
-            // part is DECLARED + size-verified, never a lying mismatch.
-            content_fingerprint: String::new(),
-            content_md5: String::new(),
-            status: crate::manifest::PartStatus::Committed,
-        });
-        rehydrated += 1;
-        rehydrated_rows += f.row_count;
-        rehydrated_bytes += f.bytes.max(0) as u64;
+        let (rows, bytes) = (f.row_count, f.bytes.max(0) as u64);
+        let adopted = super::super::commit::adopt_part(
+            summary,
+            crate::manifest::ManifestPart {
+                part_id: next_id,
+                path: f.file_name,
+                rows,
+                size_bytes: bytes,
+                // fingerprint/md5 aren't in file_log; an EMPTY md5 degrades `rivet
+                // validate` to a size-only check (the real bytes now match), so the
+                // part is DECLARED + size-verified, never a lying mismatch.
+                content_fingerprint: String::new(),
+                content_md5: String::new(),
+                status: crate::manifest::PartStatus::Committed,
+            },
+        );
+        if adopted {
+            rehydrated += 1;
+            rehydrated_rows += rows;
+            rehydrated_bytes += bytes;
+        }
     }
     if rehydrated > 0 {
-        // Keep the summary aggregates consistent with the reconstructed manifest so
-        // the run card, the reconcile gate, and the coherence invariant all agree.
-        summary.files_committed += rehydrated;
-        summary.files_adopted += rehydrated;
-        summary.files_produced += rehydrated;
-        summary.total_rows += rehydrated_rows;
-        summary.bytes_written += rehydrated_bytes;
         // ADR-0029: these parts carry NO per-column checksum (file_log stores
         // none), so the run-wide Form B this run harvests cannot cover them —
         // and nothing here has to SAY so any more. They enter `manifest_parts`
@@ -541,7 +540,7 @@ pub(crate) fn apply_m8_resume_decisions(
                 // manifest (built solely from `manifest_parts`) then omitted it
                 // and the manifest-authoritative `rivet load` lost its rows.
                 if let Some(p) = manifest_part_by_path.get(path.as_str()) {
-                    summary.manifest_parts.push((*p).clone());
+                    super::super::commit::adopt_part(summary, (*p).clone());
                     // ADR-0029: a skipped part's per-column checksum contribution
                     // is gone (the prior manifest kept only the run-wide sum, not
                     // per-part) — and, like the file_log rehydration above, this
@@ -977,16 +976,14 @@ mod tests {
     // Finding #9: a parallel-checkpoint RESUME must ACCUMULATE this invocation's
     // rows onto the rehydrated pre-crash base, never clobber it. rehydrate bumps
     // total_rows + manifest_parts cumulatively; the parallel runner then lands its
-    // workers' rows via commit::accumulate_run_rows and drains new parts via
+    // workers' new parts via
     // record_part. The coherence invariant total_rows == sum(manifest_parts.rows)
     // must survive the whole sequence. RED against a `summary.total_rows = agg`
     // clobber, which drops the 50-row base and leaves total_rows == 30 while the
     // manifest lists 80 rows.
     #[test]
     fn parallel_resume_accumulates_rows_onto_rehydrated_base_not_clobbers() {
-        use crate::pipeline::commit::{
-            PartKind, PartRecord, UnitId, accumulate_run_rows, record_part,
-        };
+        use crate::pipeline::commit::{PartKind, PartRecord, UnitId, record_part};
 
         let state_dir = tempfile::tempdir().unwrap();
         let state =
@@ -1030,8 +1027,7 @@ mod tests {
         );
 
         // ── This invocation re-exports one 30-row chunk: the runner lands the
-        // worker rows via accumulate_run_rows, then drains the new part.
-        accumulate_run_rows(&mut summary, 30);
+        // new part through record_part, which counts its rows.
         record_part(
             &plan,
             &mut summary,
@@ -1465,6 +1461,17 @@ mod tests {
             summary.manifest_parts.iter().map(|p| p.rows).sum::<i64>(),
             50,
             "all 50 rows across both siblings are carried into the finalize manifest"
+        );
+        // The run's counters say what the manifest says: skipped parts were adopted,
+        // not dropped from export_metrics / the run card / the row-count gate.
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.files_committed,
+                summary.files_adopted
+            ),
+            (50, 2, 2),
+            "a Skip adopts the prior parts into every counter, like file_log rehydration"
         );
     }
 

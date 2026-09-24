@@ -140,7 +140,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
     let state_ref = state.state_ref().clone();
     let run_id_arc = std::sync::Arc::new(run_id.clone());
-    let agg_rows = std::sync::atomic::AtomicI64::new(0);
     // Rows streamed across ALL tasks (completed + in-flight) — drives the
     // per-batch progress feed so the bar ticks during a chunk's read.
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -223,7 +222,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let state_ref = state_ref.clone();
             let shared_destination = std::sync::Arc::clone(&shared_destination);
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
-            let agg_rows = &agg_rows;
             let agg_retries = &agg_retries;
             let agg_reconnects = &agg_reconnects;
             let errors = &errors;
@@ -455,7 +453,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     };
                     match result {
                         Ok((rows, parts, chunk_checksums, chunk_shape)) => {
-                            agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
                             // Non-empty chunk: write file_log NOW (per-chunk
                             // durable manifest — the recovery flows in
                             // live_chunked_recovery.rs C3 read it after a
@@ -578,11 +575,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         }
     });
 
-    // Accumulate, never assign: on a checkpoint resume the summary already carries
-    // the rehydrated pre-crash row base (apply_m8_resume_decisions). A bare
-    // `= agg_rows` clobbered it, so total_rows under-reported while parts/bytes/
-    // files stayed cumulative — see accumulate_run_rows.
-    super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
     // Drain the governor's decisions (buffered off-thread) into the run journal — BEFORE the
     // worker-error / pending-task bails below, so a FAILED run still journals its
     // ParallelismAdjusted events. That ordering is the drift the keyset copy re-introduced

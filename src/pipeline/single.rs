@@ -341,7 +341,6 @@ pub(super) fn run_single_export(
     // under the observed schema. The INTEGRITY half stays below the loop.
     sink.drain_observations_into(&mut summary.ledger);
 
-    summary.total_rows += sink.total_rows as i64;
     log::info!(
         "export '{}': {} rows written",
         plan.export_name,

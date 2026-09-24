@@ -50,20 +50,25 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
 
-/// Add this invocation's row count onto the run's cumulative total. The parallel
-/// runners aggregate their workers' rows into an atomic and land it here at the
-/// end; on a checkpoint RESUME the summary already carries the rehydrated
-/// pre-crash base (`rehydrate_manifest_parts_from_file_log` bumps `total_rows`
-/// alongside `files_committed` / `bytes_written` / `manifest_parts`). This MUST
-/// accumulate (`+=`), never assign — a bare `summary.total_rows = agg` clobbers
-/// that base, so on resume `total_rows` under-reports (only this run's rows)
-/// while every other aggregate stays cumulative, breaking the
-/// `total_rows == sum(manifest_parts.rows)` coherence invariant and diverging from
-/// the sequential runner (which already `+=`s). The seam exists so no parallel
-/// runner can reintroduce the clobber — a future `= agg` is obviously wrong next
-/// to this call.
-pub(in crate::pipeline) fn accumulate_run_rows(summary: &mut RunSummary, this_run_rows: i64) {
-    summary.total_rows += this_run_rows;
+/// Adopt a part a PRIOR run committed (a resume) into the manifest and every run
+/// counter, once per path; `false` when the path is already there.
+///
+/// With [`record_part`] this is the only writer of the run's counters, so
+/// `total_rows == sum(manifest_parts.rows)` holds by construction.
+pub(in crate::pipeline) fn adopt_part(
+    summary: &mut RunSummary,
+    part: crate::manifest::ManifestPart,
+) -> bool {
+    if summary.manifest_parts.iter().any(|p| p.path == part.path) {
+        return false;
+    }
+    summary.total_rows += part.rows;
+    summary.bytes_written += part.size_bytes;
+    summary.files_produced += 1;
+    summary.files_committed += 1;
+    summary.files_adopted += 1;
+    summary.manifest_parts.push(part);
+    true
 }
 
 /// ADR-0029: the COMMIT UNIT a durable part and its Form-B checksum
@@ -545,8 +550,7 @@ pub(crate) fn part_indexed_name(base: &str, idx: usize, count: usize) -> String 
 /// across runners: the I2 fault window, the byte/file counters, the manifest
 /// part (I2/M1), the journal event, and the warn-on-fail file-log write (I7).
 /// Returns `true` iff the part was DEDUPED (a re-read overwrote a rehydrated part of the same
-/// path); the caller (the keyset page loop) then skips the per-page `total_rows` bump because
-/// rehydration already counted that page.
+/// path) — already counted, so no counter moves.
 ///
 /// ADR-0029: `unit` is the COMMIT UNIT this part belongs to, and it must be the
 /// SAME [`UnitId`] the runner passes to `CommitLedger::contribute_checksums` for
@@ -567,10 +571,8 @@ pub(crate) fn record_part(
 
     // ADR-0012 M1: record the committed part for the finalizer's RunManifest. Returns whether it
     // DEDUPED (a re-read overwrote a rehydrated part of the same path — the keyset after-manifest
-    // resume window). Aggregates are bumped only on a genuine NEW part, so a deduped re-read does
-    // not inflate files_committed / bytes_written past manifest_parts.len() (which would trip the
-    // run-integrity invariant). total_rows is a per-page loop counter; the keyset runner reconciles
-    // it to the manifest sum after the loop.
+    // resume window). Aggregates — rows included — are bumped only on a genuine NEW part, so a
+    // deduped re-read does not count a page twice; runners never touch the counters themselves.
     let recorded = manifest_writer::record_committed_part_with_fingerprint(
         summary,
         part.file_name.clone(),
@@ -581,6 +583,7 @@ pub(crate) fn record_part(
     );
     let deduped = recorded.deduped;
     if !deduped {
+        summary.total_rows += part.rows;
         summary.bytes_written += part.bytes;
         summary.files_produced += 1;
         summary.files_committed += 1;
@@ -1115,16 +1118,50 @@ mod tests {
     }
 
     #[test]
+    fn adopt_part_counts_a_prior_part_once_and_marks_it_adopted() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let part = crate::manifest::ManifestPart {
+            part_id: 1,
+            path: "p0.parquet".into(),
+            rows: 50,
+            size_bytes: 10,
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        };
+        assert!(adopt_part(&mut summary, part.clone()));
+        assert!(
+            !adopt_part(&mut summary, part),
+            "the same path is adopted once"
+        );
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.files_committed,
+                summary.files_adopted
+            ),
+            (50, 1, 1)
+        );
+        assert_eq!(
+            (summary.bytes_written, summary.manifest_parts.len()),
+            (10, 1)
+        );
+        assert_eq!(
+            summary.files_committed_here(),
+            0,
+            "adopted parts were not written here"
+        );
+    }
+
+    #[test]
     fn record_part_keeps_summary_aggregates_coherent_with_manifest_parts() {
         let plan = test_plan();
         let mut summary = test_summary(&plan);
         let parts = synthetic_parts(5);
 
-        // Simulate a runner: bump total_rows then record_part for each chunk.
-        // record_part does NOT touch total_rows; the runner owns that bump,
-        // so we model both halves of the contract here.
+        // A runner only calls record_part; the rows are counted there.
         for (i, p) in parts.iter().enumerate() {
-            summary.total_rows += p.rows;
             record_part(
                 &plan,
                 &mut summary,
