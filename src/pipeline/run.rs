@@ -927,28 +927,7 @@ pub(crate) fn run_waves(
         let pending: Vec<&ExportConfig> = exports
             .iter()
             .copied()
-            .filter(|e| {
-                // Probe the EXPANDED destination, not the raw template. A
-                // templated prefix (`{export}`/`{table}`/`{date}`) never matches a
-                // literal `_SUCCESS` path, so a completed templated export was
-                // never skipped and instead re-ran into the resume gate. Resolve
-                // the same way `rivet run` does at write time (today's UTC date, no
-                // `{run_id}` — a run-unique prefix is fresh every run, so there is
-                // nothing to skip and the literal token correctly never matches).
-                let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
-                let expanded = crate::destination::placeholder::expand_destination(
-                    e.destination.clone(),
-                    &ctx,
-                );
-                let done = resume && finalize::destination_has_success(&expanded);
-                if done {
-                    log::info!(
-                        "apply: skipping '{}' — destination already complete (_SUCCESS)",
-                        e.name
-                    );
-                }
-                !done
-            })
+            .filter(|e| finalize::needs_run(e, resume, "apply"))
             .collect();
         if pending.is_empty() {
             continue;
@@ -1524,14 +1503,6 @@ fn makespan_error_pct(actual_secs: f64, predicted_secs: f64) -> f64 {
     }
 }
 
-/// Is this a `--split` unit of the giant (its name under `unit_prefix`) that did
-/// NOT finish its share? Only `success` finishes it — a unit writes its window's
-/// manifest (split::synthesize never lets it skip), and the Full load needs every one.
-fn split_unit_failed(unit_prefix: Option<&str>, summary: &RunSummary, ok: bool) -> bool {
-    unit_prefix.is_some_and(|p| summary.export_name.starts_with(p))
-        && !(ok && summary.status == "success")
-}
-
 /// What `apply --pool` says when the `--resume` skip leaves nothing to run.
 ///
 /// `split_noticed` is whether this run already emitted the `--split` notice,
@@ -1759,17 +1730,7 @@ pub(crate) fn run_pool(
             if split {
                 return true; // per-unit skip happens after the split
             }
-            let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
-            let expanded =
-                crate::destination::placeholder::expand_destination(e.destination.clone(), &ctx);
-            let done = resume && finalize::destination_has_success(&expanded);
-            if done {
-                log::info!(
-                    "apply --pool: skipping '{}' — destination already complete (_SUCCESS)",
-                    e.name
-                );
-            }
-            !done
+            finalize::needs_run(e, resume, "apply --pool")
         })
         .cloned()
         .collect();
@@ -1804,149 +1765,24 @@ pub(crate) fn run_pool(
     //    never a silent fall-back to the un-split giant.
     //  * `--split` NOT set → the pre-existing ADVISORY warn (tells the operator
     //    the concrete floor-breaker; they act on it).
-    // #167 per-unit resume: (destination, family) of the giant that was split, so
-    // the post-split skip can read which of its units already completed.
-    let mut split_info: Option<(crate::config::DestinationConfig, String)> = None;
-    // #167 + bughunt 2026-08-13: a synthesized `{giant}#N` unit has no metrics
-    // history, so predicted_from would give it the 5 s placeholder and LPT
-    // would schedule the giant's slices LAST — smalls first, nothing
-    // backfilling behind the units, defeating the split's makespan purpose.
-    // Each unit inherits giant_predicted / realized (the same arithmetic
-    // pool::split_dominating models) AND the giant's classification, recorded
-    // here and consulted by the final classification sweep.
-    let mut split_seeds: std::collections::HashMap<String, super::pool::PredictedFrom> =
-        std::collections::HashMap::new();
+    // #167: what `--split` realized (the giant's prefix + each unit's seeded
+    // prediction, so LPT places the slices where the giant stood).
+    let mut realized: Option<super::split::Realized> = None;
     let advise = super::pool::advise_split(&items, m, 3.0, m.max(2));
     if split {
         match &advise {
             Some((giant, n, broken)) => {
-                let base = effective
-                    .iter()
-                    .find(|e| &e.name == giant)
-                    .expect("advise_split names an export in the set")
-                    .clone();
-                // On --resume, RECONSTRUCT the exact partition the prior run used from its
-                // units' persisted windows — never re-sample (finding 2: sample_key_boundaries
-                // is offset/percentile-based, so a source that grew between crash and resume
-                // yields different boundaries, and the name-based skip below then covers a
-                // different key range than was exported → silent gap). Re-probe only when there
-                // is no prior split in the prefix (a genuine first run).
-                // A run-varying placeholder breaks split's stable-prefix identity
-                // (resume + stamp expand `for_today` at their own moments — a
-                // cross-midnight resume reads an EMPTY prefix, silently re-runs
-                // the giant and leaves yesterday's markers wedged). Refuse now,
-                // before any unit exists (round-5).
-                if let Some(token) = super::split::split_unsafe_placeholder(&base.destination) {
-                    anyhow::bail!(
-                        "apply --pool --split: export '{}' writes to a destination with the \
-                         run-varying placeholder {token} — a split resume reconstructs its \
-                         partition FROM the prefix, so the prefix must be one stable location \
-                         across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
-                         which are stable) for the split export.",
-                        base.name
-                    );
-                }
-                let reconstructed = match resume {
-                    true => super::split::reconstruct_units_from_prefix(
-                        &base.destination,
-                        &base.family(),
-                        &base,
-                    )?,
-                    false => None,
-                };
-                let units_opt = match reconstructed {
-                    Some(u) => {
-                        // The reconstruction may have SHRUNK the partition (a
-                        // trailing-adjacent crash: the open tail absorbed the
-                        // crashed units). Stamp the ceased ordinals' ledger rows
-                        // + bucket markers terminal NOW — this is the only
-                        // moment that knows they ceased, and unstamped they
-                        // wedge gc/cleanup on the shared prefix forever
-                        // (round-4; born with the reconstruction in #217).
-                        super::split::stamp_ceased_units(
-                            &base.destination,
-                            &base.family(),
-                            &base.name,
-                            u.len(),
-                            &state,
-                        );
-                        Some(u)
-                    }
-                    None => super::split::probe_and_synthesize(&config, &base, &config_dir, *n)?,
-                };
-                match units_opt {
-                    Some(units) => {
-                        let realized = units.len();
-                        // Seed each unit with its share of the giant's
-                        // prediction so LPT places the slices where the giant
-                        // stood (front of the queue), not at the 5 s
-                        // placeholder tail — and with the giant's CLASSIFICATION,
-                        // so a giant that has never succeeded does not turn into
-                        // N "measured" units and silently delete the LOWER BOUND
-                        // hedge below (bughunt 2026-08-14).
-                        let (giant_secs, giant_from) = predicted_pre
-                            .iter()
-                            .find(|(i, _)| &i.name == giant)
-                            .map(|(i, f)| (i.predicted_secs, Some(f.clone())))
-                            .unwrap_or((0.0, None));
-                        let share = giant_secs / realized.max(1) as f64;
-                        let unit_from = match &giant_from {
-                            Some(f) => super::pool::split_unit_from(f, share),
-                            None => super::pool::PredictedFrom::SeededSplit(share),
-                        };
-                        for u in &units {
-                            split_seeds.insert(u.name.clone(), unit_from.clone());
-                        }
-                        split_info = Some((base.destination.clone(), base.family()));
-                        effective.retain(|e| &e.name != giant);
-                        // A synthesized unit is named `{giant}#i`; if a user export already carries
-                        // that exact name, the `by_name` HashMap below collapses the two and
-                        // silently DROPS the pre-existing export's whole table (convergence round-2
-                        // LOW — `#` is not reserved in export-name validation). Refuse loudly.
-                        if let Some(clash) = first_name_collision(&units, &effective) {
-                            anyhow::bail!(
-                                "apply --pool --split: the synthesized split unit '{clash}' collides \
-                                 with an existing export of the same name. Rename that export — a \
-                                 name of the form '{giant}#<n>' is reserved for split unit names."
-                            );
-                        }
-                        effective.extend(units);
-                        // `items` is rebuilt by the single post-split
-                        // classification sweep below.
-                        //
-                        // This line speaks for the SPLIT, not for the run's
-                        // prediction: `broken` is `advise_split`'s projection
-                        // over the PRE-split items (the giant at whatever its
-                        // frozen prediction was), and the seed it is derived
-                        // from is only a first-run bootstrap — from run 2 on,
-                        // each `{giant}#i` has history of its own that
-                        // supersedes it (`pool::reconcile_split_seed`). So the
-                        // honesty claim about the wall is NOT made here; it is
-                        // made once, from the reconciled classification, by
-                        // [`lower_bound_hedge`] beside the makespan print
-                        // below. Hedging from `unit_from` printed "the giant
-                        // has no successful run to measure from" in the same
-                        // run whose accounting said "N measured, 0 estimated"
-                        // (bughunt 2026-08-14).
-                        log::warn!(
-                            "apply --pool --split: split '{giant}' into {realized} range \
-                             sub-export(s) over its key — projected wall ~{:.1} min from the \
-                             pre-split predictions (was the single-export floor). The units share \
-                             one prefix and fold to family '{giant}', so the load view reads them \
-                             as one table. The run's own predicted makespan — reconciled against \
-                             each unit's own history, and hedged when any of it rests on an \
-                             unmeasured export — prints with the pool schedule on stdout, \
-                             unless the `--resume` skip leaves nothing to schedule (which says \
-                             so).",
-                            broken / 60.0,
-                        );
-                    }
-                    None => log::warn!(
-                        "apply --pool --split: '{giant}' dominates the floor but is not splittable \
-                         (needs a `chunk_by_key:`/`chunk_column:`, and not incremental/CDC) — \
-                         running it whole."
-                    ),
-                }
+                realized = super::split::realize(
+                    giant,
+                    *n,
+                    *broken,
+                    resume,
+                    &predicted_pre,
+                    &mut effective,
+                    &config,
+                    &config_dir,
+                    &state,
+                )?;
             }
             None => {
                 // advise_split returns None for a heavy dominator too, not only a balanced set.
@@ -2000,53 +1836,22 @@ pub(crate) fn run_pool(
     // never-started one runs fresh — the per-unit resume flag is set at the call
     // site below). Non-split exports still skip on their own prefix _SUCCESS.
     if split && resume {
-        let completed_units = split_info
-            .as_ref()
-            .map(|(dest, family)| super::split::completed_units_in_prefix(dest, family))
-            .unwrap_or_default();
-        effective.retain(|e| match &e.split {
-            Some(_) => {
-                let done = completed_units.contains(&e.name);
-                if done {
-                    log::info!(
-                        "apply --pool --split: skipping unit '{}' — already complete (its \
-                         manifest copy is present)",
-                        e.name
-                    );
-                }
-                !done
-            }
-            None => {
-                let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
-                let expanded = crate::destination::placeholder::expand_destination(
-                    e.destination.clone(),
-                    &ctx,
-                );
-                let done = finalize::destination_has_success(&expanded);
-                if done {
-                    log::info!(
-                        "apply --pool: skipping '{}' — destination already complete (_SUCCESS)",
-                        e.name
-                    );
-                }
-                !done
-            }
-        });
+        super::split::skip_completed(realized.as_ref(), &mut effective);
         if effective.is_empty() {
             // Every split unit is complete — but this return sits ABOVE the
             // pool's prefix-`_SUCCESS` writer, so a crash in the
             // [last unit's Success → marker] window would leave the marker
             // missing FOREVER (this is the only path that ever looks again).
             // Repair it before declaring "nothing to run" (round-4).
-            if let Some((dest_config, family)) = &split_info {
-                finalize::repair_missing_split_marker(dest_config, family);
+            if let Some(r) = &realized {
+                finalize::repair_missing_split_marker(&r.dest, &r.family);
             }
             // This return sits ABOVE the schedule + makespan block, so a run
             // that got here prints neither — and the `--split` notice above
             // points forward at exactly that makespan line. Cancel the pointer
             // here rather than leaving the operator hunting for a line that
             // cannot print (bughunt 2026-08-16).
-            log::warn!("{}", nothing_to_run_message(split_info.is_some()));
+            log::warn!("{}", nothing_to_run_message(realized.is_some()));
             return Ok(());
         }
     }
@@ -2059,12 +1864,13 @@ pub(crate) fn run_pool(
     // measured/estimated accounting below — a second predicted_from sweep
     // would re-query the state store per export and could describe a
     // different schedule than the one that runs (walk find, 2026-08-13).
+    let no_seeds = std::collections::HashMap::new();
     let predicted = super::pool::predict_items(
         &state,
         effective
             .iter()
             .map(|e| (e.name.as_str(), is_parallel_safe(e))),
-        &split_seeds,
+        realized.as_ref().map_or(&no_seeds, |r| &r.seeds),
     );
     let classified: Vec<super::pool::PredictedFrom> =
         predicted.iter().map(|(_, f)| f.clone()).collect();
@@ -2214,10 +2020,7 @@ pub(crate) fn run_pool(
                             // never-started unit's "no in-progress checkpoint".
                             // Non-split exports keep the run-wide resume flag.
                             let mut unit_opts = opts;
-                            if export.split.is_some() {
-                                unit_opts.resume = resume
-                                    && st.has_resumable_checkpoint(&export.name).unwrap_or(false);
-                            }
+                            unit_opts.resume = super::split::unit_resume(export, resume, &st);
                             job::run_export_job(
                                 config_path,
                                 &config,
@@ -2279,39 +2082,21 @@ pub(crate) fn run_pool(
 
     let mut summaries: Vec<RunSummary> = Vec::new();
     let mut failures: Vec<anyhow::Error> = Vec::new();
-    // #167: track whether every `--split` UNIT of the giant succeeded this run —
-    // the pool is the single writer of the prefix `_SUCCESS` (units suppress it),
-    // so the marker goes down only once the whole giant is complete.
-    let unit_prefix = split_info.as_ref().map(|(_, family)| format!("{family}#"));
-    let mut split_units_all_ok = true;
     // One `(export, start_ms, end_ms)` per export that ran — the input the
     // per-export concurrency label is MEASURED from (see [`pool_export_modes`]).
     let mut pool_windows: Vec<(String, i64, i64)> = Vec::with_capacity(summaries.capacity());
+    let mut oks: Vec<bool> = Vec::new();
     for (res, summary, (start_ms, end_ms)) in collected.into_inner().unwrap() {
-        if split_unit_failed(unit_prefix.as_deref(), &summary, res.is_ok()) {
-            split_units_all_ok = false;
-        }
+        oks.push(res.is_ok());
         if let Err(e) = res {
             failures.push(e);
         }
         pool_windows.push((summary.export_name.clone(), start_ms, end_ms));
         summaries.push(summary);
     }
-    // Every split unit succeeded → write the ONE prefix-level `_SUCCESS` the units
-    // deliberately suppressed (finalize wrote each unit's manifest + run-unique
-    // copy; this is the marker that says the whole giant is done). Best-effort: a
-    // missing marker only affects the resume-skip fast path, never data integrity.
-    if let Some((dest_config, family)) = &split_info
-        && split_units_all_ok
-    {
-        let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
-        let expanded =
-            crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
-        if let Err(e) = finalize::write_split_success_marker(&expanded) {
-            log::warn!(
-                "apply --pool --split: could not write the prefix _SUCCESS for '{family}': {e:#}"
-            );
-        }
+    // #167: the pool is the single writer of the split prefix `_SUCCESS`.
+    if let Some(r) = &realized {
+        super::split::seal(r, summaries.iter().zip(oks.iter().copied()));
     }
     // ONE aggregate, then the same routing every other orchestrator uses: the
     // card and the `run_aggregate` row are multi-export-only, the run-over-run
@@ -2414,20 +2199,6 @@ fn pool_safe_heavy_split(pending: &[&ExportConfig]) -> (usize, usize) {
     (pending.len() - heavy, heavy)
 }
 
-/// The first synthesized split-unit name (`{giant}#i`) that collides with an EXISTING export's
-/// name. `--pool --split` splices the units into the export set, and the downstream `by_name`
-/// HashMap collapses same-named entries — so a user export literally named `{giant}#0` would be
-/// silently dropped (its whole table lost). `Some(name)` here → the caller refuses loudly.
-fn first_name_collision<'a>(
-    units: &'a [ExportConfig],
-    existing: &[ExportConfig],
-) -> Option<&'a str> {
-    units
-        .iter()
-        .find(|u| existing.iter().any(|e| e.name == u.name))
-        .map(|u| u.name.as_str())
-}
-
 #[cfg(test)]
 mod render_guard_tests {
     use super::*;
@@ -2454,7 +2225,8 @@ mod render_guard_tests {
 
 #[cfg(test)]
 mod pool_decision_tests {
-    use super::{RunSummary, dominates_as_heavy, makespan_error_pct, split_unit_failed};
+    use super::super::split::unit_failed as split_unit_failed;
+    use super::{RunSummary, dominates_as_heavy, makespan_error_pct};
 
     #[test]
     fn a_heavy_export_dominates_only_above_its_fair_share() {
@@ -4562,7 +4334,8 @@ mod run_tail_tests {
 
 #[cfg(test)]
 mod wave_grouping_tests {
-    use super::{first_name_collision, group_exports_by_wave, is_parallel_safe, next_eligible};
+    use super::super::split::first_name_collision;
+    use super::{group_exports_by_wave, is_parallel_safe, next_eligible};
 
     #[test]
     fn a_synthesized_split_unit_colliding_with_an_existing_export_is_detected() {

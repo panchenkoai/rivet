@@ -857,6 +857,25 @@ pub(crate) fn repair_missing_split_marker(
     }
 }
 
+/// False when `resume` is set and the export's destination, expanded for today, already holds `_SUCCESS` (logged as a skip by `who`).
+pub(crate) fn needs_run(export: &crate::config::ExportConfig, resume: bool, who: &str) -> bool {
+    if !resume {
+        return true;
+    }
+    // Expanded, not the raw template: a `{export}`/`{date}` prefix never matches a literal marker path.
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&export.name);
+    let expanded =
+        crate::destination::placeholder::expand_destination(export.destination.clone(), &ctx);
+    if destination_has_success(&expanded) {
+        log::info!(
+            "{who}: skipping '{}' — destination already complete (_SUCCESS)",
+            export.name
+        );
+        return false;
+    }
+    true
+}
+
 pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -> bool {
     use crate::manifest::SUCCESS_FILENAME;
     let Ok(d) = crate::destination::create_destination(dest) else {
@@ -1584,6 +1603,24 @@ mod tests {
         // An unopenable destination counts as "not complete" (re-run it).
         let bad = cfg_local(Some("/nonexistent/definitely/missing"), None);
         assert!(!destination_has_success(&bad));
+    }
+
+    #[test]
+    fn needs_run_skips_only_a_resumed_export_whose_expanded_destination_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "name: orders\nquery: \"SELECT 1\"\nformat: parquet\ndestination:\n  type: local\n  path: {}/{{export}}\n",
+            dir.path().display()
+        );
+        let export: crate::config::ExportConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(needs_run(&export, true, "t"), "no marker -> runs");
+        std::fs::create_dir_all(dir.path().join("orders")).unwrap();
+        std::fs::write(dir.path().join("orders/_SUCCESS"), b"xxh3:0\n").unwrap();
+        assert!(
+            !needs_run(&export, true, "t"),
+            "marker under the expanded path -> skipped"
+        );
+        assert!(needs_run(&export, false, "t"), "without --resume -> runs");
     }
 
     /// The crash-in-[last unit → marker] window repair: a complete split prefix
