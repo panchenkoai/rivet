@@ -6,7 +6,7 @@ re-checked against the code at `b9d58284`; line numbers are from that commit.
 
 ## Product (Rust)
 
-### P1. Chunked-sequential over-counts `total_rows` after a retried write — pre-existing — **FIXED** (36cbd1e6; live seam test owed)
+### P1. Chunked-sequential over-counts `total_rows` after a retried write — pre-existing — **FIXED** (live seam test RED-proven)
 `src/pipeline/chunked/exec.rs:116` adds `sink.total_rows` to `summary.total_rows`
 *before* `write_sink_parts` runs. If that write fails on the first non-empty chunk,
 `files_committed` is still 0, so `decide_export_retry` (`single.rs:129`) retries. The
@@ -21,7 +21,7 @@ attempt 2 adds its rows on top of attempt 1's orphaned count.
 - **Test:** transient upload error on chunk 1 (`RIVET_TEST_ERROR_AT`), assert
   `export_metrics.total_rows == manifest sum`.
 
-### P2. Resume rehydration makes a transient blip look like a duplicate-row risk — pre-existing — **FIXED** (36cbd1e6; live seam test owed)
+### P2. Resume rehydration makes a transient blip look like a duplicate-row risk — pre-existing — **FIXED** (live seam test RED-proven)
 `src/pipeline/chunked/resume_m8.rs:288` does `summary.files_committed += rehydrated`
 (keyset resume rehydrates the same way). `decide_export_retry` (`single.rs:189`) reads
 `files_committed > 0` as "this attempt wrote files, a retry would duplicate", so a
@@ -36,7 +36,7 @@ transient source error on a `--resume` before the first NEW part becomes
   connect; assert it retries. Observe the value at the seam (the metrics row), not a
   hand-fed decider input.
 
-### P3. A manifest deleted between list and stat fails the whole load — pre-existing, now reachable via the branch — **FIXED** (36cbd1e6)
+### P3. A manifest deleted between list and stat fails the whole load — pre-existing, now reachable via the branch — **FIXED** (8455923d)
 `load::reconcile::fetch_manifests_keyed` (`src/load/reconcile.rs:78`) lists keys, then
 stats+reads each via `GcsStore::read_each_within`, whose `try_collect`
 (`src/destination/gcs.rs:140`) fails on the first error. `prepare_load` propagates it
@@ -51,7 +51,7 @@ back on the same error.
 - **Fix direction:** treat NotFound on a listed key as "vanished, skip it" inside
   `read_each_within`'s callers.
 
-### P4. `execute_resolved_plan` decides `skipped` inline — branch — **FIXED** (36cbd1e6)
+### P4. `execute_resolved_plan` decides `skipped` inline — branch — **FIXED** (8455923d)
 `src/pipeline/job.rs:1268`: `if summary.status == "skipped" { summary.skip_reason = … }`
 sits in a live-only body whose whole-function mutation exclusion was lifted on the
 ground that every decision there is a named predicate. No offline test observes
@@ -133,10 +133,14 @@ tagging.
 
 ## Found while fixing (2026-09-24)
 
-- **P1/P2 share one root:** `run_with_reconnect` reset only `summary.ledger` per attempt,
-  so a retry after a resume would re-adopt its prior parts and declare them TWICE in
-  `manifest_parts`. The duplicate-guard bail of P2 was what kept that from shipping. The
-  fix resets the whole summary to its pre-attempt snapshot.
+- **P1 and P2 are separate:** P1 is the per-attempt reset (`reset_for_retry`), P2 the
+  decision input (`files_committed_here`). A retry after a resume does NOT double-declare
+  the adopted parts even without the reset — rehydration skips a path already in
+  `manifest_parts` (`resume_m8.rs`), measured live with the reset removed.
+- **Live seam tests** (`tests/live/live_chunked_recovery.rs`, one-shot transient hook
+  `RIVET_TEST_TRANSIENT_ONCE`): `a_retried_chunk_write_does_not_count_its_rows_twice` RED
+  without the reset (`total_rows` 200 vs 150); `a_transient_error_after_resume_adopts_
+  parts_is_retried_not_refused` RED with the adopted-blind decision (exit 3).
 - **H3 needs a live Debezium run:** the MySQL probe cannot be copied as-is — compare.py
   excludes the probe by `$.source.table`, Mongo events carry `$.source.collection`, and
   `ExtractNewDocumentState` may strip the source block from the body entirely.
