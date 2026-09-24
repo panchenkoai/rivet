@@ -882,17 +882,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
-        engine_loop(led, ns)
-        if not ns.no_cloud:
-            # Inject THIS module's bring_up/seed_engine rather than letting the
-            # stage use its own copies. The copies exist only because importing
-            # the module executing as __main__ would re-run it — but a duplicate
-            # is a duplicate: the readiness hardening (two consecutive probe
-            # passes, and honouring the result) landed here and NOT there, so the
-            # BQ stage's mysql leg still hit the initdb race and recorded
-            # `SKIP seed` where the previous run had a PASS. One definition now.
-            bigquery.run_bigquery_golden(led, keep=ns.keep, parallel=ns.engine_parallel,
-                                         bring_up=bring_up, seed_engine=seed_engine)
+        if ns.no_cloud:
+            engine_loop(led, ns)
+        else:
+            # The BigQuery golden brings up its own `bq`-tagged containers on their own
+            # ports, so it runs beside the matrix instead of after it. It is handed THIS
+            # module's bring_up/seed_engine so the readiness hardening has one definition.
+            run_concurrently(led, "Engine matrix + BigQuery golden", [
+                ("engine matrix", lambda sub: engine_loop(sub, ns)),
+                ("bigquery golden", lambda sub: bigquery.run_bigquery_golden(
+                    sub, keep=ns.keep, parallel=ns.engine_parallel,
+                    bring_up=bring_up, seed_engine=seed_engine)),
+            ])
         rc = led.report()
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is
