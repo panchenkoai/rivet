@@ -267,7 +267,8 @@ def main() -> int:
     # table ending in `_probe` on EVERY engine, including the three that have
     # no probe at all.
     probe_filter = (
-        f"AND coalesce(jstr(j, '$.source.table'), '') <> '{a.exclude_table}'"
+        f"AND coalesce(jstr(j, '$.source.table'), jstr(j, '$.__collection'), '') "
+        f"<> '{a.exclude_table}'"
         if a.exclude_table else "AND TRUE"
     )
     sql = (SQL.replace("__PROBE_FILTER__", probe_filter)
@@ -294,7 +295,7 @@ ORDER BY 2, 3, 1;
         f.write(sql)
         path = f.name
     try:
-        r = subprocess.run([*DUCKDB, "-box", "-c", f".read {path}"],
+        r = subprocess.run([*DUCKDB, "-c", f".read {path}"],
                            capture_output=True, text=True)
     finally:
         os.unlink(path)
@@ -335,9 +336,20 @@ ORDER BY 2, 3, 1;
         return 1
 
     body = r.stdout.strip()
-    # DuckDB prints an empty box when a query returns no rows; agreement is the
-    # absence of any differing row.
-    if not body or "0 rows" in body or body.count("│") == 0:
+    # Agreement is ZERO differing rows, counted — never read off the rendering: the
+    # pinned duckcli prints `-box` as a `|` list, so a box-glyph test read every
+    # DISAGREE as AGREE.
+    diff_sql = sql.split("SELECT 'rivet-only'")[1].rsplit("ORDER BY", 1)[0]
+    diff_n = subprocess.run(
+        [*DUCKDB, "-noheader", "-list", "-c",
+         sql.split("SELECT 'rivet-only'")[0]
+         + f"SELECT count(*) FROM (SELECT 'rivet-only'{diff_sql});"],
+        capture_output=True, text=True)
+    if diff_n.returncode != 0 or not diff_n.stdout.strip().isdigit():
+        print(f"compare: could not count the differing rows: {diff_n.stderr.strip()}",
+              file=sys.stderr)
+        return 1
+    if int(diff_n.stdout.strip()) == 0:
         # Report the counts that were compared. "AGREE" over two captures whose
         # sizes are never printed is the same silence this guard exists to remove —
         # a reader must be able to see the comparison had something to compare.

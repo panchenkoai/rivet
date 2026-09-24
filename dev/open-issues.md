@@ -85,7 +85,7 @@ never graded in the judging gate.
 - **Fix direction:** a SQLite leg in `release-oracle-full`, or make the cell run against
   a throwaway SQLite state inside the Postgres pass.
 
-### H3. CDC differential: Mongo readiness passes on ANY change-stream cursor — pre-existing
+### H3. CDC differential: Mongo readiness passes on ANY change-stream cursor — pre-existing — **FIXED** (a delivered probe, like MySQL's; live AGREE on all three scenarios)
 `dev/cdc-oracle/run.py:512-515` counts every idle `$changeStream` cursor on the server.
 The previous scenario's Debezium is `docker rm -f`'d (no killCursors) and rivet's own
 `watch()` also leaves one, so scenario 2/3 can pass readiness before the new connector
@@ -123,6 +123,17 @@ rivet's own SQL. The gate row went with the cell.
 A change to rivet's own predicate cannot turn it red — only a schema change can. The
 fixture-against-itself class. Fix direction: read the active set through rivet (a
 `state show` field, or a `load` dry run), not through a re-typed query.
+
+### H8. The CDC differential could not DISAGREE — since 0.28.0 (on main) — **FIXED**
+Found while RED-proving H3. `compare.py` decided agreement by the absence of a box glyph
+(`│`) in DuckDB's `-box` output, but the pinned `dev/pytools/duckcli.py` (0.28.0) prints
+`-box` as a `|` list — so EVERY diff read as AGREE, on every engine. Measured: the Mongo
+crud capture with its probe left in returned `debezium-only|insert|…` and printed AGREE.
+Fix: agreement is a counted `SELECT count(*)` of the differing rows, never the rendering;
+and run.py now runs a positive control on the engines with a probe (MySQL, Mongo): the
+same comparison with the probe NOT excluded must DISAGREE, else `ORACLE-BLIND` fails the
+cell. RED-proven: with the glyph check restored, the control fails the run. Postgres and
+MSSQL have no probe, so no control there — the verdict code is shared and engine-free.
 
 ## Unexplained / unverified
 
