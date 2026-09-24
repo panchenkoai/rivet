@@ -5,6 +5,7 @@
 //! give the partition column's range per file for two small range reads each.
 
 use crate::destination::gcs::GcsStore;
+use crate::load;
 use crate::load::plan::{Granularity, PartitionKey, TablePartition};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike};
@@ -374,6 +375,71 @@ fn over_budget_message(key: &PartitionKey, span: Span, touched: i64) -> String {
              `range.interval` or load a narrower range"
         ),
     }
+}
+
+/// The URIs the partition budget applies to: the files that land in the
+/// PARTITIONED target. Under `BaseAndBuffer` the stream's files land in the
+/// BUFFER, which is created WITHOUT a partition and read whole by one MERGE, so
+/// budgeting them against the base's granularity refuses a load that would have
+/// worked. Found by dogfooding (2026-09-18): a 5,000-day buffer file on a
+/// day-partitioned base was refused by name, although no job would ever write
+/// those partitions — the adapter had already stopped packing the buffer, but
+/// this preflight still measured it.
+///
+/// A baseline manifest that resolves to no present part makes `select_load_keys`
+/// fall back to the whole listing; the check then covers everything again, which
+/// is the conservative direction.
+pub(crate) fn budgeted_uris(
+    layout: load::plan::CdcLayout,
+    runs: &[(String, crate::manifest::RunManifest)],
+    uris: &[String],
+) -> Vec<String> {
+    if !layout.log_is_disposable() {
+        return uris.to_vec();
+    }
+    let baseline: Vec<(String, crate::manifest::RunManifest)> = runs
+        .iter()
+        .filter(|(_, m)| load::orchestrate::is_baseline_leg(m))
+        .cloned()
+        .collect();
+    if baseline.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<String> = uris
+        .iter()
+        .filter_map(|u| load::split_gs_uri(u).ok().map(|(_, k)| k.to_string()))
+        .collect();
+    let want: std::collections::HashSet<String> =
+        load::reconcile::select_load_keys(&baseline, &keys)
+            .into_iter()
+            .collect();
+    uris.iter()
+        .filter(|u| load::split_gs_uri(u).is_ok_and(|(_, k)| want.contains(k)))
+        .cloned()
+        .collect()
+}
+
+/// The pre-load partition budget of a BigQuery plan (ADR-0034 D4); no other target
+/// caps the partitions one job writes.
+pub(crate) fn partition_budget_ok(
+    store: &crate::destination::gcs::GcsStore,
+    plan: &load::plan::LoadPlan,
+    uris: &[String],
+) -> Result<()> {
+    match (&plan.load.target, &plan.partition) {
+        (load::plan::LoadTarget::Bigquery { .. }, Some(partition)) => {
+            load::partition_budget::check_partition_budget(store, uris, partition)
+                .with_context(|| format!("export `{}`", plan.export_name))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The partition a load declares, for the progress line.
+pub(crate) fn partition_label(plan: &load::plan::LoadPlan) -> String {
+    plan.partition
+        .as_ref()
+        .map_or_else(|| "none".to_string(), |p| p.key.describe())
 }
 
 #[cfg(test)]
