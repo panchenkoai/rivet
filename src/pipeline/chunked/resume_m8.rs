@@ -286,6 +286,7 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         // Keep the summary aggregates consistent with the reconstructed manifest so
         // the run card, the reconcile gate, and the coherence invariant all agree.
         summary.files_committed += rehydrated;
+        summary.files_adopted += rehydrated;
         summary.files_produced += rehydrated;
         summary.total_rows += rehydrated_rows;
         summary.bytes_written += rehydrated_bytes;

@@ -111,7 +111,8 @@ impl GcsStore {
     /// the object's bytes, or `Err(size)` when it is over `cap`: a stat refuses it before
     /// any byte is read, and the read itself stops past `cap` — so an object rewritten
     /// in place between the two (a running marker becoming its terminal manifest) is
-    /// read whole when it still fits, and refused when it grew past the cap.
+    /// read whole when it still fits, and refused when it grew past the cap. A path
+    /// deleted after it was listed is left out, not an error.
     pub(crate) fn read_each_within<T>(
         &self,
         paths: &[String],
@@ -123,20 +124,28 @@ impl GcsStore {
         self._runtime.block_on(
             futures_util::stream::iter(paths)
                 .map(|p| async move {
-                    let size = op.stat(p).await?.content_length();
+                    let size = match op.stat(p).await {
+                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(None),
+                        other => other?.content_length(),
+                    };
                     if size > cap {
-                        return parse(p, Err(size));
+                        return parse(p, Err(size)).map(Some);
                     }
-                    let mut chunks = op.reader(p).await?.into_bytes_stream(..).await?;
+                    let reader = match op.reader(p).await {
+                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(None),
+                        other => other?,
+                    };
+                    let mut chunks = reader.into_bytes_stream(..).await?;
                     let mut buf = Vec::with_capacity(size as usize);
                     while let Some(chunk) = chunks.try_next().await? {
                         if let Some(over) = push_within(&mut buf, &chunk, cap) {
-                            return parse(p, Err(over));
+                            return parse(p, Err(over)).map(Some);
                         }
                     }
-                    parse(p, Ok(buf))
+                    parse(p, Ok(buf)).map(Some)
                 })
                 .buffered(16)
+                .try_filter_map(|x| async move { Ok(x) })
                 .try_collect(),
         )
     }
@@ -273,6 +282,19 @@ mod tests {
             .read_each_within(&[], 10, |_, b| Ok(b.is_ok()))
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// A key listed and then deleted (a retired running marker) is skipped, not fatal.
+    #[test]
+    fn read_each_within_skips_a_path_deleted_after_it_was_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept"), b"abc").unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let paths = ["gone".to_string(), "kept".to_string()];
+        let got = store
+            .read_each_within(&paths, 10, |p, body| Ok((p.to_string(), body.is_ok())))
+            .unwrap();
+        assert_eq!(got, vec![("kept".into(), true)]);
     }
 
     /// The streamed read's own cap — the guard for an object that grew between the stat

@@ -26,6 +26,7 @@ pub(crate) fn run_with_reconnect(
     chunk_source: super::chunked::ChunkSource,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
+    let before_first_attempt = summary.clone();
 
     for attempt in 0..=plan.tuning.max_retries {
         // ADR-0028: the tail ledger accumulates ACROSS a runner invocation, and a
@@ -36,6 +37,7 @@ pub(crate) fn run_with_reconnect(
         // is the only one the seam applies.
         summary.ledger = Default::default();
         if attempt > 0 {
+            reset_for_retry(summary, &before_first_attempt);
             summary.retries = attempt;
             let class = last_err
                 .as_ref()
@@ -126,7 +128,7 @@ pub(crate) fn run_with_reconnect(
             Err(e) => match decide_export_retry(
                 attempt,
                 plan.tuning.max_retries,
-                summary.files_committed,
+                summary.files_committed_here(),
                 &plan.export_name,
                 &e,
             ) {
@@ -141,6 +143,17 @@ pub(crate) fn run_with_reconnect(
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("export failed after retries")))
+}
+
+/// Roll `summary` back to its state before the first attempt, keeping what spans
+/// attempts (the journal and the reconnect count): a retry re-reads from scratch and
+/// re-adopts resumed parts, so the failed attempt's totals and parts must not stay.
+fn reset_for_retry(summary: &mut RunSummary, before_first_attempt: &RunSummary) {
+    let journal = std::mem::take(&mut summary.journal);
+    let reconnects = summary.reconnects;
+    *summary = before_first_attempt.clone();
+    summary.journal = journal;
+    summary.reconnects = reconnects;
 }
 
 /// Outcome of the retry decision in `run_with_reconnect`.
@@ -682,6 +695,54 @@ mod tests {
     // ── zero-rows paths ───────────────────────────────────────────────────────
 
     /// 0 rows: the runner succeeds and leaves the status to the dispatcher.
+    #[test]
+    fn a_retry_starts_from_the_pre_attempt_summary_but_keeps_journal_and_reconnects() {
+        let base = RunSummary {
+            export_name: "e".into(),
+            ..Default::default()
+        };
+        let mut s = base.clone();
+        s.total_rows = 1000;
+        s.files_committed = 3;
+        s.files_adopted = 3;
+        s.manifest_parts.push(crate::manifest::ManifestPart {
+            part_id: 0,
+            path: "p".into(),
+            rows: 1000,
+            size_bytes: 1,
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        });
+        s.reconnects = 2;
+        s.journal.record(RunEvent::RetryAttempted {
+            attempt: 1,
+            reason: "x".into(),
+            backoff_ms: 0,
+        });
+        let events = s.journal.entries.len();
+        super::reset_for_retry(&mut s, &base);
+        assert_eq!(
+            (s.total_rows, s.files_committed, s.files_adopted),
+            (0, 0, 0)
+        );
+        assert!(s.manifest_parts.is_empty());
+        assert_eq!(s.reconnects, 2);
+        assert_eq!(s.journal.entries.len(), events);
+    }
+
+    #[test]
+    fn adopted_parts_are_not_parts_this_run_committed() {
+        let mut s = RunSummary {
+            files_committed: 3,
+            files_adopted: 3,
+            ..Default::default()
+        };
+        assert_eq!(s.files_committed_here(), 0);
+        s.files_committed = 5;
+        assert_eq!(s.files_committed_here(), 2);
+    }
+
     #[test]
     fn zero_rows_no_skip_empty_succeeds() {
         let plan = minimal_plan();

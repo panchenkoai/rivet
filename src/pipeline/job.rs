@@ -827,6 +827,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         files_produced: 0,
         bytes_written: 0,
         files_committed: 0,
+        files_adopted: 0,
         duration_ms: 0,
         peak_rss_mb: 0,
         retries: 0,
@@ -1091,6 +1092,18 @@ fn ok_status(skip_empty: bool, total_rows: i64, parts: usize) -> &'static str {
     }
 }
 
+/// Terminal status of an Ok run plus, when it was skipped, why.
+fn ok_outcome(
+    skip_empty: bool,
+    total_rows: i64,
+    parts: usize,
+    strategy: &ExtractionStrategy,
+) -> (&'static str, Option<String>) {
+    let status = ok_status(skip_empty, total_rows, parts);
+    let reason = (status == "skipped").then(|| skip_reason(awaited_column(strategy)));
+    (status, reason)
+}
+
 /// The column a run with nothing new was waiting on: an incremental cursor, or the
 /// key a `keyset_incremental` run continues past.
 fn awaited_column(strategy: &ExtractionStrategy) -> Option<&str> {
@@ -1259,14 +1272,15 @@ fn execute_resolved_plan(
     match &result {
         Ok(()) => {
             if promotes_to_success(&summary.status) {
-                summary.status = ok_status(
+                let (status, reason) = ok_outcome(
                     plan.skip_empty,
                     summary.total_rows,
                     summary.manifest_parts.len(),
-                )
-                .into();
-                if summary.status == "skipped" {
-                    summary.skip_reason = Some(skip_reason(awaited_column(&plan.strategy)));
+                    &plan.strategy,
+                );
+                summary.status = status.into();
+                if reason.is_some() {
+                    summary.skip_reason = reason;
                     log::info!(
                         "export '{}': skipped (0 rows, skip_empty=true)",
                         plan.export_name
@@ -1976,6 +1990,18 @@ mod tests {
             "success",
             "rows counted, no parts yet"
         );
+    }
+
+    #[test]
+    fn only_a_skipped_run_carries_a_skip_reason() {
+        use super::ok_outcome;
+        let full = ExtractionStrategy::Snapshot;
+        assert_eq!(
+            ok_outcome(true, 0, 0, &full),
+            ("skipped", Some("source returned 0 rows".to_string()))
+        );
+        assert_eq!(ok_outcome(true, 5, 1, &full), ("success", None));
+        assert_eq!(ok_outcome(false, 0, 0, &full), ("success", None));
     }
 
     #[test]

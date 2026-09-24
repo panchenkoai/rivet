@@ -83,6 +83,8 @@ pub struct RunSummary {
     /// Incremented after each successful `dest.write()`. Non-zero means a previous
     /// attempt already committed data — retrying from the same cursor would duplicate rows.
     pub files_committed: usize,
+    /// Parts adopted from a prior run on resume (included in `files_committed`).
+    pub files_adopted: usize,
     pub duration_ms: i64,
     pub peak_rss_mb: i64,
     pub retries: u32,
@@ -279,6 +281,11 @@ pub(crate) fn fresh_run_id(export_name: &str) -> String {
 }
 
 impl RunSummary {
+    /// Parts this run committed itself — not the ones a resume adopted.
+    pub(super) fn files_committed_here(&self) -> usize {
+        self.files_committed.saturating_sub(self.files_adopted)
+    }
+
     pub(super) fn new(plan: &ResolvedRunPlan) -> Self {
         let run_id = fresh_run_id(&plan.export_name);
         let mut journal = RunJournal::new(&run_id, &plan.export_name);
@@ -301,6 +308,7 @@ impl RunSummary {
             bytes_written: 0,
             bytes_read: 0,
             files_committed: 0,
+            files_adopted: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,
@@ -383,6 +391,7 @@ impl RunSummary {
             bytes_written: 0,
             bytes_read: 0,
             files_committed: 0,
+            files_adopted: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,
