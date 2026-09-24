@@ -18,6 +18,7 @@ mod cli;
 pub(crate) mod commit;
 mod finalize;
 pub(crate) use finalize::destination_uri_for_manifest;
+mod fan_in;
 pub(crate) mod frame;
 mod governor;
 pub(crate) mod ipc;

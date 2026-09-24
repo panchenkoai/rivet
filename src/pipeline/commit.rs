@@ -655,7 +655,7 @@ pub(crate) fn record_part(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(led.observed.column_max_bytes.get("t"), Some(&100u64));
     }
 
-    fn test_plan() -> ResolvedRunPlan {
+    pub(crate) fn test_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
@@ -836,7 +836,7 @@ mod tests {
         }
     }
 
-    fn test_summary(plan: &ResolvedRunPlan) -> RunSummary {
+    pub(crate) fn test_summary(plan: &ResolvedRunPlan) -> RunSummary {
         let mut s = RunSummary::stub_for_testing("test_run", plan.export_name.clone());
         s.batch_size = 10_000;
         s.mode = "snapshot".into();
@@ -1105,7 +1105,7 @@ mod tests {
     // will fire the moment that runner finishes a real export. Two layers,
     // both CI-enforced via `cargo test`.
 
-    fn synthetic_parts(n: usize) -> Vec<PartRecord> {
+    pub(crate) fn synthetic_parts(n: usize) -> Vec<PartRecord> {
         (0..n)
             .map(|i| PartRecord {
                 file_name: format!("part_{i}.parquet"),
