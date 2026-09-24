@@ -1109,6 +1109,12 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
                     "batch/gcs cells; a change stream has no batch load and the other "
                     "stores are covered by their own readback")
         return
+    if cell.lifecycle != "clean":
+        led.skipped(cell.engine, tag, "flow:load", cell.store,
+                    f"{cell.engine} {cell.label} · load — graded on the clean cell: this leg "
+                    "exports and loads one fresh run, so a repeat/resume copy would grade the "
+                    "same thing again (loading a two-run or resumed prefix is not covered)")
+        return
     if not have("gcloud") or not proj:
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — no `gcloud` (the REST token) or no project "
