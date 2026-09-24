@@ -270,8 +270,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "its independent cells concurrently fills the idle cores; this bounds the "
              "total so the shared state DB / source containers are not stampeded.")
     ap.add_argument(
-        "--engine-parallel", type=int, default=3,
-        help="how many engines to run CONCURRENTLY in the engine loop (default 3). Each engine "
+        "--engine-parallel", type=int, default=4,
+        help="how many engines to run CONCURRENTLY in the engine loop (default 4 — every engine, so the longest never queues). Each engine "
              "owns its own containers/ports, and the scenarios race on the SHARED state backend "
              "— which doubles as a real concurrent-writer test. The dominant serial cost is CDC "
              "capture-job waits (sleep-for-the-agent), which overlap under parallelism, so the "
@@ -813,7 +813,8 @@ def main(argv: list[str] | None = None) -> int:
     from .core import set_cell_parallel
     set_cell_parallel(ns.cell_parallel)
 
-    if not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK):
+    # A clean-tree run builds the binary itself; only --no-clean needs one up front.
+    if ns.no_clean and (not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK)):
         print(f"rivet binary not found at {rivet_bin()} (build --release or set RIVET_BIN)", file=sys.stderr)
         return 2
     if not have("duckdb"):
@@ -842,8 +843,6 @@ def main(argv: list[str] | None = None) -> int:
         from datetime import datetime, timezone
 
         led.phase(f"Rivet Release Oracle — {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
-        version = rivet("--version").stdout.splitlines()
-        print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
 
         # WHICH STATE BACKEND IS BEING GRADED, said out loud.
         #
@@ -879,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
             return 1
+        version = rivet("--version").stdout.splitlines()
+        print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
         engine_loop(led, ns)

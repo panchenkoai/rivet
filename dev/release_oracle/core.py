@@ -436,10 +436,8 @@ def container_for_port(port: int) -> str | None:
     engine behind a URL. Returns None rather than an empty string, so a caller
     cannot pass ""/None into `docker exec` and get "invalid container name or ID:
     value is empty" (which is exactly what the bash version did)."""
-    for name in docker("ps", "--format", "{{.Names}}").stdout.split():
-        if any(line.endswith(f":{port}") for line in docker("port", name).stdout.splitlines()):
-            return name
-    return None
+    names = docker("ps", "--filter", f"publish={port}", "--format", "{{.Names}}").stdout.split()
+    return names[0] if names else None
 
 
 def port_of(url: str) -> int | None:

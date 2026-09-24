@@ -298,7 +298,8 @@ release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE env
 	@# code, and `cargo package` poisons the fingerprints so cargo reports
 	@# `Fresh` on a binary that predates your edits — drop the snapshot first.
 	@rm -rf target/package
-	cargo build --release
+	@# No `cargo build` here: the gate's clean-tree phase rebuilds the release
+	@# profile from nothing, so a build here was thrown away (measured 5.5 min).
 	@# newest by mtime, not lexical order (accumulating dir would mis-tail)
 	@# An ABSENT baseline is now a FAIL, not a SKIP, on all three prev-release
 	@# stages (release regression / previous-release differential / field symptom
