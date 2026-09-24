@@ -201,7 +201,7 @@ pub(super) fn density_probe(conn: &mut mysql::PooledConn, info: &mut super::Tabl
     // Tier 0 AFTER the two boundary seeks: a small claim is trusted only when
     // the span agrees (TABLE_ROWS and DATA_LENGTH freeze TOGETHER — the span
     // is the one cheap signal that is not statistics; live-proven here).
-    if super::density::catalog_claim_trusted(catalog, max.saturating_sub(min) + 1) {
+    if super::density::catalog_claim_trusted(catalog, max.saturating_sub(min).saturating_add(1)) {
         info.density = Some(DensityProbe {
             rows: catalog,
             density: 0.0,

@@ -102,8 +102,10 @@ impl GcsStore {
     }
 
     /// `parse(path, body)` over each object in `paths`, in order, 16 in flight. `body` is
-    /// the object's bytes, or `Err(size)` when its size is over `cap` — a stat decides
-    /// that before any byte of it is read, so an oversized object is never downloaded.
+    /// the object's bytes, or `Err(size)` when it is over `cap`: a stat refuses it before
+    /// any byte is read, and the read itself stops past `cap` — so an object rewritten
+    /// in place between the two (a running marker becoming its terminal manifest) is
+    /// read whole when it still fits, and refused when it grew past the cap.
     pub(crate) fn read_each_within<T>(
         &self,
         paths: &[String],
@@ -119,10 +121,15 @@ impl GcsStore {
                     if size > cap {
                         return parse(p, Err(size));
                     }
-                    // Read exactly the size the stat admitted: an object replaced by a
-                    // bigger one in between is truncated (and fails to parse), never
-                    // read unbounded.
-                    parse(p, Ok(op.read_with(p).range(0..size).await?.to_vec()))
+                    let mut chunks = op.reader(p).await?.into_bytes_stream(..).await?;
+                    let mut buf = Vec::with_capacity(size as usize);
+                    while let Some(chunk) = chunks.try_next().await? {
+                        buf.extend_from_slice(&chunk);
+                        if buf.len() as u64 > cap {
+                            return parse(p, Err(buf.len() as u64));
+                        }
+                    }
+                    parse(p, Ok(buf))
                 })
                 .buffered(16)
                 .try_collect(),

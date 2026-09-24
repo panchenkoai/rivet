@@ -475,7 +475,7 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
 
 def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, str] | None:
     """(DuckDB preamble, relation) over the parts the store's manifests DECLARE, or None when the store holds none or its client is absent."""
-    dl = work / f"dl_{store}_{random.randint(0, 32767)}"
+    dl = Path(mkdtemp(prefix=f"dl_{store}_", dir=work))
     if store == "s3":
         # DECLARED, not globbed. The prefix is read twice: once for the manifests
         # (DuckDB reads JSON over httpfs, so this needs no `mc` and no pull), then
@@ -1069,8 +1069,8 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
         # need no extra CLI: s3 (DuckDB httpfs) and gcs (the JSON-API pull) are always
         # available, so "" there means the destination holds ZERO parts after a run that
         # exited 0 — the exact "success but delivered nothing → release-ready" shape
-        # blessed_path already FAILs. Only azure (needs `az`) keeps the SKIP.
-        if store in ("s3", "gcs"):
+        # blessed_path already FAILs. Only azure WITHOUT `az` keeps the SKIP.
+        if store in ("s3", "gcs") or (store == "azure" and have("az")):
             _failed(led, engine, tag, "load", store,
                     f"load→{store} delivered 0 rows (source {scnt}) — empty destination after a "
                     f"0-exit run", "empty-destination")

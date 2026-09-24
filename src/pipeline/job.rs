@@ -1073,6 +1073,13 @@ fn promotes_to_success(current_status: &str) -> bool {
     current_status == "running"
 }
 
+/// Does the `running` marker written under `opened` survive this run with nothing
+/// replacing it? A skipped run writes no terminal manifest, and a resume that adopted
+/// an earlier id (`finished` ≠ `opened`) writes its terminal manifest under that id.
+fn marker_outlived_its_run(status: &str, opened: &str, finished: &str) -> bool {
+    status == "skipped" || opened != finished
+}
+
 /// Terminal status of a run whose runner returned Ok: `skipped` when `skip_empty`
 /// is set and it delivered nothing — no rows and no parts (a resume that only
 /// re-adopted earlier parts still delivered them), else `success`.
@@ -1353,6 +1360,9 @@ fn execute_resolved_plan(
     // itself cannot be re-written to say `failed` — failing to write it is the
     // problem.
     let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
+    if marker_outlived_its_run(&summary.status, &ledger_run_id, &summary.run_id) {
+        super::finalize::retire_running_marker(plan, &ledger_run_id);
+    }
     if let Some(why) = &manifest_gap {
         summary.status = "failed".into();
         // redact-at-assignment (round-8): this string reaches summary.json AND
@@ -1976,6 +1986,27 @@ mod tests {
             "no new rows since cursor 'updated_at'"
         );
         assert_eq!(skip_reason(None), "source returned 0 rows");
+    }
+
+    #[test]
+    fn a_marker_outlives_a_skipped_run_or_a_resume_under_another_id() {
+        use super::marker_outlived_its_run;
+        assert!(
+            marker_outlived_its_run("skipped", "r2", "r2"),
+            "no terminal manifest"
+        );
+        assert!(
+            marker_outlived_its_run("success", "r2", "r1"),
+            "resume wrote under r1"
+        );
+        assert!(
+            !marker_outlived_its_run("success", "r2", "r2"),
+            "terminal replaced it"
+        );
+        assert!(
+            !marker_outlived_its_run("failed", "r2", "r2"),
+            "failed manifest replaced it"
+        );
     }
 
     #[test]

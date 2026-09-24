@@ -71,9 +71,13 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
         if any(q.endswith(name) or q == name for q in passed):
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
         else:
-            tail = out[out.find(name):][:1200] if name in out else out[-600:]
+            # From the LAST mention: nextest prints a failed test's captured output in a
+            # `--- STDERR: … <name> ---` block after its START line, so the first mention
+            # holds no evidence. The tail goes on the printed line, not only the ledger.
+            tail = out[out.rfind(name):][:4000] if name in out else out[-2000:]
             led.failed("all", scenario, cell(name), "postgres",
-                       f"{msg(name)} — no PASS line for {name} (failed, renamed, or filtered out)",
+                       f"{msg(name)} — no PASS line for {name} (failed, renamed, or filtered "
+                       f"out)\n{tail[-1500:]}",
                        tail)
 
 

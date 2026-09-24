@@ -113,7 +113,9 @@ def mongo(js: str) -> str:
 
 
 def mssql(sql: str) -> str:
-    r = subprocess.run(MSSQL_EXEC + [sql], capture_output=True, text=True)
+    # NOCOUNT: without it sqlcmd appends "(N rows affected)" to every result, so
+    # `== NULL` / `.isdigit()` readiness checks below read the trailer, not the value.
+    r = subprocess.run(MSSQL_EXEC + [f"SET NOCOUNT ON; {sql}"], capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit(f"sqlcmd failed: {r.stderr.strip()}\n  sql: {sql}")
     return r.stdout.strip()
