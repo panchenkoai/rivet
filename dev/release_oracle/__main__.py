@@ -34,6 +34,8 @@ PHASE ORDER IS LOAD-BEARING, not cosmetic:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import argparse
 import os
 import shutil
@@ -387,7 +389,6 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
-    partner_shape.verify_partner_shape(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
@@ -423,14 +424,17 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
             "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
         ),
     )
-    # Four SAME-NAMED configs on one shared Postgres state, at once — the
-    # deployment shape the shared-state docs recommend; blessed and crashed.
-    shared_state.verify_shared_state_same_name(led)
-    # The partner's warehouse layout: base + buffer + `compact`, and loads batched
-    # under BigQuery's per-job partition cap.
-    warehouse_layout.verify_warehouse_layout(led)
-    # The same cycle on configs `rivet init` wrote: run 1 everything, run 2 the delta.
-    init_delta.verify_init_delta(led)
+    # The BigQuery-bound stages wait on warehouse jobs, not on each other: run together.
+    # Shared state: four SAME-NAMED configs on one Postgres state, blessed and crashed.
+    # Warehouse layout: base + buffer + `compact`, loads batched under the partition cap.
+    # Init delta: the same cycle on configs `rivet init` wrote. Partner shape: init
+    # --mode cdc over three tables through two loads.
+    run_concurrently(led, "BigQuery stages — shared state, warehouse layout, init delta, partner shape", [
+        ("shared state", lambda sub: shared_state.verify_shared_state_same_name(sub)),
+        ("warehouse layout", lambda sub: warehouse_layout.verify_warehouse_layout(sub)),
+        ("init delta", lambda sub: init_delta.verify_init_delta(sub)),
+        ("partner shape", lambda sub: partner_shape.verify_partner_shape(sub)),
+    ])
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
@@ -746,6 +750,24 @@ def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str
     scenarios.run_scenarios(led, engine, tag, url)
     if not ns.keep:
         docker("rm", "-fv", engine_container(engine, tag))
+
+
+def run_concurrently(led: Ledger, title: str, stages: list[tuple[str, Callable[[Ledger], None]]]) -> None:
+    """Run independent gate stages at once, each into a buffered sub-ledger flushed in list order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    led.phase(title)
+    subs = [led.buffered_child() for _ in stages]
+
+    def _one(i: int) -> None:
+        name, fn = stages[i]
+        with subs[i].span(f"{name}: stage-total"):
+            fn(subs[i])
+
+    with ThreadPoolExecutor(max_workers=len(stages)) as ex:
+        list(ex.map(_one, range(len(stages))))
+    for sub in subs:
+        sub.flush_into(led)
 
 
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
