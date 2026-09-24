@@ -101,16 +101,6 @@ impl StateStore {
         Ok(self.query_opt(&sql, &[prefix.into()], |_| ())?.is_some())
     }
 
-    /// The run_ids of the runs [`has_active_run_on_prefix`] answers `true` for —
-    /// same predicate, named rather than counted.
-    ///
-    /// The load needs the NAMES because a run still writing into the prefix can
-    /// still GROW its manifest: the CDC sink rewrites a `Success` superset at
-    /// every commit-boundary roll under ONE run_id. Recording such a run as
-    /// consumed strands every part it writes afterwards — silently, forever,
-    /// since the skip set is keyed on the run_id alone. Excluding exactly the
-    /// active runs leaves them retryable while every terminal run is still
-    /// recorded, so a completed run is never re-loaded.
     /// The status of ONE run-status row, or `None` when no row exists — the gc
     /// marker sweep's ledger probe: a `Running` BUCKET marker whose ledger row
     /// is TERMINAL is a dead crash marker even though no Success ever
@@ -246,6 +236,16 @@ impl StateStore {
         Ok(stamped)
     }
 
+    /// The run_ids of the runs [`has_active_run_on_prefix`] answers `true` for —
+    /// same predicate, named rather than counted.
+    ///
+    /// The load needs the NAMES because a run still writing into the prefix can
+    /// still GROW its manifest: the CDC sink rewrites a `Success` superset at
+    /// every commit-boundary roll under ONE run_id. Recording such a run as
+    /// consumed strands every part it writes afterwards — silently, forever,
+    /// since the skip set is keyed on the run_id alone. Excluding exactly the
+    /// active runs leaves them retryable while every terminal run is still
+    /// recorded, so a completed run is never re-loaded.
     pub fn active_run_ids_on_prefix(&self, prefix: &str) -> Result<HashSet<String>> {
         let sql = format!(
             "SELECT r.run_id FROM run_status r WHERE {}",
