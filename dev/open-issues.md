@@ -93,6 +93,15 @@ DELETE; the retention does. The count validation catches it (`loaded 0 rows, exp
 - Still open: a load into a table that has an expiry does not warn, before any job, that
   its rows fall in partitions BigQuery will drop on arrival.
 
+### P10. A resume after a FAILED chunked run under-reports its rows — pre-existing (on main) — **FIXED** (b20e9a4d)
+A chunk error that RETURNS (not a crash) still finalizes a Failed `manifest.json` under the
+same run id, so `--resume` takes the M8 `Skip` arm, which pushed the prior parts into the
+manifest and bumped no counter. export_metrics, the run card and the row-count gate read
+`total_rows`; `--reconcile` summed the manifest and hid it. Live, before the fix:
+`total_rows` 50 for a 150-row export (only the re-run chunk). Fixed by making the commit
+ledger the only writer of the counters (`record_part` + `adopt_part`); regression
+`a_resume_after_a_failed_run_reports_the_rows_it_adopted`, RED on the old Skip arm.
+
 ### P9. `cleanup_source` decides "no live run" before the warehouse copy and deletes after it — found by reading, NOT measured
 `cleanup_target_leased` (`src/load/orchestrate.rs`) asks `prefix_has_active_run` before
 `materialize`; the recursive `delete_under` runs in `maybe_cleanup` (`src/load/mod.rs`)
