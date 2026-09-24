@@ -164,3 +164,67 @@ fn skip_empty_skips_on_the_mongo_parallel_runner() {
     assert_eq!(latest_status(&rig, "bench").0, "skipped");
     m.drop_database();
 }
+
+/// A skipped run writes no terminal manifest, so on a cloud prefix nothing would
+/// replace the `running` marker it wrote at start — the prefix would read as live
+/// for ever (cleanup_source refused, gc sparing). The run must retire its marker.
+#[test]
+#[ignore = "live: requires docker compose postgres + minio"]
+fn a_skipped_run_on_s3_leaves_no_live_running_marker() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::Minio);
+    let bucket = "rivet-qa-skip-marker";
+    ensure_minio_bucket(bucket);
+    let table = unique_name("skip_marker");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (k BIGINT PRIMARY KEY, payload TEXT NOT NULL);"
+        ))
+        .unwrap();
+    let _guard = PgCleanup(table.clone());
+    let export = unique_name("skip_marker_exp");
+    let prefix = unique_name("skipmk");
+    let rig = Rig::pg_batch(&table)
+        .mode("full")
+        .export_named(&export)
+        .export_line("skip_empty: true")
+        .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let env = [
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+    let r = rig.run_args_env(&["--export", &export], &env);
+    assert!(
+        r.status.success(),
+        "an empty export under skip_empty must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(
+        latest_status(&rig, &export).0,
+        "skipped",
+        "fixture is inert: the run was not skipped"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    minio_pull_prefix(bucket, &prefix, dir.path());
+    let live: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            name.starts_with("manifest-") && name.ends_with(".json")
+        })
+        .filter(|p| {
+            let doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap_or_default();
+            doc["status"] == "running"
+        })
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(
+        live.is_empty(),
+        "a skipped run left its running marker on the prefix — it reads as live for ever: {live:?}"
+    );
+}
