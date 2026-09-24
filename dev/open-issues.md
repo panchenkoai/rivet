@@ -93,6 +93,16 @@ DELETE; the retention does. The count validation catches it (`loaded 0 rows, exp
 - Still open: a load into a table that has an expiry does not warn, before any job, that
   its rows fall in partitions BigQuery will drop on arrival.
 
+### P9. `cleanup_source` decides "no live run" before the warehouse copy and deletes after it — found by reading, NOT measured
+`cleanup_target_leased` (`src/load/orchestrate.rs`) asks `prefix_has_active_run` before
+`materialize`; the recursive `delete_under` runs in `maybe_cleanup` (`src/load/mod.rs`)
+after the copy and the count gate. An extract that STARTS during the copy writes its
+running marker and parts into a prefix that was already judged idle, and the delete takes
+them. The prefix lease covers load-vs-load only. Unverified: needs a live test that starts
+an extract between the decision and the delete. Fix direction: re-check activity at the
+delete, not only at the decision — a refreshed census at the decision point does not
+close the window.
+
 ### P5. A load whose statement landed but whose ledger row did not strands the table — pre-existing (on main)
 `live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job`
 cuts the state DB by a TIMER (1800 ms) mid `rivet load --pool`. Measured 2026-09-24:
@@ -228,6 +238,23 @@ run). Dropped by hand. Fix direction: a Drop guard that drops the test's slot, l
 ### H11. The release-build-path cell did not say the Docker image was built — fixed
 With `RIVET_ORACLE_DOCKER=1` a successful image build added no note, so the PASS line read
 the same as a run that never built one. Now `(docker image built)`.
+
+### Architecture review 2026-09-24 — the "worth exploring" candidates, researched
+- **One prefix census per load:** only pin + prepare can share one (both read the same
+  manifests; pin's older read can type a load from a run older than the one loaded).
+  Cleanup and gc must keep their own fresh reads — they guard deletes, and gc already
+  re-reads each marker right before deleting it. The four error policies are deliberate
+  (fallback / spare / warn / propagate), each matching what its site guards. Narrowed
+  candidate: move pin after the lease and derive it from prepare's census; keep a
+  standalone pin for `rivet compact`.
+- **Warehouse-layout test oracle:** 4 duplicated helper families (12 copies) plus ~15
+  cleanup lists name `{t}__changes` by hand. Proposal: `BqLive::read_bq_buffered(t)`,
+  `BqLive::read_bq_live(t, select)` (adds `NOT __is_deleted` only when the column exists),
+  and a `cleanup` that also drops `__changes` / `__staging` / `__changes__merging`. Four
+  test files would then name no service table; `live_cdc_compact`, `live_load_spec`,
+  `live_init_delta` and `live_load_partition_batches` keep naming them because the layout
+  is their subject. `live_cdc_multi_table_cycle.rs`'s module doc still describes the view
+  layout.
 
 ## Unexplained / unverified
 

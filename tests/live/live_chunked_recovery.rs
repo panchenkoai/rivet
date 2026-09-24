@@ -1465,3 +1465,55 @@ fn a_transient_error_after_resume_adopts_parts_is_retried_not_refused() {
         "the retry must not declare the adopted part twice"
     );
 }
+
+/// A resume after a run that FAILED (not crashed) takes the M8 `Skip` arm: the
+/// failed attempt finalized a manifest under the same run id, so its parts are
+/// adopted from it, not from file_log. The run's reported total must still be the
+/// cumulative one — export_metrics, the run card and the row-count gate read it.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_after_a_failed_run_reports_the_rows_it_adopted() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("m8_skip_count");
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .duckdb_oracle();
+    let cfg = rig.config_path();
+    let failed = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+    );
+    assert!(
+        !failed.status.success(),
+        "the injected chunk error must fail the run"
+    );
+    // The premise: a manifest under THIS chunk run's id, so the resume takes Skip.
+    let man: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(rig.out_dir().join("manifest.json"))
+            .expect("a failed run still writes a manifest"),
+    )
+    .unwrap();
+    assert_eq!(
+        man["run_id"].as_str(),
+        chunk_run_id(&cfg, &export).as_deref(),
+        "the manifest belongs to the run the resume continues"
+    );
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
+    assert!(
+        resume.status.success(),
+        "--resume must finish; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    rig.assert_complete("id", 150, "resume delivers every row once");
+    assert_eq!(
+        latest_metric_total_rows(&cfg, &export),
+        Some(150),
+        "the reported total counts the adopted parts, not only the re-run chunk"
+    );
+}
