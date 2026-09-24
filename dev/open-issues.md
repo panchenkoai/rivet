@@ -82,9 +82,16 @@ failed: MongoDB collection … does not exist`).
 (`src/load/bigquery/shape.rs`). BigQuery then deletes every partition older than N days
 — including partitions a load is filling right now with historical rows. rivet issues no
 DELETE; the retention does. The count validation catches it (`loaded 0 rows, expected
-200`) but blames nothing: "investigate before re-running". Open question for the owner:
-whether rivet should set warehouse-side retention at all, or refuse/warn before a load
-whose rows fall in partitions the table will expire.
+200`) but blames nothing: "investigate before re-running".
+- **Policy (owner, 2026-09-24): rivet sets no partition expiry by default.** Verified:
+  `expiration_days` has no default, `rivet init` never writes it, and every
+  `partition_expiration_days` rivet emits comes from it (`shape.rs`); dropping it from the
+  config makes the next load `SET OPTIONS(partition_expiration_days = NULL)`.
+- The hourly-limit warning (`plan.rs`) offered `expiration_days` as its FIRST fix — a
+  nudge toward deletion. Now `granularity: day` comes first and the expiry is named as
+  the deletion it is; pinned by a unit test, RED against the old wording.
+- Still open: a load into a table that has an expiry does not warn, before any job, that
+  its rows fall in partitions BigQuery will drop on arrival.
 
 ### P5. A load whose statement landed but whose ledger row did not strands the table — pre-existing (on main)
 `live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job`

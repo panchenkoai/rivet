@@ -1242,11 +1242,7 @@ fn resolve_partition(
         }
     };
     if hourly_partitions_outlive_the_table(&key, spec.expiration_days) {
-        eprintln!(
-            "  warning: export `{export}`: hourly partitions reach BigQuery's \
-             {MAX_TABLE_PARTITIONS}-partition limit after {HOURLY_LIFETIME_DAYS} days — set \
-             `expiration_days` to at most {HOURLY_LIFETIME_DAYS}, or use `granularity: day`"
-        );
+        eprintln!("{}", hourly_limit_warning(export));
     }
     if mode != LoadMode::Full {
         if spec.require_filter {
@@ -1273,6 +1269,16 @@ fn resolve_partition(
 }
 
 /// Whether an hourly key with this expiry can outgrow BigQuery's per-table partition cap.
+/// The hourly-partition limit warning: the lossless fix first; expiry only as the deletion it is.
+fn hourly_limit_warning(export: &str) -> String {
+    format!(
+        "  warning: export `{export}`: hourly partitions reach BigQuery's \
+         {MAX_TABLE_PARTITIONS}-partition limit after {HOURLY_LIFETIME_DAYS} days — use \
+         `granularity: day`. (`expiration_days` at most {HOURLY_LIFETIME_DAYS} also avoids it, \
+         but BigQuery then DELETES every partition older than that — rivet never sets it for you.)"
+    )
+}
+
 fn hourly_partitions_outlive_the_table(key: &PartitionKey, expiration_days: Option<u32>) -> bool {
     matches!(
         key,
@@ -3153,6 +3159,20 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
         assert!(e.contains("no `range` or `ingestion` partitions"), "{e}");
         let e = err(serde_json::json!({ "column": "n" }));
         assert!(e.contains("cannot partition on `n` (NUMBER)"), "{e}");
+    }
+
+    #[test]
+    fn the_hourly_limit_warning_offers_the_lossless_fix_first_and_names_expiry_a_deletion() {
+        let w = super::hourly_limit_warning("e");
+        let day = w
+            .find("use `granularity: day`")
+            .expect("names the day granularity");
+        let exp = w.find("`expiration_days`").expect("mentions the expiry");
+        assert!(day < exp, "the lossless fix comes first: {w}");
+        assert!(
+            w.contains("BigQuery then DELETES every partition older than that"),
+            "{w}"
+        );
     }
 
     #[test]
