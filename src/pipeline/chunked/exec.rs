@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use super::super::{RunSummary, progress::ChunkProgress, sink::ExportSink};
 use super::math::build_chunk_query_sql;
-use super::poison;
 use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
@@ -223,36 +222,15 @@ pub(crate) fn run_chunked_parallel(
         parallel
     );
 
+    // `completed` counts only successes (progress); the governor's exit count is
+    // FanIn's `finished`, bumped on every exit — a success-only count would strand
+    // it whenever a chunk fails.
     let completed = AtomicUsize::new(0);
-    // Every worker bumps this exactly once — on success, failure, OR an
-    // unwinding panic (it is bumped by the `WorkerExit` RAII guard, not a tail
-    // statement) — so the governor thread can tell when the run is *done*
-    // regardless of outcome.
-    // `completed` counts only successes (progress bar / summary); using it for
-    // the governor's exit condition deadlocks the `thread::scope` whenever a
-    // chunk fails (the governor would loop forever waiting for a success count
-    // that never arrives).
-    let finished = AtomicUsize::new(0);
     // Rows streamed across ALL chunks (completed + in-flight) — drives the
     // per-batch progress feed so the bar ticks during a chunk's read.
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let errors = std::sync::Mutex::new(Vec::<String>::new());
-    // PartRecords pushed by workers, drained into record_part post-scope so the
-    // I2/M1 → I7 → counters ordering lives once in commit::record_part. Tuple
-    // second is the chunk_index used by the ChunkCompleted journal event. The
-    // bytes_written / files_produced / files_committed counters are no longer
-    // accumulated worker-side — record_part bumps them in the drain.
-    let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
-        std::sync::Mutex::new(Vec::new());
-    // Each worker pushes its chunk's Form-B checksums and shape bytes here; the
-    // parent feeds them to the run ledger post-join (order-independent).
-    let checksums_shared: std::sync::Mutex<
-        Vec<(
-            i64,
-            super::super::commit::UnitChecksums,
-            super::super::commit::Observations,
-        )>,
-    > = std::sync::Mutex::new(Vec::new());
+    // Parts, shapes, checksums and failures, drained post-join in FanIn's fixed order.
+    let fan = crate::pipeline::fan_in::FanIn::default();
     // Schema fingerprint captured by whichever worker resolves the dest
     // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
     // produced rows so no schema was seen).  Drained into `summary` after
@@ -279,7 +257,13 @@ pub(crate) fn run_chunked_parallel(
         // Governor thread (shared seam): samples source pressure on its own monitoring connection
         // and resizes the semaphore within [floor, ceiling], self-terminating once every chunk
         // worker has FINISHED (success OR failure) so a failing chunk can't strand it.
-        governor.spawn_into(s, &semaphore, &finished, total_chunks, &plan.export_name);
+        governor.spawn_into(
+            s,
+            &semaphore,
+            fan.finished(),
+            total_chunks,
+            &plan.export_name,
+        );
 
         for (i, (start, end)) in chunks.iter().enumerate() {
             // Block (kernel-park) until a worker slot frees up.
@@ -299,10 +283,7 @@ pub(crate) fn run_chunked_parallel(
             let base_query = &plan.base_query;
             let col = &cp.column;
             let completed = &completed;
-            let finished = &finished;
-            let errors = &errors;
-            let file_records = &file_records;
-            let checksums_shared = &checksums_shared;
+            let fan_r = &fan;
             let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
             let pb_thread = pb_handle.clone();
@@ -311,16 +292,11 @@ pub(crate) fn run_chunked_parallel(
             let end = *end;
             let shared_destination = std::sync::Arc::clone(&shared_destination);
 
-            s.spawn(move || {
-                // Return the permit and mark this worker FINISHED on every exit path —
-                // including an unwinding panic, which the tail statements this replaced
-                // skipped: the governor thread's only exit is `finished >= total`, so a
-                // panicking worker left it looping forever and `thread::scope` could never
-                // join (the process hung instead of reporting the failure), while the
-                // un-released permit stalled the spawner loop at `parallel = 1` even with
-                // the governor disarmed. Same shape as the keyset runner's `FinishGuard`.
-                let _exit = crate::pipeline::governor::WorkerExit::new(semaphore, finished);
-                let result = (|| -> Result<()> {
+            fan.spawn(s, format!("chunk {i}"), move || {
+                // The parent took this permit; release it on every exit, panic included,
+                // or the spawner stalls at `parallel = 1` (FanIn::spawn counts the exit).
+                let _permit = crate::pipeline::governor::TaskPermit::adopt(semaphore);
+                {
                     // Test-only, mirroring both checkpoint runners
                     // (sequential_checkpoint.rs / parallel_checkpoint.rs): make ONE
                     // chunk fail without killing the process, so the collected-worker-
@@ -393,18 +369,13 @@ pub(crate) fn run_chunked_parallel(
                             plan_for_worker.validate.then_some(plan_for_worker.format),
                             |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
                         )?;
-                        let mut records = poison::lock_recover(file_records);
+                        let unit = super::super::commit::UnitId::Chunk(i as i64);
                         for rec in recs {
-                            records.push((rec, i as i64));
+                            fan_r.part(unit, rec);
                         }
-                        drop(records);
-                        // ADR-0029: tagged with the chunk — the same unit the
-                        // parent's `record_part` drain records these parts under.
-                        poison::lock_recover(checksums_shared).push((
-                            i as i64,
-                            sink.take_checksums(),
-                            sink.take_shape(),
-                        ));
+                        // ADR-0029: the chunk is the commit unit its parts are recorded under.
+                        fan_r.observe(sink.take_shape());
+                        fan_r.contribute(unit, sink.take_checksums());
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -420,20 +391,11 @@ pub(crate) fn run_chunked_parallel(
                         sink.total_rows
                     );
                     Ok(())
-                })();
-
-                if let Err(e) = result {
-                    log::error!("export '{}': chunk {} failed: {:#}", export_name, i, e);
-                    poison::lock_recover(errors).push(format!("chunk {}: {:#}", i, e));
                 }
-                // `_exit` drops here: permit released, `finished` bumped.
             });
         }
     });
 
-    // Drain governor decisions (recorded off-thread) into the run journal — BEFORE any error
-    // check, so a failed run still journals its ParallelismAdjusted events.
-    governor.drain_into(summary);
     if plan.validate {
         summary.validated = Some(true);
     }
@@ -444,42 +406,31 @@ pub(crate) fn run_chunked_parallel(
         summary.schema_fingerprint = Some(fp);
     }
 
-    // Drain each worker-written part through the shared commit path: I2/M1 +
-    // bytes/files counters + ChunkCompleted journal + I7 file-log. All summary
-    // and state mutation happens here on the parent thread, post-join.
-    for (rec, chunk_index) in poison::into_recover(file_records) {
-        super::super::commit::record_part(
-            plan,
-            summary,
-            Some(state),
-            &rec,
-            super::super::commit::PartKind::Chunk { chunk_index },
-            super::super::commit::UnitId::Chunk(chunk_index),
-        );
-    }
+    // Every durable part (file_log written here, in the drain — ADR-0017), then the
+    // shapes and committed checksums, then the bail.
+    let drained = fan.finish(
+        plan,
+        summary,
+        Some(state),
+        Some(governor),
+        |_, unit| match unit {
+            super::super::commit::UnitId::Chunk(chunk_index) => {
+                super::super::commit::PartKind::Chunk { chunk_index }
+            }
+            other => unreachable!("chunked parts are recorded under a chunk unit, not {other:?}"),
+        },
+        |errs| {
+            anyhow::anyhow!(
+                "export '{}': {} chunks failed:\n{}",
+                plan.export_name,
+                errs.len(),
+                errs.join("\n")
+            )
+        },
+    );
     // After the drain: record_part is what counts the rows.
     pb.finish(summary.total_rows);
-
-    let errs = poison::into_recover(errors);
-    if !errs.is_empty() {
-        anyhow::bail!(
-            "export '{}': {} chunks failed:\n{}",
-            plan.export_name,
-            errs.len(),
-            errs.join("\n")
-        );
-    }
-
-    // ADR-0028/0029: feed every worker's chunk checksums into the run ledger
-    // (order-independent merge) under the SAME chunk unit the drain above
-    // recorded that chunk's parts with; the seam harvests once, at the
-    // dispatcher, and computes the coverage itself.
-    for (chunk_index, checksums, shape) in poison::into_recover(checksums_shared) {
-        summary.ledger.observe(shape);
-        summary
-            .ledger
-            .contribute(super::super::commit::UnitId::Chunk(chunk_index), checksums);
-    }
+    drained?;
 
     log::info!(
         "export '{}': all {} chunks completed",

@@ -58,6 +58,7 @@ impl FanIn {
 
     /// A unit failed; the run fails after the drain.
     pub(crate) fn fail(&self, label: &str, msg: impl std::fmt::Display) {
+        log::error!("{label} failed: {msg}");
         locked(&self.errors).push(format!("{label}: {msg}"));
     }
 
