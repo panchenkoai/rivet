@@ -216,6 +216,19 @@ sibling versions print too: two `✓` lines glued into one, so counting ✓ line
 under-counts by the number of collisions (2 in the 626060c2 gate). The verdict is derived
 from ledger rows and is unaffected. Fix: a buffered baseline ledger.
 
+### H10. Live tests on `rivet init` configs leak their Postgres slot when they fail — found 2026-09-24
+The pre-release gate on c69805df went red on 9 `doctor` cells: three inactive LOGICAL slots
+(`rivet_appdb_68163`, `rivet_fullcdc_19408`, `rivet_snap_32968`, ~410 MiB of WAL each)
+pinned the CDC stand, and `doctor` rightly refused. `rivet init` names the slot
+`rivet_<database>`; these came from live tests on throwaway databases during a full
+`--run-ignored all` run whose failures skipped cleanup (`catalog_xmin` 386890-386893: one
+run). Dropped by hand. Fix direction: a Drop guard that drops the test's slot, like
+`MongoDbGuard` drops its database — a panic must not leave state the gate grades.
+
+### H11. The release-build-path cell did not say the Docker image was built — fixed
+With `RIVET_ORACLE_DOCKER=1` a successful image build added no note, so the PASS line read
+the same as a run that never built one. Now `(docker image built)`.
+
 ## Unexplained / unverified
 
 ### U1. `init_delta[warehouse:mysql]` failed once, cause unknown

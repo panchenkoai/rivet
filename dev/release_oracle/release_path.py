@@ -133,6 +133,8 @@ def verify_release_build_path(led: Ledger) -> None:
             log.write_text(build.out)
             if not build.ok:
                 fails.append(f"docker-image-build(see {log}) ")
+            else:
+                note.append("docker image built ")
         else:
             note.append("docker absent (image build skipped) ")
     else:
