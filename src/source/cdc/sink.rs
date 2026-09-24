@@ -123,6 +123,8 @@ struct TableSink<'a> {
     /// re-read — see `value_checksum::Fold`) — recorded into the manifest so `rivet validate` Form B
     /// covers CDC prefixes instead of silently skipping the value leg.
     column_sums: std::collections::BTreeMap<String, u64>,
+    /// How many of `parts` the last per-roll manifest already declared.
+    manifested_parts: usize,
 }
 
 impl TableSink<'_> {
@@ -333,18 +335,32 @@ fn roll_all(
         // count-gate-invisible loss). A `Success` run-unique manifest (no `_SUCCESS`
         // marker yet — the prefix is not complete) is idempotently rewritten as a
         // superset each roll; the terminal write at clean end adds `_SUCCESS`.
-        for s in sinks.iter() {
-            let manifest = build_manifest(
-                engine,
-                &s.column_sums,
-                &s.out,
-                export_name,
-                format,
-                run_id,
-                started_at,
-                &s.parts,
-            );
-            write_manifest_without_success_marker(s.out.dest, &manifest)?;
+        let dirty: Vec<usize> = (0..sinks.len())
+            .filter(|&i| sinks[i].parts.len() != sinks[i].manifested_parts)
+            .collect();
+        let pending: Vec<(&dyn crate::destination::Destination, RunManifest)> = dirty
+            .iter()
+            .map(|&i| {
+                let s = &sinks[i];
+                let manifest = build_manifest(
+                    engine,
+                    &s.column_sums,
+                    &s.out,
+                    export_name,
+                    format,
+                    run_id,
+                    started_at,
+                    &s.parts,
+                );
+                (s.out.dest, manifest)
+            })
+            .collect();
+        write_concurrently(&pending, |(dest, manifest)| {
+            write_manifest_without_success_marker(*dest, manifest).map(|_| ())
+        })?;
+        drop(pending);
+        for i in dirty {
+            sinks[i].manifested_parts = sinks[i].parts.len();
         }
         if let Some(ck) = checkpoint {
             p.save(ck)?;
@@ -397,6 +413,7 @@ pub(crate) fn run_to_files(
             parts: Vec::new(),
             seq: 0,
             column_sums: std::collections::BTreeMap::new(),
+            manifested_parts: 0,
         })
         .collect();
 
@@ -576,42 +593,87 @@ pub(crate) fn run_to_files(
     // covered by the per-roll run-unique manifest `roll_all` wrote before each
     // ack, so the manifest is built for the CALLER's accounting and no
     // `_SUCCESS` is claimed — the run did not succeed.
-    let mut manifests = Vec::with_capacity(sinks.len());
+    let manifests: Vec<RunManifest> = sinks
+        .iter()
+        .map(|s| {
+            build_manifest(
+                cfg.engine,
+                &s.column_sums,
+                &s.out,
+                &cfg.export_name,
+                cfg.format,
+                &cfg.run_id,
+                &cfg.started_at,
+                &s.parts,
+            )
+        })
+        .collect();
+    // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
+    // AND an immutable run-unique copy, so a prefix accumulating several
+    // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
+    //
+    // Only on the clean path: writing `_SUCCESS` for a run that FAILED would
+    // tell every downstream reader the prefix is complete. A failed run's
+    // parts stay declared by the per-roll manifest, which carries no marker.
     // A failure to write the TERMINAL manifest becomes the run's outcome, but
     // must not discard the manifests either — the parts it describes are
     // durable regardless of whether the marker landed.
-    let mut write_err: Option<anyhow::Error> = None;
-    for s in &sinks {
-        let manifest = build_manifest(
-            cfg.engine,
-            &s.column_sums,
-            &s.out,
-            &cfg.export_name,
-            cfg.format,
-            &cfg.run_id,
-            &cfg.started_at,
-            &s.parts,
-        );
-        // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
-        // AND an immutable run-unique copy, so a prefix accumulating several
-        // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
-        //
-        // Only on the clean path: writing `_SUCCESS` for a run that FAILED would
-        // tell every downstream reader the prefix is complete. A failed run's
-        // parts stay declared by the per-roll manifest, which carries no marker.
-        if drain.is_ok()
-            && write_err.is_none()
-            && let Err(e) = write_manifest(s.out.dest, &manifest)
-        {
-            write_err = Some(e);
-        }
-        manifests.push(manifest);
-    }
+    let write_err: Option<anyhow::Error> = if drain.is_ok() {
+        let jobs: Vec<(&dyn crate::destination::Destination, &RunManifest)> = sinks
+            .iter()
+            .zip(&manifests)
+            .map(|(s, m)| (s.out.dest, m))
+            .collect();
+        write_concurrently(&jobs, |(dest, manifest)| {
+            write_manifest(*dest, manifest).map(|_| ())
+        })
+        .err()
+    } else {
+        None
+    };
     match (drain, write_err) {
         (Err(e), _) => (manifests, Err(e)),
         (Ok(()), Some(e)) => (manifests, Err(e)),
         (Ok(()), None) => (manifests, Ok(())),
     }
+}
+
+/// Object-store writes in flight at once per roll: enough to hide per-PUT latency, few enough to stay polite to the store.
+const MANIFEST_WRITERS: usize = 16;
+
+/// Apply `write` to every item on up to [`MANIFEST_WRITERS`] threads; after the first error no new item starts, and that error is returned.
+fn write_concurrently<T: Sync>(items: &[T], write: impl Fn(&T) -> Result<()> + Sync) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..MANIFEST_WRITERS.min(items.len()) {
+            scope.spawn(|| {
+                loop {
+                    if first_err
+                        .lock()
+                        .expect("write error slot poisoned")
+                        .is_some()
+                    {
+                        break;
+                    }
+                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    if let Err(e) = write(item) {
+                        first_err
+                            .lock()
+                            .expect("write error slot poisoned")
+                            .get_or_insert(e);
+                    }
+                }
+            });
+        }
+    });
+    first_err
+        .into_inner()
+        .expect("write error slot poisoned")
+        .map_or(Ok(()), Err)
 }
 
 /// Build the sink schema once, on the first flush — refining decimal scales from
@@ -2681,6 +2743,123 @@ mod tests {
         fn capabilities(&self) -> crate::destination::DestinationCapabilities {
             self.inner.capabilities()
         }
+    }
+
+    /// Records every object key written through it, delegating to a real destination.
+    struct RecordingDest {
+        inner: Box<dyn crate::destination::Destination>,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::destination::Destination for RecordingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            self.keys.lock().unwrap().push(key.to_string());
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A roll rewrites the run-unique manifest only for a table that gained a part since the
+    /// last one; an idle table in a busy stream is written once, at the terminal manifest.
+    #[test]
+    fn a_roll_rewrites_the_manifest_only_for_tables_that_gained_a_part() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let busy = RecordingDest {
+            inner: local_dest(&da),
+            keys: Default::default(),
+        };
+        let idle = RecordingDest {
+            inner: local_dest(&db),
+            keys: Default::default(),
+        };
+        let cols = int_col();
+        let ev = |table: &str, id: i64| {
+            let mut e = insert(id);
+            e.table = table.into();
+            e.committed = true;
+            e
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![ev("b", 4), ev("a", 1), ev("a", 2), ev("a", 3)]),
+            acked: Vec::new(),
+        };
+        fn output<'a>(
+            table: &str,
+            cols: &[TypeMapping],
+            dest: &'a dyn crate::destination::Destination,
+        ) -> TableOutput<'a> {
+            TableOutput {
+                table: table.into(),
+                columns: cols.to_vec(),
+                dest,
+                dest_uri: String::new(),
+                row_hash: crate::config::RowHash::All(false),
+            }
+        }
+        let base = cfg(&busy, &cols, FormatType::Parquet, 1);
+        let (m, r) = run_to_files(
+            &mut stream,
+            SinkConfig {
+                outputs: vec![output("a", &cols, &busy), output("b", &cols, &idle)],
+                ..base
+            },
+        );
+        r.unwrap();
+        assert_eq!(
+            (m[0].parts.len(), m[1].parts.len()),
+            (3, 1),
+            "fixture is inert — table a must roll three parts and b one"
+        );
+        let run_unique = |d: &RecordingDest| {
+            d.keys
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| k.rsplit('/').next().unwrap().starts_with("manifest-"))
+                .count()
+        };
+        assert_eq!(
+            run_unique(&idle),
+            2,
+            "b gained its part on the first roll and stayed idle for the next three: one \
+             per-roll manifest plus the terminal one, not one per roll of the whole stream"
+        );
+        assert_eq!(
+            run_unique(&busy),
+            4,
+            "a gained a part on every roll, then the terminal"
+        );
+    }
+
+    /// Manifest writes overlap: the first item can only finish once the second has started.
+    #[test]
+    fn write_concurrently_overlaps_writes_and_returns_the_first_error() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = (std::sync::Mutex::new(tx), std::sync::Mutex::new(rx));
+        let items = [0, 1];
+        write_concurrently(&items, |&i| {
+            if i == 0 {
+                rx.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| anyhow::anyhow!("item 1 never ran while item 0 was in flight"))
+            } else {
+                tx.lock().unwrap().send(()).map_err(Into::into)
+            }
+        })
+        .expect("two writes must be in flight at once");
+
+        let err = write_concurrently(&[1, 2, 3], |&i| {
+            anyhow::ensure!(i != 2, "item {i} refused");
+            Ok(())
+        })
+        .expect_err("a failed write is the result");
+        assert!(err.to_string().contains("item 2 refused"), "{err}");
     }
 
     /// A failed TERMINAL manifest write is the run's OUTCOME — never a success
