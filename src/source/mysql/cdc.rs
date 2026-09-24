@@ -44,6 +44,9 @@ type CachedTableMap = (
     Option<std::sync::Arc<[String]>>,
 );
 
+/// How long the server keeps the binlog dump open while rivet is busy flushing a roll to the store (the server default is 60 s).
+const DUMP_WRITE_TIMEOUT_SECS: u32 = 3600;
+
 pub(crate) struct MysqlChangeStream {
     stream: BinlogStream,
     /// TABLE_MAP cache: the event (Arc — rows-event decode borrows it) plus
@@ -625,6 +628,12 @@ impl MysqlChangeStream {
             .flatten()
             .flatten()
             .unwrap_or_default();
+        conn.query_drop(format!(
+            "SET SESSION net_write_timeout = {DUMP_WRITE_TIMEOUT_SECS}"
+        ))
+        .map_err(|e| {
+            anyhow::anyhow!("mysql cdc: raising net_write_timeout on the binlog connection: {e}")
+        })?;
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
@@ -2523,6 +2532,33 @@ mod tests {
         assert_eq!(binlog_file_ordinal("my.replica.000007"), Some(7));
         assert_eq!(binlog_file_ordinal("no-suffix"), None);
         assert_eq!(binlog_file_ordinal("binlog.notanum"), None);
+    }
+
+    /// The dump thread must outlive a long store flush: its session `net_write_timeout` is
+    /// rivet's, not the server's 60 s default that dropped a real run mid-flush.
+    #[test]
+    #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
+    fn the_binlog_dump_session_outlives_a_long_flush() {
+        let _stream =
+            MysqlChangeStream::open_from_current(URL, 4244, DrainMode::Continuous, None).unwrap();
+        // performance_schema is root-only on the stand; the stream itself runs as `rivet`.
+        let mut c =
+            Conn::new(Opts::from_url("mysql://root:rivet@127.0.0.1:3307/rivet").unwrap()).unwrap();
+        let seen: Option<u32> = c
+            .query_first(
+                "SELECT CAST(v.VARIABLE_VALUE AS UNSIGNED) \
+                 FROM performance_schema.threads t \
+                 JOIN performance_schema.variables_by_thread v USING (THREAD_ID) \
+                 WHERE t.PROCESSLIST_COMMAND LIKE 'Binlog Dump%' \
+                   AND v.VARIABLE_NAME = 'net_write_timeout' \
+                 ORDER BY t.THREAD_ID DESC LIMIT 1",
+            )
+            .unwrap();
+        assert_eq!(
+            seen,
+            Some(DUMP_WRITE_TIMEOUT_SECS),
+            "the dump thread runs on the server default, so a flush longer than it kills the stream"
+        );
     }
 
     #[test]
