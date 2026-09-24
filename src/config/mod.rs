@@ -1,3 +1,4 @@
+mod cdc;
 pub mod cursor;
 mod destination;
 mod export;
@@ -9,6 +10,7 @@ pub mod resolve;
 pub mod schema;
 mod source;
 
+pub use cdc::*;
 pub use cursor::IncrementalCursorMode;
 pub use destination::*;
 pub use export::*;
@@ -556,17 +558,6 @@ impl Config {
         Ok(())
     }
 
-    /// CDC stream resources are per-export and their **defaults collide**: two
-    /// PostgreSQL cdc exports without an explicit `slot:` both resolve to
-    /// `rivet_slot` — each export's ack advances `confirmed_flush_lsn` past
-    /// changes the *other* never read (mutual, silent data loss). Two MySQL
-    /// exports both default to `server_id: 4271` — the server kills the older
-    /// replica connection. A shared `checkpoint:` path makes exports overwrite
-    /// each other's resume position on any engine. All three are config bugs a
-    /// naive multi-table CDC config hits by default, so reject them at load, on
-    /// the RESOLVED values (defaults included). SQL Server `capture_instance`
-    /// sharing is deliberately allowed: the change-table poll is read-only and
-    /// resume state lives in the per-export checkpoint.
     /// `format: csv` × a `load:` block is REFUSED: the load path lists
     /// `*.parquet` only, so a CSV prefix resolves to zero URIs and the load
     /// prints "produced no files — nothing to load" and exits 0 — success-shaped,
@@ -588,137 +579,6 @@ impl Config {
                      report \"nothing to load\" and exit 0 while the CSV data sits \
                      unloaded forever. Use `format: parquet` for loaded exports, or \
                      drop the load block for this one.",
-                    e.name
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_cdc_resource_conflicts(&self) -> crate::error::Result<()> {
-        use std::collections::HashMap;
-
-        let mut slots: HashMap<String, &str> = HashMap::new();
-        let mut server_ids: HashMap<u32, &str> = HashMap::new();
-        // Keyed by the NORMALISED, case-folded path (see the insert below).
-        let mut checkpoints: HashMap<String, &str> = HashMap::new();
-
-        for e in self.exports.iter().filter(|e| e.mode == ExportMode::Cdc) {
-            let cdc = e.cdc.as_ref();
-            // ZERO is refused for both rollover knobs, the same guard chunk_size
-            // has. `0` is not "disable": `buf >= 0` is always true, so a zero
-            // budget rolls a part on EVERY committed transaction — a file
-            // explosion (one parquet + one PUT per txn), silently, while the
-            // operator who typed 0 meant "no cap". `None` is the documented way
-            // to get row-count-only; absence gets the protective default.
-            if let Some(c) = cdc {
-                if c.rollover == Some(0) {
-                    crate::config_bail!(
-                        crate::error::codes::CONFIG_CDC_ROLLOVER_INVALID,
-                        "export '{}': cdc.rollover must be >= 1 (got 0). A zero \
-                         rollover rolls a part on every committed transaction; \
-                         omit the field for the default (100000).",
-                        e.name
-                    );
-                }
-                if c.rollover_memory_mb == Some(0) {
-                    crate::config_bail!(
-                        crate::error::codes::CONFIG_CDC_ROLLOVER_INVALID,
-                        "export '{}': cdc.rollover_memory_mb must be >= 1 (got 0). \
-                         A zero byte budget rolls a part on every committed \
-                         transaction; omit the field for the default (256 MiB).",
-                        e.name
-                    );
-                }
-                // Checked at VALIDATION, where the error can name the field: the
-                // runtime multiply (`mb * 1024 * 1024`) wraps in release, and a
-                // wrapped budget of 0 is the file explosion above wearing a
-                // plausible-looking huge number.
-                if let Some(mb) = c.rollover_memory_mb
-                    && mb.checked_mul(1024 * 1024).is_none()
-                {
-                    crate::config_bail!(
-                        crate::error::codes::CONFIG_CDC_ROLLOVER_INVALID,
-                        "export '{}': cdc.rollover_memory_mb {} overflows a byte \
-                         count on this platform.",
-                        e.name,
-                        mb
-                    );
-                }
-            }
-            match self.source.source_type {
-                SourceType::Postgres => {
-                    let slot = cdc
-                        .and_then(|c| c.slot.clone())
-                        .unwrap_or_else(|| DEFAULT_PG_SLOT.to_string());
-                    if let Some(prev) = slots.insert(slot.clone(), &e.name) {
-                        crate::config_bail!(
-                            crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
-                            "exports '{prev}' and '{}': same PostgreSQL slot '{slot}' — a slot \
-                             has ONE consumer; each export's ack would advance it past changes \
-                             the other never read (silent data loss). Set a distinct `cdc.slot:` \
-                             per export (the default is '{DEFAULT_PG_SLOT}').",
-                            e.name
-                        );
-                    }
-                }
-                SourceType::Mysql => {
-                    let sid = cdc
-                        .and_then(|c| c.server_id)
-                        .unwrap_or(DEFAULT_MYSQL_SERVER_ID);
-                    if let Some(prev) = server_ids.insert(sid, &e.name) {
-                        crate::config_bail!(
-                            crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
-                            "exports '{prev}' and '{}': same MySQL server_id {sid} — the server \
-                             kills the older replica connection when a new one registers with \
-                             the same id. Set a distinct `cdc.server_id:` per export (the \
-                             default is {DEFAULT_MYSQL_SERVER_ID}).",
-                            e.name
-                        );
-                    }
-                }
-                SourceType::Mssql => {}
-                // MongoDB change streams watch the whole database — no per-export
-                // slot or server_id to collide. Two Mongo CDC exports sharing a
-                // `checkpoint:` path IS still a conflict, caught by the shared
-                // checkpoint check below.
-                SourceType::Mongo => {}
-            }
-            // RESOLVED, not the raw string — the function's own doc promises "on
-            // the RESOLVED values", and the runtime maps every relative path
-            // through the config dir (`resolve_checkpoint`), so `./cdc/x.ckpt`
-            // (init's own scaffold form) and `cdc/x.ckpt` are ONE file the raw
-            // comparison called two. With `parallel_exports` the miss became two
-            // streams acking one resume file concurrently; the next run resumed
-            // from whichever wrote last and silently skipped the other's span.
-            // Validation has no config-dir, so it NORMALISES both spellings the
-            // same way the resolver does (component-wise, `.` dropped) — equal
-            // normalised relatives resolve equal absolutely, whatever the dir.
-            if let Some(ckpt) = cdc.and_then(|c| c.checkpoint.as_deref())
-                && let Some(prev) = checkpoints.insert(
-                    // `components()` KEEPS a leading `./` (only interior dots are
-                    // normalised — measured: the first cut of this fix compared
-                    // `[CurDir, cdc, x]` with `[cdc, x]` and still called them
-                    // two), so CurDir is filtered explicitly. The resolver never
-                    // sees it either: `config_dir.join(p)` makes every dot
-                    // interior before ITS components() pass.
-                    // Case-folded as well: `Orders.ckpt` and `orders.ckpt` are ONE file
-                    // on macOS and Windows, and a config written on Linux is run there.
-                    std::path::Path::new(ckpt)
-                        .components()
-                        .filter(|c| !matches!(c, std::path::Component::CurDir))
-                        .collect::<std::path::PathBuf>()
-                        .to_string_lossy()
-                        .to_lowercase(),
-                    &e.name,
-                )
-            {
-                crate::config_bail!(
-                    crate::error::codes::CONFIG_CDC_RESOURCE_CONFLICT,
-                    "exports '{prev}' and '{}': same checkpoint path '{ckpt}' (compared \
-                     case-insensitively: on macOS and Windows two spellings are one file) — \
-                     each export must own its resume position or they overwrite each \
-                     other's. Set a distinct `cdc.checkpoint:` per export.",
                     e.name
                 );
             }
@@ -1431,97 +1291,7 @@ impl Config {
                 }
             }
             ExportMode::Full => {}
-            ExportMode::Cdc => {
-                match (&export.table, &export.tables) {
-                    (None, None) => anyhow::bail!(
-                        "export '{}': cdc mode requires `table:` (or `tables:` for a \
-                         multi-table stream)",
-                        export.name
-                    ),
-                    (Some(_), Some(_)) => anyhow::bail!(
-                        "export '{}': `table:` and `tables:` are mutually exclusive — \
-                         use `tables: [a, b]` for a multi-table stream",
-                        export.name
-                    ),
-                    (None, Some(ts)) => {
-                        if ts.is_empty() {
-                            anyhow::bail!(
-                                "export '{}': `tables:` must list at least one table",
-                                export.name
-                            );
-                        }
-                        let mut seen = std::collections::HashSet::new();
-                        for t in ts {
-                            if !seen.insert(t.as_str()) {
-                                anyhow::bail!(
-                                    "export '{}': duplicate table '{}' in `tables:`",
-                                    export.name,
-                                    t
-                                );
-                            }
-                        }
-                        // Two DISTINCT strings can still name one relation, and the
-                        // sink routes each event to the FIRST that matches — so the
-                        // loser's prefix collects a `_SUCCESS` and a `row_count: 0`
-                        // manifest on every run, which a downstream loader reads as
-                        // a healthy, complete, empty export rather than as a config
-                        // error (round-3B bughunt, DEMONSTRATED live on PostgreSQL:
-                        // three inserts, `status: success, rows: 3`, all three under
-                        // `bh_orders/` while `public.bh_orders/` published emptiness).
-                        // The distinct-string check above cannot see it.
-                        if self.source.source_type != SourceType::Mongo
-                            && let Some((a, b)) = overlapping_table_pair(ts)
-                        {
-                            anyhow::bail!(
-                                "export '{}': `tables:` lists both '{}' and '{}', which can name \
-                                 the SAME relation — a bare name matches any schema, so every \
-                                 event routes to whichever is listed first and the other \
-                                 publishes an empty, successful-looking export forever. Keep one \
-                                 spelling.",
-                                export.name,
-                                a,
-                                b
-                            );
-                        }
-                        // A streaming destination has no per-table sub-prefix to
-                        // extend — `dest_for_table`'s `Stdout` arm is a no-op while
-                        // the local and cloud arms both append `<table>/`. So every
-                        // captured table shares ONE stream: round-10 measured two
-                        // tables emitting two different CSV headers into one output,
-                        // which any reader downstream mixes silently. No manifest is
-                        // written for a streaming destination either, so the stream
-                        // is the only artifact and nothing records the interleave.
-                        if export.destination.destination_type == DestinationType::Stdout {
-                            anyhow::bail!(
-                                "export '{}': `tables:` cannot write to `destination: \
-                                 {{ type: stdout }}` — a stream has no per-table \
-                                 sub-prefix, so all {} tables would interleave into one \
-                                 output with their headers and column sets mixed. Use a \
-                                 local or cloud destination, or capture one table per \
-                                 export.",
-                                export.name,
-                                ts.len()
-                            );
-                        }
-                        if self.source.source_type == SourceType::Mssql {
-                            anyhow::bail!(
-                                "export '{}': `tables:` is not yet supported for SQL Server — \
-                                 its capture instances are per-table; use one cdc export per \
-                                 table (capture_instance each)",
-                                export.name
-                            );
-                        }
-                    }
-                    (Some(_), None) => {}
-                }
-                if export.query.is_some() || export.query_file.is_some() {
-                    anyhow::bail!(
-                        "export '{}': cdc mode reads the transaction log, not a query — \
-                         remove query/query_file and use `table:`",
-                        export.name
-                    );
-                }
-            }
+            ExportMode::Cdc => self.validate_export_cdc_mode(export)?,
         }
 
         Ok(())
@@ -1605,12 +1375,7 @@ impl Config {
             );
         }
 
-        if export.cdc.is_some() && export.mode != ExportMode::Cdc {
-            anyhow::bail!(
-                "export '{}': a `cdc:` block is only valid with `mode: cdc`",
-                export.name
-            );
-        }
+        self.validate_cdc_block_needs_cdc_mode(export)?;
         Ok(())
     }
 
@@ -1649,165 +1414,6 @@ impl Config {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// CDC baselines, checkpoints and resume anchors.
-    fn validate_export_cdc(&self, export: &ExportConfig) -> crate::error::Result<()> {
-        // A baseline (`initial: snapshot` or `backfill:`) writes each table's
-        // snapshot under the reserved sub-prefix `snapshot/` — a table actually
-        // NAMED "snapshot" would share a prefix with another table's marker.
-        if let Some(cdc) = &export.cdc
-            && cdc.has_baseline()
-        {
-            let clashes = |t: &str| t.rsplit('.').next().unwrap_or(t) == "snapshot";
-            if export.table.as_deref().is_some_and(clashes)
-                || export.tables.iter().flatten().any(|t| clashes(t))
-            {
-                anyhow::bail!(
-                    "export '{}': a table named 'snapshot' collides with the reserved \
-                     `snapshot/` sub-prefix that a baseline (`cdc.initial: snapshot` or \
-                     `cdc.backfill`) writes — rename the table or use a separate export \
-                     without a baseline",
-                    export.name
-                );
-            }
-        }
-
-        // `initial:` needs a durable anchor BEFORE anything reads. PostgreSQL
-        // pins server-side (the slot); MySQL / SQL Server have no server-side
-        // anchor, so the checkpoint file IS the anchor there. Stated against the
-        // MODE rather than only `snapshot` by name, so a future `initial:` mode
-        // inherits the requirement instead of silently deferring the failure to
-        // `ensure_anchor` — which demands a checkpoint on these engines for ANY
-        // mode, i.e. after the run has already started.
-        // One predicate for both baselines (`initial:` and `backfill:`).
-        if let Some(why) = export::baseline_checkpoint_refusal(export, self.source.source_type) {
-            anyhow::bail!(why);
-        }
-
-        // `cdc.backfill` is the other way to get a baseline, and it is the same
-        // step: anchor first, then read the table. Declaring both would run two
-        // baselines over one anchor — the synthesized `mode: full` leg AND the
-        // referenced export's — into one prefix, which is not a merge but a
-        // duplicate nobody asked for.
-        if let Some(cdc) = &export.cdc
-            && cdc.backfill.is_some()
-            && cdc.initial.is_some()
-        {
-            anyhow::bail!(
-                "export '{}': `cdc.initial:` and `cdc.backfill:` both describe the FIRST run's \
-                 baseline — keep one. `initial: snapshot` synthesizes a single-stream full scan; \
-                 `backfill:` borrows the read strategy of the batch export that already describes \
-                 the table (its key, workers, page size and resume).",
-                export.name
-            );
-        }
-
-        // The pairing itself, resolved by the ONE function the CDC job also calls,
-        // so a reference the run would reject cannot pass validation.
-        // (The checkpoint requirement is `baseline_checkpoint_refusal`, above.)
-        if let Some(cdc) = &export.cdc
-            && cdc.backfill.is_some()
-        {
-            let pairs = export::resolve_backfill(export, &self.exports)
-                .map_err(|why| anyhow::anyhow!(why))?;
-            // A document store has no schema qualifier: `audit.events` is a
-            // collection, not `events` in schema `audit`. The bare-name fold that
-            // pairs `orders` with `public.orders` on SQL would pair two DIFFERENT
-            // collections here — and turn the other one's export into a recipe the
-            // run loop stops running.
-            if !self.source.source_type.is_sql() {
-                for (captured, recipe) in &pairs {
-                    if recipe.table.as_deref() != Some(captured.as_str()) {
-                        anyhow::bail!(
-                            "export '{}': `cdc.backfill` paired collection '{captured}' with export \
-                             '{}', which reads '{}' — a MongoDB collection name is literal (a dot \
-                             is part of the name, not a schema), so the recipe must read exactly \
-                             `table: {captured}`",
-                            export.name,
-                            recipe.name,
-                            recipe.table.as_deref().unwrap_or("")
-                        );
-                    }
-                }
-            }
-            // The recipe's READ is validated here, not at the leg: `plan`/`check`
-            // skip a recipe, so its table shortcut and `columns:` were first parsed
-            // by the leg — after the anchor had been taken.
-            for (table, recipe) in &pairs {
-                if self.source.source_type.is_sql()
-                    && let Some(t) = recipe.table.as_deref()
-                {
-                    export::validate_table_shortcut_ident(&recipe.name, t)?;
-                }
-                crate::plan::build::parse_column_overrides_pub(&recipe.columns, &recipe.name)?;
-                // One column, one type across the recipe and the stream — decided
-                // here, for every pair, so a conflict added after the baseline
-                // refuses the next run at config load, not after its anchor.
-                export::refuse_backfill_type_conflict(export, table, recipe)?;
-            }
-            // A `table.column` type key is narrowed by LEAF, so two captured tables
-            // with one leaf cannot be typed apart: a recipe's `columns:` on either
-            // would type both. Refuse rather than let the later recipe win silently.
-            if let Some((a, b)) = export::same_leaf_typed_pair(&pairs) {
-                anyhow::bail!(
-                    "export '{}': captured tables '{a}' and '{b}' share the leaf name and a \
-                     recipe declares `columns:` — per-table column types are keyed \
-                     `table.column` by the bare name, so one declaration would type both. \
-                     Capture them in two `mode: cdc` exports, or drop the recipe's `columns:`.",
-                    export.name
-                );
-            }
-        }
-
-        // MongoDB change streams and the MySQL binlog have NO server-side resume
-        // anchor (unlike a PostgreSQL slot, or SQL Server's change table whose
-        // min-LSN floors a missing from-LSN into an over-read): the checkpoint
-        // file IS the anchor. Without it every run re-anchors at "now" and
-        // silently loses every change since the last one — so `mode: cdc` on
-        // these two requires `cdc.checkpoint:` ALWAYS, not only under
-        // `initial: snapshot`.
-        //
-        // MySQL was left out when this rule was first added for mongo, and the
-        // hole was total: `cdc.initial` absent skips the `initial.is_some()` rule
-        // above, and the run-time backstop that would catch it —
-        // `CdcEngine::ensure_anchor`, which demands a checkpoint for
-        // Mysql|Mssql|Mongo — is unreachable, because its only production caller
-        // sits inside `initial_snapshot_pending`, which returns early when
-        // `cdc.initial.is_none()`. Measured on a live stand: two runs with three
-        // changes between them captured ZERO events, both exiting 0. `rivet
-        // doctor` already prints the exact diagnosis, but `run` never invokes it.
-        if export.mode == ExportMode::Cdc
-            && matches!(
-                self.source.source_type,
-                SourceType::Mongo | SourceType::Mysql
-            )
-            && export
-                .cdc
-                .as_ref()
-                .and_then(|c| c.checkpoint.as_ref())
-                .is_none()
-        {
-            anyhow::bail!(
-                "export '{}': {:?} `mode: cdc` requires `cdc.checkpoint:` — this engine has \
-                 no server-side resume anchor, so without the checkpoint file each run \
-                 re-anchors at the current position and silently loses every change \
-                 between runs.",
-                export.name,
-                self.source.source_type
-            );
-        }
-
-        // (A `mode: cdc` refusal of DOTTED Mongo collection names lived here until
-        // round-3B. It was written when a dotted name really was dropped — the
-        // router split it into a bogus `schema.table` — and the ROUTER was fixed
-        // while the guard that existed because of the bug stayed, refusing a
-        // capture that works and telling operators to rename a production
-        // collection. Mongo's routing now has no split arm at all, so the string
-        // has one reading; see `a_mongo_dotted_name_never_splits_into_a_schema_
-        // qualifier` and `mongo_cdc_accepts_a_dotted_collection_name_because_the_
-        // router_addresses_it`.)
         Ok(())
     }
 
