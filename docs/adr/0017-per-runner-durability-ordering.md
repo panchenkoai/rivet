@@ -193,6 +193,25 @@ was conscious and addressable, not a hidden footgun.
 - The `StateStore::open` per chunk in `parallel_checkpoint` is a known
   performance smell, not fixed in this release.
 
+## Amendment 2026-09-24 — the drain is one module
+
+The four parallel runners (plain chunked, parallel checkpoint, parallel keyset,
+parallel Mongo) no longer write their own post-join drain. Workers publish parts,
+observations, committed checksums and failures to `pipeline::fan_in::FanIn`, and
+`FanIn::finish` drains them on the parent in one fixed order: governor log,
+observations, every durable part through `commit::record_part`, committed
+checksums, then the bail. The asymmetry this ADR keeps is now the `file_log`
+argument of `finish` — `None` where the worker already wrote file_log (parallel
+checkpoint; parallel keyset on a checkpoint run), `Some(state)` where the drain
+writes it (plain chunked, parallel Mongo, non-checkpoint keyset). The timing is
+unchanged; it is stated at one call site per runner instead of implied by a loop.
+
+Measured reason, not a refactor for its own sake: three of the four drains had
+already diverged — observations fed below the bail in both chunked runners (the
+ledger's contract is above it), inline copies of the governor guards in keyset,
+and a panicking Mongo worker handing back nothing it had written. Work
+distribution (spawner, pool, per-range) and the reads (ADR-0028) stay per runner.
+
 ## References
 
 - `src/pipeline/commit.rs` — the shared `record_part` body that runs
