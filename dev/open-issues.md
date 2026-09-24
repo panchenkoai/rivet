@@ -77,6 +77,15 @@ failed: MongoDB collection … does not exist`).
   of a collection that has never existed, and a typo is already warned by the stream.
 - **Not done:** it changes shipped behaviour — a product decision, not a test fix.
 
+### P8. `expiration_days` lets BigQuery drop loaded rows on arrival — by config, reported late
+`load.partition.expiration_days: N` becomes the table option `partition_expiration_days = N`
+(`src/load/bigquery/shape.rs`). BigQuery then deletes every partition older than N days
+— including partitions a load is filling right now with historical rows. rivet issues no
+DELETE; the retention does. The count validation catches it (`loaded 0 rows, expected
+200`) but blames nothing: "investigate before re-running". Open question for the owner:
+whether rivet should set warehouse-side retention at all, or refuse/warn before a load
+whose rows fall in partitions the table will expire.
+
 ### P5. A load whose statement landed but whose ledger row did not strands the table — pre-existing (on main)
 `live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job`
 cuts the state DB by a TIMER (1800 ms) mid `rivet load --pool`. Measured 2026-09-24:

@@ -834,9 +834,17 @@ fn bigquery_changelog_inherits_the_partition_rivet_gave_the_table() {
     assert_eq!(distinct_ids(&bq, &table), "35");
 }
 
+/// More hourly partitions than one BigQuery job may write (4,000) still LOAD: with
+/// the partition declared, the writer closes a part before it would touch more than
+/// the budget and the load batches parts by footer — so nothing is refused. (The
+/// by-name refusal is for a file written BEFORE the partition was declared; see
+/// `partition_budget.rs` and the warehouse-layout cells.)
+///
+/// Oracle: BigQuery's own `INFORMATION_SCHEMA.PARTITIONS` — 4,100 non-empty hourly
+/// partitions exist, which no single load job can have written.
 #[test]
 #[ignore = "live: requires docker compose up -d postgres + BigQuery creds"]
-fn bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load() {
+fn bigquery_hourly_partitions_over_the_job_cap_load_in_budgeted_batches() {
     let Some(bq) = BqLive::from_env("bq_part_cap") else {
         return;
     };
@@ -847,28 +855,29 @@ fn bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load() {
         "id INT NOT NULL PRIMARY KEY, ts TIMESTAMPTZ NOT NULL",
     );
     let _cleanup = bq.cleanup(&[&table]);
+    // One row per hour: the row count must not bound the occupied partitions below
+    // the cap, or the batching is never needed.
     e.exec(&format!(
-        "INSERT INTO {table} (id, ts) SELECT g, TIMESTAMPTZ '2026-01-01 10:00:00+00' + \
-         (g - 1) * INTERVAL '1 day' FROM generate_series(1, 200) g"
+        "INSERT INTO {table} (id, ts) SELECT g, TIMESTAMPTZ '2026-01-01 00:00:00+00' + \
+         (g - 1) * INTERVAL '1 hour' FROM generate_series(1, 4100) g"
     ));
     let rig = e
         .rig(&table)
         .dest_gcs_live(&bq.bucket, &bq.prefix)
-        .top_line(&partition_line(
-            &bq,
-            "{ column: ts, granularity: hour, expiration_days: 30 }",
-        ));
+        .top_line(&partition_line(&bq, "{ column: ts, granularity: hour }"));
     rig.run_ok();
-    let said = load_fails(&rig);
-    assert!(
-        said.contains("about 4777 hour partitions of `ts`"),
-        "the refusal counts the partitions:\n{said}"
+    load_ok(&rig);
+    assert_eq!(bq.read_bq_count(&table), "4100", "every row lands");
+    let parts = &bq.read_bq_rows(&format!(
+        "SELECT COUNT(*) AS n FROM `{}.{}`.INFORMATION_SCHEMA.PARTITIONS \
+         WHERE table_name = '{table}' AND total_rows > 0",
+        bq.project, bq.dataset
+    ))[0];
+    assert_eq!(
+        parts["n"].as_str(),
+        Some("4100"),
+        "4,100 hourly partitions — more than one job may write, so the load batched"
     );
-    assert!(
-        said.contains("use `granularity: day` (about 200)"),
-        "and names the granularity that fits:\n{said}"
-    );
-    assert_eq!(bq.read_bq_table_type(&table), None, "no job ran");
 }
 
 #[test]
