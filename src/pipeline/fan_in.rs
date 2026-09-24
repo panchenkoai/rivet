@@ -166,8 +166,12 @@ mod tests {
         let plan = test_plan();
         let mut summary = test_summary(&plan);
         let fan = FanIn::default();
+        let part = synthetic_parts(1).remove(0);
         std::thread::scope(|s| {
-            fan.spawn(s, "range 1".into(), || panic!("kaput"));
+            fan.spawn(s, "range 1".into(), || {
+                fan.part(UnitId::Chunk(1), part);
+                panic!("kaput")
+            });
             fan.spawn(s, "range 2".into(), || Ok(()));
         });
         assert_eq!(
@@ -179,6 +183,10 @@ mod tests {
             .finish(&plan, &mut summary, None, None, chunk_kind, bail)
             .unwrap_err();
         assert_eq!(err.to_string(), "failed: range 1: worker panicked: kaput");
+        assert_eq!(
+            summary.files_committed, 1,
+            "a part written before the panic is still counted"
+        );
     }
 
     #[test]

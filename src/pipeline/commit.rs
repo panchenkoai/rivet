@@ -144,16 +144,6 @@ pub(crate) struct UnitChecksums {
     pub(in crate::pipeline) key: Option<String>,
 }
 
-impl UnitChecksums {
-    /// Fold another sink's checksums into this unit (commutative; first key wins).
-    pub(in crate::pipeline) fn absorb(&mut self, other: UnitChecksums) {
-        accumulate_column_checksums(&mut self.sums, &other.sums);
-        if self.key.is_none() {
-            self.key = other.key;
-        }
-    }
-}
-
 /// ADR-0029 half 2 — the integrity record, which is only meaningful as a set
 /// covering EXACTLY the parts the manifest lists.
 ///

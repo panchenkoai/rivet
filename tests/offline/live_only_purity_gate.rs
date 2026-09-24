@@ -119,7 +119,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
         1,
         0,
-        1,
+        0,
         1,
     ),
     // `run_with_reconnect`'s row is GONE: its whole-function exclusion was lifted
