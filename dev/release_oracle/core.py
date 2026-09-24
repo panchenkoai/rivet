@@ -29,6 +29,8 @@ by comparing transcripts rather than by trust.
 
 from __future__ import annotations
 
+import functools
+
 import os
 import shutil
 import subprocess
@@ -446,3 +448,12 @@ def port_of(url: str) -> int | None:
 
     m = re.search(r":(\d+)(?:/|$)", url)
     return int(m.group(1)) if m else None
+
+
+@functools.cache
+def sqlcmd(container: str) -> tuple[str, ...]:
+    """sqlcmd for THIS SQL Server image: tools18 (2022, needs `-C`) or tools (2019, no `-C`)."""
+    for path, flags in (("/opt/mssql-tools18/bin/sqlcmd", ("-C",)), ("/opt/mssql-tools/bin/sqlcmd", ())):
+        if docker_exec(container, "test", "-x", path, timeout=20).ok:
+            return (path, *flags)
+    raise SystemExit(f"{container}: no sqlcmd at tools18 or tools — the image changed its layout")

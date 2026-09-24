@@ -60,6 +60,7 @@ try:  # imported as part of the package
         port_of,
         rivet,
         rivet_bin,
+        sqlcmd,
         wait_until,
     )
 except ImportError:  # run directly out of dev/release_oracle/
@@ -74,6 +75,7 @@ except ImportError:  # run directly out of dev/release_oracle/
         port_of,
         rivet,
         rivet_bin,
+        sqlcmd,
         wait_until,
     )
 
@@ -191,8 +193,9 @@ def _sqlcmd(url: str, *, q: str | None = None, sql: str | None = None) -> Proc:
     c = _container_for(url)
     if c is None:
         return _no_container(url)
-    tool = "/opt/mssql-tools18/bin/sqlcmd"
-    base = [tool, "-S", "localhost", "-U", "rivet", "-P", "rivet", "-C", "-d", "rivet", "-b"]
+    u = urllib.parse.urlsplit(url)
+    user, pw = urllib.parse.unquote(u.username or ""), urllib.parse.unquote(u.password or "")
+    base = [*sqlcmd(c), "-S", "localhost", "-U", user, "-P", pw, "-d", u.path.lstrip("/") or "rivet", "-b"]
     if q is not None:
         return docker_exec(c, *base, "-Q", q)
     return docker_exec(c, *base, stdin=sql)

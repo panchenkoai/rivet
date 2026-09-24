@@ -50,7 +50,7 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       port_of, release_bin_env, rivet, rivet_bin, run)
+                       port_of, release_bin_env, rivet, rivet_bin, run, sqlcmd)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
@@ -68,6 +68,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         rivet,
         rivet_bin,
         run,
+        sqlcmd,
     )
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
@@ -583,7 +584,7 @@ def source_query(engine: str, url: str, query: str) -> str:
     elif engine == "mysql":
         argv = ["mysql", "-urivet", "-privet", "rivet", "-N", "-e", query]
     elif engine == "mssql":
-        argv = ["/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa",
+        argv = [*sqlcmd(container), "-S", "localhost", "-U", "sa",
                 "-P", "Rivet_Passw0rd!", "-d", "rivet", "-h", "-1", "-W",
                 "-Q", f"SET NOCOUNT ON; {query}"]
     elif engine == "mongo":

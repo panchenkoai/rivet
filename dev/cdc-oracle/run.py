@@ -98,7 +98,7 @@ MSSQL_HOST_IN_NET = os.environ.get("CDC_ORACLE_MSSQL_HOST", "mssql-cdc")
 MSSQL_URL = os.environ.get("MSSQL_CDC_URL", "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet")
 MSSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MSSQL_CONTAINER", "rivet-mssql-cdc-1"),
               "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
-              "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-Q"]
+              "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-b", "-Q"]
 MONGO_HOST_IN_NET = os.environ.get("CDC_ORACLE_MONGO_HOST", "mongo80-cdc")
 MONGO_URL = os.environ.get("MONGO_CDC_URL", "mongodb://127.0.0.1:27208/rivet?replicaSet=rs0&directConnection=true")
 MONGO_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MONGO_CONTAINER", "stand-mongo80-cdc-1"),
@@ -117,7 +117,7 @@ def mssql(sql: str) -> str:
     # `== NULL` / `.isdigit()` readiness checks below read the trailer, not the value.
     r = subprocess.run(MSSQL_EXEC + [f"SET NOCOUNT ON; {sql}"], capture_output=True, text=True)
     if r.returncode != 0:
-        raise SystemExit(f"sqlcmd failed: {r.stderr.strip()}\n  sql: {sql}")
+        raise SystemExit(f"sqlcmd failed: {(r.stderr or r.stdout).strip()}\n  sql: {sql}")
     return r.stdout.strip()
 
 

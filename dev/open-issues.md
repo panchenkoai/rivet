@@ -6,7 +6,7 @@ re-checked against the code at `b9d58284`; line numbers are from that commit.
 
 ## Product (Rust)
 
-### P1. Chunked-sequential over-counts `total_rows` after a retried write — pre-existing
+### P1. Chunked-sequential over-counts `total_rows` after a retried write — pre-existing — **FIXED** (36cbd1e6; live seam test owed)
 `src/pipeline/chunked/exec.rs:116` adds `sink.total_rows` to `summary.total_rows`
 *before* `write_sink_parts` runs. If that write fails on the first non-empty chunk,
 `files_committed` is still 0, so `decide_export_retry` (`single.rs:129`) retries. The
@@ -21,7 +21,7 @@ attempt 2 adds its rows on top of attempt 1's orphaned count.
 - **Test:** transient upload error on chunk 1 (`RIVET_TEST_ERROR_AT`), assert
   `export_metrics.total_rows == manifest sum`.
 
-### P2. Resume rehydration makes a transient blip look like a duplicate-row risk — pre-existing
+### P2. Resume rehydration makes a transient blip look like a duplicate-row risk — pre-existing — **FIXED** (36cbd1e6; live seam test owed)
 `src/pipeline/chunked/resume_m8.rs:288` does `summary.files_committed += rehydrated`
 (keyset resume rehydrates the same way). `decide_export_retry` (`single.rs:189`) reads
 `files_committed > 0` as "this attempt wrote files, a retry would duplicate", so a
@@ -36,7 +36,7 @@ transient source error on a `--resume` before the first NEW part becomes
   connect; assert it retries. Observe the value at the seam (the metrics row), not a
   hand-fed decider input.
 
-### P3. A manifest deleted between list and stat fails the whole load — pre-existing, now reachable via the branch
+### P3. A manifest deleted between list and stat fails the whole load — pre-existing, now reachable via the branch — **FIXED** (36cbd1e6)
 `load::reconcile::fetch_manifests_keyed` (`src/load/reconcile.rs:78`) lists keys, then
 stats+reads each via `GcsStore::read_each_within`, whose `try_collect`
 (`src/destination/gcs.rs:140`) fails on the first error. `prepare_load` propagates it
@@ -51,7 +51,7 @@ back on the same error.
 - **Fix direction:** treat NotFound on a listed key as "vanished, skip it" inside
   `read_each_within`'s callers.
 
-### P4. `execute_resolved_plan` decides `skipped` inline — branch
+### P4. `execute_resolved_plan` decides `skipped` inline — branch — **FIXED** (36cbd1e6)
 `src/pipeline/job.rs:1268`: `if summary.status == "skipped" { summary.skip_reason = … }`
 sits in a live-only body whose whole-function mutation exclusion was lifted on the
 ground that every decision there is a named predicate. No offline test observes
@@ -94,18 +94,18 @@ streams → reference misses early changes → `DISAGREE (rivet-only)` → false
 - **Fix direction:** filter by the connector's appName/namespace, or a liveness probe
   like MySQL's (write a sentinel, wait until Debezium emits it).
 
-### H4. CDC differential MSSQL: `sqlcmd` without `-b` — pre-existing (NOCOUNT fixed on branch)
+### H4. CDC differential MSSQL: `sqlcmd` without `-b` — pre-existing (NOCOUNT fixed on branch) — **FIXED** (fix/open-issues-r3)
 `dev/cdc-oracle/run.py:99-101` `MSSQL_EXEC` has no `-b`, so sqlcmd exits 0 on a SQL error
 and the `returncode != 0` guard never fires (e.g. a failed `sp_cdc_enable_table`,
 22926). `SET NOCOUNT ON` was added in `9c20fd46`; `-b` was not.
 
-### H5. CDC e2e MSSQL shim logs in as `rivet`/`rivet` — pre-existing
+### H5. CDC e2e MSSQL shim logs in as `rivet`/`rivet` — pre-existing — **FIXED** (fix/open-issues-r3)
 `dev/release_oracle/cdc.py:195` uses `-U rivet -P rivet`; nothing in compose, `dev/stand`
 or seeds creates that login (every other harness client uses `sa`). Works only on a stand
 where it was created by hand; a fresh stand fails every MSSQL CDC cell as "source setup
 failed".
 
-### H6. `source_query` hardcodes mssql-tools18 — pre-existing
+### H6. `source_query` hardcodes mssql-tools18 — pre-existing — **FIXED** (fix/open-issues-r3)
 `dev/release_oracle/scenarios.py:586` builds `/opt/mssql-tools18/bin/sqlcmd -C …`;
 `__main__.sqlcmd_path` (`__main__.py:638`) already probes 2019's `/opt/mssql-tools`.
 Adding the 2019 row the matrix invites turns every source count into `""` → harness
@@ -123,3 +123,16 @@ so the next failure carries its evidence.
 The release-build-path phase runs lock sync, manifest-chef, schema guards and the
 cargo-chef planner; `docker build` runs only with `RIVET_ORACLE_DOCKER=1`. Run it before
 tagging.
+
+## Found while fixing (2026-09-24)
+
+- **P1/P2 share one root:** `run_with_reconnect` reset only `summary.ledger` per attempt,
+  so a retry after a resume would re-adopt its prior parts and declare them TWICE in
+  `manifest_parts`. The duplicate-guard bail of P2 was what kept that from shipping. The
+  fix resets the whole summary to its pre-attempt snapshot.
+- **H3 needs a live Debezium run:** the MySQL probe cannot be copied as-is — compare.py
+  excludes the probe by `$.source.table`, Mongo events carry `$.source.collection`, and
+  `ExtractNewDocumentState` may strip the source block from the body entirely.
+- **The current `mssql/server:2019-latest` image ships tools18** (verified on
+  `stand-mssql2019-batch-1`); the `/opt/mssql-tools` fallback only matters for older
+  2019 images, and was not exercised live.
