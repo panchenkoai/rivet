@@ -2012,7 +2012,8 @@ mod tests {
     #[test]
     fn a_keyset_incremental_run_waits_on_its_key_a_full_keyset_on_nothing() {
         use super::awaited_column;
-        use crate::plan::{ExtractionStrategy, KeysetPlan};
+        use crate::config::IncrementalCursorMode;
+        use crate::plan::{ExtractionStrategy, IncrementalCursorPlan, KeysetPlan};
         let keyset = |incremental| {
             ExtractionStrategy::Keyset(KeysetPlan {
                 key_column: "id".into(),
@@ -2022,6 +2023,17 @@ mod tests {
                 parallel: 1,
             })
         };
+        let incremental = ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        });
+        assert_eq!(
+            awaited_column(&incremental),
+            Some("updated_at"),
+            "the cursor it waited on"
+        );
         assert_eq!(awaited_column(&keyset(true)), Some("id"));
         assert_eq!(
             awaited_column(&keyset(false)),

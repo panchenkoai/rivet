@@ -1,9 +1,9 @@
 //! Shape-drift warn (`shape_drift_warn_factor`) on EVERY runner.
 //!
 //! Each case exports a table whose `payload` values are one byte wide, widens a
-//! single row in the LAST chunk / page / range to 200 bytes, and exports again:
-//! the second run must warn. The wide row is never in the first sink, so the
-//! warn proves the run-wide max is merged across every sink the runner used.
+//! single row in a MIDDLE chunk / page / range to 200 bytes, and exports again:
+//! the second run must warn. The wide row is in neither the first nor the last
+//! sink, so a runner that fed only one end of its run stays RED.
 
 use crate::common::*;
 use postgres::NoTls;
@@ -19,7 +19,7 @@ impl Drop for PgCleanup {
 
 const WARN: &str = "shape drift in column 'payload'";
 
-/// Run the export twice around a widening of the last row; return run 2's stderr.
+/// Run the export twice around a widening of a middle row; return run 2's stderr.
 fn pg_second_run_stderr(tag: &str, text_key: bool, mode: &str, lines: &[&str]) -> String {
     require_alive(LiveService::Postgres);
     let table = unique_name(tag);
@@ -33,7 +33,8 @@ fn pg_second_run_stderr(tag: &str, text_key: bool, mode: &str, lines: &[&str]) -
     } else {
         "g"
     };
-    let last = if text_key { "'k0020'" } else { "20" };
+    // Row 8: chunk 2 of 4 (size 5), page 3 of 7 (size 3) — never an end sink.
+    let middle = if text_key { "'k0008'" } else { "8" };
     let mut c = pg_connect();
     c.batch_execute(&format!(
         "CREATE TABLE {table} ({key}, payload TEXT NOT NULL);
@@ -58,7 +59,7 @@ fn pg_second_run_stderr(tag: &str, text_key: bool, mode: &str, lines: &[&str]) -
         String::from_utf8_lossy(&r1.stderr)
     );
     c.batch_execute(&format!(
-        "UPDATE {table} SET payload = repeat('x', 200) WHERE k = {last};"
+        "UPDATE {table} SET payload = repeat('x', 200) WHERE k = {middle};"
     ))
     .unwrap();
     let r2 = rig.run_args(&["--export", &export]);
@@ -70,7 +71,7 @@ fn pg_second_run_stderr(tag: &str, text_key: bool, mode: &str, lines: &[&str]) -
 fn assert_warns(runner: &str, stderr: &str) {
     assert!(
         stderr.contains(WARN),
-        "{runner}: a 200× growth of `payload` in the last sink must warn `{WARN}`; stderr:\n{stderr}"
+        "{runner}: a 200× growth of `payload` in a middle sink must warn `{WARN}`; stderr:\n{stderr}"
     );
 }
 
@@ -146,13 +147,14 @@ fn shape_drift_warns_on_the_mongo_parallel_runner() {
         .mongo("page_size: 1000")
         .export_line("parallel: 4");
     rig.run_ok();
-    m.upsert_set("bench", 3999, "wide", &"x".repeat(5000));
+    // _id 1500: the second of four worker ranges — neither end.
+    m.upsert_set("bench", 1500, "wide", &"x".repeat(5000));
     let r2 = rig.run_args(&[]);
     let stderr = String::from_utf8_lossy(&r2.stderr);
     assert!(r2.status.success(), "run 2 must succeed; stderr:\n{stderr}");
     assert!(
         stderr.contains("shape drift in column 'document'"),
-        "mongo-parallel: a 5000-byte document in the last worker's range must warn; stderr:\n{stderr}"
+        "mongo-parallel: a 5000-byte document in a middle worker's range must warn; stderr:\n{stderr}"
     );
     m.drop_database();
 }

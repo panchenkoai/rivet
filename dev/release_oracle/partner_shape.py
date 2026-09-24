@@ -247,6 +247,10 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
              "; ".join(f"{t}: live={live} flagged={gone} source={src} sum(id) bq={bs} src={ss} buffer_left={buf}"
                        for t, (live, gone, src, bs, ss, buf) in got2.items()))
     finally:
-        gcp.bq_delete_dataset(proj, dset)
-        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+        # The source teardown first: it drops a replication slot, and a cloud call
+        # below may raise — a leaked slot pins WAL on the stand.
         _cleanup(engine, url, slot)
+        try:
+            gcp.bq_delete_dataset(proj, dset)
+        finally:
+            gcp.gcs_delete_prefix(bucket, f"{pfx}/")

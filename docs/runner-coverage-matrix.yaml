@@ -235,7 +235,7 @@ scenarios:
     mongo_parallel: { na: "runs UNDER `ExtractionStrategy::Keyset` (single.rs: a Mongo keyset export with parallel > 1 fans _id-range workers), so it takes the Keyset arm of the same match — the cell to the left is the same code. A separate strategy variant would need its own `test` cell here." }
 
   - id: shape_drift_warn
-    what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Applied once at the finalize_export seam from the ledger's max-merged shape bytes; every runner feeds its sinks' bytes (Observations via take_observations / take_shape). Each test widens ONE row in the LAST chunk/page/range, so a runner that fed only its first sink stays RED."
+    what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Applied once at the finalize_export seam from the ledger's max-merged shape bytes; every runner feeds its sinks' bytes (Observations via take_observations / take_shape). Each test widens ONE row in a MIDDLE chunk/page/range, so a runner that fed only its first or only its last sink stays RED."
     single:         { test: shape_drift_warns_on_the_single_runner }
     chunked:        { test: shape_drift_warns_on_the_chunked_runner }
     chunked_checkpoint: { test: shape_drift_warns_on_the_checkpoint_runner }

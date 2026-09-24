@@ -1085,10 +1085,10 @@ mod tests {
             work_mem_fetch_cap(1_000_000, 1_000, 4 << 20, None),
             (2446, 1000, 1200)
         );
-        // A 1 MiB arrow budget clamps it to 1048 rows.
+        // A 2 MiB arrow budget clamps it to 2097 rows (2 so `*` and `+` differ).
         assert_eq!(
-            work_mem_fetch_cap(1_000_000, 1_000, 4 << 20, Some(1)).0,
-            1048
+            work_mem_fetch_cap(1_000_000, 1_000, 4 << 20, Some(2)).0,
+            2097
         );
         // Tiny rows floor the pg width at 64 B; a tiny work_mem floors the target at 100.
         assert_eq!(work_mem_fetch_cap(10, 10, 4 << 20, None).1, 1);

@@ -364,6 +364,13 @@ def _why(p) -> str:
     return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
+def _null_note(nn: int) -> str:
+    """The oracle detail for a per-column null profile: all-NULL columns, or that it could not be read."""
+    if nn < 0:
+        return " · null profile UNREADABLE"
+    return f" · ALLNULL {nn} cols" if nn else ""
+
+
 #: (engine, cell label, tag) → when the cell's previous stage ended; a stage's
 #: duration is the time since that mark.
 _STEP_MARK: dict[tuple[str, str, str], float] = {}
@@ -1007,10 +1014,9 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                 # just local (the GCS store is exactly where the real incident occurred).
                 prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
                 nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
-                n_null = max(0, nn)
-                _stage(led, cell, tag, "oracle", duck == want * mult and n_null == 0,
-                       f"duckdb={duck} source={want}x{mult}"
-                       + (f" · ALLNULL {n_null} cols" if n_null else ""))
+                # -1 is "could not measure": never read as "no all-NULL columns".
+                _stage(led, cell, tag, "oracle", duck == want * mult and nn == 0,
+                       f"duckdb={duck} source={want}x{mult}" + _null_note(nn))
         else:
             # A change stream is not the table: the count is of CHANGES. But the
             # change set here is the SHARED, DETERMINISTIC cdc.changes() — cdc.py's
@@ -1026,10 +1032,9 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
             # already pulled to work/pull_<store>.
             prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
             nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
-            n_null = max(0, nn)
-            _stage(led, cell, tag, "oracle", duck >= want and n_null == 0,
+            _stage(led, cell, tag, "oracle", duck >= want and nn == 0,
                    f"duckdb={duck} >= {want} deterministic changes (at-least-once floor)"
-                   + (f" · ALLNULL {n_null} cols" if n_null else ""))
+                   + _null_note(nn))
 
     # ── validate ─────────────────────────────────────────────────────────────
     p = rivet("validate", "-c", str(cfg), *cell.flags.get("validate", []),

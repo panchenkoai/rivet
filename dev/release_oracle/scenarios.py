@@ -50,7 +50,7 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       port_of, rivet, rivet_bin, run)
+                       port_of, release_bin_env, rivet, rivet_bin, run)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         docker_exec,
         have,
         port_of,
+        release_bin_env,
         rivet,
         rivet_bin,
         run,
@@ -1265,7 +1266,7 @@ def verify_state_migrations(led: Ledger) -> None:
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all",
          "-E", "test(state_parity_) or test(/pg_keyset_range_round_trips_and_commits$/)"],
-        env={"RIVET_BIN": str(rivet_bin()), "RIVET_TEST_STATE_URL": state_url},
+        env={**release_bin_env(), "RIVET_TEST_STATE_URL": state_url},
         timeout=NO_TIMEOUT,
     )
     transcript = fresh.out
@@ -1329,7 +1330,7 @@ def _drive_live_tests(
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", expr],
-        env={"RIVET_BIN": str(rivet_bin()), "RIVET_SKIP_LOG": str(skip_log)},
+        env={**release_bin_env(), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=3600,
     )
     log_path.write_text(res.out)
@@ -1699,7 +1700,7 @@ def verify_replica_read(led: Ledger) -> None:
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all",
          "-E", "test(/cdc_reads_changes_from_a_replica$/)"],
-        env={"RIVET_BIN": str(rivet_bin())},
+        env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
@@ -1795,7 +1796,7 @@ def _run_pool_module(
         # `$`-anchored form would match NONE of (measured on `state_parity_`).
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", f"test({test_filter})"],
-        env={"RIVET_BIN": str(rivet_bin())},
+        env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)

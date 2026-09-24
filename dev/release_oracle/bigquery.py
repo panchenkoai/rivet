@@ -721,10 +721,14 @@ def _bq_one_engine(
             verify_load_pool(led, proj=proj, dset=dset, bucket=bucket, work=work,
                              child=child, engine=engine, url=url)
 
-    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
-    if not keep:
-        gcp.bq_delete_dataset(proj, eng_dset)
-        docker("rm", "-fv", engine_container(engine, _TAG))
+    try:
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+        if not keep:
+            gcp.bq_delete_dataset(proj, eng_dset)
+    finally:
+        # The engine container goes even when a cloud cleanup raises.
+        if not keep:
+            docker("rm", "-fv", engine_container(engine, _TAG))
     return None
 
 

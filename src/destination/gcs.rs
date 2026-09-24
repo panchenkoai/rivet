@@ -28,6 +28,12 @@ fn dir_boundary(path: &str) -> String {
     }
 }
 
+/// Append one streamed chunk; `Some(len)` once the body has grown past `cap` (stop reading).
+fn push_within(buf: &mut Vec<u8>, chunk: &[u8], cap: u64) -> Option<u64> {
+    buf.extend_from_slice(chunk);
+    (buf.len() as u64 > cap).then_some(buf.len() as u64)
+}
+
 /// A blocking GCS handle for the load layer's one-off object ops — recursive
 /// list (manifests / parquet), read (manifest bytes), and recursive delete
 /// (source cleanup). Mirrors [`CloudDestination`]'s runtime + blocking wrap,
@@ -124,9 +130,8 @@ impl GcsStore {
                     let mut chunks = op.reader(p).await?.into_bytes_stream(..).await?;
                     let mut buf = Vec::with_capacity(size as usize);
                     while let Some(chunk) = chunks.try_next().await? {
-                        buf.extend_from_slice(&chunk);
-                        if buf.len() as u64 > cap {
-                            return parse(p, Err(buf.len() as u64));
+                        if let Some(over) = push_within(&mut buf, &chunk, cap) {
+                            return parse(p, Err(over));
                         }
                     }
                     parse(p, Ok(buf))
@@ -268,6 +273,26 @@ mod tests {
             .read_each_within(&[], 10, |_, b| Ok(b.is_ok()))
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// The streamed read's own cap — the guard for an object that grew between the stat
+    /// and the read (the stat branch is covered above). A revert to reading exactly the
+    /// stat's size cannot be exercised here: the fs backend cannot swap an object between
+    /// the two calls.
+    #[test]
+    fn a_body_that_grows_past_the_cap_while_streaming_is_refused() {
+        let mut buf = Vec::new();
+        assert_eq!(push_within(&mut buf, b"abc", 5), None);
+        assert_eq!(
+            push_within(&mut buf, b"de", 5),
+            None,
+            "exactly the cap still fits"
+        );
+        assert_eq!(
+            push_within(&mut buf, b"f", 5),
+            Some(6),
+            "one byte over is refused"
+        );
     }
 
     #[test]

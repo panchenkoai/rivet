@@ -391,7 +391,15 @@ def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:
 
 # ── the release binary under test ──────────────────────────────────────────────
 def rivet_bin() -> Path:
-    return Path(os.environ.get("RIVET_BIN", ROOT / "target" / "release" / "rivet"))
+    """$RIVET_BIN, else the release binary cargo builds — under $CARGO_TARGET_DIR when set."""
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
+    return Path(os.environ.get("RIVET_BIN", target / "release" / "rivet"))
+
+
+def release_bin_env() -> dict[str, str]:
+    """Env that makes a `cargo nextest` leg drive the gate's release binary: the Rust
+    tests resolve rivet from RIVET_BIN_OVERRIDE (tests/common/runner.rs), not RIVET_BIN."""
+    return {"RIVET_BIN": str(rivet_bin()), "RIVET_BIN_OVERRIDE": str(rivet_bin())}
 
 
 def rivet(*args: str, **kw) -> Proc:
