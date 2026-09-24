@@ -33,7 +33,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -391,7 +391,7 @@ struct TokenResponse {
 /// credential shapes — see [`AdcCredentials`].
 pub struct AdcUserTokenLoader {
     creds: AdcCredentials,
-    minted: Mutex<Option<MintedToken>>,
+    minted: Arc<Mutex<Option<MintedToken>>>,
 }
 
 struct MintedToken {
@@ -527,10 +527,28 @@ pub(crate) fn parse_token_response(data: &str) -> Result<(String, u64)> {
 /// (The name is frozen by the extension seam, not by the behaviour: it serves
 /// `service_account` key files too. See [`AdcUserTokenLoader`].)
 pub fn try_authorized_user_loader() -> Result<Option<AdcUserTokenLoader>> {
-    Ok(load_adc_credentials()?.map(|creds| AdcUserTokenLoader {
+    Ok(load_adc_credentials()?.map(loader_for))
+}
+
+/// A loader for these credentials, on the token cache every loader for the same identity shares.
+fn loader_for(creds: AdcCredentials) -> AdcUserTokenLoader {
+    AdcUserTokenLoader {
+        minted: shared_token_cache(creds.cache_key()),
         creds,
-        minted: Mutex::new(None),
-    }))
+    }
+}
+
+/// The one GCS token cache per identity in this process, so N stores (one per CDC table) mint once, not N times.
+fn shared_token_cache(key: String) -> Arc<Mutex<Option<MintedToken>>> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    type Caches = Mutex<HashMap<String, Arc<Mutex<Option<MintedToken>>>>>;
+    static CACHES: OnceLock<Caches> = OnceLock::new();
+    let mut caches = CACHES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("shared GCS token cache map poisoned");
+    Arc::clone(caches.entry(key).or_default())
 }
 
 /// Read the well-known ADC file and return the credentials it holds.
@@ -957,11 +975,45 @@ mod tests {
         assert!(!token_still_fresh(minted, 0, minted));
     }
 
+    /// A CDC run opens one store per table; the second loader for one identity must serve the
+    /// first one's token instead of minting again, and another identity must not see it.
+    #[test]
+    fn loaders_for_one_identity_share_the_minted_token() {
+        let first = loader_for(AdcCredentials::user_for_test(
+            "cid-share",
+            "csec",
+            "rtoken-share",
+        ));
+        let second = loader_for(AdcCredentials::user_for_test(
+            "cid-share",
+            "csec",
+            "rtoken-share",
+        ));
+        let stranger = loader_for(AdcCredentials::user_for_test(
+            "cid-share",
+            "csec",
+            "rtoken-other",
+        ));
+        *first.minted.lock().unwrap() = Some(MintedToken {
+            token: GoogleToken::new("tok", 3600, GCS_SCOPE),
+            minted_at: Instant::now(),
+            expires_in_secs: 3600,
+        });
+        assert!(
+            second.cached_token(Instant::now()).is_some(),
+            "same identity mints once"
+        );
+        assert!(
+            stranger.cached_token(Instant::now()).is_none(),
+            "another identity never borrows it"
+        );
+    }
+
     #[test]
     fn cached_token_serves_fresh_and_rejects_near_expiry() {
         let loader = AdcUserTokenLoader {
             creds: AdcCredentials::user_for_test("cid", "csec", "rtoken"),
-            minted: Mutex::new(None),
+            minted: Arc::new(Mutex::new(None)),
         };
         let now = Instant::now();
         assert!(loader.cached_token(now).is_none(), "empty cache mints");
@@ -1018,7 +1070,7 @@ mod tests {
     fn adc_loader_debug_never_leaks_secrets() {
         let loader = AdcUserTokenLoader {
             creds: AdcCredentials::user_for_test("cid", "SECRETVALUE", "RTOKENVALUE"),
-            minted: Mutex::new(None),
+            minted: Arc::new(Mutex::new(None)),
         };
         let dbg = format!("{loader:?}");
         assert!(!dbg.contains("SECRETVALUE"), "client_secret leaked: {dbg}");
@@ -1417,7 +1469,7 @@ qPSokX7fAC0Ku7S5xJe4XfPd
             "{:?}",
             AdcUserTokenLoader {
                 creds: sa_credentials_with_marked_key(),
-                minted: Mutex::new(None),
+                minted: Arc::new(Mutex::new(None)),
             }
         );
         let blocking = format!("{:?}", blocking_source(sa_credentials_with_marked_key()));
