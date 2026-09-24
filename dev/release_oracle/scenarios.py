@@ -1193,7 +1193,7 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     # Does the chain above have working oracles at all? Breaks each artifact
     # class and requires the matching stage to go RED — a green stage that was
     # never red is unverified, and this module's own first draft had one.
-    blessed_flow.sc_not_inert(led, engine, url, state_url)
+    blessed_flow.sc_not_inert(led, engine, url, state_url, tag)
 
 
 # ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────

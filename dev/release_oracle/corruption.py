@@ -493,11 +493,14 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
     out = work / "out"
     out.mkdir(parents=True, exist_ok=True)
     table = "public.recon_probe"
+    name = f"recon_probe_{tag.replace('.', '_')}"
     cfg = work / "recon.yaml"
     cfg.write_text(
         f"source:\n  type: postgres\n  url_env: ORACLE_URL\n"
         f"exports:\n"
-        f"  - name: recon_probe\n"
+        # Per version: concurrent versions share the Postgres state, where one export
+        # name is one lease — the second version's run was refused.
+        f"  - name: {name}\n"
         f"    table: {table}\n"
         f"    mode: chunked\n"
         f"    chunk_column: id\n"
@@ -522,7 +525,7 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
         return
 
     def rec() -> int:
-        return rivet("reconcile", "-c", str(cfg), "-e", "recon_probe", env=env, timeout=NO_TIMEOUT).returncode
+        return rivet("reconcile", "-c", str(cfg), "-e", name, env=env, timeout=NO_TIMEOUT).returncode
 
     def val() -> int:
         return rivet("validate", "-c", str(cfg), "--depth", "full", env=env, timeout=NO_TIMEOUT).returncode

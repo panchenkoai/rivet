@@ -1661,16 +1661,18 @@ def _bit(led: Ledger, engine: str, ok: bool, msg: str, why: str) -> None:
         led.failed(engine, "flow", "flow:inert", "local", f"inertness · {why}", why)
 
 
-def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str) -> None:
+def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str, tag: str = "live") -> None:
     """Break each artifact class and require the matching stage to go RED."""
     led.phase("blessed flow · inertness probe (each oracle must fail when its subject is broken)")
     cell = Cell(engine=engine, pipeline="batch", lifecycle="clean", store="local",
                 state="sqlite", flags=_flags_for(0, "batch", "clean", "local"))
-    work = scenarios.work_dir() / f"inert_{engine}"
+    # Per version: --version-parallel runs a family's versions at once, and a shared
+    # dir let two baselines write one prefix (duckdb=300000 over a 150000 source).
+    work = scenarios.work_dir() / f"inert_{engine}_{tag.replace('.', '_')}"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     base = Ledger()
-    _run_chain(base, cell, url, state_url, work, "")
+    _run_chain(base, cell, url, state_url, work, "", tag)
     if base.red:
         led.failed(engine, "flow", "flow:inert", "local",
                    "inertness probe · the baseline chain is not green — cannot grade sensitivity")

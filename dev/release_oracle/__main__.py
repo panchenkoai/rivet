@@ -226,16 +226,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "outcome this must never produce.",
     )
     ap.add_argument(
-        "--version-parallel", type=int, default=1,
+        "--version-parallel", type=int, default=8,
         help="how many VERSIONS of one engine family to run concurrently "
-        "(default 1 = the serial behaviour). The family's versions are the "
-        "matrix's critical path — postgres alone is 22.5 of the 23.2-minute "
-        "matrix wall, seven versions back to back. Each version owns its own "
-        "container name and port, so the ceiling is MEMORY, not collisions: "
-        "measured 2026-09-20, the Docker VM caps at 39.2 GiB with ~10.5 GiB "
-        "free, while every family at full version parallelism wants ~25 GiB. "
-        "Raise it per run, deliberately; the global --cell-parallel cap still "
-        "bounds what the extra containers can actually do at once.",
+        "(default 8 = every version the matrix lists; 1 = serial). Serial, mongo's "
+        "five versions were the whole matrix wall (13.6 min). Each version owns its "
+        "own container name, port, work dirs and export names, so the ceiling is "
+        "MEMORY: measured 2026-09-24, every family at once peaked at 30.5 of 40 GiB "
+        "in the Docker VM and the matrix took 4.2 min with no failed cell. Lower it "
+        "if Docker memory is tight.",
     )
     ap.add_argument(
         "--latest-only",
@@ -266,7 +264,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
     ap.add_argument(
-        "--cell-parallel", type=int, default=8,
+        "--cell-parallel", type=int, default=16,
         help="global cap on concurrent MATRIX CELLS (blessed_flow/blessed_path) across "
              "ALL engines. The matrix is I/O-bound (~62%% CPU idle at 4-way), so running "
              "its independent cells concurrently fills the idle cores; this bounds the "
