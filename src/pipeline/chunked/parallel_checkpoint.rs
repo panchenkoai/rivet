@@ -586,7 +586,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     summary.reconnects = summary
         .reconnects
         .saturating_add(agg_reconnects.load(Ordering::Relaxed));
-    pb_cp.finish(summary.total_rows);
     if plan.validate {
         summary.validated = Some(true);
     }
@@ -615,6 +614,8 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             super::super::commit::UnitId::Chunk(chunk_index),
         );
     }
+    // After the drain: record_part is what counts the rows.
+    pb_cp.finish(summary.total_rows);
 
     let errs = poison::into_recover(errors);
     if !errs.is_empty() {

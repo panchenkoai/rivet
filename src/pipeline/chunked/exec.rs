@@ -431,8 +431,6 @@ pub(crate) fn run_chunked_parallel(
         }
     });
 
-    pb.finish(summary.total_rows);
-
     // Drain governor decisions (recorded off-thread) into the run journal — BEFORE any error
     // check, so a failed run still journals its ParallelismAdjusted events.
     governor.drain_into(summary);
@@ -459,6 +457,8 @@ pub(crate) fn run_chunked_parallel(
             super::super::commit::UnitId::Chunk(chunk_index),
         );
     }
+    // After the drain: record_part is what counts the rows.
+    pb.finish(summary.total_rows);
 
     let errs = poison::into_recover(errors);
     if !errs.is_empty() {
