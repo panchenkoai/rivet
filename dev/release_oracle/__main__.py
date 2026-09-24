@@ -201,6 +201,17 @@ def _self_test() -> int:
     print(f"self-test ok: {len(_ENV_FLAG_TABLE)} spellings — argparse, env_flag and "
           "regression.without_prev_release_comparison() agree on every one")
 
+    # Two versions of the gate's matrix must never mint one name: every cell's dirs,
+    # prefixes and names come from `scenarios.Scope`, keyed on engine AND version.
+    grid = [(e, line.split()[0]) for e in matrix_cfg("engines").split()
+            for line in matrix_cfg("versions", e).splitlines() if line.split()]
+    scopes = [scenarios.Scope(e, t) for e, t in grid]
+    for mint in (lambda s: s.name("x", "t"), lambda s: str(s.dir("x", "t")),
+                 lambda s: s.prefix("x", "t")):
+        minted = [mint(s) for s in scopes]
+        assert len(set(minted)) == len(minted), f"two versions share a name: {minted}"
+    print(f"self-test ok: {len(scopes)} engine versions mint {len(scopes)} distinct names each way")
+
     # …and the regression module's own decisions about a child harness it cannot
     # run here: the SIGINT-first timeout, the grace period's grammar and where
     # its default comes from, the stand row when the container will not answer,
@@ -230,10 +241,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="how many VERSIONS of one engine family to run concurrently "
         "(default 8 = every version the matrix lists; 1 = serial). Serial, mongo's "
         "five versions were the whole matrix wall (13.6 min). Each version owns its "
-        "own container name, port, work dirs and export names, so the ceiling is "
-        "MEMORY: measured 2026-09-24, every family at once peaked at 30.5 of 40 GiB "
-        "in the Docker VM and the matrix took 4.2 min with no failed cell. Lower it "
-        "if Docker memory is tight.",
+        "own container name, port, work dirs and export names (`scenarios.Scope`), so the "
+        "ceiling is MEMORY: measured 2026-09-24 in the full gate, every family at once "
+        "peaked near 31 of 40 GiB in the Docker VM and the matrix took 5.9 min. Lower "
+        "it if Docker memory is tight.",
     )
     ap.add_argument(
         "--latest-only",

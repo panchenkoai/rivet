@@ -155,7 +155,7 @@ def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
     are two call sites of the same string, and a prefix that differs between
     them reads as "the export wrote nothing".
     """
-    return f"blessed/{scenarios.work_dir().name}/{engine}/{tag}/{table}/{scenario}"
+    return scenarios.Scope(engine, tag).prefix("blessed", table, scenario)
 
 
 def _duckdb_ok() -> bool:
@@ -351,7 +351,7 @@ def sc_blessed_path(
     The two are the same contract with hand-written SQL on each side, so the
     chain is walked on both rather than assumed transferable.
     """
-    work = scenarios.work_dir() / f"blessed_{engine}_{tag}_{table.replace('.','_')}_{scenario}_{store}_{'pg' if state_url else 'sq'}"
+    work = scenarios.Scope(engine, tag).dir("blessed", table, scenario, store, "pg" if state_url else "sq")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     dest_dir = work / "out"
@@ -677,16 +677,16 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # was right; the gate handed two concurrent processes one warehouse table. The
     # work dir and bucket prefix below already carried the tag; this did not.
     dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
-            + f"_{engine}_{tag.replace('.', '_')}")
+            + "_" + scenarios.Scope(engine, tag).key)
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",
                     f"{engine} {tag} · bigquery — no bq CLI or project", "no creds")
         return
 
-    work = scenarios.work_dir() / f"bq_{engine}_{tag}_{table}"
+    work = scenarios.Scope(engine, tag).dir("bq", table)
     work.mkdir(parents=True, exist_ok=True)
-    pfx = f"blessed/{engine}/{tag}/{table}"
+    pfx = scenarios.Scope(engine, tag).prefix("blessedbq", table)
     # `rivet load` derives the warehouse table from the `table:` field, NOT from
     # the export name — so this must be the source table's name or the verify
     # queries a table that was never created. It read `-1` (absent) while the

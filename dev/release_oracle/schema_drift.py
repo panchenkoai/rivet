@@ -29,10 +29,10 @@ from pathlib import Path
 
 try:
     from .core import Ledger, have, rivet, run
-    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
+    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, have, rivet, run  # type: ignore
-    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
+    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
 
 __all__ = ["verify_schema_fingerprint_moves_with_the_schema"]
 
@@ -78,7 +78,7 @@ def verify_schema_fingerprint_moves_with_the_schema(
         )
         return
 
-    work = work_dir() / f"sf_{tag.replace('.', '_')}"
+    work = Scope(engine, tag).dir("sf")
     out = work / "out"
     out.mkdir(parents=True, exist_ok=True)
     cfg = work / "sf.yaml"

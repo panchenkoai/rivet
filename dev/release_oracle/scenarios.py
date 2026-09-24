@@ -156,6 +156,26 @@ def work_dir() -> Path:
     return _WORK
 
 
+class Scope:
+    """One engine version's namespace: every dir, prefix and name a cell mints carries both."""
+
+    def __init__(self, engine: str, tag: str) -> None:
+        self.engine, self.tag = engine, tag
+        self.key = f"{engine}_{tag.replace('.', '_')}"
+
+    def name(self, kind: str, *parts: str) -> str:
+        """An identifier-safe name: `<kind>_<engine>_<tag>_<parts…>`."""
+        return "_".join((kind, self.key, *(p.replace(".", "_") for p in parts)))
+
+    def dir(self, kind: str, *parts: str) -> Path:
+        """This run's scratch dir for one cell."""
+        return work_dir() / self.name(kind, *parts)
+
+    def prefix(self, kind: str, *parts: str) -> str:
+        """An object-store prefix, unique per run as well as per version."""
+        return "/".join((kind, work_dir().name, self.key, *(p.replace(".", "_") for p in parts)))
+
+
 # ── ledger rows ──────────────────────────────────────────────────────────────
 # Print AND record in one call (the property `Ledger.passed/failed/skipped`
 # exists for — a ✓ without a row, or a row without a ✓, is how the bash's printed
@@ -187,10 +207,6 @@ def cfg(*query: str) -> str:
 
 def _bless(flag: str) -> bool:
     return os.environ.get(flag, "0") == "1"
-
-
-def _tag(tag: str) -> str:
-    return tag.replace(".", "_")
 
 
 def _tcp_open(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -843,7 +859,7 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
                       never exercises.
     """
     fails = ""
-    out = work_dir() / f"it_{engine}_{_tag(tag)}"
+    out = Scope(engine, tag).dir("it")
     out.mkdir(parents=True, exist_ok=True)
 
     # (1) users loss/dup — all engines.
@@ -964,7 +980,7 @@ def sc_keyset_parallel(led: Ledger, engine: str, tag: str, url: str) -> None:
             "mongo na",
         )
         return
-    out = work_dir() / f"kp_{engine}_{_tag(tag)}"
+    out = Scope(engine, tag).dir("kp")
     out.mkdir(parents=True, exist_ok=True)
     if not _export_local(engine, url, "users", out / "users", "chunked", "parquet", 4).ok:
         _failed(led, engine, tag, "keyset_parallel", "-", f"keyset_parallel[{engine}]: export failed", "export")
@@ -1013,12 +1029,12 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
     # prefix per run isolates this run so the count gate compares 150k to 150k,
     # not an accumulation.
     bucket = cfg("store", store, "bucket")
-    prefix = f"oracle/{work_dir().name}/{engine}_{_tag(tag)}/{store}"
+    prefix = Scope(engine, tag).prefix("oracle", store)
     dest = store_dest(store, bucket, prefix)
     if dest is None:
         _skipped(led, engine, tag, "load", store, f"{store}: no dest config", "no dest")
         return
-    yaml_path = work_dir() / f"load_{engine}_{_tag(tag)}_{store}.yaml"
+    yaml_path = Scope(engine, tag).dir("load", store).with_suffix(".yaml")
     tls_block = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
     mode_block = "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000"
     if engine == "mongo":

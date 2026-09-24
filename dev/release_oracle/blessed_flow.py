@@ -679,7 +679,7 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
     # prefix started using it, silently undid that fix by shadowing the
     # parameter. The gate caught the inert fix on the very next run.
     slug = f"{cell.pipeline}_{cell.lifecycle}_{cell.store}_{cell.state}"
-    work = scenarios.work_dir() / f"flow_{cell.engine}{tag}_{slug}_{cell.table}"
+    work = scenarios.Scope(cell.engine, tag).dir("flow", slug, cell.table)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
 
@@ -756,8 +756,7 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
     # prefix and the readback counted every earlier version's parts as this
     # one's: 450000 rows read from a 150000-row table (3x), then 750000 (5x) as
     # the run progressed. Caught by the gate itself on its first full pass.
-    prefix = (f"flow/{scenarios.work_dir().name}/{cell.engine}{tag}/{slug}/"
-              f"{cell.table.replace('.', '_')}")
+    prefix = scenarios.Scope(cell.engine, tag).prefix("flow", slug, cell.table)
     mark = 0
 
     cdc._export_store_creds()  # MINIO_/AZURITE_ keys the dest blocks name by *_env
@@ -1102,7 +1101,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
     dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
-            + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
+            + "_" + scenarios.Scope(cell.engine, tag).name("flow", _cell_slug))
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — the warehouse leg runs on the "
@@ -1125,7 +1124,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     tbl = cell.table.split(".")[-1]
     # Version-scoped for the same reason the readback prefix is: the gate runs
     # this once per gridded version and `cell.engine` does not distinguish them.
-    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{_cell_slug}/{tbl}"
+    pfx = scenarios.Scope(cell.engine, tag).prefix("flowload", cell.pipeline, _cell_slug, tbl)
     lcfg = work / "load.yaml"
     tls = "\n  tls: {accept_invalid_certs: true}" if cell.engine == "mssql" else ""
     lcfg.write_text(
@@ -1166,7 +1165,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # concurrently. `dset` and `pfx` in this same function were version-keyed for
     # exactly this reason; this one was missed.
     load_id = (
-        f"flow-{cell.engine}{tag.replace('.', '_')}-{cell.lifecycle}-{cell.state}"
+        f"flow-{scenarios.Scope(cell.engine, tag).key}-{cell.lifecycle}-{cell.state}"
         f"-{scenarios.work_dir().name}-{os.getpid()}"
     )
     # No `--rivet-bin`: the load resolves types IN PROCESS now (the flag existed
@@ -1684,7 +1683,7 @@ def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str, tag: str = 
                 state="sqlite", flags=_flags_for(0, "batch", "clean", "local"))
     # Per version: --version-parallel runs a family's versions at once, and a shared
     # dir let two baselines write one prefix (duckdb=300000 over a 150000 source).
-    work = scenarios.work_dir() / f"inert_{engine}_{tag.replace('.', '_')}"
+    work = scenarios.Scope(engine, tag).dir("inert")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     base = Ledger()
