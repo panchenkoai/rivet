@@ -127,6 +127,7 @@ pub(crate) fn run_chunked_sequential(
             // so a large chunked export pays ONE manifest GET, not one per chunk
             // (roast 2026-08-09). Satisfies the unguarded_callers_also_guard lint
             // because this file now opens a guarded frame at run start.
+            crate::test_hook::maybe_transient_once("chunk_write")?;
             let frame = crate::pipeline::frame::RunnerFrame::open_unguarded(plan)?;
             let base = super::chunk_part_filename(&plan.export_name, i, &frame.ext);
             let dest = frame.dest;

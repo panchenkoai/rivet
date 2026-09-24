@@ -1383,3 +1383,85 @@ fn chunked_resume_reexports_a_chunk_whose_part_was_deleted_between_attempts() {
         "a chunk deleted between attempts must be re-exported, never re-declared",
     );
 }
+
+/// P1: a chunk whose rows were counted but whose write failed transiently is retried,
+/// and the retry must not add those rows twice. Observed at the seam: the run's own
+/// `export_metrics.total_rows`, against the destination read by DuckDB.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_retried_chunk_write_does_not_count_its_rows_twice() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("p1_retry_count");
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .duckdb_oracle();
+    let out = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_TRANSIENT_ONCE", "chunk_write")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the retry must finish the export; stderr:\n{err}"
+    );
+    assert!(
+        err.contains("retry 1/"),
+        "the fixture must really retry; stderr:\n{err}"
+    );
+    rig.assert_complete("id", 150, "a retried chunk write delivers every row once");
+    assert_eq!(
+        latest_metric_total_rows(&rig.config_path(), &export),
+        Some(150),
+        "the run's reported total must equal what it delivered, not add the failed attempt"
+    );
+}
+
+/// P2: on a checkpoint resume, a transient error before the first NEW part is a retry,
+/// not a duplicate-guard stop — the parts it adopted were written by the crashed run.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_transient_error_after_resume_adopts_parts_is_retried_not_refused() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("p2_resume_retry");
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .duckdb_oracle();
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
+    assert!(!crash.status.success(), "the crash run must die");
+    let resume = rig.run_args_env(
+        &["--export", &export, "--resume"],
+        &[("RIVET_TEST_TRANSIENT_ONCE", "after_resume_adopt")],
+    );
+    let err = String::from_utf8_lossy(&resume.stderr);
+    assert!(
+        resume.status.success(),
+        "a transient blip after adopting parts must be retried; stderr:\n{err}"
+    );
+    assert!(
+        err.contains("retry 1/"),
+        "the fixture must really retry; stderr:\n{err}"
+    );
+    rig.assert_complete("id", 150, "resume + retry delivers every row exactly once");
+    let man: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        (man["part_count"].as_u64(), man["row_count"].as_i64()),
+        (Some(3), Some(150)),
+        "the retry must not declare the adopted part twice"
+    );
+}

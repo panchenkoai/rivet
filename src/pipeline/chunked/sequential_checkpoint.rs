@@ -303,6 +303,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         // so run_diagnosis emits "resumed a prior CRASHED run" — the field-log
         // crash signal, previously set only by the keyset runner.
         summary.resumed = stats.adopted_prior_work();
+        crate::test_hook::maybe_transient_once("after_resume_adopt")?;
     }
 
     let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);

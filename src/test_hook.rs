@@ -128,6 +128,21 @@ pub(crate) fn maybe_fail_at(point: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Return a retryable (`(temporary)`) `Err` the FIRST time `RIVET_TEST_TRANSIENT_ONCE`
+/// names `point` in this process, so a retry of the same export gets past it.
+pub(crate) fn maybe_transient_once(point: &str) -> crate::error::Result<()> {
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if std::env::var("RIVET_TEST_TRANSIENT_ONCE").is_ok_and(|p| p == point)
+        && !FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        anyhow::bail!(
+            "Unexpected (temporary) rivet test-hook: injected transient error at '{point}' \
+             (RIVET_TEST_TRANSIENT_ONCE)"
+        );
+    }
+    Ok(())
+}
+
 /// Return an `Err` if `RIVET_TEST_ERROR_AT` matches `"{point}:{index}"` — simulates a
 /// per-worker SQL error (connection drop / statement timeout) MID-RANGE, distinct from
 /// the hard-exit crash: the worker RETURNS an error (not process death), the parallel
