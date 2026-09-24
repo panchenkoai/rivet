@@ -10,7 +10,7 @@
 //! | Flag | Test |
 //! |------|------|
 //! | `--json` | `run_json_flag_prints_aggregate_summary_to_stdout` |
-//! | `--summary-output` | `run_summary_output_writes_json_to_file` |
+//! | `--summary-output` | `run_summary_output_writes_json_to_file`, `run_summary_output_creates_a_missing_parent_directory` |
 //! | `--param` (single) | `run_param_flag_substitutes_in_query` |
 //! | `--param` (multi) | `run_multi_param_substitutes_multiple_variables` |
 //! | `--reconcile` | `run_reconcile_flag_exits_zero_when_counts_match` |
@@ -222,6 +222,36 @@ fn run_summary_output_writes_json_to_file() {
         10,
         "destination must physically hold all 10 rows"
     );
+}
+
+/// A single-export run writes `--summary-output` into a directory that does not exist yet, like a multi-export run does.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn run_summary_output_creates_a_missing_parent_directory() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(3);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let rig = simple_rig(table.name(), out.path());
+    let summary_path = cfg_dir.path().join("not/yet/there/summary.json");
+
+    let result = rig.cli(&[
+        "run",
+        "--export",
+        table.name(),
+        "--summary-output",
+        summary_path.to_str().unwrap(),
+    ]);
+
+    assert!(
+        result.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let raw = std::fs::read_to_string(&summary_path).expect("summary file must be written");
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+    assert_eq!(json["success_count"].as_i64(), Some(1));
 }
 
 #[test]

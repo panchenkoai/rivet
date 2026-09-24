@@ -1028,6 +1028,29 @@ fn should_reconcile(allow_reconcile: bool, plan_reconcile: bool, failed: bool) -
 /// `!rejected.is_empty()` gate sits in the live-only `run_export_job` body and
 /// its `!` survived the in-diff mutation gate — dropping it inverts the verdict,
 /// so a clean plan would be refused and a rejected one would RUN.
+/// Log every plan diagnostic and return the refusal naming ALL rejections, if any.
+fn log_plan_diagnostics(
+    export_name: &str,
+    diags: &[crate::plan::validate::Diagnostic],
+) -> Option<anyhow::Error> {
+    let mut rejected: Vec<String> = Vec::new();
+    for d in diags {
+        match d.level {
+            DiagnosticLevel::Rejected => {
+                log::error!("[{}] plan validation rejected: {}", d.rule, d.message);
+                rejected.push(d.message.clone());
+            }
+            DiagnosticLevel::Warning => {
+                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
+            }
+            DiagnosticLevel::Degraded => {
+                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
+            }
+        }
+    }
+    plan_rejection_error(export_name, &rejected)
+}
+
 fn plan_rejection_error(export_name: &str, rejected: &[String]) -> Option<anyhow::Error> {
     if rejected.is_empty() {
         return None;
@@ -1576,22 +1599,7 @@ fn run_export_job_inner(
     };
 
     let diags = validate_plan(&plan);
-    let mut rejected: Vec<String> = Vec::new();
-    for d in &diags {
-        match d.level {
-            DiagnosticLevel::Rejected => {
-                log::error!("[{}] plan validation rejected: {}", d.rule, d.message);
-                rejected.push(d.message.clone());
-            }
-            DiagnosticLevel::Warning => {
-                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
-            }
-            DiagnosticLevel::Degraded => {
-                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
-            }
-        }
-    }
-    if let Some(err) = plan_rejection_error(&plan.export_name, &rejected) {
+    if let Some(err) = log_plan_diagnostics(&plan.export_name, &diags) {
         let summary = synthetic_failed_summary(&export.name, &err);
         return (Err(err), summary);
     }
@@ -1701,28 +1709,9 @@ pub(crate) fn run_export_job_with_chunk_source(
     record_load_spec: bool,
 ) -> (Result<()>, RunSummary) {
     // Re-validate the plan from the artifact (fast, no DB queries).
-    let diags = validate_plan(plan);
-    for d in &diags {
-        match d.level {
-            DiagnosticLevel::Rejected => {
-                // A refusal BEFORE any work: the caller still gets a summary, so
-                // the run has one shape whatever it did (the same contract
-                // `run_export_job` keeps for its own early bails).
-                let err = anyhow::anyhow!(
-                    "export '{}': plan validation rejected: {}",
-                    plan.export_name,
-                    d.message
-                );
-                let summary = synthetic_failed_summary(&plan.export_name, &err);
-                return (Err(err), summary);
-            }
-            DiagnosticLevel::Warning => {
-                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
-            }
-            DiagnosticLevel::Degraded => {
-                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
-            }
-        }
+    if let Some(err) = log_plan_diagnostics(&plan.export_name, &validate_plan(plan)) {
+        let summary = synthetic_failed_summary(&plan.export_name, &err);
+        return (Err(err), summary);
     }
 
     log::info!(

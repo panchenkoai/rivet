@@ -90,6 +90,53 @@ pub(crate) fn multi_export_concurrent() -> bool {
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
 }
 
+/// Swaps the render flags in for one run and restores the previous values on drop, panic included.
+struct RenderFlags(bool, bool);
+
+impl RenderFlags {
+    /// Set `multi` and, when given, `concurrent`; the guard puts both back.
+    fn set(multi: bool, concurrent: Option<bool>) -> Self {
+        let prev_multi = MULTI_EXPORT_MODE.swap(multi, AtomicOrdering::Relaxed);
+        let prev_concurrent = match concurrent {
+            Some(c) => MULTI_EXPORT_CONCURRENT.swap(c, AtomicOrdering::Relaxed),
+            None => MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed),
+        };
+        Self(prev_multi, prev_concurrent)
+    }
+}
+
+impl Drop for RenderFlags {
+    fn drop(&mut self) {
+        MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
+        MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// The in-process card UI: installs the ipc sender and runs `parent_ui` until dropped, panic included.
+struct CardUi(Option<std::thread::JoinHandle<()>>);
+
+impl CardUi {
+    /// Install the sender and spawn the UI thread.
+    fn start(name_floor: usize, n_cards: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
+        ipc::install_in_process_tx(tx);
+        let thread = std::thread::Builder::new()
+            .name("rivet-ui".to_string())
+            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
+            .ok();
+        Self(thread)
+    }
+}
+
+impl Drop for CardUi {
+    fn drop(&mut self) {
+        ipc::clear_in_process_tx();
+        if let Some(t) = self.0.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 fn print_json_summary(agg: &crate::state::RunAggregate) {
     match serde_json::to_string_pretty(agg) {
         Ok(json) => println!("{json}"),
@@ -568,16 +615,7 @@ pub fn run(
     // so subsequent invocations within the same process (tests, library
     // callers) start with a clean slate.
     let multi_export = export_name.is_none() && exports.len() > 1;
-    let prev_multi = MULTI_EXPORT_MODE.swap(multi_export, AtomicOrdering::Relaxed);
-    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(run_parallel, AtomicOrdering::Relaxed);
-    struct ResetMultiExport(bool, bool);
-    impl Drop for ResetMultiExport {
-        fn drop(&mut self) {
-            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
-            MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
-        }
-    }
-    let _reset_multi = ResetMultiExport(prev_multi, prev_concurrent);
+    let _render_flags = RenderFlags::set(multi_export, Some(run_parallel));
 
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(exports.len());
     // Keep the typed `anyhow::Error`s (not flattened strings) so the final bail
@@ -616,12 +654,7 @@ pub fn run(
             ));
         }
         let n_cards = exports.len();
-        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
-        ipc::install_in_process_tx(tx);
-        let ui_thread = std::thread::Builder::new()
-            .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
-            .ok();
+        let card_ui = CardUi::start(name_floor, n_cards);
 
         // In-process concurrency sets MULTI_EXPORT_CONCURRENT, so every export's
         // DIAGNOSIS hedges and points at the run-level harm line — emit it here
@@ -666,10 +699,7 @@ pub fn run(
         // card stack to scrollback).  Joining is best-effort: even if the
         // UI thread is wedged we still want to print the run aggregate
         // below.
-        ipc::clear_in_process_tx();
-        if let Some(t) = ui_thread {
-            let _ = t.join();
-        }
+        drop(card_ui);
         // Stamp the window BEFORE the bracket close queries the source, so the
         // aggregate's duration excludes the instrumentation round-trip.
         window_end = Some(chrono::Utc::now());
@@ -691,12 +721,7 @@ pub fn run(
         // attended bit is unset; `run_ui` already falls back to linear
         // mode for piped stderr.
         let n_cards = exports.len();
-        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
-        ipc::install_in_process_tx(tx);
-        let ui_thread = std::thread::Builder::new()
-            .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
-            .ok();
+        let card_ui = CardUi::start(name_floor, n_cards);
 
         for export in &exports {
             let (res, summary) =
@@ -707,10 +732,7 @@ pub fn run(
             summaries.push(summary);
         }
 
-        ipc::clear_in_process_tx();
-        if let Some(t) = ui_thread {
-            let _ = t.join();
-        }
+        drop(card_ui);
         // Single-export sequential runs still emit the detailed block after
         // the card commits to scrollback.
         if exports.len() == 1
@@ -783,8 +805,7 @@ pub fn run(
         // stdout — honour both without polluting the DB or stderr (the
         // multi-export path writes the file through `persist` above).
         if let Some(out) = summary_output
-            && let Err(e) =
-                std::fs::write(out, serde_json::to_string_pretty(&agg).unwrap_or_default())
+            && let Err(e) = aggregate::write_json(out, &agg)
         {
             log::warn!(
                 "aggregate: failed to write summary JSON to {}: {:#}",
@@ -854,14 +875,7 @@ pub(crate) fn run_waves(
     // (subprocess) path renders the parent card stack itself and each child sees
     // `exports.len() == 1`, so the flag must stay clear there — matching `run`'s
     // parallel-processes branch.
-    let prev_multi = MULTI_EXPORT_MODE.swap(total > 1 && !parallel, AtomicOrdering::Relaxed);
-    struct ResetMulti(bool);
-    impl Drop for ResetMulti {
-        fn drop(&mut self) {
-            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
-        }
-    }
-    let _reset = ResetMulti(prev_multi);
+    let _render_flags = RenderFlags::set(total > 1 && !parallel, None);
 
     let state = StateStore::open(config_path)?;
     // `apply --parallel` re-execs children with ENV_CONCURRENT_SIBLINGS, so each
@@ -2103,7 +2117,6 @@ pub(crate) fn run_pool(
         .map(|e| e.name.chars().count())
         .max()
         .unwrap_or(0);
-    let prev_multi = MULTI_EXPORT_MODE.swap(false, AtomicOrdering::Relaxed);
     // The pool runs up to `m` exports on concurrent in-process threads:
     // declare that, so (a) per-export indicatif chunk bars stay suppressed
     // (concurrent threads corrupt each other's terminal writes — same reason
@@ -2123,34 +2136,8 @@ pub(crate) fn run_pool(
     // bughunt). Counted once, here, and read by all three surfaces.
     let (safe_pending, heavy_pending) = pool_safe_heavy_split(&pending);
     let really_concurrent = pool_is_concurrent(m, safe_pending, heavy_pending);
-    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(really_concurrent, AtomicOrdering::Relaxed);
-    struct ResetPoolStatics(bool, bool);
-    impl Drop for ResetPoolStatics {
-        fn drop(&mut self) {
-            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
-            MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
-        }
-    }
-    let _reset_pool_statics = ResetPoolStatics(prev_multi, prev_concurrent);
-    // The ipc sender gets the same panic-safety: a worker panic re-raised by
-    // `thread::scope` would otherwise skip the straight-line clear below and
-    // leak a stale global Sender for the rest of the process (bughunt
-    // 2026-08-13). clear is idempotent, so the guard + the normal-path clear
-    // coexist harmlessly.
-    struct ClearIpcTx;
-    impl Drop for ClearIpcTx {
-        fn drop(&mut self) {
-            ipc::clear_in_process_tx();
-        }
-    }
-    let _clear_ipc = ClearIpcTx;
-    let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
-    ipc::install_in_process_tx(tx);
-    let n_cards = pending.len();
-    let ui_thread = std::thread::Builder::new()
-        .name("rivet-ui".to_string())
-        .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
-        .ok();
+    let _render_flags = RenderFlags::set(false, Some(really_concurrent));
+    let card_ui = CardUi::start(name_floor, pending.len());
 
     // Run-level source-harm bracket: the per-export deltas overlap in time
     // under pool concurrency (each reads the same server-global counters over
@@ -2268,10 +2255,7 @@ pub(crate) fn run_pool(
     // model would grade itself against its own measurement cost (bughunt
     // 2026-08-13). Taken here, right after the export loop drains.
     let finished_at = chrono::Utc::now();
-    ipc::clear_in_process_tx();
-    if let Some(h) = ui_thread {
-        let _ = h.join();
-    }
+    drop(card_ui);
     // The run-level harm verdict the per-export DIAGNOSIS lines point at:
     // spills during the pool window are REAL harm to the source (disk-spilling
     // tmp tables, PG temp files) whoever triggered them — WARN so it is visible
@@ -2442,6 +2426,30 @@ fn first_name_collision<'a>(
         .iter()
         .find(|u| existing.iter().any(|e| e.name == u.name))
         .map(|u| u.name.as_str())
+}
+
+#[cfg(test)]
+mod render_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_under_the_card_ui_clears_the_sender_and_restores_the_flags() {
+        let unwound = std::panic::catch_unwind(|| {
+            let _flags = RenderFlags::set(true, Some(true));
+            let _ui = CardUi::start(0, 0);
+            assert!(ipc::IN_PROCESS_TX.lock().unwrap().is_some());
+            panic!("a worker panicked");
+        });
+        assert!(unwound.is_err());
+        assert!(
+            ipc::IN_PROCESS_TX
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+        assert!(!multi_export_mode());
+        assert!(!MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed));
+    }
 }
 
 #[cfg(test)]
