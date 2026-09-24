@@ -20,6 +20,7 @@ pub mod cdc;
 pub mod compact;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
+mod pin;
 pub mod plan;
 pub(crate) mod pool;
 pub mod reconcile;

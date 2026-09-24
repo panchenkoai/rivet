@@ -176,7 +176,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // append_done_line / full_done_line), and the mode router was made
     // exhaustive so its arm-deletion mutants stop compiling. The staged-prefix
     // predicates (ledger_says_active, prefix_is_active, cleanup_verdict) have
-    // since moved with their guards into src/load/staging.rs.
+    // since moved with their guards into src/load/staging.rs, and the other two
+    // excluded bodies with their commands: `run_compacts` into src/load/compact.rs,
+    // `pin_plan_to_its_run` into src/load/pin.rs — both clean, so no row either.
     //
     // `prepare_load`'s two remaining `&&` are LET-CHAINS (`if let Some(s) =
     // state && let Some((_, m)) = keyed.first()`), not boolean decisions: the

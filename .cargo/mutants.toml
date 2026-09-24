@@ -608,7 +608,7 @@ exclude_re = [
     # never closes a transaction and the arm deletion captures no rows (full cycle).
     "replace MysqlChangeStream::close_transaction_at -> bool",
     "delete match arm Some\\(EventData::RowsEvent\\(re\\)\\) in MysqlChangeStream::fill",
-    # `pin_plan_to_its_run` (load/orchestrate.rs) lists a real store's manifests
+    # `pin_plan_to_its_run` (load/pin.rs) lists a real store's manifests
     # and reads the state DB; the decision it feeds — rebuilding the plan from one
     # run's spec — is `retype_plan` (unit-tested). Stubbed to `Ok(plan.clone())` it
     # is the pre-fix behaviour. Live:
@@ -624,7 +624,7 @@ exclude_re = [
     # their body stubs are born MISSED for the documented reason above. Their
     # decisions are named predicates next door, each unit-tested: `is_baseline_leg`
     # (RED against the name-based classifier that overwrote the base with a delta),
-    # `buffer_uris`, `base_done_line`; `run_compacts` decides through the loader's
+    # `buffer_uris`, `base_done_line`; `run_compacts` (load/compact.rs) decides through the loader's
     # `compact_*_sql` builders (unit-tested) and `lease_busy_message`. Live:
     # tests/live/live_cdc_compact.rs (both cells) and the `warehouse_layout` gate cell.
     "replace load_one_cdc_base ->",

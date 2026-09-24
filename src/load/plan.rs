@@ -419,7 +419,7 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
     let (reports, keys) = crate::preflight::load_type_reports(&cfg, &state, target)?;
 
     // Deferred: this plan is typed from the BY-NAME spec, which the load then pins
-    // to the run it consumes (`orchestrate::pin_plan_to_its_run`) — a same-named
+    // to the run it consumes (`pin::pin_plan_to_its_run`) — a same-named
     // export of another config may have written that row, and its columns are not
     // this table's. The fit is checked strictly after the pin, or by
     // `check_spec_fit` when no pin is possible.

@@ -4,9 +4,10 @@ use crate::error::Result;
 use crate::load;
 use crate::load::orchestrate::{
     failures_of, hand_off_state, ledger_load_id, ledger_status, needs_source_engine,
-    no_outcome_error, open_state, ownership_of, pin_plan_to_its_run, reconnect, require_pk,
-    resolve_run_id, take_table_lease,
+    no_outcome_error, open_state, ownership_of, reconnect, require_pk, resolve_run_id,
+    take_table_lease,
 };
+use crate::load::pin::pin_plan_to_its_run;
 use crate::load::{ObjectKind, Ownership};
 use crate::state::{LoadRecord, StateStore};
 use anyhow::Context as _;
