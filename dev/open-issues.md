@@ -78,10 +78,18 @@ Second defect in the same test: a wall-clock kill point is calibrated to one bui
 speed (1800 ms vacuous on main, 2800 ms vacuous again) — drive the cut from a fault hook
 at "statement done, ledger row not yet written", not a timer.
 
-### P6. Failing on main AND the branch, same environment, isolated — pre-existing, not triaged
+### P6. Failing on main AND the branch, same environment, isolated — pre-existing
 Run 18-at-a-time-4 on both c6da13c5 and this branch; identical outcome:
 `full_cdc_cycle_{postgres,mysql,mssql,mongo}` and `partner_shape_three_tables_one_stream_
-{mysql,postgres}` (run 2 appends 10 rows where 5 changed — or live state 5 vs 7),
+{mysql,postgres}` — **FIXED, stale tests, not a product defect**: "left 5, right 10" was
+5 rows MISSING from the expectation, not 5 extra. The tests modelled the pre-0.27 layout
+(`__changes` accumulates baseline + delta, a view gives live state, no compact), while a
+`backfill:` stream runs base + buffer: the buffer holds only the delta and live state is
+the base after `rivet compact` (docs/cdc-full-cycle.md §4). Rewritten to the doc: compact
+after every load, the delta asserted in the buffer, live state on the base; all six
+green; RED-proven with the compact script's DROP removed. The doc's §5/§6 still said
+"the view" and were corrected too.
+Still open from the same run:
 `mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling` and two
 `live_mongo::*_empty_first_run_then_populated` (the missing-collection refusal fires on
 the empty first run the tests expect to succeed), `bigquery_hourly_partitions_over_the_
