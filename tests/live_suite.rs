@@ -173,6 +173,8 @@ mod live_mysql_retry_and_faults;
 mod live_mysql_schema_drift;
 #[path = "live/live_oltp_load.rs"]
 mod live_oltp_load;
+#[path = "live/live_oracle.rs"]
+mod live_oracle;
 #[path = "live/live_parallel_ux.rs"]
 mod live_parallel_ux;
 #[path = "live/live_parquet_roundtrip.rs"]

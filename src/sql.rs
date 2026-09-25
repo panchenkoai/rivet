@@ -31,12 +31,33 @@ pub(crate) fn quote_ident(source_type: SourceType, name: &str) -> String {
         SourceType::Mysql => format!("`{}`", name.replace('`', "``")),
         // SQL Server bracket-quoting: `[col]`; internal `]` doubled (`[a]]b]`).
         SourceType::Mssql => format!("[{}]", name.replace(']', "]]")),
+        // Oracle: double-quoted and therefore case-SENSITIVE — the name is used as the
+        // catalog stores it (unquoted DDL names fold to upper case).
+        SourceType::Oracle => format!("\"{}\"", name.replace('"', "\"\"")),
         // MongoDB has no SQL identifier dialect. Every SQL builder is guarded by
         // full-mode-only validation, so this arm is unreachable — panic loudly
         // if a future path ever routes a Mongo source through SQL.
         SourceType::Mongo => unreachable!(
             "quote_ident: MongoDB has no SQL dialect (guarded by full-mode-only validation)"
         ),
+    }
+}
+
+/// A derived table's alias as referenced (`_rivet.col`); Oracle needs it quoted,
+/// since an unquoted identifier may not start with `_`.
+pub(crate) fn alias(source_type: SourceType, name: &str) -> String {
+    match source_type {
+        SourceType::Oracle => format!("\"{name}\""),
+        _ => name.to_string(),
+    }
+}
+
+/// A derived table's alias as declared after `FROM (...)`: `AS name`, or the bare
+/// quoted name on Oracle, which rejects `AS` before a table alias.
+pub(crate) fn derived(source_type: SourceType, name: &str) -> String {
+    match source_type {
+        SourceType::Oracle => alias(source_type, name),
+        _ => format!("AS {name}"),
     }
 }
 
@@ -185,7 +206,10 @@ pub(crate) fn aggregate_sql(
     let q = quote_ident(source_type, col);
     match strip_simple_projection_from(base_query) {
         Some(table_ident) => format!("SELECT {agg}({q}) FROM {table_ident}"),
-        None => format!("SELECT {agg}({q}) FROM ({base_query}) AS _rivet"),
+        None => format!(
+            "SELECT {agg}({q}) FROM ({base_query}) {}",
+            derived(source_type, "_rivet")
+        ),
     }
 }
 
@@ -202,13 +226,19 @@ pub(crate) fn aggregate_sql(
 pub(crate) fn null_key_probe_sql(source_type: SourceType, col: &str, base_query: &str) -> String {
     let from = match strip_simple_projection_from(base_query) {
         Some(table_ident) => table_ident.to_string(),
-        None => format!("({base_query}) AS _rivet_nullprobe"),
+        None => format!(
+            "({base_query}) {}",
+            derived(source_type, "_rivet_nullprobe")
+        ),
     };
     let q = quote_ident(source_type, col);
     match source_type {
         SourceType::Mssql => format!("SELECT TOP 1 1 FROM {from} WHERE {q} IS NULL"),
         SourceType::Postgres | SourceType::Mysql => {
             format!("SELECT 1 FROM {from} WHERE {q} IS NULL LIMIT 1")
+        }
+        SourceType::Oracle => {
+            format!("SELECT 1 FROM {from} WHERE {q} IS NULL FETCH FIRST 1 ROWS ONLY")
         }
         // Unreachable: the null-key probe is a chunked-mode concern, and chunked
         // mode is rejected for MongoDB at config validation.
@@ -256,6 +286,21 @@ pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Op
         // No scan-free row estimate for MongoDB in this SQL helper — the
         // chunk-sparsity diagnostic is a SQL/chunked concern Mongo never reaches.
         // `None` = "unknown", which the caller already tolerates.
+        // `ALL_TABLES.NUM_ROWS` is the optimizer statistic (NULL until DBMS_STATS
+        // has run — the caller's `> 0` guard then skips the density line). The
+        // `table:` shortcut ident is unquoted, so Oracle resolved it upper-cased.
+        SourceType::Oracle => {
+            let (owner, table) = match table_ident.rsplit_once('.') {
+                Some((o, t)) => (format!("UPPER('{o}')"), t),
+                None => (
+                    "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
+                    table_ident,
+                ),
+            };
+            Some(format!(
+                "SELECT num_rows FROM all_tables WHERE owner = {owner} AND table_name = UPPER('{table}')"
+            ))
+        }
         SourceType::Mongo => None,
     }
 }

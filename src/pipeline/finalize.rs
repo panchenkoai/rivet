@@ -377,6 +377,7 @@ pub(super) fn finalize_manifest(
         crate::config::SourceType::Postgres => "postgres",
         crate::config::SourceType::Mysql => "mysql",
         crate::config::SourceType::Mssql => "mssql",
+        crate::config::SourceType::Oracle => "oracle",
         crate::config::SourceType::Mongo => "mongo",
     };
 
@@ -973,6 +974,7 @@ pub(super) fn write_running_manifest(
         SourceType::Postgres => "postgres",
         SourceType::Mysql => "mysql",
         SourceType::Mssql => "mssql",
+        SourceType::Oracle => "oracle",
         SourceType::Mongo => "mongo",
     };
     let manifest = RunManifest {

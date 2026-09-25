@@ -3,6 +3,8 @@ pub(crate) mod cdc;
 pub mod mongo;
 pub mod mssql;
 pub mod mysql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 pub(crate) mod pg_numeric_wire;
 pub mod postgres;
 pub(crate) mod query;
@@ -45,6 +47,18 @@ impl StatementDurationTimeout {
         Self {
             message: format!(
                 "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+
+    /// Oracle client-side statement-duration timeout (no per-statement server limit).
+    pub fn oracle(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "oracle: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
                  this query cannot finish within the budget; split it with `mode: chunked` \
                  (per-chunk statements stay under the limit) or raise \
                  `tuning.statement_timeout_s`"
@@ -470,6 +484,15 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             &url,
             config.tls.as_ref(),
         )?)),
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => Ok(Box::new(oracle::OracleSource::connect_with_tls(
+            &url,
+            config.tls.as_ref(),
+        )?)),
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => {
+            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
+        }
         SourceType::Mongo => Ok(Box::new(mongo::MongoSource::connect(
             &url,
             config.tls.as_ref(),

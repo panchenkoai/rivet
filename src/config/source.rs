@@ -358,6 +358,7 @@ impl SourceConfig {
             SourceType::Postgres => 5432,
             SourceType::Mysql => 3306,
             SourceType::Mssql => 1433,
+            SourceType::Oracle => 1521,
             SourceType::Mongo => 27017,
         };
         let port = self.port.unwrap_or(default_port);
@@ -366,6 +367,7 @@ impl SourceConfig {
             SourceType::Postgres => "postgresql",
             SourceType::Mysql => "mysql",
             SourceType::Mssql => "sqlserver",
+            SourceType::Oracle => "oracle",
             SourceType::Mongo => "mongodb",
         };
 
@@ -488,6 +490,8 @@ pub enum SourceType {
     Postgres,
     Mysql,
     Mssql,
+    /// Oracle Database 19c+, read through Oracle's pure-Rust thin driver.
+    Oracle,
     /// Document store. Unlike the three SQL engines, MongoDB has no SQL, no
     /// fixed per-collection schema, and no `information_schema` — so the
     /// SQL-shaped read seam (chunked/keyset planning, incremental predicate

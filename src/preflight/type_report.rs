@@ -430,6 +430,12 @@ pub(crate) fn connect_source_of(
         )?),
         SourceType::Mysql => Box::new(source::mysql::MysqlSource::connect_with_tls(url, tls)?),
         SourceType::Mssql => Box::new(source::mssql::MssqlSource::connect_with_tls(url, tls)?),
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => Box::new(source::oracle::OracleSource::connect_with_tls(url, tls)?),
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => {
+            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
+        }
         SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(url, tls, None)?),
     })
 }

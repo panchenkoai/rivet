@@ -1005,14 +1005,14 @@ fn source_rename_action(
     let quote = |id: &str| match source {
         SourceType::Mysql => format!("`{id}`"),
         SourceType::Mssql => format!("[{id}]"),
-        SourceType::Postgres | SourceType::Mongo => format!("\"{id}\""),
+        SourceType::Postgres | SourceType::Oracle | SourceType::Mongo => format!("\"{id}\""),
     };
     let Some(table) = table else {
         return format!("alias it in the export's query: {} AS {latin}", quote(file));
     };
     let qualified = table.split('.').map(quote).collect::<Vec<_>>().join(".");
     match source {
-        SourceType::Postgres => format!(
+        SourceType::Postgres | SourceType::Oracle => format!(
             "ALTER TABLE {qualified} RENAME COLUMN {} TO {};",
             quote(file),
             quote(latin)
@@ -1404,6 +1404,9 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
         SourceType::Mysql => Ok(SourceEngine::MySql),
         SourceType::Mssql => Ok(SourceEngine::SqlServer),
         SourceType::Mongo => Ok(SourceEngine::Mongo),
+        SourceType::Oracle => {
+            anyhow::bail!("CDC is not supported for Oracle yet (batch exports only)")
+        }
     }
 }
 

@@ -335,6 +335,11 @@ fn check_source_auth(config: &Config) -> Result<()> {
             crate::source::mssql::MssqlSource::connect_with_tls(&url, tls)?;
             Ok(())
         }
+        SourceType::Oracle => {
+            // `create_source` connects, pins the session and fails on a bad login.
+            crate::source::create_source(&config.source)?;
+            Ok(())
+        }
         SourceType::Mongo => {
             // `connect_with_tls` runs a connect + `ping` round-trip itself, so a
             // successful construction is a green health-check.
@@ -675,6 +680,9 @@ pub(crate) fn source_error_hint(
             SourceType::Mssql => {
                 "TLS handshake failed. SQL Server forces TLS on the login handshake; set `tls.ca_file: /path/to/ca-bundle.pem` to trust a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
+            SourceType::Oracle => {
+                "TLS handshake failed. Oracle over TLS uses `tcps`: check the listener's TCPS port and that its certificate chains to the system trust store (a private `tls.ca_file` is not supported yet)."
+            }
             SourceType::Mongo => {
                 "TLS handshake failed. For MongoDB, enable TLS in the connection string (`?tls=true`) and set `tls.ca_file: /path/to/ca-bundle.pem` for a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
@@ -705,6 +713,9 @@ pub(crate) fn source_error_hint(
             }
             SourceType::Mssql => {
                 "Verify the SQL login/password and that the login maps to a database user with SELECT on the target tables (`GRANT SELECT ON dbo.tbl TO [user]`). Check you are pointed at the right database — contained-DB users and server logins are resolved differently."
+            }
+            SourceType::Oracle => {
+                "Verify the user/password (ORA-01017) and that the URL path is the SERVICE name (not a SID). The user needs CREATE SESSION and SELECT on the target tables; SELECT_CATALOG_ROLE lets rivet read row estimates and source-harm counters."
             }
             SourceType::Mongo => {
                 "Verify the user/password and `authSource`. MongoDB scopes users to an auth database — add `?authSource=admin` (or the DB where the user was created) to the connection URL, and grant the user the `read` role on the target database."

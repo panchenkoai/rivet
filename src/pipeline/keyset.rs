@@ -218,7 +218,7 @@ fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
     use crate::config::SourceType::*;
     match st {
         Postgres | Mysql => format!("LIMIT 1 OFFSET {off}"),
-        Mssql => format!("OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY"),
+        Mssql | Oracle => format!("OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY"),
         Mongo => unreachable!("parallel keyset sampling is a SQL path; Mongo uses $sample"),
     }
 }

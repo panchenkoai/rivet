@@ -19,7 +19,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `type` | `postgres` \| `mysql` \| `mssql` \| `mongo` | **yes** |  |
+| `type` | `postgres` \| `mysql` \| `mssql` \| `oracle` \| `mongo` | **yes** |  |
 | `url` | `string` |  |  |
 | `url_env` | `string` |  |  |
 | `url_file` | `string` |  |  |

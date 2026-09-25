@@ -697,7 +697,7 @@ impl Config {
                 // slot or server_id to collide. Two Mongo CDC exports sharing a
                 // `checkpoint:` path IS still a conflict, caught by the shared
                 // checkpoint check below.
-                SourceType::Mongo => {}
+                SourceType::Mongo | SourceType::Oracle => {}
             }
             // RESOLVED, not the raw string — the function's own doc promises "on
             // the RESOLVED values", and the runtime maps every relative path
@@ -746,6 +746,13 @@ impl Config {
         &self,
         export: &ExportConfig,
     ) -> crate::error::Result<()> {
+        if self.source.source_type == SourceType::Oracle {
+            anyhow::bail!(
+                "export '{}': `mode: cdc` is not supported for Oracle yet — use `mode: full`, \
+                 `chunked` or `incremental`",
+                export.name
+            );
+        }
         match (&export.table, &export.tables) {
             (None, None) => anyhow::bail!(
                 "export '{}': cdc mode requires `table:` (or `tables:` for a \

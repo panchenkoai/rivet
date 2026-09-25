@@ -780,6 +780,9 @@ fn run_cdc_inner(
                         // The same strings the sink will route by — see the field's doc.
                         configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                     },
+                    crate::config::SourceType::Oracle => {
+                        unreachable!("oracle cdc is refused at config validation")
+                    }
                     crate::config::SourceType::Mongo => CdcEngineOpts::Mongo {
                         canonical: config.source.mongo.as_ref().is_some_and(|m| {
                             matches!(m.json, crate::config::MongoJsonMode::Canonical)

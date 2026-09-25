@@ -177,6 +177,11 @@
           ]
         },
         {
+          "description": "Oracle Database 19c+, read through Oracle's pure-Rust thin driver.",
+          "type": "string",
+          "const": "oracle"
+        },
+        {
           "description": "Document store. Unlike the three SQL engines, MongoDB has no SQL, no\nfixed per-collection schema, and no `information_schema` — so the\nSQL-shaped read seam (chunked/keyset planning, incremental predicate\nbuilding, catalog introspection) does not apply. The OSS source is the\nJSON-blob model: each document exports as `_id` + a `document` JSON\ncolumn, typing punted downstream. Change streams (CDC) map onto the\ncanonical `ChangeStream` seam separately.",
           "type": "string",
           "const": "mongo"

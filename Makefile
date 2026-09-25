@@ -8,7 +8,7 @@
 # installed some other way).
 PY ?= uv run python
 
-.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db sweep-test-cloud test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo seed-garbage seed-garbage-postgres seed-garbage-mysql seed-garbage-mssql
+.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db sweep-test-cloud test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo seed-oracle seed-garbage seed-garbage-postgres seed-garbage-mysql seed-garbage-mssql
 
 # PR-fast: offline type-mapping contracts (no docker).
 test-types:
@@ -134,10 +134,15 @@ seed-build:
 	cargo build --bin seed --features dev-seed
 
 # Seed EVERY live database. A per-DB target below runs one engine at a time.
-seed-db: seed-postgres seed-mysql seed-mssql seed-mongo
+seed-db: seed-postgres seed-mysql seed-mssql seed-mongo seed-oracle
 
 seed-postgres: seed-build
 	RIVET_SEED_I_KNOW=1 target/debug/seed --target postgres $(SEED_ARGS)
+
+# Oracle 23ai Free: the classic + garbage schema, ported table-for-table from MySQL
+# (deviations are listed in the script header). Runs as the stand's `rivet` user.
+seed-oracle:
+	docker compose exec -T oracle sqlplus -s rivet/rivet@localhost/FREEPDB1 < seeds/common/oracle.sql
 
 seed-mysql: seed-build
 	RIVET_SEED_I_KNOW=1 target/debug/seed --target mysql $(SEED_ARGS)

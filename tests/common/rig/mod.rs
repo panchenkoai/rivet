@@ -205,6 +205,12 @@ impl Rig {
         r
     }
 
+    /// Oracle batch (23ai Free :1521, app user `rivet`). Oracle stores unquoted
+    /// names upper-case, so pass the table as the catalog holds it.
+    pub fn oracle_batch(table: &str) -> Self {
+        Self::new("oracle", super::env::ORACLE_URL, table)
+    }
+
     /// Mongo batch (standalone :27017). The db varies per test — chain
     /// `.source_url(&MongoTest::url(PORT, &db))`.
     pub fn mongo_batch(table: &str) -> Self {

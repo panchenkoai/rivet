@@ -14,6 +14,8 @@ mod doctor;
 mod mongo;
 mod mssql;
 mod mysql;
+#[cfg(feature = "oracle")]
+mod oracle;
 mod postgres;
 mod schema_error;
 pub mod type_report;
@@ -195,6 +197,12 @@ pub(crate) fn get_export_diagnostic(
         SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
         SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
         SourceType::Mssql => mssql::diagnose_export_mssql(&url, tls, export),
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => oracle::diagnose_export_oracle(&url, tls, export),
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => {
+            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
+        }
         SourceType::Mongo => {
             mongo::diagnose_export_mongo(&url, tls, export, config.source.mongo.as_ref())
         }
@@ -401,6 +409,12 @@ pub fn check(
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
         SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => oracle::check_oracle(&url, tls, &exports)?,
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => {
+            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
+        }
         SourceType::Mongo => mongo::check_mongo(&url, tls, &exports, config.source.mongo.as_ref())?,
     };
     // #149: measured beats declared — overlay the state store's actuals and

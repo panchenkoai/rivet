@@ -461,6 +461,18 @@ fn resolve_chunked_strategy(
                 tbl,
             )
         }
+        #[cfg(feature = "oracle")]
+        crate::config::SourceType::Oracle => {
+            crate::source::oracle::introspect_oracle_table_for_chunking(
+                &url,
+                config.source.tls.as_ref(),
+                tbl,
+            )
+        }
+        #[cfg(not(feature = "oracle"))]
+        crate::config::SourceType::Oracle => {
+            anyhow::bail!("source.type: oracle — this rivet was built without the `oracle` feature")
+        }
         crate::config::SourceType::Mongo => anyhow::bail!(
             "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
              collection is read as `_id` + `document` JSON)"
