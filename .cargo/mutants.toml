@@ -679,6 +679,33 @@ exclude_re = [
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_changelog -> Result<\\(\\)>",
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_leftovers -> Result<Vec<String>>",
     "replace BigQueryApi::run_query_first_row -> Result<Vec<Option<String>>>",
+    # The ClickHouse loader's HTTP methods (load/clickhouse.rs): each is one statement
+    # or one part sent over the HTTP interface, so no offline test can run them and
+    # their body stubs are born MISSED. What each DECIDES is next door and graded:
+    # the DDL and version (`changelog_shape`, `changelog_conflict`, `columns_ddl`,
+    # `create_table_sql`, `pull_source`, `CLICKHOUSE_VERSION_EXPR`), the count
+    # (`parquet_rows`), the catalog decode (`object_kind_of`), the view text
+    # (`clickhouse_final_view`). Live, each stub is caught: tests/live/live_clickhouse_load.rs
+    # (a stubbed insert_uris/materialize/append_changelog fails the count gate or the
+    # source comparison; a stubbed changes_has_prior_changes/object_kind/column_overlap/
+    # row_count/adopt_as_changelog breaks the incremental adoption and re-key cells) and
+    # the `clickhouse_load` gate row; `the_change_log_keeps_the_latest_source_position…`
+    # and `a_pulled_part_lands…` (lib, live) cover create_current_view and the pull.
+    "replace ClickhouseLoader::post -> Result<String>",
+    "replace ClickhouseLoader::query -> Result<String>",
+    "replace ClickhouseLoader::number -> Result<u64>",
+    "replace ClickhouseLoader::insert_uris -> Result<u64>",
+    "replace ClickhouseLoader::existing_changelog_conflict -> Result<Option<String>>",
+    "replace ClickhouseLoader::store -> Result<&GcsStore>",
+    "replace <impl TargetLoader for ClickhouseLoader>::materialize -> Result<u64>",
+    "replace <impl TargetLoader for ClickhouseLoader>::append_changelog -> Result<u64>",
+    "replace <impl TargetLoader for ClickhouseLoader>::create_view -> Result<\\(\\)>",
+    "replace <impl TargetLoader for ClickhouseLoader>::create_current_view -> Result<\\(\\)>",
+    "replace <impl TargetLoader for ClickhouseLoader>::changes_has_prior_changes -> Result<bool>",
+    "replace <impl TargetLoader for ClickhouseLoader>::object_kind -> Result<ObjectKind>",
+    "replace <impl TargetLoader for ClickhouseLoader>::column_overlap -> Result<\\(u64, u64\\)>",
+    "replace <impl TargetLoader for ClickhouseLoader>::row_count -> Result<u64>",
+    "replace <impl TargetLoader for ClickhouseLoader>::adopt_as_changelog -> Result<\\(\\)>",
     # `await_job`'s poll deadline, `started.elapsed() > budget`: EQUIVALENT against
     # `>=`, and the reason is the clock, not the coverage. The two differ on exactly
     # one input — elapsed EQUAL to the budget to the nanosecond — which no caller can

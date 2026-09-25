@@ -13,8 +13,8 @@ use super::cdc::{self, Warehouse};
 use super::{GcsStore, ObjectKind, TargetLoader};
 use crate::types::target::TargetColumnSpec;
 
-/// HTTP timeout for one ClickHouse call; one part's INSERT is seconds on a LAN.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// HTTP timeout for one ClickHouse call (20 min); one part's INSERT is seconds on a LAN.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// Loads staged Parquet into ClickHouse over its HTTP interface.
 pub struct ClickhouseLoader {
@@ -107,10 +107,10 @@ impl ClickhouseLoader {
         let text = resp
             .text()
             .context("reading the ClickHouse HTTP response")?;
-        if !status.is_success() {
-            bail!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text));
+        match status.is_success() {
+            true => Ok(text.trim().to_string()),
+            false => bail!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text)),
         }
-        Ok(text.trim().to_string())
     }
 
     /// Run one SQL statement and return its output.
@@ -923,6 +923,62 @@ mod tests {
         );
         let e = format!("{:#}", refused.expect_err("a NULL key must refuse"));
         assert!(e.contains("`id`") && e.contains("NULL"), "{e}");
+    }
+
+    /// The pure SQL and naming helpers, each pinned to its exact text.
+    #[test]
+    fn ddl_names_and_error_trimming_render_exactly() {
+        assert_eq!(
+            create_table_sql(
+                "CREATE TABLE IF NOT EXISTS",
+                "`d`.`t`",
+                "  `id` Int64",
+                "ReplacingMergeTree(__ver)",
+                "(`id`)"
+            ),
+            "CREATE TABLE IF NOT EXISTS `d`.`t` (\n  `id` Int64\n) ENGINE = ReplacingMergeTree(__ver) \
+             ORDER BY (`id`) SETTINGS allow_nullable_key = 1"
+        );
+        let loader = ClickhouseLoader::new("http://ch:8123/", "raw", "u", "P", Default::default());
+        assert_eq!(TargetLoader::fqtn(&loader, "orders"), "raw.orders");
+        assert_eq!(loader.quoted("orders"), "`raw`.`orders`");
+        assert_eq!(
+            loader.system_filter("o'r", "name"),
+            "database = 'raw' AND name = 'o\\'r'"
+        );
+        let long = format!("Code: 60. DB::Exception: x\n{}", "trace\n".repeat(20));
+        let trimmed = trim_ch_error(&long);
+        assert_eq!(trimmed.lines().count(), 6, "the head, not the stack trace");
+        assert!(trimmed.starts_with("Code: 60."));
+    }
+
+    /// build_loader marks a CDC plan's loader as CDC: adopting a full-load table then
+    /// refuses before any HTTP call, while an incremental loader would go to the server.
+    #[test]
+    fn build_loader_wires_the_cdc_flag_from_the_plan_mode() {
+        unsafe { std::env::set_var("RIVET_CH_WIRE_TEST_PASSWORD", "x") };
+        let mut plan = crate::load::plan::test_plan(crate::load::plan::LoadMode::Cdc, "gs://b/p/");
+        plan.load.target = crate::load::plan::LoadTarget::Clickhouse {
+            url: "http://127.0.0.1:1".into(),
+            database: "d".into(),
+            user: "u".into(),
+            password_env: "RIVET_CH_WIRE_TEST_PASSWORD".into(),
+            named_collection: None,
+        };
+        let cdc = crate::load::build_loader(&plan, "run");
+        let err = cdc
+            .adopt_as_changelog("t")
+            .expect_err("a CDC log cannot adopt a table");
+        assert!(err.is::<crate::load::Refused>(), "{err:#}");
+        plan.mode = crate::load::plan::LoadMode::Incremental;
+        let inc = crate::load::build_loader(&plan, "run");
+        let err = inc
+            .adopt_as_changelog("t")
+            .expect_err("nothing listens on :1");
+        assert!(
+            !err.is::<crate::load::Refused>(),
+            "an incremental log adopts by RENAME, over HTTP: {err:#}"
+        );
     }
 
     #[test]

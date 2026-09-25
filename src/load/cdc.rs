@@ -1052,6 +1052,26 @@ mod tests {
         assert!(cdc.contains("PARTITION BY `a`, `b`"), "{cdc}");
     }
 
+    /// ClickHouse's current-state view reads the collapsing log with FINAL and flags deletes.
+    #[test]
+    fn the_clickhouse_view_reads_final_and_flags_deletes() {
+        let sql = clickhouse_final_view("d.orders", "d.orders__changes");
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW `d`.`orders` AS\nSELECT * EXCEPT (__op, __pos, __seq, __ver),\n       \
+             ifNull(__op = 'delete', false) AS __is_deleted\nFROM `d`.`orders__changes` FINAL"
+        );
+        assert_eq!(
+            [
+                Warehouse::BigQuery,
+                Warehouse::Snowflake,
+                Warehouse::ClickHouse
+            ]
+            .map(Warehouse::label),
+            ["BigQuery", "Snowflake", "ClickHouse"]
+        );
+    }
+
     #[test]
     fn meta_column_specs_are_typed_per_warehouse_and_ordered() {
         let bq = meta_column_specs(Warehouse::BigQuery);
