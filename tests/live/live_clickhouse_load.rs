@@ -77,6 +77,11 @@ fn source_rows(tbl: &str) -> Vec<(i64, i64)> {
         .expect("read source")
 }
 
+/// The `(id, v)` rows ClickHouse returns for `sql` (a `FORMAT TSV` query).
+fn clickhouse_rows(sql: &str) -> Vec<(i64, i64)> {
+    pairs(&ch(sql))
+}
+
 /// `id\tv` lines of `sql` parsed into pairs.
 fn pairs(tsv: &str) -> Vec<(i64, i64)> {
     tsv.lines()
@@ -104,11 +109,11 @@ fn load(rig: &Rig) {
 }
 
 /// The view's live rows equal `source`, and exactly `deleted` is flagged.
-fn assert_view_is(view: &str, source: Vec<(i64, i64)>, deleted: &str) {
+fn clickhouse_rows_match_source(view: &str, source: Vec<(i64, i64)>, deleted: &str) {
     assert_eq!(
-        pairs(&ch(&format!(
+        clickhouse_rows(&format!(
             "SELECT id, v FROM {view} WHERE NOT __is_deleted ORDER BY id FORMAT TSV"
-        ))),
+        )),
         source,
         "the view's live rows must equal the source"
     );
@@ -136,7 +141,7 @@ fn a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source() {
 
     rig.run_ok();
     load(&rig);
-    assert_view_is(&view, source_rows(&tbl), "");
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "");
 
     conn()
         .query_drop(format!(
@@ -149,7 +154,7 @@ fn a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source() {
         .expect("changes");
     rig.run_ok();
     load(&rig);
-    assert_view_is(&view, source_rows(&tbl), "2");
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "2");
 }
 
 /// The same cycle from PostgreSQL: the version decodes an LSN (`hi/lo` hex).
@@ -182,7 +187,7 @@ fn a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source()
 
     rig.run_ok();
     load(&rig);
-    assert_view_is(&view, source(&mut c), "");
+    clickhouse_rows_match_source(&view, source(&mut c), "");
 
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (6, 6), (7, 7); \
@@ -194,7 +199,7 @@ fn a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source()
     .expect("changes");
     rig.run_ok();
     load(&rig);
-    assert_view_is(&view, source(&mut c), "2");
+    clickhouse_rows_match_source(&view, source(&mut c), "2");
 }
 
 /// The same cycle from SQL Server: the version decodes a 10-byte LSN.
@@ -234,7 +239,7 @@ fn a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
 
     rig.run_ok();
     load(&rig);
-    assert_view_is(&view, source(), "");
+    clickhouse_rows_match_source(&view, source(), "");
 
     mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (6,6),(7,7); \
@@ -246,7 +251,7 @@ fn a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
     wait_for_capture(&ci, 14);
     rig.run_ok();
     load(&rig);
-    assert_view_is(&view, source(), "2");
+    clickhouse_rows_match_source(&view, source(), "2");
 }
 
 /// A load that dies after appending but before recording itself re-appends every
@@ -282,7 +287,7 @@ fn a_load_that_dies_after_appending_is_re_run_without_duplicating_the_view() {
         .parse()
         .expect("count");
     assert_eq!(physical, 10, "the re-run appended every row a second time");
-    assert_view_is(&view, source_rows(&tbl), "");
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "");
 }
 
 /// A PostgreSQL `(id, v, updated_at)` table on the main stand holding ids `1..=n`.
@@ -326,11 +331,7 @@ fn a_full_load_into_clickhouse_replaces_the_table_with_the_current_source() {
     let db = Db::new("rivet_chtest");
     let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
     let table = format!("{}.{tbl}", db.0);
-    let loaded = || {
-        pairs(&ch(&format!(
-            "SELECT id, v FROM {table} ORDER BY id FORMAT TSV"
-        )))
-    };
+    let loaded = || clickhouse_rows(&format!("SELECT id, v FROM {table} ORDER BY id FORMAT TSV"));
 
     rig.run_ok();
     load(&rig);
@@ -387,9 +388,7 @@ fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_
         "the first delta turned the table into the change log behind a view"
     );
     assert_eq!(
-        pairs(&ch(&format!(
-            "SELECT id, v FROM {view} ORDER BY id FORMAT TSV"
-        ))),
+        clickhouse_rows(&format!("SELECT id, v FROM {view} ORDER BY id FORMAT TSV")),
         pg_rows(&mut c, &tbl)
     );
 }
