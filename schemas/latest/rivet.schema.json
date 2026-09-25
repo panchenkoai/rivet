@@ -24,6 +24,7 @@
       ]
     },
     "parallel_exports": {
+      "description": "Same as `rivet run --parallel-exports`: the exports run concurrently, at most 16 at once; a CDC export run alone also takes its pending baseline snapshots at most 16 at once.",
       "type": "boolean",
       "default": false
     },

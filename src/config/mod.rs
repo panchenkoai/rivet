@@ -37,6 +37,7 @@ pub struct Config {
     pub exports: Vec<ExportConfig>,
     #[serde(default)]
     pub notifications: Option<NotificationsConfig>,
+    /// Same as `rivet run --parallel-exports`: the exports run concurrently, at most 16 at once; a CDC export run alone also takes its pending baseline snapshots at most 16 at once.
     #[serde(default)]
     pub parallel_exports: bool,
     #[serde(default)]

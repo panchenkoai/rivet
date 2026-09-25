@@ -120,7 +120,7 @@ pub(crate) fn run_export_pool(
         |state, _, export| Ok(run(export, state)),
         |export| {
             let err = anyhow::anyhow!(
-                "export '{}': no worker could run it (a state database open failed or the worker panicked)",
+                "export '{}' did not complete: its worker panicked or could not open the state database (the log above names which)",
                 export.name
             );
             let summary = job::synthetic_failed_summary(&export.name, &err);
@@ -685,8 +685,9 @@ pub fn run(
 
     if run_parallel {
         log::info!(
-            "running {} exports in parallel (separate state DB connection per export)",
-            exports.len()
+            "running {} exports on up to {} worker threads (one state DB connection per worker)",
+            exports.len(),
+            crate::workers::effective_pool(None, exports.len())
         );
 
         // In threads mode every export emits the same `ChildEvent` stream
@@ -725,9 +726,7 @@ pub fn run(
         // Stamp the window BEFORE the bracket close queries the source, so the
         // aggregate's duration excludes the instrumentation round-trip.
         window_end = Some(chrono::Utc::now());
-        run_harm.close_and_warn(HarmWindow::Parallel {
-            exports: exports.len(),
-        });
+        run_harm.close_and_warn(HarmWindow::Parallel { exports: workers });
 
         for (res, summary) in collected {
             if let Err(e) = res {
@@ -1166,8 +1165,8 @@ fn finish_run_tail(
 pub(crate) enum HarmWindow {
     /// `--pool m`: `exports` exports drained through `slots` slots.
     Pool { exports: usize, slots: usize },
-    /// `--parallel-exports` / `--parallel-export-processes` / `apply --parallel`:
-    /// `exports` exports concurrent with no slot cap. `exports` is the PEAK
+    /// `--parallel-exports` (at most 16 at once, also CDC snapshot legs) /
+    /// `--parallel-export-processes` (no cap) / `apply --parallel`: `exports` exports concurrent. `exports` is the PEAK
     /// number that actually overlapped, not how many the run covered — the
     /// frame is a concurrency claim, so it must count concurrency.
     Parallel { exports: usize },
@@ -1475,10 +1474,9 @@ fn pool_export_modes(windows: &[(String, i64, i64)]) -> Vec<(String, &'static st
 /// (`"parallel-processes"` at the child-process aggregate, `if run_parallel {
 /// "parallel-threads" } else { "sequential" }` at the tail).
 ///
-/// `peak` is how many exports ran AT ONCE: `exports.len()` on both concurrent
-/// paths, which spawn one child process / one thread per export with no cap and
-/// join them all, and 1 on the sequential loop. Nothing serializes those paths
-/// today — the fix is that the CLAIM is now derived from a count rather than
+/// `peak` is how many exports ran AT ONCE: the worker count on the threads path
+/// (at most 16), `exports.len()` on the child-process path (one child per export,
+/// no cap), and 1 on the sequential loop. The fix is that the CLAIM is now derived from a count rather than
 /// from `run_parallel`, so the first cost gate to split them (which is exactly
 /// how `apply --parallel`'s wave bug was born: a flag that meant "concurrent"
 /// until the gate started emitting single-child batches) cannot leave a
@@ -1562,7 +1560,9 @@ fn run_harm_verdict(deltas: &[(String, i64)], window: HarmWindow) -> Option<Stri
         HarmWindow::Parallel { exports } => (
             "parallel run",
             format!("the run window ({exports} concurrent exports)"),
-            Some("the export concurrency (`--pool N` bounds it)"),
+            Some(
+                "the export concurrency (`--pool N` bounds it; `--parallel-exports` is capped at 16)",
+            ),
         ),
         // No concurrency lever: this window HAD no concurrency. Naming one
         // would send the operator to shrink a 1, and would push the two levers
@@ -1634,7 +1634,9 @@ impl<'a> RunHarmBracket<'a> {
     /// taken after the probe (see [`snapshot_then_stamp`]). Call immediately
     /// before the concurrent work and use the returned instant as the run's
     /// `started_at`.
-    fn open(source: &'a crate::config::SourceConfig) -> (Self, chrono::DateTime<chrono::Utc>) {
+    pub(crate) fn open(
+        source: &'a crate::config::SourceConfig,
+    ) -> (Self, chrono::DateTime<chrono::Utc>) {
         let (before, window_start) = snapshot_then_stamp(|| job::harm_snapshot(source));
         (Self { source, before }, window_start)
     }
@@ -1642,7 +1644,7 @@ impl<'a> RunHarmBracket<'a> {
     /// Take the `after` snapshot and WARN the verdict if the window crossed the
     /// shared threshold. WARN (not info) so it is visible at the default log
     /// level — an invisible "your source is spilling" line is no line at all.
-    fn close_and_warn(self, window: HarmWindow) {
+    pub(crate) fn close_and_warn(self, window: HarmWindow) {
         if let (Some(before), Some(after)) = (&self.before, job::harm_snapshot(self.source))
             && let Some(line) = run_harm_verdict(&job::harm_deltas(before, &after), window)
         {

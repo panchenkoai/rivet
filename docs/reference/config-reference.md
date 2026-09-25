@@ -11,7 +11,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `source` | [SourceConfig](#sourceconfig) | **yes** |  |
 | `exports` | array of [ExportConfig](#exportconfig) | **yes** |  |
 | `notifications` | [NotificationsConfig](#notificationsconfig) |  |  |
-| `parallel_exports` | `boolean` |  |  |
+| `parallel_exports` | `boolean` |  | Same as `rivet run --parallel-exports`: the exports run concurrently, at most 16 at once; a CDC export run alone also takes its pending baseline snapshots at most 16 at once. |
 | `parallel_export_processes` | `boolean` |  |  |
 | `load` | [LoadSection](#loadsection) |  | The warehouse **load** target — consumed by `rivet load`, so ONE config drives both the export and the downstream load. The extraction commands validate it (a malformed block fails `rivet check` before an extract runs) and otherwise ignore it: it shapes the load, not the extract. |
 

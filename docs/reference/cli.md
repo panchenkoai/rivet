@@ -51,7 +51,7 @@ rivet run --config <PATH> [OPTIONS]
 | `--reconcile` | | bool | Run `COUNT(*)` on source query and compare with exported rows |
 | `--resume` | | bool | Resume an in-progress chunked export. Exits non-zero with an actionable message if no in-progress checkpoint exists — run without `--resume` to start fresh, or `rivet state reset-chunks` to clear a stuck run |
 | `--force` | | bool | Override safety gates that would otherwise refuse the run. Today: with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present (ADR-0012 M8). Without it, resume against a complete run refuses so an operator cannot accidentally re-export over a verified dataset |
-| `--parallel-exports` | | bool | Run all exports concurrently (ignored with `--export`) |
+| `--parallel-exports` | | bool | Run the config's exports concurrently, at most 16 at once; a CDC export run alone also takes its pending baseline snapshots at most 16 at once |
 | `--parallel-export-processes` | | bool | Run each export as a separate child process |
 | `--summary-output` | | PATH | Write run aggregate to this file as JSON |
 | `--json` | | bool | Print run aggregate to stdout as JSON after the run |
@@ -84,10 +84,11 @@ rivet run -c my_export.yaml --parallel-export-processes
 
 ### `--parallel-export-processes` — one card per export
 
-`--parallel-exports` runs every export in the same Rivet process on a separate
-thread. That keeps logs simple, but every export shares the same source
-connection pool / global allocator, and a panic in one export tears the whole
-run down.
+`--parallel-exports` runs the exports in the same Rivet process on up to 16
+worker threads. That keeps logs simple, but every export shares the same source
+connection pool / global allocator. A panic in one export is caught and reported
+as that export's failure while the others finish (release builds unwind; the
+`release-min` profile aborts instead).
 
 `--parallel-export-processes` instead spawns one `rivet` *child process* per
 export — full memory and connection isolation, no shared allocator. The parent

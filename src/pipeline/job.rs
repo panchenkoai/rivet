@@ -1567,14 +1567,17 @@ fn run_export_job_inner(
             // The batch pool `--parallel-exports` runs on: every leg runs, each on its
             // own state connection, and a finished snapshot is recorded as it lands.
             let _flags = super::run::RenderFlags::set(super::run::multi_export_mode(), Some(true));
+            let (harm, _) = super::run::RunHarmBracket::open(&config.source);
             let legs: Vec<&ExportConfig> = pending.iter().collect();
-            let (outcomes, _) = super::run::run_export_pool(config_path, &legs, |synth, own| {
-                let outcome = run_export_job(config_path, config, synth, own, config_dir, opts);
-                if outcome.0.is_ok() {
-                    record_snapshot_done(own, &export.name, synth, &outcome.1);
-                }
-                outcome
-            });
+            let (outcomes, workers) =
+                super::run::run_export_pool(config_path, &legs, |synth, own| {
+                    let outcome = run_export_job(config_path, config, synth, own, config_dir, opts);
+                    if outcome.0.is_ok() {
+                        record_snapshot_done(own, &export.name, synth, &outcome.1);
+                    }
+                    outcome
+                });
+            harm.close_and_warn(super::run::HarmWindow::Parallel { exports: workers });
             outcomes
         } else {
             let mut done = Vec::with_capacity(pending.len());

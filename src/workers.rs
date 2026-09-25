@@ -99,7 +99,10 @@ where
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         work(&resource, i, item)
                     }))
-                    .unwrap_or_else(|_| Err(on_lost(item)));
+                    .unwrap_or_else(|payload| {
+                        log::error!("worker item {i} panicked: {}", panic_text(&*payload));
+                        Err(on_lost(item))
+                    });
                     done.lock().unwrap().push((i, outcome));
                 }
             });
@@ -123,6 +126,15 @@ where
     }
     out.sort_by_key(|(i, _)| *i);
     out.into_iter().map(|(_, outcome)| outcome).collect()
+}
+
+/// The message a panic carried, for the log line that replaces the unwound stack.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// [`run_workers`] at the default width with no per-worker state: every item runs, a panic becomes that item's error.

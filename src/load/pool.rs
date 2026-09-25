@@ -1,4 +1,4 @@
-//! Bounded work-stealing executor for the per-table `load` / `compact` loops.
+//! Pool policy for the per-table `load` / `compact` loops: the ceiling warning and when a lost ledger is fatal. The executor itself is [`crate::workers::run_workers`].
 //!
 //! WHY THIS IS SAFE TO RUN CONCURRENTLY, and what that rests on. Unlike the export
 //! pool (`pipeline/run.rs`), which serialises heavy exports because they contend for
@@ -31,9 +31,8 @@
 //! Split out of [`super::orchestrate`] so the SCHEDULING is graded: `run_loads`
 //! is a live-only body (its whole-function mutants are excluded — nothing in an
 //! offline run drives a warehouse), and a live-only body may not DECIDE. The
-//! pool is generic over the work item, so its contracts — every item runs once,
-//! a failure isolates, results come back in item order — are proven here against
-//! a fake closure, with no warehouse, no credentials and no state DB.
+//! executor's contracts — every item runs once, a failure isolates, results come
+//! back in item order — are proven in `crate::workers` against a fake closure.
 
 pub(crate) use crate::workers::{MAX_POOL, effective_pool, run_workers};
 

@@ -386,7 +386,8 @@ fn roll_all(
         // in the ack→terminal-manifest window would orphan the acked parts (silent,
         // count-gate-invisible loss). A `Success` run-unique manifest (no `_SUCCESS`
         // marker yet — the prefix is not complete) is idempotently rewritten as a
-        // superset each roll; the terminal write at clean end adds `_SUCCESS`.
+        // superset on each roll that gave the table a new part; the terminal write
+        // at clean end adds `_SUCCESS`.
         let dirty: Vec<usize> = (0..sinks.len())
             .filter(|&i| sinks[i].parts.len() != sinks[i].manifested_parts)
             .collect();
