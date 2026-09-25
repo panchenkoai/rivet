@@ -127,7 +127,33 @@ struct TableSink<'a> {
     manifested_parts: usize,
 }
 
+/// The facts one sink run shares across every table and every roll: who it is, how it writes, where it records.
+struct SinkRun<'a> {
+    engine: super::CdcEngine,
+    format: FormatType,
+    export_name: &'a str,
+    run_token: &'a str,
+    run_id: &'a str,
+    started_at: &'a str,
+    checkpoint: Option<&'a Path>,
+    state: Option<&'a crate::state::StateStore>,
+}
+
 impl TableSink<'_> {
+    /// This table's run manifest over the parts it has so far.
+    fn manifest(&self, run: &SinkRun<'_>) -> RunManifest {
+        build_manifest(
+            run.engine,
+            &self.column_sums,
+            &self.out,
+            run.export_name,
+            run.format,
+            run.run_id,
+            run.started_at,
+            &self.parts,
+        )
+    }
+
     /// Build this table's schema before its first flush, so the concurrent encode only reads the sink.
     fn prepare_schema(&mut self) {
         // The schema is built lazily at the first flush so decimal column
@@ -315,16 +341,9 @@ pub(crate) fn table_matches(
 fn roll_all(
     sinks: &mut [TableSink<'_>],
     stream: &mut dyn ChangeStream,
-    engine: super::CdcEngine,
-    format: FormatType,
-    export_name: &str,
-    run_token: &str,
-    checkpoint: Option<&Path>,
+    run: &SinkRun<'_>,
     last_commit: &Option<Position>,
     unacked_commit: &mut bool,
-    run_id: &str,
-    started_at: &str,
-    state: Option<&crate::state::StateStore>,
 ) -> Result<()> {
     let pending: Vec<usize> = (0..sinks.len())
         .filter(|&i| !sinks[i].buf.is_empty())
@@ -334,6 +353,7 @@ fn roll_all(
     }
     let uploaded = {
         let view: Vec<&TableSink<'_>> = pending.iter().map(|&i| &sinks[i]).collect();
+        let (engine, format, run_token) = (run.engine, run.format, run.run_token);
         crate::workers::run_each(&view, |s| s.encode_and_upload(engine, format, run_token))
     };
     // Every part that reached the store is recorded, even when a sibling's upload
@@ -344,8 +364,8 @@ fn roll_all(
             Ok((part, sums)) => sinks[i].record_part(
                 part,
                 sums,
-                format,
-                state.map(|st| (st, export_name, run_id)),
+                run.format,
+                run.state.map(|st| (st, run.export_name, run.run_id)),
             ),
             Err(e) => {
                 first_err.get_or_insert(e);
@@ -372,20 +392,7 @@ fn roll_all(
             .collect();
         let pending: Vec<(&dyn crate::destination::Destination, RunManifest)> = dirty
             .iter()
-            .map(|&i| {
-                let s = &sinks[i];
-                let manifest = build_manifest(
-                    engine,
-                    &s.column_sums,
-                    &s.out,
-                    export_name,
-                    format,
-                    run_id,
-                    started_at,
-                    &s.parts,
-                );
-                (s.out.dest, manifest)
-            })
+            .map(|&i| (sinks[i].out.dest, sinks[i].manifest(run)))
             .collect();
         crate::workers::run_each(&pending, |(dest, manifest)| {
             write_manifest_without_success_marker(*dest, manifest).map(|_| ())
@@ -396,7 +403,7 @@ fn roll_all(
         for i in dirty {
             sinks[i].manifested_parts = sinks[i].parts.len();
         }
-        if let Some(ck) = checkpoint {
+        if let Some(ck) = run.checkpoint {
             p.save(ck)?;
         }
         // Fault point: manifest + checkpoint persisted, source NOT acked — a crash
@@ -456,6 +463,16 @@ pub(crate) fn run_to_files(
         rollover_bytes: cfg.rollover_memory_bytes,
     };
     let checkpoint = cfg.checkpoint.as_deref();
+    let run = SinkRun {
+        engine: cfg.engine,
+        format: cfg.format,
+        export_name: &cfg.export_name,
+        run_token: &run_token,
+        run_id: &cfg.run_id,
+        started_at: &cfg.started_at,
+        checkpoint,
+        state: cfg.state,
+    };
     let (mut total_rows, mut total_bytes, mut emitted) = (0usize, 0usize, 0usize);
     // The last commit-boundary position seen, and whether a commit has arrived
     // since the last ack — the only position it is ever valid to advance to.
@@ -546,20 +563,7 @@ pub(crate) fn run_to_files(
                     total_rows += 1;
                     emitted += 1;
                     if policy.should_roll(total_rows, total_bytes, committed) {
-                        roll_all(
-                            &mut sinks,
-                            stream,
-                            cfg.engine,
-                            cfg.format,
-                            &cfg.export_name,
-                            &run_token,
-                            checkpoint,
-                            &last_commit,
-                            &mut unacked_commit,
-                            &cfg.run_id,
-                            &cfg.started_at,
-                            cfg.state,
-                        )?;
+                        roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                         total_rows = 0;
                         total_bytes = 0;
                     }
@@ -588,20 +592,7 @@ pub(crate) fn run_to_files(
             // so a `max_events` stop mid-span still checkpoints a whole transaction.
             let buffered_rows: usize = sinks.iter().map(|s| s.buf.len()).sum();
             if pass_must_roll(unacked_commit, buffered_rows) {
-                roll_all(
-                    &mut sinks,
-                    stream,
-                    cfg.engine,
-                    cfg.format,
-                    &cfg.export_name,
-                    &run_token,
-                    checkpoint,
-                    &last_commit,
-                    &mut unacked_commit,
-                    &cfg.run_id,
-                    &cfg.started_at,
-                    cfg.state,
-                )?;
+                roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                 total_rows = 0;
                 total_bytes = 0;
             }
@@ -627,21 +618,7 @@ pub(crate) fn run_to_files(
     // covered by the per-roll run-unique manifest `roll_all` wrote before each
     // ack, so the manifest is built for the CALLER's accounting and no
     // `_SUCCESS` is claimed — the run did not succeed.
-    let manifests: Vec<RunManifest> = sinks
-        .iter()
-        .map(|s| {
-            build_manifest(
-                cfg.engine,
-                &s.column_sums,
-                &s.out,
-                &cfg.export_name,
-                cfg.format,
-                &cfg.run_id,
-                &cfg.started_at,
-                &s.parts,
-            )
-        })
-        .collect();
+    let manifests: Vec<RunManifest> = sinks.iter().map(|s| s.manifest(&run)).collect();
     // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
     // AND an immutable run-unique copy, so a prefix accumulating several
     // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
