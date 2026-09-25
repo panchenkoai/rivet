@@ -277,6 +277,46 @@ fn unless_gone<T>(r: opendal::Result<T>) -> Result<Option<T>> {
 mod tests {
     use super::*;
 
+    /// The load store opens the destination's own backend, not GCS for every export.
+    #[test]
+    fn the_load_store_opens_each_destinations_own_backend() {
+        use crate::config::DestinationType;
+        let dest = |t: DestinationType, extra: DestinationConfig| DestinationConfig {
+            destination_type: t,
+            bucket: Some("b".into()),
+            ..extra
+        };
+        unsafe { std::env::set_var("RIVET_OP_TEST_KEY", "a2V5") };
+        let s3 = dest(
+            DestinationType::S3,
+            DestinationConfig {
+                endpoint: Some("http://127.0.0.1:1".into()),
+                region: Some("us-east-1".into()),
+                ..Default::default()
+            },
+        );
+        let az = dest(
+            DestinationType::Azure,
+            DestinationConfig {
+                account_name: Some("a".into()),
+                account_key_env: Some("RIVET_OP_TEST_KEY".into()),
+                ..Default::default()
+            },
+        );
+        let gcs = dest(
+            DestinationType::Gcs,
+            DestinationConfig {
+                endpoint: Some("http://127.0.0.1:1".into()),
+                allow_anonymous: true,
+                ..Default::default()
+            },
+        );
+        let scheme = |c: &DestinationConfig| operator_for(c).unwrap().info().scheme().to_string();
+        assert_eq!(scheme(&s3), "s3");
+        assert_eq!(scheme(&az), "azblob");
+        assert_eq!(scheme(&gcs), "gcs");
+    }
+
     #[test]
     fn read_each_within_keeps_order_and_never_reads_an_object_over_the_cap() {
         let dir = tempfile::tempdir().unwrap();

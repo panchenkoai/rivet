@@ -679,6 +679,11 @@ exclude_re = [
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_changelog -> Result<\\(\\)>",
     "replace <impl super::ShapeControl for BigQueryLoader>::rebuild_leftovers -> Result<Vec<String>>",
     "replace BigQueryApi::run_query_first_row -> Result<Vec<Option<String>>>",
+    # The CLI's one routing function (cli/dispatch.rs): its body stub is born MISSED
+    # under `--lib --bins`, which runs no binary. The offline integration suite drives
+    # the binary through it: stubbing it to `Ok(())` fails 15 tests of
+    # tests/offline_suite.rs (measured 2026-09-26).
+    "replace dispatch -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # The ClickHouse loader's HTTP methods (load/clickhouse.rs): each is one statement
     # or one part sent over the HTTP interface, so no offline test can run them and
     # their body stubs are born MISSED. What each DECIDES is next door and graded:
@@ -692,6 +697,7 @@ exclude_re = [
     # the `clickhouse_load` gate row; `the_change_log_keeps_the_latest_source_position…`
     # and `a_pulled_part_lands…` (lib, live) cover create_current_view and the pull.
     "replace ClickhouseLoader::post -> Result<String>",
+    "replace ClickhouseLoader::insert_one -> Result<u64>",
     "replace ClickhouseLoader::query -> Result<String>",
     "replace ClickhouseLoader::number -> Result<u64>",
     "replace ClickhouseLoader::insert_uris -> Result<u64>",

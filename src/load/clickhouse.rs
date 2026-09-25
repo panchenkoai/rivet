@@ -131,37 +131,38 @@ impl ClickhouseLoader {
     /// materialized views write too and reads 0 under `async_insert`, while a statement that
     /// returns 200 under `wait_end_of_query` inserted all of its rows (ADR-0035 CH6).
     fn insert_uris(&self, target: &str, uris: &[String]) -> Result<u64> {
-        let mut total = 0;
-        for uri in uris {
-            let (bucket, key) = super::split_object_uri(uri)?;
-            let (query, body, rows) = match &self.named_collection {
-                Some(nc) => {
-                    let source = pull_source(nc, super::scheme_of(uri), bucket, key);
-                    (
-                        format!("INSERT INTO {target} SELECT * FROM {source}"),
-                        Vec::new(),
-                        self.number(&format!("SELECT count() FROM {source}"))?,
-                    )
-                }
-                None => {
-                    let bytes = self
-                        .store()?
-                        .read(key)
-                        .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
-                    let rows = parquet_rows(&bytes).with_context(|| format!("reading {uri}"))?;
-                    (format!("INSERT INTO {target} FORMAT Parquet"), bytes, rows)
-                }
-            };
-            let params = [
-                ("query", query.as_str()),
-                ("input_format_null_as_default", "0"),
-                ("async_insert", "0"),
-            ];
-            self.post(&params, body)
-                .with_context(|| format!("inserting {uri} into {target}"))?;
-            total += rows;
-        }
-        Ok(total)
+        uris.iter().map(|uri| self.insert_one(target, uri)).sum()
+    }
+
+    /// Insert one part into `target`; the rows it holds.
+    fn insert_one(&self, target: &str, uri: &str) -> Result<u64> {
+        let (bucket, key) = super::split_object_uri(uri)?;
+        let (query, body, rows) = match &self.named_collection {
+            Some(nc) => {
+                let source = pull_source(nc, super::scheme_of(uri), bucket, key);
+                (
+                    format!("INSERT INTO {target} SELECT * FROM {source}"),
+                    Vec::new(),
+                    self.number(&format!("SELECT count() FROM {source}"))?,
+                )
+            }
+            None => {
+                let bytes = self
+                    .store()?
+                    .read(key)
+                    .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
+                let rows = parquet_rows(&bytes).with_context(|| format!("reading {uri}"))?;
+                (format!("INSERT INTO {target} FORMAT Parquet"), bytes, rows)
+            }
+        };
+        let params = [
+            ("query", query.as_str()),
+            ("input_format_null_as_default", "0"),
+            ("async_insert", "0"),
+        ];
+        self.post(&params, body)
+            .with_context(|| format!("inserting {uri} into {target}"))?;
+        Ok(rows)
     }
 
     /// Why an existing `<table>__changes` cannot take this load, read from the catalog; `None` when absent or matching.
@@ -228,13 +229,9 @@ impl TargetLoader for ClickhouseLoader {
             &order_by(&self.cluster_by),
         ))?;
         let rows = self.insert_uris(&swap, uris)?;
-        match self.object_kind(table)? {
-            ObjectKind::Absent => self.query(&format!("RENAME TABLE {swap} TO {target}"))?,
-            _ => {
-                self.query(&format!("EXCHANGE TABLES {swap} AND {target}"))?;
-                self.query(&format!("DROP TABLE {swap}"))?
-            }
-        };
+        for sql in swap_in(self.object_kind(table)?, &swap, &target) {
+            self.query(&sql)?;
+        }
         Ok(rows)
     }
 
@@ -328,11 +325,9 @@ impl TargetLoader for ClickhouseLoader {
             if wanted.is_empty() { "''" } else { &wanted },
             self.system_filter(table, "table")
         ))?;
-        let mut it = out.split('\t').map(str::parse::<u64>);
-        match (it.next(), it.next()) {
-            (Some(Ok(total)), Some(Ok(matched))) => Ok((total, matched)),
-            _ => bail!("ClickHouse returned `{out}` for a column-overlap probe of `{table}`"),
-        }
+        parse_pair(&out).with_context(|| {
+            format!("ClickHouse returned `{out}` for a column-overlap probe of `{table}`")
+        })
     }
 
     fn row_count(&self, table: &str) -> Result<u64> {
@@ -376,6 +371,24 @@ fn pull_source(collection: &str, scheme: &str, bucket: &str, key: &str) -> Strin
             literal(&format!("{bucket}/{key}"))
         ),
     }
+}
+
+/// The statements that put a filled `swap` table in `target`'s place: a rename when there
+/// is nothing there yet, else an exchange and a drop of what was there.
+fn swap_in(existing: ObjectKind, swap: &str, target: &str) -> Vec<String> {
+    match existing {
+        ObjectKind::Absent => vec![format!("RENAME TABLE {swap} TO {target}")],
+        _ => vec![
+            format!("EXCHANGE TABLES {swap} AND {target}"),
+            format!("DROP TABLE {swap}"),
+        ],
+    }
+}
+
+/// Two tab-separated counts, as a `SELECT a, b … FORMAT TSV` returns them.
+fn parse_pair(tsv: &str) -> Option<(u64, u64)> {
+    let (a, b) = tsv.trim().split_once('\t')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 /// The first of `cols` that is not a plain SQL identifier.
@@ -959,6 +972,21 @@ mod tests {
         );
         let e = format!("{:#}", refused.expect_err("a NULL key must refuse"));
         assert!(e.contains("`id`") && e.contains("NULL"), "{e}");
+    }
+
+    #[test]
+    fn a_first_full_load_renames_and_a_later_one_exchanges_then_drops() {
+        assert_eq!(
+            swap_in(ObjectKind::Absent, "s", "t"),
+            ["RENAME TABLE s TO t"]
+        );
+        assert_eq!(
+            swap_in(ObjectKind::Table, "s", "t"),
+            ["EXCHANGE TABLES s AND t", "DROP TABLE s"]
+        );
+        assert_eq!(parse_pair("7\t3\n"), Some((7, 3)));
+        assert_eq!(parse_pair("7"), None);
+        assert_eq!(parse_pair("x\t3"), None);
     }
 
     /// The pure SQL and naming helpers, each pinned to its exact text.

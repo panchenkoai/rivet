@@ -1775,6 +1775,19 @@ mod tests {
                 && !appending.contains("rivet compact"),
             "block:\n{appending}"
         );
+        let no_load = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            !no_load.contains("rivet load"),
+            "no load block, no load step:\n{no_load}"
+        );
     }
 
     #[test]
