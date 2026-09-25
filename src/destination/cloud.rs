@@ -320,8 +320,7 @@ impl<B: CloudBackend> CloudDestination<B> {
     /// the whole budget never fit, so they always stream.
     fn reserve_oneshot(&self, size: u64) -> Option<OneShotReservation<'_>> {
         let size = i64::try_from(size).unwrap_or(i64::MAX);
-        take_from(self.oneshot_budget, size)
-            .then_some(OneShotReservation(self.oneshot_budget, size))
+        take_from(self.oneshot_budget, size).then(|| OneShotReservation(self.oneshot_budget, size))
     }
 }
 
@@ -609,6 +608,19 @@ mod tests {
         assert!(
             big.reserve_oneshot(part).is_some(),
             "the same part one-shots under a 129 MB budget"
+        );
+    }
+
+    /// A refused reservation must not touch the pool: an eager `then_some` built the
+    /// guard anyway, and its drop credited every streamed part's size to the budget.
+    #[test]
+    fn a_refused_reservation_leaves_the_pool_unchanged() {
+        let dest = CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(71)), 0).unwrap();
+        assert!(dest.reserve_oneshot(72 * 1024 * 1024).is_none());
+        assert_eq!(
+            oneshot_pool(&gcs_cfg(Some(71))).load(Ordering::Relaxed),
+            71 * 1024 * 1024,
+            "a part that streams must not grow the one-shot budget"
         );
     }
 

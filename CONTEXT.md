@@ -133,8 +133,8 @@ The integrity depth an export declares it requires (`exports[].verify`): `size`
 (default — accept size-only) or `content` (every part must be content-MD5
 verified). `content` turns a size-only part into a fatal verdict failure
 (`ContentVerificationUnmet`), so the operator gets a loud, actionable error
-(on GCS / Azure, keep parts under `oneshot_budget_mb` so they upload as a single
-PUT; S3 cannot meet it) instead of a silent
+(on GCS / Azure, raise `oneshot_budget_mb` above the part size so parts upload as
+a single PUT; S3 cannot meet it) instead of a silent
 size-only cliff. Enforced once via `enforce_content_policy`, called by both the
 run `--validate` finalize and the `rivet validate` command. _Avoid_: validate
 level, deep (that meant re-download, which we never do).

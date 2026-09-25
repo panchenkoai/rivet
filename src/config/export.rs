@@ -290,8 +290,8 @@ pub struct ExportConfig {
     /// `size` (default) accepts size-only verification; `content` requires every
     /// part's content MD5 to be checked against the store's listing (no
     /// download) and **fails** validation for any part that could only be
-    /// size-verified — a part too large for a single PUT (on GCS / Azure, keep
-    /// `max_file_size` under `destination.oneshot_budget_mb`), or a backend that
+    /// size-verified — a part too large for a single PUT (on GCS / Azure, raise
+    /// `destination.oneshot_budget_mb` above the part size), or a backend that
     /// exposes no trusted checksum (S3, local FS).
     #[serde(default)]
     pub verify: VerifyMode,

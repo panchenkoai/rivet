@@ -185,10 +185,10 @@ records it in the manifest; GCS and Azure compute their own for a part uploaded
 as a single PUT and return it in object listings. `--validate` compares the two
 with **no download**. Parts large enough to stream as multipart / block-list get
 no checksum, and neither does S3 (its ETag is not an MD5 under SSE-KMS / SSE-C, so
-rivet does not trust it) or local FS. Under `verify: content` on GCS / Azure, keep
-`max_file_size` well under `destination.oneshot_budget_mb` (default 64 MB): the
-budget is shared by concurrent uploads, so a part one-shots only if it fits what is
-free at that moment. S3 cannot meet `verify: content`.
+rivet does not trust it) or local FS. Under `verify: content` on GCS / Azure, set
+`destination.oneshot_budget_mb` (default 64 MB) comfortably above your part size:
+the budget is shared by concurrent uploads, so a part one-shots only if it fits
+what is free at that moment. S3 cannot meet `verify: content`.
 
 The run report and `rivet validate` show coverage explicitly, e.g.
 `3 verified (2 md5, 1 size-only)`.

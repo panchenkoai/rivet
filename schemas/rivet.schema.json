@@ -700,7 +700,7 @@
           "$ref": "#/$defs/DestinationConfig"
         },
         "verify": {
-          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — a part too large for a single PUT (on GCS / Azure, keep\n`max_file_size` under `destination.oneshot_budget_mb`), or a backend that\nexposes no trusted checksum (S3, local FS).",
+          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — a part too large for a single PUT (on GCS / Azure, raise\n`destination.oneshot_budget_mb` above the part size), or a backend that\nexposes no trusted checksum (S3, local FS).",
           "$ref": "#/$defs/VerifyMode",
           "default": "size"
         },
