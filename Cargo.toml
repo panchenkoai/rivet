@@ -201,6 +201,10 @@ harness = false
 name = "resource_aware"
 harness = false
 
+[[bench]]
+name = "upload_budget"
+harness = false
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
