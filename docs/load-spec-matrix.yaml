@@ -223,7 +223,7 @@ scenarios:
     what: "`range` + `expiration_days` is refused when the block is read (BigQuery has no expiry for integer ranges), before the extract"
     bigquery:   { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
     snowflake:  { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
-    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
+    clickhouse: { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
 
   - id: changelog_never_expires_the_export_stamp
     what: "a change log partitioned on `_rivet_exported_at` (one value per run) is partitioned by load date: its expiry is dropped like an ingestion-time one, else the never-changed baseline rows expire out of the view"

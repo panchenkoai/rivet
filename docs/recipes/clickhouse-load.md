@@ -19,6 +19,9 @@ rivet run  -c rivet.yaml    # Parquet into GCS
 rivet load -c rivet.yaml    # Parquet into ClickHouse
 ```
 
+A CDC scaffold captures changes from its anchor on; rows that existed before are not
+in it. For them, set `cdc.initial: snapshot` (or a `cdc.backfill:`) before the first run.
+
 The generated block:
 
 ```yaml
@@ -39,7 +42,7 @@ load:
 |---|---|
 | `full`, `chunked`, `time_window` | `<table>`, a `MergeTree` replaced whole by every load (filled beside it, then swapped in) |
 | `cdc` | `<table>__changes`, a `ReplacingMergeTree` keyed on the primary key, and the view `<table>` |
-| `incremental` | `<table>__changes`, a `MergeTree`, and the view `<table>` picking the latest cursor per key |
+| `incremental` | the first run lands `<table>` as a `MergeTree`; the first delta renames it to `<table>__changes` and `<table>` becomes a view picking the latest cursor per key |
 
 For a CDC table the engine keeps one version per key: the one with the latest
 source position (PostgreSQL LSN, MySQL binlog file + offset, SQL Server LSN),
@@ -50,8 +53,9 @@ flags deletes:
 SELECT * FROM raw.orders WHERE NOT __is_deleted;
 ```
 
-Filter the view in `WHERE`, not `PREWHERE`: a `PREWHERE` on a non-key column runs
-before the engine collapses versions and can return an old one.
+ClickHouse does not allow `PREWHERE` on the view. If you read `<table>__changes FINAL`
+directly, filter non-key columns in `WHERE`: a `PREWHERE` runs before the engine
+collapses versions and can return an old one.
 
 ## Letting ClickHouse read the bucket itself
 

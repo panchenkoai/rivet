@@ -306,6 +306,25 @@ pub(super) fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
     plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
 }
 
+/// Why a CDC snapshot over an earlier full-load table is refused, with the ways out this warehouse takes.
+pub(super) fn snapshot_over_full_table_refusal(
+    fqtn: &str,
+    warehouse: load::cdc::Warehouse,
+) -> String {
+    let keep = match warehouse {
+        // A CDC change log there is a ReplacingMergeTree, which a table cannot become (ADR-0035 CH11).
+        load::cdc::Warehouse::ClickHouse => "",
+        _ => {
+            ", or run the stream without `initial: snapshot` to keep the table's rows as the baseline"
+        }
+    };
+    format!(
+        "`{fqtn}` is a table from an earlier full load, and this CDC load carries an initial \
+         snapshot of the same table — the snapshot is a new baseline, so keep one: drop the \
+         table (the snapshot replaces it){keep}"
+    )
+}
+
 /// Why a CDC load from `engine` cannot reach one of `plans`' targets, or `None`.
 pub(super) fn unsupported_cdc_target(
     engine: load::cdc::SourceEngine,
@@ -1538,12 +1557,9 @@ fn load_one_cdc(
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             let kind = load::before_write(loader.object_kind(&plan.table))?;
             if snapshot_over_full_table(shape, kind) {
-                return Err(load::refused(format!(
-                    "`{}` is a table from an earlier full load, and this CDC load carries an \
-                     initial snapshot of the same table — the snapshot is a new baseline, so \
-                     keep one: drop the table (the snapshot replaces it), or run the stream \
-                     without `initial: snapshot` to keep the table's rows as the baseline",
-                    loader.fqtn(&plan.table)
+                return Err(load::refused(snapshot_over_full_table_refusal(
+                    &loader.fqtn(&plan.table),
+                    loader.warehouse(),
                 )));
             }
             if shape {
@@ -3317,6 +3333,22 @@ mod live_only_decisions {
             plan_at(LoadMode::Full, "gs://b/base"),
             plan_at(LoadMode::Cdc, "gs://b/base"),
         ]));
+    }
+
+    /// ClickHouse cannot adopt the table under CDC, so its refusal offers only the drop.
+    #[test]
+    fn a_snapshot_over_a_full_table_offers_only_the_ways_out_the_warehouse_takes() {
+        use crate::load::cdc::Warehouse;
+        let bq = snapshot_over_full_table_refusal("p.d.t", Warehouse::BigQuery);
+        assert!(
+            bq.contains("drop the table") && bq.contains("without `initial: snapshot`"),
+            "{bq}"
+        );
+        let ch = snapshot_over_full_table_refusal("d.t", Warehouse::ClickHouse);
+        assert!(
+            ch.contains("drop the table") && !ch.contains("without `initial"),
+            "{ch}"
+        );
     }
 
     /// Only a MongoDB stream into ClickHouse is refused: another engine, another

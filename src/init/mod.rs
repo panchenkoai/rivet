@@ -769,7 +769,8 @@ pub fn init(
                         mode_override,
                         text.contains("      backfill: auto"),
                         text.contains("\nload:"),
-                        text.contains("\n  layout: base_buffer")
+                        text.contains("\n  layout: base_buffer"),
+                        text.contains("mode: cdc") || text.contains("mode: incremental")
                     )
                 );
             }
@@ -787,7 +788,8 @@ pub fn init(
                         mode_override,
                         text.contains("      backfill: auto"),
                         text.contains("\nload:"),
-                        text.contains("\n  layout: base_buffer")
+                        text.contains("\n  layout: base_buffer"),
+                        text.contains("mode: cdc") || text.contains("mode: incremental")
                     )
                 );
             }
@@ -811,6 +813,7 @@ fn next_steps_block(
     has_backfill: bool,
     has_load: bool,
     has_compact: bool,
+    has_delta: bool,
 ) -> String {
     let mut s = String::from("\nNext steps:\n");
     if matches!(provenance, SourceProvenance::Inline) {
@@ -855,6 +858,12 @@ fn next_steps_block(
             "\nThen the warehouse half of the cycle (review `load:` first — its values are guesses):\n  \
              rivet load    -c {path}                  # Parquet -> the base, or the buffer on later runs\n  \
              rivet compact -c {path}                  # merge the buffer into the base and drop it\n"
+        ));
+    } else if has_load && has_delta {
+        s.push_str(&format!(
+            "\nThen the warehouse half (review `load:` first — its values are guesses):\n  \
+             rivet load    -c {path}                  # a full export OVERWRITES its table; a cdc or \
+             incremental one appends to <table>__changes behind the <table> view\n"
         ));
     } else if has_load {
         s.push_str(&format!(
@@ -1690,6 +1699,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
         assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
         assert!(
@@ -1707,6 +1717,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             Some("cdc"),
+            false,
             false,
             false,
             false,
@@ -1732,6 +1743,7 @@ mod tests {
                 false,
                 true,
                 has_compact,
+                false,
             )
         };
         let compacting = block(true);
@@ -1747,6 +1759,22 @@ mod tests {
                 && !overwriting.contains("rivet compact"),
             "block:\n{overwriting}"
         );
+        // A warehouse that never compacts (ClickHouse) with delta exports: the load
+        // appends behind a view — "each load OVERWRITES" would be false for them.
+        let appending = super::next_steps_block(
+            "rivet.yaml",
+            &super::SourceProvenance::Env("X".into()),
+            Some("cdc"),
+            false,
+            true,
+            false,
+            true,
+        );
+        assert!(
+            appending.contains("appends to <table>__changes")
+                && !appending.contains("rivet compact"),
+            "block:\n{appending}"
+        );
     }
 
     #[test]
@@ -1755,6 +1783,7 @@ mod tests {
             "rivet.yaml",
             &super::SourceProvenance::Env("X".into()),
             None,
+            false,
             false,
             false,
             false,
