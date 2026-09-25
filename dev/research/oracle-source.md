@@ -162,6 +162,69 @@ profile vs source; preflight refusals (identity column, >30-char name, unsupport
 type, `ENABLE_GOLDENGATE_REPLICATION`, NOARCHIVELOG, no supplemental logging);
 mid-window DDL refused; partial and full rollback; PK-update representation.
 
+## 7a. Live spike results (2026-09-25)
+
+Spike: `dev/spikes/oracle-driver` (standalone crate, not part of rivet) against
+`gvenzl/oracle-free:23-slim-faststart` (Oracle 23ai Free, arm64). It reads a 21-column
+table through `oracledb =26.0.0-beta.4`, builds Arrow itself, writes Parquet, and is
+compared against (a) Oracle's own server rendering (`TO_CHAR`, `SYS_EXTRACT_UTC`,
+`RAWTOHEX`, `DBMS_LOB.GETLENGTH`, `JSON_SERIALIZE`) and (b) DuckDB `oracle_scanner`
+0.2.2, a reader with its own protocol implementation.
+
+**Exact through our own Arrow builder**: bare `NUMBER` (1E125, 1E-130, 29 significant
+digits, via `OracleNumber` text → Utf8), `NUMBER(38,10)`, `NUMBER(18)`, NaN/Inf,
+`BOOLEAN`, `DATE` incl. year −4712 and 0001, `TIMESTAMP(9)` (ns), `TSTZ` as a UTC
+instant, `TSLTZ`, unicode/emoji, `CHAR` padding, 100 KB `CLOB`, `RAW`, `''` → NULL.
+oracle_scanner agreed on 66 of 70 cells; the 4 differences are representation
+(`'1'` vs true), its own TSTZ text (UTC fields with the source offset appended — the
+same misleading form the driver's `Display` prints; server `SYS_EXTRACT_UTC` confirms
+our Parquet), and one real driver defect (below).
+
+**Driver defects found (oracledb 26.0.0-beta.4)**
+1. `TIMESTAMP WITH TIME ZONE` holding a **region name** (`Europe/Berlin`) **panics**
+   (`todo!()` in `ora_type/timestamp.rs:236`). rivet must `catch_unwind` or fetch such
+   columns as `SYS_EXTRACT_UTC(col)` / `TO_CHAR(...)`; report upstream.
+2. `EMPTY_BLOB()` (length 0) arrives as **NULL**; the independent reader returns `b''`.
+   Empty ≠ NULL is lost for BLOBs.
+3. `oracledb::Error` implements only `Debug` (no `Display`, no `std::error::Error`) —
+   an adapter is needed for anyhow.
+4. `OracleTimestamp`'s `Display` of a TSTZ prints UTC fields with the original offset
+   (a different instant); negative `INTERVAL DAY TO SECOND` `Display` is garbled
+   (`P-1DT0H0M0.-00001000S`). Build from fields, never from `Display`.
+5. CLOB/BLOB are described as `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW` in fetch metadata;
+   `get::<String>` refuses NUMBER; `JsonValue` has no text serializer (use
+   `JSON_SERIALIZE` server-side).
+6. The crate pulls `aws-lc-sys` (a C/cmake build) as rustls' crypto provider — check
+   against rivet's cross builds.
+
+**rivet-side mapping findings**: `TIMESTAMP(9)` in ns overflows i64 past 2262 (the
+row with 9999-12-31 had to be nulled) → µs (truncating ns) or a declared overflow
+policy; Parquet has no `Timestamp(Second)` (DuckDB reads it as BIGINT) → map `DATE`
+to µs.
+
+**LogMiner through the thin driver**: works — `DBMS_LOGMNR.ADD_LOGFILE` /
+`START_LOGMNR` PL/SQL calls and `V$LOGMNR_CONTENTS` + `MINE_VALUE` over the online
+logs, from the CDB root. One transaction's inserts share one XID. Per-type isolation
+on 23ai Free:
+
+| column type | LogMiner |
+|---|---|
+| VARCHAR2 / NUMBER | INSERT/UPDATE decoded |
+| native `JSON` (23ai) | **UNSUPPORTED** |
+| `BOOLEAN` (23ai) | **UNSUPPORTED** |
+| CLOB | INSERT with `EMPTY_CLOB()` + a separate UPDATE carrying the value |
+| TSTZ / DATE in `SQL_REDO` | rendered by session NLS: `'29-FEB-24 10.00.00.000000 AM +02:00'` (two-digit year) |
+| UPDATE without PK supplemental logging | only the changed column + ROWID |
+
+Consequences: preflight must refuse CDC for tables with native JSON / BOOLEAN; LOB
+writes must be framed within their transaction; `MINE_VALUE` text (e.g. `1.0…E+125`)
+needs a parser and pinned NLS; PK supplemental logging is a prerequisite. Tables
+dropped and recreated appear as `UNKNOWN.OBJ#` with the online-catalog dictionary.
+
+Not yet exercised: ARCHIVELOG + archived-log registration, resume across a log
+switch, gap detection, RAC — they need the full image (`container-registry.oracle.com`
+is ~0.6 MB/s from here; its pull is paused).
+
 ## 8. Open questions for the owner
 
 - **Q1** Bare `NUMBER`: string, `Decimal256` with a declared scale, or refuse without a
