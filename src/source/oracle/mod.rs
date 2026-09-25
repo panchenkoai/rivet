@@ -226,6 +226,13 @@ impl OracleSource {
         })
     }
 
+    /// Can this user read V$SYSSTAT and V$SYSTEM_EVENT, the harm and governor probes' views?
+    /// `None` when the connection itself fails.
+    pub(crate) fn sample_harm_views(url: &str, tls: Option<&TlsConfig>) -> Option<bool> {
+        let mut src = Self::connect_with_tls(url, tls).ok()?;
+        Some(src.harm_counters().is_some() && src.sample_governor_pressure().is_some())
+    }
+
     /// Every row of `sql`, each cell as text, read through the same re-projection as an export.
     pub(crate) fn query_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         let sql = self.projected(sql)?.sql;

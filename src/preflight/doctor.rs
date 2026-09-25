@@ -128,6 +128,7 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             // after the source line, so its position is unchanged.
             if !json {
                 note_mssql_harm_permission(&config);
+                note_oracle_harm_permission(&config);
             }
         }
         Err(e) => {
@@ -372,6 +373,27 @@ fn note_mssql_harm_permission(config: &Config) {
             "[note] Source-harm metrics need VIEW SERVER STATE — this SQL Server login lacks it, \
              so lock-wait metrics will be skipped. Data extraction is unaffected. \
              Grant with: GRANT VIEW SERVER STATE TO [your_login];"
+        );
+    }
+}
+
+/// Advisory (never a `[FAIL]`): an Oracle user that cannot read V$SYSSTAT / V$SYSTEM_EVENT
+/// gets no harm metrics and no governor pressure, silently.
+fn note_oracle_harm_permission(config: &Config) {
+    if config.source.source_type != SourceType::Oracle {
+        return;
+    }
+    let Ok(url) = config.source.resolve_url() else {
+        return;
+    };
+    if let Some(false) =
+        crate::source::oracle::OracleSource::sample_harm_views(&url, config.source.tls.as_ref())
+    {
+        println!(
+            "[note] This Oracle user cannot read V$SYSSTAT / V$SYSTEM_EVENT, so source-harm \
+             metrics and governor pressure will be absent. Data extraction is unaffected. \
+             Grant with: GRANT SELECT_CATALOG_ROLE TO your_user; (or SELECT on V_$SYSSTAT and \
+             V_$SYSTEM_EVENT)"
         );
     }
 }
@@ -715,7 +737,7 @@ pub(crate) fn source_error_hint(
                 "Verify the SQL login/password and that the login maps to a database user with SELECT on the target tables (`GRANT SELECT ON dbo.tbl TO [user]`). Check you are pointed at the right database — contained-DB users and server logins are resolved differently."
             }
             SourceType::Oracle => {
-                "Verify the user/password (ORA-01017) and that the URL path is the SERVICE name (not a SID). The user needs CREATE SESSION and SELECT on the target tables; SELECT_CATALOG_ROLE lets rivet read row estimates and source-harm counters."
+                "Verify the user/password (ORA-01017) and that the URL path is the SERVICE name (not a SID). The user needs CREATE SESSION and SELECT on the target tables; SELECT_CATALOG_ROLE (or SELECT on V$SYSSTAT and V$SYSTEM_EVENT) lets rivet read source-harm counters and governor pressure; row estimates come from ALL_TABLES and need no extra grant."
             }
             SourceType::Mongo => {
                 "Verify the user/password and `authSource`. MongoDB scopes users to an auth database — add `?authSource=admin` (or the DB where the user was created) to the connection URL, and grant the user the `read` role on the target database."

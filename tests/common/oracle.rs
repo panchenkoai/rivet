@@ -28,6 +28,24 @@ pub fn ora_conn() -> oracledb::Connection {
     conn
 }
 
+/// A connection as the stand's `SYSTEM` user (password `rivet`), for grants and session kills.
+pub fn ora_system_conn() -> oracledb::Connection {
+    let target = ORACLE_URL.split_once('@').unwrap().1;
+    let cfg = ora(
+        oracledb::Config::default()
+            .set_credentials("system", "rivet")
+            .set_connect_string(target),
+        "config",
+    );
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    ora(oracledb::connect(cfg), "connect as system")
+}
+
+/// Run one statement as `SYSTEM`.
+pub fn ora_system_exec(sql: &str) {
+    ora(ora_system_conn().execute(sql, &[]), sql);
+}
+
 /// Run one statement (DDL or DML) and commit.
 pub fn ora_exec(sql: &str) {
     let conn = ora_conn();

@@ -982,3 +982,182 @@ fn a_query_with_a_trailing_semicolon_or_comment_still_exports() {
         }
     }
 }
+
+/// The first `sid,serial#` of a `RIVET` session running (or last running) SQL that names `table`,
+/// the describe probe excluded.
+fn rivet_session_on(conn: &oracledb::Connection, table: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT TO_CHAR(s.sid) || ',' || TO_CHAR(s.serial#) FROM v$session s \
+         JOIN v$sql q ON q.sql_id = NVL(s.sql_id, s.prev_sql_id) \
+         WHERE s.username = 'RIVET' AND q.sql_text LIKE '%{table}%' \
+         AND q.sql_text NOT LIKE '%1 = 0%' AND q.sql_text NOT LIKE '%v$session%' AND ROWNUM = 1"
+    );
+    let mut cursor = conn.query(&sql, &[]).ok()?;
+    cursor.next()?.ok()?.get::<Option<String>>(0).ok()?
+}
+
+/// A session killed on the server mid-export is retried on a fresh connection and
+/// every row still lands exactly once.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_session_killed_mid_export_is_retried_and_delivers_every_row() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_kill",
+        "id NUMBER PRIMARY KEY, name VARCHAR2(40) NOT NULL, amount NUMBER(12,2)",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, 'name_' || LEVEL, LEVEL * 1.25 FROM dual CONNECT BY LEVEL <= 40000",
+        t.name()
+    ));
+    let export = unique_name("ora_kill");
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t.name())
+        .export_named(&export)
+        .mode("full")
+        .export_line("tuning:")
+        .export_line("  batch_size: 50")
+        .export_line("  max_retries: 3")
+        .export_line("  retry_backoff_ms: 200")
+        .dest_path(out.path().to_path_buf());
+
+    let table = t.name().to_string();
+    let killer = std::thread::spawn(move || {
+        let sys = ora_system_conn();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        // Short-lived probe connections also name the table: kill only a session seen for 2 s.
+        let mut seen: Option<(String, std::time::Instant)> = None;
+        while std::time::Instant::now() < deadline {
+            match (rivet_session_on(&sys, &table), &seen) {
+                (Some(sid), Some((prev, since))) if *prev == sid => {
+                    if since.elapsed() >= std::time::Duration::from_secs(2) {
+                        let kill = format!("ALTER SYSTEM KILL SESSION '{sid}' IMMEDIATE");
+                        match sys.execute(&kill, &[]) {
+                            Ok(_) => return true,
+                            // Mid-call: the session dies when the call returns.
+                            Err(e) if format!("{e:?}").contains("ORA-00031") => return true,
+                            Err(_) => seen = None,
+                        }
+                    }
+                }
+                (Some(sid), _) => seen = Some((sid, std::time::Instant::now())),
+                (None, _) => seen = None,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    });
+    let run = rig.run_args(&["--export", &export]);
+    assert!(
+        killer.join().unwrap(),
+        "the export's session was never seen to kill"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "stderr:\n{stderr}");
+
+    let journal = StateDb::next_to_config(&rig.config_path()).latest_journal_json(&export);
+    assert!(
+        journal.contains("RetryAttempted"),
+        "the run must record a retry; journal:\n{journal}\nstderr:\n{stderr}"
+    );
+    let source: i64 = ora_text_rows(&format!("SELECT TO_CHAR(COUNT(*)) FROM {}", t.name()))[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(source, 40_000);
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()) as i64,
+        source,
+        "every row"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(out.path(), "count(DISTINCT \"ID\")", None),
+        source,
+        "no row twice"
+    );
+}
+
+/// The doctor advisory for a user that cannot read the harm and governor views, verbatim.
+const HARM_VIEWS_NOTE: &str = "[note] This Oracle user cannot read V$SYSSTAT / V$SYSTEM_EVENT, \
+    so source-harm metrics and governor pressure will be absent. Data extraction is unaffected. \
+    Grant with: GRANT SELECT_CATALOG_ROLE TO your_user; (or SELECT on V_$SYSSTAT and V_$SYSTEM_EVENT)";
+
+/// A user with only CREATE SESSION and SELECT on one table, dropped on scope exit.
+struct LeastPrivUser(String);
+
+impl LeastPrivUser {
+    const PASSWORD: &'static str = "Lp_passw0rd1";
+
+    fn create(table: &str) -> Self {
+        let name = unique_name("ora_lp").to_uppercase();
+        ora_system_exec(&format!(
+            "CREATE USER {name} IDENTIFIED BY \"{}\"",
+            Self::PASSWORD
+        ));
+        let user = Self(name);
+        ora_system_exec(&format!("GRANT CREATE SESSION TO {}", user.0));
+        ora_system_exec(&format!("GRANT SELECT ON RIVET.{table} TO {}", user.0));
+        user
+    }
+
+    fn url(&self) -> String {
+        format!(
+            "oracle://{}:{}@127.0.0.1:1521/FREEPDB1",
+            self.0,
+            Self::PASSWORD
+        )
+    }
+}
+
+impl Drop for LeastPrivUser {
+    fn drop(&mut self) {
+        let _ =
+            std::panic::catch_unwind(|| ora_system_exec(&format!("DROP USER {} CASCADE", self.0)));
+    }
+}
+
+/// `rivet doctor`'s stdout for an Oracle source authenticating via `url`; source auth must pass.
+fn oracle_doctor_stdout(url: &str, table: &str) -> String {
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(table)
+        .export_named(&unique_name("ora_doctor"))
+        .query(&format!("SELECT ID FROM RIVET.{table}"))
+        .source_url(url)
+        .dest_path(out.path().to_path_buf());
+    let run = rig.cli(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        stdout.contains("Source auth"),
+        "source auth must pass for the note path to run; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    stdout
+}
+
+/// Without catalog privileges `rivet doctor` says harm metrics and governor pressure will be absent.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn doctor_notes_unreadable_harm_views_for_a_least_privilege_user() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(5);
+    let user = LeastPrivUser::create(t.name());
+    let stdout = oracle_doctor_stdout(&user.url(), t.name());
+    assert!(
+        stdout.lines().any(|l| l == HARM_VIEWS_NOTE),
+        "expected the exact note line; stdout:\n{stdout}"
+    );
+}
+
+/// The stand's `rivet` user holds SELECT_CATALOG_ROLE, so the note stays silent.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn doctor_is_silent_on_harm_views_for_a_catalog_reader() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(5);
+    let stdout = oracle_doctor_stdout(ORACLE_URL, t.name());
+    assert!(
+        !stdout.contains("V$SYSSTAT"),
+        "no harm-view note for a catalog reader; stdout:\n{stdout}"
+    );
+}

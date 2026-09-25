@@ -172,6 +172,11 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // --- Fallback: string-based classification ---
     let msg = format!("{:#}", err).to_lowercase();
 
+    // Oracle: the source lifts `oracledb::Error` (Debug-only) into a string, so no downcast.
+    if is_oracle_lost_session(&msg) {
+        return TRANSIENT_RECONNECT;
+    }
+
     // Auth / credential errors are never transient — fix config, not retry
     if msg.contains("loading credential")
         || msg.contains("loadcredential")
@@ -358,6 +363,22 @@ fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> RetryClass {
     PERMANENT
 }
 
+/// A lost or killed Oracle session: the thin driver's dead-connection wording or an ORA code
+/// for a killed session, a dropped channel, or an unreachable listener.
+fn is_oracle_lost_session(msg: &str) -> bool {
+    const CODES: &[&str] = &[
+        "ora-00028", // your session has been killed
+        "ora-03113", // end-of-file on communication channel
+        "ora-03114", // not connected to ORACLE
+        "ora-03135", // connection lost contact
+        "ora-12537", // TNS:connection closed
+        "ora-12170", // TNS:connect timeout occurred
+        "ora-12541", // TNS:no listener
+    ];
+    msg.contains("the database or network closed the connection")
+        || CODES.iter().any(|c| msg.contains(c))
+}
+
 /// Classify a MySQL error by numeric code.
 /// Reference: <https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html>
 fn classify_mysql_error(err: &mysql::Error) -> Option<RetryClass> {
@@ -467,6 +488,40 @@ mod tests {
                 matches!(c, RetryClass::Transient { .. }),
                 "{msg} must classify transient, got {c:?}"
             );
+        }
+    }
+
+    /// A lost or killed Oracle session reconnects and retries, in the form the source renders it.
+    #[test]
+    fn a_lost_oracle_session_is_transient_and_reconnects() {
+        for msg in [
+            "oracle: the database or network closed the connection",
+            "oracle: ORA-00028: your session has been killed",
+            "oracle: ORA-03113: end-of-file on communication channel",
+            "oracle: ORA-03114: not connected to ORACLE",
+            "oracle: ORA-03135: connection lost contact",
+            "oracle: ORA-12537: TNS:connection closed",
+            "oracle: ORA-12170: TNS:Connect timeout occurred",
+            "oracle: ORA-12541: TNS:no listener",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{msg}"));
+            assert_eq!(c, TRANSIENT_RECONNECT, "{msg}");
+        }
+    }
+
+    /// Missing objects, bad credentials and syntax errors stay permanent on Oracle.
+    #[test]
+    fn a_permanent_oracle_error_is_not_retried() {
+        for msg in [
+            "oracle: ORA-00942: table or view \"RIVET\".\"NOPE\" does not exist",
+            "oracle: ORA-00904: \"NOPE\": invalid identifier",
+            "oracle: ORA-01017: invalid credential or not authorized; logon denied",
+            "oracle: ORA-00900: invalid SQL statement",
+            "oracle: ORA-00923: FROM keyword not found where expected",
+            "oracle: ORA-00933: SQL command not properly ended",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{msg}"));
+            assert_eq!(c, PERMANENT, "{msg}");
         }
     }
 
