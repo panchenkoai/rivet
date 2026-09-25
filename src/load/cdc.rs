@@ -263,7 +263,7 @@ pub fn flag_spec(warehouse: Warehouse) -> TargetColumnSpec {
 }
 
 /// The ClickHouse change log's version: `(source position << 128) | (__seq + 1)`,
-/// the position decoded from the `__pos` JSON's own shape (ADR-0035 CH3).
+/// the position decoded from the `__pos` JSON's own shape; an unknown shape fails the insert (ADR-0035 CH3).
 pub(crate) const CLICKHOUSE_VERSION_EXPR: &str = "bitOr(bitShiftLeft(toUInt256(multiIf(\
 __pos IS NULL, toUInt128(0), \
 JSONHas(ifNull(__pos, ''), 'file'), bitOr(bitShiftLeft(toUInt128(toUInt64OrZero(extract(\
@@ -274,7 +274,9 @@ toUInt128(reinterpretAsUInt64(reverse(unhex(concat(\
 leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[1], 8, '0'), \
 leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[2], 8, '0')))))), \
 reinterpretAsUInt128(reverse(unhex(leftPad(JSONExtractString(ifNull(__pos, ''), 'lsn'), 32, '0')))))), \
-128), toUInt256(ifNull(__seq, -1) + 1))";
+128), toUInt256(ifNull(__seq, -1) + 1)) + toUInt256(throwIf(\
+__pos IS NOT NULL AND NOT (JSONHas(ifNull(__pos, ''), 'file') OR JSONHas(ifNull(__pos, ''), 'lsn')), \
+'rivet: unrecognised __pos shape — no source position to version this row by (ADR-0035 CH3)'))";
 
 /// A half-open window on the partition column, as typed SQL literals: `lo..hi_exclusive`
 /// selects the buffer's winners one MERGE takes, `all_lo..all_hi_exclusive` is the whole

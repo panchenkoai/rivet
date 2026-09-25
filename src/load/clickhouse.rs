@@ -850,6 +850,42 @@ mod tests {
         assert_eq!(got, "1\twin\n2\twin\n3\twin\n4\twin\n5\twin");
     }
 
+    /// A `__pos` of no known shape (a Mongo resume token) fails the insert loudly instead
+    /// of versioning the row 0, where insert order would decide the winner.
+    #[test]
+    #[ignore = "live: requires docker compose clickhouse"]
+    fn an_unknown_position_shape_fails_the_insert() {
+        unsafe { std::env::set_var("RIVET_CH_SHAPE_TEST_PASSWORD", "rivet") };
+        let db = format!("rivet_chshape_{}", std::process::id());
+        let loader = ClickhouseLoader::new(
+            "http://127.0.0.1:8123",
+            &db,
+            "rivet",
+            "RIVET_CH_SHAPE_TEST_PASSWORD",
+            crate::config::DestinationConfig::default(),
+        )
+        .cdc(true);
+        loader
+            .query(&format!("CREATE DATABASE IF NOT EXISTS {db}"))
+            .unwrap();
+        loader
+            .append_changelog("t", &[spec("id", "Int64")], &[], &["id".to_string()])
+            .unwrap();
+        let changes = loader.quoted("t__changes");
+        let insert = |pos: &str| {
+            loader.query(&format!(
+                "INSERT INTO {changes} (__op, __pos, __seq, id) VALUES ('update', {}, 0, 1)",
+                literal(pos)
+            ))
+        };
+        let known = insert(r#"{"lsn":"0/1"}"#);
+        let unknown = insert(r#"{"_data":"8263"}"#);
+        loader.query(&format!("DROP DATABASE {db}")).unwrap();
+        known.expect("a PostgreSQL LSN is versioned");
+        let e = format!("{:#}", unknown.expect_err("a resume token has no version"));
+        assert!(e.contains("unrecognised __pos shape"), "{e}");
+    }
+
     /// Through a named collection ClickHouse reads the part itself: columns match by
     /// name whatever their order, the count is the insert's own, and a NULL key refuses.
     #[test]
