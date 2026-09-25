@@ -426,9 +426,11 @@ source:
 
 ```
 peak_rss ≈ batch_size × avg_row_bytes × parallel_workers
+         + Σ distinct destination.oneshot_budget_mb   (64 MB when unset; cloud only)
 ```
 
-Add ~50–150 MB overhead for the Tokio runtime, the source connection pool, jemalloc bookkeeping, and the OS page cache on the temp file.
+The one-shot term is per rivet process: under `parallel_export_processes` each
+child adds its own. Add ~50–150 MB overhead for the Tokio runtime, the source connection pool, jemalloc bookkeeping, and the OS page cache on the temp file.
 
 ### Rule of thumb by table width
 

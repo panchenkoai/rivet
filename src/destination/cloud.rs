@@ -329,14 +329,11 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
         let size = std::fs::metadata(local_path)?.len();
-        // One-shot upload when the part fits this destination's memory budget:
-        // a single PUT (S3 `PutObject` / GCS upload / Azure `Put Blob`) makes the store
-        // compute and store a content checksum the listing then exposes for
-        // no-download verification.  This is what lets `--validate` md5-check
-        // Azure parts at all — Azure auto-computes `Content-MD5` only for a
-        // single `Put Blob`, never for the `Put Block List` the streaming
-        // writer produces (each `write()` past the first stages a block).
-        // Otherwise stream — memory-bounded, size-only for those parts.
+        // One-shot upload when the part fits this destination's memory budget: one
+        // PUT instead of a sequential multipart (5 MiB parts on S3/GCS, 256 KiB
+        // blocks on Azure), and on GCS / Azure a store-computed Content-MD5 that
+        // `--validate` checks with no download (Azure computes it only for a single
+        // `Put Blob`). Otherwise stream — memory-bounded, size-only for those parts.
         let outcome = if let Some(_reservation) = self.reserve_oneshot(size) {
             let body = std::fs::read(local_path)?;
             let meta = self.op.write(&key, body)?;

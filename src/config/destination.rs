@@ -48,12 +48,14 @@ pub struct DestinationConfig {
     pub allow_anonymous: bool,
     /// Cap on the RAM one-shot (single-PUT) upload buffers may hold, in MB
     /// (default 64; cloud destinations only). A one-shot PUT buffers the whole part;
-    /// on GCS and Azure the store then records a `Content-MD5` that `validate` checks
-    /// (S3 verifies size-only either way). A part that does not fit the remaining
-    /// budget streams instead (memory-bounded). `0` streams every non-empty part.
-    /// The cap is process-wide per value:
-    /// every destination with the same budget — including each table of a CDC
-    /// export — draws from one pool of that size, so it never multiplies.
+    /// on GCS and Azure the store then records a `Content-MD5` that `validate` checks,
+    /// and on every store it is one request instead of a sequential multipart (S3
+    /// verifies size-only either way). A part that does not fit the remaining budget
+    /// streams instead (memory-bounded). `0` streams every non-empty part.
+    /// Each distinct value is one pool per rivet process, shared by every destination
+    /// configured with it (including each table of a CDC export). Different values
+    /// are separate pools, so worst-case one-shot RAM is the sum of the distinct
+    /// values in use; under `parallel_export_processes` every child has its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oneshot_budget_mb: Option<u64>,
 }
