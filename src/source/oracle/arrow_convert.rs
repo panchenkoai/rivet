@@ -29,8 +29,8 @@ pub(super) const BARE_NUMBER_WARNING: &str = "NUMBER without declared precision 
      `columns: {ID: \"decimal(38,0)\"}`.";
 
 /// Warning attached to a `TIMESTAMP(7..9)` column truncated to microseconds.
-pub(super) const TIMESTAMP_NS_WARNING: &str = "TIMESTAMP(7..9) → Timestamp(microsecond): the sub-microsecond digits are truncated; \
-     TIMESTAMP(0..6) is exact.";
+pub(super) const TIMESTAMP_NS_WARNING: &str = "TIMESTAMP(7..9) / INTERVAL DAY TO SECOND(7..9) → microseconds: the sub-microsecond \
+     digits are truncated; a fractional precision of 0..6 is exact.";
 
 /// The Rivet type for one re-projected column; `native` is its DECLARED type
 /// (re-projection turns a zoned timestamp into a UTC `TIMESTAMP`, JSON into text).
@@ -48,6 +48,7 @@ pub(super) fn oracle_type_to_rivet(
         }
         _ if native.starts_with("interval") => RivetType::Interval,
         _ if native == "json" => RivetType::Json,
+        _ if native == "vector" || native == "object" || native == "xmltype" => RivetType::String,
         "DB_TYPE_NUMBER" => number_type(meta.precision(), meta.scale()),
         "DB_TYPE_BINARY_FLOAT" => RivetType::Float32,
         "DB_TYPE_BINARY_DOUBLE" => RivetType::Float64,
@@ -68,8 +69,8 @@ pub(super) fn oracle_type_to_rivet(
         other => RivetType::Unsupported {
             native_type: native_label(other),
             reason: format!(
-                "Oracle column type {} has no Rivet mapping; select it through a \
-                     conversion in a `query:` (e.g. TO_CHAR) or drop it",
+                "Oracle column type {} has no Rivet mapping; select a convertible \
+                     expression of it in a `query:`, or drop it",
                 native_label(other)
             ),
         },
@@ -77,16 +78,20 @@ pub(super) fn oracle_type_to_rivet(
 }
 
 /// NUMBER(p,s): small integers, then `Decimal`; bare `NUMBER`/`FLOAT` as exact text.
+/// Oracle's `s > p` and negative `s` are widened to the lossless decimal Parquet accepts.
 fn number_type(precision: u8, scale: i8) -> RivetType {
+    let decimal = |precision: u8, scale: i8| RivetType::Decimal { precision, scale };
     match (precision, scale) {
         // Bare NUMBER (p=0) and FLOAT(b) (scale -127): no fixed-scale decimal holds them.
         (0, _) | (_, -127) => RivetType::String,
         (1..=9, 0) => RivetType::Int32,
         (10..=18, 0) => RivetType::Int64,
-        (p, s) => RivetType::Decimal {
-            precision: p,
-            scale: s,
+        (p, s) if s < 0 => match p.checked_add(s.unsigned_abs()).filter(|w| *w <= 38) {
+            Some(w) => decimal(w, 0),
+            None => RivetType::String,
         },
+        (p, s) if s as u8 > p => decimal(s as u8, s),
+        (p, s) => decimal(p, s),
     }
 }
 
@@ -117,13 +122,22 @@ pub(super) fn oracle_type_mappings(
                 mapping
             } else if is_bare_number(m) {
                 mapping.with_warning(BARE_NUMBER_WARNING)
-            } else if native.starts_with("timestamp") && m.scale() > 6 {
-                mapping.with_warning(TIMESTAMP_NS_WARNING)
+            } else if sub_microsecond(native, m.scale()) {
+                TypeMapping {
+                    fidelity: crate::types::TypeFidelity::Lossy,
+                    ..mapping
+                }
+                .with_warning(TIMESTAMP_NS_WARNING)
             } else {
                 mapping
             }
         })
         .collect()
+}
+
+/// True for a TIMESTAMP / INTERVAL DAY TO SECOND whose fraction is finer than the µs rivet keeps.
+fn sub_microsecond(native: &str, scale: i8) -> bool {
+    (native.starts_with("timestamp") || native.starts_with("interval_ds")) && scale > 6
 }
 
 /// The Arrow schema for a result set; an error names every column without a mapping.
@@ -148,8 +162,7 @@ pub(super) fn oracle_schema(
     }
     if !errors.is_empty() {
         anyhow::bail!(
-            "Oracle export: {} column(s) have no safe type mapping — add column overrides in \
-             rivet.yaml (`columns:`):\n{}",
+            "Oracle export: {} column(s) have no safe type mapping:\n{}",
             errors.len(),
             errors.join("\n")
         );
@@ -167,19 +180,31 @@ fn interval_iso(row: &Row, idx: usize, db_type: &str) -> Result<Option<String>> 
                 + i64::from(v.nanoseconds()) / 1_000;
             crate::source::postgres::pg_interval_to_iso8601(0, v.days(), us)
         }),
-        _ => row.get::<Option<OracleIntervalYM>>(idx).ora()?.map(|v| {
-            crate::source::postgres::pg_interval_to_iso8601(
-                v.years() * 12 + i32::from(v.months()),
-                0,
-                0,
-            )
-        }),
+        _ => row
+            .get::<Option<OracleIntervalYM>>(idx)
+            .ora()?
+            .map(|v| interval_ym_iso(v.years(), i32::from(v.months()))),
     })
+}
+
+/// ISO 8601 for a YEAR TO MONTH interval, straight from its fields (YEAR(9) overflows i32 months).
+fn interval_ym_iso(years: i32, months: i32) -> String {
+    match (years, months) {
+        (0, 0) => "PT0S".to_string(),
+        (0, m) => format!("P{m}M"),
+        (y, 0) => format!("P{y}Y"),
+        (y, m) => format!("P{y}Y{m}M"),
+    }
 }
 
 /// Microseconds since the Unix epoch for an Oracle timestamp's fields, read as UTC.
 pub(super) fn timestamp_micros(t: &OracleTimestamp) -> Result<i64> {
-    let date = chrono::NaiveDate::from_ymd_opt(t.year() as i32, t.month() as u32, t.day() as u32)
+    // Oracle has no year 0 (-1 is 1 BC); chrono's proleptic year 0 is 1 BC.
+    let year = match t.year() as i32 {
+        y if y < 0 => y + 1,
+        y => y,
+    };
+    let date = chrono::NaiveDate::from_ymd_opt(year, t.month() as u32, t.day() as u32)
         .ok_or_else(|| anyhow::anyhow!("oracle: invalid date {t}"))?;
     let time = chrono::NaiveTime::from_hms_nano_opt(
         t.hour() as u32,
@@ -357,6 +382,18 @@ mod tests {
                 scale: 2
             }
         );
+        let dec = |precision, scale| RivetType::Decimal { precision, scale };
+        assert_eq!(number_type(3, 5), dec(5, 5), "s > p widens to (s,s)");
+        assert_eq!(
+            number_type(5, -2),
+            dec(7, 0),
+            "negative scale widens to integers"
+        );
+        assert_eq!(
+            number_type(38, -1),
+            RivetType::String,
+            "past 38 digits: exact text"
+        );
         assert_eq!(number_type(0, -127), RivetType::String, "bare NUMBER");
         assert_eq!(number_type(126, -127), RivetType::String, "FLOAT(126)");
     }
@@ -367,7 +404,27 @@ mod tests {
         assert_eq!(timestamp_micros(&t).unwrap(), 1_709_212_455_123_456);
         let bc = OracleTimestamp::new_date(-4712, 1, 1);
         assert!(timestamp_micros(&bc).unwrap() < 0);
+        // 1 BC = Oracle year -1; DuckDB's make_date(0, 6, 15) is the independent value.
+        let one_bc = OracleTimestamp::new_date(-1, 6, 15);
+        assert_eq!(timestamp_micros(&one_bc).unwrap(), -62_152_876_800_000_000);
         let max = OracleTimestamp::new_timestamp(9999, 12, 31, 23, 59, 59, 999_999_999);
         assert_eq!(timestamp_micros(&max).unwrap(), 253_402_300_799_999_999);
+    }
+
+    #[test]
+    fn a_year_to_month_interval_renders_past_the_i32_month_range() {
+        assert_eq!(interval_ym_iso(999_999_999, 11), "P999999999Y11M");
+        assert_eq!(interval_ym_iso(-999_999_999, -11), "P-999999999Y-11M");
+        assert_eq!(interval_ym_iso(0, -3), "P-3M");
+        assert_eq!(interval_ym_iso(2, 0), "P2Y");
+        assert_eq!(interval_ym_iso(0, 0), "PT0S");
+    }
+
+    #[test]
+    fn only_a_sub_microsecond_fraction_is_lossy() {
+        assert!(sub_microsecond("timestamp", 9));
+        assert!(sub_microsecond("interval_ds", 7));
+        assert!(!sub_microsecond("timestamp", 6));
+        assert!(!sub_microsecond("number", 9));
     }
 }

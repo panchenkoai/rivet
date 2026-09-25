@@ -42,9 +42,9 @@ impl<T> Ora<T> for std::result::Result<T, oracledb::Error> {
 /// An actionable hint for failures whose cause rivet has measured.
 fn known_failure_hint(msg: &str) -> Option<&'static str> {
     msg.contains("unknown TTC message type").then_some(
-        "the Oracle thin driver (oracledb 26.0.0-beta.4) lost protocol sync. rivet fetches \
-         with prefetch_rows=1, which avoids the known trigger (a LOB in a wide row with a \
-         larger prefetch); please report this query shape",
+        "the Oracle thin driver (oracledb 26.0.0-beta.4) lost protocol sync. rivet avoids \
+         both known triggers (prefetch_rows=1 for a LOB in a wide row; no statement cache, \
+         whose re-execution desyncs on wide rows); please report this query shape",
     )
 }
 
@@ -54,6 +54,9 @@ const SESSION_PIN: &[&str] = &[
     "ALTER SESSION SET TIME_ZONE = '+00:00'",
     "ALTER SESSION SET NLS_CALENDAR = 'GREGORIAN'",
     "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'",
+    // A keyset / cursor seek compares keys the way ORDER BY sorts them: bytewise.
+    "ALTER SESSION SET NLS_SORT = BINARY",
+    "ALTER SESSION SET NLS_COMP = BINARY",
     // A DATE cursor is rendered from a microsecond timestamp, so its fraction is always zero.
     "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD\"T\"HH24:MI:SS\".000000\"'",
     "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD\"T\"HH24:MI:SS.FF'",
@@ -150,7 +153,9 @@ pub(crate) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Connection> 
     let config = oracledb::Config::default()
         .set_credentials(&parts.user, &parts.password)
         .set_connect_string(&connect_string(&parts, tls)?)
-        .ora()?;
+        .ora()?
+        // Re-executing a cached statement over a wide row desyncs the beta driver.
+        .set_stmtcachesize(0);
     let conn = oracledb::connect(config)
         .ora()
         .map_err(|e| crate::source::describe_connect_error(url, e))?;
@@ -169,7 +174,9 @@ fn projection_expr(meta: &Metadata, quoted: &str) -> Option<Result<String>> {
         // from the driver's signed fields instead (arrow_convert::interval_iso).
         "DB_TYPE_ROWID" | "DB_TYPE_UROWID" => format!("ROWIDTOCHAR({quoted})"),
         "DB_TYPE_JSON" => format!("JSON_SERIALIZE({quoted} RETURNING CLOB)"),
-        "DB_TYPE_XMLTYPE" => format!("XMLSERIALIZE(CONTENT {quoted} AS CLOB)"),
+        // The driver describes XMLTYPE as DB_TYPE_OBJECT; any other object type fails here loudly.
+        "DB_TYPE_XMLTYPE" | "DB_TYPE_OBJECT" => format!("XMLSERIALIZE(CONTENT {quoted} AS CLOB)"),
+        "DB_TYPE_VECTOR" => format!("FROM_VECTOR({quoted} RETURNING CLOB)"),
         _ => return None,
     }))
 }
@@ -535,7 +542,7 @@ pub(crate) fn introspect_oracle_table_for_chunking(
         ))?;
     // Keyset keys: single-column UNIQUE indexes on NOT NULL columns of a type the
     // cursor reads back (integer NUMBER of any precision, bare NUMBER as exact text, strings, DATE,
-    // zone-less TIMESTAMP); PK first. Decimal keys are refused by exclusion.
+    // zone-less TIMESTAMP(0..6) — finer is read at µs); PK first. Decimal keys are refused by exclusion.
     let keyset_keys = src.query_list(&format!(
         "SELECT col FROM ( \
            SELECT ic.column_name col, \
@@ -553,7 +560,8 @@ pub(crate) fn introspect_oracle_table_for_chunking(
              AND ((tc.data_type = 'NUMBER' AND tc.data_precision IS NULL AND tc.data_scale IS NULL) \
                OR (tc.data_type = 'NUMBER' AND tc.data_scale = 0) \
                OR tc.data_type IN ('VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR', 'DATE') \
-               OR (tc.data_type LIKE 'TIMESTAMP%' AND tc.data_type NOT LIKE '%ZONE%')) \
+               OR (tc.data_type LIKE 'TIMESTAMP%' AND tc.data_type NOT LIKE '%ZONE%' \
+                   AND tc.data_scale <= 6)) \
            GROUP BY ic.column_name) ORDER BY is_pk DESC, col"
     ))?;
     Ok(crate::source::TableIntrospection {

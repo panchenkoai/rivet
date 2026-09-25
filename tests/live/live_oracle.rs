@@ -3,7 +3,7 @@
 //! `RAWTOHEX`, `DBMS_LOB.GETLENGTH`) read as text, compared cell by cell with the
 //! Parquet rivet wrote — never rivet's own summary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use arrow::array::{Array, AsArray};
@@ -53,7 +53,12 @@ fn render(a: &dyn Array, i: usize) -> Option<String> {
                 .as_primitive::<arrow::datatypes::TimestampMicrosecondType>()
                 .value(i);
             let dt = chrono::DateTime::from_timestamp_micros(us).unwrap();
-            canon_ts(&dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
+            // Oracle's SYYYY has no year 0 (-1 is 1 BC); chrono's year 0 is 1 BC.
+            let year = match chrono::Datelike::year(&dt) {
+                y if y <= 0 => y - 1,
+                y => y,
+            };
+            canon_ts(&format!("{year:04}{}", dt.format("-%m-%dT%H:%M:%S%.6f")))
         }
         DataType::Binary => a
             .as_binary::<i32>()
@@ -571,4 +576,170 @@ fn an_init_generated_config_keysets_a_number_19_key_past_i64() {
         150_001,
         "no row read twice"
     );
+}
+
+/// Keyset over the wide seeded ORDERS re-executes one page statement many times; every row lands once.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_over_a_wide_table_survives_many_page_reexecutions() {
+    require_alive(LiveService::Oracle);
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch("ORDERS")
+        .mode("chunked")
+        .export_line("chunk_by_key: ID")
+        .export_line("chunk_size: 7000")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let source: i64 = ora_text_rows("SELECT TO_CHAR(COUNT(*)) FROM ORDERS")[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()) as i64,
+        source,
+        "every row"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(out.path(), "count(DISTINCT \"ID\")", None),
+        source,
+        "no row twice"
+    );
+}
+
+/// Types past Arrow's direct reach: s > p, negative scale, YEAR(9) intervals, BC dates, XMLTYPE, VECTOR.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn edge_oracle_types_export_losslessly() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_edge",
+        "id NUMBER(10) PRIMARY KEY, nsp NUMBER(3,5), nneg NUMBER(5,-2), \
+         iym INTERVAL YEAR(9) TO MONTH, d DATE, x XMLTYPE, v VECTOR(3, FLOAT32)",
+    );
+    for row in [
+        "1, 0.00123, 12300, INTERVAL '999999999-11' YEAR(9) TO MONTH, \
+         TO_DATE('-0001-06-15','SYYYY-MM-DD'), XMLTYPE('<a>x</a>'), TO_VECTOR('[1.5, 2, -3]')",
+        "2, -0.00999, -9999900, INTERVAL '-999999999-11' YEAR(9) TO MONTH, \
+         TO_DATE('-4712-01-01','SYYYY-MM-DD'), NULL, NULL",
+        "3, NULL, NULL, INTERVAL '0-0' YEAR TO MONTH, TO_DATE('2024-02-29','YYYY-MM-DD'), NULL, NULL",
+    ] {
+        ora_exec(&format!("INSERT INTO {} VALUES ({row})", t.name()));
+    }
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    for col in ["NSP", "NNEG"] {
+        let want: BTreeMap<i64, Option<String>> =
+            oracle_cells(t.name(), &format!("TO_CHAR({col}, 'TM9')"))
+                .into_iter()
+                .map(|(k, v)| (k, v.map(|s| canon_num(s.trim()))))
+                .collect();
+        assert_eq!(
+            parquet_cells(out.path(), col),
+            want,
+            "{col} vs the database's TO_CHAR"
+        );
+    }
+    let iym = parquet_cells(out.path(), "IYM");
+    assert_eq!(iym[&1].as_deref(), Some("P999999999Y11M"));
+    assert_eq!(iym[&2].as_deref(), Some("P-999999999Y-11M"));
+    assert_eq!(iym[&3].as_deref(), Some("PT0S"));
+    // DuckDB renders the calendar date (with its own BC marker); Oracle renders the same.
+    let want_d: BTreeSet<String> = ora_text_rows(&format!(
+        "SELECT TO_CHAR(d, 'YYYY-MM-DD') || CASE WHEN d < DATE '0001-01-01' THEN ' (BC)' END FROM {}",
+        t.name()
+    ))
+    .into_iter()
+    .map(|r| r[0].clone().unwrap())
+    .collect();
+    assert_eq!(
+        duckdb_dir_parquet_distinct_strings(out.path(), "CAST(\"D\" AS DATE)"),
+        want_d
+    );
+    let x = parquet_cells(out.path(), "X");
+    assert_eq!(x[&1].as_deref().map(str::trim), Some("<a>x</a>"));
+    let v = parquet_cells(out.path(), "V");
+    let floats: Vec<f64> = serde_json::from_str(v[&1].as_deref().unwrap()).unwrap();
+    assert_eq!(floats, vec![1.5, 2.0, -3.0]);
+    assert_eq!(v[&2], None);
+}
+
+/// A logon trigger that makes comparison linguistic must not change what a keyset seek skips.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_linguistic_session_default_does_not_lose_keyset_rows() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_nls", "k VARCHAR2(20) PRIMARY KEY, n NUMBER");
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT p || LPAD(l, 4, '0'), l \
+         FROM (SELECT LEVEL l FROM dual CONNECT BY LEVEL <= 300) \
+         CROSS JOIN (SELECT 'a' p FROM dual UNION ALL SELECT 'A' FROM dual \
+                     UNION ALL SELECT TO_CHAR(UNISTR('\\00E4')) FROM dual UNION ALL SELECT 'Z' FROM dual)",
+        t.name()
+    ));
+    let trigger = format!("{}_LOGON", t.name());
+    ora_exec(&format!(
+        "CREATE OR REPLACE TRIGGER {trigger} AFTER LOGON ON rivet.SCHEMA BEGIN \
+         EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = GERMAN_CI'; \
+         EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = LINGUISTIC'; END;"
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: K")
+        .export_line("chunk_size: 70")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    ora_exec(&format!("DROP TRIGGER {trigger}"));
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(duckdb_total_parquet_rows(out.path()), 1200, "every row");
+    assert_eq!(
+        duckdb_dir_scalar(out.path(), "count(DISTINCT \"K\")", None),
+        1200,
+        "no row twice"
+    );
+}
+
+/// A TIMESTAMP(9) key is read at microseconds, so keyset on it is refused rather than looping.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn keyset_on_a_timestamp_9_key_fails_loudly_instead_of_looping() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_ts9", "t9 TIMESTAMP(9) PRIMARY KEY, n NUMBER");
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT TIMESTAMP '2024-01-01 00:00:00.123456000' \
+         + NUMTODSINTERVAL(LEVEL / 1e9, 'SECOND'), LEVEL FROM dual CONNECT BY LEVEL <= 50",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: T9")
+        .export_line("chunk_size: 7")
+        .dest_path(out.path().to_path_buf())
+        .run_with_envs_bounded(&[], std::time::Duration::from_secs(60))
+        .expect("keyset on a TIMESTAMP(9) key must end, not loop");
+    assert!(
+        !run.status.success(),
+        "a microsecond-read TIMESTAMP(9) key must be refused"
+    );
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(err.contains("T9"), "the refusal names the key:\n{err}");
 }

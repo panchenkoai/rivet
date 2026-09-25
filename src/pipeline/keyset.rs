@@ -655,12 +655,14 @@ fn run_keyset_parallel(
                     local_checks.push(page.checksums);
                     let last_page = is_last_page(page.rows, page_size);
                     if !last_page {
-                        cursor = Some(page.next_cursor.ok_or_else(|| {
+                        let next = page.next_cursor.ok_or_else(|| {
                             anyhow::anyhow!(
                                 "could not advance the '{key_r}' cursor at page {pages} \
                                  (NULL or unsupported type)"
                             )
-                        })?);
+                        })?;
+                        ensure_cursor_advanced(cursor.as_deref(), &next, key_r, pages)?;
+                        cursor = Some(next);
                     }
                     pages += 1;
                     if last_page {
@@ -829,6 +831,17 @@ fn nothing_past_anchor(anchor: Option<&str>, cur_max: Option<&str>) -> bool {
 /// Did the sampler collapse a requested parallel fan-out to a single range?
 fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
     parallel > 1 && total_ranges == 1
+}
+
+/// Refuse a full page whose last key renders equal to the previous bound: the seek would re-read it for ever.
+fn ensure_cursor_advanced(prev: Option<&str>, next: &str, key: &str, page: usize) -> Result<()> {
+    anyhow::ensure!(
+        prev != Some(next),
+        "keyset page {page} ended on the same '{key}' value it started after ({next}): the key's \
+         rendering is coarser than its values (e.g. a TIMESTAMP(7..9) read at microseconds), so the \
+         seek cannot advance. Page on a unique key rivet reads exactly."
+    );
+    Ok(())
 }
 
 /// A short page means the key range is exhausted.
@@ -1127,7 +1140,10 @@ pub(crate) fn run_keyset(
         // unsupported type), we must NOT loop on the same bound — that would
         // re-read the same page forever.
         match page.next_cursor {
-            Some(v) => last = Some(v),
+            Some(v) => {
+                ensure_cursor_advanced(last.as_deref(), &v, &kp.key_column, pages - 1)?;
+                last = Some(v)
+            }
             None => {
                 // Failure forensics (v18): stamp the LAST key we did read — the
                 // boundary just before the unadvanceable row. With `cursor_high`
@@ -1199,6 +1215,21 @@ pub(crate) fn run_keyset(
 mod tests {
     use super::*;
     use crate::config::SourceType;
+
+    #[test]
+    fn a_page_that_ends_on_its_start_bound_is_refused() {
+        assert!(
+            ensure_cursor_advanced(
+                Some("2024-01-01T00:00:00.123456"),
+                "2024-01-01T00:00:00.123456",
+                "T9",
+                3
+            )
+            .is_err()
+        );
+        assert!(ensure_cursor_advanced(Some("7"), "14", "ID", 1).is_ok());
+        assert!(ensure_cursor_advanced(None, "7", "ID", 0).is_ok());
+    }
 
     // ── seek_tag: the sequential-checkpoint part-name identity ────────────────
     const FNV_ID_000300: &str = "c4c7be0f3cc9638a"; // FNV-1a of "id-000300", pinned
