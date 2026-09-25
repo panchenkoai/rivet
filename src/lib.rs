@@ -115,3 +115,4 @@ pub mod preflight;
 pub(crate) mod quality;
 pub(crate) mod scalar;
 pub(crate) mod sql;
+pub(crate) mod workers;

@@ -92,54 +92,50 @@ pub(crate) fn multi_export_concurrent() -> bool {
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
 }
 
+/// Whether a CDC export's snapshot legs fan out: asked for, and not already inside a parallel export run, where the two pools would nest past the ceiling.
+pub(crate) fn snapshots_fan_out(parallel_requested: bool, exports_run_in_parallel: bool) -> bool {
+    parallel_requested && !exports_run_in_parallel
+}
+
 /// One export's result and summary, as `job::run_export_job` returns them.
 pub(crate) type ExportOutcome = (Result<()>, RunSummary);
 
-/// Run every export on up to the pool ceiling of threads, each on its own state connection; outcomes in input order, plus the worker count.
+/// Run every export on the shared worker pool (`workers::run_workers`), one state connection per worker; outcomes in input order, plus the worker count.
 pub(crate) fn run_export_pool(
     config_path: &str,
     exports: &[&ExportConfig],
     run: impl Fn(&ExportConfig, &StateStore) -> ExportOutcome + Sync,
 ) -> (Vec<ExportOutcome>, usize) {
-    let workers = crate::load::pool::effective_pool(None, exports.len());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let finished: std::sync::Mutex<Vec<(usize, ExportOutcome)>> =
-        std::sync::Mutex::new(Vec::with_capacity(exports.len()));
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&export) = exports.get(i) else {
-                            break;
-                        };
-                        let outcome = match StateStore::open(config_path) {
-                            Ok(state) => run(export, &state),
-                            Err(e) => {
-                                let err = anyhow::anyhow!(
-                                    "export '{}': failed to open state database: {:#}",
-                                    export.name,
-                                    e
-                                );
-                                let summary = job::synthetic_failed_summary(&export.name, &err);
-                                (Err(err), summary)
-                            }
-                        };
-                        finished.lock().unwrap().push((i, outcome));
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            if let Err(payload) = h.join() {
-                std::panic::resume_unwind(payload);
+    let workers = crate::workers::effective_pool(None, exports.len());
+    let outcomes = crate::workers::run_workers(
+        exports,
+        workers,
+        || match StateStore::open(config_path) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                log::error!("export worker: failed to open the state database: {e:#}");
+                None
             }
-        }
-    });
-    let mut finished = finished.into_inner().unwrap();
-    finished.sort_by_key(|(i, _)| *i);
-    (finished.into_iter().map(|(_, o)| o).collect(), workers)
+        },
+        |state, _, export| Ok(run(export, state)),
+        |export| {
+            let err = anyhow::anyhow!(
+                "export '{}': no worker could run it (a state database open failed or the worker panicked)",
+                export.name
+            );
+            let summary = job::synthetic_failed_summary(&export.name, &err);
+            Box::new((Err(err), summary))
+        },
+    );
+    let outcomes = outcomes
+        .into_iter()
+        .map(
+            |o: std::result::Result<ExportOutcome, Box<ExportOutcome>>| {
+                o.unwrap_or_else(|lost| *lost)
+            },
+        )
+        .collect();
+    (outcomes, workers)
 }
 
 /// Swaps the render flags in for one run and restores the previous values on drop, panic included.
@@ -542,13 +538,15 @@ pub fn run(
         selected
     };
 
+    let parallel_requested = parallel_exports_cli || config.parallel_exports;
+    let run_parallel = parallel_requested && export_name.is_none() && exports.len() > 1;
     let opts = RunOptions {
         validate,
         reconcile,
         resume,
         force,
         params,
-        parallel_snapshots: parallel_exports_cli || config.parallel_exports,
+        parallel_snapshots: snapshots_fan_out(parallel_requested, run_parallel),
     };
 
     // Seeds the card-table name column so it aligns from the first redraw
@@ -658,10 +656,6 @@ pub fn run(
         return result;
     }
 
-    let run_parallel = (parallel_exports_cli || config.parallel_exports)
-        && export_name.is_none()
-        && exports.len() > 1;
-
     // Compact-rendering hints for the per-export renderers.  Set once here so
     // every code path below — sequential, `--parallel-exports`, the apply
     // path, etc. — sees a consistent mode.  Restored at the end of the run
@@ -714,15 +708,10 @@ pub fn run(
         // (same bracket as the pool and the process-parallel parent).
         let (run_harm, window_start) = RunHarmBracket::open(&config.source);
         started_at = window_start;
-        let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
-            std::sync::Mutex::new(Vec::with_capacity(exports.len()));
-        let (outcomes, workers) = run_export_pool(config_path, &exports, |export, state| {
+        let (collected, workers) = run_export_pool(config_path, &exports, |export, state| {
             job::run_export_job(config_path, &config, export, state, &config_dir, &opts)
         });
-        // Every worker is spawned before any finishes its first export, so the
-        // worker count IS the overlap this run reached.
         peak_concurrency = peak_concurrency.max(workers);
-        collected.lock().unwrap().extend(outcomes);
 
         // All exports are done → drop the sender so `parent_ui::run_ui`
         // sees the channel close and exits cleanly (committing the final
@@ -737,7 +726,7 @@ pub fn run(
             exports: exports.len(),
         });
 
-        for (res, summary) in collected.into_inner().unwrap() {
+        for (res, summary) in collected {
             if let Err(e) = res {
                 failures.push(e);
             }
@@ -2226,6 +2215,26 @@ mod render_guard_tests {
         );
         assert!(!multi_export_mode());
         assert!(!MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_fan_out_tests {
+    use super::snapshots_fan_out;
+
+    /// Snapshot legs fan out only when parallelism was asked for AND the exports themselves
+    /// are not already running in parallel — nested, the two pools would reach 16 × 16.
+    #[test]
+    fn snapshots_fan_out_only_outside_a_parallel_export_run() {
+        assert!(
+            snapshots_fan_out(true, false),
+            "a lone CDC export fans its snapshots out"
+        );
+        assert!(
+            !snapshots_fan_out(true, true),
+            "inside a parallel export run the snapshots stay sequential"
+        );
+        assert!(!snapshots_fan_out(false, false), "no flag, no fan-out");
     }
 }
 

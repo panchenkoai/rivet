@@ -26,6 +26,7 @@ mod state;
 mod test_hook;
 mod tuning;
 mod types;
+mod workers;
 
 fn main() {
     // F-NEW-F (0.7.5 audit): default log level was `error`, so every

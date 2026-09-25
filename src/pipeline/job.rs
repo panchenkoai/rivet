@@ -1566,7 +1566,7 @@ fn run_export_job_inner(
         let outcomes = if opts.parallel_snapshots && pending.len() > 1 {
             // The batch pool `--parallel-exports` runs on: every leg runs, each on its
             // own state connection, and a finished snapshot is recorded as it lands.
-            let _flags = super::run::RenderFlags::set(true, Some(true));
+            let _flags = super::run::RenderFlags::set(super::run::multi_export_mode(), Some(true));
             let legs: Vec<&ExportConfig> = pending.iter().collect();
             let (outcomes, _) = super::run::run_export_pool(config_path, &legs, |synth, own| {
                 let outcome = run_export_job(config_path, config, synth, own, config_dir, opts);

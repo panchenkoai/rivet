@@ -295,50 +295,6 @@ pub fn create_destination_for_probe(config: &DestinationConfig) -> Result<Box<dy
     }
 }
 
-/// Object-store calls in flight at once when one step fans out over many tables' prefixes.
-pub(crate) const OBJECT_STORE_FANOUT: usize = 16;
-
-/// Apply `f` to every item on up to [`OBJECT_STORE_FANOUT`] threads, results in input order; after the first error no new item starts (its slot is `None`).
-pub(crate) fn map_concurrently<T: Sync, R: Send>(
-    items: &[T],
-    f: impl Fn(&T) -> Result<R> + Sync,
-) -> Vec<Option<Result<R>>> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let slots: Vec<std::sync::Mutex<Option<Result<R>>>> =
-        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..OBJECT_STORE_FANOUT.min(items.len()) {
-            scope.spawn(|| {
-                while !failed.load(Ordering::Relaxed) {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(i) else {
-                        break;
-                    };
-                    let outcome = f(item);
-                    if outcome.is_err() {
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                    *slots[i].lock().expect("result slot poisoned") = Some(outcome);
-                }
-            });
-        }
-    });
-    slots
-        .into_iter()
-        .map(|slot| slot.into_inner().expect("result slot poisoned"))
-        .collect()
-}
-
-/// [`map_concurrently`] for calls with nothing to return: the first error, by item order, is the result.
-pub(crate) fn for_each_concurrently<T: Sync>(
-    items: &[T],
-    f: impl Fn(&T) -> Result<()> + Sync,
-) -> Result<()> {
-    map_concurrently(items, f).into_iter().flatten().collect()
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -536,31 +492,5 @@ mod tests {
         let dest = create_destination(&config).unwrap();
         let caps = dest.capabilities();
         assert_eq!(caps.commit_protocol, WriteCommitProtocol::Streaming);
-    }
-
-    /// Fanned-out calls overlap: the first item can only finish once the second has started.
-    #[test]
-    fn for_each_concurrently_overlaps_calls_and_returns_the_first_error() {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let (tx, rx) = (std::sync::Mutex::new(tx), std::sync::Mutex::new(rx));
-        let items = [0, 1];
-        for_each_concurrently(&items, |&i| {
-            if i == 0 {
-                rx.lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .map_err(|_| anyhow::anyhow!("item 1 never ran while item 0 was in flight"))
-            } else {
-                tx.lock().unwrap().send(()).map_err(Into::into)
-            }
-        })
-        .expect("two writes must be in flight at once");
-
-        let err = for_each_concurrently(&[1, 2, 3], |&i| {
-            anyhow::ensure!(i != 2, "item {i} refused");
-            Ok(())
-        })
-        .expect_err("a failed write is the result");
-        assert!(err.to_string().contains("item 2 refused"), "{err}");
     }
 }

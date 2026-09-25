@@ -334,25 +334,22 @@ fn roll_all(
     }
     let uploaded = {
         let view: Vec<&TableSink<'_>> = pending.iter().map(|&i| &sinks[i]).collect();
-        crate::destination::map_concurrently(&view, |s| {
-            s.encode_and_upload(engine, format, run_token)
-        })
+        crate::workers::run_each(&view, |s| s.encode_and_upload(engine, format, run_token))
     };
     // Every part that reached the store is recorded, even when a sibling's upload
     // failed: it is durable either way, and the error still stops the ack below.
     let mut first_err = None;
     for (i, outcome) in pending.into_iter().zip(uploaded) {
         match outcome {
-            Some(Ok((part, sums))) => sinks[i].record_part(
+            Ok((part, sums)) => sinks[i].record_part(
                 part,
                 sums,
                 format,
                 state.map(|st| (st, export_name, run_id)),
             ),
-            Some(Err(e)) => {
+            Err(e) => {
                 first_err.get_or_insert(e);
             }
-            None => {}
         }
     }
     if let Some(e) = first_err {
@@ -390,9 +387,11 @@ fn roll_all(
                 (s.out.dest, manifest)
             })
             .collect();
-        crate::destination::for_each_concurrently(&pending, |(dest, manifest)| {
+        crate::workers::run_each(&pending, |(dest, manifest)| {
             write_manifest_without_success_marker(*dest, manifest).map(|_| ())
-        })?;
+        })
+        .into_iter()
+        .collect::<Result<()>>()?;
         drop(pending);
         for i in dirty {
             sinks[i].manifested_parts = sinks[i].parts.len();
@@ -659,9 +658,11 @@ pub(crate) fn run_to_files(
             .zip(&manifests)
             .map(|(s, m)| (s.out.dest, m))
             .collect();
-        crate::destination::for_each_concurrently(&jobs, |(dest, manifest)| {
+        crate::workers::run_each(&jobs, |(dest, manifest)| {
             write_manifest(*dest, manifest).map(|_| ())
         })
+        .into_iter()
+        .collect::<Result<()>>()
         .err()
     } else {
         None

@@ -680,9 +680,12 @@ fn run_cdc_inner(
     // Finding #44, early check: refuse BEFORE the first part lands if a prefix
     // belongs to the other pipeline shape (config error, fail the run cleanly —
     // the write-seam guard stays as the backstop). One read per table, fanned out.
-    if let Err(e) = crate::destination::for_each_concurrently(&wired, |(_, dest, _)| {
+    if let Err(e) = crate::workers::run_each(&wired, |(_, dest, _)| {
         crate::manifest::guard_manifest_mode(dest.as_ref(), "cdc")
-    }) {
+    })
+    .into_iter()
+    .collect::<Result<()>>()
+    {
         return (Vec::new(), Err(e));
     }
     // `columns:` type overrides, narrowed per table: bare keys apply to every
