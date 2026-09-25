@@ -25,6 +25,7 @@
 //! | `keyset_after_open_before_first_page` | `keyset.rs` (fresh run opened, no page committed — stale-cursor recovery guard) | `RIVET_TEST_PANIC_AT=keyset_after_open_before_first_page` |
 //! | `keyset_after_data_complete` | `keyset.rs` (all pages committed, resume anchor cleared — post-data-failure guard) | `RIVET_TEST_PANIC_AT=keyset_after_data_complete` |
 //! | `compact_before_merge` | `load/bigquery/mod.rs` (buffer read, nothing merged yet — the buffer must survive) | `RIVET_TEST_PANIC_AT=compact_before_merge` |
+//! | `load_after_append` | `load/mod.rs` (changes appended and the view built, the load not yet recorded — the next load re-appends) | `RIVET_TEST_PANIC_AT=load_after_append` |
 //! | `compact_after_merge` | `load/bigquery/mod.rs` (MERGEs + DROP already committed) | `RIVET_TEST_PANIC_AT=compact_after_merge` |
 //!
 //! # Test usage

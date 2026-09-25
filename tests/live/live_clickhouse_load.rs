@@ -248,3 +248,39 @@ fn a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
     load(&rig);
     assert_view_is(&view, source(), "2");
 }
+
+/// A load that dies after appending but before recording itself re-appends every
+/// part on the next load: the copies share key and version, so the view is
+/// unchanged and the count gate still passes.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_load_that_dies_after_appending_is_re_run_without_duplicating_the_view() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_crash", 5);
+    let db = Db::new("rivet_tmp_ch");
+    let rig = into_clickhouse(Rig::mysql_cdc(&tbl), &db);
+    let view = format!("{}.{tbl}", db.0);
+    rig.run_ok();
+
+    let crashed = rig.load_args_env(
+        &[],
+        &[
+            (PASSWORD_ENV, CLICKHOUSE_PASSWORD),
+            ("RIVET_TEST_PANIC_AT", "load_after_append"),
+        ],
+    );
+    assert!(
+        !crashed.status.success(),
+        "the fault hook must stop the first load"
+    );
+    ch(&format!("SYSTEM STOP MERGES {view}__changes"));
+    load(&rig);
+
+    let physical: u64 = ch(&format!("SELECT count() FROM {view}__changes"))
+        .parse()
+        .expect("count");
+    assert_eq!(physical, 10, "the re-run appended every row a second time");
+    assert_view_is(&view, source_rows(&tbl), "");
+}

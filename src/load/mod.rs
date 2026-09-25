@@ -762,6 +762,7 @@ fn append_and_view(
     }
 
     build_view(loader)?;
+    crate::test_hook::maybe_panic_at("load_after_append");
     // Cleanup runs here (inside the driver, after the gate), BEFORE the caller
     // records the ledger in `execute_load`. A crash between the two re-appends
     // this run next load — an at-least-once double-append the dedup view absorbs
