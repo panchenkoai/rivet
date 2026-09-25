@@ -50,8 +50,8 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       nextest_outcomes, nextest_passed, port_of, release_bin_env, rivet, rivet_bin,
-                       run, sqlcmd)
+                       nextest_filter, nextest_outcomes, nextest_passed, port_of, release_bin_env,
+                       rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         docker,
         docker_exec,
         have,
+        nextest_filter,
         nextest_outcomes,
         nextest_passed,
         port_of,
@@ -72,6 +73,7 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         rivet_bin,
         run,
         sqlcmd,
+        test_passed,
     )
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
@@ -1346,7 +1348,7 @@ def _drive_live_tests(
     skip_log.write_text("")
     # `test(=X)` matches the FULL nextest name (`<module>::<fn>`), so the bare
     # fn name never matches; anchor the regex form at the end instead.
-    expr = " or ".join(f"test(/{t}$/)" for t in tests)
+    expr = nextest_filter(tests)
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", expr],
@@ -1362,7 +1364,7 @@ def _drive_live_tests(
     # as "this named test never passed" and failed the row (gate #9, the gremlin
     # binlog-cut cell, green in gate #8 and green in its own log here).
     passed = nextest_passed(res.out)
-    missing = [t for t in tests if not any(p.endswith(t) or p == t for p in passed)]
+    missing = [t for t in tests if not test_passed(t, passed)]
     skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
     if missing:
         _failed(

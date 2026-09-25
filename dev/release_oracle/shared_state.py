@@ -22,10 +22,11 @@ project/bucket or `gcloud` (the REST token).
 from __future__ import annotations
 
 import os
+import socket
 import re
 from collections.abc import Callable
 
-from .core import Ledger, ROOT, have, nextest_passed, rivet_bin, run
+from .core import Ledger, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
 
 TESTS = (
     "same_named_configs_share_a_postgres_state_cdc_cycle",
@@ -33,32 +34,49 @@ TESTS = (
 )
 
 
+def _listening(port: int) -> bool:
+    """Whether something accepts TCP connections on localhost:`port`."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
-                  cell: Callable[[str], str], msg: Callable[[str], str]) -> None:
-    """Run live Rig tests against the gate binary; grade each by cargo's own verdict line."""
-    state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL") or ""
-    proj = os.environ.get("BQ_ORACLE_PROJECT") or run(["gcloud", "config", "get-value", "project"]).stdout.strip()
-    bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
-    missing = [w for w, ok in (
-        ("cargo", have("cargo")), ("gcloud", have("gcloud")),
-        ("Postgres state URL", state.startswith("postgres")), ("BigQuery project", bool(proj)),
-    ) if not ok]
+                  cell: Callable[[str], str], msg: Callable[[str], str], *,
+                  cloud: bool = True, services: tuple[tuple[str, int], ...] = ()) -> None:
+    """Run live Rig tests against the gate binary; grade each by cargo's own verdict line.
+
+    `cloud` cells need the BigQuery project, `gcloud` and a Postgres state URL; `services`
+    are local ports the tests need. A missing one is a SKIP naming it, never a FAIL.
+    """
+    env = {"RIVET_BIN_OVERRIDE": str(rivet_bin())}
+    checks = [("cargo", have("cargo"))]
+    if cloud:
+        state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL") or ""
+        proj = os.environ.get("BQ_ORACLE_PROJECT") or (
+            run(["gcloud", "config", "get-value", "project"]).stdout.strip() if have("gcloud") else "")
+        checks += [("gcloud", have("gcloud")), ("Postgres state URL", state.startswith("postgres")),
+                   ("BigQuery project", bool(proj))]
+        env.update({
+            "RIVET_TEST_STATE_URL": state,
+            "BIGQUERY_TEST_PROJECT": proj,
+            "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test"),
+        })
+    checks += [(f"{name} (:{port})", _listening(port)) for name, port in services]
+    missing = [w for w, ok in checks if not ok]
     if missing:
         led.skipped("-", scenario, "rig", "postgres",
-                    f"{scenario}: cannot run — missing {', '.join(missing)}", "prereq")
+                    f"{scenario}: cannot run — missing {', '.join(missing)}",
+                    f"prereq: {', '.join(missing)}")
         return
-    env = {
-        "RIVET_TEST_STATE_URL": state,
-        "BIGQUERY_TEST_PROJECT": proj,
-        "RIVET_TEST_GCS_BUCKET": bucket,
-        "RIVET_BIN_OVERRIDE": str(rivet_bin()),
-    }
     # nextest, not plain `cargo test`: tests/live_suite.rs's own header says the
     # per-test process isolation this consolidated suite depends on is GONE under
     # the default libtest harness, where `--test-threads=1` was the mitigation.
     # `test(=X)` matches the FULL `<module>::<fn>` name, so the bare fn name never
     # matches — anchor the regex form at the end instead (same as _drive_live_tests).
-    expr = " or ".join(f"test(/{t}$/)" for t in tests)
+    expr = nextest_filter(tests)
     p = run(["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
              "--test", "live_suite", "--run-ignored", "all", "-E", expr],
             cwd=ROOT, env=env, timeout=None)
@@ -67,7 +85,7 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     # nextest's own summary counts it green ("6 passed (2 leaky)").
     passed = nextest_passed(out)
     for name in tests:
-        if any(q.endswith(name) or q == name for q in passed):
+        if test_passed(name, passed):
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
         else:
             # From the test's captured-output block (`--- STDOUT/STDERR: … <name> ---`):

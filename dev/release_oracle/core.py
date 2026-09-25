@@ -507,3 +507,13 @@ def verify_nextest_grading(led: "Ledger") -> None:
     else:
         led.passed("-", "harness", "nextest-grading", "-",
                    "nextest parser: FAIL + LEAK is red, LEAK green, SLOW not final", "ok")
+
+
+def nextest_filter(tests: Sequence[str]) -> str:
+    """A nextest `-E` expression selecting exactly these test fns, by their whole last path segment."""
+    return " or ".join(f"test(/(^|::){t}$/)" for t in tests)
+
+
+def test_passed(name: str, passed: set[str]) -> bool:
+    """Whether the test fn `name` is among `passed` — a whole path segment, never a suffix of another name."""
+    return any(q == name or q.endswith("::" + name) for q in passed)

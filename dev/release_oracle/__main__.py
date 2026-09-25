@@ -233,6 +233,17 @@ def _self_test() -> int:
     why = nextest_grading_error()
     assert why is None, why
     print("self-test ok: a FAIL + LEAK line is a failure, a LEAK line a pass, SLOW is not final")
+    # A Rig cell whose local service is down is a SKIP naming it, and needs no cloud.
+    from .shared_state import run_rig_tests
+    probe = Ledger(colour=False)
+    run_rig_tests(probe, "probe", ("t",), cell=str, msg=str, cloud=False, services=(("nothing", 1),))
+    skipped = [c for c in probe.cells if c.status == Status.SKIP]
+    assert len(probe.cells) == 1 and skipped and "nothing (:1)" in skipped[0].detail, probe.cells
+    print("self-test ok: a Rig cell with a service down SKIPs naming it, without cloud prerequisites")
+    from .core import nextest_filter, test_passed
+    assert test_passed("t", {"m::t"}) and not test_passed("t", {"m::at", "m::t_x"}), "suffix match"
+    assert nextest_filter(["t"]) == "test(/(^|::)t$/)"
+    print("self-test ok: a test is matched by its whole name, never by a suffix of another")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 

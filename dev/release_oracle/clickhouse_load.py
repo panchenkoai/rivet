@@ -22,6 +22,9 @@ CELLS = {
     "a_full_load_into_clickhouse_replaces_the_table_with_the_current_source": "full",
     "an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_rows": "incremental",
     "init_clickhouse_flags_scaffold_the_load_block_and_require_each_other": "init",
+    "a_changed_load_pk_is_refused_before_it_rekeys_the_change_log": "rekey-refused",
+    "a_materialized_view_on_the_change_log_does_not_break_the_count": "mv-count",
+    "uuid_json_time_and_array_columns_load_with_their_values": "types",
 }
 
 
@@ -31,4 +34,7 @@ def verify_clickhouse_load(led: Ledger) -> None:
         led, "clickhouse", tuple(CELLS),
         cell=CELLS.__getitem__,
         msg=lambda n: f"clickhouse[{CELLS[n]}] · {n.replace('_', ' ')}",
+        cloud=False,
+        services=(("clickhouse", 8123), ("fake-gcs", 4443), ("postgres", 5432),
+                  ("postgres-cdc", 5434), ("mysql-cdc", 3307), ("mssql-cdc", 1434)),
     )
