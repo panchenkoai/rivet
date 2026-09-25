@@ -762,12 +762,24 @@ mod clickhouse {
                 }
             }
             RivetType::Date => Resolved::ok("Date32"),
-            // No time-of-day type; Time64 autoloads as Int64 (µs of day). There is
-            // no native type to recover to — fix at source if a real time matters.
-            RivetType::Time { .. } => Resolved::warn(
-                "Int64",
-                "ClickHouse has no TIME type; time-of-day autoloads as Int64 (µs of day)",
-            ),
+            // No time-of-day type: an Int64 column keeps whole seconds only (measured:
+            // 13:45:07.123456 -> 49507); Decimal64 keeps the fraction (49507.123456).
+            RivetType::Time { unit } => {
+                let p = match unit {
+                    TimeUnit::Second => 0,
+                    TimeUnit::Millisecond => 3,
+                    TimeUnit::Microsecond => 6,
+                    TimeUnit::Nanosecond => 9,
+                };
+                Resolved::diverge(
+                    format!("Decimal64({p})"),
+                    "Int64",
+                    "ClickHouse has no TIME type: rivet load declares seconds since midnight as \
+                     Decimal64, keeping the fraction; a plain Parquet autoload reads Int64 whole \
+                     seconds",
+                    None,
+                )
+            }
             // DateTime64 holds both naive and tz timestamps natively (verified:
             // naive -> DateTime64(6), tz -> DateTime64(6, 'UTC')).
             RivetType::Timestamp { unit, timezone } => {
@@ -777,10 +789,15 @@ mod clickhouse {
                     TimeUnit::Microsecond => 6,
                     TimeUnit::Nanosecond => 9,
                 };
-                match timezone {
-                    Some(tz) => Resolved::ok(format!("DateTime64({p}, '{tz}')")),
-                    None => Resolved::ok(format!("DateTime64({p})")),
-                }
+                let ty = match timezone {
+                    Some(tz) => format!("DateTime64({p}, '{tz}')"),
+                    None => format!("DateTime64({p})"),
+                };
+                Resolved::warn(
+                    ty,
+                    "DateTime64 holds 1900-01-01 to 2299-12-31; a value outside loads clamped to \
+                     the nearest end",
+                )
             }
             RivetType::String | RivetType::Text | RivetType::Enum => Resolved::ok("String"),
             // ClickHouse String holds arbitrary bytes, so bytea/blob round-trips
@@ -818,7 +835,11 @@ mod clickhouse {
                         inner_r.target_type
                     ))
                 } else {
-                    Resolved::ok(format!("Array(Nullable({}))", inner_r.target_type))
+                    Resolved::warn(
+                        format!("Array(Nullable({}))", inner_r.target_type),
+                        "a ClickHouse Array cannot be NULL: a NULL list loads as [], the same \
+                         value as an empty list",
+                    )
                 }
             }
             RivetType::Unsupported { .. } => Resolved::fail(unsupported_reason(t)),
@@ -1312,13 +1333,42 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_time_autoloads_as_int64() {
-        // ClickHouse has no TIME type; time-of-day autoloads as Int64 (µs of day).
+    fn clickhouse_time_loads_as_decimal_seconds_of_day() {
+        // No TIME type: Int64 keeps whole seconds only, Decimal64(6) keeps the µs.
         let s = ch(&RivetType::Time {
             unit: super::super::TimeUnit::Microsecond,
         });
+        assert_eq!(s.target_type, "Decimal64(6)");
         assert_eq!(s.autoload_type, "Int64");
         assert_eq!(s.status, TargetStatus::Warn);
+    }
+
+    #[test]
+    fn clickhouse_says_what_its_timestamps_and_arrays_cannot_hold() {
+        let ts = ch(&RivetType::Timestamp {
+            unit: super::super::TimeUnit::Microsecond,
+            timezone: None,
+        });
+        assert_eq!(
+            (ts.target_type.as_str(), ts.status),
+            ("DateTime64(6)", TargetStatus::Warn)
+        );
+        assert!(
+            ts.note
+                .as_deref()
+                .unwrap_or("")
+                .contains("1900-01-01 to 2299-12-31")
+        );
+        let list = ch(&RivetType::List {
+            inner: Box::new(RivetType::Int32),
+        });
+        assert_eq!(list.status, TargetStatus::Warn);
+        assert!(
+            list.note
+                .as_deref()
+                .unwrap_or("")
+                .contains("a NULL list loads as []")
+        );
     }
 
     #[test]
@@ -1329,7 +1379,11 @@ mod tests {
             timezone: None,
         });
         assert_eq!(s.target_type, "DateTime64(9)");
-        assert_eq!(s.status, TargetStatus::Ok);
+        assert_eq!(
+            s.status,
+            TargetStatus::Warn,
+            "the 1900-2299 range is said, not hidden"
+        );
     }
 
     #[test]

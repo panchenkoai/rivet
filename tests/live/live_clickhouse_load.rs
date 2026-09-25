@@ -476,3 +476,50 @@ fn a_materialized_view_on_the_change_log_does_not_break_the_count() {
     load(&rig);
     clickhouse_rows_match_source(&view, source_rows(&tbl), "");
 }
+
+/// uuid, jsonb, a fractional time and arrays (one NULL) load and keep their values:
+/// the uuid recovers through the resolver's own cast, the time keeps its microseconds.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn uuid_json_time_and_array_columns_load_with_their_values() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = pg_connect();
+    let tbl = unique_name("rivet_ch_types");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, u UUID, j JSONB, t TIME, a INT[]); \
+         INSERT INTO {tbl} VALUES \
+           (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{{\"k\": [1, 2]}}', '13:45:07.123456', '{{1,2}}'), \
+           (2, NULL, NULL, NULL, NULL)"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    rig.run_ok();
+    load(&rig);
+
+    let table = format!("{}.{tbl}", db.0);
+    let got = ch(&format!(
+        "SELECT id, if(u IS NULL, '', toString(toUUID(concat(substring(lower(hex(u)),1,8),'-',\
+         substring(lower(hex(u)),9,4),'-',substring(lower(hex(u)),13,4),'-',\
+         substring(lower(hex(u)),17,4),'-',substring(lower(hex(u)),21,12))))), \
+         ifNull(j, ''), ifNull(toString(t), ''), toString(a) FROM {table} ORDER BY id FORMAT TSV"
+    ));
+    let rows: Vec<Vec<&str>> = got.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 2, "{got}");
+    assert_eq!(rows[0][1], "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "uuid");
+    let json: serde_json::Value = serde_json::from_str(rows[0][2]).expect("json text");
+    assert_eq!(json, serde_json::json!({"k": [1, 2]}), "jsonb");
+    assert_eq!(
+        rows[0][3], "49507.123456",
+        "13:45:07.123456 as seconds since midnight"
+    );
+    assert_eq!(rows[0][4], "[1,2]", "array");
+    assert_eq!(&rows[1][1..4], ["", "", ""], "NULLs stay NULL");
+    assert_eq!(
+        rows[1][4], "[]",
+        "a NULL array loads as [] — the resolver says so"
+    );
+}

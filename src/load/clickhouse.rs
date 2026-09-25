@@ -501,10 +501,16 @@ fn columns_ddl(specs: &[TargetColumnSpec], not_null: &[String]) -> String {
 }
 
 /// The native type a spec lands as: `Nullable(T)` unless it is a key column or a container.
+/// JSON and UUID are declared as what their Parquet converts into (`String`, the 16 raw
+/// bytes); a `JSON` or `UUID` column refuses the insert (measured).
 fn column_type(spec: &TargetColumnSpec, not_null: bool) -> String {
-    let t = &spec.target_type;
+    let t = match spec.target_type.as_str() {
+        "JSON" => "String",
+        "UUID" => "FixedString(16)",
+        other => other,
+    };
     if not_null || t.starts_with("Array(") || t.starts_with("LowCardinality(") {
-        t.clone()
+        t.to_string()
     } else {
         format!("Nullable({t})")
     }
