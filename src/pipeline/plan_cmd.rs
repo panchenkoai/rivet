@@ -271,7 +271,7 @@ pub fn run_plan_command(
     // match a `- name:` line — so the preview must model the value now ON DISK,
     // not `recs` (bughunt 2026-08-14; read-only contract 2026-08-20).
     let safe_of = effective_parallel_safe(&recs, &config, &fields, &written);
-    if pool_estimate_is_printable(&format) {
+    if pool_estimate_is_printable(&format, artifacts.len()) {
         print_pool_estimate(&artifacts, &safe_of, &state);
     }
 
@@ -667,7 +667,7 @@ fn compute_plan_data(
 /// work than the wave plan beside it); when any prediction rests on a
 /// placeholder or a failed attempt, the print says LOWER BOUND, mirroring
 /// `run_pool`'s accounting.
-/// May the pool advisory be printed for this output format?
+/// May the pool advisory be printed for this output format and export count?
 ///
 /// `--format json` with no `--output` makes STDOUT the machine document: a
 /// human advisory printed beside it turns the stream into two documents, and
@@ -677,8 +677,8 @@ fn compute_plan_data(
 /// every multi-export plan (live-suite catch on this branch). The decision is
 /// a pure fn so it is unit-testable; the print itself writes to stdout and
 /// cannot be observed in-process.
-fn pool_estimate_is_printable(format: &PlanOutputFormat) -> bool {
-    !matches!(format, PlanOutputFormat::Json(None))
+fn pool_estimate_is_printable(format: &PlanOutputFormat, exports: usize) -> bool {
+    exports > 1 && !matches!(format, PlanOutputFormat::Json(None))
 }
 
 fn print_pool_estimate(
@@ -686,9 +686,6 @@ fn print_pool_estimate(
     safe_of: &std::collections::HashMap<String, bool>,
     state: &StateStore,
 ) {
-    if artifacts.len() < 2 {
-        return; // a single export has nothing to schedule
-    }
     let predicted = super::pool::predict_items(
         state,
         artifacts.iter().map(|a| {
@@ -1871,12 +1868,18 @@ mod tests {
     fn the_pool_advisory_never_shares_stdout_with_the_json_document() {
         use super::{PlanOutputFormat, pool_estimate_is_printable};
         // stdout carries the document — nothing else may be written there.
-        assert!(!pool_estimate_is_printable(&PlanOutputFormat::Json(None)));
+        assert!(!pool_estimate_is_printable(
+            &PlanOutputFormat::Json(None),
+            2
+        ));
         // A file target leaves stdout free for the human lines.
-        assert!(pool_estimate_is_printable(&PlanOutputFormat::Json(Some(
-            "plan.json".to_string()
-        ))));
-        assert!(pool_estimate_is_printable(&PlanOutputFormat::Pretty));
+        assert!(pool_estimate_is_printable(
+            &PlanOutputFormat::Json(Some("plan.json".to_string())),
+            2
+        ));
+        assert!(pool_estimate_is_printable(&PlanOutputFormat::Pretty, 2));
+        // A single export has nothing to schedule.
+        assert!(!pool_estimate_is_printable(&PlanOutputFormat::Pretty, 1));
     }
 
     /// Field find (2026-08-13 pool dogfood): a chunked export on a NON-UNIQUE

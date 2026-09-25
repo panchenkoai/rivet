@@ -1216,6 +1216,12 @@ pub(crate) mod tests {
         /// expired credential. Distinct from every `kinds` entry, which can only say
         /// what an object IS; the difference decides whether a stop is journaled as a
         /// refusal or as a failure, and only the failure forges ownership.
+        /// Say what `table` is when the driver probes it.
+        pub(crate) fn with_kind(self, table: &str, kind: ObjectKind) -> Self {
+            self.kinds.borrow_mut().insert(table.into(), kind);
+            self
+        }
+
         pub(crate) fn probe_fails(reason: &str) -> Self {
             Self {
                 kind_error: Some(reason.to_string()),

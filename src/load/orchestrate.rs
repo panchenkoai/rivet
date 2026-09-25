@@ -1970,6 +1970,43 @@ mod load_ledger_tests {
     use super::*;
 
     #[test]
+    fn the_shared_pool_helpers_keep_state_leases_and_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        let state = open_state(cfg.to_str().unwrap(), "stateless").expect("a writable dir opens");
+
+        let lease = take_table_lease(Some(&state), "p.d.orders").unwrap();
+        assert!(lease.is_some(), "the first taker holds the table");
+        let Err(busy) = take_table_lease(Some(&state), "p.d.orders") else {
+            panic!("a held table must refuse a second taker");
+        };
+        assert!(format!("{busy:#}").contains("p.d.orders"), "{busy:#}");
+        drop(lease);
+        assert!(take_table_lease(None, "p.d.orders").unwrap().is_none());
+
+        let (state_ref, had) = hand_off_state(Some(state), None, 1);
+        assert!(had && state_ref.is_some());
+        assert!(matches!(
+            reconnect(state_ref.as_ref(), "drain"),
+            Some(Some(_))
+        ));
+        assert!(matches!(reconnect(None, "drain"), Some(None)));
+        let (none_ref, none_had) = hand_off_state(None, None, 1);
+        assert!(!none_had && none_ref.is_none());
+
+        let failed = failures_of(vec![
+            Ok(()),
+            Err(anyhow::anyhow!("a")),
+            Ok(()),
+            Err(anyhow::anyhow!("b")),
+        ]);
+        assert_eq!(
+            failed.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
     fn resolve_run_id_treats_blank_as_absent() {
         // #dogfood LOW: `--run-id ""` / RIVET_RUN_ID="" (clap → Some("")) must not
         // become the correlation label verbatim — blank is treated as absent.
@@ -2384,7 +2421,7 @@ mod live_only_decisions {
         CleanupVerdict, cleanup_target, cleanup_verdict, ledger_says_active, prefix_has_active_run,
         prefix_is_active,
     };
-    use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
+    use load::plan::{CdcLayout, LoadMode, LoadPlan};
 
     /// `ledger_status`: a `Refused` stop, however deep under context, is `refused`;
     /// anything else is `failed`.
@@ -2839,39 +2876,7 @@ mod live_only_decisions {
 
     /// A resolved plan, so a test can vary the ONE field it is about.
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
-        LoadPlan {
-            deleted_flag: false,
-            renames: Vec::new(),
-            rename_warnings: Vec::new(),
-            refusal: None,
-            export_name: "orders".into(),
-            unit: None,
-            table: "orders".into(),
-            partition: None,
-            specs: vec![],
-            gcs_prefix: gcs_prefix.into(),
-            destination: crate::config::DestinationConfig::default(),
-            load: LoadSection {
-                deleted_flag: None,
-                layout: None,
-                target: LoadTarget::Bigquery {
-                    project: "p".into(),
-                    dataset: "d".into(),
-                },
-                cleanup_source: false,
-                pk: load::plan::KeyColumns::Columns(vec!["id".into()]),
-                allow_source_drift: false,
-                gc_orphans: false,
-                cluster_by: load::plan::KeyColumns::None,
-                partition: None,
-            },
-            mode,
-            cursor_column: None,
-            pk: vec!["id".into()],
-            clustering: load::plan::Clustering::Auto(vec![]),
-            pinned_run: None,
-            layout: CdcLayout::LogAndView,
-        }
+        load::plan::test_plan(mode, gcs_prefix)
     }
 
     /// An fs-backed store over `dir`, standing in for the bucket. `gs://b/base`
@@ -3505,6 +3510,37 @@ mod live_only_decisions {
         assert!(
             !dir.path().join(orphan).exists(),
             "with no run active, an unmanifested part is crash debris and must be collected"
+        );
+    }
+
+    #[test]
+    fn gc_retires_a_running_marker_whose_run_the_ledger_says_is_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "gs://b/base";
+        let mut marker = success_manifest("run-dead", "part-0.parquet");
+        marker.status = crate::manifest::ManifestStatus::Running;
+        marker.parts.clear();
+        marker.part_count = 0;
+        marker.row_count = 0;
+        let key = "base/manifest-run-dead.json";
+        write_at(&dir, key, &serde_json::to_vec(&marker).unwrap());
+        let state = StateStore::open_in_memory().unwrap();
+        state
+            .begin_run("run-dead", "orders", prefix, "2026-08-21T00:00:00Z")
+            .unwrap();
+        state
+            .finish_run("run-dead", "failed", "2026-08-21T01:00:00Z")
+            .unwrap();
+
+        maybe_gc_orphans(
+            &fs_store(&dir),
+            &plan_at(LoadMode::Full, prefix),
+            Some(&state),
+        );
+
+        assert!(
+            !dir.path().join(key).exists(),
+            "a marker nothing supersedes is still dead once the ledger closed its run"
         );
     }
 
