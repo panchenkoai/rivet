@@ -94,18 +94,4 @@ mod tests {
         assert_eq!(DestinationType::Azure.label(), "azure");
         assert_eq!(DestinationType::Stdout.label(), "stdout");
     }
-
-    /// A plan artifact sealed before this field existed must still verify: the plan
-    /// seal hashes the serialized destination, so an unset budget may add no key.
-    #[test]
-    fn an_unset_oneshot_budget_serializes_as_before_so_old_plan_seals_verify() {
-        let unset = serde_json::to_value(DestinationConfig::default()).unwrap();
-        assert!(unset.get("oneshot_budget_mb").is_none(), "{unset}");
-        let set = serde_json::to_value(DestinationConfig {
-            oneshot_budget_mb: Some(128),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(set["oneshot_budget_mb"], 128);
-    }
 }

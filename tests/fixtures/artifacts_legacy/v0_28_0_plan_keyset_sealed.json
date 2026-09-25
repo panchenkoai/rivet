@@ -1,0 +1,140 @@
+{
+  "rivet_version": "0.28.0",
+  "plan_id": "8df94a48f67f43f6b4bb4f2d60225eb7",
+  "created_at": "2026-09-25T12:42:29.598894Z",
+  "expires_at": "2026-09-26T12:42:29.598894Z",
+  "export_name": "orders",
+  "strategy": "keyset",
+  "plan_fingerprint": "",
+  "integrity": "xxh3:008ab7adb1c78e63",
+  "resolved_plan": {
+    "export_name": "orders",
+    "source_table": "orders",
+    "base_query": "SELECT * FROM orders",
+    "is_split_unit": false,
+    "strategy": {
+      "Keyset": {
+        "key_column": "id",
+        "chunk_size": 100000,
+        "checkpoint": true,
+        "incremental": false,
+        "parallel": 1
+      }
+    },
+    "format": "parquet",
+    "compression": "zstd",
+    "compression_level": null,
+    "max_file_size_bytes": null,
+    "skip_empty": false,
+    "meta_columns": {
+      "exported_at": true,
+      "row_hash": true
+    },
+    "destination": {
+      "type": "gcs",
+      "bucket": "rivet-fixture-bucket",
+      "prefix": "exports/orders/",
+      "path": null,
+      "region": null,
+      "endpoint": null,
+      "credentials_file": null,
+      "access_key_env": null,
+      "secret_key_env": null,
+      "session_token_env": null,
+      "aws_profile": null,
+      "account_name": null,
+      "account_key_env": null,
+      "sas_token_env": null,
+      "allow_anonymous": false
+    },
+    "quality": null,
+    "tuning": {
+      "batch_size": 10000,
+      "batch_size_memory_mb": 32,
+      "throttle_ms": 50,
+      "statement_timeout_s": 300,
+      "max_retries": 3,
+      "retry_backoff_ms": 2000,
+      "lock_timeout_s": 30,
+      "memory_threshold_mb": 4096,
+      "max_batch_memory_mb": null,
+      "on_batch_memory_exceeded": "warn",
+      "adaptive": false,
+      "min_parallel": null,
+      "max_value_mb": 256,
+      "configured_profile": "balanced"
+    },
+    "tuning_profile_label": "balanced (default)",
+    "validate": false,
+    "reconcile": false,
+    "resume": false,
+    "verify": "size",
+    "source": {
+      "type": "postgres",
+      "url": null,
+      "url_env": "DATABASE_URL",
+      "url_file": null,
+      "host": null,
+      "port": null,
+      "user": null,
+      "password": null,
+      "password_env": null,
+      "database": null,
+      "environment": null,
+      "tuning": null,
+      "tls": null,
+      "mongo": null
+    },
+    "column_overrides": {
+      "price": {
+        "kind": "decimal",
+        "precision": 10,
+        "scale": 2
+      }
+    },
+    "schema_drift_policy": "warn",
+    "shape_drift_warn_factor": 2.0,
+    "parquet": {
+      "row_group_strategy": "auto",
+      "row_group_rows": null,
+      "target_row_group_mb": 128,
+      "max_row_group_mb": null
+    }
+  },
+  "computed": {
+    "chunk_ranges": [],
+    "chunk_count": 0,
+    "cursor_snapshot": null,
+    "row_estimate": 250000
+  },
+  "diagnostics": {
+    "verdict": "ACCEPTABLE",
+    "warnings": [
+      "verdict ACCEPTABLE but preflight collected no specific warnings — review `rivet check` output for context"
+    ],
+    "recommended_profile": "fast",
+    "strategy_rationale": "Mode keyset: seek-paginates by the indexed key `id` (~250K), bounding peak memory and query hold-time without a single-integer PK. Parallelism: single worker — keyset is sequential by default — set `parallel: N` to fan out N seek workers; parallel=1 fits the 2048 MB budget at ~35 MB peak. Risk — resumable: pages forward by key within a run, but a re-run restarts from the first page; memory: bounded to ~35 MB peak."
+  },
+  "prioritization": {
+    "export_recommendation": {
+      "export_name": "orders",
+      "priority_score": 50,
+      "priority_class": "medium",
+      "cost_class": "medium",
+      "risk_class": "low",
+      "recommended_wave": 3,
+      "isolate_on_source": false,
+      "reasons": [
+        {
+          "kind": "large_table",
+          "message": "Medium/large estimated row count (~250000)."
+        },
+        {
+          "kind": "chunking_heavy",
+          "message": "Chunked extraction — monitor source during long runs."
+        }
+      ]
+    }
+  },
+  "config_path": "rivet.yaml"
+}
