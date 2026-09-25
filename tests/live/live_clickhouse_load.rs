@@ -284,3 +284,112 @@ fn a_load_that_dies_after_appending_is_re_run_without_duplicating_the_view() {
     assert_eq!(physical, 10, "the re-run appended every row a second time");
     assert_view_is(&view, source_rows(&tbl), "");
 }
+
+/// A PostgreSQL `(id, v, updated_at)` table on the main stand holding ids `1..=n`.
+fn pg_batch_seeded(prefix: &str, n: i64) -> (String, PgTable, postgres::Client) {
+    let mut c = pg_connect();
+    let tbl = unique_name(prefix);
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT, updated_at TIMESTAMP NOT NULL); \
+         INSERT INTO {tbl} SELECT g, g, TIMESTAMP '2026-01-01' FROM generate_series(1, {n}) g"
+    ))
+    .expect("seed");
+    (tbl.clone(), PgTable::adopt(tbl), c)
+}
+
+fn pg_rows(c: &mut postgres::Client, tbl: &str) -> Vec<(i64, i64)> {
+    c.query(&format!("SELECT id, v FROM {tbl} ORDER BY id"), &[])
+        .expect("read source")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+fn batch_into_clickhouse(rig: Rig, db: &Db) -> Rig {
+    rig.dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+        .top_line(&format!(
+            "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+             user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id] }}",
+            db.0
+        ))
+}
+
+/// A whole-table load replaces the table: the second load serves the source as it
+/// is now, not the union of both runs.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_full_load_into_clickhouse_replaces_the_table_with_the_current_source() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_full", 5);
+    let db = Db::new("rivet_tmp_ch");
+    let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
+    let table = format!("{}.{tbl}", db.0);
+    let loaded = || {
+        pairs(&ch(&format!(
+            "SELECT id, v FROM {table} ORDER BY id FORMAT TSV"
+        )))
+    };
+
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(loaded(), pg_rows(&mut c, &tbl));
+
+    c.batch_execute(&format!(
+        "DELETE FROM {tbl} WHERE id = 2; UPDATE {tbl} SET v = 99 WHERE id = 1; \
+         INSERT INTO {tbl} VALUES (6, 6, TIMESTAMP '2026-01-02')"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    load(&rig);
+    assert_eq!(
+        loaded(),
+        pg_rows(&mut c, &tbl),
+        "the second load replaced the first"
+    );
+}
+
+/// An incremental export: the first (cursor-less) run loads a table, the first
+/// delta renames it into the change log behind a view that picks the latest cursor.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_rows() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_inc", 5);
+    let db = Db::new("rivet_tmp_ch");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let view = format!("{}.{tbl}", db.0);
+
+    rig.run_ok();
+    load(&rig);
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1; \
+         INSERT INTO {tbl} VALUES (6, 6, TIMESTAMP '2026-02-01')"
+    ))
+    .expect("changes");
+    rig.run_ok();
+    load(&rig);
+
+    assert_eq!(
+        ch(&format!(
+            "SELECT engine FROM system.tables WHERE database = '{}' AND name = '{tbl}' FORMAT TSV",
+            db.0
+        )),
+        "View",
+        "the first delta turned the table into the change log behind a view"
+    );
+    assert_eq!(
+        pairs(&ch(&format!(
+            "SELECT id, v FROM {view} ORDER BY id FORMAT TSV"
+        ))),
+        pg_rows(&mut c, &tbl)
+    );
+}
