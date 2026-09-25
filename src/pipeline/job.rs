@@ -2029,6 +2029,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn log_plan_diagnostics_refuses_on_every_rejection_and_passes_warnings() {
+        use super::log_plan_diagnostics;
+        use crate::plan::DiagnosticLevel;
+        use crate::plan::validate::Diagnostic;
+        let d = |level, message: &str| Diagnostic {
+            level,
+            rule: "r",
+            message: message.into(),
+        };
+        let warn_only = [
+            d(DiagnosticLevel::Warning, "w"),
+            d(DiagnosticLevel::Degraded, "g"),
+        ];
+        assert!(log_plan_diagnostics("orders", &warn_only).is_none());
+        let rejected = [
+            d(DiagnosticLevel::Rejected, "first"),
+            d(DiagnosticLevel::Warning, "w"),
+            d(DiagnosticLevel::Rejected, "second"),
+        ];
+        let msg = format!("{:#}", log_plan_diagnostics("orders", &rejected).unwrap());
+        assert!(msg.contains("first") && msg.contains("second") && !msg.contains("w\n"));
+    }
+
     /// A successful run promotes ONLY the transient status it was built with.
     ///
     /// Both directions matter and the `==`→`!=` mutant inverts both: with `!=`

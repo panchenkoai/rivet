@@ -238,8 +238,6 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         .max()
         .unwrap_or(0);
     let mut rehydrated = 0usize;
-    let mut rehydrated_rows = 0i64;
-    let mut rehydrated_bytes = 0u64;
     let mut missing: Vec<MissingPart> = Vec::new();
     for f in files {
         // Don't duplicate a part a fresh record_part already added this run.
@@ -284,8 +282,6 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         );
         if adopted {
             rehydrated += 1;
-            rehydrated_rows += rows;
-            rehydrated_bytes += bytes;
         }
     }
     if rehydrated > 0 {
@@ -299,8 +295,8 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         // harvest reaches from the data (and would hide whether the shortfall
         // was hydration or a runner's unit-id mismatch).
         log::info!(
-            "resume: reconstructed {rehydrated} committed part(s) ({rehydrated_rows} rows, \
-             {rehydrated_bytes} bytes) into the manifest from the state DB file_log (no \
+            "resume: reconstructed {rehydrated} committed part(s) into the manifest from the \
+             state DB file_log (no \
              destination manifest to hydrate from) — the finalize manifest now covers every \
              committed part, rotation siblings included"
         );
@@ -828,6 +824,52 @@ mod tests {
     }
 
     #[test]
+    fn a_probed_rehydration_declares_only_the_parts_the_destination_still_holds() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_probe";
+        state.insert_chunk_tasks(run_id, &[(1, 100)]).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 50, Some("orders_chunk0_p0.parquet"))
+            .unwrap();
+        for (file_name, rows) in [
+            ("orders_chunk0_p0.parquet", 30),
+            ("orders_chunk0_p1.parquet", 20),
+        ] {
+            state
+                .record_file(FilePart {
+                    run_id,
+                    export_name: "orders",
+                    file_name,
+                    rows,
+                    bytes: 1024,
+                    format: "parquet",
+                    compression: None,
+                    cursor_high: None,
+                })
+                .unwrap();
+        }
+        let present: std::collections::HashSet<String> =
+            ["orders_chunk0_p0.parquet".to_string()].into();
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+
+        let (n, missing) =
+            rehydrate_manifest_parts_probed(&state, run_id, &mut summary, Some(&present)).unwrap();
+
+        assert_eq!(n, 1);
+        let declared: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(declared, ["orders_chunk0_p0.parquet"]);
+        let lost: Vec<&str> = missing.iter().map(|(_, f)| f.as_str()).collect();
+        assert_eq!(lost, ["orders_chunk0_p1.parquet"]);
+    }
+
+    #[test]
     fn rehydration_recovers_all_rotation_siblings_from_file_log() {
         // Round-5: chunk_task stores ONE file_name per chunk (only the FIRST
         // max_file_size rotation sibling), so rehydrating from it orphaned the other
@@ -904,6 +946,10 @@ mod tests {
             summary.manifest_parts.iter().all(|p| p.size_bytes > 0),
             "parts carry their REAL byte size (not 0) so validate's size check can't lie"
         );
+        let mut ids: Vec<u32> = summary.manifest_parts.iter().map(|p| p.part_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "each reconstructed part gets its own part_id");
         assert_eq!(
             summary.total_rows - rows_before,
             50,

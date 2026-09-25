@@ -1371,6 +1371,61 @@ mod tests {
         assert_eq!(names, vec!["daily#0", "daily#1", "daily#2", "daily#3"]);
     }
 
+    #[test]
+    fn realize_on_resume_swaps_the_giant_for_its_units_seeded_with_its_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("250"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("250"), Some("500"));
+        write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
+        let users = sample_export("users");
+        let item = |name: &str, secs: f64| PoolItem {
+            name: name.into(),
+            predicted_secs: secs,
+            parallel_safe: true,
+        };
+        let pre = [
+            (item("users", 10.0), PredictedFrom::Measured(10.0)),
+            (item("daily", 400.0), PredictedFrom::Measured(400.0)),
+        ];
+        let cfg = Config::from_yaml(
+            "source:\n  type: postgres\n  url: postgresql://localhost/db\nexports:\n\
+             \x20 - name: users\n    table: users\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out }\n",
+        )
+        .unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let mut effective = vec![users, giant];
+
+        let r = realize(
+            "daily",
+            4,
+            100.0,
+            true,
+            &pre,
+            &mut effective,
+            &cfg,
+            dir.path(),
+            &state,
+        )
+        .unwrap()
+        .expect("a reconstructable split is realized");
+
+        let names: Vec<&str> = effective.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["users", "daily#0", "daily#1", "daily#2", "daily#3"]);
+        assert_eq!(r.family, "daily");
+        assert_eq!(r.seeds.len(), 4);
+        for (unit, from) in &r.seeds {
+            assert!(
+                matches!(from, PredictedFrom::SeededSplit(s) if *s == 100.0),
+                "{unit} must inherit the giant's 400 s / 4 as a measured seed, got {from:?}"
+            );
+        }
+    }
+
     // Helper: the (lo, hi) window of each reconstructed unit, in ordinal order.
     fn wins_of(units: &[ExportConfig]) -> Vec<(Option<String>, Option<String>)> {
         units

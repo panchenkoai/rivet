@@ -475,6 +475,33 @@ mod tests {
         write_noted(dir, name, field, column, stats, None);
     }
 
+    #[test]
+    fn the_budget_applies_only_to_a_partitioned_bigquery_plan_and_names_the_export() {
+        use crate::load::plan::{LoadMode, test_plan};
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        let days: Vec<i64> = (0..4100).map(|i| start + i * DAY).collect();
+        let (field, column) = ts_column(&days);
+        write_noted(dir.path(), "wide.parquet", field, column, true, None);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let uris = vec!["gs://b/wide.parquet".to_string()];
+
+        let mut plan = test_plan(LoadMode::Full, "gs://b/");
+        assert_eq!(super::partition_label(&plan), "none");
+        assert!(
+            super::partition_budget_ok(&store, &plan, &uris).is_ok(),
+            "no partition, no cap"
+        );
+
+        plan.partition = Some(time("ts", Granularity::Day));
+        assert_eq!(
+            super::partition_label(&plan),
+            plan.partition.as_ref().unwrap().key.describe()
+        );
+        let err = super::partition_budget_ok(&store, &plan, &uris).unwrap_err();
+        assert!(format!("{err:#}").contains("export `orders`"), "{err:#}");
+    }
+
     fn write_noted(
         dir: &std::path::Path,
         name: &str,

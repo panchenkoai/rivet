@@ -124,16 +124,15 @@ impl GcsStore {
         self._runtime.block_on(
             futures_util::stream::iter(paths)
                 .map(|p| async move {
-                    let size = match op.stat(p).await {
-                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(None),
-                        other => other?.content_length(),
+                    let Some(meta) = unless_gone(op.stat(p).await)? else {
+                        return Ok(None);
                     };
+                    let size = meta.content_length();
                     if size > cap {
                         return parse(p, Err(size)).map(Some);
                     }
-                    let reader = match op.reader(p).await {
-                        Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(None),
-                        other => other?,
+                    let Some(reader) = unless_gone(op.reader(p).await)? else {
+                        return Ok(None);
                     };
                     let mut chunks = reader.into_bytes_stream(..).await?;
                     let mut buf = Vec::with_capacity(size as usize);
@@ -261,6 +260,14 @@ impl CloudBackend for GcsBackend {
     }
 }
 
+/// `None` for an object deleted since it was listed; any other error stands.
+fn unless_gone<T>(r: opendal::Result<T>) -> Result<Option<T>> {
+    match r {
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        other => Ok(Some(other?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +289,49 @@ mod tests {
             .read_each_within(&[], 10, |_, b| Ok(b.is_ok()))
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn an_object_exactly_at_the_cap_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("edge"), vec![b'x'; 10]).unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let got = store
+            .read_each_within(&["edge".to_string()], 10, |_, body| {
+                Ok(body.map(|b| b.len()))
+            })
+            .unwrap();
+        assert_eq!(got, vec![Ok(10)]);
+    }
+
+    /// Only NotFound means "deleted since it was listed"; any other stat or open error fails the read.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_object_is_an_error_not_a_skip() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::write(sealed.join("m"), b"abc").unwrap();
+        std::fs::write(dir.path().join("locked"), b"abc").unwrap();
+        let set = |p: &std::path::Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(&sealed, 0o000);
+        set(&dir.path().join("locked"), 0o000);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let read = |p: &str| store.read_each_within(&[p.to_string()], 10, |_, b| Ok(b.is_ok()));
+        let (stat_denied, open_denied) = (read("sealed/m"), read("locked"));
+        set(&sealed, 0o755);
+        set(&dir.path().join("locked"), 0o644);
+        assert!(
+            stat_denied.is_err(),
+            "a stat that fails for another reason: {stat_denied:?}"
+        );
+        assert!(
+            open_denied.is_err(),
+            "an open that fails for another reason: {open_denied:?}"
+        );
     }
 
     /// A key listed and then deleted (a retired running marker) is skipped, not fatal.

@@ -414,6 +414,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_gate_reads_the_base_only_when_a_buffer_exists() {
+        use load::tests::fake_loader;
+        let no_buffer = fake_loader(0);
+        assert!(
+            compact_gate_of(&no_buffer, "orders", None).is_ok(),
+            "nothing to merge"
+        );
+        let buffer_without_base =
+            fake_loader(0).with_kind("orders__changes", load::ObjectKind::Table);
+        assert!(
+            compact_gate_of(&buffer_without_base, "orders", None).is_err(),
+            "a buffer with no base to merge into is refused"
+        );
+    }
+
+    #[test]
+    fn a_cdc_plan_ranks_by_its_engine_and_any_other_by_its_cursor() {
+        use crate::load::cdc::{CompactOrder, SourceEngine};
+        use crate::load::plan::{LoadMode, test_plan};
+        let cdc = test_plan(LoadMode::Cdc, "gs://b/");
+        assert_eq!(
+            compact_order_of(&cdc, Some(SourceEngine::Postgres)).unwrap(),
+            CompactOrder::Cdc(SourceEngine::Postgres)
+        );
+        assert!(compact_order_of(&cdc, None).is_err());
+        let mut inc = test_plan(LoadMode::Incremental, "gs://b/");
+        assert!(compact_order_of(&inc, Some(SourceEngine::Postgres)).is_err());
+        inc.cursor_column = Some("updated_at".into());
+        assert_eq!(
+            compact_order_of(&inc, None).unwrap(),
+            CompactOrder::Cursor("updated_at".into())
+        );
+    }
+
     /// `rivet compact` merges every base-and-buffer table, CDC or incremental; every
     /// other plan is passed by with a reason that names what it is, never silently.
     #[test]

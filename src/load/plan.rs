@@ -1106,6 +1106,44 @@ pub fn retype_plan(
 }
 
 /// [`build_plans_keyed`] with no recorded keys.
+/// A resolved BigQuery plan for tests, so each can vary the one field it is about.
+#[cfg(test)]
+pub(crate) fn test_plan(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
+    LoadPlan {
+        deleted_flag: false,
+        renames: Vec::new(),
+        rename_warnings: Vec::new(),
+        refusal: None,
+        export_name: "orders".into(),
+        unit: None,
+        table: "orders".into(),
+        partition: None,
+        specs: vec![],
+        gcs_prefix: gcs_prefix.into(),
+        destination: crate::config::DestinationConfig::default(),
+        load: LoadSection {
+            deleted_flag: None,
+            layout: None,
+            target: LoadTarget::Bigquery {
+                project: "p".into(),
+                dataset: "d".into(),
+            },
+            cleanup_source: false,
+            pk: KeyColumns::Columns(vec!["id".into()]),
+            allow_source_drift: false,
+            gc_orphans: false,
+            cluster_by: KeyColumns::None,
+            partition: None,
+        },
+        mode,
+        cursor_column: None,
+        pk: vec!["id".into()],
+        clustering: Clustering::Auto(vec![]),
+        pinned_run: None,
+        layout: CdcLayout::LogAndView,
+    }
+}
+
 #[cfg(test)]
 fn build_plans(
     cfg: &crate::config::Config,

@@ -149,6 +149,11 @@ pub(crate) fn run_export_pool(
     (outcomes, workers)
 }
 
+/// One-line cards: this process renders more than one export itself (not one pinned export, not a subprocess parent).
+fn compact_cards(pinned_export: bool, exports: usize, subprocess_parent: bool) -> bool {
+    !pinned_export && !subprocess_parent && exports > 1
+}
+
 /// Swaps the render flags in for one run and restores the previous values on drop, panic included.
 pub(crate) struct RenderFlags(bool, bool);
 
@@ -677,7 +682,7 @@ pub fn run(
     // path, etc. — sees a consistent mode.  Restored at the end of the run
     // so subsequent invocations within the same process (tests, library
     // callers) start with a clean slate.
-    let multi_export = export_name.is_none() && exports.len() > 1;
+    let multi_export = compact_cards(export_name.is_some(), exports.len(), false);
     let _render_flags = RenderFlags::set(multi_export, Some(run_parallel));
 
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(exports.len());
@@ -910,7 +915,7 @@ pub(crate) fn run_waves(
     // (subprocess) path renders the parent card stack itself and each child sees
     // `exports.len() == 1`, so the flag must stay clear there — matching `run`'s
     // parallel-processes branch.
-    let _render_flags = RenderFlags::set(total > 1 && !parallel, None);
+    let _render_flags = RenderFlags::set(compact_cards(false, total, parallel), None);
 
     let state = StateStore::open(config_path)?;
     // `apply --parallel` re-execs children with ENV_CONCURRENT_SIBLINGS, so each
@@ -2215,6 +2220,23 @@ fn pool_safe_heavy_split(pending: &[&ExportConfig]) -> (usize, usize) {
 #[cfg(test)]
 mod render_guard_tests {
     use super::*;
+
+    #[test]
+    fn only_a_process_rendering_several_exports_itself_uses_compact_cards() {
+        assert!(compact_cards(false, 2, false));
+        assert!(
+            !compact_cards(false, 1, false),
+            "one export gets the full card"
+        );
+        assert!(
+            !compact_cards(true, 5, false),
+            "a pinned --export gets the full card"
+        );
+        assert!(
+            !compact_cards(false, 5, true),
+            "subprocess children render their own"
+        );
+    }
 
     #[test]
     fn a_panic_under_the_card_ui_clears_the_sender_and_restores_the_flags() {
