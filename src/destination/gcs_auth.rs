@@ -391,7 +391,14 @@ struct TokenResponse {
 /// credential shapes — see [`AdcCredentials`].
 pub struct AdcUserTokenLoader {
     creds: AdcCredentials,
-    minted: Arc<Mutex<Option<MintedToken>>>,
+    minted: Arc<SharedToken>,
+}
+
+/// One identity's token and the gate that lets a single caller mint it on a cold cache.
+#[derive(Default)]
+struct SharedToken {
+    token: Mutex<Option<MintedToken>>,
+    mint_gate: tokio::sync::Mutex<()>,
 }
 
 struct MintedToken {
@@ -426,7 +433,7 @@ impl AdcUserTokenLoader {
     }
 
     fn cached_token(&self, now: Instant) -> Option<GoogleToken> {
-        let cache = self.minted.lock().expect("ADC token cache poisoned");
+        let cache = self.minted.token.lock().expect("ADC token cache poisoned");
         cache
             .as_ref()
             .filter(|c| token_still_fresh(c.minted_at, c.expires_in_secs, now))
@@ -468,7 +475,7 @@ impl AdcUserTokenLoader {
             GCS_SCOPE,
         );
         {
-            let mut cache = self.minted.lock().expect("ADC token cache poisoned");
+            let mut cache = self.minted.token.lock().expect("ADC token cache poisoned");
             *cache = Some(MintedToken {
                 token: token.clone(),
                 minted_at: Instant::now(),
@@ -491,8 +498,10 @@ impl GoogleTokenLoad for AdcUserTokenLoader {
         Self: 'b,
     {
         Box::pin(async move {
-            // Two concurrent stale loads may both mint; harmless — both
-            // tokens are valid, last writer wins.
+            if let Some(token) = self.cached_token(Instant::now()) {
+                return Ok(Some(token));
+            }
+            let _minting = self.minted.mint_gate.lock().await;
             if let Some(token) = self.cached_token(Instant::now()) {
                 return Ok(Some(token));
             }
@@ -539,10 +548,10 @@ fn loader_for(creds: AdcCredentials) -> AdcUserTokenLoader {
 }
 
 /// The one GCS token cache per identity in this process, so N stores (one per CDC table) mint once, not N times.
-fn shared_token_cache(key: String) -> Arc<Mutex<Option<MintedToken>>> {
+fn shared_token_cache(key: String) -> Arc<SharedToken> {
     use std::collections::HashMap;
     use std::sync::OnceLock;
-    type Caches = Mutex<HashMap<String, Arc<Mutex<Option<MintedToken>>>>>;
+    type Caches = Mutex<HashMap<String, Arc<SharedToken>>>;
     static CACHES: OnceLock<Caches> = OnceLock::new();
     let mut caches = CACHES
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -994,7 +1003,7 @@ mod tests {
             "csec",
             "rtoken-other",
         ));
-        *first.minted.lock().unwrap() = Some(MintedToken {
+        *first.minted.token.lock().unwrap() = Some(MintedToken {
             token: GoogleToken::new("tok", 3600, GCS_SCOPE),
             minted_at: Instant::now(),
             expires_in_secs: 3600,
@@ -1013,12 +1022,12 @@ mod tests {
     fn cached_token_serves_fresh_and_rejects_near_expiry() {
         let loader = AdcUserTokenLoader {
             creds: AdcCredentials::user_for_test("cid", "csec", "rtoken"),
-            minted: Arc::new(Mutex::new(None)),
+            minted: Arc::default(),
         };
         let now = Instant::now();
         assert!(loader.cached_token(now).is_none(), "empty cache mints");
         {
-            let mut cache = loader.minted.lock().unwrap();
+            let mut cache = loader.minted.token.lock().unwrap();
             *cache = Some(MintedToken {
                 token: GoogleToken::new("t", 3600, GCS_SCOPE),
                 minted_at: now,
@@ -1070,7 +1079,7 @@ mod tests {
     fn adc_loader_debug_never_leaks_secrets() {
         let loader = AdcUserTokenLoader {
             creds: AdcCredentials::user_for_test("cid", "SECRETVALUE", "RTOKENVALUE"),
-            minted: Arc::new(Mutex::new(None)),
+            minted: Arc::default(),
         };
         let dbg = format!("{loader:?}");
         assert!(!dbg.contains("SECRETVALUE"), "client_secret leaked: {dbg}");
@@ -1469,7 +1478,7 @@ qPSokX7fAC0Ku7S5xJe4XfPd
             "{:?}",
             AdcUserTokenLoader {
                 creds: sa_credentials_with_marked_key(),
-                minted: Arc::new(Mutex::new(None)),
+                minted: Arc::default(),
             }
         );
         let blocking = format!("{:?}", blocking_source(sa_credentials_with_marked_key()));
@@ -1509,6 +1518,65 @@ qPSokX7fAC0Ku7S5xJe4XfPd
     }
 
     /// Concurrent callers on a cold cache mint ONE token, not one each.
+    /// Loaders for one identity that load together on a cold cache — a CDC run opening its
+    /// per-table stores at once — mint one token between them, not one each.
+    #[test]
+    fn loaders_loading_together_on_a_cold_cache_mint_one_token() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/token", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                served.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let body = r#"{"access_token":"tok","expires_in":3600}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let json = sa_json(Some(&uri), TEST_RSA_PKCS8_PEM).replace(
+            TEST_SA_EMAIL,
+            "single-flight@rivet-unit.iam.gserviceaccount.com",
+        );
+        let loaders: Vec<_> = (0..8)
+            .map(|_| Arc::new(loader_for(parse_adc_file(&json).unwrap().unwrap())))
+            .collect();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async {
+            let tasks: Vec<_> = loaders
+                .iter()
+                .map(|l| {
+                    let l = Arc::clone(l);
+                    tokio::spawn(async move { l.load(reqwest::Client::new()).await })
+                })
+                .collect();
+            let mut got = Vec::new();
+            for t in tasks {
+                got.push(t.await.unwrap().unwrap().is_some());
+            }
+            got
+        });
+        assert!(got.iter().all(|&t| t), "every loader got a token");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "loaders for one identity minted in parallel instead of sharing one grant"
+        );
+    }
+
     #[test]
     fn concurrent_callers_on_a_cold_cache_mint_exactly_one_token() {
         use std::io::{Read, Write};
