@@ -92,9 +92,20 @@ pub(crate) fn multi_export_concurrent() -> bool {
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
 }
 
-/// Whether a CDC export's snapshot legs fan out: asked for, and not already inside a parallel export run or a sibling child process, where the pools would nest past the ceiling.
-pub(crate) fn snapshots_fan_out(parallel_requested: bool, exports_run_in_parallel: bool) -> bool {
-    parallel_requested && !exports_run_in_parallel
+/// How a `rivet run` fans out: `(exports_in_parallel, snapshot_legs_may_fan_out)`. Exports run in parallel when asked for, with no single export named and 2+ to run; a lone CDC export's snapshot legs may fan out when asked for and neither the exports nor sibling child processes already do, where the pools would nest past the ceiling.
+pub(crate) fn run_concurrency(
+    flag: bool,
+    config_flag: bool,
+    one_export_named: bool,
+    exports: usize,
+    sibling_child: bool,
+) -> (bool, bool) {
+    let requested = flag || config_flag;
+    let exports_parallel = requested && !one_export_named && exports > 1;
+    (
+        exports_parallel,
+        requested && !exports_parallel && !sibling_child,
+    )
 }
 
 /// One export's result and summary, as `job::run_export_job` returns them.
@@ -538,18 +549,20 @@ pub fn run(
         selected
     };
 
-    let parallel_requested = parallel_exports_cli || config.parallel_exports;
-    let run_parallel = parallel_requested && export_name.is_none() && exports.len() > 1;
+    let (run_parallel, parallel_snapshots) = run_concurrency(
+        parallel_exports_cli,
+        config.parallel_exports,
+        export_name.is_some(),
+        exports.len(),
+        multi_export_concurrent(),
+    );
     let opts = RunOptions {
         validate,
         reconcile,
         resume,
         force,
         params,
-        parallel_snapshots: snapshots_fan_out(
-            parallel_requested,
-            run_parallel || multi_export_concurrent(),
-        ),
+        parallel_snapshots,
     };
 
     // Seeds the card-table name column so it aligns from the first redraw
@@ -2224,22 +2237,69 @@ mod render_guard_tests {
 }
 
 #[cfg(test)]
-mod snapshot_fan_out_tests {
-    use super::snapshots_fan_out;
+mod run_concurrency_tests {
+    use super::{RunSummary, run_concurrency, run_export_pool};
 
-    /// Snapshot legs fan out only when parallelism was asked for AND the exports themselves
-    /// are not already running in parallel — nested, the two pools would reach 16 × 16.
+    /// Every export gets its own outcome, in input order, on a pool no wider than the work.
     #[test]
-    fn snapshots_fan_out_only_outside_a_parallel_export_run() {
-        assert!(
-            snapshots_fan_out(true, false),
-            "a lone CDC export fans its snapshots out"
+    fn run_export_pool_answers_every_export_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rivet.yaml");
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\n\
+             exports:\n\
+             \x20 - {name: a, table: a, format: parquet, destination: {type: local, path: ./o}}\n\
+             \x20 - {name: b, table: b, format: parquet, destination: {type: local, path: ./o}}\n\
+             \x20 - {name: c, table: c, format: parquet, destination: {type: local, path: ./o}}\n",
+        )
+        .expect("three exports load");
+        let exports: Vec<_> = cfg.exports.iter().collect();
+        let (outcomes, workers) =
+            run_export_pool(config_path.to_str().unwrap(), &exports, |export, _state| {
+                let summary = RunSummary {
+                    export_name: export.name.clone(),
+                    ..Default::default()
+                };
+                if export.name == "b" {
+                    (Err(anyhow::anyhow!("b refused")), summary)
+                } else {
+                    (Ok(()), summary)
+                }
+            });
+        assert_eq!(workers, 3, "never wider than the work");
+        let names: Vec<_> = outcomes
+            .iter()
+            .map(|(_, s)| s.export_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["a", "b", "c"],
+            "one outcome per export, in input order"
         );
-        assert!(
-            !snapshots_fan_out(true, true),
-            "inside a parallel export run the snapshots stay sequential"
-        );
-        assert!(!snapshots_fan_out(false, false), "no flag, no fan-out");
+        assert!(outcomes[0].0.is_ok() && outcomes[1].0.is_err() && outcomes[2].0.is_ok());
+    }
+
+    /// Every input that can flip either answer, each against the row that differs only in it.
+    #[test]
+    fn run_concurrency_fans_out_exports_or_snapshot_legs_never_both() {
+        // (flag, config flag, one export named, exports, sibling child) -> (exports, legs)
+        let rows = [
+            ((true, false, false, 3, false), (true, false)),
+            ((false, true, false, 3, false), (true, false)),
+            ((false, false, false, 3, false), (false, false)),
+            ((true, false, true, 3, false), (false, true)),
+            ((true, false, false, 1, false), (false, true)),
+            ((true, false, false, 2, false), (true, false)),
+            ((true, false, false, 1, true), (false, false)),
+            ((false, false, false, 1, false), (false, false)),
+        ];
+        for ((f, c, named, n, sib), want) in rows {
+            assert_eq!(
+                run_concurrency(f, c, named, n, sib),
+                want,
+                "flag={f} config={c} named={named} exports={n} sibling={sib}"
+            );
+        }
     }
 }
 

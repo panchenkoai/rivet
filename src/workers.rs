@@ -511,6 +511,17 @@ mod tests {
         );
     }
 
+    /// The panic's own message reaches the log line, whatever the payload's string type.
+    #[test]
+    fn panic_text_reads_str_and_string_payloads() {
+        let from_str = std::panic::catch_unwind(|| panic!("static boom")).unwrap_err();
+        assert_eq!(panic_text(&*from_str), "static boom");
+        let from_string = std::panic::catch_unwind(|| panic!("{} boom", "formatted")).unwrap_err();
+        assert_eq!(panic_text(&*from_string), "formatted boom");
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(7_u8)).unwrap_err();
+        assert_eq!(panic_text(&*other), "non-string panic payload");
+    }
+
     /// `run_each` overlaps its items: the first can only finish once the second has started, and a failure stays in its own slot.
     #[test]
     fn run_each_overlaps_items_and_keeps_each_outcome_in_its_slot() {

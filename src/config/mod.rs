@@ -75,11 +75,12 @@ pub(crate) fn overlapping_table_pair(ts: &[String]) -> Option<(String, String)> 
 
 /// Two `tables:` entries whose per-table directories are one directory on a case-insensitive filesystem, if any.
 pub(crate) fn case_colliding_table_pair(ts: &[String]) -> Option<(String, String)> {
-    for (i, a) in ts.iter().enumerate() {
-        for b in ts.iter().skip(i + 1) {
-            if a != b && a.to_lowercase() == b.to_lowercase() {
-                return Some((a.clone(), b.clone()));
-            }
+    let mut first_by_folded = std::collections::HashMap::new();
+    for t in ts {
+        if let Some(prev) = first_by_folded.insert(t.to_lowercase(), t)
+            && prev != t
+        {
+            return Some((prev.clone(), t.clone()));
         }
     }
     None

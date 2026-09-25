@@ -1495,6 +1495,11 @@ pub(super) fn run_export_job(
     (result, summary)
 }
 
+/// Whether a CDC export's pending snapshot legs run on the pool: allowed for this run and more than one to run.
+fn snapshot_legs_fan_out(allowed: bool, legs: usize) -> bool {
+    allowed && legs > 1
+}
+
 /// Record one finished baseline snapshot in the state DB, right after it lands; best-effort.
 fn record_snapshot_done(
     state: &StateStore,
@@ -1563,7 +1568,7 @@ fn run_export_job_inner(
                     return (Err(e), summary);
                 }
             };
-        let outcomes = if opts.parallel_snapshots && pending.len() > 1 {
+        let outcomes = if snapshot_legs_fan_out(opts.parallel_snapshots, pending.len()) {
             // The batch pool `--parallel-exports` runs on: every leg runs, each on its
             // own state connection, and a finished snapshot is recorded as it lands.
             let _flags = super::run::RenderFlags::set(super::run::multi_export_mode(), Some(true));
@@ -1779,6 +1784,62 @@ pub(crate) fn run_export_job_with_chunk_source(
             plan_warnings: Vec::new(),
         },
     )
+}
+
+#[cfg(test)]
+mod snapshot_leg_tests {
+    use super::*;
+
+    fn cdc_export() -> crate::config::ExportConfig {
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\n\
+             exports:\n  - name: cdc\n    mode: cdc\n    tables: [orders, items]\n\
+             \x20   format: parquet\n    cdc:\n      checkpoint: /tmp/ck\n\
+             \x20   destination:\n      type: local\n      path: ./out\n",
+        )
+        .expect("a two-table CDC config loads");
+        cfg.exports[0].clone()
+    }
+
+    /// Snapshot legs go to the pool only when this run allows it AND there is more than one.
+    #[test]
+    fn snapshot_legs_fan_out_needs_permission_and_more_than_one_leg() {
+        assert!(snapshot_legs_fan_out(true, 2));
+        assert!(
+            !snapshot_legs_fan_out(true, 1),
+            "one leg gains nothing from a pool"
+        );
+        assert!(
+            !snapshot_legs_fan_out(false, 5),
+            "not allowed, never pooled"
+        );
+    }
+
+    /// A finished leg is recorded under the key the next run's snapshot plan asks for,
+    /// so a rerun after a part-way failure does not redo it.
+    #[test]
+    fn a_finished_snapshot_leg_is_recorded_under_the_key_the_plan_reads() {
+        let export = cdc_export();
+        let leg =
+            crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders", "orders");
+        let state = StateStore::open_in_memory().unwrap();
+        let key = crate::pipeline::cdc_job::snapshot_key(&leg.destination);
+        assert!(
+            !state.snapshot_done("cdc", "orders", &key).unwrap(),
+            "fixture starts undone"
+        );
+        let mut summary = RunSummary::default();
+        summary.journal.run_id = "leg-run".into();
+        record_snapshot_done(&state, "cdc", &leg, &summary);
+        assert!(
+            state.snapshot_done("cdc", "orders", &key).unwrap(),
+            "the leg must be marked done where snapshot_plan looks"
+        );
+        assert!(
+            !state.snapshot_done("cdc", "items", &key).unwrap(),
+            "only the leg that finished"
+        );
+    }
 }
 
 #[cfg(test)]
