@@ -120,11 +120,11 @@ The part-body MD5 rivet computes locally before upload and records in the
 manifest (base64, GCS `md5Hash` encoding). Destination verification compares it
 to the object's listing metadata to confirm content without downloading. Backend
 coverage (verified live unless noted): **GCS** base64 `md5Hash` (always);
-**S3** single-part ETag hex (always; multipart composite `<hash>-<N>` → size-only);
+**S3** size-only (its ETag is not an MD5 under SSE-KMS / SSE-C, so it is not trusted);
 **Azure** md5 for parts rivet uploads as a single `Put Blob` (Azure auto-computes
 `Content-MD5` only then — verified live), size-only for parts large enough to
 stream as `Put Block List`; **local FS** size-only. The one-shot vs stream
-threshold (`cloud.rs`) is what makes Azure md5 work for small parts. Encodings are normalised
+threshold (`destination.oneshot_budget_mb`) is what makes Azure md5 work for small parts. Encodings are normalised
 to raw digest bytes (`md5_digest_bytes`) so base64 and hex of the same digest
 compare equal. _Avoid_: checksum, hash (use for the xxh3 `content_fingerprint`).
 
@@ -133,7 +133,8 @@ The integrity depth an export declares it requires (`exports[].verify`): `size`
 (default — accept size-only) or `content` (every part must be content-MD5
 verified). `content` turns a size-only part into a fatal verdict failure
 (`ContentVerificationUnmet`), so the operator gets a loud, actionable error
-(lower `max_file_size` so parts upload as a single PUT) instead of a silent
+(on GCS / Azure, keep parts under `oneshot_budget_mb` so they upload as a single
+PUT; S3 cannot meet it) instead of a silent
 size-only cliff. Enforced once via `enforce_content_policy`, called by both the
 run `--validate` finalize and the `rivet validate` command. _Avoid_: validate
 level, deep (that meant re-download, which we never do).

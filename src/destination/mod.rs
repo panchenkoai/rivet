@@ -98,8 +98,8 @@ pub struct ObjectMeta {
     /// exposes one — `None` otherwise.  Lets verification compare content
     /// against `manifest.parts[].content_md5` with no download.  Coverage:
     /// - **GCS** — always (`md5Hash`, base64).
-    /// - **S3** — single-part objects (ETag, hex); multipart composite ETags
-    ///   (`<hash>-<N>`) are not an MD5 and verify size-only.
+    /// - **S3** — never: the listed ETag is not an MD5 under SSE-KMS / SSE-C, so it
+    ///   is dropped (`LIST_MD5_IS_TRUSTWORTHY = false`) and S3 verifies size-only.
     /// - **Azure** — when the blob carries a `Content-MD5`. Azure auto-computes
     ///   one *only* for a single-shot `Put Blob`, so rivet one-shots parts that
     ///   fit in memory (verified live: `Content-MD5` present → md5-checked);
@@ -113,7 +113,7 @@ pub struct ObjectMeta {
 ///
 /// Surfaces the store's *own* content checksum from the upload response when
 /// one is available — GCS / Azure single `Put Blob` compute an MD5 from the
-/// received bytes, S3 single `PutObject` returns the MD5 as the ETag.  The
+/// received bytes (S3 reports none: its ETag is not trusted as an MD5).  The
 /// commit path compares it to the locally computed MD5 for a fail-fast,
 /// no-download transit-integrity check.  `None` when the backend / upload path
 /// doesn't report one (local FS, streamed multipart / block-list).

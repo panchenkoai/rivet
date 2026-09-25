@@ -340,9 +340,8 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         let outcome = if let Some(_reservation) = self.reserve_oneshot(size) {
             let body = std::fs::read(local_path)?;
             let meta = self.op.write(&key, body)?;
-            // The single-PUT response carries the store's own checksum: GCS /
-            // Azure as `content_md5` (base64), S3 as the ETag (hex MD5).  Hand
-            // it back for the commit-time transit check.
+            // The single-PUT response carries the store's own checksum on GCS /
+            // Azure (`content_md5`, base64); hand it back for the transit check.
             super::WriteOutcome {
                 // Use the store's REAL Content-MD5 header only (GCS / Azure
                 // return it, base64). Do NOT fall back to the S3 ETag: for an

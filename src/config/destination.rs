@@ -47,13 +47,14 @@ pub struct DestinationConfig {
     #[serde(default)]
     pub allow_anonymous: bool,
     /// Cap on the RAM one-shot (single-PUT) upload buffers may hold, in MB
-    /// (default 64). A one-shot PUT buffers the whole part so the store records a
-    /// content checksum (`Content-MD5`, checked by `validate`); a part that does
-    /// not fit the remaining budget streams instead (memory-bounded, size-only
-    /// verification). `0` streams every part. The cap is process-wide per value:
+    /// (default 64; cloud destinations only). A one-shot PUT buffers the whole part;
+    /// on GCS and Azure the store then records a `Content-MD5` that `validate` checks
+    /// (S3 verifies size-only either way). A part that does not fit the remaining
+    /// budget streams instead (memory-bounded). `0` streams every non-empty part.
+    /// The cap is process-wide per value:
     /// every destination with the same budget — including each table of a CDC
     /// export — draws from one pool of that size, so it never multiplies.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oneshot_budget_mb: Option<u64>,
 }
 
@@ -94,30 +95,17 @@ mod tests {
         assert_eq!(DestinationType::Stdout.label(), "stdout");
     }
 
+    /// A plan artifact sealed before this field existed must still verify: the plan
+    /// seal hashes the serialized destination, so an unset budget may add no key.
     #[test]
-    fn oneshot_budget_mb_is_optional_and_parses() {
-        // `deny_unknown_fields` is on: the field must be a *known* optional key
-        // so an old config (without it) and a new one (with it) both load.
-        let omitted: DestinationConfig = serde_yaml_ng::from_str(
-            "type: local\n\
-             path: ./out\n",
-        )
-        .expect("legacy config without the field must parse");
-        assert_eq!(omitted.oneshot_budget_mb, None);
-
-        let set: DestinationConfig = serde_yaml_ng::from_str(
-            "type: s3\n\
-             bucket: b\n\
-             oneshot_budget_mb: 128\n",
-        )
-        .expect("config with the field must parse");
-        assert_eq!(set.oneshot_budget_mb, Some(128));
-
-        let zero: DestinationConfig = serde_yaml_ng::from_str(
-            "type: gcs\n\
-             oneshot_budget_mb: 0\n",
-        )
-        .expect("0 is a valid disable value");
-        assert_eq!(zero.oneshot_budget_mb, Some(0));
+    fn an_unset_oneshot_budget_serializes_as_before_so_old_plan_seals_verify() {
+        let unset = serde_json::to_value(DestinationConfig::default()).unwrap();
+        assert!(unset.get("oneshot_budget_mb").is_none(), "{unset}");
+        let set = serde_json::to_value(DestinationConfig {
+            oneshot_budget_mb: Some(128),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(set["oneshot_budget_mb"], 128);
     }
 }

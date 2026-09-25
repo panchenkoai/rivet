@@ -4,9 +4,8 @@
 //!
 //! Parsing + business-rule validation are both offline (`Config::from_yaml`),
 //! so this runs in CI without a database or network. It pins the config-level
-//! surface of the knob; the memory-behaviour half (shared process-wide pool vs
-//! a per-destination private pool) is unit-tested in
-//! `destination::cloud::tests` and exercised live in `tests/live/`.
+//! surface of the knob; the memory-behaviour half (one pool per budget value)
+//! is unit-tested in `destination::cloud::tests`; it has no live test.
 
 #[test]
 fn oneshot_budget_mb_resolves_through_the_public_config_surface() {
