@@ -46,18 +46,13 @@ pub struct DestinationConfig {
     pub sas_token_env: Option<String>,
     #[serde(default)]
     pub allow_anonymous: bool,
-    /// Cap on the total RAM one-shot (single-PUT) upload buffers may hold, in
-    /// MB. `None` (the default) draws from the shared process-wide 64 MB pool —
-    /// the historical behaviour, so N parallel exports do not multiply the
-    /// ceiling. A set value gives THIS destination its own pool of that size
-    /// (N opt-in destinations ⇒ up to N × budget — the operator's choice).
-    /// `0` disables one-shot uploads entirely (every part streams, size-only
-    /// verification). A one-shot PUT must buffer the whole part in memory so the
-    /// store can compute and store a content checksum; parts that don't fit the
-    /// budget instead stream (memory-bounded). Applies per destination *instance*
-    /// — the sequential chunked runner creates one instance per chunk, so a
-    /// private pool re-arms each chunk there (harmless: only one instance is
-    /// live at a time).
+    /// Cap on the RAM one-shot (single-PUT) upload buffers may hold, in MB
+    /// (default 64). A one-shot PUT buffers the whole part so the store records a
+    /// content checksum (`Content-MD5`, checked by `validate`); a part that does
+    /// not fit the remaining budget streams instead (memory-bounded, size-only
+    /// verification). `0` streams every part. The cap is process-wide per value:
+    /// every destination with the same budget — including each table of a CDC
+    /// export — draws from one pool of that size, so it never multiplies.
     #[serde(default)]
     pub oneshot_budget_mb: Option<u64>,
 }
