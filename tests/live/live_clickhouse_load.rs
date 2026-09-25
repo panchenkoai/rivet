@@ -446,3 +446,33 @@ fn a_changed_load_pk_is_refused_before_it_rekeys_the_change_log() {
     );
     assert_eq!(rows(), before, "nothing was written: the view is unchanged");
 }
+
+/// A materialized view on the change log writes rows of its own; the load's count
+/// must be the rows it inserted, or every load after the view is attached refuses.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_materialized_view_on_the_change_log_does_not_break_the_count() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_mv", 3);
+    let db = Db::new("rivet_chtest");
+    let rig = into_clickhouse(Rig::mysql_cdc(&tbl), &db);
+    let view = format!("{}.{tbl}", db.0);
+    rig.run_ok();
+    load(&rig);
+    ch(&format!(
+        "CREATE TABLE {view}_audit (id Int64) ENGINE = MergeTree ORDER BY id"
+    ));
+    ch(&format!(
+        "CREATE MATERIALIZED VIEW {view}_audit_mv TO {view}_audit AS SELECT id FROM {view}__changes"
+    ));
+    conn()
+        .query_drop(format!(
+            "INSERT INTO {tbl} (id, v) VALUES (4, 4); UPDATE {tbl} SET v = 9 WHERE id = 1"
+        ))
+        .expect("changes");
+    rig.run_ok();
+    load(&rig);
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "");
+}

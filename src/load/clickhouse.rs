@@ -84,8 +84,8 @@ impl ClickhouseLoader {
         Ok(self.store.get_or_init(|| s))
     }
 
-    /// POST `body` with `params`; returns the response text and the `written_rows` summary.
-    fn post(&self, params: &[(&str, &str)], body: Vec<u8>) -> Result<(String, u64)> {
+    /// POST `body` with `params`, waiting for the statement to finish; returns the response text.
+    fn post(&self, params: &[(&str, &str)], body: Vec<u8>) -> Result<String> {
         let pass = std::env::var(&self.password_env).with_context(|| {
             format!(
                 "ClickHouse load: `password_env` names `{}`, which is not set",
@@ -104,25 +104,18 @@ impl ClickhouseLoader {
             .send()
             .with_context(|| format!("ClickHouse HTTP request to {} failed", self.url))?;
         let status = resp.status();
-        let written = resp
-            .headers()
-            .get("X-ClickHouse-Summary")
-            .and_then(|h| h.to_str().ok())
-            .map(written_rows)
-            .transpose()?
-            .unwrap_or(0);
         let text = resp
             .text()
             .context("reading the ClickHouse HTTP response")?;
         if !status.is_success() {
             bail!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text));
         }
-        Ok((text.trim().to_string(), written))
+        Ok(text.trim().to_string())
     }
 
     /// Run one SQL statement and return its output.
     fn query(&self, sql: &str) -> Result<String> {
-        Ok(self.post(&[], sql.as_bytes().to_vec())?.0)
+        self.post(&[], sql.as_bytes().to_vec())
     }
 
     /// A single `u64` from a `SELECT` returning one number.
@@ -132,28 +125,38 @@ impl ClickhouseLoader {
             .with_context(|| format!("ClickHouse returned `{out}` for `{sql}`"))
     }
 
-    /// Insert every part in `uris` into `target`; the rows ClickHouse reports written.
+    /// Insert every part in `uris` into `target`; the rows those parts hold.
+    ///
+    /// The count comes from each part, not from `X-ClickHouse-Summary`: that counts rows
+    /// materialized views write too and reads 0 under `async_insert`, while a statement that
+    /// returns 200 under `wait_end_of_query` inserted all of its rows (ADR-0035 CH6).
     fn insert_uris(&self, target: &str, uris: &[String]) -> Result<u64> {
         let mut total = 0;
         for uri in uris {
             let (bucket, key) = super::split_gs_uri(uri)?;
-            let (query, body) = match &self.named_collection {
-                Some(nc) => (pull_insert_sql(target, nc, bucket, key), Vec::new()),
-                None => (
-                    format!("INSERT INTO {target} FORMAT Parquet"),
-                    self.store()?
-                        .read(key)
-                        .with_context(|| format!("reading {uri} for the ClickHouse load"))?,
+            let (query, body, rows) = match &self.named_collection {
+                Some(nc) => (
+                    pull_insert_sql(target, nc, bucket, key),
+                    Vec::new(),
+                    self.number(&pull_count_sql(nc, bucket, key))?,
                 ),
+                None => {
+                    let bytes = self
+                        .store()?
+                        .read(key)
+                        .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
+                    let rows = parquet_rows(&bytes).with_context(|| format!("reading {uri}"))?;
+                    (format!("INSERT INTO {target} FORMAT Parquet"), bytes, rows)
+                }
             };
             let params = [
                 ("query", query.as_str()),
                 ("input_format_null_as_default", "0"),
+                ("async_insert", "0"),
             ];
-            total += self
-                .post(&params, body)
-                .with_context(|| format!("inserting {uri} into {target}"))?
-                .1;
+            self.post(&params, body)
+                .with_context(|| format!("inserting {uri} into {target}"))?;
+            total += rows;
         }
         Ok(total)
     }
@@ -363,6 +366,14 @@ fn pull_insert_sql(target: &str, collection: &str, bucket: &str, key: &str) -> S
     )
 }
 
+/// `SELECT count() FROM gcs(<collection>, filename = …)`: the rows ClickHouse sees in the part.
+fn pull_count_sql(collection: &str, bucket: &str, key: &str) -> String {
+    format!(
+        "SELECT count() FROM gcs({collection}, filename = {}, format = 'Parquet')",
+        literal(&format!("{bucket}/{key}"))
+    )
+}
+
 /// The first of `cols` that is not a plain SQL identifier.
 fn unsafe_column(cols: &[String]) -> Option<&String> {
     cols.iter().find(|c| !super::is_safe_load_ident(c))
@@ -549,14 +560,21 @@ fn object_kind_of(engine: &str) -> ObjectKind {
     }
 }
 
-/// `written_rows` from an `X-ClickHouse-Summary` header.
-fn written_rows(summary: &str) -> Result<u64> {
-    let v: serde_json::Value = serde_json::from_str(summary)
-        .with_context(|| format!("parsing X-ClickHouse-Summary `{summary}`"))?;
-    let n = &v["written_rows"];
-    n.as_u64()
-        .or_else(|| n.as_str().and_then(|s| s.parse().ok()))
-        .with_context(|| format!("X-ClickHouse-Summary has no written_rows: `{summary}`"))
+/// The row count a Parquet file's footer declares.
+fn parquet_rows(file: &[u8]) -> Result<u64> {
+    use parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
+    const TAIL: usize = 8;
+    let tail: [u8; TAIL] = file
+        .get(file.len().saturating_sub(TAIL)..)
+        .and_then(|t| t.try_into().ok())
+        .context("too short to be a Parquet file")?;
+    let len = FooterTail::try_new(&tail)?.metadata_length();
+    let start = file
+        .len()
+        .checked_sub(TAIL + len)
+        .context("the Parquet footer is longer than the file")?;
+    let meta = ParquetMetaDataReader::decode_metadata(&file[start..file.len() - TAIL])?;
+    u64::try_from(meta.file_metadata().num_rows()).context("a negative Parquet row count")
 }
 
 /// The head of a ClickHouse error, without its stack trace.
@@ -740,14 +758,25 @@ mod tests {
     }
 
     #[test]
-    fn written_rows_reads_the_quoted_or_bare_number() {
-        assert_eq!(written_rows(r#"{"written_rows":"42"}"#).unwrap(), 42);
-        assert_eq!(written_rows(r#"{"written_rows":7}"#).unwrap(), 7);
-        assert!(written_rows(r#"{"read_rows":"1"}"#).is_err());
+    fn the_row_count_is_the_parquet_footers() {
+        use std::sync::Arc;
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        assert_eq!(parquet_rows(&buf).unwrap(), 6);
+        assert!(
+            parquet_rows(&buf[..4]).is_err(),
+            "a truncated file is refused"
+        );
     }
 
-    /// Versions decide the winner, never insert order: each key's rows go in
-    /// newest-first, and the oldest row must not survive (ADR-0035 CH3).
     #[test]
     #[ignore = "live: requires docker compose clickhouse"]
     fn the_change_log_keeps_the_latest_source_position_whatever_the_insert_order() {
