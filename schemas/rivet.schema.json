@@ -1643,11 +1643,11 @@
       ]
     },
     "LoadSection": {
-      "description": "The block as written: `target` plus the union of both warehouses' fields.",
+      "description": "The block as written: `target` plus the union of every warehouse's fields.",
       "type": "object",
       "properties": {
         "target": {
-          "description": "The warehouse: `bigquery` or `snowflake`.",
+          "description": "The warehouse: `bigquery`, `snowflake` or `clickhouse`.",
           "$ref": "#/$defs/LoadTargetKind"
         },
         "project": {
@@ -1683,7 +1683,7 @@
           "default": null
         },
         "database": {
-          "description": "Snowflake: the database the tables are created in.",
+          "description": "Snowflake / ClickHouse: the database the tables are created in.",
           "type": [
             "string",
             "null"
@@ -1700,6 +1700,30 @@
         },
         "storage_integration": {
           "description": "Snowflake: a pre-created GCS `STORAGE INTEGRATION`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "url": {
+          "description": "ClickHouse: the HTTP endpoint, e.g. `http://localhost:8123`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "user": {
+          "description": "ClickHouse: the user the load authenticates as.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "password_env": {
+          "description": "ClickHouse: the env var holding that user's password.",
           "type": [
             "string",
             "null"
@@ -1769,7 +1793,8 @@
       "type": "string",
       "enum": [
         "bigquery",
-        "snowflake"
+        "snowflake",
+        "clickhouse"
       ]
     }
   }

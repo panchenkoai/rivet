@@ -184,14 +184,17 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `target` | `bigquery` \| `snowflake` | **yes** | The warehouse: `bigquery` or `snowflake`. |
+| `target` | `bigquery` \| `snowflake` \| `clickhouse` | **yes** | The warehouse: `bigquery`, `snowflake` or `clickhouse`. |
 | `project` | `string` |  | BigQuery: the project the dataset lives in. |
 | `dataset` | `string` |  | BigQuery: the dataset the tables are created in. |
 | `connection` | `string` |  | Snowflake: the `snow` CLI connection name. |
 | `warehouse` | `string` |  | Snowflake: the virtual warehouse the load runs on. |
-| `database` | `string` |  | Snowflake: the database the tables are created in. |
+| `database` | `string` |  | Snowflake / ClickHouse: the database the tables are created in. |
 | `schema` | `string` |  | Snowflake: the schema the tables are created in. |
 | `storage_integration` | `string` |  | Snowflake: a pre-created GCS `STORAGE INTEGRATION`. |
+| `url` | `string` |  | ClickHouse: the HTTP endpoint, e.g. `http://localhost:8123`. |
+| `user` | `string` |  | ClickHouse: the user the load authenticates as. |
+| `password_env` | `string` |  | ClickHouse: the env var holding that user's password. |
 | `cleanup_source` | `boolean` |  | After a successful load, delete the staged Parquet under the export prefix. |
 | `pk` | `auto` \| `none` |  | Dedup key of the incremental/CDC current-state view: `auto` (the source primary key `rivet run` recorded), `none`, or explicit columns; ignored for `full`. |
 | `layout` | `log_view` \| `base_buffer` |  | `log_view` or `base_buffer` — where the current state lives. Absent derives it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest changelog+view. `base_buffer` needs `target: bigquery` — `rivet compact` is what merges the buffer into the base, and it is BigQuery-only. |

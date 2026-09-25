@@ -97,6 +97,8 @@ mod live_chunked_dense;
 mod live_chunked_recovery;
 #[path = "live/live_cli_flags.rs"]
 mod live_cli_flags;
+#[path = "live/live_clickhouse_load.rs"]
+mod live_clickhouse_load;
 #[path = "live/live_content_load.rs"]
 mod live_content_load;
 #[path = "live/live_crash_recovery.rs"]

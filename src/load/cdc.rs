@@ -52,6 +52,7 @@ pub enum SourceEngine {
 pub enum Warehouse {
     BigQuery,
     Snowflake,
+    ClickHouse,
 }
 
 impl Warehouse {
@@ -60,14 +61,15 @@ impl Warehouse {
         match self {
             Warehouse::BigQuery => "BigQuery",
             Warehouse::Snowflake => "Snowflake",
+            Warehouse::ClickHouse => "ClickHouse",
         }
     }
 
-    /// The `SELECT *`-minus-columns keyword: BigQuery spells it `EXCEPT`,
-    /// Snowflake `EXCLUDE`.
+    /// The `SELECT *`-minus-columns keyword: BigQuery and ClickHouse spell it
+    /// `EXCEPT`, Snowflake `EXCLUDE`.
     fn except_keyword(self) -> &'static str {
         match self {
-            Warehouse::BigQuery => "EXCEPT",
+            Warehouse::BigQuery | Warehouse::ClickHouse => "EXCEPT",
             Warehouse::Snowflake => "EXCLUDE",
         }
     }
@@ -76,11 +78,16 @@ impl Warehouse {
     /// warehouse. BigQuery back-ticks the whole path; Snowflake leaves it bare
     /// (matching the unquoted identifiers the Snowflake loader creates, so a
     /// lowercase name resolves to the same upper-cased object) — a back-tick
-    /// there is a syntax error.
-    fn quote_fqtn(self, fqtn: &str) -> String {
+    /// there is a syntax error. ClickHouse back-ticks each dot-separated segment.
+    pub(crate) fn quote_fqtn(self, fqtn: &str) -> String {
         match self {
             Warehouse::BigQuery => format!("`{fqtn}`"),
             Warehouse::Snowflake => fqtn.to_string(),
+            Warehouse::ClickHouse => fqtn
+                .split('.')
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join("."),
         }
     }
 
@@ -90,9 +97,9 @@ impl Warehouse {
     /// columns unquoted (upper-cased), and a case-sensitive `"col"` there would
     /// miss them; a reserved-word column already fails at the Snowflake `__changes`
     /// DDL, a narrower pre-existing limitation.
-    fn quote_ident(self, col: &str) -> String {
+    pub(crate) fn quote_ident(self, col: &str) -> String {
         match self {
-            Warehouse::BigQuery => format!("`{col}`"),
+            Warehouse::BigQuery | Warehouse::ClickHouse => format!("`{col}`"),
             Warehouse::Snowflake => col.to_string(),
         }
     }
@@ -174,6 +181,8 @@ impl SourceEngine {
             (Warehouse::Snowflake, SourceEngine::Mongo) => {
                 vec!["PARSE_JSON(__pos):_data::string".into()]
             }
+            // ── ClickHouse: the log's own version column (ADR-0035 CH3).
+            (Warehouse::ClickHouse, _) => vec!["__ver".into()],
         };
         // `__seq` is always the final, least-significant tiebreak: it orders
         // changes that share a commit position (same transaction).
@@ -199,6 +208,7 @@ pub fn meta_column_specs(warehouse: Warehouse) -> Vec<TargetColumnSpec> {
     let (str_ty, int_ty) = match warehouse {
         Warehouse::BigQuery => ("STRING", "INT64"),
         Warehouse::Snowflake => ("VARCHAR", "INTEGER"),
+        Warehouse::ClickHouse => ("String", "Int64"),
     };
     ["__op", "__pos"]
         .into_iter()
@@ -247,9 +257,24 @@ pub fn flag_spec(warehouse: Warehouse) -> TargetColumnSpec {
     let ty = match warehouse {
         Warehouse::BigQuery => "BOOL",
         Warehouse::Snowflake => "BOOLEAN",
+        Warehouse::ClickHouse => "Bool",
     };
     meta_spec(DELETE_FLAG_COLUMN, ty)
 }
+
+/// The ClickHouse change log's version: `(source position << 128) | (__seq + 1)`,
+/// the position decoded from the `__pos` JSON's own shape (ADR-0035 CH3).
+pub(crate) const CLICKHOUSE_VERSION_EXPR: &str = "bitOr(bitShiftLeft(toUInt256(multiIf(\
+__pos IS NULL, toUInt128(0), \
+JSONHas(ifNull(__pos, ''), 'file'), bitOr(bitShiftLeft(toUInt128(toUInt64OrZero(extract(\
+JSONExtractString(ifNull(__pos, ''), 'file'), '[0-9]+$'))), 64), \
+toUInt128(JSONExtractUInt(ifNull(__pos, ''), 'pos'))), \
+position(JSONExtractString(ifNull(__pos, ''), 'lsn'), '/') > 0, \
+toUInt128(reinterpretAsUInt64(reverse(unhex(concat(\
+leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[1], 8, '0'), \
+leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[2], 8, '0')))))), \
+reinterpretAsUInt128(reverse(unhex(leftPad(JSONExtractString(ifNull(__pos, ''), 'lsn'), 32, '0')))))), \
+128), toUInt256(ifNull(__seq, -1) + 1))";
 
 /// A half-open window on the partition column, as typed SQL literals: `lo..hi_exclusive`
 /// selects the buffer's winners one MERGE takes, `all_lo..all_hi_exclusive` is the whole
@@ -612,6 +637,9 @@ pub fn dedup_view_sql(
     pk: &[&str],
     engine: SourceEngine,
 ) -> String {
+    if warehouse == Warehouse::ClickHouse {
+        return clickhouse_final_view(view_fqtn, changes_fqtn);
+    }
     let partition = quote_partition(warehouse, pk);
     // `initial: snapshot` backfill rows load as a plain full-snapshot parquet —
     // no `__op`/`__pos`/`__seq` — so they land in `__changes` with those NULL.
@@ -631,6 +659,20 @@ pub fn dedup_view_sql(
         &partition,
         &order,
         "COALESCE(__op = 'delete', FALSE)",
+    )
+}
+
+/// The ClickHouse current-state view: the engine keeps one version per key, `FINAL` reads it (ADR-0035 CH5).
+fn clickhouse_final_view(view_fqtn: &str, changes_fqtn: &str) -> String {
+    let wh = Warehouse::ClickHouse;
+    format!(
+        "CREATE OR REPLACE VIEW {view} AS\n\
+         SELECT * EXCEPT (__op, __pos, __seq, __ver),\n\
+         \x20      ifNull(__op = 'delete', false) AS {flag}\n\
+         FROM {changes} FINAL",
+        view = wh.quote_fqtn(view_fqtn),
+        changes = wh.quote_fqtn(changes_fqtn),
+        flag = DELETE_FLAG_COLUMN,
     )
 }
 
@@ -941,7 +983,7 @@ mod tests {
                 "{wh:?}: no CDC delete logic: {sql}"
             );
             let kw = match wh {
-                Warehouse::BigQuery => "EXCEPT",
+                Warehouse::BigQuery | Warehouse::ClickHouse => "EXCEPT",
                 Warehouse::Snowflake => "EXCLUDE",
             };
             assert!(

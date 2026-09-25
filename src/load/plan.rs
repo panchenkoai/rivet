@@ -1278,6 +1278,11 @@ fn resolve_partition(
         LoadTarget::Snowflake { .. } => {
             super::snowflake::partition_expr(export, spec, &column_type)?
         }
+        LoadTarget::Clickhouse { .. } => bail!(
+            "export `{export}`: `partition:` is not supported for a ClickHouse load — the \
+             change log collapses versions only within a partition, so a row whose \
+             partition value changes would stay duplicated for ever (ADR-0035 CH8)"
+        ),
     };
     if hourly_partitions_outlive_the_table(&key, spec.expiration_days) {
         eprintln!("{}", hourly_limit_warning(export));

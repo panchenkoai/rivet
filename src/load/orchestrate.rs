@@ -69,6 +69,11 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     } else {
         None
     };
+    if let Some(e) = engine
+        && let Some(why) = unsupported_cdc_target(e, &plans)
+    {
+        anyhow::bail!("{why}");
+    }
     // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
     // come from the `load:` block, so the CLI carries no per-mode flags.
     // Per-table FAULT ISOLATION, mirroring `rivet run` (pipeline/run.rs): collect
@@ -301,6 +306,23 @@ fn lease_busy_message(target_fqtn: &str) -> String {
 /// configs the parse engine exists for.
 pub(super) fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
     plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
+}
+
+/// Why a CDC load from `engine` cannot reach one of `plans`' targets, or `None`.
+pub(super) fn unsupported_cdc_target(
+    engine: load::cdc::SourceEngine,
+    plans: &[load::plan::LoadPlan],
+) -> Option<String> {
+    let clickhouse_cdc = plans.iter().any(|p| {
+        p.mode == load::plan::LoadMode::Cdc
+            && matches!(p.load.target, load::plan::LoadTarget::Clickhouse { .. })
+    });
+    (engine == load::cdc::SourceEngine::Mongo && clickhouse_cdc).then(|| {
+        "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer \
+         order for the change log's version (ADR-0035 CH7) — load it into BigQuery or \
+         Snowflake, or export it in batch mode"
+            .to_string()
+    })
 }
 
 /// Fold every per-plan failure into ONE error, or `None` when nothing failed.
@@ -1455,10 +1477,7 @@ fn rebaseline_action(warehouse_has_changes: bool, ledger: LedgerSignal) -> Rebas
 fn rebaseline_refusal(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse) -> String {
     // The remedy must PARSE where the operator pastes it (round-8): backticks
     // are BigQuery-only; Snowflake takes the bare fqtn.
-    let quoted = match warehouse {
-        crate::load::cdc::Warehouse::BigQuery => format!("`{target_fqtn}__changes`"),
-        crate::load::cdc::Warehouse::Snowflake => format!("{target_fqtn}__changes"),
-    };
+    let quoted = warehouse.quote_fqtn(&format!("{target_fqtn}__changes"));
     rebaseline_refusal_text(&quoted)
 }
 

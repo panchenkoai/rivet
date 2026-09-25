@@ -48,11 +48,11 @@ impl JsonSchema for LoadSection {
     }
 }
 
-/// The block as written: `target` plus the union of both warehouses' fields.
+/// The block as written: `target` plus the union of every warehouse's fields.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RawLoadSection {
-    /// The warehouse: `bigquery` or `snowflake`.
+    /// The warehouse: `bigquery`, `snowflake` or `clickhouse`.
     target: LoadTargetKind,
     /// BigQuery: the project the dataset lives in.
     #[serde(default)]
@@ -66,7 +66,7 @@ struct RawLoadSection {
     /// Snowflake: the virtual warehouse the load runs on.
     #[serde(default)]
     warehouse: Option<String>,
-    /// Snowflake: the database the tables are created in.
+    /// Snowflake / ClickHouse: the database the tables are created in.
     #[serde(default)]
     database: Option<String>,
     /// Snowflake: the schema the tables are created in.
@@ -75,6 +75,15 @@ struct RawLoadSection {
     /// Snowflake: a pre-created GCS `STORAGE INTEGRATION`.
     #[serde(default)]
     storage_integration: Option<String>,
+    /// ClickHouse: the HTTP endpoint, e.g. `http://localhost:8123`.
+    #[serde(default)]
+    url: Option<String>,
+    /// ClickHouse: the user the load authenticates as.
+    #[serde(default)]
+    user: Option<String>,
+    /// ClickHouse: the env var holding that user's password.
+    #[serde(default)]
+    password_env: Option<String>,
     /// After a successful load, delete the staged Parquet under the export prefix.
     #[serde(default)]
     cleanup_source: bool,
@@ -118,6 +127,7 @@ struct RawLoadSection {
 enum LoadTargetKind {
     Bigquery,
     Snowflake,
+    Clickhouse,
 }
 
 impl LoadTargetKind {
@@ -125,6 +135,7 @@ impl LoadTargetKind {
         match self {
             LoadTargetKind::Bigquery => "bigquery",
             LoadTargetKind::Snowflake => "snowflake",
+            LoadTargetKind::Clickhouse => "clickhouse",
         }
     }
 }
@@ -135,25 +146,45 @@ impl TryFrom<RawLoadSection> for LoadSection {
     /// The target's own fields must be present and the other warehouse's absent.
     fn try_from(r: RawLoadSection) -> Result<Self, String> {
         let name = r.target.name();
-        let bigquery = [("project", &r.project), ("dataset", &r.dataset)];
-        let snowflake = [
-            ("connection", &r.connection),
-            ("warehouse", &r.warehouse),
-            ("database", &r.database),
-            ("schema", &r.schema),
-            ("storage_integration", &r.storage_integration),
+        // (field, value, the warehouses it belongs to); `database` is shared.
+        let fields: [(&str, &Option<String>, &[LoadTargetKind]); 10] = [
+            ("project", &r.project, &[LoadTargetKind::Bigquery]),
+            ("dataset", &r.dataset, &[LoadTargetKind::Bigquery]),
+            ("connection", &r.connection, &[LoadTargetKind::Snowflake]),
+            ("warehouse", &r.warehouse, &[LoadTargetKind::Snowflake]),
+            (
+                "database",
+                &r.database,
+                &[LoadTargetKind::Snowflake, LoadTargetKind::Clickhouse],
+            ),
+            ("schema", &r.schema, &[LoadTargetKind::Snowflake]),
+            (
+                "storage_integration",
+                &r.storage_integration,
+                &[LoadTargetKind::Snowflake],
+            ),
+            ("url", &r.url, &[LoadTargetKind::Clickhouse]),
+            ("user", &r.user, &[LoadTargetKind::Clickhouse]),
+            (
+                "password_env",
+                &r.password_env,
+                &[LoadTargetKind::Clickhouse],
+            ),
         ];
-        let (own, foreign, other) = match r.target {
-            LoadTargetKind::Bigquery => (&bigquery[..], &snowflake[..], "snowflake"),
-            LoadTargetKind::Snowflake => (&snowflake[..], &bigquery[..], "bigquery"),
-        };
-        if let Some((field, _)) = foreign.iter().find(|(_, v)| v.is_some()) {
+        let foreign = fields
+            .iter()
+            .find(|(_, v, of)| v.is_some() && !of.contains(&r.target));
+        if let Some((field, _, of)) = foreign {
+            let other = of[0].name();
             return Err(format!(
                 "`load:` targets `{name}` but carries `{field}`, a `{other}` field — remove it \
                  (it would be silently ignored, masking a mis-configured load)"
             ));
         }
-        if let Some((field, _)) = own.iter().find(|(_, v)| v.is_none()) {
+        let missing = fields
+            .iter()
+            .find(|(_, v, of)| v.is_none() && of.contains(&r.target));
+        if let Some((field, _, _)) = missing {
             return Err(format!("`load:` targets `{name}` but has no `{field}`"));
         }
         let take = |v: &Option<String>| v.clone().unwrap_or_default();
@@ -168,6 +199,12 @@ impl TryFrom<RawLoadSection> for LoadSection {
                 database: take(&r.database),
                 schema: take(&r.schema),
                 storage_integration: take(&r.storage_integration),
+            },
+            LoadTargetKind::Clickhouse => LoadTarget::Clickhouse {
+                url: take(&r.url),
+                database: take(&r.database),
+                user: take(&r.user),
+                password_env: take(&r.password_env),
             },
         };
         Ok(LoadSection {
@@ -231,6 +268,12 @@ pub enum LoadTarget {
         schema: String,
         storage_integration: String,
     },
+    Clickhouse {
+        url: String,
+        database: String,
+        user: String,
+        password_env: String,
+    },
 }
 
 impl LoadTarget {
@@ -239,6 +282,7 @@ impl LoadTarget {
         match self {
             LoadTarget::Bigquery { .. } => "bigquery",
             LoadTarget::Snowflake { .. } => "snowflake",
+            LoadTarget::Clickhouse { .. } => "clickhouse",
         }
     }
 }

@@ -17,6 +17,7 @@ use staging::maybe_cleanup;
 mod bigquery;
 mod bq_rest;
 pub mod cdc;
+mod clickhouse;
 pub mod compact;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
@@ -1142,6 +1143,22 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.private_key_path = std::env::var("RIVET_SNOWFLAKE_KEY").ok();
             Box::new(l)
         }
+        LoadTarget::Clickhouse {
+            url,
+            database,
+            user,
+            password_env,
+        } => Box::new(
+            clickhouse::ClickhouseLoader::new(
+                url,
+                database,
+                user,
+                password_env,
+                plan.destination.clone(),
+            )
+            .cluster_by(plan.clustering.columns().to_vec())
+            .cdc(plan.mode == plan::LoadMode::Cdc),
+        ),
     }
 }
 
