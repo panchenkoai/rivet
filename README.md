@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/assets/rivet_logo.png" alt="Rivet" width="480">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rivet-wordmark-dark.svg">
+    <img src="docs/assets/rivet-wordmark.svg" alt="Rivet" width="260">
+  </picture>
 </p>
 
 <p align="center">
@@ -18,7 +21,10 @@ Batch snapshots or log-based change data capture. Resumable, verifiable, source-
 </p>
 
 <p align="center">
-  <img src="docs/assets/rivet-flow.svg" alt="PostgreSQL, MySQL, SQL Server and MongoDB → rivet → S3, GCS, Azure Blob or local disk → BigQuery or Snowflake" width="900">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rivet-flow-dark.svg">
+    <img src="docs/assets/rivet-flow.svg" alt="PostgreSQL, MySQL, SQL Server and MongoDB → rivet → S3, GCS, Azure Blob or local disk → BigQuery or Snowflake" width="900">
+  </picture>
 </p>
 
 ## What you get

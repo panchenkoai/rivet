@@ -10,6 +10,9 @@
   measured 3–4.5× faster per part at 50 ms RTT). `0` streams every part. The cap
   is shared by every destination with the same value, including each table of a
   CDC export, so it never multiplies by table count.
+
+## 0.29.0 — 2026-09-25
+
 - **A multi-table CDC cycle to GCS is 10–13× faster** (60 tables, 330k changes,
   measured against 0.28.0 on the same binlog span: 348 s → 35 s on a SQLite ledger,
   376 s → 29 s on Postgres; an idle cycle 115 s → 10 s). The time was not data:
@@ -32,6 +35,19 @@
   others finish (release builds; `release-min` aborts).
 - GCS: the ADC access token is minted once per identity per process, not once per
   destination (a multi-table CDC run opened one per table, ~0.4 s each).
+- **Internals behind the same behaviour** (refactor-3): the commit ledger is the only
+  writer of a run's counters, and one `FanIn` owns every parallel runner's tail
+  (keyset, chunked, Mongo, parallel checkpoint). Fixes a resume after a failed chunked
+  run under-reporting rows (50 of 150) and a Mongo worker panic that lost a durable
+  part. `rivet run --summary-output` into a missing directory, `apply` stopping at the
+  first plan rejection, and a leaked progress channel after a panic are fixed on the way.
+- **A local multi-table CDC stream refuses tables that differ only by letter case**
+  (`Orders` / `orders`): on a case-insensitive filesystem (macOS, Windows) their parts
+  overwrote each other and the lost rows were permanent while `rivet validate` passed.
+  Cloud prefixes are case-sensitive and keep both.
+- **README rewritten** around what rivet does: a diagram (sources → rivet → storage →
+  warehouse, light and dark), six claims, and three quickstarts — batch, CDC, and the
+  full `run` → `load` → `compact` cycle — each run as printed against a live stand.
 
 ## 0.28.0 — 2026-09-23
 
