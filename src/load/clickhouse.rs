@@ -158,6 +158,38 @@ impl ClickhouseLoader {
         Ok(total)
     }
 
+    /// Why an existing `<table>__changes` cannot take this load, read from the catalog; `None` when absent or matching.
+    fn existing_changelog_conflict(
+        &self,
+        table: &str,
+        shape: &ChangelogShape<'_>,
+        pk: &[String],
+        full: &[TargetColumnSpec],
+    ) -> Result<Option<String>> {
+        let name = format!("{table}__changes");
+        let found = self.query(&format!(
+            "SELECT engine, sorting_key FROM system.tables WHERE {} FORMAT TSV",
+            self.system_filter(&name, "name")
+        ))?;
+        let Some((engine, sorting_key)) = found.split_once('\t') else {
+            return Ok(None);
+        };
+        let cols = self.query(&format!(
+            "SELECT name, type FROM system.columns WHERE {} FORMAT TSV",
+            self.system_filter(&name, "table")
+        ))?;
+        let existing: Vec<(&str, &str)> = cols.lines().filter_map(|l| l.split_once('\t')).collect();
+        Ok(changelog_conflict(
+            &TargetLoader::fqtn(self, &name),
+            &TargetLoader::fqtn(self, table),
+            shape,
+            pk,
+            (engine, sorting_key),
+            &existing,
+            full,
+        ))
+    }
+
     /// `name = 'x' AND database = 'y'` for a `system.*` lookup of `table`.
     fn system_filter(&self, table: &str, name_col: &str) -> String {
         format!(
@@ -210,6 +242,9 @@ impl TargetLoader for ClickhouseLoader {
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
         let shape = changelog_shape(self.cdc, table, pk)?;
+        if let Some(why) = self.existing_changelog_conflict(table, &shape, pk, &full)? {
+            return Err(super::refused(why));
+        }
         let ddl = columns_ddl(&full, shape.not_null) + &shape.version_column;
         self.query(&create_table_sql(
             "CREATE TABLE IF NOT EXISTS",
@@ -380,6 +415,58 @@ fn changelog_shape<'a>(cdc: bool, table: &str, pk: &'a [String]) -> Result<Chang
     })
 }
 
+/// Why an existing change log (`engine`, `sorting_key`, column types) cannot take a load
+/// shaped `shape` over `wanted`, or `None`: another engine (the export changed mode), another
+/// key (a changed `load.pk`) or another column type would each corrupt it silently.
+fn changelog_conflict(
+    changes: &str,
+    view: &str,
+    shape: &ChangelogShape<'_>,
+    pk: &[String],
+    (engine, sorting_key): (&str, &str),
+    existing: &[(&str, &str)],
+    wanted: &[TargetColumnSpec],
+) -> Option<String> {
+    let want_engine = shape.engine.split('(').next().unwrap_or(shape.engine);
+    let restart = format!(
+        "Nothing was written. Drop it and `{view}`, then re-snapshot the export (a CDC stream) \
+         or `rivet state reset` it (an incremental one) so the next load starts the log over"
+    );
+    if engine != want_engine {
+        return Some(format!(
+            "`{changes}` is a {engine}, but this load writes a {want_engine} change log \
+             (the export's mode changed; ADR-0035). {restart}"
+        ));
+    }
+    let key: Vec<String> = sorting_key
+        .split(',')
+        .map(|c| c.trim().trim_matches('`').to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if want_engine == "ReplacingMergeTree" && key != pk {
+        return Some(format!(
+            "`{changes}` collapses versions by ({}), but `load.pk` is now ({}): rows the old key \
+             already merged cannot be told apart again. {restart}",
+            key.join(", "),
+            pk.join(", ")
+        ));
+    }
+    let squash = |t: &str| t.replace(' ', "");
+    wanted.iter().find_map(|s| {
+        let want = column_type(s, shape.not_null.contains(&s.column_name));
+        let (_, have) = existing.iter().find(|(n, _)| *n == s.column_name)?;
+        (squash(have) != squash(&want)).then(|| {
+            format!(
+                "column `{}` of `{changes}` is {have}, but the export now resolves it to {want}; \
+                 inserting would convert every value silently. Widen it with `ALTER TABLE \
+                 {changes} MODIFY COLUMN `{}` {want}` (not possible for a key column). \
+                 Otherwise: {restart}",
+                s.column_name, s.column_name,
+            )
+        })
+    })
+}
+
 /// `CREATE … <fqtn> (<ddl>) ENGINE = <engine> ORDER BY <key>`, allowing a Nullable key column.
 fn create_table_sql(verb: &str, fqtn: &str, ddl: &str, engine: &str, key: &str) -> String {
     format!(
@@ -542,6 +629,70 @@ mod tests {
             .map(|s| s.column_name)
             .collect();
         assert_eq!(names, ["__op", "__pos", "__seq", "id"]);
+    }
+
+    /// An existing log is refused before any write when the load would corrupt it:
+    /// another engine (a mode switch), another key (a changed `load.pk`), another type.
+    #[test]
+    fn an_existing_change_log_that_this_load_would_corrupt_is_refused() {
+        let pk = ["id".to_string()];
+        let cdc = changelog_shape(true, "t", &pk).unwrap();
+        let inc = changelog_shape(false, "t", &pk).unwrap();
+        let specs = changelog_specs(&[spec("id", "Int64"), spec("v", "Decimal(10,2)")]);
+        let cols = [
+            ("id", "Int64"),
+            ("v", "Nullable(Decimal(10, 2))"),
+            ("__op", "Nullable(String)"),
+        ];
+        let inc_cols = [("id", "Nullable(Int64)"), ("v", "Nullable(Decimal(10, 2))")];
+        let conflict = |shape: &ChangelogShape<'_>,
+                        key: &[String],
+                        existing: (&str, &str),
+                        cols: &[(&str, &str)]| {
+            changelog_conflict("d.t__changes", "d.t", shape, key, existing, cols, &specs)
+        };
+        assert_eq!(
+            conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &cols),
+            None,
+            "a matching log"
+        );
+        assert_eq!(
+            conflict(&inc, &pk, ("MergeTree", ""), &inc_cols),
+            None,
+            "a matching incremental log"
+        );
+
+        let mode =
+            conflict(&inc, &pk, ("ReplacingMergeTree", "id"), &cols).expect("cdc -> incremental");
+        assert!(
+            mode.contains("is a ReplacingMergeTree") && mode.contains("Nothing was written"),
+            "{mode}"
+        );
+        assert!(
+            conflict(&cdc, &pk, ("MergeTree", ""), &cols).is_some(),
+            "incremental -> cdc"
+        );
+
+        let wider = ["id".to_string(), "tenant".to_string()];
+        let cdc2 = changelog_shape(true, "t", &wider).unwrap();
+        let key = conflict(&cdc2, &wider, ("ReplacingMergeTree", "id"), &cols).expect("pk changed");
+        assert!(
+            key.contains("collapses versions by (id)") && key.contains("(id, tenant)"),
+            "{key}"
+        );
+        assert_eq!(
+            conflict(&cdc2, &wider, ("ReplacingMergeTree", "id, `tenant`"), &cols),
+            None,
+            "the catalog's spelling of the same key"
+        );
+
+        let narrow = [("id", "Int64"), ("v", "Nullable(Decimal(9, 2))")];
+        let ty =
+            conflict(&cdc, &pk, ("ReplacingMergeTree", "id"), &narrow).expect("a type changed");
+        assert!(
+            ty.contains("column `v`") && ty.contains("MODIFY COLUMN"),
+            "{ty}"
+        );
     }
 
     #[test]

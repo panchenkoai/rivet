@@ -392,3 +392,57 @@ fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_
         pg_rows(&mut c, &tbl)
     );
 }
+
+/// A change log keyed on one `load.pk` cannot take a load keyed on another: rows the
+/// old key already collapsed cannot be told apart again, so the load refuses before
+/// writing and the view keeps serving what it served.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_changed_load_pk_is_refused_before_it_rekeys_the_change_log() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let mut c = conn();
+    let tbl = unique_name("rivet_ch_pk");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT, tenant BIGINT, v INT, \
+         PRIMARY KEY (id, tenant)); INSERT INTO {tbl} VALUES (1, 1, 11), (1, 2, 12)"
+    ))
+    .expect("seed");
+    let _guard = Table(tbl.clone());
+    let db = Db::new("rivet_chtest");
+    let keyed = |pk: &str| {
+        Rig::mysql_cdc(&tbl)
+            .cdc("initial: snapshot")
+            .dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+            .top_line(&format!(
+                "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+                 user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [{pk}] }}",
+                db.0
+            ))
+    };
+    let first = keyed("id, tenant");
+    first.run_ok();
+    load(&first);
+    let view = format!("{}.{tbl}", db.0);
+    let rows = || {
+        ch(&format!(
+            "SELECT id, tenant, v FROM {view} ORDER BY id, tenant FORMAT TSV"
+        ))
+    };
+    let before = rows();
+    assert_eq!(
+        before, "1\t1\t11\n1\t2\t12",
+        "the composite key keeps both rows"
+    );
+
+    let second = keyed("id");
+    second.run_ok();
+    let out = second.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("collapses versions by (id, tenant)"),
+        "a re-keyed load must refuse, naming both keys:\n{err}"
+    );
+    assert_eq!(rows(), before, "nothing was written: the view is unchanged");
+}
