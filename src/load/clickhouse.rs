@@ -866,10 +866,15 @@ mod tests {
         )
         .cdc(true)
         .named_collection(Some("rivet_stand_minio".into()));
-        let _ = reqwest::blocking::Client::new()
-            .put("http://127.0.0.1:9000/rivet-qa-ch-pull")
-            .basic_auth("minioadmin", Some("minioadmin"))
-            .send();
+        let made = std::process::Command::new("docker")
+            .args(["compose", "exec", "-T", "minio", "sh", "-c"])
+            .arg(
+                "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin >/dev/null 2>&1 \
+                 && mc mb -p local/rivet-qa-ch-pull >/dev/null 2>&1 || true",
+            )
+            .status()
+            .expect("docker compose exec minio");
+        assert!(made.success(), "creating the MinIO bucket failed: {made}");
         let write = |name: &str, select: &str| {
             loader
                 .query(&format!(
