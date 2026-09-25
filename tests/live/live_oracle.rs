@@ -520,3 +520,55 @@ fn every_seeded_oracle_table_exports_every_row() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// `rivet init` on a NUMBER(19) key that straddles i64::MAX scaffolds keyset, and the run pages it exactly.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_init_generated_config_keysets_a_number_19_key_past_i64() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_n19", "id NUMBER(19) PRIMARY KEY, v VARCHAR2(20)");
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT 9223372036854700000 + LEVEL, 'v' || LEVEL FROM dual CONNECT BY LEVEL <= 150001",
+        t.name()
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let env = [("ORACLE_URL", ORACLE_URL)];
+    let init = run_rivet_in_dir(
+        dir.path(),
+        &[
+            "init",
+            "--source-env",
+            "ORACLE_URL",
+            "--table",
+            t.name(),
+            "--mode",
+            "chunked",
+            "-o",
+            "rivet.yaml",
+        ],
+        &env,
+    );
+    assert!(
+        init.status.success(),
+        "init:\n{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let yaml = std::fs::read_to_string(dir.path().join("rivet.yaml")).unwrap();
+    assert!(
+        yaml.contains("chunk_by_key: ID"),
+        "init must keyset the NUMBER(19) key:\n{yaml}"
+    );
+    let run = run_rivet_in_dir(dir.path(), &["run", "-c", "rivet.yaml"], &env);
+    assert!(
+        run.status.success(),
+        "run:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let out = dir.path().join("output").join(t.name());
+    assert_eq!(duckdb_total_parquet_rows(&out), 150_001, "every row");
+    assert_eq!(
+        duckdb_dir_scalar(&out, "count(DISTINCT \"ID\")", None),
+        150_001,
+        "no row read twice"
+    );
+}

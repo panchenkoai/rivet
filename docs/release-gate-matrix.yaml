@@ -69,6 +69,14 @@ grid:
   mongo:
     gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
     gaps:  []
+  oracle:
+    gated: []
+    gaps:  ["23-free"]               # the Oracle batch source (phase 1) has a compose stand
+                                     # (gvenzl/oracle-free:23-slim-faststart) and live tests, but
+                                     # dev/release-oracle/matrix.yaml does not list the engine, so
+                                     # the gate brings up no Oracle version. Deliberately NOT an
+                                     # empty `versions:` there: that would be a gate leg over zero
+                                     # versions, a vacuous pass.
 
 # ── Per-(engine, version) DATA / BEHAVIOUR scenarios (run once per gridded version) ──
 # Cell is per-ENGINE (uniform across that engine's gridded versions); a version-specific
@@ -80,60 +88,70 @@ scenarios:
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: blessed_path
     what: "COMPLEMENTS docs/scenario-artifact-matrix.yaml, which owns the artifact/meta-DB half more deeply (14 lifecycle scenarios, all engines, canonical seed, chunk_run/chunk_task/load_run snapshots). What is added here and provably absent there: an INDEPENDENT oracle (that driver has zero duckdb calls — it compares rivet's records to rivet's files), the COMMAND CHAIN in one traversal: init -> doctor -> check -> plan -> apply -> validate, one cell per stage, asserting every artifact (config, plan.json, parquet, manifest.json, _SUCCESS, export_metrics/file_log/run_status) with DuckDB as the independent oracle for rows and file count. Per-stage coverage existed everywhere; no test drove three of the five subcommands in one body, and both defects found 2026-08-04 (apply's empty config path, CDC's unexpanded {date}) lived in that handoff gap."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: blessed_flow
     what: "The WHOLE journey as ONE declared cross-product, not per-defect additions: pipeline{batch,cdc} x lifecycle{clean,repeat,resume} x store{local,s3,gcs} x state{sqlite,postgres} x engine = 144 cells, 76 runnable, 68 `na` each carrying its reason in the ledger. Where blessed_path walks init->apply for one strategy, this adds what that chain cannot reach: the CDC pipeline (plan/apply REFUSE a cdc export, so those cells run `run`), the crash-then-resume lifecycle (a fault hook kills the first apply, and the probe FAILS the cell if the hook did not stop it — a resume whose first run succeeded is a clean re-run wearing a flag), the repeat lifecycle asserted on the MANIFEST COPIES rather than the parquet (the data surviving is what makes a sidecar clobber invisible), and `load` with load_run/loaded_source_run. Values are read ONLY by DuckDB, and only from parts a manifest DECLARES as committed — counting every parquet under the prefix reads a crashed run's orphans as delivered data. State is scoped per-run (watermark on export_metrics, which has no run_id; run ids from the manifests for file_log/run_status): the first draft counted `export_name='flow'` and read 37 rows of unrelated history on a cell that wrote one."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: not_inert
     what: "The chain's own oracles must be able to go RED. Breaks each artifact class and requires the matching stage to fail: every declared part removed (oracle must stop agreeing with the source), no manifest (must report undelivered, not count the parquet lying next to it), a run id that never ran (state must refuse). Carries a NEGATIVE control too — removing ONE redundant copy of a repeated export must NOT move the oracle; the first draft demanded a failure there and went red against a correct oracle."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: verdicts
     what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: integrity_types
     what: "users 150K loss/dup 0 (source count+distinct == DuckDB read) + per-engine DuckDB type/CSV golden (parquet binary path + CSV all-varchar text path)."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    { na: "Mongo is a JSON-blob model (full-scan only) — no per-engine type matrix; the loss/dup arm still runs under integrity_types" }
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: keyset_parallel
     what: "parallel:4 keyset fan-out: loss/dup 0 (DuckDB oracle) AND >=2 distinct pk_w{ridx} workers (no silent degrade to sequential)."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    { na: "Mongo parallel:N is the separate _id-range mongo_parallel reader, not SQL keyset" }
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: load
     what: "manifested parts -> each object store {s3/minio, gcs/fake-gcs, azure/azurite}, independent readback count == summed manifest row_count + id-set round-trips."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
+    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
   - id: gc_survival
     what: "concurrent-extract bucket-erasure guard: a Running manifest spares an in-flight part; none deletes the orphan; Success parts always kept."
     postgres: test
     mysql:    { na: "store-level property, source-agnostic — one engine's parts exercise it (runs on postgres)" }
     mssql:    { na: "store-level property (see postgres)" }
     mongo:    { na: "store-level property (see postgres)" }
+    oracle:   { na: "store-level property (see postgres)" }
   - id: load_pool
     what: "`rivet load --pool 16` at the pool's FULL declared width (MAX_POOL == DEFAULT_POOL == 16): 16 tables seeded alike, config GENERATED by `rivet init --include 'pool_t*' --gcs-bucket --bigquery-project --bigquery-dataset` (exports AND the load: block — not a line written by hand, so the cell also grades what init decides over 16 tables). TWO oracles, because completeness alone is vacuous here: (1) per table, BigQuery's COUNT(*) AND SUM(id) vs a re-query of the SOURCE — identical counts across 16 alike tables cannot see a fan-out that routed one table's rows under another's name, the sums can; (2) NON-VACUITY — BigQuery's own job history must show >=2 LOAD_DATA jobs for these tables OVERLAPPING in time, with touching-but-not-overlapping counted as 1, since a pool that degraded to sequential still loads every row and still passes (1). Sibling of keyset_parallel's '>=2 distinct worker parts'. An activation check fails the cell BEFORE measuring if init emitted fewer than 16 exports, so a narrowed pool can never be reported as the wide one."
     postgres: test
     mysql:    { na: "the load reads Parquet from GCS and talks to BigQuery — the SOURCE engine cannot change how the pool behaves; one engine exercises it (runs on postgres)" }
     mssql:    { na: "source-agnostic load path (see postgres)" }
     mongo:    { na: "source-agnostic load path (see postgres)" }
+    oracle:   { na: "source-agnostic load path (see postgres)" }
 
 # ── Source-agnostic PREFLIGHTS (run ONCE before the engine loop, not per engine/version) ──
 preflights:

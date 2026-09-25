@@ -22,7 +22,7 @@ meta:
     otherwise. A run stamps its own hardware/date; treat cross-hardware absolute
     numbers as indicative, ratios (x baseline) as portable.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   # ── Capture throughput ──────────────────────────────────────────────────────
@@ -34,6 +34,7 @@ scenarios:
     mysql:    { measured: { rows_per_s: 500000, date: "2026-07-19" } }
     mssql:    { measured: { rows_per_s: 189000, date: "2026-07-19" } }
     mongo:    { measured: { rows_per_s: 38000,  date: "2026-07-19", note: "JSON-blob model; per-event resume token" } }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   # ── Steady-state memory (the O(rollover) contract) ──────────────────────────
   - id: cdc_interval_soak_rss_flat
@@ -50,6 +51,7 @@ scenarios:
     mysql:    { measured: { note: "RSS-flat asserted by python3 -m dev.pytools.cdc_interval soak-all mysql; numbers unpersisted" } }
     mssql:    { measured: { note: "RSS-flat asserted by python3 -m dev.pytools.cdc_interval soak-all mssql; numbers unpersisted" } }
     mongo:    { measured: { peak_rss_mb: 72, note: "22k events, flat RSS across intervals (ad-hoc 2026-07)" } }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   # ── Source-side HARM under load ─────────────────────────────────────────────
   - id: cdc_cotenancy_writer_cost
@@ -60,6 +62,7 @@ scenarios:
     mysql:    { measured: { throughput_x: 1.07, date: "2026-07-19", note: "binlog dump is a passive reader — no cost" } }
     mssql:    { measured: { throughput_x: 0.78, date: "2026-07-19", note: "−22%: the capture Agent DUPLICATES every change into change tables (a 2nd write) — inherent to SQL Server CDC, not rivet" } }
     mongo:    { measured: { throughput_x: 1.01, date: "2026-07-19", note: "change stream reads the oplog — no cost" } }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: cdc_slot_retention_harm
     what: "does the CDC READER pin source-side log retention (the disk-fill hazard)? PostgreSQL's logical slot does; the others' logs are trimmed on the server's own schedule"
@@ -69,6 +72,7 @@ scenarios:
     mysql:    { measured: { class: "reader-independent", note: "binlog purged by binlog_expire_logs_seconds regardless of reader — no disk-fill harm" } }
     mssql:    { measured: { class: "reader-independent", note: "change tables trimmed by the CDC cleanup job regardless of reader — no disk-fill harm" } }
     mongo:    { measured: { class: "reader-independent", note: "oplog is a fixed-size capped collection (4.4GB cap observed) — no disk-fill harm" } }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: cdc_drain_keeps_up_under_heavy_wal
     what: "at a high WAL/write rate, does a continuous (back-to-back) drain KEEP UP (retention bounded) or fall behind (retention grows unbounded)?"
@@ -78,6 +82,7 @@ scenarios:
     mysql:    { na: "no consume-retention coupling (reader-independent) — 'keep up' is not a retention concern" }
     mssql:    { na: "no consume-retention coupling (reader-independent)" }
     mongo:    { na: "no consume-retention coupling (capped oplog)" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   # ── Batch export (the other mode) ───────────────────────────────────────────
   - id: batch_export_memory_flat
@@ -88,6 +93,7 @@ scenarios:
     mysql:    { measured: { note: "same streaming architecture — flat RSS (shared build_array path)" } }
     mssql:    { measured: { note: "same streaming architecture — flat RSS" } }
     mongo:    { measured: { note: "same streaming architecture — flat RSS" } }
+    oracle:   { gap: "no Oracle baseline captured yet — no flat-RSS measurement on an Oracle table" }
 
   - id: batch_export_hot_source_harm
     what: "OLTP p99 degradation / long-held query (xmin-hold → vacuum-block → bloat) on a LIVE source under a co-running rivet BATCH export — the 'can I point rivet at prod, or do I need a replica?' question"
@@ -114,3 +120,4 @@ scenarios:
     mysql:    { measured: { longq_s: 0.00, note: "same server-side-cursor architecture — no long-held query; captured in the cross-engine bench" } }
     mssql:    { measured: { longq_s: 0.00, note: "same architecture — no long-held query" } }
     mongo:    { na: "no long-held snapshot-txn / xmin analog; the JSON-blob keyset scan does not hold a vacuum-blocking horizon the way an MVCC SQL snapshot does" }
+    oracle:   { gap: "the harm counters are recorded (a_run_records_the_oracle_source_harm_counters) but no co-tenancy OLTP p99 baseline was measured" }

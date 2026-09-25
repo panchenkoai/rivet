@@ -11,7 +11,7 @@
 # bounded NVARCHAR), and the absence of a direct `assert_mssql_doc_parquet_schema`
 # helper (MSSQL Arrow types are pinned via the DuckDB autoload + checksum guard).
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   - id: type_decimal
@@ -20,6 +20,7 @@ scenarios:
     mysql:    { test: mysql_golden_decimal_payments_exact_sums_and_decimal128_types, oracle: independent }
     mssql:    { test: roast_mssql_decimal_scale_survives_all_null_first_batch, oracle: independent }
     mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_uuid
     what: "uuid — PG uuid, MySQL CHAR(36), MSSQL uniqueidentifier → canonical value"
@@ -27,6 +28,7 @@ scenarios:
     mysql:    { test: mysql_golden_uuid_varchar_utf8_expected_canonical_lower, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { test: mongo_batch_parallel_objectid_and_string_id, oracle: independent }
+    oracle:   { na: "Oracle has no UUID type — SYS_GUID() yields RAW(16), which is type_binary" }
 
   - id: type_json
     what: "json/jsonb — byte/content fidelity through Parquet"
@@ -34,6 +36,7 @@ scenarios:
     mysql:    { test: mysql_edge_json_content_round_trip, oracle: independent }
     mssql:    { na: "SQL Server has no native JSON type; the matrix fixture omits it by design" }
     mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_timestamp_tz
     what: "timestamp / timestamptz — timezone handling (naive vs UTC instant)"
@@ -41,6 +44,7 @@ scenarios:
     mysql:    { test: mysql_golden_datetime_vs_timestamp_parquet_microsecond_semantics, oracle: independent }
     mssql:    { test: mssql_batch_datetimeoffset_exports_the_utc_instant, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_date_time
     what: "date / time — Date32, Time64(µs)"
@@ -48,6 +52,7 @@ scenarios:
     mysql:   { test: duckdb_mysql_matrix_per_column_null_profile_matches_source, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "date/time ride the verbatim document blob" }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_binary
     what: "binary / bytea / varbinary — stays Arrow Binary, not Utf8"
@@ -55,6 +60,7 @@ scenarios:
     mysql:    { test: mysql_golden_fixed_binary_four_is_arrow_binary_not_utf8, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "binary rides the verbatim document blob" }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_array
     what: "ARRAY / LIST — an Arrow List column, element-by-element. This row did not exist until 2026-08-02, which is why arrays reached NEITHER value-integrity mechanism: `_rivet_row_hash` canonicalised containers from Arrow's DISPLAY TEXT (so `['a, b']` == `['a','b']`, and `[NULL]` == `['']` == `[]`) and the value checksum skipped LIST cells entirely — stubbing `CellSource::list` to `None` passed the whole lib cycle AND the whole live suite. One absent row, two blind oracles. PostgreSQL is the ONLY engine that produces an Arrow List, so one `test` cell and three structural `na`s is full coverage here, not a thin row. The covered element types are narrower than the builder suggests: `build_pg_text_array` has arms for JSON/NUMERIC/UUID/INTERVAL arrays, but the pipeline refuses all four upstream (`_numeric` has no mapping; jsonb[] and interval[] fail to decode as a one-dimensional List; uuid[] is refused as 'temporal/uuid/bytea array elements are not yet supported'), leaving bool/i16/i32/i64/f32/f64/text — exactly what the seed's `array_matrix` carries."
@@ -62,6 +68,7 @@ scenarios:
     mysql:    { na: "MySQL has no array type — the closest is JSON, covered by type_json. Nothing here can build an Arrow List." }
     mssql:    { na: "SQL Server has no array type either; the same JSON note applies." }
     mongo:    { na: "a Mongo document exports as exactly two columns (`_id` + one extended-JSON blob), so an in-document array never becomes an Arrow List column — the same fixed-shape reason the drift gate is `na` for this engine." }
+    oracle:   { gap: "Oracle VARRAY / nested-table columns map to RivetType::Unsupported — no Arrow List path and no test" }
 
   - id: type_boolean
     what: "boolean — incl NULL; MySQL BIT(1)/TINYINT(1) → Boolean, BIT(8) → Int"
@@ -69,6 +76,7 @@ scenarios:
     mysql:   { test: duckdb_mysql_matrix_per_column_null_profile_matches_source, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "booleans ride the verbatim document blob" }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_integer_families
     what: "int2/4/8 + unsigned widening (u64 > i64::MAX → UInt64, not overflow)"
@@ -76,6 +84,7 @@ scenarios:
     mysql:   { test: duckdb_mysql_matrix_per_column_null_profile_matches_source, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }
 
   - id: type_text
     what: "text / varchar / nvarchar — empty, whitespace, large (100KB), unicode"
@@ -83,3 +92,4 @@ scenarios:
     mysql:    { test: mysql_edge_string_extremes_round_trip, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "text rides the verbatim document blob" }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type, oracle: independent }

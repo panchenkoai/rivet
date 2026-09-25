@@ -24,7 +24,7 @@
 # with a shape-guard + regression test `decode_resume_token_rejects_malformed_
 # shapes_without_panicking`. This is the matrix earning its keep.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   - id: fuzz_config_yaml
@@ -33,6 +33,7 @@ scenarios:
     mysql:    { test: config_from_yaml }
     mssql:    { test: config_from_yaml }
     mongo:    { test: config_from_yaml }
+    oracle:   { test: config_from_yaml }
 
   - id: fuzz_cdc_wire_decode
     what: "decoding a CDC change record off the replication wire into typed cells"
@@ -40,6 +41,7 @@ scenarios:
     mysql:    { na: "binary binlog events are decoded by the mysql_common crate, not Rivet code — there is no Rivet-owned text/byte parser to fuzz" }
     mssql:    { na: "change-table rows arrive as tiberius typed ColumnData (binary protocol, driver-decoded); Rivet only maps the enum in cell_to_rivet" }
     mongo:    { na: "BSON change events are deserialized into typed events by the mongodb driver, not Rivet code" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: fuzz_checkpoint_token_decode
     what: "decoding the persisted resume/checkpoint token from an untrusted, corruptible / hand-editable file"
@@ -47,6 +49,7 @@ scenarios:
     mysql:    { na: "binlog coords read by panic-safe field access (.get(\"file\") / .get(\"pos\")); no bson-backed type deserialization" }
     mssql:    { na: "from-LSN read by panic-safe field access; no bson-backed type deserialization" }
     mongo:    { test: mongo_resume_token }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }
 
   - id: fuzz_spill_frame_decode
     what: "the CDC spill tagged frame (length-prefixed on-disk record log) — a persisted, corruptible input like the checkpoint row; round-4 found a nesting-bomb SIGSEGV and a 4 GiB length-prefix pre-alloc here by hand"
@@ -54,3 +57,4 @@ scenarios:
     mysql:    { test: spill_frame_decode }
     mssql:    { test: spill_frame_decode }
     mongo:    { na: "Mongo spills NOTHING by construction (the control engine in the spill design) — no adapter-side buffer ever reaches SpooledTx, so there is no frame to parse" }
+    oracle:   { gap: "oracle CDC not implemented yet (phase 3) — `mode: cdc` is refused at config validation" }

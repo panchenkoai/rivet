@@ -213,6 +213,27 @@ impl OracleSource {
         })
     }
 
+    /// Every row of `sql`, each cell as text — the multi-row twin of `query_scalar`.
+    pub(crate) fn query_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        let cursor = self.conn.query(sql, &[]).ora()?;
+        let n = cursor.columns().len();
+        cursor
+            .map(|row| {
+                let row = row.ora()?;
+                (0..n).map(|i| cell_text(&row, i)).collect()
+            })
+            .collect()
+    }
+
+    /// The first column of every row of `sql`, NULLs dropped.
+    pub(crate) fn query_list(&mut self, sql: &str) -> Result<Vec<String>> {
+        Ok(self
+            .query_rows(sql)?
+            .into_iter()
+            .filter_map(|r| r.into_iter().next().flatten())
+            .collect())
+    }
+
     /// Every row of a `(name, number)` query, as integer pairs; `None` when the probe fails.
     fn named_counters(&self, sql: &str) -> Option<Vec<(String, i64)>> {
         let cursor = self.conn.query(sql, &[]).ok()?;
@@ -459,13 +480,14 @@ impl Source for OracleSource {
             None => "c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
         };
         let sql = format!(
-            "SELECT LISTAGG(cc.column_name, CHR(31)) WITHIN GROUP (ORDER BY cc.position) \
+            "SELECT cc.column_name \
              FROM all_constraints c JOIN all_cons_columns cc \
                ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
-             WHERE c.constraint_type = 'P' AND c.table_name = '{}' AND {owner_pred}",
+             WHERE c.constraint_type = 'P' AND c.table_name = '{}' AND {owner_pred} \
+             ORDER BY cc.position",
             esc(name)
         );
-        Ok(crate::source::split_key_list(self.query_scalar(&sql)?))
+        Ok(crate::source::non_empty_keys(self.query_list(&sql)?))
     }
 }
 
@@ -480,18 +502,6 @@ fn catalog_owner_table(qualified_table: &str) -> (String, String) {
             format!("'{}'", esc(qualified_table)),
         ),
     }
-}
-
-/// Split a `CHR(31)`-joined catalog list.
-fn split_unit_sep(joined: Option<String>) -> Vec<String> {
-    joined
-        .map(|s| {
-            s.split('\u{1f}')
-                .filter(|c| !c.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Catalog facts the planner needs to chunk or keyset-page `qualified_table`.
@@ -510,10 +520,10 @@ pub(crate) fn introspect_oracle_table_for_chunking(
         .unwrap_or(0);
     // Integer NUMBER(p<=18, 0): the columns range chunking can do arithmetic on.
     let int_pred = "tc.data_type = 'NUMBER' AND tc.data_scale = 0 AND tc.data_precision <= 18";
-    let int_columns = split_unit_sep(src.query_scalar(&format!(
-        "SELECT LISTAGG(tc.column_name, CHR(31)) WITHIN GROUP (ORDER BY tc.column_id) \
-         FROM all_tab_columns tc WHERE tc.owner = {owner} AND tc.table_name = {table} AND {int_pred}"
-    ))?);
+    let int_columns = src.query_list(&format!(
+        "SELECT tc.column_name FROM all_tab_columns tc \
+         WHERE tc.owner = {owner} AND tc.table_name = {table} AND {int_pred} ORDER BY tc.column_id"
+    ))?;
     let single_int_pk = src
         .query_scalar(&format!(
             "SELECT MIN(cc.column_name) FROM all_constraints c \
@@ -524,10 +534,10 @@ pub(crate) fn introspect_oracle_table_for_chunking(
              HAVING COUNT(*) = 1 AND MIN(CASE WHEN {int_pred} THEN 1 ELSE 0 END) = 1"
         ))?;
     // Keyset keys: single-column UNIQUE indexes on NOT NULL columns of a type the
-    // cursor reads back (integers, bare NUMBER as exact text, strings, DATE,
+    // cursor reads back (integer NUMBER of any precision, bare NUMBER as exact text, strings, DATE,
     // zone-less TIMESTAMP); PK first. Decimal keys are refused by exclusion.
-    let keyset_keys = split_unit_sep(src.query_scalar(&format!(
-        "SELECT LISTAGG(col, CHR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
+    let keyset_keys = src.query_list(&format!(
+        "SELECT col FROM ( \
            SELECT ic.column_name col, \
                   MAX(CASE WHEN c.constraint_type = 'P' THEN 1 ELSE 0 END) is_pk \
            FROM all_indexes i \
@@ -541,11 +551,11 @@ pub(crate) fn introspect_oracle_table_for_chunking(
              AND (SELECT COUNT(*) FROM all_ind_columns x \
                   WHERE x.index_owner = i.owner AND x.index_name = i.index_name) = 1 \
              AND ((tc.data_type = 'NUMBER' AND tc.data_precision IS NULL AND tc.data_scale IS NULL) \
-               OR ({int_pred}) \
+               OR (tc.data_type = 'NUMBER' AND tc.data_scale = 0) \
                OR tc.data_type IN ('VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR', 'DATE') \
                OR (tc.data_type LIKE 'TIMESTAMP%' AND tc.data_type NOT LIKE '%ZONE%')) \
-           GROUP BY ic.column_name)"
-    ))?);
+           GROUP BY ic.column_name) ORDER BY is_pk DESC, col"
+    ))?;
     Ok(crate::source::TableIntrospection {
         single_int_pk,
         keyset_keys,

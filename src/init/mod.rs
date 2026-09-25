@@ -7,6 +7,8 @@ mod density;
 mod mongo;
 mod mssql;
 mod mysql;
+#[cfg(feature = "oracle")]
+mod oracle;
 mod postgres;
 mod yaml_scaffold;
 
@@ -492,7 +494,10 @@ fn is_keysettable_type(t: &str) -> bool {
     let t = t.to_lowercase();
     // uuid, string (char/varchar/text families), and float/real/double — but NOT
     // decimal/numeric/money (the planner's keyset cursor excludes those).
-    t.contains("uuid")
+    // `number`: an Oracle NUMBER without precision (init::oracle::catalog_type) —
+    // the cursor carries it as exact text and the server compares it numerically.
+    t == "number"
+        || t.contains("uuid")
         || t.contains("uniqueidentifier")
         || t.contains("char") // char, varchar, nvarchar, character varying, bpchar
         || t.contains("text")
@@ -513,9 +518,11 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
         Ok("mssql")
     } else if source_url.starts_with("mongodb") {
         Ok("mongo")
+    } else if source_url.starts_with("oracle://") {
+        Ok("oracle")
     } else {
         anyhow::bail!(
-            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, or mongodb://, got: {}",
+            "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, mongodb://, or oracle://, got: {}",
             source_url
         )
     }
@@ -528,7 +535,9 @@ pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceTy
         "postgres" => SourceType::Postgres,
         "mysql" => SourceType::Mysql,
         "mssql" => SourceType::Mssql,
-        _ => SourceType::Mongo,
+        "oracle" => SourceType::Oracle,
+        "mongo" => SourceType::Mongo,
+        other => unreachable!("source_type returned an unknown engine {other}"),
     })
 }
 
@@ -987,6 +996,12 @@ fn introspect_single_table(
             mark_mssql_catalog_exact(&mut info);
             info
         }
+        #[cfg(feature = "oracle")]
+        "oracle" => {
+            let mut conn = oracle::connect(source_url, tls)?;
+            let owner = oracle::resolve_schema(&mut conn, eff_schema.as_deref())?;
+            oracle::introspect(&mut conn, &owner, table_name)?
+        }
         "mongo" => {
             // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
             // guard the SQL engines got was absent), so an operator scoping to a
@@ -1198,6 +1213,7 @@ fn init_discovery_json(
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
             "mssql" => format!("table [{}].[{}]", info.schema, info.table),
+            "oracle" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mongo" => format!("collection {}", info.table),
             _ => unreachable!(),
         };
@@ -1356,6 +1372,19 @@ fn introspect_all(
             }
             Ok(out)
         }
+        #[cfg(feature = "oracle")]
+        "oracle" => {
+            let mut conn = oracle::connect(source_url, tls)?;
+            let owner = oracle::resolve_schema(&mut conn, schema)?;
+            let names = retain_filtered(oracle::list_tables(&mut conn, &owner)?, filter);
+            let mut out = Vec::with_capacity(names.len());
+            for n in names {
+                if let Some(info) = scan_step(oracle::introspect(&mut conn, &owner, &n))? {
+                    out.push(info)
+                }
+            }
+            Ok(out)
+        }
         "mongo" => {
             reject_mongo_schema(schema)?;
             let conn = mongo::connect(source_url, tls)?;
@@ -1399,6 +1428,13 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
                 .filter(|s| !s.is_empty())
                 .unwrap_or("dbo");
             format!("SQL Server schema \"{sch}\" ({n} {obj})")
+        }
+        "oracle" => {
+            let owner = schema
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(current schema)");
+            format!("Oracle schema \"{owner}\" ({n} {obj})")
         }
         "mongo" => {
             // Database name from the URL path: mongodb://[user@]host[:port]/<db>[?opts]
@@ -2893,7 +2929,7 @@ mod tests {
 
     #[test]
     fn source_type_unsupported_scheme_names_sqlserver() {
-        let err = source_type("oracle://host/db").expect_err("oracle is unsupported");
+        let err = source_type("db2://host/db").expect_err("db2 is unsupported");
         let msg = format!("{err}");
         assert!(
             msg.contains("sqlserver://"),

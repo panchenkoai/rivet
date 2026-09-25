@@ -7,7 +7,7 @@
 # ride the shared matrix/differential harness for the happy path. The ratchet makes
 # the holes visible and un-growable; fill them by writing the per-engine test.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   # ── destinations ──────────────────────────────────────────────────────────
@@ -17,6 +17,7 @@ scenarios:
     mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
     mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
     mongo:    { test: mongo_batch_keyset_no_loss_or_dup }
+    oracle:   { test: every_seeded_oracle_table_exports_every_row }
 
   - id: dest_gcs
     what: "destination: gcs — fake-GCS round-trip, all rows"
@@ -24,6 +25,7 @@ scenarios:
     mysql:    { test: stand_dest_gcs_mysql }
     mssql:    { test: stand_dest_gcs_mssql }
     mongo:    { test: stand_dest_gcs_mongo }
+    oracle:   { gap: "no Oracle fake-GCS round-trip" }
 
   - id: dest_s3
     what: "destination: s3 — MinIO round-trip, all rows"
@@ -31,6 +33,7 @@ scenarios:
     mysql:    { test: stand_dest_s3_mysql }
     mssql:    { test: stand_dest_s3_mssql }
     mongo:    { test: stand_dest_s3_mongo }
+    oracle:   { gap: "no Oracle MinIO round-trip" }
 
   # ── format / compression ──────────────────────────────────────────────────
   - id: format_parquet
@@ -39,6 +42,7 @@ scenarios:
     mysql:    { test: mysql_golden_full_type_matrix_schema_coverage }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
     mongo:    { test: mongo_batch_keyset_no_loss_or_dup }
+    oracle:   { test: oracle_full_export_matches_the_databases_own_rendering_for_every_type }
 
   - id: format_csv
     what: "format: csv — decimal-as-text, unicode/newline escaping"
@@ -46,6 +50,7 @@ scenarios:
     mysql:    { test: mysql_type_matrix_csv_decimal_text_preserved }
     mssql:    { test: stand_format_csv_mssql }
     mongo:    { test: stand_format_csv_mongo }
+    oracle:   { gap: "no Oracle format: csv test" }
 
   - id: compression_codecs
     what: "compression: full codec matrix (zstd/snappy/gzip/none) reads back correctly"
@@ -53,6 +58,7 @@ scenarios:
     mysql:    { test: stand_compression_codecs_mysql }
     mssql:    { test: stand_compression_codecs_mssql }
     mongo:    { test: stand_compression_codecs_mongo }
+    oracle:   { gap: "no Oracle codec-matrix test" }
 
   # ── enrichment / verification / tuning ────────────────────────────────────
   - id: meta_columns
@@ -61,6 +67,7 @@ scenarios:
     mysql:    { na: "engine-agnostic post-read enrichment (src/enrich.rs); one e2e test covers every engine" }
     mssql:    { na: "engine-agnostic — see the postgres cell" }
     mongo:    { na: "engine-agnostic — see the postgres cell" }
+    oracle:   { na: "engine-agnostic — see the postgres cell" }
 
   - id: reconcile
     what: "--reconcile — destination count matches source (exit 0), mismatch exits nonzero"
@@ -68,6 +75,7 @@ scenarios:
     mysql:    { test: mysql_reconcile_all_match_exits_zero_with_pretty_output }
     mssql:    { test: mssql_reconcile_all_match_exits_zero_with_pretty_output }
     mongo:    { test: mongo_run_reconcile_matches_source_count }
+    oracle:   { gap: "no Oracle --reconcile test" }
 
   - id: parallel_n
     what: "parallel: N — concurrent workers, no loss or dup"
@@ -75,6 +83,7 @@ scenarios:
     mysql:    { test: dense_ties_mysql_parallel_no_loss_no_dup }
     mssql:    { test: dense_ties_mssql_parallel_no_loss_no_dup }
     mongo:    { test: mongo_batch_parallel_integer_id_no_loss_or_dup }
+    oracle:   { gap: "no Oracle parallel: N live test" }
 
   - id: environment_tuning_profile
     what: "source.environment → tuning profile default (local → fast)"
@@ -82,6 +91,7 @@ scenarios:
     mysql:    { test: stand_environment_profile_mysql }
     mssql:    { test: stand_environment_profile_mssql }
     mongo:    { na: "the profile-DEFAULT label this scenario checks is computed engine-agnostically in plan::build (config.source.environment.map(default_profile), src/plan/build.rs:49-59) BEFORE any engine dispatch, and carried into RunSummary — a shared SourceConfig→summary path, identical for Mongo (same as the meta_columns `engine-agnostic — see postgres` na's). (The SQL-only Log-Flush-Waits RUNTIME governor is a different mechanism and not what this row tests.)" }
+    oracle:   { na: "the profile-DEFAULT label is computed engine-agnostically in plan::build before engine dispatch — see the mongo cell" }
 
   - id: cross_db_parity
     what: "same seed on two engines → equal row count + equal PK id-set + identical empty-export behaviour"
@@ -89,3 +99,4 @@ scenarios:
     mysql:    { test: pg_and_mysql_chunked_exports_agree_on_row_count_and_id_set }
     mssql:    { test: pg_and_mssql_full_exports_agree_on_row_count_and_id_set }
     mongo:    { na: "Mongo's JSON-blob model has no row-for-row SQL parity to compare against" }
+    oracle:   { gap: "the Oracle seed is ported table-for-table from MySQL, but no Oracle-vs-MySQL parity test exists" }

@@ -412,11 +412,17 @@ pub trait Source: Send {
 
 /// Split a catalog's unit-separator-joined key list; an empty list is no key.
 pub(crate) fn split_key_list(joined: Option<String>) -> Option<Vec<String>> {
-    let cols: Vec<String> = joined?
-        .split('\u{1f}')
-        .filter(|c| !c.is_empty())
-        .map(str::to_string)
-        .collect();
+    non_empty_keys(
+        joined?
+            .split('\u{1f}')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// A key column list, or `None` when the table has no key.
+pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
 }
 

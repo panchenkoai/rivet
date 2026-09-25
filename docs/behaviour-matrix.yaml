@@ -12,7 +12,7 @@
 # (decimal(p,s), uuid, json, tstz, binary per engine), formats (parquet/csv),
 # destinations (local/gcs/s3), reconcile.
 
-engines: [postgres, mysql, mssql, mongo]
+engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
   # ── extraction modes ──────────────────────────────────────────────────────
@@ -22,6 +22,7 @@ scenarios:
     mysql:    { test: mysql_full_mode_repeated_run_accumulates_manifest_entries }
     mssql:    { test: mssql_full_mode_repeated_run_accumulates_manifest_entries }
     mongo:    { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
+    oracle:   { test: every_seeded_oracle_table_exports_every_row }
 
   - id: mode_incremental
     what: "mode: incremental — WHERE cursor > last_value; re-run picks up only new rows"
@@ -29,6 +30,7 @@ scenarios:
     mysql:    { test: mysql_incremental_third_run_picks_up_newly_inserted_rows }
     mssql:    { test: mssql_incremental_third_run_picks_up_newly_inserted_rows }
     mongo:    { na: "Mongo has no SQL cursor-column incremental; keyset resume (chunking matrix) fills the role" }
+    oracle:   { test: an_incremental_timestamp_cursor_resumes_past_the_last_row }
 
   - id: incremental_settle
     what: "exports[].settle — rows export only once older than `after` by the source clock; a separate settle column keeps the cursor below the first unsettled row (no out-of-order skip)"
@@ -36,6 +38,7 @@ scenarios:
     mysql:    { test: settle_on_another_column_never_skips_an_out_of_order_row_mysql }
     mssql:    { test: settle_on_another_column_never_skips_an_out_of_order_row_mssql }
     mongo:    { na: "Mongo has no SQL cursor-column incremental" }
+    oracle:   { gap: "settle_threshold has an Oracle arm (SYS_EXTRACT_UTC(SYSTIMESTAMP) - NUMTODSINTERVAL) and the settle subquery an Oracle alias form; no Oracle live test" }
 
   - id: mode_time_window
     what: "mode: time_window — bounded date scan (time_column + days_window), anchored on today"
@@ -43,6 +46,7 @@ scenarios:
     mysql:    { test: stand_time_window_mysql }
     mssql:    { test: stand_time_window_mssql }
     mongo:    { na: "no SQL date-window mode on Mongo" }
+    oracle:   { gap: "no Oracle time_window live test (date-literal rendering in the window predicate is Oracle-dialect)" }
 
   # ── config features (engine-agnostic: one offline test covers all engines) ──
   - id: config_var_substitution
@@ -51,6 +55,7 @@ scenarios:
     mysql:    { na: "engine-agnostic config-layer feature (src/config/resolve.rs); one offline test covers every engine — see the postgres cell" }
     mssql:    { na: "engine-agnostic — see the postgres cell" }
     mongo:    { na: "engine-agnostic — see the postgres cell" }
+    oracle:   { na: "engine-agnostic — see the postgres cell" }
 
   - id: config_var_substitution_strict_unset
     what: "an unresolved ${VAR} (neither param nor env) is a hard error, not a silent substitution"
@@ -58,6 +63,7 @@ scenarios:
     mysql:    { na: "engine-agnostic — the strict-mode assertion lives in the same offline test module" }
     mssql:    { na: "engine-agnostic — see the postgres cell" }
     mongo:    { na: "engine-agnostic — see the postgres cell" }
+    oracle:   { na: "engine-agnostic — see the postgres cell" }
 
   - id: config_query_from_file
     what: "query loaded from a file (query_file) with ${VAR} substitution applied to the file contents"
@@ -65,3 +71,4 @@ scenarios:
     mysql:    { na: "engine-agnostic config-layer feature; one offline test covers every engine" }
     mssql:    { na: "engine-agnostic — see the postgres cell" }
     mongo:    { na: "engine-agnostic — see the postgres cell" }
+    oracle:   { na: "engine-agnostic — see the postgres cell" }
