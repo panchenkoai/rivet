@@ -1495,6 +1495,47 @@ pub(super) fn run_export_job(
     (result, summary)
 }
 
+/// Record one finished baseline snapshot in the state DB, right after it lands; best-effort.
+fn record_snapshot_done(
+    state: &StateStore,
+    export_name: &str,
+    synth: &ExportConfig,
+    summary: &RunSummary,
+) {
+    // Snapshot done → record it in the state DB, the cleanup-proof twin of
+    // the GCS `snapshot/_SUCCESS` marker: once here, `cleanup_source`
+    // wiping the bucket no longer re-snapshots. Best-effort — a state
+    // write failure must not fail an otherwise-successful snapshot.
+    //
+    // Degradation on that rare failure: the durable signal is lost, so if
+    // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
+    // NEXT run finds no evidence and re-snapshots the whole table —
+    // wasteful (a fresh full re-read + re-load), NOT data loss: the
+    // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
+    // anchor and no changes are skipped.
+    // The LABEL, never the relation read. `snapshot_plan` asks this store
+    // with the configured string, and on SQL Server `synth.table` is the
+    // catalog's pair — so writing that made the key unable to match itself
+    // and every cycle re-snapshotted the whole table under a green run
+    // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
+    // the two are the same string anyway.
+    if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
+        && let Err(e) = state.mark_snapshot_done(
+            export_name,
+            table,
+            &super::cdc_job::snapshot_key(&synth.destination),
+            &summary.journal.run_id,
+        )
+    {
+        log::warn!(
+            "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",
+            export_name,
+            table,
+            e
+        );
+    }
+}
+
 fn run_export_job_inner(
     config_path: &str,
     config: &Config,
@@ -1522,44 +1563,36 @@ fn run_export_job_inner(
                     return (Err(e), summary);
                 }
             };
-        for synth in &pending {
-            let (res, summary) =
-                run_export_job(config_path, config, synth, state, config_dir, opts);
-            if res.is_err() {
-                return (res, summary);
+        let outcomes = if opts.parallel_snapshots && pending.len() > 1 {
+            // The batch pool `--parallel-exports` runs on: every leg runs, each on its
+            // own state connection, and a finished snapshot is recorded as it lands.
+            let _flags = super::run::RenderFlags::set(true, Some(true));
+            let legs: Vec<&ExportConfig> = pending.iter().collect();
+            let (outcomes, _) = super::run::run_export_pool(config_path, &legs, |synth, own| {
+                let outcome = run_export_job(config_path, config, synth, own, config_dir, opts);
+                if outcome.0.is_ok() {
+                    record_snapshot_done(own, &export.name, synth, &outcome.1);
+                }
+                outcome
+            });
+            outcomes
+        } else {
+            let mut done = Vec::with_capacity(pending.len());
+            for synth in &pending {
+                let outcome = run_export_job(config_path, config, synth, state, config_dir, opts);
+                if outcome.0.is_ok() {
+                    record_snapshot_done(state, &export.name, synth, &outcome.1);
+                }
+                let stop = outcome.0.is_err();
+                done.push(outcome);
+                if stop {
+                    break;
+                }
             }
-            // Snapshot done → record it in the state DB, the cleanup-proof twin of
-            // the GCS `snapshot/_SUCCESS` marker: once here, `cleanup_source`
-            // wiping the bucket no longer re-snapshots. Best-effort — a state
-            // write failure must not fail an otherwise-successful snapshot.
-            //
-            // Degradation on that rare failure: the durable signal is lost, so if
-            // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
-            // NEXT run finds no evidence and re-snapshots the whole table —
-            // wasteful (a fresh full re-read + re-load), NOT data loss: the
-            // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
-            // anchor and no changes are skipped.
-            // The LABEL, never the relation read. `snapshot_plan` asks this store
-            // with the configured string, and on SQL Server `synth.table` is the
-            // catalog's pair — so writing that made the key unable to match itself
-            // and every cycle re-snapshotted the whole table under a green run
-            // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
-            // the two are the same string anyway.
-            if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
-                && let Err(e) = state.mark_snapshot_done(
-                    &export.name,
-                    table,
-                    &super::cdc_job::snapshot_key(&synth.destination),
-                    &summary.journal.run_id,
-                )
-            {
-                log::warn!(
-                    "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",
-                    export.name,
-                    table,
-                    e
-                );
-            }
+            done
+        };
+        if let Some(failed) = outcomes.into_iter().find(|(res, _)| res.is_err()) {
+            return failed;
         }
         return super::cdc_job::run_cdc_export(config_path, config, export, state);
     }

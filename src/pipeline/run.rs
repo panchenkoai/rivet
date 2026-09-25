@@ -39,6 +39,8 @@ pub struct RunOptions<'a> {
     /// (per ADR-0013: one `--force`, scoped to whichever gate it overrides).
     pub force: bool,
     pub params: Option<&'a std::collections::HashMap<String, String>>,
+    /// A CDC export's pending baseline snapshots run concurrently (up to the pool ceiling) — `--parallel-exports`.
+    pub parallel_snapshots: bool,
 }
 
 /// True when the current process is running more than one export in this
@@ -90,12 +92,62 @@ pub(crate) fn multi_export_concurrent() -> bool {
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
 }
 
+/// One export's result and summary, as `job::run_export_job` returns them.
+pub(crate) type ExportOutcome = (Result<()>, RunSummary);
+
+/// Run every export on up to the pool ceiling of threads, each on its own state connection; outcomes in input order, plus the worker count.
+pub(crate) fn run_export_pool(
+    config_path: &str,
+    exports: &[&ExportConfig],
+    run: impl Fn(&ExportConfig, &StateStore) -> ExportOutcome + Sync,
+) -> (Vec<ExportOutcome>, usize) {
+    let workers = crate::load::pool::effective_pool(None, exports.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let finished: std::sync::Mutex<Vec<(usize, ExportOutcome)>> =
+        std::sync::Mutex::new(Vec::with_capacity(exports.len()));
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&export) = exports.get(i) else {
+                            break;
+                        };
+                        let outcome = match StateStore::open(config_path) {
+                            Ok(state) => run(export, &state),
+                            Err(e) => {
+                                let err = anyhow::anyhow!(
+                                    "export '{}': failed to open state database: {:#}",
+                                    export.name,
+                                    e
+                                );
+                                let summary = job::synthetic_failed_summary(&export.name, &err);
+                                (Err(err), summary)
+                            }
+                        };
+                        finished.lock().unwrap().push((i, outcome));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(payload) = h.join() {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    });
+    let mut finished = finished.into_inner().unwrap();
+    finished.sort_by_key(|(i, _)| *i);
+    (finished.into_iter().map(|(_, o)| o).collect(), workers)
+}
+
 /// Swaps the render flags in for one run and restores the previous values on drop, panic included.
-struct RenderFlags(bool, bool);
+pub(crate) struct RenderFlags(bool, bool);
 
 impl RenderFlags {
     /// Set `multi` and, when given, `concurrent`; the guard puts both back.
-    fn set(multi: bool, concurrent: Option<bool>) -> Self {
+    pub(crate) fn set(multi: bool, concurrent: Option<bool>) -> Self {
         let prev_multi = MULTI_EXPORT_MODE.swap(multi, AtomicOrdering::Relaxed);
         let prev_concurrent = match concurrent {
             Some(c) => MULTI_EXPORT_CONCURRENT.swap(c, AtomicOrdering::Relaxed),
@@ -496,6 +548,7 @@ pub fn run(
         resume,
         force,
         params,
+        parallel_snapshots: parallel_exports_cli || config.parallel_exports,
     };
 
     // Seeds the card-table name column so it aligns from the first redraw
@@ -663,59 +716,13 @@ pub fn run(
         started_at = window_start;
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
             std::sync::Mutex::new(Vec::with_capacity(exports.len()));
-        let workers = crate::load::pool::effective_pool(None, exports.len());
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        type Outcome = (Result<()>, RunSummary);
-        let finished: std::sync::Mutex<Vec<(usize, Outcome)>> =
-            std::sync::Mutex::new(Vec::with_capacity(exports.len()));
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..workers)
-                .map(|_| {
-                    s.spawn(|| {
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&export) = exports.get(i) else {
-                                break;
-                            };
-                            let pair = match StateStore::open(config_path) {
-                                Ok(state) => job::run_export_job(
-                                    config_path,
-                                    &config,
-                                    export,
-                                    &state,
-                                    &config_dir,
-                                    &opts,
-                                ),
-                                Err(e) => {
-                                    let err = anyhow::anyhow!(
-                                        "export '{}': failed to open state database: {:#}",
-                                        export.name,
-                                        e
-                                    );
-                                    let summary = job::synthetic_failed_summary(&export.name, &err);
-                                    (Err(err), summary)
-                                }
-                            };
-                            finished.lock().unwrap().push((i, pair));
-                        }
-                    })
-                })
-                .collect();
-            // Every worker is spawned before any is joined, so the number of live
-            // workers IS the overlap this run reached — counted, not assumed.
-            peak_concurrency = peak_concurrency.max(handles.len());
-            for h in handles {
-                if let Err(payload) = h.join() {
-                    std::panic::resume_unwind(payload);
-                }
-            }
+        let (outcomes, workers) = run_export_pool(config_path, &exports, |export, state| {
+            job::run_export_job(config_path, &config, export, state, &config_dir, &opts)
         });
-        let mut finished = finished.into_inner().unwrap();
-        finished.sort_by_key(|(i, _)| *i);
-        collected
-            .lock()
-            .unwrap()
-            .extend(finished.into_iter().map(|(_, pair)| pair));
+        // Every worker is spawned before any finishes its first export, so the
+        // worker count IS the overlap this run reached.
+        peak_concurrency = peak_concurrency.max(workers);
+        collected.lock().unwrap().extend(outcomes);
 
         // All exports are done → drop the sender so `parent_ui::run_ui`
         // sees the channel close and exits cleanly (committing the final
@@ -867,6 +874,7 @@ pub(crate) fn run_waves(
         resume,
         force,
         params: None,
+        parallel_snapshots: false,
     };
 
     // Group exports by wave (ascending; an export with no `wave:` runs last).
@@ -1695,6 +1703,7 @@ pub(crate) fn run_pool(
         resume,
         force,
         params: None,
+        parallel_snapshots: false,
     };
     // Pre-migrate the state DB once before worker threads race on DDL, and use
     // this handle for the duration reads below.
