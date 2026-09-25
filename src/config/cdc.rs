@@ -122,7 +122,9 @@ pub struct CdcExportConfig {
     /// Defaults to 256 (MiB): the row count alone is a budget for one row width,
     /// and absence must not mean "no byte budget". The bytes are the buffered
     /// changes' RESIDENT cost (struct + commit position + values), not the part
-    /// file's size on disk.
+    /// file's size on disk. It bounds the buffer, not the process: a roll encodes
+    /// up to 16 tables' parts at once, each a columnar copy of its buffered rows,
+    /// so peak RSS sits above the budget (measured +31% on a 60-table stream).
     pub rollover_memory_mb: Option<usize>,
     /// MySQL replica server-id for the binlog connection (default 4271; must be
     /// distinct from the source's and any other replica).

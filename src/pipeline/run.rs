@@ -92,7 +92,7 @@ pub(crate) fn multi_export_concurrent() -> bool {
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
 }
 
-/// Whether a CDC export's snapshot legs fan out: asked for, and not already inside a parallel export run, where the two pools would nest past the ceiling.
+/// Whether a CDC export's snapshot legs fan out: asked for, and not already inside a parallel export run or a sibling child process, where the pools would nest past the ceiling.
 pub(crate) fn snapshots_fan_out(parallel_requested: bool, exports_run_in_parallel: bool) -> bool {
     parallel_requested && !exports_run_in_parallel
 }
@@ -546,7 +546,10 @@ pub fn run(
         resume,
         force,
         params,
-        parallel_snapshots: snapshots_fan_out(parallel_requested, run_parallel),
+        parallel_snapshots: snapshots_fan_out(
+            parallel_requested,
+            run_parallel || multi_export_concurrent(),
+        ),
     };
 
     // Seeds the card-table name column so it aligns from the first redraw
