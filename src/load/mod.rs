@@ -1074,11 +1074,12 @@ fn cursor_preflight(table: &str, specs: &[TargetColumnSpec], cursor_column: &str
 
 /// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
 /// shape opendal's bucket-scoped operator wants.
-pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
-    let (bucket, key) = uri
-        .strip_prefix("gs://")
+pub(crate) fn split_object_uri(uri: &str) -> Result<(&str, &str)> {
+    let (bucket, key) = ["gs://", "s3://", "az://"]
+        .iter()
+        .find_map(|s| uri.strip_prefix(s))
         .and_then(|rest| rest.split_once('/'))
-        .with_context(|| format!("not a `gs://bucket/path` URI: {uri}"))?;
+        .with_context(|| format!("not a `gs://`, `s3://` or `az://` bucket/path URI: {uri}"))?;
     // Refuse an EMPTY bucket-relative key. It addresses the bucket ROOT, and the
     // load's recursive cleanup (delete_under → remove_all) and gc_orphans (list +
     // remove) would then wipe the ENTIRE bucket — including unrelated exports and
@@ -1096,6 +1097,20 @@ pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
         );
     }
     Ok((bucket, key))
+}
+
+/// The URI scheme the load layer writes for a destination's parts: `gs`, `s3` or `az`.
+pub(crate) fn uri_scheme(t: crate::config::DestinationType) -> &'static str {
+    match t {
+        crate::config::DestinationType::S3 => "s3",
+        crate::config::DestinationType::Azure => "az",
+        _ => "gs",
+    }
+}
+
+/// The scheme of a load URI (`gs` for `gs://b/k`).
+pub(crate) fn scheme_of(uri: &str) -> &str {
+    uri.split("://").next().unwrap_or("gs")
 }
 
 /// Open the one [`GcsStore`] a load reuses for reconcile, URI listing, and
@@ -2315,24 +2330,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn split_gs_uri_parses_bucket_and_bucket_relative_key() {
+    fn split_object_uri_parses_bucket_and_bucket_relative_key() {
         // The parse every load op addresses through: (bucket, bucket-relative
         // key). The `delete_under` test above can't pin this — it drains by REL
         // regardless of what split returns — so a mangled split (wrong bucket, or
         // an empty key that lists/deletes the whole bucket root) is invisible
         // there. Pin it directly.
-        assert_eq!(split_gs_uri("gs://b/p").unwrap(), ("b", "p"));
+        assert_eq!(split_object_uri("gs://b/p").unwrap(), ("b", "p"));
         assert_eq!(
-            split_gs_uri("gs://bucket/a/b/c.parquet").unwrap(),
+            split_object_uri("gs://bucket/a/b/c.parquet").unwrap(),
             ("bucket", "a/b/c.parquet"),
             "only the FIRST '/' splits bucket from key; the rest is the key"
         );
-        assert!(
-            split_gs_uri("s3://b/p").is_err(),
-            "a non-gs scheme is rejected"
+        assert_eq!(
+            split_object_uri("s3://b/p").unwrap(),
+            ("b", "p"),
+            "an S3 part"
+        );
+        assert_eq!(
+            split_object_uri("az://c/p").unwrap(),
+            ("c", "p"),
+            "an Azure part"
         );
         assert!(
-            split_gs_uri("gs://bucket-only").is_err(),
+            split_object_uri("http://b/p").is_err(),
+            "a scheme no store writes is rejected"
+        );
+        assert!(
+            split_object_uri("gs://bucket-only").is_err(),
             "a bucket with no '/' has no (bucket, key) split"
         );
         // The bucket-ROOT prefix must be REFUSED, never returned as an empty key:
@@ -2342,12 +2367,15 @@ pub(crate) mod tests {
         // that would otherwise wipe unrelated data. (RED before the empty-key guard.)
         for root in ["gs://bucket/", "gs://bucket//", "gs://bucket///"] {
             assert!(
-                split_gs_uri(root).is_err(),
+                split_object_uri(root).is_err(),
                 "bucket-root prefix {root:?} must be refused, not parsed to an empty (root) key"
             );
         }
         // A non-empty key with a trailing slash is still a real prefix.
-        assert_eq!(split_gs_uri("gs://b/exports/").unwrap(), ("b", "exports/"));
+        assert_eq!(
+            split_object_uri("gs://b/exports/").unwrap(),
+            ("b", "exports/")
+        );
     }
 
     #[test]

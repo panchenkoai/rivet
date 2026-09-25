@@ -439,6 +439,21 @@ fn init_clickhouse_flags_scaffold_the_load_block_and_require_each_other() {
             && !String::from_utf8_lossy(&neither.stdout).contains("clickhouse"),
         "no warehouse flags, no load block — and the user's default must not demand a URL"
     );
+    let on_s3 = init(&[
+        "--clickhouse-url",
+        "http://ch.example:8123",
+        "--clickhouse-database",
+        "qa_raw",
+        "--s3-bucket",
+        "qa-scaffold-s3",
+    ]);
+    let s3_yaml = String::from_utf8_lossy(&on_s3.stdout);
+    assert!(
+        on_s3.status.success()
+            && s3_yaml.contains("type: s3")
+            && s3_yaml.contains("target: clickhouse"),
+        "ClickHouse loads an export staged on S3 too:\n{s3_yaml}"
+    );
 
     for (refused, why) in [
         (

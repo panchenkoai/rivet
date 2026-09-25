@@ -523,3 +523,110 @@ fn uuid_json_time_and_array_columns_load_with_their_values() {
         "a NULL array loads as [] — the resolver says so"
     );
 }
+
+/// One CDC cycle staged on `dest`, loaded into ClickHouse — by rivet sending each part,
+/// or, with `collection`, by ClickHouse reading it from the store itself.
+fn staged_cdc_cycle(
+    prefix: &str,
+    dest: impl Fn(Rig) -> Rig,
+    envs: &[(&str, &str)],
+    collection: Option<&str>,
+) {
+    require_alive(LiveService::ClickHouse);
+    let (tbl, _guard) = seeded(prefix, 5);
+    let db = Db::new("rivet_chtest");
+    let extra = collection
+        .map(|c| format!(", named_collection: {c}"))
+        .unwrap_or_default();
+    let rig = dest(Rig::mysql_cdc(&tbl).cdc("initial: snapshot")).top_line(&format!(
+        "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+         user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id]{extra} }}",
+        db.0
+    ));
+    let mut all: Vec<(&str, &str)> = envs.to_vec();
+    all.push((PASSWORD_ENV, CLICKHOUSE_PASSWORD));
+    let view = format!("{}.{tbl}", db.0);
+    let run = rig.run_args_env(&[], envs);
+    assert!(
+        run.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    rig.load_ok(&[], &all);
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "");
+    conn()
+        .query_drop(format!(
+            "INSERT INTO {tbl} (id, v) VALUES (6, 6); UPDATE {tbl} SET v = 9 WHERE id = 1; \
+             DELETE FROM {tbl} WHERE id = 2"
+        ))
+        .expect("changes");
+    let run = rig.run_args_env(&[], envs);
+    assert!(
+        run.status.success(),
+        "run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    rig.load_ok(&[], &all);
+    clickhouse_rows_match_source(&view, source_rows(&tbl), "2");
+}
+
+const MINIO_ENV: [(&str, &str); 2] = [
+    ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+    ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+];
+const S3_BUCKET: &str = "rivet-qa-clickhouse-load-s3";
+const AZ_CONTAINER: &str = "rivet-qa-clickhouse-load-az";
+
+fn on_s3(rig: Rig) -> Rig {
+    rig.dest_s3(S3_BUCKET, &unique_name("chload"), MINIO_ENDPOINT)
+}
+
+fn on_azure(rig: Rig) -> Rig {
+    rig.dest_azure(AZ_CONTAINER, &unique_name("chload"))
+}
+
+/// An export staged on S3 (MinIO) loads into ClickHouse, rivet sending the parts.
+#[test]
+#[ignore = "live: requires clickhouse + minio + mysql-cdc"]
+fn a_cdc_stream_staged_on_s3_loads_into_clickhouse() {
+    require_alive(LiveService::Minio);
+    ensure_minio_bucket(S3_BUCKET);
+    staged_cdc_cycle("rivet_ch_s3", on_s3, &MINIO_ENV, None);
+}
+
+/// …and ClickHouse reads the same parts from S3 itself through a named collection.
+#[test]
+#[ignore = "live: requires clickhouse (named collections) + minio + mysql-cdc"]
+fn a_cdc_stream_staged_on_s3_is_pulled_by_clickhouse() {
+    require_alive(LiveService::Minio);
+    ensure_minio_bucket(S3_BUCKET);
+    staged_cdc_cycle("rivet_ch_s3p", on_s3, &MINIO_ENV, Some("rivet_stand_minio"));
+}
+
+/// An export staged on Azure (Azurite) loads into ClickHouse, rivet sending the parts.
+#[test]
+#[ignore = "live: requires clickhouse + azurite + mysql-cdc"]
+fn a_cdc_stream_staged_on_azure_loads_into_clickhouse() {
+    require_alive(LiveService::Azurite);
+    ensure_azure_container(AZ_CONTAINER);
+    staged_cdc_cycle(
+        "rivet_ch_az",
+        on_azure,
+        &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)],
+        None,
+    );
+}
+
+/// …and ClickHouse reads the same parts from Azure itself through a named collection.
+#[test]
+#[ignore = "live: requires clickhouse (named collections) + azurite + mysql-cdc"]
+fn a_cdc_stream_staged_on_azure_is_pulled_by_clickhouse() {
+    require_alive(LiveService::Azurite);
+    ensure_azure_container(AZ_CONTAINER);
+    staged_cdc_cycle(
+        "rivet_ch_azp",
+        on_azure,
+        &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)],
+        Some("rivet_stand_azurite"),
+    );
+}

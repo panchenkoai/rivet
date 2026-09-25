@@ -329,6 +329,20 @@ impl Clustering {
 /// silent-no-load class the expansion above closes for the static tokens, left
 /// open for the day-specific one). `{run_id}` (and any token still unresolved
 /// after expansion) fails loud the same way.
+/// Whether a load into `target` can read an export staged on `dest`.
+fn load_reads(target: &LoadTarget, dest: crate::config::DestinationType) -> bool {
+    use crate::config::DestinationType;
+    match target {
+        LoadTarget::Clickhouse { .. } => {
+            matches!(
+                dest,
+                DestinationType::Gcs | DestinationType::S3 | DestinationType::Azure
+            )
+        }
+        _ => dest == DestinationType::Gcs,
+    }
+}
+
 fn resolve_load_prefix(
     dest: &crate::config::DestinationConfig,
     export_name: &str,
@@ -364,7 +378,10 @@ fn resolve_load_prefix(
             base
         );
     }
-    Ok(format!("gs://{bucket}/{base}"))
+    Ok(format!(
+        "{}://{bucket}/{base}",
+        super::uri_scheme(dest.destination_type)
+    ))
 }
 
 /// The load prefix of ONE table of a multiplex `tables:` CDC stream, given the
@@ -384,7 +401,7 @@ fn resolve_load_prefix(
 /// the placeholder expansion and the `{partition}` strip both see the base the
 /// export wrote, and the table segment can never land below a stripped token.
 fn table_load_prefix(base_uri: &str, table: &str) -> Result<String> {
-    let (bucket, base) = crate::load::split_gs_uri(base_uri)?;
+    let (bucket, base) = crate::load::split_object_uri(base_uri)?;
     let sub = crate::pipeline::cdc_job::dest_for_table(
         &crate::config::DestinationConfig {
             destination_type: crate::config::DestinationType::Gcs,
@@ -393,7 +410,11 @@ fn table_load_prefix(base_uri: &str, table: &str) -> Result<String> {
         },
         table,
     );
-    Ok(format!("gs://{bucket}/{}", sub.prefix.unwrap_or_default()))
+    Ok(format!(
+        "{}://{bucket}/{}",
+        crate::load::scheme_of(base_uri),
+        sub.prefix.unwrap_or_default()
+    ))
 }
 
 pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
@@ -695,14 +716,15 @@ fn build_plans_keyed(
         // "up to date", exit 0; cleanup/gc would target that foreign prefix.
         // Both warehouse loaders are GCS-only (Snowflake rewrites gs://→gcs://),
         // so refuse anything else loudly at plan time.
-        if dest.destination_type != crate::config::DestinationType::Gcs {
+        if !load_reads(&load.target, dest.destination_type) {
             anyhow::bail!(
-                "export `{}` has `load:` but its destination is `type: {}` — the load \
-                 layer reads GCS only (Snowflake via storage integration, BigQuery via \
-                 LOAD DATA). Stage the export to a gcs destination, or drop the load \
-                 block.",
+                "export `{}` has `load:` but its destination is `type: {}` — a {} load \
+                 reads GCS only (Snowflake via storage integration, BigQuery via LOAD DATA; \
+                 ClickHouse also reads S3 and Azure). Stage the export to a gcs destination, \
+                 or drop the load block.",
                 export.name,
-                dest.destination_type.label()
+                dest.destination_type.label(),
+                load.target.name()
             );
         }
         let bucket = dest.bucket.as_deref().with_context(|| {
@@ -1621,6 +1643,42 @@ mod tests {
     /// GCS client anyway — a same-named FOREIGN GCS bucket got listed (empty →
     /// "up to date" forever, exit 0; cleanup/gc would target it). RED against
     /// removing the destination_type gate in build_plans.
+    /// ClickHouse reads its parts from GCS, S3 or Azure, so each plans, with the part
+    /// URIs in that store's scheme; BigQuery and Snowflake stay GCS-only.
+    #[test]
+    fn a_clickhouse_load_plans_over_gcs_s3_and_azure_exports() {
+        for (dest, scheme) in [
+            ("gcs", "gs"),
+            ("s3", "s3"),
+            (
+                "azure\n      account_name: a\n      account_key_env: K",
+                "az",
+            ),
+        ] {
+            let cfg = crate::config::Config::from_yaml(&format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\nexports:\n  - name: alpha\n    \
+                 table: alpha_tbl\n    mode: full\n    format: parquet\n    destination:\n      \
+                 type: {dest}\n      bucket: b1\n      prefix: exports/alpha/\nload:\n  target: clickhouse\n  \
+                 url: \"http://ch:8123\"\n  database: d\n  user: u\n  password_env: P\n"
+            ))
+            .unwrap();
+            let load = cfg.load.clone().unwrap();
+            let reports = vec![report("alpha", vec![col("id", TargetStatus::Ok)])];
+            let plans = build_plans(&cfg, &load, reports).expect("ClickHouse reads this store");
+            assert_eq!(plans[0].gcs_prefix, format!("{scheme}://b1/exports/alpha/"));
+        }
+        assert!(!load_reads(
+            &LoadTarget::Snowflake {
+                connection: "c".into(),
+                warehouse: "w".into(),
+                database: "d".into(),
+                schema: "s".into(),
+                storage_integration: "i".into(),
+            },
+            crate::config::DestinationType::Azure
+        ));
+    }
+
     #[test]
     fn a_load_block_on_a_non_gcs_destination_is_refused() {
         let cfg = crate::config::Config::from_yaml(

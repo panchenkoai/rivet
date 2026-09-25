@@ -1,8 +1,9 @@
 # Loading rivet Parquet into ClickHouse
 
 `rivet load` writes an export's Parquet into ClickHouse over the HTTP interface
-([ADR-0035](../adr/0035-clickhouse-load-target.md)). The export must land in GCS;
-the ClickHouse database must already exist.
+([ADR-0035](../adr/0035-clickhouse-load-target.md)). The export may land in GCS, S3
+or Azure (`rivet init` takes `--gcs-bucket` or `--s3-bucket`); the ClickHouse
+database must already exist.
 
 ## Generate the config
 
@@ -64,11 +65,13 @@ named collection ClickHouse reads the part directly, and no data passes through
 the host running rivet:
 
 ```sql
--- once, as an administrator; HMAC keys from GCS "Interoperability"
+-- once, as an administrator. GCS: HMAC keys from "Interoperability"; S3: the bucket's
+-- endpoint and keys; Azure: a connection string (the container is the export's bucket).
 CREATE NAMED COLLECTION gcs_raw AS
   url = 'https://storage.googleapis.com/',
   access_key_id = '...',
   secret_access_key = '...';
+CREATE NAMED COLLECTION azure_raw AS connection_string = '...';
 GRANT NAMED COLLECTION ON gcs_raw TO loader;
 ```
 

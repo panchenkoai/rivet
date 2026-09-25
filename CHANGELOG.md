@@ -11,7 +11,8 @@
   log collapses itself and needs no `rivet compact`. Full loads swap in a filled
   table; incremental loads get a change log and a latest-cursor view. By default
   rivet sends each part over HTTP; with `named_collection:` ClickHouse reads the
-  bucket itself. Not supported: MongoDB CDC, `partition:`, `layout: base_buffer`.
+  bucket itself. The export may be staged on GCS, S3 or Azure. Not supported:
+  MongoDB CDC, `partition:`, `layout: base_buffer`.
 - **`destination.oneshot_budget_mb`** (by @ssyusyukalov, #143): the RAM cap on
   single-PUT uploads, until now fixed at 64 MB, is configurable. On GCS and Azure a
   part that fits uploads in one PUT and gets a store-computed `Content-MD5` that

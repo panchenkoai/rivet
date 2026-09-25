@@ -133,13 +133,16 @@ impl ClickhouseLoader {
     fn insert_uris(&self, target: &str, uris: &[String]) -> Result<u64> {
         let mut total = 0;
         for uri in uris {
-            let (bucket, key) = super::split_gs_uri(uri)?;
+            let (bucket, key) = super::split_object_uri(uri)?;
             let (query, body, rows) = match &self.named_collection {
-                Some(nc) => (
-                    pull_insert_sql(target, nc, bucket, key),
-                    Vec::new(),
-                    self.number(&pull_count_sql(nc, bucket, key))?,
-                ),
+                Some(nc) => {
+                    let source = pull_source(nc, super::scheme_of(uri), bucket, key);
+                    (
+                        format!("INSERT INTO {target} SELECT * FROM {source}"),
+                        Vec::new(),
+                        self.number(&format!("SELECT count() FROM {source}"))?,
+                    )
+                }
                 None => {
                     let bytes = self
                         .store()?
@@ -358,20 +361,21 @@ impl TargetLoader for ClickhouseLoader {
     }
 }
 
-/// `INSERT … SELECT * FROM gcs(<collection>, filename = '<bucket>/<key>')`: ClickHouse reads the part.
-fn pull_insert_sql(target: &str, collection: &str, bucket: &str, key: &str) -> String {
-    format!(
-        "INSERT INTO {target} SELECT * FROM gcs({collection}, filename = {}, format = 'Parquet')",
-        literal(&format!("{bucket}/{key}"))
-    )
-}
-
-/// `SELECT count() FROM gcs(<collection>, filename = …)`: the rows ClickHouse sees in the part.
-fn pull_count_sql(collection: &str, bucket: &str, key: &str) -> String {
-    format!(
-        "SELECT count() FROM gcs({collection}, filename = {}, format = 'Parquet')",
-        literal(&format!("{bucket}/{key}"))
-    )
+/// The table function reading one part through `collection`: `gcs`/`s3` take the path under
+/// the collection's URL, `azureBlobStorage` the container and the blob.
+fn pull_source(collection: &str, scheme: &str, bucket: &str, key: &str) -> String {
+    match scheme {
+        "az" => format!(
+            "azureBlobStorage({collection}, container = {}, blob_path = {}, format = 'Parquet')",
+            literal(bucket),
+            literal(key)
+        ),
+        s => format!(
+            "{}({collection}, filename = {}, format = 'Parquet')",
+            if s == "s3" { "s3" } else { "gcs" },
+            literal(&format!("{bucket}/{key}"))
+        ),
+    }
 }
 
 /// The first of `cols` that is not a plain SQL identifier.
@@ -917,11 +921,18 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_reads_the_part_through_the_collection_by_name() {
+    fn a_pull_reads_the_part_with_the_function_of_its_store() {
         assert_eq!(
-            pull_insert_sql("`d`.`t`", "gcs_raw", "b", "p/part'1.parquet"),
-            "INSERT INTO `d`.`t` SELECT * FROM gcs(gcs_raw, filename = 'b/p/part\\'1.parquet', \
-             format = 'Parquet')"
+            pull_source("nc", "gs", "b", "p/part'1.parquet"),
+            "gcs(nc, filename = 'b/p/part\\'1.parquet', format = 'Parquet')"
+        );
+        assert_eq!(
+            pull_source("nc", "s3", "b", "p/a.parquet"),
+            "s3(nc, filename = 'b/p/a.parquet', format = 'Parquet')"
+        );
+        assert_eq!(
+            pull_source("nc", "az", "c", "p/a.parquet"),
+            "azureBlobStorage(nc, container = 'c', blob_path = 'p/a.parquet', format = 'Parquet')"
         );
     }
 

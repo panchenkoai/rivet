@@ -387,7 +387,7 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
 * `--bigquery-project <PROJECT>` — Scaffold a `load:` block for this BigQuery project. With `--bigquery-dataset` the generated config carries the warehouse target, a per-table partition guess and the base+buffer layout, so `rivet load` and `rivet compact` work from it after a review. Needs `--gcs-bucket`: the load reads GCS only, so a local or S3 scaffold with a `load:` block is a config `rivet load` refuses
 * `--bigquery-dataset <DATASET>` — The dataset the load creates its tables in (with `--bigquery-project`)
-* `--clickhouse-url <URL>` — Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g. `http://localhost:8123`. Needs `--clickhouse-database` and `--gcs-bucket`
+* `--clickhouse-url <URL>` — Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g. `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the export stages in (`--gcs-bucket` or `--s3-bucket`)
 * `--clickhouse-database <DATABASE>` — The ClickHouse database the load creates its tables in (with `--clickhouse-url`)
 * `--clickhouse-user <USER>` — The ClickHouse user the load authenticates as (with `--clickhouse-url`)
 

@@ -25,6 +25,10 @@ CELLS = {
     "a_changed_load_pk_is_refused_before_it_rekeys_the_change_log": "rekey-refused",
     "a_materialized_view_on_the_change_log_does_not_break_the_count": "mv-count",
     "uuid_json_time_and_array_columns_load_with_their_values": "types",
+    "a_cdc_stream_staged_on_s3_loads_into_clickhouse": "s3:push",
+    "a_cdc_stream_staged_on_s3_is_pulled_by_clickhouse": "s3:pull",
+    "a_cdc_stream_staged_on_azure_loads_into_clickhouse": "azure:push",
+    "a_cdc_stream_staged_on_azure_is_pulled_by_clickhouse": "azure:pull",
 }
 
 
@@ -35,6 +39,7 @@ def verify_clickhouse_load(led: Ledger) -> None:
         cell=CELLS.__getitem__,
         msg=lambda n: f"clickhouse[{CELLS[n]}] · {n.replace('_', ' ')}",
         cloud=False,
-        services=(("clickhouse", 8123), ("fake-gcs", 4443), ("postgres", 5432),
-                  ("postgres-cdc", 5434), ("mysql-cdc", 3307), ("mssql-cdc", 1434)),
+        services=(("clickhouse", 8123), ("fake-gcs", 4443), ("minio", 9000), ("azurite", 10000),
+                  ("postgres", 5432), ("postgres-cdc", 5434), ("mysql-cdc", 3307),
+                  ("mssql-cdc", 1434)),
     )
