@@ -181,6 +181,12 @@ fn projection_expr(meta: &Metadata, quoted: &str) -> Option<Result<String>> {
     }))
 }
 
+/// A result column name an outer query cannot reference: the ROWID pseudo-column
+/// shadows it, or it cannot be written as a quoted identifier.
+fn unreferenceable(name: &str) -> bool {
+    name == "ROWID" || name.contains('"') || name.len() > 128
+}
+
 /// The native type label a mapping reports: the DECLARED type, before re-projection.
 fn native_type(meta: &Metadata) -> String {
     let base = meta
@@ -220,9 +226,10 @@ impl OracleSource {
         })
     }
 
-    /// Every row of `sql`, each cell as text — the multi-row twin of `query_scalar`.
+    /// Every row of `sql`, each cell as text, read through the same re-projection as an export.
     pub(crate) fn query_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-        let cursor = self.conn.query(sql, &[]).ora()?;
+        let sql = self.projected(sql)?.sql;
+        let cursor = self.conn.query(&sql, &[]).ora()?;
         let n = cursor.columns().len();
         cursor
             .map(|row| {
@@ -299,6 +306,14 @@ impl OracleSource {
             }
         }
         let sql = if rewritten {
+            if let Some(m) = metas.iter().find(|m| unreferenceable(m.name())) {
+                anyhow::bail!(
+                    "oracle: column {:?} must be re-read through a conversion, but that name \
+                     cannot be referenced from an outer query — give it an alias in the \
+                     `query:` (e.g. `... AS row_id`)",
+                    m.name()
+                );
+            }
             cols.extend(flags);
             format!("SELECT {} FROM ({query}) \"_rivet_p\"", cols.join(", "))
         } else {
@@ -424,7 +439,8 @@ impl Source for OracleSource {
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
-        let mut cursor = self.conn.query(sql, &[]).ora()?;
+        let sql = self.projected(sql)?.sql;
+        let mut cursor = self.conn.query(&sql, &[]).ora()?;
         match cursor.next() {
             Some(row) => cell_text(&row.ora()?, 0),
             None => Ok(None),
@@ -477,37 +493,15 @@ impl Source for OracleSource {
     }
 
     fn primary_key(&mut self, table: &str) -> Result<Option<Vec<String>>> {
-        let (owner, name) = match table.rsplit_once('.') {
-            Some((o, t)) => (Some(o.trim_matches('"')), t.trim_matches('"')),
-            None => (None, table.trim_matches('"')),
-        };
-        let esc = |s: &str| s.replace('\'', "''");
-        let owner_pred = match owner {
-            Some(o) => format!("c.owner = '{}'", esc(o)),
-            None => "c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
-        };
+        let (owner, name) = crate::sql::oracle_catalog_preds(table);
         let sql = format!(
             "SELECT cc.column_name \
              FROM all_constraints c JOIN all_cons_columns cc \
                ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
-             WHERE c.constraint_type = 'P' AND c.table_name = '{}' AND {owner_pred} \
-             ORDER BY cc.position",
-            esc(name)
+             WHERE c.constraint_type = 'P' AND c.table_name = {name} AND c.owner = {owner} \
+             ORDER BY cc.position"
         );
         Ok(crate::source::non_empty_keys(self.query_list(&sql)?))
-    }
-}
-
-/// `(owner, table)` catalog predicates for a `[schema.]table` ident as written in
-/// a `table:` shortcut — unquoted, so Oracle resolved it upper-cased.
-fn catalog_owner_table(qualified_table: &str) -> (String, String) {
-    let esc = |s: &str| s.trim_matches('"').replace('\'', "''").to_uppercase();
-    match qualified_table.rsplit_once('.') {
-        Some((o, t)) => (format!("'{}'", esc(o)), format!("'{}'", esc(t))),
-        None => (
-            "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
-            format!("'{}'", esc(qualified_table)),
-        ),
     }
 }
 
@@ -517,7 +511,7 @@ pub(crate) fn introspect_oracle_table_for_chunking(
     tls: Option<&TlsConfig>,
     qualified_table: &str,
 ) -> Result<crate::source::TableIntrospection> {
-    let (owner, table) = catalog_owner_table(qualified_table);
+    let (owner, table) = crate::sql::oracle_catalog_preds(qualified_table);
     let mut src = OracleSource::connect_with_tls(url, tls)?;
     let row_estimate = src
         .query_scalar(&format!(
@@ -576,6 +570,16 @@ pub(crate) fn introspect_oracle_table_for_chunking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_an_outer_query_cannot_reference_are_detected() {
+        assert!(unreferenceable("ROWID"));
+        assert!(unreferenceable("FROM_TZ(CAST(\"DATE\"ASTIMESTAMP),'UTC')"));
+        assert!(unreferenceable(&"A".repeat(129)));
+        assert!(!unreferenceable("ROW_ID"));
+        assert!(!unreferenceable("rowid"));
+        assert!(!unreferenceable(&"A".repeat(128)));
+    }
 
     #[test]
     fn a_full_oracle_url_parses_and_decodes_its_userinfo() {

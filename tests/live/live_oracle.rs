@@ -743,3 +743,99 @@ fn keyset_on_a_timestamp_9_key_fails_loudly_instead_of_looping() {
     let err = String::from_utf8_lossy(&run.stderr);
     assert!(err.contains("T9"), "the refusal names the key:\n{err}");
 }
+
+/// `table:` written lower-case resolves the way Oracle does, so its primary key is recorded.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_lowercase_table_shortcut_records_its_primary_key() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(5);
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(&t.name().to_lowercase())
+        .export_named("lc")
+        .dest_path(out.path().to_path_buf());
+    let run = rig.run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        recorded_primary_key(&rig.config_path(), "lc"),
+        Some(vec!["ID".to_string()])
+    );
+}
+
+/// `rivet check` refuses a lower-case strategy column and names Oracle's case rule.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn check_refuses_a_key_column_in_the_wrong_case() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(5);
+    let check = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .cli(&["check"]);
+    assert!(
+        !check.status.success(),
+        "a key column the result lacks must fail check"
+    );
+    let err = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        err.contains("column 'id' is not in the export's result; Oracle names match exactly and a table created without quotes stores them upper-case — write 'ID'"),
+        "stderr:\n{err}"
+    );
+}
+
+/// Range-chunking by day over a region-named TSTZ reads its bounds through the UTC re-projection.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn chunk_by_days_over_a_region_named_tstz_reads_every_row() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_tzd",
+        "id NUMBER(10) PRIMARY KEY, ts TIMESTAMP WITH TIME ZONE",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, TO_TIMESTAMP_TZ('2024-07-01 10:00:00 Europe/Berlin', \
+         'YYYY-MM-DD HH24:MI:SS TZR') + NUMTODSINTERVAL(LEVEL, 'HOUR') FROM dual CONNECT BY LEVEL <= 100",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_column: TS")
+        .export_line("chunk_by_days: 1")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(duckdb_total_parquet_rows(out.path()), 100, "every row");
+    assert_eq!(
+        duckdb_dir_scalar(out.path(), "count(DISTINCT \"ID\")", None),
+        100,
+        "no row twice"
+    );
+}
+
+/// An unaliased ROWID cannot be re-read from an outer query; rivet says to alias it.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_unaliased_rowid_is_refused_with_the_alias_fix() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(3);
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .query(&format!("SELECT ROWID, id FROM {}", t.name()))
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert!(!run.status.success(), "an unaliased ROWID must be refused");
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        err.contains("column \"ROWID\" must be re-read through a conversion"),
+        "stderr:\n{err}"
+    );
+}

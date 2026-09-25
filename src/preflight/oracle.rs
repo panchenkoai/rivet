@@ -33,23 +33,6 @@ pub(super) fn diagnose_export_oracle(
     diagnose_oracle(&mut conn, export)
 }
 
-/// `(owner, table)` SQL predicates for a `[schema.]table` as Oracle resolved it.
-fn owner_table(qualified: &str) -> (String, String) {
-    let lit = |s: &str| {
-        format!(
-            "'{}'",
-            s.trim_matches('"').replace('\'', "''").to_uppercase()
-        )
-    };
-    match qualified.rsplit_once('.') {
-        Some((o, t)) => (lit(o), lit(t)),
-        None => (
-            "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
-            lit(qualified),
-        ),
-    }
-}
-
 fn scalar_i64(conn: &mut OracleSource, sql: &str, what: &str) -> Option<i64> {
     match conn.query_scalar(sql) {
         Ok(v) => v.and_then(|s| s.trim().parse::<i64>().ok()),
@@ -66,6 +49,11 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
     if let Some(fail) = schema_fail_oracle(conn, base_query) {
         return Err(fail);
     }
+    for col in key_columns(export) {
+        if let Some(fail) = key_column_fail_oracle(conn, base_query, col) {
+            return Err(fail);
+        }
+    }
     let base_table_owned = strip_select_star_from(base_query)
         .map(std::borrow::Cow::Borrowed)
         .or_else(|| table_from_simple_query(base_query));
@@ -76,7 +64,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     let row_estimate = base_table.and_then(|t| {
-        let (owner, table) = owner_table(t);
+        let (owner, table) = crate::sql::oracle_catalog_preds(t);
         scalar_i64(
             conn,
             &format!(
@@ -87,7 +75,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         .map(|n| n.max(0))
     });
     let avg_row_bytes = base_table.and_then(|t| {
-        let (owner, table) = owner_table(t);
+        let (owner, table) = crate::sql::oracle_catalog_preds(t);
         scalar_i64(
             conn,
             &format!(
@@ -156,9 +144,47 @@ fn schema_fail_oracle(conn: &mut OracleSource, base_query: &str) -> Option<anyho
     Some(PreflightSchemaError::new(detail, code.to_string()).into_error())
 }
 
+/// The columns the export's strategy pages or tracks by, as written in the config.
+fn key_columns(export: &ExportConfig) -> Vec<&str> {
+    [
+        &export.chunk_column,
+        &export.chunk_by_key,
+        &export.cursor_column,
+        &export.cursor_fallback_column,
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::as_str)
+    .collect()
+}
+
+/// A strategy column the result does not have is a loud error naming Oracle's case rule.
+fn key_column_fail_oracle(
+    conn: &mut OracleSource,
+    base_query: &str,
+    col: &str,
+) -> Option<anyhow::Error> {
+    let quoted = crate::sql::quote_ident(SourceType::Oracle, col);
+    let probe = format!("SELECT {quoted} FROM ({base_query}) \"_rivet_probe\" WHERE 1 = 0");
+    let e = conn.query_scalar(&probe).err()?;
+    format!("{e:#}").contains("ORA-00904").then(|| {
+        PreflightSchemaError::new(unknown_key_column_detail(col), "ORA-00904".to_string())
+            .into_error()
+    })
+}
+
+/// Why a strategy column was not found: Oracle matches names exactly, and unquoted DDL is upper-case.
+fn unknown_key_column_detail(col: &str) -> String {
+    format!(
+        "column '{col}' is not in the export's result; Oracle names match exactly and a table \
+         created without quotes stores them upper-case — write '{}'",
+        col.to_uppercase()
+    )
+}
+
 /// The single integer `NUMBER(p<=18,0)` primary-key column of `table`, if any.
 fn single_int_pk_oracle(conn: &mut OracleSource, qualified: &str) -> Option<String> {
-    let (owner, table) = owner_table(qualified);
+    let (owner, table) = crate::sql::oracle_catalog_preds(qualified);
     conn.query_scalar(&format!(
         "SELECT MIN(cc.column_name) FROM all_constraints c \
          JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
@@ -202,7 +228,7 @@ fn range_min_max_oracle(
 /// `Some(true)` when `column` leads some index on `table`, `Some(false)` when the
 /// probe ran and found none, `None` when it could not run.
 fn column_has_index_oracle(conn: &mut OracleSource, qualified: &str, column: &str) -> Option<bool> {
-    let (owner, table) = owner_table(qualified);
+    let (owner, table) = crate::sql::oracle_catalog_preds(qualified);
     let col = column.trim_matches('"').replace('\'', "''");
     scalar_i64(
         conn,

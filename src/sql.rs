@@ -205,9 +205,9 @@ pub(crate) fn aggregate_sql(
 ) -> String {
     let q = quote_ident(source_type, col);
     match strip_simple_projection_from(base_query) {
-        Some(table_ident) => format!("SELECT {agg}({q}) FROM {table_ident}"),
+        Some(table_ident) => format!("SELECT {agg}({q}) AS rivet_agg FROM {table_ident}"),
         None => format!(
-            "SELECT {agg}({q}) FROM ({base_query}) {}",
+            "SELECT {agg}({q}) AS rivet_agg FROM ({base_query}) {}",
             derived(source_type, "_rivet")
         ),
     }
@@ -290,23 +290,47 @@ pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Op
         // has run — the caller's `> 0` guard then skips the density line). The
         // `table:` shortcut ident is unquoted, so Oracle resolved it upper-cased.
         SourceType::Oracle => {
-            let (owner, table) = match table_ident.rsplit_once('.') {
-                Some((o, t)) => (format!("UPPER('{o}')"), t),
-                None => (
-                    "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
-                    table_ident,
-                ),
-            };
+            let (owner, table) = oracle_catalog_preds(table_ident);
             Some(format!(
-                "SELECT num_rows FROM all_tables WHERE owner = {owner} AND table_name = UPPER('{table}')"
+                "SELECT num_rows FROM all_tables WHERE owner = {owner} AND table_name = {table}"
             ))
         }
         SourceType::Mongo => None,
     }
 }
 
+/// `(owner, table)` catalog literals for an Oracle `[owner.]table`: an unquoted
+/// part folds upper-case as Oracle resolves it, a double-quoted part stays verbatim.
+pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
+    let lit = |part: &str| {
+        let name = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+            Some(quoted) => quoted.to_string(),
+            None => part.to_uppercase(),
+        };
+        format!("'{}'", name.replace('\'', "''"))
+    };
+    match qualified.rsplit_once('.') {
+        Some((owner, table)) => (lit(owner), lit(table)),
+        None => (
+            "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
+            lit(qualified),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn oracle_catalog_names_fold_unquoted_parts_only() {
+        let (o, t) = oracle_catalog_preds("rivet.orders");
+        assert_eq!((o.as_str(), t.as_str()), ("'RIVET'", "'ORDERS'"));
+        let (o, t) = oracle_catalog_preds("orders");
+        assert_eq!(o, "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')");
+        assert_eq!(t, "'ORDERS'");
+        assert_eq!(oracle_catalog_preds("\"Mixed\"").1, "'Mixed'");
+        assert_eq!(oracle_catalog_preds("o'x").1, "'O''X'");
+    }
     use super::*;
 
     #[test]
@@ -415,7 +439,7 @@ mod tests {
                 "created_at",
                 "SELECT * FROM events"
             ),
-            "SELECT min(\"created_at\") FROM events"
+            "SELECT min(\"created_at\") AS rivet_agg FROM events"
         );
     }
 
@@ -428,7 +452,7 @@ mod tests {
                 "created_at",
                 "SELECT id, created_at FROM events WHERE x"
             ),
-            "SELECT max(\"created_at\") FROM (SELECT id, created_at FROM events WHERE x) AS _rivet"
+            "SELECT max(\"created_at\") AS rivet_agg FROM (SELECT id, created_at FROM events WHERE x) AS _rivet"
         );
         // dialect quoting flows through.
         assert!(
