@@ -18,13 +18,22 @@
       .head { fill: #8c959f; }
       .note { font-size: 11.5px; fill: #59636e; }
       .dot { fill: #6f9be0; }
-      .node { fill: #eef4fd; stroke: #9dbbe8; stroke-width: 1.5; }
-      .halo { fill: #253a5e; }
-      .brand { font-size: 21px; font-weight: 800; letter-spacing: 1px; fill: #2f4a73; }
-      .chip { fill: #ffffff; stroke: #9dbbe8; stroke-width: 1; }
-      .chiptext { font-size: 10px; font-weight: 700; letter-spacing: 1.2px; fill: #2f5fae; }
+      .node { fill: #0d1117; stroke: #2f5fae; stroke-width: 1.5; }
+      .brand { font-size: 21px; font-weight: 800; letter-spacing: 1px; fill: #ffffff; }
+      .chip { fill: #16233a; stroke: #2f5fae; stroke-width: 1; }
+      .chiptext { font-size: 10px; font-weight: 700; letter-spacing: 1.2px; fill: #cfe2ff; }
       .hint { font-size: 12px; font-weight: 500; fill: #2f5fae; }
       .muted { font-size: 11.5px; fill: #59636e; }
+        .cap { fill: #9198a1; }
+        .pill, .card { fill: #151b23; stroke: #3d444d; }
+        .label { fill: #f0f6fc; }
+        .edge { stroke: #656c76; }
+        .head { fill: #656c76; }
+        .note { fill: #9198a1; }
+        .node { fill: #1a2b47; stroke: #6f9be0; }
+        .chip { fill: #0d1117; stroke: #6f9be0; }
+        .hint { fill: #8db3ee; }
+        .muted { fill: #9198a1; }
     </style>
   </defs>
 
@@ -52,9 +61,8 @@
 
   <!-- rivet -->
   <rect class="node" x="330" y="98" width="140" height="110" rx="24"/>
-  <circle class="halo" cx="362" cy="148" r="17"/>
-  <ellipse cx="362" cy="143" rx="10.5" ry="4" fill="url(#steel)"/>
-  <rect x="358.5" y="145" width="7" height="12" rx="2" fill="url(#steel)"/>
+  <ellipse cx="364" cy="140" rx="15" ry="5.5" fill="url(#steel)"/>
+  <rect x="360.5" y="142" width="7" height="16" rx="2" fill="url(#steel)"/>
   <text class="brand" x="385" y="159">RIVET</text>
   <rect class="chip" x="345" y="174" width="52" height="20" rx="10"/>
   <text class="chiptext" x="371" y="188" text-anchor="middle">BATCH</text>
