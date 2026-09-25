@@ -62,6 +62,16 @@ exclude_re = [
     "replace > with (==|<|>=) in rehydrate_manifest_parts_probed$",
     "replace print_pool_estimate with \\(\\)",
     "replace \\+ with [-*] in print_pool_estimate$",
+    # Equivalent: an empty chunk's sink never opened a writer, so
+    # `commit::write_sink_parts` declares no part whatever this guard says
+    # (`>= 0` over an unsigned count is `true`; `parallel_chunked_empty_chunks_
+    # write_no_parts` pins that no empty part lands, and kills `<` and `==`).
+    "replace > with >= in run_chunked_parallel$",
+    # The trait default is unreachable: its only caller, `retire_running_marker`,
+    # returns before it for Local and Stdout, the two backends that do not
+    # override it. The cloud override is live-guarded by
+    # `a_skipped_run_on_s3_leaves_no_live_running_marker`.
+    "replace Destination::remove -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
 
     # The `escaped` guard in `split_qualified_ident` (src/source/postgres/cdc.rs):
     # `b'"' if in_quotes && next == b'"'`. Stubbing the guard to `false` is

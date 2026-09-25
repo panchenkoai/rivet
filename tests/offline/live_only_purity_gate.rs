@@ -117,10 +117,10 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     ("src/pipeline/keyset.rs::run_keyset_parallel", 4, 0, 2, 2),
     (
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
-        1,
         0,
         0,
-        1,
+        0,
+        0,
     ),
     // `run_with_reconnect`'s row is GONE: its whole-function exclusion was lifted
     // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
