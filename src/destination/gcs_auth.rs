@@ -547,17 +547,37 @@ fn loader_for(creds: AdcCredentials) -> AdcUserTokenLoader {
     }
 }
 
+/// Registry of one shared value per credential identity (`AdcCredentials::cache_key`) for the whole process.
+type PerIdentity<V> = std::sync::OnceLock<Mutex<std::collections::HashMap<String, Arc<V>>>>;
+
+/// The value registered for `key`, created by `make` the first time any caller asks.
+fn per_identity<V>(
+    registry: &'static PerIdentity<V>,
+    key: String,
+    make: impl FnOnce() -> V,
+) -> Arc<V> {
+    let mut map = registry
+        .get_or_init(Default::default)
+        .lock()
+        .expect("per-identity registry poisoned");
+    Arc::clone(map.entry(key).or_insert_with(|| Arc::new(make())))
+}
+
 /// The one GCS token cache per identity in this process, so N stores (one per CDC table) mint once, not N times.
 fn shared_token_cache(key: String) -> Arc<SharedToken> {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    type Caches = Mutex<HashMap<String, Arc<SharedToken>>>;
-    static CACHES: OnceLock<Caches> = OnceLock::new();
-    let mut caches = CACHES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("shared GCS token cache map poisoned");
-    Arc::clone(caches.entry(key).or_default())
+    static CACHES: PerIdentity<SharedToken> = std::sync::OnceLock::new();
+    per_identity(&CACHES, key, SharedToken::default)
+}
+
+/// The one blocking (BigQuery REST) token source per identity in this process; the first caller's HTTP client serves every later one.
+pub(crate) fn shared_blocking_source(
+    creds: AdcCredentials,
+    http: &reqwest::blocking::Client,
+) -> Arc<BlockingAdcTokenSource> {
+    static SOURCES: PerIdentity<BlockingAdcTokenSource> = std::sync::OnceLock::new();
+    per_identity(&SOURCES, creds.cache_key(), || {
+        BlockingAdcTokenSource::new(creds, http.clone())
+    })
 }
 
 /// Read the well-known ADC file and return the credentials it holds.
@@ -1517,7 +1537,6 @@ qPSokX7fAC0Ku7S5xJe4XfPd
         assert!(parse_adc_file(json).unwrap().is_none());
     }
 
-    /// Concurrent callers on a cold cache mint ONE token, not one each.
     /// Loaders for one identity that load together on a cold cache — a CDC run opening its
     /// per-table stores at once — mint one token between them, not one each.
     #[test]
@@ -1577,6 +1596,7 @@ qPSokX7fAC0Ku7S5xJe4XfPd
         );
     }
 
+    /// Concurrent callers on a cold cache mint ONE token, not one each.
     #[test]
     fn concurrent_callers_on_a_cold_cache_mint_exactly_one_token() {
         use std::io::{Read, Write};

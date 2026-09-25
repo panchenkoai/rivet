@@ -522,26 +522,6 @@ pub(crate) enum TokenSourceKind {
     GcloudCli,
 }
 
-/// The ADC token source for this principal, shared by every client in the process.
-fn shared_adc_source(
-    creds: gcs_auth::AdcCredentials,
-    http: &reqwest::blocking::Client,
-) -> std::sync::Arc<BlockingAdcTokenSource> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-    static SOURCES: OnceLock<Mutex<HashMap<String, Arc<BlockingAdcTokenSource>>>> = OnceLock::new();
-    let key = creds.cache_key();
-    let mut sources = SOURCES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("shared ADC source map poisoned");
-    Arc::clone(
-        sources
-            .entry(key)
-            .or_insert_with(|| Arc::new(BlockingAdcTokenSource::new(creds, http.clone()))),
-    )
-}
-
 impl Auth {
     fn resolve(http: &reqwest::blocking::Client) -> Result<Self> {
         let static_token = std::env::var("RIVET_BQ_ACCESS_TOKEN").ok();
@@ -561,7 +541,10 @@ impl Auth {
                 static_token.expect("a Static choice implies a token"),
             ))),
             TokenSourceKind::Adc => {
-                let src = shared_adc_source(adc.expect("an Adc choice implies credentials"), http);
+                let src = gcs_auth::shared_blocking_source(
+                    adc.expect("an Adc choice implies credentials"),
+                    http,
+                );
                 // Say WHICH identity the jobs will run as, at resolution time.
                 // A load that silently acts as a different principal than the
                 // operator configured is an audit trail that reads as fiction
@@ -973,9 +956,9 @@ mod tests {
             .unwrap()
         };
         let http = reqwest::blocking::Client::new();
-        let a = super::shared_adc_source(adc("user-a-refresh"), &http);
-        let b = super::shared_adc_source(adc("user-a-refresh"), &http);
-        let other = super::shared_adc_source(adc("user-b-refresh"), &http);
+        let a = gcs_auth::shared_blocking_source(adc("user-a-refresh"), &http);
+        let b = gcs_auth::shared_blocking_source(adc("user-a-refresh"), &http);
+        let other = gcs_auth::shared_blocking_source(adc("user-b-refresh"), &http);
         assert!(std::sync::Arc::ptr_eq(&a, &b), "one identity, one cache");
         assert!(
             !std::sync::Arc::ptr_eq(&a, &other),
