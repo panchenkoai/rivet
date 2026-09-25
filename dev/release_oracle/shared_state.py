@@ -25,7 +25,7 @@ import os
 import re
 from collections.abc import Callable
 
-from .core import Ledger, ROOT, have, rivet_bin, run
+from .core import Ledger, ROOT, have, nextest_passed, rivet_bin, run
 
 TESTS = (
     "same_named_configs_share_a_postgres_state_cdc_cycle",
@@ -65,8 +65,7 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     out = (p.stdout or "") + (p.stderr or "")
     # LEAK is a test that PASSED but left a handle or child open past its end;
     # nextest's own summary counts it green ("6 passed (2 leaky)").
-    passed = {m.group(1)
-              for m in re.finditer(r"(?:PASS|LEAK) \[[^\]]*\] \([^)]*\) \S+ (\S+)", out)}
+    passed = nextest_passed(out)
     for name in tests:
         if any(q.endswith(name) or q == name for q in passed):
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")

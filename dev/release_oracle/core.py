@@ -32,6 +32,7 @@ from __future__ import annotations
 import functools
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -457,3 +458,23 @@ def sqlcmd(container: str) -> tuple[str, ...]:
         if docker_exec(container, "test", "-x", path, timeout=20).ok:
             return (path, *flags)
     raise SystemExit(f"{container}: no sqlcmd at tools18 or tools — the image changed its layout")
+
+
+# A nextest status line: `<STATUS> [ 1.2s] (3/7) <binary> <test>`. The status is the whole
+# run of capitals before `[`, so `FAIL + LEAK` is read whole: matching `(PASS|LEAK) [`
+# found the `LEAK [` inside it and graded a failed, leaky test green.
+_NEXTEST_LINE = re.compile(r"^\s*([A-Z][A-Z +]*[A-Z])\s+\[[^\]]*\] \([^)]*\) \S+ (\S+)", re.M)
+
+
+def nextest_outcomes(out: str) -> dict[str, str]:
+    """Each test's final nextest status (`PASS`, `LEAK`, `FAIL`, `FAIL + LEAK`, …); `SLOW` is not final."""
+    final: dict[str, str] = {}
+    for status, name in _NEXTEST_LINE.findall(out):
+        if status != "SLOW":
+            final[name] = status
+    return final
+
+
+def nextest_passed(out: str) -> set[str]:
+    """The tests nextest reports green: `PASS`, or `LEAK` (passed, left a handle open)."""
+    return {n for n, s in nextest_outcomes(out).items() if s in ("PASS", "LEAK")}

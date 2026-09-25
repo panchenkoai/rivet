@@ -50,7 +50,8 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       port_of, release_bin_env, rivet, rivet_bin, run, sqlcmd)
+                       nextest_outcomes, nextest_passed, port_of, release_bin_env, rivet, rivet_bin,
+                       run, sqlcmd)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
@@ -63,6 +64,8 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         docker,
         docker_exec,
         have,
+        nextest_outcomes,
+        nextest_passed,
         port_of,
         release_bin_env,
         rivet,
@@ -1358,10 +1361,7 @@ def _drive_live_tests(
     # ("6 tests run: 6 passed (2 leaky)"). Matching only `PASS` read a green run
     # as "this named test never passed" and failed the row (gate #9, the gremlin
     # binlog-cut cell, green in gate #8 and green in its own log here).
-    passed = {
-        m.group(1)
-        for m in re.finditer(r"(?:PASS|LEAK) \[[^\]]*\] \([^)]*\) \S+ (\S+)", res.out)
-    }
+    passed = nextest_passed(res.out)
     missing = [t for t in tests if not any(p.endswith(t) or p == t for p in passed)]
     skipped = [ln for ln in skip_log.read_text().splitlines() if ln.strip()]
     if missing:
@@ -1724,13 +1724,13 @@ def _run_pool_module(
     # a PASS that left a handle open past the test's end; nextest counts it green.
     # nextest prints a FAIL line TWICE (inline, then again in its failure summary),
     # so dedupe by name or one failure would emit two rows.
-    seen: dict[str, str] = {}
-    for m in re.finditer(
-        r"(PASS|LEAK|FAIL) \[[^\]]*\] \([^)]*\) \S+ live_pool_toxiproxy::(\w+)", p.out
-    ):
-        seen.setdefault(m.group(2), m.group(1))
+    seen = {
+        name.removeprefix("live_pool_toxiproxy::"): status
+        for name, status in nextest_outcomes(p.out).items()
+        if name.startswith("live_pool_toxiproxy::")
+    }
     for name, res in sorted(seen.items()):
-        if res == "FAIL":
+        if res not in ("PASS", "LEAK"):
             led.failed("pool", scenario, name[:16], "-", f"pool {scenario}: {name} FAILED")
         else:
             led.add("pool", scenario, name[:16], "-", Status.PASS, name)

@@ -247,6 +247,10 @@ preflights:
     what: "the guarantee path on configs the PRODUCT wrote: `rivet init --bigquery-project/--bigquery-dataset` scaffolds the `load:` section, and on that file run 1 takes everything and run 2 takes only the delta — batch on PostgreSQL / MySQL / SQL Server (`run → load → compact`: run 1 a BASE TABLE, run 2 a buffered delta that `compact` merges, the UPDATE landed, the buffer gone), an incremental export (every row, then the delta), a single-table CDC scaffold (run 1 captures NOTHING — the anchor — run 2 the changes), a multi-table `backfill: auto` scaffold (every baseline, then the changes). No hand-typed YAML anywhere: init's own decisions (the cursor, the layout, the load block) are what is graded — the SQL Server `datetime2` cursor miss was found this way. Oracles: the source, `bq`, the Parquet on disk — never rivet's report."
     backends: [sqlite, gcs]
     status: test        # verify_init_delta (dev/release_oracle/init_delta.py) — runs tests/live/live_init_delta.rs through the Rig against the gate binary; RIVET_CDC_STATE_URL + BQ_ORACLE_PROJECT + `bq` + cargo, SKIP-if-absent
+  - id: clickhouse_load
+    what: "`rivet load` into ClickHouse (ADR-0035) against the stand's server: a CDC stream from MySQL, PostgreSQL and SQL Server whose `FINAL` view equals the source row for row with the deleted key flagged (the version decodes each engine's position); a load killed after appending re-runs, the log holds every row twice and the view is unchanged; a full load swaps in the current source; an incremental export adopts the table behind a latest-cursor view; `rivet init --clickhouse-*` scaffolds the block and its flags require each other. Oracles: the source and ClickHouse read back directly — never rivet's report."
+    backends: [postgres, gcs]
+    status: test        # verify_clickhouse_load (dev/release_oracle/clickhouse_load.py) — runs tests/live/live_clickhouse_load.rs + live_init_extended.rs through the Rig against the gate binary; clickhouse + fake-gcs + the CDC engines + cargo, SKIP-if-absent
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-
@@ -298,5 +302,5 @@ infra:
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated — driven by run_bigquery_golden (dev/release_oracle/bigquery.py),
-      which is this row's driver under a different name; Snowflake + ClickHouse are resolver/type-only (no live
-      load-and-readback) — ClickHouse is even a local compose service, cheap to add"
+      which is this row's driver under a different name; ClickHouse has its own row (clickhouse_load); Snowflake is
+      resolver/type-only (no live load-and-readback)"

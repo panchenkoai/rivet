@@ -49,6 +49,7 @@ from . import (
     bigquery,
     blessed_flow,
     cdc,
+    clickhouse_load,
     concurrency,
     gifs,
     init_delta,
@@ -227,6 +228,19 @@ def _self_test() -> int:
     # its default comes from, the stand row when the container will not answer,
     # and the banner/footer that describe whether anything was compared at all.
     # One entry point, so CI and the offline suite get both halves.
+    # A failed test that also leaked prints `FAIL + LEAK [`: it must never read as green.
+    from .core import nextest_outcomes, nextest_passed
+    sample = (
+        "        SLOW [> 60.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
+        "        PASS [  61.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
+        "        LEAK [   0.400s] (2/4) rivet-cli::live_suite m::leaky_pass\n"
+        " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
+        "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
+        "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
+    )
+    assert nextest_passed(sample) == {"m::slow_then_pass", "m::leaky_pass"}, nextest_passed(sample)
+    assert nextest_outcomes(sample)["m::leaky_fail"] == "FAIL + LEAK"
+    print("self-test ok: a FAIL + LEAK line is a failure, a LEAK line a pass, SLOW is not final")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -452,6 +466,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
         ("warehouse layout", lambda sub: warehouse_layout.verify_warehouse_layout(sub)),
         ("init delta", lambda sub: init_delta.verify_init_delta(sub)),
         ("partner shape", lambda sub: partner_shape.verify_partner_shape(sub)),
+        ("clickhouse load", lambda sub: clickhouse_load.verify_clickhouse_load(sub)),
     ])
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
