@@ -102,9 +102,7 @@ impl ExportTarget {
 
     /// Flags a column name `rivet load` renames (BigQuery look-alikes) or refuses.
     fn grade_column_name(self, spec: &mut TargetColumnSpec) {
-        if !matches!(self, ExportTarget::BigQuery | ExportTarget::Snowflake)
-            || crate::load::is_safe_load_ident(&spec.column_name)
-        {
+        if self == ExportTarget::DuckDb || crate::load::is_safe_load_ident(&spec.column_name) {
             return;
         }
         let (status, note) = match crate::load::latin_fold(&spec.column_name) {
@@ -1330,6 +1328,29 @@ mod tests {
             .status,
             TargetStatus::Ok
         );
+    }
+
+    /// `rivet load` refuses a non-identifier column on ClickHouse too, so `check` must say so.
+    #[test]
+    fn clickhouse_grades_a_column_name_the_load_refuses_as_fail() {
+        let mut spec = TargetColumnSpec {
+            column_name: "naïve col".into(),
+            target_type: "String".into(),
+            autoload_type: "String".into(),
+            status: TargetStatus::Ok,
+            note: None,
+            cast_sql: None,
+        };
+        ExportTarget::ClickHouse.grade_column_name(&mut spec);
+        assert_eq!(spec.status, TargetStatus::Fail, "{:?}", spec.note);
+        let mut plain = TargetColumnSpec {
+            column_name: "naive_col".into(),
+            ..spec.clone()
+        };
+        plain.status = TargetStatus::Ok;
+        plain.note = None;
+        ExportTarget::ClickHouse.grade_column_name(&mut plain);
+        assert_eq!(plain.status, TargetStatus::Ok);
     }
 
     #[test]
