@@ -93,13 +93,19 @@ def start_stores(led: Ledger) -> None:
 
     from .core import wait_until
 
-    wait_until(lambda: scenarios.store_up("s3") or scenarios.store_up("gcs"), tries=15, delay=1.0)
+    # Each store on its own: `s3 or gcs` returned as soon as fake-gcs answered, and a
+    # MinIO the `up` had just RECREATED (no volume — its buckets gone) was not up yet,
+    # so the bucket PUT below failed unread and every s3 cell then failed on
+    # `bucket not found` (measured 2026-09-25: all four CDC cells).
+    wait_until(lambda: scenarios.store_up("s3"), tries=30, delay=1.0)
+    wait_until(lambda: scenarios.store_up("gcs"), tries=15, delay=1.0)
 
     # MinIO: a signed REST PUT (the `mc` images are no longer public); 409 = already there.
-    from dev.pytools.e2e import s3_make_bucket
+    from dev.pytools.e2e import s3_bucket_exists, s3_make_bucket
 
-    s3_make_bucket("http://127.0.0.1:9000", BUCKET,
-                   scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY)
+    wait_until(lambda: s3_make_bucket("http://127.0.0.1:9000", BUCKET,
+                                      scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY),
+               tries=15, delay=1.0)
 
     # fake-gcs: the JSON API, because an upload 404s until the bucket exists.
     import json as _json
@@ -122,7 +128,12 @@ def start_stores(led: Ledger) -> None:
              "--connection-string", scenarios.AZURITE_CONN], timeout=120)
 
     def mark(store: str) -> str:
-        return "✓" if scenarios.store_up(store) else "✗"
+        up = scenarios.store_up(store)
+        if store == "s3":
+            # Up is not enough: the cells write INTO the bucket, so say ✓ only when it exists.
+            up = up and s3_bucket_exists("http://127.0.0.1:9000", BUCKET,
+                                         scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY)
+        return "✓" if up else "✗"
 
     led.ok(f"stores up (bucket/container {BUCKET}: minio {mark('s3')} gcs {mark('gcs')} azure {mark('azure')})")
 
