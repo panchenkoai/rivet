@@ -792,6 +792,26 @@ impl Config {
                         b
                     );
                 }
+                // A local destination writes each table under `<path>/<table>/`,
+                // and on a case-insensitive filesystem (macOS, Windows) `Orders/` and
+                // `orders/` are ONE directory: same-named parts overwrite each other
+                // and the checkpoint moves past the lost rows (bughunt 2026-09-25,
+                // measured on MySQL with `lower_case_table_names=0`).
+                if export.destination.destination_type == DestinationType::Local
+                    && let Some((a, b)) = super::case_colliding_table_pair(ts)
+                {
+                    anyhow::bail!(
+                        "export '{}': `tables:` lists '{}' and '{}', which differ only by \
+                         letter case — on a local destination their directories are one \
+                         directory on a case-insensitive filesystem (macOS, Windows), so \
+                         their parts overwrite each other. Capture one of them in its own \
+                         export with its own `destination.path`, or write to a cloud \
+                         destination, whose object keys are case-sensitive.",
+                        export.name,
+                        a,
+                        b
+                    );
+                }
                 // A streaming destination has no per-table sub-prefix to
                 // extend — `dest_for_table`'s `Stdout` arm is a no-op while
                 // the local and cloud arms both append `<table>/`. So every

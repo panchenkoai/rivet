@@ -73,6 +73,18 @@ pub(crate) fn overlapping_table_pair(ts: &[String]) -> Option<(String, String)> 
     None
 }
 
+/// Two `tables:` entries whose per-table directories are one directory on a case-insensitive filesystem, if any.
+pub(crate) fn case_colliding_table_pair(ts: &[String]) -> Option<(String, String)> {
+    for (i, a) in ts.iter().enumerate() {
+        for b in ts.iter().skip(i + 1) {
+            if a != b && a.to_lowercase() == b.to_lowercase() {
+                return Some((a.clone(), b.clone()));
+            }
+        }
+    }
+    None
+}
+
 impl Config {
     pub fn load(path: &str) -> crate::error::Result<Self> {
         Self::load_with_params(path, None)
@@ -1714,6 +1726,31 @@ mod row_hash_config {
             cfg.exports[0].meta_columns.row_hash.declared(),
             Some(["id", "status", "updated_at"].map(String::from).as_slice())
         );
+    }
+
+    /// Tables differing only by case share one directory on a case-insensitive local
+    /// filesystem, so a local multi-table stream refuses them; a cloud prefix keeps them apart.
+    #[test]
+    fn a_local_stream_refuses_tables_that_differ_only_by_case() {
+        let cfg = |dest: &str| {
+            format!(
+                "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\n\
+                 exports:\n  - name: cdc\n    mode: cdc\n    tables: [HuntQ, other, huntq]\n\
+                 \x20   format: parquet\n    cdc:\n      checkpoint: /tmp/ck\n    destination:\n{dest}"
+            )
+        };
+        let err = Config::from_yaml(&cfg("      type: local\n      path: ./out\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'HuntQ' and 'huntq'") && err.contains("letter case"),
+            "a local stream must refuse case-colliding tables by name: {err}"
+        );
+        Config::from_yaml(&cfg(
+            "      type: gcs\n      bucket: b\n      prefix: \"t/\"\n",
+        ))
+        .expect("object keys are case-sensitive, so a cloud stream keeps both tables");
+        assert_eq!(case_colliding_table_pair(&["a".into(), "b".into()]), None);
     }
 
     #[test]
