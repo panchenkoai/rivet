@@ -161,13 +161,11 @@ impl TargetLoader for ClickhouseLoader {
     }
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
-        for c in &self.cluster_by {
-            if !super::is_safe_load_ident(c) {
-                bail!(
-                    "ClickHouse load: `cluster_by` column `{}` is not a plain SQL identifier",
-                    c.escape_default()
-                );
-            }
+        if let Some(c) = unsafe_column(&self.cluster_by) {
+            bail!(
+                "ClickHouse load: `cluster_by` column `{}` is not a plain SQL identifier",
+                c.escape_default()
+            );
         }
         let target = self.quoted(table);
         let swap = self.quoted(&format!("{table}__rivet_swap"));
@@ -196,43 +194,18 @@ impl TargetLoader for ClickhouseLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
-        let mut full = cdc::meta_column_specs(Warehouse::ClickHouse);
-        full.extend(
-            specs
-                .iter()
-                .filter(|s| !cdc::is_meta_column(&s.column_name))
-                .cloned(),
-        );
+        let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
-        let (engine, key, extra) = if self.cdc {
-            if pk.is_empty() {
-                bail!(
-                    "ClickHouse CDC load of `{table}` needs a primary key: the change log \
-                     collapses versions by key (ADR-0035 CH2) — set `load.pk`"
-                );
-            }
-            (
-                "ReplacingMergeTree(__ver)",
-                order_by(pk),
-                format!(
-                    ",\n  `__ver` UInt256 MATERIALIZED {}",
-                    cdc::CLICKHOUSE_VERSION_EXPR
-                ),
-            )
-        } else {
-            ("MergeTree", order_by(&[]), String::new())
-        };
-        let key_cols: &[String] = if self.cdc { pk } else { &[] };
-        let ddl = columns_ddl(&full, key_cols) + &extra;
+        let shape = changelog_shape(self.cdc, table, pk)?;
+        let ddl = columns_ddl(&full, shape.not_null) + &shape.version_column;
         self.query(&create_table_sql(
             "CREATE TABLE IF NOT EXISTS",
             &changes,
             &ddl,
-            engine,
-            &key,
+            shape.engine,
+            &shape.order_by,
         ))?;
-        let alter = alter_add_columns_sql(&changes, &full, key_cols);
-        if !alter.is_empty() {
+        if let Some(alter) = alter_add_columns_sql(&changes, &full, shape.not_null) {
             self.query(&alter)
                 .with_context(|| format!("adding new columns to `{table}__changes`"))?;
         }
@@ -249,14 +222,15 @@ impl TargetLoader for ClickhouseLoader {
 
     fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
         let changes = format!("{table}__changes");
-        if self.object_kind(&changes)? == ObjectKind::Absent {
+        if let ObjectKind::Absent = self.object_kind(&changes)? {
             return Ok(false);
         }
-        let n = self.number(&format!(
-            "SELECT count() FROM {} WHERE __op IS NOT NULL",
+        let out = self.query(&format!(
+            "SELECT if(count() > 0, 'true', 'false') FROM {} WHERE __op IS NOT NULL",
             self.quoted(&changes)
         ))?;
-        Ok(n > 0)
+        out.parse()
+            .with_context(|| format!("ClickHouse returned `{out}` for a prior-changes probe"))
     }
 
     fn object_kind(&self, table: &str) -> Result<ObjectKind> {
@@ -311,6 +285,58 @@ impl TargetLoader for ClickhouseLoader {
     }
 }
 
+/// The first of `cols` that is not a plain SQL identifier.
+fn unsafe_column(cols: &[String]) -> Option<&String> {
+    cols.iter().find(|c| !super::is_safe_load_ident(c))
+}
+
+/// A change log's columns: rivet's meta columns, then the data columns.
+fn changelog_specs(specs: &[TargetColumnSpec]) -> Vec<TargetColumnSpec> {
+    let mut full = cdc::meta_column_specs(Warehouse::ClickHouse);
+    full.extend(
+        specs
+            .iter()
+            .filter(|s| !cdc::is_meta_column(&s.column_name))
+            .cloned(),
+    );
+    full
+}
+
+/// The engine, key and version column of a change log (ADR-0035 CH2, CH10).
+struct ChangelogShape<'a> {
+    engine: &'static str,
+    order_by: String,
+    not_null: &'a [String],
+    version_column: String,
+}
+
+/// A CDC log collapses versions by the PK; an incremental log is a plain `MergeTree`.
+fn changelog_shape<'a>(cdc: bool, table: &str, pk: &'a [String]) -> Result<ChangelogShape<'a>> {
+    if !cdc {
+        return Ok(ChangelogShape {
+            engine: "MergeTree",
+            order_by: order_by(&[]),
+            not_null: &[],
+            version_column: String::new(),
+        });
+    }
+    if pk.is_empty() {
+        bail!(
+            "ClickHouse CDC load of `{table}` needs a primary key: the change log collapses \
+             versions by key (ADR-0035 CH2) — set `load.pk`"
+        );
+    }
+    Ok(ChangelogShape {
+        engine: "ReplacingMergeTree(__ver)",
+        order_by: order_by(pk),
+        not_null: pk,
+        version_column: format!(
+            ",\n  `__ver` UInt256 MATERIALIZED {}",
+            cdc::CLICKHOUSE_VERSION_EXPR
+        ),
+    })
+}
+
 /// `CREATE … <fqtn> (<ddl>) ENGINE = <engine> ORDER BY <key>`, allowing a Nullable key column.
 fn create_table_sql(verb: &str, fqtn: &str, ddl: &str, engine: &str, key: &str) -> String {
     format!(
@@ -343,10 +369,14 @@ fn column_type(spec: &TargetColumnSpec, not_null: bool) -> String {
     }
 }
 
-/// `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` for every spec, or `""` when there are none.
-fn alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec], not_null: &[String]) -> String {
+/// `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` for every spec, or `None` when there are none.
+fn alter_add_columns_sql(
+    fqtn: &str,
+    specs: &[TargetColumnSpec],
+    not_null: &[String],
+) -> Option<String> {
     if specs.is_empty() {
-        return String::new();
+        return None;
     }
     let adds = specs
         .iter()
@@ -359,7 +389,7 @@ fn alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec], not_null: &[Str
         })
         .collect::<Vec<_>>()
         .join(",\n  ");
-    format!("ALTER TABLE {fqtn}\n  {adds}")
+    Some(format!("ALTER TABLE {fqtn}\n  {adds}"))
 }
 
 /// `(`a`, `b`)`, or `tuple()` for no columns.
@@ -443,6 +473,61 @@ mod tests {
     }
 
     #[test]
+    fn a_cdc_log_collapses_by_key_and_an_incremental_log_does_not() {
+        let pk = ["id".to_string()];
+        let cdc = changelog_shape(true, "t", &pk).unwrap();
+        assert_eq!(cdc.engine, "ReplacingMergeTree(__ver)");
+        assert_eq!(cdc.order_by, "(`id`)");
+        assert_eq!(cdc.not_null, &pk);
+        assert!(cdc.version_column.contains("`__ver` UInt256 MATERIALIZED"));
+        let inc = changelog_shape(false, "t", &pk).unwrap();
+        assert_eq!(
+            (inc.engine, inc.order_by.as_str()),
+            ("MergeTree", "tuple()")
+        );
+        assert!(inc.not_null.is_empty() && inc.version_column.is_empty());
+        let err = changelog_shape(true, "t", &[])
+            .err()
+            .expect("no key refuses");
+        assert!(err.to_string().contains("needs a primary key"), "{err}");
+    }
+
+    #[test]
+    fn the_log_puts_rivets_columns_first_and_never_twice() {
+        let names: Vec<String> = changelog_specs(&[spec("__op", "String"), spec("id", "Int64")])
+            .into_iter()
+            .map(|s| s.column_name)
+            .collect();
+        assert_eq!(names, ["__op", "__pos", "__seq", "id"]);
+    }
+
+    #[test]
+    fn a_cluster_column_that_is_not_an_identifier_is_named() {
+        let cols = ["id".to_string(), "a;b".to_string()];
+        assert_eq!(unsafe_column(&cols), Some(&cols[1]));
+        assert_eq!(unsafe_column(&cols[..1]), None);
+    }
+
+    #[test]
+    fn new_columns_are_added_only_when_there_are_some() {
+        assert_eq!(alter_add_columns_sql("`d`.`t`", &[], &[]), None);
+        let sql = alter_add_columns_sql(
+            "`d`.`t`",
+            &[spec("id", "Int64"), spec("v", "String")],
+            &["id".into()],
+        )
+        .expect("one ALTER");
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS `id` Int64,"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS `v` Nullable(String)"),
+            "{sql}"
+        );
+    }
+
+    #[test]
     fn order_by_quotes_each_column_or_is_tuple() {
         assert_eq!(order_by(&[]), "tuple()");
         assert_eq!(
@@ -473,7 +558,7 @@ mod tests {
     #[ignore = "live: requires docker compose clickhouse"]
     fn the_change_log_keeps_the_latest_source_position_whatever_the_insert_order() {
         unsafe { std::env::set_var("RIVET_CH_VERSION_TEST_PASSWORD", "rivet") };
-        let db = format!("rivet_tmp_chver_{}", std::process::id());
+        let db = format!("rivet_chver_{}", std::process::id());
         let loader = ClickhouseLoader::new(
             "http://127.0.0.1:8123",
             &db,

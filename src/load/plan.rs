@@ -2913,6 +2913,10 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
                 "target": "snowflake", "connection": "c", "warehouse": "w",
                 "database": "d", "schema": "s", "storage_integration": "i"
             }),
+            "clickhouse" => serde_json::json!({
+                "target": "clickhouse", "url": "http://ch:8123", "database": "d",
+                "user": "u", "password_env": "P"
+            }),
             _ => serde_json::json!({ "target": "bigquery", "project": "p", "dataset": "d" }),
         };
         v.as_object_mut()
@@ -3160,6 +3164,40 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
         );
         let e = err(serde_json::json!({ "column": "d) FROM x; --" }));
         assert!(e.contains("not a plain SQL identifier"), "{e}");
+    }
+
+    #[test]
+    fn clickhouse_refuses_every_partition_form_in_every_mode() {
+        let specs = [
+            typed("ts", "DateTime64(6)"),
+            typed("d", "Date32"),
+            typed("n", "Int64"),
+        ];
+        for mode in [LoadMode::Full, LoadMode::Incremental, LoadMode::Cdc] {
+            for block in [
+                serde_json::json!({ "column": "ts", "granularity": "month" }),
+                serde_json::json!({ "column": "d" }),
+                serde_json::json!({ "column": "n" }),
+                serde_json::json!({ "ingestion": "day" }),
+                serde_json::json!({ "range": { "column": "n", "start": 0, "end": 10, "interval": 1 } }),
+            ] {
+                let e = resolve_partition(
+                    "e",
+                    &load_with(
+                        "clickhouse",
+                        serde_json::json!({ "partition": block.clone() }),
+                    ),
+                    mode,
+                    &specs,
+                    SpecFit::Strict,
+                )
+                .expect_err("ClickHouse takes no partition");
+                assert!(
+                    e.to_string().contains("ADR-0035 CH8"),
+                    "{mode:?} {block}: {e}"
+                );
+            }
+        }
     }
 
     #[test]

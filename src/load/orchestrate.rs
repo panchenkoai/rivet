@@ -69,9 +69,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     } else {
         None
     };
-    if let Some(e) = engine
-        && let Some(why) = unsupported_cdc_target(e, &plans)
-    {
+    if let Some(why) = engine.and_then(|e| unsupported_cdc_target(e, &plans)) {
         anyhow::bail!("{why}");
     }
     // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
@@ -3319,6 +3317,37 @@ mod live_only_decisions {
             plan_at(LoadMode::Full, "gs://b/base"),
             plan_at(LoadMode::Cdc, "gs://b/base"),
         ]));
+    }
+
+    /// Only a MongoDB stream into ClickHouse is refused: another engine, another
+    /// warehouse, or a batch load of a Mongo export all proceed (ADR-0035 CH7).
+    #[test]
+    fn only_mongo_cdc_into_clickhouse_is_refused() {
+        use crate::load::cdc::SourceEngine;
+        let into = |mode, target| {
+            let mut p = plan_at(mode, "gs://b/base");
+            p.load.target = target;
+            p
+        };
+        let ch = || load::plan::LoadTarget::Clickhouse {
+            url: "u".into(),
+            database: "d".into(),
+            user: "x".into(),
+            password_env: "P".into(),
+        };
+        let why = unsupported_cdc_target(SourceEngine::Mongo, &[into(LoadMode::Cdc, ch())])
+            .expect("mongo CDC into ClickHouse refuses");
+        assert!(why.contains("ADR-0035 CH7"), "{why}");
+        let bq = plan_at(LoadMode::Cdc, "gs://b/base");
+        assert_eq!(unsupported_cdc_target(SourceEngine::Mongo, &[bq]), None);
+        assert_eq!(
+            unsupported_cdc_target(SourceEngine::Mongo, &[into(LoadMode::Full, ch())]),
+            None
+        );
+        assert_eq!(
+            unsupported_cdc_target(SourceEngine::Postgres, &[into(LoadMode::Cdc, ch())]),
+            None
+        );
     }
 
     /// The ledger's three answers, each decisive. A query ERROR must read as

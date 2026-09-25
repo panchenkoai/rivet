@@ -626,6 +626,10 @@ pub struct InitYamlDestination {
     /// warehouse half of the cycle too.
     pub bigquery_project: Option<String>,
     pub bigquery_dataset: Option<String>,
+    /// `--clickhouse-url` / `--clickhouse-database`: the same, for a ClickHouse load.
+    pub clickhouse_url: Option<String>,
+    pub clickhouse_database: Option<String>,
+    pub clickhouse_user: Option<String>,
 }
 
 impl InitYamlDestination {
@@ -2481,6 +2485,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2508,6 +2515,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         yaml_scaffold::generate_config(
             info,
@@ -2626,6 +2636,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2655,6 +2668,9 @@ mod tests {
             s3_region: Some("eu-central-1".to_string()),
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2689,6 +2705,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2712,6 +2731,9 @@ mod tests {
             s3_region: None,
             bigquery_project: None,
             bigquery_dataset: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

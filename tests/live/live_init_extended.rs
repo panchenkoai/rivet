@@ -386,3 +386,91 @@ fn init_bigquery_flags_scaffold_the_load_block_and_require_each_other() {
          `load:` block with a local destination, which `rivet load` refuses"
     );
 }
+
+/// `rivet init --clickhouse-url/--clickhouse-database[/--clickhouse-user]` scaffold a
+/// ClickHouse `load:` block carrying every value it was given; each half without the
+/// other, the user without a URL, a missing bucket and a second warehouse are refused.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn init_clickhouse_flags_scaffold_the_load_block_and_require_each_other() {
+    require_alive(LiveService::Postgres);
+    let _table = seed_pg_numeric_table(5);
+    let init = |extra: &[&str]| -> std::process::Output {
+        let mut args = vec!["init", "--source", POSTGRES_URL];
+        args.extend_from_slice(extra);
+        std::process::Command::new(RIVET_BIN)
+            .args(&args)
+            .output()
+            .expect("spawn rivet init")
+    };
+    let full = [
+        "--clickhouse-url",
+        "http://ch.example:8123",
+        "--clickhouse-database",
+        "qa_raw",
+        "--gcs-bucket",
+        "qa-scaffold-bucket",
+    ];
+
+    let named = init(&[&full[..], &["--clickhouse-user", "qa_loader"]].concat());
+    assert!(
+        named.status.success(),
+        "init with the ClickHouse flags must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&named.stdout);
+    for want in [
+        "target: clickhouse",
+        "url: http://ch.example:8123",
+        "database: qa_raw",
+        "user: qa_loader",
+        "password_env: CLICKHOUSE_PASSWORD",
+    ] {
+        assert!(yaml.contains(want), "missing `{want}` in:\n{yaml}");
+    }
+    let defaulted = String::from_utf8_lossy(&init(&full).stdout).to_string();
+    assert!(
+        defaulted.contains("user: default"),
+        "no --clickhouse-user scaffolds ClickHouse's own default user:\n{defaulted}"
+    );
+    let neither = init(&[]);
+    assert!(
+        neither.status.success()
+            && !String::from_utf8_lossy(&neither.stdout).contains("clickhouse"),
+        "no warehouse flags, no load block — and the user's default must not demand a URL"
+    );
+
+    for (refused, why) in [
+        (
+            &["--clickhouse-url", "http://x:8123", "--gcs-bucket", "b"][..],
+            "a URL with no database",
+        ),
+        (
+            &["--clickhouse-database", "d", "--gcs-bucket", "b"][..],
+            "a database with no URL",
+        ),
+        (&["--clickhouse-user", "u"][..], "a user with no URL"),
+        (
+            &[
+                "--clickhouse-url",
+                "http://x:8123",
+                "--clickhouse-database",
+                "d",
+            ][..],
+            "no GCS bucket to load from",
+        ),
+        (
+            &[
+                &full[..],
+                &["--bigquery-project", "p", "--bigquery-dataset", "d"],
+            ]
+            .concat()[..],
+            "two warehouses at once",
+        ),
+    ] {
+        assert!(
+            !init(refused).status.success(),
+            "must refuse {why}: {refused:?}"
+        );
+    }
+}

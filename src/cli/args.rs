@@ -64,6 +64,7 @@ pub fn parse_cli() -> Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process; its size never matters
 pub enum Commands {
     /// Run export jobs defined in config
     Run(RunArgs),
@@ -345,6 +346,31 @@ pub enum Commands {
             requires = "bigquery_project"
         )]
         bigquery_dataset: Option<String>,
+        /// Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g.
+        /// `http://localhost:8123`. Needs `--clickhouse-database` and `--gcs-bucket`.
+        #[arg(
+            long = "clickhouse-url",
+            value_name = "URL",
+            requires = "clickhouse_database",
+            requires = "gcs_bucket",
+            conflicts_with_all = ["s3_bucket", "bigquery_project"]
+        )]
+        clickhouse_url: Option<String>,
+        /// The ClickHouse database the load creates its tables in (with `--clickhouse-url`).
+        #[arg(
+            long = "clickhouse-database",
+            value_name = "DATABASE",
+            requires = "clickhouse_url"
+        )]
+        clickhouse_database: Option<String>,
+        /// The ClickHouse user the load authenticates as (with `--clickhouse-url`).
+        #[arg(
+            long = "clickhouse-user",
+            value_name = "USER",
+            default_value = "default",
+            requires = "clickhouse_url"
+        )]
+        clickhouse_user: String,
         /// TLS posture for BOTH the introspection connection init opens AND the
         /// `source.tls:` block written into the scaffold. Required (or `disable`,
         /// explicitly) for any non-loopback host — without it the TLS gate

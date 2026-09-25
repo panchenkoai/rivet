@@ -8,218 +8,261 @@
 # `test:` cells for the forms are LIVE (a run + load per cell on the test project, the
 # metadata read back through `tables.get`); the Snowflake ones are SQL-text proofs, since
 # Snowflake is not live-run from this stand. Validation rows are target-agnostic config
-# checks and cite the same test in both load columns.
+# checks and cite the same test in every load column. ClickHouse takes no partition and has
+# no shape control (ADR-0035 CH8): every form is one refusal test, the shape rows are `na`.
 
 load_targets: true
-engines: [bigquery, snowflake]
+engines: [bigquery, snowflake, clickhouse]
 
 scenarios:
   - id: timestamp_hour
     what: "a TIMESTAMP column by hour → TIMESTAMP_TRUNC(c, HOUR); Snowflake a leading DATE_TRUNC('HOUR', c) clustering expression"
     bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: timestamp_day
     what: "a TIMESTAMP column by day → TIMESTAMP_TRUNC(c, DAY) (BigQuery renders it DATE(c); compared as metadata, not text)"
     bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: timestamp_month
     what: "a TIMESTAMP column by month → TIMESTAMP_TRUNC(c, MONTH)"
     bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: timestamp_year
     what: "a TIMESTAMP column by year → TIMESTAMP_TRUNC(c, YEAR)"
     bigquery:   { test: bigquery_timestamp_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: datetime_hour
     what: "a DATETIME column by hour → DATETIME_TRUNC(c, HOUR)"
     bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: datetime_day
     what: "a DATETIME column by day → DATETIME_TRUNC(c, DAY)"
     bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: datetime_month
     what: "a DATETIME column by month → DATETIME_TRUNC(c, MONTH)"
     bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: datetime_year
     what: "a DATETIME column by year → DATETIME_TRUNC(c, YEAR)"
     bigquery:   { test: bigquery_datetime_partitions_land_at_every_granularity }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: date_day
     what: "a DATE column by day → the column itself"
     bigquery:   { test: bigquery_date_partitions_land_by_day_month_and_year }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: date_month
     what: "a DATE column by month → DATE_TRUNC(c, MONTH)"
     bigquery:   { test: bigquery_date_partitions_land_by_day_month_and_year }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: date_year
     what: "a DATE column by year → DATE_TRUNC(c, YEAR)"
     bigquery:   { test: bigquery_date_partitions_land_by_day_month_and_year }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: date_hour_refused
     what: "a DATE column by hour is refused at plan time — a DATE has no hours"
     bigquery:   { test: bigquery_partition_refuses_a_form_the_column_type_cannot_take }
     snowflake:  { na: "Snowflake's DATE_TRUNC truncates a DATE at any granularity; nothing to refuse" }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: non_temporal_column_refused
     what: "a STRING / INT64 column under `column:` is refused, naming the type; the column lookup is one seam for both targets (resolve_partition)"
     bigquery:   { test: bigquery_partition_refuses_a_form_the_column_type_cannot_take }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: range_int64
     what: "an INT64 column with `range` → RANGE_BUCKET(c, GENERATE_ARRAY(start, end, interval))"
     bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: range_on_a_non_integer_refused
     what: "`range` on anything but INT64 is refused at plan time"
     bigquery:   { test: bigquery_partition_refuses_a_form_the_column_type_cannot_take }
     snowflake:  { na: "Snowflake has no range partitions; the form itself is refused (range_int64)" }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: ingestion_hour
     what: "load time by hour → TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)"
     bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: ingestion_day
     what: "load time by day → _PARTITIONDATE"
     bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: ingestion_month
     what: "load time by month → TIMESTAMP_TRUNC(_PARTITIONTIME, MONTH)"
     bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: ingestion_year
     what: "load time by year → TIMESTAMP_TRUNC(_PARTITIONTIME, YEAR)"
     bigquery:   { test: bigquery_range_and_load_time_partitions_land_as_declared }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: one_form_per_block
     what: "a `partition:` block names exactly one of column / range / ingestion; a stray granularity, a zero expiry, a reversed or too-fine range and a typo'd key are refused when the block is read"
     bigquery:   { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
     snowflake:  { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
+    clickhouse: { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
 
   - id: per_export_override_and_none
     what: "a per-export `partition:` replaces the top-level one, `none` included; the top-level default is `none`"
     bigquery:   { test: with_override_replaces_some_fields_and_inherits_the_rest }
     snowflake:  { test: with_override_replaces_some_fields_and_inherits_the_rest }
+    clickhouse: { test: with_override_replaces_some_fields_and_inherits_the_rest }
 
   - id: expiration_and_filter_options
     what: "`expiration_days` / `require_filter` land as partition_expiration_days / require_partition_filter on the full table; Snowflake refuses both"
     bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
     snowflake:  { test: snowflake_partition_is_a_leading_date_trunc_and_refuses_bigquery_only_forms }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: options_change_in_place
     what: "a changed expiry / filter is applied with ALTER TABLE SET OPTIONS after the overwrite — BigQuery refuses an overwrite declaring different options (verified 2026-09-12)"
     bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
     snowflake:  { na: "no partition options" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: changed_partition_of_a_full_table_refused
     what: "a full load onto rivet's own table with a different partition key or granularity is refused naming both, nothing touched (D5)"
     bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
     snowflake:  { na: "CREATE OR REPLACE TABLE re-creates the table with the new clustering key — Snowflake has no partition spec to conflict" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: changelog_inherits_the_table_partition
     what: "the first delta renames the partitioned full table to `__changes`, keeping the partition and lifting require_partition_filter (MT7)"
     bigquery:   { test: bigquery_changelog_inherits_the_partition_rivet_gave_the_table }
     snowflake:  { test: adoption_renames_the_table_and_adds_the_meta_columns }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: changelog_created_by_rivet_is_partitioned_without_a_filter
     what: "a change log rivet creates (CDC) takes the partition and a column/range expiry, never require_partition_filter or a load-date expiry"
     bigquery:   { test: a_changelog_is_partitioned_like_the_table_but_never_requires_a_filter }
     snowflake:  { test: a_partition_expression_leads_the_clustering_key }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: changelog_keeps_its_shape_under_the_defaults
     what: "with `partition` absent and `cluster_by: auto` an existing change log keeps the shape it has (D2: the log follows the table it grew from) — no drift is ever reported"
     bigquery:   { test: changelog_drift_follows_only_a_declared_partition_or_clustering }
     snowflake:  { na: "no change-log shape probe (changelog_drift defaults to none)" }
+    clickhouse: { na: "no shape control on ClickHouse (ADR-0035)" }
 
   - id: changelog_reclustered_in_place
     what: "a written `cluster_by` that differs from the log's is patched in place (tables.patch clustering, set or cleared) before the append"
     bigquery:   { test: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild }
     snowflake:  { na: "no change-log shape probe; Snowflake could ALTER TABLE … CLUSTER BY in place — not wired, not live-run" }
+    clickhouse: { na: "no shape control on ClickHouse (ADR-0035)" }
 
   - id: changelog_partition_change_refused_until_rebuild
     what: "a written `partition` that differs from the log's refuses the load naming both keys and the bytes a rebuild reads; nothing is touched"
     bigquery:   { test: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild }
     snowflake:  { na: "no change-log shape probe" }
+    clickhouse: { na: "no shape control on ClickHouse (ADR-0035)" }
 
   - id: rebuild_changelog_swaps_a_repartitioned_copy_in
     what: "`rivet load --rebuild-changelog` copies the log in the declared shape (billed CTAS), checks the row count, renames the old aside, the copy in, drops the old; an interrupted swap's leftovers stop the next load"
     bigquery:   { test: bigquery_changelog_follows_a_written_cluster_by_and_repartitions_only_on_rebuild }
     snowflake:  { na: "rebuild_changelog is refused as unsupported on Snowflake" }
+    clickhouse: { na: "no shape control on ClickHouse (ADR-0035)" }
 
   - id: span_over_the_job_cap_refused
     what: "ONE Parquet file whose values alone span more than 4,000 partitions is refused from the footer statistics before any job, naming the file and the granularity that fits (D4) — the shape no batching splits (dates uncorrelated with the read key)"
     bigquery:   { test: a_file_spanning_the_whole_history_is_refused_by_name_before_any_job }
     snowflake:  { na: "no per-job partition cap" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: span_over_the_job_cap_loads_in_batches
     what: "files that are each narrow but together wide are packed, by their lowest value, into LOAD DATA jobs of at most 4,000 partitions each (a keyset export over an autoincrement key is date-local without chunking by date); a whole-table load that needs several jobs fills `<table>__staging` and swaps it in with one CLONE, an append load runs its batches into `__changes`. Measured live: 5,000 daily partitions read by keyset → two jobs, DAY partitions kept; the same rows with dates permuted → refused by file name, ledger `refused`, nothing in the warehouse"
     bigquery:   { test: a_wide_history_read_by_keyset_loads_daily_partitions_in_batches }
     snowflake:  { na: "no per-job partition cap — one COPY" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: hourly_lifetime_warning
     what: "hourly partitions without an expiry of at most 416 days warn at plan time — 10,000 partitions per table"
     bigquery:   { test: hourly_partitions_outlive_the_table_without_a_short_expiry }
     snowflake:  { na: "no per-table partition cap" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: span_budget_counts_every_part_that_has_statistics
     what: "a part without statistics for the column leaves its own rows to BigQuery; the span the other parts prove is still refused, in either order — and an INT32-stored range column (PG integer, MySQL int) is budgeted like INT64"
     bigquery:   { test: a_stats_less_file_does_not_hide_the_other_files_span }
     snowflake:  { na: "no per-job partition cap" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: range_partition_takes_no_expiry
     what: "`range` + `expiration_days` is refused when the block is read (BigQuery has no expiry for integer ranges), before the extract"
     bigquery:   { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
     snowflake:  { test: partition_block_refuses_two_forms_bad_ranges_and_zero_expiry }
+    clickhouse: { test: clickhouse_refuses_every_partition_form_in_every_mode }
 
   - id: changelog_never_expires_the_export_stamp
     what: "a change log partitioned on `_rivet_exported_at` (one value per run) is partitioned by load date: its expiry is dropped like an ingestion-time one, else the never-changed baseline rows expire out of the view"
     bigquery:   { test: the_log_never_expires_partitions_on_the_export_stamp }
     snowflake:  { na: "expiration_days is refused on Snowflake" }
+    clickhouse: { na: "ClickHouse takes no partition (ADR-0035 CH8)" }
 
   - id: foreign_table_refusal_holds_on_every_attempt
     what: "the ownership refusal is journaled as `refused`, which never makes the table rivet's own — the second load (a scheduler retry) refuses again instead of overwriting or adopting the table"
     bigquery:   { test: bigquery_load_refuses_a_table_it_did_not_load_on_every_attempt }
     snowflake:  { test: a_refused_load_does_not_make_a_foreign_table_rivets_own }
+    clickhouse: { test: a_refused_load_does_not_make_a_foreign_table_rivets_own }
 
   - id: unwritten_cluster_by_follows_the_table
     what: "a full load onto its own table with `cluster_by` unwritten (auto) keeps the table's clustering (an unclustered 0.23 table is not refused after the upgrade); a written one still conflicts"
     bigquery:   { test: bigquery_full_load_follows_the_clustering_of_the_table_it_overwrites }
     snowflake:  { na: "no table shape probe on Snowflake (no ShapeControl)" }
+    clickhouse: { na: "no shape control on ClickHouse (ADR-0035)" }
 
   - id: whole_table_run_onto_the_view_joins_the_log
     what: "an incremental whole-table run (after `state reset`, or re-selected by a stateless cycle) whose name is already the view is appended to the log at least once, never refused on the view"
     bigquery:   { test: bigquery_incremental_first_run_lands_as_a_table_and_the_first_delta_starts_the_changelog }
     snowflake:  { test: a_whole_table_run_joins_the_log_whenever_the_target_already_exists }
+    clickhouse: { test: a_whole_table_run_joins_the_log_whenever_the_target_already_exists }
 
   - id: full_then_incremental_adopts_the_table
     what: "an export switched from `mode: full` to incremental: the whole pass (MT1) NEVER overwrites the existing table — the table is renamed into `__changes` and the pass appended to it, so a row deleted at the source survives in the log; counted in the warehouse per leg"
     bigquery:   { test: bigquery_incremental_never_overwrites_an_existing_table_and_adopts_it_as_the_log }
     snowflake:  { test: adoption_renames_the_table_and_adds_the_meta_columns }
+    clickhouse: { test: an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_rows }
 
   - id: incremental_onto_a_pre_existing_table_refused
     what: "`mode: incremental` from the first run onto a table already in the dataset that the ledger does not know: refused on every attempt, nothing written, no `__changes` adopted"
     bigquery:   { test: bigquery_incremental_onto_a_table_already_in_the_dataset_is_refused_every_time }
     snowflake:  { test: a_table_rivet_did_not_load_is_not_taken_over }
+    clickhouse: { test: a_table_rivet_did_not_load_is_not_taken_over }
 
   - id: rebuild_carries_the_logs_properties
     what: "`--rebuild-changelog` carries description, labels, friendly name, table expiry and the KMS key onto the copy, and refuses a log with column policy tags or row access policies (a copy carries neither)"
     bigquery:   { test: a_rebuild_carries_the_logs_properties_and_refuses_the_policies_it_cannot }
     snowflake:  { na: "rebuild_changelog is refused as unsupported on Snowflake" }
+    clickhouse: { na: "no shape control on ClickHouse (ADR-0035)" }

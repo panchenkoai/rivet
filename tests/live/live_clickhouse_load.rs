@@ -130,7 +130,7 @@ fn a_mysql_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source() {
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
     let (tbl, _guard) = seeded("rivet_ch_cdc", 5);
-    let db = Db::new("rivet_tmp_ch");
+    let db = Db::new("rivet_chtest");
     let rig = into_clickhouse(Rig::mysql_cdc(&tbl), &db);
     let view = format!("{}.{tbl}", db.0);
 
@@ -176,7 +176,7 @@ fn a_postgres_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source()
             .map(|r| (r.get(0), r.get(1)))
             .collect()
     };
-    let db = Db::new("rivet_tmp_ch");
+    let db = Db::new("rivet_chtest");
     let rig = into_clickhouse(Rig::pg_cdc(&tbl, &slot), &db);
     let view = format!("{}.{tbl}", db.0);
 
@@ -228,7 +228,7 @@ fn a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source
             .join("\n"),
         )
     };
-    let db = Db::new("rivet_tmp_ch");
+    let db = Db::new("rivet_chtest");
     let rig = into_clickhouse(Rig::mssql_cdc(&table, &ci).cdc("until_current: true"), &db);
     let view = format!("{}.{table}", db.0);
 
@@ -259,7 +259,7 @@ fn a_load_that_dies_after_appending_is_re_run_without_duplicating_the_view() {
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
     let (tbl, _guard) = seeded("rivet_ch_crash", 5);
-    let db = Db::new("rivet_tmp_ch");
+    let db = Db::new("rivet_chtest");
     let rig = into_clickhouse(Rig::mysql_cdc(&tbl), &db);
     let view = format!("{}.{tbl}", db.0);
     rig.run_ok();
@@ -323,7 +323,7 @@ fn a_full_load_into_clickhouse_replaces_the_table_with_the_current_source() {
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
     let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_full", 5);
-    let db = Db::new("rivet_tmp_ch");
+    let db = Db::new("rivet_chtest");
     let rig = batch_into_clickhouse(Rig::pg_batch(&tbl).mode("full"), &db);
     let table = format!("{}.{tbl}", db.0);
     let loaded = || {
@@ -359,7 +359,7 @@ fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
     let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_inc", 5);
-    let db = Db::new("rivet_tmp_ch");
+    let db = Db::new("rivet_chtest");
     let rig = batch_into_clickhouse(
         Rig::pg_batch(&tbl)
             .mode("incremental")
