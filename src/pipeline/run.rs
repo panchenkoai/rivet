@@ -663,36 +663,59 @@ pub fn run(
         started_at = window_start;
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
             std::sync::Mutex::new(Vec::with_capacity(exports.len()));
+        let workers = crate::load::pool::effective_pool(None, exports.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        type Outcome = (Result<()>, RunSummary);
+        let finished: std::sync::Mutex<Vec<(usize, Outcome)>> =
+            std::sync::Mutex::new(Vec::with_capacity(exports.len()));
         std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for &export in &exports {
-                handles.push(s.spawn(|| {
-                    let state = match StateStore::open(config_path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let err = anyhow::anyhow!(
-                                "export '{}': failed to open state database: {:#}",
-                                export.name,
-                                e
-                            );
-                            let summary = job::synthetic_failed_summary(&export.name, &err);
-                            return (Err(err), summary);
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    s.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&export) = exports.get(i) else {
+                                break;
+                            };
+                            let pair = match StateStore::open(config_path) {
+                                Ok(state) => job::run_export_job(
+                                    config_path,
+                                    &config,
+                                    export,
+                                    &state,
+                                    &config_dir,
+                                    &opts,
+                                ),
+                                Err(e) => {
+                                    let err = anyhow::anyhow!(
+                                        "export '{}': failed to open state database: {:#}",
+                                        export.name,
+                                        e
+                                    );
+                                    let summary = job::synthetic_failed_summary(&export.name, &err);
+                                    (Err(err), summary)
+                                }
+                            };
+                            finished.lock().unwrap().push((i, pair));
                         }
-                    };
-                    job::run_export_job(config_path, &config, export, &state, &config_dir, &opts)
-                }));
-            }
-            // Every thread is spawned before any is joined, so the number of
-            // live handles IS the overlap this run reached — counted, not
-            // assumed from `run_parallel`.
+                    })
+                })
+                .collect();
+            // Every worker is spawned before any is joined, so the number of live
+            // workers IS the overlap this run reached — counted, not assumed.
             peak_concurrency = peak_concurrency.max(handles.len());
             for h in handles {
-                match h.join() {
-                    Ok(pair) => collected.lock().unwrap().push(pair),
-                    Err(payload) => std::panic::resume_unwind(payload),
+                if let Err(payload) = h.join() {
+                    std::panic::resume_unwind(payload);
                 }
             }
         });
+        let mut finished = finished.into_inner().unwrap();
+        finished.sort_by_key(|(i, _)| *i);
+        collected
+            .lock()
+            .unwrap()
+            .extend(finished.into_iter().map(|(_, pair)| pair));
 
         // All exports are done → drop the sender so `parent_ui::run_ui`
         // sees the channel close and exits cleanly (committing the final
