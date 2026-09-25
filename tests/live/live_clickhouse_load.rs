@@ -77,6 +77,11 @@ fn source_rows(tbl: &str) -> Vec<(i64, i64)> {
         .expect("read source")
 }
 
+/// The raw TSV ClickHouse returns for `sql`, for rows that are not `(id, v)` pairs.
+fn clickhouse_rows_tsv(sql: &str) -> String {
+    ch(sql)
+}
+
 /// The `(id, v)` rows ClickHouse returns for `sql` (a `FORMAT TSV` query).
 fn clickhouse_rows(sql: &str) -> Vec<(i64, i64)> {
     pairs(&ch(sql))
@@ -501,7 +506,7 @@ fn uuid_json_time_and_array_columns_load_with_their_values() {
     load(&rig);
 
     let table = format!("{}.{tbl}", db.0);
-    let got = ch(&format!(
+    let got = clickhouse_rows_tsv(&format!(
         "SELECT id, if(u IS NULL, '', toString(toUUID(concat(substring(lower(hex(u)),1,8),'-',\
          substring(lower(hex(u)),9,4),'-',substring(lower(hex(u)),13,4),'-',\
          substring(lower(hex(u)),17,4),'-',substring(lower(hex(u)),21,12))))), \
