@@ -195,6 +195,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `url` | `string` |  | ClickHouse: the HTTP endpoint, e.g. `http://localhost:8123`. |
 | `user` | `string` |  | ClickHouse: the user the load authenticates as. |
 | `password_env` | `string` |  | ClickHouse: the env var holding that user's password. |
+| `named_collection` | `string` |  | ClickHouse: a server-side named collection holding the bucket's URL and HMAC keys; ClickHouse then reads the Parquet itself instead of rivet sending it. |
 | `cleanup_source` | `boolean` |  | After a successful load, delete the staged Parquet under the export prefix. |
 | `pk` | `auto` \| `none` |  | Dedup key of the incremental/CDC current-state view: `auto` (the source primary key `rivet run` recorded), `none`, or explicit columns; ignored for `full`. |
 | `layout` | `log_view` \| `base_buffer` |  | `log_view` or `base_buffer` — where the current state lives. Absent derives it from the mode: a CDC stream with a `backfill:` is base+buffer, the rest changelog+view. `base_buffer` needs `target: bigquery` — `rivet compact` is what merges the buffer into the base, and it is BigQuery-only. |

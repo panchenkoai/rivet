@@ -84,6 +84,10 @@ struct RawLoadSection {
     /// ClickHouse: the env var holding that user's password.
     #[serde(default)]
     password_env: Option<String>,
+    /// ClickHouse: a server-side named collection holding the bucket's URL and HMAC
+    /// keys; ClickHouse then reads the Parquet itself instead of rivet sending it.
+    #[serde(default)]
+    named_collection: Option<String>,
     /// After a successful load, delete the staged Parquet under the export prefix.
     #[serde(default)]
     cleanup_source: bool,
@@ -171,8 +175,14 @@ impl TryFrom<RawLoadSection> for LoadSection {
                 &[LoadTargetKind::Clickhouse],
             ),
         ];
+        let optional: [(&str, &Option<String>, &[LoadTargetKind]); 1] = [(
+            "named_collection",
+            &r.named_collection,
+            &[LoadTargetKind::Clickhouse],
+        )];
         let foreign = fields
             .iter()
+            .chain(optional.iter())
             .find(|(_, v, of)| v.is_some() && !of.contains(&r.target));
         if let Some((field, _, of)) = foreign {
             let other = of[0].name();
@@ -200,12 +210,23 @@ impl TryFrom<RawLoadSection> for LoadSection {
                 schema: take(&r.schema),
                 storage_integration: take(&r.storage_integration),
             },
-            LoadTargetKind::Clickhouse => LoadTarget::Clickhouse {
-                url: take(&r.url),
-                database: take(&r.database),
-                user: take(&r.user),
-                password_env: take(&r.password_env),
-            },
+            LoadTargetKind::Clickhouse => {
+                if let Some(nc) = r.named_collection.as_deref()
+                    && !crate::load::is_safe_load_ident(nc)
+                {
+                    return Err(format!(
+                        "`load.named_collection` `{}` is not a plain identifier",
+                        nc.escape_default()
+                    ));
+                }
+                LoadTarget::Clickhouse {
+                    url: take(&r.url),
+                    database: take(&r.database),
+                    user: take(&r.user),
+                    password_env: take(&r.password_env),
+                    named_collection: r.named_collection.clone(),
+                }
+            }
         };
         Ok(LoadSection {
             target,
@@ -273,6 +294,7 @@ pub enum LoadTarget {
         database: String,
         user: String,
         password_env: String,
+        named_collection: Option<String>,
     },
 }
 

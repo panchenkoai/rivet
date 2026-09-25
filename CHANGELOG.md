@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`rivet load` into ClickHouse** (ADR-0035; the loader started from
+  @ssyusyukalov's #145). `load: { target: clickhouse, url, database, user,
+  password_env }`, or `rivet init --clickhouse-url … --clickhouse-database …`. A
+  CDC table lands in `<table>__changes`, a `ReplacingMergeTree` keyed on the primary
+  key with a version decoded from the source position (PostgreSQL LSN, MySQL binlog
+  file + offset, SQL Server LSN), behind a `FINAL` view that flags deletes, so the
+  log collapses itself and needs no `rivet compact`. Full loads swap in a filled
+  table; incremental loads get a change log and a latest-cursor view. By default
+  rivet sends each part over HTTP; with `named_collection:` ClickHouse reads the
+  bucket itself. Not supported: MongoDB CDC, `partition:`, `layout: base_buffer`.
 - **`destination.oneshot_budget_mb`** (by @ssyusyukalov, #143): the RAM cap on
   single-PUT uploads, until now fixed at 64 MB, is configurable. On GCS and Azure a
   part that fits uploads in one PUT and gets a store-computed `Content-MD5` that

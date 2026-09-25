@@ -1680,8 +1680,15 @@ fn a_clickhouse_load_names_its_own_fields_and_refuses_foreign_ones() {
             database: "d".into(),
             user: "u".into(),
             password_env: "CH_PW".into(),
+            named_collection: None,
         }
     );
+    let pulled = Config::from_yaml(&cfg(&format!("{own}  named_collection: gcs_raw\n")))
+        .expect("a named collection is optional and owned by ClickHouse");
+    assert!(matches!(
+        pulled.load.expect("load").target,
+        load::LoadTarget::Clickhouse { named_collection: Some(ref n), .. } if n == "gcs_raw"
+    ));
     let err = |load: &str| format!("{:#}", Config::from_yaml(&cfg(load)).unwrap_err());
     let missing = err("  url: \"http://localhost:8123\"\n  database: d\n  user: u\n");
     assert!(missing.contains("has no `password_env`"), "{missing}");
@@ -1689,6 +1696,8 @@ fn a_clickhouse_load_names_its_own_fields_and_refuses_foreign_ones() {
     assert!(bq.contains("carries `project`, a `bigquery` field"), "{bq}");
     let sf = err(&format!("{own}  schema: s\n"));
     assert!(sf.contains("carries `schema`, a `snowflake` field"), "{sf}");
+    let bad_nc = err(&format!("{own}  named_collection: \"x; DROP\"\n"));
+    assert!(bad_nc.contains("is not a plain identifier"), "{bad_nc}");
     let layout = err(&format!("{own}  layout: base_buffer\n"));
     assert!(layout.contains("BigQuery-only"), "{layout}");
 }

@@ -1730,6 +1730,14 @@
           ],
           "default": null
         },
+        "named_collection": {
+          "description": "ClickHouse: a server-side named collection holding the bucket's URL and HMAC\nkeys; ClickHouse then reads the Parquet itself instead of rivet sending it.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "cleanup_source": {
           "description": "After a successful load, delete the staged Parquet under the export prefix.",
           "type": "boolean",

@@ -28,6 +28,8 @@ pub struct ClickhouseLoader {
     cluster_by: Vec<String>,
     /// A CDC load: the change log is a `ReplacingMergeTree(__ver)` keyed on the PK.
     cdc: bool,
+    /// Read parts server-side through this named collection instead of sending them.
+    named_collection: Option<String>,
 }
 
 impl ClickhouseLoader {
@@ -48,7 +50,14 @@ impl ClickhouseLoader {
             store: OnceLock::new(),
             cluster_by: Vec::new(),
             cdc: false,
+            named_collection: None,
         }
+    }
+
+    /// Have ClickHouse read each part itself through `collection` (ADR-0035 CH6).
+    pub(crate) fn named_collection(mut self, collection: Option<String>) -> Self {
+        self.named_collection = collection;
+        self
     }
 
     /// Set the full-load table's `ORDER BY` columns.
@@ -125,20 +134,24 @@ impl ClickhouseLoader {
 
     /// Insert every part in `uris` into `target`; the rows ClickHouse reports written.
     fn insert_uris(&self, target: &str, uris: &[String]) -> Result<u64> {
-        let insert = format!("INSERT INTO {target} FORMAT Parquet");
         let mut total = 0;
         for uri in uris {
-            let (_, key) = super::split_gs_uri(uri)?;
-            let bytes = self
-                .store()?
-                .read(key)
-                .with_context(|| format!("reading {uri} for the ClickHouse load"))?;
+            let (bucket, key) = super::split_gs_uri(uri)?;
+            let (query, body) = match &self.named_collection {
+                Some(nc) => (pull_insert_sql(target, nc, bucket, key), Vec::new()),
+                None => (
+                    format!("INSERT INTO {target} FORMAT Parquet"),
+                    self.store()?
+                        .read(key)
+                        .with_context(|| format!("reading {uri} for the ClickHouse load"))?,
+                ),
+            };
             let params = [
-                ("query", insert.as_str()),
+                ("query", query.as_str()),
                 ("input_format_null_as_default", "0"),
             ];
             total += self
-                .post(&params, bytes)
+                .post(&params, body)
                 .with_context(|| format!("inserting {uri} into {target}"))?
                 .1;
         }
@@ -283,6 +296,14 @@ impl TargetLoader for ClickhouseLoader {
         ))
         .map(|_| ())
     }
+}
+
+/// `INSERT … SELECT * FROM gcs(<collection>, filename = '<bucket>/<key>')`: ClickHouse reads the part.
+fn pull_insert_sql(target: &str, collection: &str, bucket: &str, key: &str) -> String {
+    format!(
+        "INSERT INTO {target} SELECT * FROM gcs({collection}, filename = {}, format = 'Parquet')",
+        literal(&format!("{bucket}/{key}"))
+    )
 }
 
 /// The first of `cols` that is not a plain SQL identifier.
@@ -616,6 +637,86 @@ mod tests {
             .unwrap();
         loader.query(&format!("DROP DATABASE {db}")).unwrap();
         assert_eq!(got, "1\twin\n2\twin\n3\twin\n4\twin\n5\twin");
+    }
+
+    /// Through a named collection ClickHouse reads the part itself: columns match by
+    /// name whatever their order, the count is the insert's own, and a NULL key refuses.
+    #[test]
+    #[ignore = "live: requires docker compose clickhouse (with dev/clickhouse/named_collections.xml) + minio"]
+    fn a_pulled_part_lands_by_column_name_and_a_null_key_refuses() {
+        unsafe { std::env::set_var("RIVET_CH_PULL_TEST_PASSWORD", "rivet") };
+        let db = format!("rivet_chpull_{}", std::process::id());
+        let loader = ClickhouseLoader::new(
+            "http://127.0.0.1:8123",
+            &db,
+            "rivet",
+            "RIVET_CH_PULL_TEST_PASSWORD",
+            crate::config::DestinationConfig::default(),
+        )
+        .cdc(true)
+        .named_collection(Some("rivet_stand_minio".into()));
+        let _ = reqwest::blocking::Client::new()
+            .put("http://127.0.0.1:9000/rivet-qa-ch-pull")
+            .basic_auth("minioadmin", Some("minioadmin"))
+            .send();
+        let write = |name: &str, select: &str| {
+            loader
+                .query(&format!(
+                    "INSERT INTO FUNCTION s3(rivet_stand_minio, filename = 'rivet-qa-ch-pull/{db}/{name}', \
+                     format = 'Parquet') {select} SETTINGS s3_truncate_on_insert = 1"
+                ))
+                .unwrap();
+        };
+        write(
+            "ok.parquet",
+            "SELECT 'b' AS v, toInt64(0) AS __seq, '{\"lsn\":\"0/2\"}' AS __pos, toInt64(1) AS id, \
+             'update' AS __op UNION ALL SELECT 'a', 0, '{\"lsn\":\"0/1\"}', 1, 'insert' \
+             UNION ALL SELECT 'c', 0, '{\"lsn\":\"0/1\"}', 2, 'insert'",
+        );
+        write(
+            "null_key.parquet",
+            "SELECT 'x' AS v, CAST(NULL, 'Nullable(Int64)') AS id",
+        );
+        loader
+            .query(&format!("CREATE DATABASE IF NOT EXISTS {db}"))
+            .unwrap();
+        let specs = [spec("id", "Int64"), spec("v", "String")];
+        let pk = ["id".to_string()];
+        let uri = |name: &str| format!("gs://rivet-qa-ch-pull/{db}/{name}");
+        let written = loader
+            .append_changelog("t", &specs, &[uri("ok.parquet")], &pk)
+            .unwrap();
+        let refused = loader.append_changelog("t", &specs, &[uri("null_key.parquet")], &pk);
+        let view = cdc::dedup_view_sql(
+            Warehouse::ClickHouse,
+            &format!("{db}.t"),
+            &format!("{db}.t__changes"),
+            &["id"],
+            cdc::SourceEngine::Postgres,
+        );
+        loader.create_view("t", &view).unwrap();
+        let got = loader
+            .query(&format!(
+                "SELECT id, v FROM `{db}`.`t` ORDER BY id FORMAT TSV"
+            ))
+            .unwrap();
+        loader.query(&format!("DROP DATABASE {db}")).unwrap();
+        assert_eq!(written, 3, "the count is what ClickHouse wrote");
+        assert_eq!(
+            got, "1\tb\n2\tc",
+            "columns matched by name, the later version won"
+        );
+        let e = format!("{:#}", refused.expect_err("a NULL key must refuse"));
+        assert!(e.contains("`id`") && e.contains("NULL"), "{e}");
+    }
+
+    #[test]
+    fn a_pull_reads_the_part_through_the_collection_by_name() {
+        assert_eq!(
+            pull_insert_sql("`d`.`t`", "gcs_raw", "b", "p/part'1.parquet"),
+            "INSERT INTO `d`.`t` SELECT * FROM gcs(gcs_raw, filename = 'b/p/part\\'1.parquet', \
+             format = 'Parquet')"
+        );
     }
 
     #[test]

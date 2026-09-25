@@ -1,0 +1,10 @@
+<!-- A named collection for the ClickHouse load's server-side pull (ADR-0035): MinIO on the stand. -->
+<clickhouse>
+  <named_collections>
+    <rivet_stand_minio>
+      <url>http://minio:9000/</url>
+      <access_key_id>minioadmin</access_key_id>
+      <secret_access_key>minioadmin</secret_access_key>
+    </rivet_stand_minio>
+  </named_collections>
+</clickhouse>

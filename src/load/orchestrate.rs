@@ -3334,6 +3334,7 @@ mod live_only_decisions {
             database: "d".into(),
             user: "x".into(),
             password_env: "P".into(),
+            named_collection: None,
         };
         let why = unsupported_cdc_target(SourceEngine::Mongo, &[into(LoadMode::Cdc, ch())])
             .expect("mongo CDC into ClickHouse refuses");
