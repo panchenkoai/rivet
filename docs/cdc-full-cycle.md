@@ -158,14 +158,16 @@ Make more changes, start `rivet run`, and kill it while it is draining (`kill
 and `cdc_after_ack`). Then simply:
 
 ```sh
-rivet run  --config cfg.yaml
-rivet load --config cfg.yaml
+rivet run     --config cfg.yaml
+rivet load    --config cfg.yaml
+rivet compact --config cfg.yaml   # base + buffer; a `log_view` stream skips this
 ```
 
-Check: the view equals the source, one row per key. `orders__changes` may hold
-a change twice if the kill landed after the part was flushed but before the
-checkpoint advanced — that is at-least-once, and the view collapses it. What
-must never happen is a change in neither.
+Check: live state (`WHERE NOT __is_deleted`) equals the source, one row per key.
+`orders__changes` may hold a change twice if the kill landed after the part was
+flushed but before the checkpoint advanced — that is at-least-once, and `compact`
+(or the view, under `log_view`) collapses it. What must never happen is a change
+in neither.
 
 ## 6. Idle cycle
 
@@ -174,7 +176,8 @@ rivet run  --config cfg.yaml   # nothing changed
 rivet load --config cfg.yaml   # "up to date"
 ```
 
-Check: `orders__changes` did not grow; the view still equals the source.
+Check: no `orders__changes` buffer was created (under `log_view`, the changelog
+did not grow); live state still equals the source.
 
 ## Recovery orders that matter
 

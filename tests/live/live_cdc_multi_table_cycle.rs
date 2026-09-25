@@ -73,14 +73,24 @@ fn count(bq: &BqLive, table: &str) -> i64 {
     bq.read_bq_count(table).parse().expect("a count")
 }
 
-/// Rows the warehouse has ACCUMULATED for one table: its changelog once it
-/// exists, the plain baseline table before the first delta turns it into one.
-fn accumulated(bq: &BqLive, table: &str) -> i64 {
+/// `rivet compact`: merge every buffer into its base and drop it (a no-op without one).
+fn compact_ok(rig: &Rig) {
+    let out = rig.cli(&["compact"]);
+    assert!(
+        out.status.success(),
+        "rivet compact failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Rows in one table's `__changes` buffer — 0 when there is none.
+fn buffered(bq: &BqLive, table: &str) -> i64 {
     let changes = format!("{table}__changes");
     if bq.read_bq_table_type(&changes).is_some() {
         count(bq, &changes)
     } else {
-        count(bq, table)
+        0
     }
 }
 
@@ -91,22 +101,15 @@ fn ids(k: usize, from: i64, to: i64) -> Vec<i64> {
     (from..=to).map(|i| (k as i64) * 100 + i).collect()
 }
 
-/// The LIVE state of one table equals its source — row count, one row per key,
-/// AND the sum of ids (routing across tables is invisible to counts alone).
+/// The LIVE state of one table's base (after `compact`) equals its source — row
+/// count, one row per key, AND the sum of ids (routing across tables is invisible
+/// to counts alone).
 fn assert_table_is_source(bq: &BqLive, table: &str, src: &mut dyn Source, step: &str) {
     let source = src.count(table);
     let source_sum = src.sum_id(table);
-    let live = if bq
-        .read_bq_table_type(&format!("{table}__changes"))
-        .is_some()
-    {
-        "WHERE NOT __is_deleted"
-    } else {
-        ""
-    };
     let row = &bq.read_bq_rows(&format!(
         "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d, IFNULL(SUM(id), 0) AS s \
-         FROM `{}.{}.{table}` {live}",
+         FROM `{}.{}.{table}` WHERE NOT __is_deleted",
         bq.project, bq.dataset
     ))[0];
     let n: i64 = row["n"].as_str().expect("count").parse().expect("a count");
@@ -168,19 +171,24 @@ fn cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
     );
 
     // 1. Anchor + every table's baseline in ONE run, then the first load: one
-    //    warehouse object PER table (the multiplex fan-out), each equal to its source.
+    //    base PER table (the multiplex fan-out), each equal to its source once any
+    //    changes the anchor also streamed are compacted in.
     rig.run_ok();
     load_ok(&rig);
     for t in &tables {
-        assert!(
-            accumulated(&bq, t) >= 5,
-            "run 1: {t}: the baseline must reach the warehouse"
+        assert_eq!(
+            count(&bq, t),
+            5,
+            "run 1: {t}: the baseline must reach the base"
         );
+    }
+    compact_ok(&rig);
+    for t in &tables {
         assert_table_is_source(&bq, t, src, "run 1");
     }
-    let base: Vec<i64> = tables.iter().map(|t| accumulated(&bq, t)).collect();
 
-    // 2. A delta in EVERY table → run 2 → load 2: exactly the 5 changed rows each.
+    // 2. A delta in EVERY table → run 2 → load 2: exactly the 5 changed rows each,
+    //    in that table's buffer; compact.
     for (k, t) in tables.iter().enumerate() {
         for id in ids(k, 6, 8) {
             src.exec(&format!("INSERT INTO {t} (id, v) VALUES ({id}, {id})"));
@@ -193,15 +201,17 @@ fn cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
     }
     rig.run_ok();
     load_ok(&rig);
-    for (t, b) in tables.iter().zip(&base) {
+    for t in &tables {
         assert_eq!(
-            accumulated(&bq, t),
-            b + 5,
-            "run 2: {t}: appends the 5 changed rows (3 inserts, 1 update, 1 delete) and nothing else"
+            buffered(&bq, t),
+            5,
+            "run 2: {t}: buffers the 5 changed rows (3 inserts, 1 update, 1 delete) and nothing else"
         );
+    }
+    compact_ok(&rig);
+    for t in &tables {
         assert_table_is_source(&bq, t, src, "run 2");
     }
-    let base: Vec<i64> = tables.iter().map(|t| accumulated(&bq, t)).collect();
 
     // 3. A crash on the CDC leg AFTER the part is flushed, BEFORE the checkpoint
     //    advances: the next plain run re-reads the un-acked changes of every table.
@@ -223,25 +233,26 @@ fn cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut dyn Source) {
     );
     rig.run_ok();
     load_ok(&rig);
-    for (t, b) in tables.iter().zip(&base) {
+    for t in &tables {
         assert!(
-            accumulated(&bq, t) >= b + 2,
+            buffered(&bq, t) >= 2,
             "run 3 (after the crash): {t}: rows 9 and 10 must land — nothing lost"
         );
+    }
+    compact_ok(&rig);
+    for t in &tables {
         assert_table_is_source(&bq, t, src, "run 3 after cdc_after_flush_before_ack");
     }
 
-    // 4. Idle: a run with no changes and a load with no new run append nothing.
-    let before: Vec<i64> = tables.iter().map(|t| accumulated(&bq, t)).collect();
+    // 4. Idle: a run with no changes and a load with no new run buffer nothing.
     rig.run_ok();
     load_ok(&rig);
     load_ok(&rig);
-    for (t, b) in tables.iter().zip(&before) {
-        assert_eq!(
-            accumulated(&bq, t),
-            *b,
-            "idle: {t}: nothing may be appended"
-        );
+    for t in &tables {
+        assert_eq!(buffered(&bq, t), 0, "idle: {t}: nothing may be appended");
+    }
+    compact_ok(&rig);
+    for t in &tables {
         assert_table_is_source(&bq, t, src, "idle");
     }
 }

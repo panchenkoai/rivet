@@ -50,7 +50,7 @@ from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
     from .core import (HERE, ROOT, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
-                       port_of, rivet, rivet_bin, run)
+                       port_of, release_bin_env, rivet, rivet_bin, run, sqlcmd)
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
@@ -64,9 +64,11 @@ except ImportError:  # pragma: no cover - depends on how the driver is invoked
         docker_exec,
         have,
         port_of,
+        release_bin_env,
         rivet,
         rivet_bin,
         run,
+        sqlcmd,
     )
     DUCKDB = [sys.executable, str(Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
@@ -146,19 +148,32 @@ NO_TIMEOUT: float | None = None
 # destination prefix).
 _WORK: Path | None = None
 
-
-def set_work_dir(path: Path) -> None:
-    global _WORK
-    _WORK = Path(path)
-    _WORK.mkdir(parents=True, exist_ok=True)
-
-
 def work_dir() -> Path:
     global _WORK
     if _WORK is None:
         _WORK = Path(os.environ.get("RIVET_ORACLE_WORK") or mkdtemp())
         _WORK.mkdir(parents=True, exist_ok=True)
     return _WORK
+
+
+class Scope:
+    """One engine version's namespace: every dir, prefix and name a cell mints carries both."""
+
+    def __init__(self, engine: str, tag: str) -> None:
+        self.engine, self.tag = engine, tag
+        self.key = f"{engine}_{tag.replace('.', '_')}"
+
+    def name(self, kind: str, *parts: str) -> str:
+        """An identifier-safe name: `<kind>_<engine>_<tag>_<parts…>`."""
+        return "_".join((kind, self.key, *(p.replace(".", "_") for p in parts)))
+
+    def dir(self, kind: str, *parts: str) -> Path:
+        """This run's scratch dir for one cell."""
+        return work_dir() / self.name(kind, *parts)
+
+    def prefix(self, kind: str, *parts: str) -> str:
+        """An object-store prefix, unique per run as well as per version."""
+        return "/".join((kind, work_dir().name, self.key, *(p.replace(".", "_") for p in parts)))
 
 
 # ── ledger rows ──────────────────────────────────────────────────────────────
@@ -192,10 +207,6 @@ def cfg(*query: str) -> str:
 
 def _bless(flag: str) -> bool:
     return os.environ.get(flag, "0") == "1"
-
-
-def _tag(tag: str) -> str:
-    return tag.replace(".", "_")
 
 
 def _tcp_open(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -482,7 +493,7 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
 
 def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, str] | None:
     """(DuckDB preamble, relation) over the parts the store's manifests DECLARE, or None when the store holds none or its client is absent."""
-    dl = work / f"dl_{store}_{random.randint(0, 32767)}"
+    dl = Path(mkdtemp(prefix=f"dl_{store}_", dir=work))
     if store == "s3":
         # DECLARED, not globbed. The prefix is read twice: once for the manifests
         # (DuckDB reads JSON over httpfs, so this needs no `mc` and no pull), then
@@ -501,41 +512,34 @@ def store_parts(store: str, bucket: str, prefix: str, work: Path) -> tuple[str, 
             return None
         lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)
         return S3_HTTPFS_PREAMBLE, f"read_parquet([{lst}])"
-    if store == "gcs":
-        # No gsutil needed — the fake-gcs JSON API is enough, and it keeps the
-        # readback independent of rivet.
-        dl.mkdir(parents=True, exist_ok=True)
-        # `--all` because the manifests ARE the oracle here: the default mode pulls
-        # only parquet and flattens it to `part_N.parquet`, which cannot answer what
-        # the run declared and breaks the names a manifest uses.
-        got = run(
-            [PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket, prefix,
-             str(dl), "--all"]
-        ).stdout.strip()
-        try:
-            pulled = int(got)
-        except ValueError:
-            pulled = 0
-        if pulled <= 0:
-            return None
-        src = _declared_read(dl, ".parquet")
-        return ("", f"read_parquet({src})") if src else None
-    if store == "azure":
-        if not have("az"):
-            return None
-        dl.mkdir(parents=True, exist_ok=True)
-        run(
-            [
-                "az", "storage", "blob", "download-batch",
-                "--connection-string", AZURITE_CONN,
-                "-s", bucket,
-                "--pattern", f"{prefix}/*",
-                "-d", str(dl),
-            ]
-        )
+    if store in ("gcs", "azure") and pull_prefix(store, bucket, prefix, dl):
         src = _declared_read(dl, ".parquet")
         return ("", f"read_parquet({src})") if src else None
     return None
+
+
+def pull_prefix(store: str, bucket: str, prefix: str, dest: Path) -> bool:
+    """Download a store prefix WHOLE into `dest` (manifests included) with the store's own client; False when the client is absent or nothing came down."""
+    dest.mkdir(parents=True, exist_ok=True)
+    if store == "s3":
+        if not have("mc"):
+            return False
+        run(["mc", "alias", "set", "rivetgate", "http://127.0.0.1:9000",
+             MINIO_ACCESS_KEY, MINIO_SECRET_KEY])
+        return run(["mc", "cp", "--recursive", f"rivetgate/{bucket}/{prefix}/", str(dest)]).ok
+    if store == "gcs":
+        # `--all`: the default mode pulls only parquet, renamed `part_N.parquet`,
+        # which cannot answer what the run declared.
+        got = run([PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket,
+                   prefix, str(dest), "--all"]).stdout.strip()
+        return got.isdigit() and int(got) > 0
+    if store == "azure":
+        if not have("az"):
+            return False
+        run(["az", "storage", "blob", "download-batch", "--connection-string", AZURITE_CONN,
+             "-s", bucket, "--pattern", f"{prefix}/*", "-d", str(dest)])
+        return any(dest.iterdir())
+    return False
 
 
 def store_dest(store: str, bucket: str, prefix: str) -> str | None:
@@ -585,43 +589,40 @@ def _store_env(url: str) -> dict[str, str]:
 
 
 # ── source-side oracles ──────────────────────────────────────────────────────
-def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> str:
-    """`"<count> <distinct>"` from the client inside the container publishing `url`'s port — never a sibling version's container; empty when none does."""
+def source_query(engine: str, url: str, query: str) -> str:
+    """First line `query` prints through the engine's own client in the container publishing `url`'s port (a shell expression on mongo); "" when none does."""
     port = port_of(url)
     container = container_for_port(port) if port else None
     if container is None:
         return ""
     if engine == "postgres":
-        return docker_exec(
-            container, "psql", "-U", "rivet", "-d", "rivet", "-tA",
-            "-c", f"SELECT count(*)||' '||count(DISTINCT {id_col}) FROM {table}",
-        ).stdout.strip()
-    if engine == "mysql":
-        return docker_exec(
-            container, "mysql", "-urivet", "-privet", "rivet", "-N",
-            "-e", f"SELECT CONCAT(count(*),' ',count(DISTINCT {id_col})) FROM {table}",
-        ).stdout.strip()
-    if engine == "mssql":
-        out = docker_exec(
-            container, "/opt/mssql-tools18/bin/sqlcmd",
-            "-S", "localhost", "-U", "sa", "-P", "Rivet_Passw0rd!", "-d", "rivet",
-            "-C", "-h", "-1", "-W",
-            "-Q", f"SET NOCOUNT ON; SELECT CONCAT(count(*),' ',count(DISTINCT {id_col})) FROM {table}",
-        ).stdout
-        return out.replace("\r", "").strip()
-    if engine == "mongo":
-        # mongo:4.4 ships the legacy `mongo` shell, 5.0+ ships `mongosh`. Pick
-        # whichever the container actually has, or the count comes back as an OCI
-        # "executable not found" string and the gate false-fails on good data.
-        shell = mongo_shell(container)
-        # countDocuments({}) NOT countDocuments() — the legacy 4.4 shell rejects
-        # the no-arg form ("match filter must be an expression in an object").
-        return docker_exec(
-            container, shell, "mongodb://127.0.0.1:27017/rivet", "--quiet",
-            "--eval",
-            f"print(db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length)",
-        ).stdout.strip()
-    return ""
+        argv = ["psql", "-U", "rivet", "-d", "rivet", "-tA", "-c", query]
+    elif engine == "mysql":
+        argv = ["mysql", "-urivet", "-privet", "rivet", "-N", "-e", query]
+    elif engine == "mssql":
+        argv = [*sqlcmd(container), "-S", "localhost", "-U", "sa",
+                "-P", "Rivet_Passw0rd!", "-d", "rivet", "-h", "-1", "-W",
+                "-Q", f"SET NOCOUNT ON; {query}"]
+    elif engine == "mongo":
+        # countDocuments({}) not countDocuments(): the legacy 4.4 shell rejects the no-arg form.
+        argv = [mongo_shell(container), "mongodb://127.0.0.1:27017/rivet", "--quiet",
+                "--eval", f"print({query})"]
+    else:
+        return ""
+    out = docker_exec(container, *argv).stdout.replace("\r", "").strip()
+    return out.splitlines()[0].strip() if out else ""
+
+
+def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> str:
+    """`"<count> <distinct>"` from the source engine's own client; empty when no container serves `url`."""
+    concat = f"SELECT CONCAT(count(*),' ',count(DISTINCT {id_col})) FROM {table}"
+    query = {
+        "postgres": f"SELECT count(*)||' '||count(DISTINCT {id_col}) FROM {table}",
+        "mysql": concat,
+        "mssql": concat,
+        "mongo": f"db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length",
+    }.get(engine)
+    return source_query(engine, url, query) if query else ""
 
 
 def mongo_shell(container: str) -> str:
@@ -858,7 +859,7 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
                       never exercises.
     """
     fails = ""
-    out = work_dir() / f"it_{engine}_{_tag(tag)}"
+    out = Scope(engine, tag).dir("it")
     out.mkdir(parents=True, exist_ok=True)
 
     # (1) users loss/dup — all engines.
@@ -979,7 +980,7 @@ def sc_keyset_parallel(led: Ledger, engine: str, tag: str, url: str) -> None:
             "mongo na",
         )
         return
-    out = work_dir() / f"kp_{engine}_{_tag(tag)}"
+    out = Scope(engine, tag).dir("kp")
     out.mkdir(parents=True, exist_ok=True)
     if not _export_local(engine, url, "users", out / "users", "chunked", "parquet", 4).ok:
         _failed(led, engine, tag, "keyset_parallel", "-", f"keyset_parallel[{engine}]: export failed", "export")
@@ -1028,12 +1029,12 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
     # prefix per run isolates this run so the count gate compares 150k to 150k,
     # not an accumulation.
     bucket = cfg("store", store, "bucket")
-    prefix = f"oracle/{work_dir().name}/{engine}_{_tag(tag)}/{store}"
+    prefix = Scope(engine, tag).prefix("oracle", store)
     dest = store_dest(store, bucket, prefix)
     if dest is None:
         _skipped(led, engine, tag, "load", store, f"{store}: no dest config", "no dest")
         return
-    yaml_path = work_dir() / f"load_{engine}_{_tag(tag)}_{store}.yaml"
+    yaml_path = Scope(engine, tag).dir("load", store).with_suffix(".yaml")
     tls_block = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
     mode_block = "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000"
     if engine == "mongo":
@@ -1086,8 +1087,8 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
         # need no extra CLI: s3 (DuckDB httpfs) and gcs (the JSON-API pull) are always
         # available, so "" there means the destination holds ZERO parts after a run that
         # exited 0 — the exact "success but delivered nothing → release-ready" shape
-        # blessed_path already FAILs. Only azure (needs `az`) keeps the SKIP.
-        if store in ("s3", "gcs"):
+        # blessed_path already FAILs. Only azure WITHOUT `az` keeps the SKIP.
+        if store in ("s3", "gcs") or (store == "azure" and have("az")):
             _failed(led, engine, tag, "load", store,
                     f"load→{store} delivered 0 rows (source {scnt}) — empty destination after a "
                     f"0-exit run", "empty-destination")
@@ -1208,7 +1209,7 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     # Does the chain above have working oracles at all? Breaks each artifact
     # class and requires the matching stage to go RED — a green stage that was
     # never red is unverified, and this module's own first draft had one.
-    blessed_flow.sc_not_inert(led, engine, url, state_url)
+    blessed_flow.sc_not_inert(led, engine, url, state_url, tag)
 
 
 # ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────
@@ -1282,7 +1283,7 @@ def verify_state_migrations(led: Ledger) -> None:
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all",
          "-E", "test(state_parity_) or test(/pg_keyset_range_round_trips_and_commits$/)"],
-        env={"RIVET_BIN": str(rivet_bin()), "RIVET_TEST_STATE_URL": state_url},
+        env={**release_bin_env(), "RIVET_TEST_STATE_URL": state_url},
         timeout=NO_TIMEOUT,
     )
     transcript = fresh.out
@@ -1346,7 +1347,7 @@ def _drive_live_tests(
     res = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", expr],
-        env={"RIVET_BIN": str(rivet_bin()), "RIVET_SKIP_LOG": str(skip_log)},
+        env={**release_bin_env(), "RIVET_SKIP_LOG": str(skip_log)},
         timeout=3600,
     )
     log_path.write_text(res.out)
@@ -1559,104 +1560,6 @@ def verify_live_only_coverage(led: Ledger) -> None:
 
 
 # ── coverage-ledger drift-guards PREFLIGHT (offline, runs ONCE) ──────────────
-def verify_inflight_run_stays_loadable(led: Ledger) -> None:
-    """A load must NOT record an in-flight extraction run as fully consumed.
-
-    The load's skip set is keyed on `run_id` alone (`select_runs` ->
-    `loaded_source_run`), but a CDC run's manifest GROWS under one id: the sink
-    rewrites a `Success` superset at every commit-boundary roll, and
-    `list_manifest_keys` deliberately prefers that run-unique copy. A load firing
-    mid-cycle therefore sampled a partial superset, recorded the id, and every
-    part the same run wrote afterwards was skipped FOREVER while the next load
-    printed "CDC LOAD SKIP: up to date". With `until_current: false` the id never
-    rotates, so the loss was unbounded. Released since 0.20.0.
-
-    The fix excludes the runs the ledger reports still writing into the prefix
-    (`StateStore::active_run_ids_on_prefix`) from the consumed set, leaving them
-    retryable. This cell drives THAT signal through the release binary, because
-    it is the half a release can regress silently and it decides both failure
-    directions: a run wrongly reported active makes every load re-append
-    forever; a run wrongly reported finished restores the original silent loss.
-
-    Deliberately a ledger check, not a timed extract/load race: the race needs
-    sub-second timing against a live stream, and a flaky gate is worse than a
-    narrow one. The end-to-end half lives in the live suite; this pins the signal
-    it depends on, in the binary that ships.
-    """
-    if not have("sqlite3"):
-        _skipped(led, "load", "inflight", "skipset", "-",
-                 "in-flight load skip-set: sqlite3 absent", "no sqlite3")
-        return
-    work = work_dir() / "inflight_skipset"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True, exist_ok=True)
-    pfx = "gs://oracle/exports/orders/"
-
-    # The schema comes from the RELEASE binary — `state show` opens and migrates
-    # the store beside the config — so a migration that drops or renames
-    # run_status fails HERE rather than only in a unit test built from source.
-    cfgf = work / "probe.yaml"
-    cfgf.write_text(
-        "source: { type: postgres, url_env: RIVET_ORACLE_PROBE_URL }\n"
-        "exports:\n  - name: probe\n    table: probe\n    mode: full\n"
-        "    format: parquet\n"
-        f"    destination: {{ type: local, path: {work}/out }}\n"
-    )
-    show = run([str(rivet_bin()), "state", "show", "-c", str(cfgf)],
-               env={"RIVET_ORACLE_PROBE_URL": "postgres://rivet:rivet@127.0.0.1:5432/rivet"},
-               timeout=120)
-    # This cell inspects the state through `sqlite3` on the file beside the
-    # config, so it grades the SQLITE backend only. On a `--state-url` pass the
-    # state lives in PostgreSQL and no such file exists — a legitimate skip, but
-    # it used to be reported as `rc=0`, which names the one thing that was fine.
-    # A skip reason that does not say why is how a backend silently loses a cell.
-    db = work / ".rivet_state.db"
-    if show.returncode != 0:
-        _skipped(led, "load", "inflight", "skipset", "-",
-                 f"in-flight load skip-set: `rivet state show` failed (rc={show.returncode})",
-                 "state show failed")
-        return
-    if not db.exists():
-        _skipped(led, "load", "inflight", "skipset", "-",
-                 "in-flight load skip-set: this cell reads the SQLite state file directly, and "
-                 "this pass stores state in PostgreSQL — graded on the SQLite pass",
-                 "sqlite-only cell")
-        return
-
-    def sql(stmt: str) -> str:
-        return run(["sqlite3", str(db), stmt], timeout=60).stdout.strip()
-
-    now = "2026-08-01T10:00:00Z"
-    sql(
-        "INSERT INTO run_status (run_id, export_name, prefix, status, started_at) "
-        f"VALUES ('run_live','orders','{pfx}','running','{now}'), "
-        f"       ('run_done','archive','{pfx}','success','{now}');"
-    )
-    # The loader's predicate, verbatim from run_status_store.rs, run against the
-    # schema the release binary just created.
-    named = sql(
-        "SELECT group_concat(run_id) FROM run_status r "
-        f"WHERE (rtrim(r.prefix,'/') = rtrim('{pfx}','/') "
-        f"       OR r.prefix LIKE rtrim('{pfx}','/') || '/%' "
-        f"       OR rtrim('{pfx}','/') LIKE rtrim(r.prefix,'/') || '/%') "
-        "  AND r.status = 'running' "
-        "  AND NOT EXISTS (SELECT 1 FROM run_status r2 "
-        "                  WHERE r2.export_name = r.export_name "
-        "                    AND r2.started_at > r.started_at);"
-    )
-    ids = {x for x in named.split(",") if x}
-    if ids != {"run_live"}:
-        _failed(led, "load", "inflight", "skipset", "-",
-                "in-flight load skip-set: the ledger must name EXACTLY the running run "
-                f"on the prefix — expected {{'run_live'}}, got {ids or 'nothing'}",
-                "wrong active set")
-        return
-    _passed(led, "load", "inflight", "skipset", "-",
-            "in-flight load skip-set: the ledger names the running run and forgets the "
-            "finished one, so a growing manifest is never recorded consumed",
-            "run_live named, run_done not")
-
-
 def verify_coverage_matrices(led: Ledger) -> None:
     """Run every docs/*-matrix.yaml drift-guard so the go/no-go gate itself blocks
     on a rotted ledger, not just CI. A drifted matrix means the coverage claims a
@@ -1716,7 +1619,7 @@ def verify_replica_read(led: Ledger) -> None:
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all",
          "-E", "test(/cdc_reads_changes_from_a_replica$/)"],
-        env={"RIVET_BIN": str(rivet_bin())},
+        env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
@@ -1812,7 +1715,7 @@ def _run_pool_module(
         # `$`-anchored form would match NONE of (measured on `state_parity_`).
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "-E", f"test({test_filter})"],
-        env={"RIVET_BIN": str(rivet_bin())},
+        env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)

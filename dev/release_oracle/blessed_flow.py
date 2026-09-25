@@ -66,7 +66,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import blessed_path, cdc, scenarios
+from . import blessed_path, cdc, gcp, scenarios
 from ..pytools import registry
 from .core import (
     run,
@@ -364,10 +364,25 @@ def _why(p) -> str:
     return f"{head} · full output: {f}" if head else f"full output: {f}"
 
 
+def _null_note(nn: int) -> str:
+    """The oracle detail for a per-column null profile: all-NULL columns, or that it could not be read."""
+    if nn < 0:
+        return " · null profile UNREADABLE"
+    return f" · ALLNULL {nn} cols" if nn else ""
+
+
+#: (engine, cell label, tag) → when the cell's previous stage ended; a stage's
+#: duration is the time since that mark.
+_STEP_MARK: dict[tuple[str, str, str], float] = {}
+
+
 def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str) -> bool:
     """Record one stage. Every stage is its own row — a chain that dies at `plan`
     must leave `apply` as SKIP "not reached", never absent: in a 200-row report an
     absent cell reads as not-applicable."""
+    key, now = (cell.engine, cell.label, tag), time.perf_counter()
+    led.record_span(f"step {cell.engine} {stage} {cell.store}", now - _STEP_MARK.get(key, now))
+    _STEP_MARK[key] = now
     name = f"flow:{stage}"
     msg = f"{cell.engine} {cell.label} · {stage}"
     if ok:
@@ -613,28 +628,7 @@ def _pull(store: str, bucket: str, prefix: str, work: Path) -> Path | None:
     """Bring a cloud prefix down whole — manifests included, not just parquet."""
     dl = work / f"pull_{store}"
     shutil.rmtree(dl, ignore_errors=True)
-    dl.mkdir(parents=True, exist_ok=True)
-    if store == "s3":
-        if not have("mc"):
-            return None
-        alias = "rivetgate"
-        run(["mc", "alias", "set", alias, "http://127.0.0.1:9000",
-             scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY])
-        p = run(["mc", "cp", "--recursive", f"{alias}/{bucket}/{prefix}/", str(dl)])
-        return dl if p.ok else None
-    if store == "gcs":
-        # The emulator's JSON API is enough, and it keeps the pull independent
-        # of rivet — the same helper `store_readback` uses.
-        # `--all`: the manifests are the point. The default mode pulls only
-        # parquet and renames it `part_N.parquet`, which cannot answer "what did
-        # this run declare".
-        got = run([scenarios.PY, str(scenarios._asset("lib/gcs_pull.py")),
-                   "http://127.0.0.1:4443", bucket, prefix, str(dl), "--all"]).stdout.strip()
-        try:
-            return dl if int(got) > 0 else None
-        except ValueError:
-            return None
-    return None
+    return dl if scenarios.pull_prefix(store, bucket, prefix, dl) else None
 
 
 def _flow_rows(path: Path) -> int:
@@ -685,7 +679,7 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
     # prefix started using it, silently undid that fix by shadowing the
     # parameter. The gate caught the inert fix on the very next run.
     slug = f"{cell.pipeline}_{cell.lifecycle}_{cell.store}_{cell.state}"
-    work = scenarios.work_dir() / f"flow_{cell.engine}{tag}_{slug}_{cell.table}"
+    work = scenarios.Scope(cell.engine, tag).dir("flow", slug, cell.table)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
 
@@ -742,6 +736,7 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
 def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                cdc_block: str, tag: str = "live") -> None:
     """Walk one cell's whole chain, recording a row per stage."""
+    _STEP_MARK[(cell.engine, cell.label, tag)] = time.perf_counter()
     # NOT re-bound here. `tag` is the engine version, passed in — a literal
     # "flow" at this line shadowed the parameter and made the version-scoped
     # prefix inert while looking correct at its definition. Twice, in two
@@ -761,8 +756,7 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
     # prefix and the readback counted every earlier version's parts as this
     # one's: 450000 rows read from a 150000-row table (3x), then 750000 (5x) as
     # the run progressed. Caught by the gate itself on its first full pass.
-    prefix = (f"flow/{scenarios.work_dir().name}/{cell.engine}{tag}/{slug}/"
-              f"{cell.table.replace('.', '_')}")
+    prefix = scenarios.Scope(cell.engine, tag).prefix("flow", slug, cell.table)
     mark = 0
 
     cdc._export_store_creds()  # MINIO_/AZURITE_ keys the dest blocks name by *_env
@@ -1019,10 +1013,9 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                 # just local (the GCS store is exactly where the real incident occurred).
                 prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
                 nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
-                n_null = max(0, nn)
-                _stage(led, cell, tag, "oracle", duck == want * mult and n_null == 0,
-                       f"duckdb={duck} source={want}x{mult}"
-                       + (f" · ALLNULL {n_null} cols" if n_null else ""))
+                # -1 is "could not measure": never read as "no all-NULL columns".
+                _stage(led, cell, tag, "oracle", duck == want * mult and nn == 0,
+                       f"duckdb={duck} source={want}x{mult}" + _null_note(nn))
         else:
             # A change stream is not the table: the count is of CHANGES. But the
             # change set here is the SHARED, DETERMINISTIC cdc.changes() — cdc.py's
@@ -1038,10 +1031,9 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
             # already pulled to work/pull_<store>.
             prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
             nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
-            n_null = max(0, nn)
-            _stage(led, cell, tag, "oracle", duck >= want and n_null == 0,
+            _stage(led, cell, tag, "oracle", duck >= want and nn == 0,
                    f"duckdb={duck} >= {want} deterministic changes (at-least-once floor)"
-                   + (f" · ALLNULL {n_null} cols" if n_null else ""))
+                   + _null_note(nn))
 
     # ── validate ─────────────────────────────────────────────────────────────
     p = rivet("validate", "-c", str(cfg), *cell.flags.get("validate", []),
@@ -1109,16 +1101,22 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # its siblings. Same lesson as the per-cell fix above, one level deeper.
     _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
     dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
-            + f"_{cell.engine}_{tag.replace('.', '_')}_{_cell_slug}")
+            + "_" + scenarios.Scope(cell.engine, tag).name("flow", _cell_slug))
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — the warehouse leg runs on the "
                     "batch/gcs cells; a change stream has no batch load and the other "
                     "stores are covered by their own readback")
         return
-    if not have("bq") or not proj:
+    if cell.lifecycle != "clean":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
-                    f"{cell.engine} {cell.label} · load — no `bq` CLI or no project "
+                    f"{cell.engine} {cell.label} · load — graded on the clean cell: this leg "
+                    "exports and loads one fresh run, so a repeat/resume copy would grade the "
+                    "same thing again (loading a two-run or resumed prefix is not covered)")
+        return
+    if not have("gcloud") or not proj:
+        led.skipped(cell.engine, tag, "flow:load", cell.store,
+                    f"{cell.engine} {cell.label} · load — no `gcloud` (the REST token) or no project "
                     "(set BQ_ORACLE_PROJECT); the emulator cannot stand in, a warehouse "
                     "must read the real bucket")
         return
@@ -1126,7 +1124,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     tbl = cell.table.split(".")[-1]
     # Version-scoped for the same reason the readback prefix is: the gate runs
     # this once per gridded version and `cell.engine` does not distinguish them.
-    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{_cell_slug}/{tbl}"
+    pfx = scenarios.Scope(cell.engine, tag).prefix("flowload", cell.pipeline, _cell_slug, tbl)
     lcfg = work / "load.yaml"
     tls = "\n  tls: {accept_invalid_certs: true}" if cell.engine == "mssql" else ""
     lcfg.write_text(
@@ -1140,11 +1138,12 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # Clear both sides first. A leftover table makes the next count a union of
     # two loads, and a gate that accumulates state stops measuring the run in
     # front of it.
-    run(["bq", "--project_id", proj, "mk", "-f", "--dataset", f"{proj}:{dset}"])
-    run(["bq", "--project_id", proj, "rm", "-f", "-t", f"{proj}:{dset}.{tbl}"])
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    gcp.bq_ensure_dataset(proj, dset)
+    gcp.bq_delete_table(proj, dset, tbl)
+    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
 
-    e = rivet("run", "-c", str(lcfg), env=env, timeout=scenarios.NO_TIMEOUT)
+    with led.span(f"step {cell.engine} load·export {cell.store}"):
+        e = rivet("run", "-c", str(lcfg), env=env, timeout=scenarios.NO_TIMEOUT)
     if not e.ok:
         _stage(led, cell, tag, "load", False, f"export to real gcs failed: {_why(e)}")
         return
@@ -1166,34 +1165,37 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # concurrently. `dset` and `pfx` in this same function were version-keyed for
     # exactly this reason; this one was missed.
     load_id = (
-        f"flow-{cell.engine}{tag.replace('.', '_')}-{cell.lifecycle}-{cell.state}"
+        f"flow-{scenarios.Scope(cell.engine, tag).key}-{cell.lifecycle}-{cell.state}"
         f"-{scenarios.work_dir().name}-{os.getpid()}"
     )
     # No `--rivet-bin`: the load resolves types IN PROCESS now (the flag existed
     # only to pin which binary the `rivet check` subprocess was, and is gone).
-    p = rivet("load", "-c", str(lcfg),
-              "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
+    with led.span(f"step {cell.engine} load·rivet_load {cell.store}"):
+        p = rivet("load", "-c", str(lcfg),
+                  "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
     if not p.ok:
         _stage(led, cell, tag, "load", False, f"exit={p.returncode} {_why(p)}")
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
         return
 
-    # BigQuery's own count, decoded by Google's parquet reader.
-    q = run(["bq", "--project_id", proj, "query", "--nouse_legacy_sql", "--format", "csv",
-             f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`"]).stdout.strip().splitlines()
-    got = int(q[-1]) if q and q[-1].strip().isdigit() else -1
-    want = blessed_path._source_rows(cell.engine, url, cell.table)
-    lok, ldetail = _load_rows(cell, work, state_url, load_id, tbl)
-    _stage(led, cell, tag, "load", got == want and got > 0 and lok,
-           f"bigquery={got} source={want} · ledger {ldetail}")
-
-    # Cleanup is part of the cycle: the cell's own dataset goes, verified by a show that fails.
-    run(["bq", "--project_id", proj, "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
-    gone = run(["bq", "--project_id", proj, "show", "-d", f"{proj}:{dset}"])
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-    _stage(led, cell, tag, "load:cleanup", not gone.ok,
-           "cell dataset dropped (verified by a show that fails)"
-           if not gone.ok else "the dataset is STILL THERE after rm — the next run's count "
+    # BigQuery's own count, decoded by Google's parquet reader. A raised read still
+    # drops the cell's dataset and prefix.
+    try:
+        with led.span(f"step {cell.engine} load·verify {cell.store}"):
+            q = gcp.bq_scalar(proj, f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`")
+            got = int(q) if q is not None and q.isdigit() else -1
+            want = blessed_path._source_rows(cell.engine, url, cell.table)
+            lok, ldetail = _load_rows(cell, work, state_url, load_id, tbl)
+        _stage(led, cell, tag, "load", got == want and got > 0 and lok,
+               f"bigquery={got} source={want} · ledger {ldetail}")
+    finally:
+        # Cleanup is part of the cycle: the cell's own dataset goes, verified by a GET.
+        gcp.bq_delete_dataset(proj, dset)
+        still_there = gcp.bq_dataset_exists(proj, dset)
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+    _stage(led, cell, tag, "load:cleanup", not still_there,
+           "cell dataset dropped (verified by a GET that 404s)"
+           if not still_there else "the dataset is STILL THERE after rm — the next run's count "
            "would be a union of two loads")
 
 
@@ -1267,6 +1269,16 @@ def failed_cells(path: Path | None = None) -> set[str]:
     return out
 
 
+_CDC_CLAIMS: dict[str, str] = {}
+_CDC_CLAIMS_LOCK = threading.Lock()
+
+
+def _claim_cdc_tag(engine: str, tag: str) -> str:
+    """The one version of `engine` that runs its CDC cells this gate: the first to ask."""
+    with _CDC_CLAIMS_LOCK:
+        return _CDC_CLAIMS.setdefault(engine, tag)
+
+
 def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
                     state_url: str = "", cdc_url: str = "",
                     only: set[str] | None = None) -> None:
@@ -1299,6 +1311,7 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
         verdicts = {}
 
     cdc_url = cdc_url or os.environ.get(f"RIVET_CDC_{engine.upper()}_URL", "")
+    cdc_tag = _claim_cdc_tag(engine, tag)
     # Skips are decided SEQUENTIALLY (no rivet, just a ledger row, kept in
     # declaration order); only the cells that actually run a chain go through the
     # pool, so no-op work never occupies a slot.
@@ -1315,6 +1328,11 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
                         f"{cell.engine} {cell.label} — not in this re-run's cell set")
             continue
         u = cdc_url if cell.pipeline == "cdc" else url
+        if cell.pipeline == "cdc" and u and cdc_tag != tag:
+            led.skipped(cell.engine, tag, "flow:chain", cell.store,
+                        f"{cell.engine} {cell.label} — graded under {engine} {cdc_tag}: CDC "
+                        f"cells run against the one CDC stand, not this version's container")
+            continue
         if not u:
             led.skipped(cell.engine, tag, "flow:chain", cell.store,
                         f"{cell.engine} {cell.label} — no RIVET_CDC_{engine.upper()}_URL "
@@ -1658,16 +1676,18 @@ def _bit(led: Ledger, engine: str, ok: bool, msg: str, why: str) -> None:
         led.failed(engine, "flow", "flow:inert", "local", f"inertness · {why}", why)
 
 
-def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str) -> None:
+def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str, tag: str = "live") -> None:
     """Break each artifact class and require the matching stage to go RED."""
     led.phase("blessed flow · inertness probe (each oracle must fail when its subject is broken)")
     cell = Cell(engine=engine, pipeline="batch", lifecycle="clean", store="local",
                 state="sqlite", flags=_flags_for(0, "batch", "clean", "local"))
-    work = scenarios.work_dir() / f"inert_{engine}"
+    # Per version: --version-parallel runs a family's versions at once, and a shared
+    # dir let two baselines write one prefix (duckdb=300000 over a 150000 source).
+    work = scenarios.Scope(engine, tag).dir("inert")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     base = Ledger()
-    _run_chain(base, cell, url, state_url, work, "")
+    _run_chain(base, cell, url, state_url, work, "", tag)
     if base.red:
         led.failed(engine, "flow", "flow:inert", "local",
                    "inertness probe · the baseline chain is not green — cannot grade sensitivity")
@@ -1742,63 +1762,6 @@ def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str) -> None:
     _bit(led, engine, not ok,
          f"inertness · a run id that never ran → state refuses ({detail})",
          f"the state stage accepted a run id that never ran ({detail})")
-
-
-# ── the DAG, printed from the same data the executor walks ───────────────────
-#: What each stage asserts and WHO answers it. The oracle column is the point of
-#: the whole module: three different questions (rivet re-reads, DuckDB decodes,
-#: the source counts) and a chain that answers one of them is not verified.
-STAGE_ORACLE = {
-    "init":            ("rivet init",     "the config's SHAPE (exports, mode, dest kind, table)"),
-    "init:discover":   ("rivet init",     "the survey artifact: tables[] each with suggested_mode"),
-    "doctor":          ("rivet doctor",   "source + destination auth, CDC slot hygiene"),
-    "check":           ("rivet check",    "column types resolve; --strict admits no warning"),
-    "plan":            ("rivet plan",     "plan.json parses and names the export"),
-    "apply":           ("rivet apply",    "wave execution; resume cells crash FIRST (fault hook)"),
-    "run":             ("rivet run",      "cdc capture after an anchor run + real changes"),
-    "artifacts":       ("filesystem",     "parts, manifest.json, run-unique copies, _SUCCESS"),
-    "artifacts:checkpoint": ("filesystem", "the CDC resume anchor exists and is non-empty"),
-    "state":           ("state backend",  "export_metrics/file_log/run_status SCOPED to this run"),
-    "oracle":          ("DuckDB",         "rows in MANIFEST-DECLARED parts vs the source's own count"),
-    "validate":        ("rivet validate", "rivet re-reads its own output; then again ADDRESSED"),
-    "reconcile":       ("rivet run",      "destination count vs a fresh source count"),
-    "load":            ("BigQuery",       "a foreign reader decodes it; ledger has load_run"),
-    "load:cleanup":    ("bq show",        "the table is really gone (rm -f exits 0 regardless)"),
-}
-
-
-def print_dag() -> str:
-    """Render the matrix as a DAG. Built from CHAIN/axes, never hand-drawn."""
-    L: list[str] = []
-    cells = cross_product(["postgres", "mysql", "mssql", "mongo"])
-    run_n = sum(1 for c in cells if c.na_reason() is None)
-    L.append("blessed flow — the whole user journey as one cross-product")
-    L.append("")
-    L.append("  AXES                                                cells")
-    L.append("  ────────────────────────────────────────────────────────")
-    for name, vals in (("engine", ["postgres", "mysql", "mssql", "mongo"]),
-                       ("pipeline", ["batch", "cdc"]),
-                       ("lifecycle", ["clean", "repeat", "resume"]),
-                       ("store", ["local", "s3", "gcs"]),
-                       ("state", ["sqlite", "postgres"])):
-        L.append(f"  {name:<10} {' × '.join(vals):<40} {len(vals):>3}")
-    L.append(f"  {'':<10} {'=':<40} {len(cells):>3} declared, "
-             f"{run_n} runnable, {len(cells) - run_n} na")
-    L.append("")
-    for pipe in ("batch", "cdc"):
-        L.append(f"  {pipe.upper()} chain")
-        L.append("  " + "─" * 74)
-        steps = [s for s in CHAIN[pipe]]
-        if pipe == "cdc":
-            steps.insert(steps.index("artifacts") + 1, "artifacts:checkpoint")
-        for i, st in enumerate(steps):
-            who, what = STAGE_ORACLE.get(st, ("?", "?"))
-            arm = "└─" if i == len(steps) - 1 else "├─"
-            L.append(f"   {arm} {st:<22} [{who:<14}] {what}")
-        L.append("")
-    L.append("  A stage that fails leaves every later stage as SKIP \"not reached\" —")
-    L.append("  an absent row in a 900-row report reads as not-applicable.")
-    return "\n".join(L)
 
 
 def main(argv: list[str] | None = None) -> int:

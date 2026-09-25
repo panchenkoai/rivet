@@ -43,11 +43,11 @@ from pathlib import Path
 
 try:
     from .core import Ledger, Status, have, rivet, run
-    from .scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, work_dir
+    from .scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, Scope, work_dir
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, Status, have, rivet, run  # type: ignore
-    from scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, work_dir  # type: ignore
+    from scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
     DUCKDB = [__import__("sys").executable, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = ["verify_row_hash", "canonical_image", "row_hash_of"]
@@ -194,7 +194,7 @@ def verify_row_hash(led: Ledger, engine: str, tag: str, url: str) -> None:
         _skipped(led, engine, tag, "row_hash", "-", "row_hash: duckdb absent", "no duckdb")
         return
 
-    base = work_dir() / f"rh_{engine}_{tag.replace('.', '_')}"
+    base = Scope(engine, tag).dir("rh")
 
     # ── Check A: an independent implementation must reproduce the column ──
     full = base / "full"

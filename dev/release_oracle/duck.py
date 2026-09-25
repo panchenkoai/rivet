@@ -46,11 +46,13 @@ class Oracle:
         self,
         *,
         bigquery: bool = False,
+        bq_dataset: str | None = None,
         mysql: str | None = None,
         postgres: str | None = None,
         mssql: str | None = None,
         mongo: str | None = None,
         gcs: bool = False,
+        state: str | None = None,
     ) -> None:
         self.db = duckdb.connect()
         self.project: str | None = None
@@ -74,6 +76,11 @@ class Oracle:
         if postgres:
             self.db.sql("INSTALL postgres; LOAD postgres;")
             self.db.sql(f"ATTACH '{postgres}' AS pg (TYPE postgres, READ_ONLY)")
+        if state:
+            # rivet's state DB: a Postgres URL, else a SQLite file path.
+            kind = "postgres" if state.startswith("postgres") else "sqlite"
+            self.db.sql(f"INSTALL {kind}; LOAD {kind};")
+            self.db.sql(f"ATTACH '{state}' AS st (TYPE {kind}, READ_ONLY)")
         if bigquery:
             target = bq_target()
             if target is None:
@@ -85,7 +92,11 @@ class Oracle:
             self.project = target[0]
             # Community extension: first use downloads it into ~/.duckdb.
             self.db.sql("INSTALL bigquery FROM community; LOAD bigquery;")
-            self.db.sql(f"ATTACH 'project={self.project}' AS bq (TYPE bigquery, READ_ONLY)")
+            # Scoped to the cell's own dataset: a project-wide attach resolves names by
+            # listing EVERY dataset, and one a concurrent cell drops mid-listing fails
+            # the query (`Not found: Dataset …`).
+            scope = f" dataset={bq_dataset}" if bq_dataset else ""
+            self.db.sql(f"ATTACH 'project={self.project}{scope}' AS bq (TYPE bigquery, READ_ONLY)")
 
     def rows(self, sql: str) -> list[tuple]:
         """Every row of one query, over whatever is attached."""
@@ -95,18 +106,6 @@ class Oracle:
         """The first column of the first row — the shape a count check wants."""
         row = self.db.sql(sql).fetchone()
         return None if row is None else row[0]
-
-    def bq_query(self, sql: str) -> list[tuple]:
-        """Run NATIVE BigQuery SQL (INFORMATION_SCHEMA, `SAFE.`, …) through the extension.
-
-        `bq.<dataset>.<table>` reads go through DuckDB's own planner; this is the
-        door for the queries only BigQuery itself can answer.
-        """
-        if self.project is None:
-            raise RuntimeError("Oracle was built without bigquery=True")
-        return self.db.sql(
-            f"SELECT * FROM bigquery_query('{self.project}', $${sql}$$)"
-        ).fetchall()
 
     def close(self) -> None:
         """Release the session."""

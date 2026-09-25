@@ -50,20 +50,25 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
 
-/// Add this invocation's row count onto the run's cumulative total. The parallel
-/// runners aggregate their workers' rows into an atomic and land it here at the
-/// end; on a checkpoint RESUME the summary already carries the rehydrated
-/// pre-crash base (`rehydrate_manifest_parts_from_file_log` bumps `total_rows`
-/// alongside `files_committed` / `bytes_written` / `manifest_parts`). This MUST
-/// accumulate (`+=`), never assign — a bare `summary.total_rows = agg` clobbers
-/// that base, so on resume `total_rows` under-reports (only this run's rows)
-/// while every other aggregate stays cumulative, breaking the
-/// `total_rows == sum(manifest_parts.rows)` coherence invariant and diverging from
-/// the sequential runner (which already `+=`s). The seam exists so no parallel
-/// runner can reintroduce the clobber — a future `= agg` is obviously wrong next
-/// to this call.
-pub(in crate::pipeline) fn accumulate_run_rows(summary: &mut RunSummary, this_run_rows: i64) {
-    summary.total_rows += this_run_rows;
+/// Adopt a part a PRIOR run committed (a resume) into the manifest and every run
+/// counter, once per path; `false` when the path is already there.
+///
+/// With [`record_part`] this is the only writer of the run's counters, so
+/// `total_rows == sum(manifest_parts.rows)` holds by construction.
+pub(in crate::pipeline) fn adopt_part(
+    summary: &mut RunSummary,
+    part: crate::manifest::ManifestPart,
+) -> bool {
+    if summary.manifest_parts.iter().any(|p| p.path == part.path) {
+        return false;
+    }
+    summary.total_rows += part.rows;
+    summary.bytes_written += part.size_bytes;
+    summary.files_produced += 1;
+    summary.files_committed += 1;
+    summary.files_adopted += 1;
+    summary.manifest_parts.push(part);
+    true
 }
 
 /// ADR-0029: the COMMIT UNIT a durable part and its Form-B checksum
@@ -117,6 +122,26 @@ pub(crate) struct Observations {
     /// Max observed byte length per column (shape-drift warn input); merged
     /// by max so worker/part order is irrelevant.
     pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
+}
+
+impl Observations {
+    /// Fold another sink's observations in: first schema wins, shape max-merges.
+    pub(in crate::pipeline) fn merge(&mut self, other: Observations) {
+        if self.drift_schema.is_none() {
+            self.drift_schema = other.drift_schema;
+        }
+        for (col, len) in other.column_max_bytes {
+            let e = self.column_max_bytes.entry(col).or_insert(0);
+            *e = (*e).max(len);
+        }
+    }
+}
+
+/// One commit unit's Form-B checksums and the key column they are keyed to.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnitChecksums {
+    pub(in crate::pipeline) sums: std::collections::BTreeMap<String, u64>,
+    pub(in crate::pipeline) key: Option<String>,
 }
 
 /// ADR-0029 half 2 — the integrity record, which is only meaningful as a set
@@ -175,27 +200,14 @@ pub(crate) struct CommitLedger {
 }
 
 impl CommitLedger {
-    /// First-wins schema note (idempotent run-wide, like the fingerprint pin).
-    /// An OBSERVATION: feed it as soon as a schema is in hand, above any bail.
-    pub(in crate::pipeline) fn note_schema(&mut self, schema: &arrow::datatypes::Schema) {
-        if self.observed.drift_schema.is_none() {
-            self.observed.drift_schema = Some(schema.clone());
-        }
+    /// Feed what a runner SAW. Eager: call it above any bail (ADR-0029).
+    pub(in crate::pipeline) fn observe(&mut self, o: Observations) {
+        self.observed.merge(o);
     }
 
-    /// Max-merge one sink's observed per-column byte lengths. An OBSERVATION.
-    pub(in crate::pipeline) fn merge_shape(
-        &mut self,
-        max_bytes: &std::collections::HashMap<String, u64>,
-    ) {
-        for (col, len) in max_bytes {
-            let e = self
-                .observed
-                .column_max_bytes
-                .entry(col.clone())
-                .or_insert(0);
-            *e = (*e).max(*len);
-        }
+    /// Contribute one COMMITTED unit's checksums (see [`Self::contribute_checksums`]).
+    pub(in crate::pipeline) fn contribute(&mut self, unit: UnitId, c: UnitChecksums) {
+        self.contribute_checksums(unit, &c.sums, c.key);
     }
 
     /// ADR-0029: contribute one COMMITTED unit's Form-B checksums, keyed by the
@@ -528,8 +540,7 @@ pub(crate) fn part_indexed_name(base: &str, idx: usize, count: usize) -> String 
 /// across runners: the I2 fault window, the byte/file counters, the manifest
 /// part (I2/M1), the journal event, and the warn-on-fail file-log write (I7).
 /// Returns `true` iff the part was DEDUPED (a re-read overwrote a rehydrated part of the same
-/// path); the caller (the keyset page loop) then skips the per-page `total_rows` bump because
-/// rehydration already counted that page.
+/// path) — already counted, so no counter moves.
 ///
 /// ADR-0029: `unit` is the COMMIT UNIT this part belongs to, and it must be the
 /// SAME [`UnitId`] the runner passes to `CommitLedger::contribute_checksums` for
@@ -550,10 +561,8 @@ pub(crate) fn record_part(
 
     // ADR-0012 M1: record the committed part for the finalizer's RunManifest. Returns whether it
     // DEDUPED (a re-read overwrote a rehydrated part of the same path — the keyset after-manifest
-    // resume window). Aggregates are bumped only on a genuine NEW part, so a deduped re-read does
-    // not inflate files_committed / bytes_written past manifest_parts.len() (which would trip the
-    // run-integrity invariant). total_rows is a per-page loop counter; the keyset runner reconciles
-    // it to the manifest sum after the loop.
+    // resume window). Aggregates — rows included — are bumped only on a genuine NEW part, so a
+    // deduped re-read does not count a page twice; runners never touch the counters themselves.
     let recorded = manifest_writer::record_committed_part_with_fingerprint(
         summary,
         part.file_name.clone(),
@@ -564,6 +573,7 @@ pub(crate) fn record_part(
     );
     let deduped = recorded.deduped;
     if !deduped {
+        summary.total_rows += part.rows;
         summary.bytes_written += part.bytes;
         summary.files_produced += 1;
         summary.files_committed += 1;
@@ -635,7 +645,7 @@ pub(crate) fn record_part(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, SourceConfig, SourceType,
@@ -712,15 +722,19 @@ mod tests {
         // first-wins schema: the second (drifted) schema must NOT replace it.
         let a = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let b = Schema::new(vec![Field::new("other", DataType::Utf8, true)]);
-        led.note_schema(&a);
-        led.note_schema(&b);
+        let obs = |sc: &Schema| Observations {
+            drift_schema: Some(sc.clone()),
+            ..Default::default()
+        };
+        led.observe(obs(&a));
+        led.observe(obs(&b));
         assert_eq!(
             led.observed
                 .drift_schema
                 .as_ref()
                 .map(|s| s.field(0).name().clone()),
             Some("id".to_string()),
-            "note_schema is first-wins — a later page/worker schema must not replace the run's"
+            "observe is first-wins on the schema — a later page/worker schema must not replace the run's"
         );
 
         // first-Some-wins key: a None feed leaves it open for a later Some.
@@ -752,12 +766,16 @@ mod tests {
         // shape is max-merge: order-independent, the larger observation wins.
         let s1: std::collections::HashMap<String, u64> = [("t".to_string(), 100u64)].into();
         let s2: std::collections::HashMap<String, u64> = [("t".to_string(), 40u64)].into();
-        led.merge_shape(&s1);
-        led.merge_shape(&s2);
+        for column_max_bytes in [s1, s2] {
+            led.observe(Observations {
+                column_max_bytes,
+                ..Default::default()
+            });
+        }
         assert_eq!(led.observed.column_max_bytes.get("t"), Some(&100u64));
     }
 
-    fn test_plan() -> ResolvedRunPlan {
+    pub(crate) fn test_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
             split_window: None,
             bytes_read: Default::default(),
@@ -808,7 +826,7 @@ mod tests {
         }
     }
 
-    fn test_summary(plan: &ResolvedRunPlan) -> RunSummary {
+    pub(crate) fn test_summary(plan: &ResolvedRunPlan) -> RunSummary {
         let mut s = RunSummary::stub_for_testing("test_run", plan.export_name.clone());
         s.batch_size = 10_000;
         s.mode = "snapshot".into();
@@ -1077,7 +1095,7 @@ mod tests {
     // will fire the moment that runner finishes a real export. Two layers,
     // both CI-enforced via `cargo test`.
 
-    fn synthetic_parts(n: usize) -> Vec<PartRecord> {
+    pub(crate) fn synthetic_parts(n: usize) -> Vec<PartRecord> {
         (0..n)
             .map(|i| PartRecord {
                 file_name: format!("part_{i}.parquet"),
@@ -1090,16 +1108,50 @@ mod tests {
     }
 
     #[test]
+    fn adopt_part_counts_a_prior_part_once_and_marks_it_adopted() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let part = crate::manifest::ManifestPart {
+            part_id: 1,
+            path: "p0.parquet".into(),
+            rows: 50,
+            size_bytes: 10,
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        };
+        assert!(adopt_part(&mut summary, part.clone()));
+        assert!(
+            !adopt_part(&mut summary, part),
+            "the same path is adopted once"
+        );
+        assert_eq!(
+            (
+                summary.total_rows,
+                summary.files_committed,
+                summary.files_adopted
+            ),
+            (50, 1, 1)
+        );
+        assert_eq!(
+            (summary.bytes_written, summary.manifest_parts.len()),
+            (10, 1)
+        );
+        assert_eq!(
+            summary.files_committed_here(),
+            0,
+            "adopted parts were not written here"
+        );
+    }
+
+    #[test]
     fn record_part_keeps_summary_aggregates_coherent_with_manifest_parts() {
         let plan = test_plan();
         let mut summary = test_summary(&plan);
         let parts = synthetic_parts(5);
 
-        // Simulate a runner: bump total_rows then record_part for each chunk.
-        // record_part does NOT touch total_rows; the runner owns that bump,
-        // so we model both halves of the contract here.
+        // A runner only calls record_part; the rows are counted there.
         for (i, p) in parts.iter().enumerate() {
-            summary.total_rows += p.rows;
             record_part(
                 &plan,
                 &mut summary,

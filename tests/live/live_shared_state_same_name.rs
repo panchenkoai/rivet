@@ -53,25 +53,7 @@ fn state_url() -> Option<String> {
 /// own their table and a crashed earlier invocation leaves nothing behind.
 fn dataset_for(bq: &BqLive, engine: &str) -> BqLive {
     let dataset = stand_bq_tmp(&format!("same_{engine}"));
-    let bq_cmd = |args: &[&str]| {
-        std::process::Command::new("bq")
-            .arg(format!("--project_id={}", bq.project))
-            .args(args)
-            .output()
-            .expect("`bq` must run")
-    };
-    let _ = bq_cmd(&["rm", "-r", "-f", "-d", &format!("{}:{dataset}", bq.project)]);
-    let out = bq_cmd(&[
-        "mk",
-        "-f",
-        "--dataset",
-        &format!("{}:{dataset}", bq.project),
-    ]);
-    assert!(
-        out.status.success(),
-        "bq mk {dataset}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    recreate_dataset(&bq.project, &dataset);
     BqLive {
         project: bq.project.clone(),
         dataset,
@@ -153,7 +135,7 @@ fn all_at_once(
     extra: &[(&str, &str)],
 ) -> Vec<std::process::Output> {
     let cfgs: Vec<PathBuf> = legs.iter().map(|l| l.scn.rig.config_path()).collect();
-    std::thread::scope(|s| {
+    let timed: Vec<(std::process::Output, f64)> = std::thread::scope(|s| {
         let handles: Vec<_> = cfgs
             .iter()
             .map(|cfg| {
@@ -161,7 +143,9 @@ fn all_at_once(
                 s.spawn(move || {
                     let mut envs: Vec<(&str, &str)> = vec![("RIVET_STATE_URL", state)];
                     envs.extend_from_slice(extra);
-                    run_rivet_env(&[sub, "-c", &cfg], &envs)
+                    let t0 = std::time::Instant::now();
+                    let out = run_rivet_env(&[sub, "-c", &cfg], &envs);
+                    (out, t0.elapsed().as_secs_f64())
                 })
             })
             .collect();
@@ -169,7 +153,18 @@ fn all_at_once(
             .into_iter()
             .map(|h| h.join().expect("leg thread"))
             .collect()
-    })
+    });
+    let per_leg: Vec<String> = legs
+        .iter()
+        .zip(&timed)
+        .map(|(l, (_, secs))| format!("{}={secs:.1}s", l.engine))
+        .collect();
+    eprintln!(
+        "[timing] rivet {sub} x{}: {}",
+        legs.len(),
+        per_leg.join(" ")
+    );
+    timed.into_iter().map(|(out, _)| out).collect()
 }
 
 fn assert_all_ok(legs: &[Leg], outs: &[std::process::Output], step: &str) {
@@ -252,39 +247,75 @@ fn remember_runs(legs: &mut [Leg]) {
     }
 }
 
-/// The live state of one leg's warehouse table equals its source: count, one row
-/// per key, SUM(id) — the last catches a row routed under another leg's prefix.
-/// A CDC leg's cycle ends with `rivet compact` (the buffer merged into the base),
-/// so this compacts whenever a buffer exists before reading.
-fn assert_leg_is_source(leg: &mut Leg, step: &str) {
-    let source = leg.scn.count();
-    let pk = leg.scn.pk();
-    // The warehouse table carries the SOURCE table's name (`users` is the export).
-    let wh = leg.scn.table.clone();
-    if leg
-        .bq
-        .read_bq_table_type(&format!("{wh}__changes"))
-        .is_some()
-    {
+/// Every leg's live warehouse table equals its source: count, one row per key,
+/// SUM(id) — the last catches a row routed under another leg's prefix. All legs
+/// at once: each owns its dataset, and a check (a `rivet compact` plus three reads)
+/// is ~14 s, so four in turn were half of the CDC cycle. A failing leg's panic is
+/// re-raised as is.
+fn assert_legs_are_source(legs: &mut [Leg], step: &str) {
+    let want: Vec<(i64, String, String)> = legs
+        .iter_mut()
+        .map(|l| (l.scn.count(), l.scn.pk().to_string(), l.scn.table.clone()))
+        .collect();
+    let got: Vec<(i64, i64, i64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = legs
+            .iter()
+            .zip(&want)
+            .map(|(l, (_, pk, wh))| {
+                let (cfg, bq, engine) = (l.scn.rig.config_path(), &l.bq, l.engine);
+                s.spawn(move || warehouse_counts(&cfg, bq, engine, wh, pk, step))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    for ((leg, (source, _, _)), (n, d, s)) in legs.iter().zip(&want).zip(got) {
+        assert_eq!(
+            n, *source,
+            "{step}: {}: warehouse rows must equal the source",
+            leg.engine
+        );
+        assert_eq!(d, n, "{step}: {}: one row per key", leg.engine);
+        // Every id this leg owns lies in [k*100+1, k*100+99]; a foreign row would
+        // move the sum off that band.
+        let lo = leg.k * 100;
+        assert!(
+            s > lo * n && s <= (lo + 99) * n,
+            "{step}: {}: SUM(id)={s} over {n} rows is not this engine's band ({lo}+1..{lo}+99) — \
+             a sibling config's rows landed here",
+            leg.engine
+        );
+    }
+}
+
+/// `(rows, distinct keys, SUM(key))` of a leg's live warehouse table, compacting
+/// first whenever a buffer exists (a CDC leg's cycle ends with `rivet compact`).
+fn warehouse_counts(
+    cfg: &std::path::Path,
+    bq: &BqLive,
+    engine: &str,
+    wh: &str,
+    pk: &str,
+    step: &str,
+) -> (i64, i64, i64) {
+    if bq.read_bq_table_type(&format!("{wh}__changes")).is_some() {
         // The same shared state every other step of the leg runs against.
         let state = state_url().expect("the shared state URL that admitted this test");
-        let out = leg
-            .scn
-            .rig
-            .cli_env(&["compact"], &[("RIVET_STATE_URL", &state)]);
+        let cfg = cfg.to_string_lossy();
+        let out = run_rivet_env(&["compact", "-c", &cfg], &[("RIVET_STATE_URL", &state)]);
         assert!(
             out.status.success(),
-            "{step}: {}: rivet compact failed:\n{}",
-            leg.engine,
+            "{step}: {engine}: rivet compact failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let flagged = !leg
-        .bq
+    let flagged = !bq
         .read_bq_rows(&format!(
             "SELECT column_name FROM `{}.{}.INFORMATION_SCHEMA.COLUMNS` \
              WHERE table_name = '{wh}' AND column_name = '__is_deleted'",
-            leg.bq.project, leg.bq.dataset
+            bq.project, bq.dataset
         ))
         .is_empty();
     let live = if flagged {
@@ -292,29 +323,13 @@ fn assert_leg_is_source(leg: &mut Leg, step: &str) {
     } else {
         ""
     };
-    let row = &leg.bq.read_bq_rows(&format!(
+    let row = &bq.read_bq_rows(&format!(
         "SELECT COUNT(*) AS n, COUNT(DISTINCT {pk}) AS d, \
          IFNULL(SUM(SAFE_CAST({pk} AS INT64)), 0) AS s FROM `{}.{}.{wh}` {live}",
-        leg.bq.project, leg.bq.dataset
+        bq.project, bq.dataset
     ))[0];
-    let n: i64 = row["n"].as_str().expect("count").parse().expect("a count");
-    let d: i64 = row["d"].as_str().expect("count").parse().expect("a count");
-    let s: i64 = row["s"].as_str().expect("sum").parse().expect("a sum");
-    assert_eq!(
-        n, source,
-        "{step}: {}: warehouse rows must equal the source",
-        leg.engine
-    );
-    assert_eq!(d, n, "{step}: {}: one row per key", leg.engine);
-    // Every id this leg owns lies in [k*100+1, k*100+99]; a foreign row would
-    // move the sum off that band.
-    let lo = leg.k * 100;
-    assert!(
-        s > lo * n && s <= (lo + 99) * n,
-        "{step}: {}: SUM(id)={s} over {n} rows is not this engine's band ({lo}+1..{lo}+99) — \
-         a sibling config's rows landed here",
-        leg.engine
-    );
+    let num = |k: &str| -> i64 { row[k].as_str().expect("count").parse().expect("a count") };
+    (num("n"), num("d"), num("s"))
 }
 
 /// The state DB's account of the fleet, read with a plain Postgres client.
@@ -412,9 +427,7 @@ fn cdc_cycle(mut legs: Vec<Leg>, state: &str) {
     assert_all_ok(&legs, &all_at_once(&legs, "run", state, &[]), "run 1");
     remember_runs(&mut legs);
     assert_all_ok(&legs, &all_at_once(&legs, "load", state, &[]), "load 1");
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "cdc run 1");
-    }
+    assert_legs_are_source(&mut legs, "cdc run 1");
     assert_state_accounts_for(&mut oracle, &legs, "cdc run 1", true);
 
     // 2. A delta everywhere → run all → load all.
@@ -429,9 +442,7 @@ fn cdc_cycle(mut legs: Vec<Leg>, state: &str) {
     assert_all_ok(&legs, &all_at_once(&legs, "run", state, &[]), "run 2");
     remember_runs(&mut legs);
     assert_all_ok(&legs, &all_at_once(&legs, "load", state, &[]), "load 2");
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "cdc run 2");
-    }
+    assert_legs_are_source(&mut legs, "cdc run 2");
     assert_state_accounts_for(&mut oracle, &legs, "cdc run 2", true);
 
     // 3. EVERY stream crashes at once after flushing, before acking; the plain
@@ -459,9 +470,7 @@ fn cdc_cycle(mut legs: Vec<Leg>, state: &str) {
     );
     remember_runs(&mut legs);
     assert_all_ok(&legs, &all_at_once(&legs, "load", state, &[]), "load 3");
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "cdc run 3 after a simultaneous crash");
-    }
+    assert_legs_are_source(&mut legs, "cdc run 3 after a simultaneous crash");
     assert_state_accounts_for(&mut oracle, &legs, "cdc run 3", true);
 
     // 4. The streams crash ONE AT A TIME while the others run clean — the shared
@@ -517,9 +526,7 @@ fn cdc_cycle(mut legs: Vec<Leg>, state: &str) {
     }
     remember_runs(&mut legs);
     assert_all_ok(&legs, &all_at_once(&legs, "load", state, &[]), "load 4");
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "cdc after crashes in turn");
-    }
+    assert_legs_are_source(&mut legs, "cdc after crashes in turn");
     assert_state_accounts_for(&mut oracle, &legs, "cdc after crashes in turn", true);
 }
 
@@ -534,9 +541,7 @@ fn batch_cycle(mut legs: Vec<Leg>, state: &str) {
         &all_at_once(&legs, "load", state, &[]),
         "batch load 1",
     );
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "batch run 1");
-    }
+    assert_legs_are_source(&mut legs, "batch run 1");
     assert_state_accounts_for(&mut oracle, &legs, "batch run 1", false);
 
     // 2. More rows → run all → load all: the full load overwrites with the latest run.
@@ -553,9 +558,7 @@ fn batch_cycle(mut legs: Vec<Leg>, state: &str) {
         &all_at_once(&legs, "load", state, &[]),
         "batch load 2",
     );
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "batch run 2");
-    }
+    assert_legs_are_source(&mut legs, "batch run 2");
     assert_state_accounts_for(&mut oracle, &legs, "batch run 2", false);
 
     // 3. Every snapshot crashes at once after a part is written; the plain runs
@@ -587,9 +590,7 @@ fn batch_cycle(mut legs: Vec<Leg>, state: &str) {
         &all_at_once(&legs, "load", state, &[]),
         "batch load 3",
     );
-    for leg in legs.iter_mut() {
-        assert_leg_is_source(leg, "batch run 3 after a simultaneous crash");
-    }
+    assert_legs_are_source(&mut legs, "batch run 3 after a simultaneous crash");
     assert_state_accounts_for(&mut oracle, &legs, "batch run 3", false);
 }
 

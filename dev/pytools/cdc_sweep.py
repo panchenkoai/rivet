@@ -25,7 +25,7 @@ A crash leaves durable parts no manifest lists; a consumer summing manifests
 the union of `manifest-<run_id>.json`, and the orphan set is checked separately —
 it must be EMPTY unless a crash created it.
 
-AXES. Derived from `CdcExportConfig` in src/config/export.rs, not from memory;
+AXES. Derived from `CdcExportConfig` in src/config/cdc.rs, not from memory;
 `docs/cdc-axis-matrix.yaml` is the ledger and `tests/offline/cdc_axis_matrix_guard.rs`
 fails the build when a new CDC knob or a new `cdc_*` crash hook appears without a
 row saying how it is swept.

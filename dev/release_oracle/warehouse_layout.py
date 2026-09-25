@@ -22,7 +22,7 @@ the gate's binary:
 
 Oracles are the tests': the source, `bq`, the SQLite ledger — never rivet's report.
 SKIP — never a silent pass — without cargo, the Postgres state URL, the BigQuery
-project/bucket or the `bq` CLI.
+project/bucket or `gcloud` (the REST token).
 """
 
 from __future__ import annotations

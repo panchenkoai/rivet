@@ -448,35 +448,50 @@ pub(in crate::pipeline) struct RowProgress {
 }
 
 impl ExportSink {
-    /// ADR-0029 (splitting ADR-0028's `drain_tail_into`) — the OBSERVATION half
-    /// of this sink's tail: the dest schema it resolved and the per-column shape
-    /// bytes it saw. Neither carries a coverage obligation, so drain them as
-    /// soon as the read is done and BEFORE any fallible write — a run that then
-    /// fails still records the fingerprint it OBSERVED instead of the stale
-    /// open-time baseline. Applied by `finalize::finalize_export{,_records}`.
+    /// ADR-0029 — what this sink SAW: its dest schema and per-column max bytes.
+    /// No coverage obligation, so a runner feeds it as soon as the read is done.
+    pub(in crate::pipeline) fn take_observations(
+        &mut self,
+    ) -> crate::pipeline::commit::Observations {
+        crate::pipeline::commit::Observations {
+            drift_schema: self.dest_schema.as_deref().cloned(),
+            column_max_bytes: std::mem::take(&mut self.column_max_bytes),
+        }
+    }
+
+    /// [`Self::take_observations`] without the schema — for chunked runners, whose
+    /// drift gate runs pre-chunk (ADR-0021) and must not be re-run post-run.
+    pub(in crate::pipeline) fn take_shape(&mut self) -> crate::pipeline::commit::Observations {
+        crate::pipeline::commit::Observations {
+            drift_schema: None,
+            column_max_bytes: std::mem::take(&mut self.column_max_bytes),
+        }
+    }
+
+    /// ADR-0029 — this sink's Form-B checksums and their key column. Contribute
+    /// them only once the unit's parts are committed.
+    pub(in crate::pipeline) fn take_checksums(&mut self) -> crate::pipeline::commit::UnitChecksums {
+        crate::pipeline::commit::UnitChecksums {
+            key: self.checksum_key(),
+            sums: std::mem::take(&mut self.column_checksums),
+        }
+    }
+
+    /// Feed [`Self::take_observations`] into `ledger`.
     pub(in crate::pipeline) fn drain_observations_into(
         &mut self,
         ledger: &mut crate::pipeline::commit::CommitLedger,
     ) {
-        if let Some(schema) = self.dest_schema.as_deref() {
-            ledger.note_schema(schema);
-        }
-        ledger.merge_shape(&std::mem::take(&mut self.column_max_bytes));
+        ledger.observe(self.take_observations());
     }
 
-    /// ADR-0029 — the INTEGRITY half: the Form-B checksums this sink
-    /// accumulated (keyed to the cursor/key column when the key survived into
-    /// the dest batch), contributed under `unit`, the commit unit whose parts
-    /// they cover. Drain it only once that unit's parts are committed; the seam
-    /// compares `unit` against the units `record_part` registered and suppresses
-    /// Form B itself if the two sets disagree.
+    /// Contribute [`Self::take_checksums`] to `ledger` under `unit`.
     pub(in crate::pipeline) fn drain_integrity_into(
         &mut self,
         unit: crate::pipeline::commit::UnitId,
         ledger: &mut crate::pipeline::commit::CommitLedger,
     ) {
-        let key = self.checksum_key();
-        ledger.contribute_checksums(unit, &std::mem::take(&mut self.column_checksums), key);
+        ledger.contribute(unit, self.take_checksums());
     }
 
     /// The column this sink's Form-B checksums are keyed to, or `None` when they are

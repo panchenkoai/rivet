@@ -155,7 +155,7 @@ def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
     are two call sites of the same string, and a prefix that differs between
     them reads as "the export wrote nothing".
     """
-    return f"blessed/{scenarios.work_dir().name}/{engine}/{tag}/{table}/{scenario}"
+    return scenarios.Scope(engine, tag).prefix("blessed", table, scenario)
 
 
 def _duckdb_ok() -> bool:
@@ -211,40 +211,9 @@ def _parquet_rows_and_files(path: Path) -> tuple[int, int]:
 
 
 def _source_rows(engine: str, url: str, table: str) -> int:
-    """Row count from the source engine's OWN client, resolved by the URL's port.
-
-    `scenarios._source_count_distinct` finds the gate's own `rivet-oracle-eng-*`
-    containers by name; pointed at a dev stand it returns "" and the oracle then
-    SKIPs — correct, but it never compares. `container_for_port` resolves
-    whichever container actually serves the URL under test, so the same walk
-    works on the gate's containers and on a local stand. -1 means unresolvable,
-    which the caller turns into a SKIP, never into agreement."""
-    port = port_of(url)
-    c = container_for_port(port) if port else None
-    if not c:
-        return -1
-    if engine == "postgres":
-        out = docker_exec(c, "psql", "-U", "rivet", "-d", "rivet", "-tA",
-                          "-c", f"SELECT count(*) FROM {table}").stdout.strip()
-    elif engine == "mysql":
-        out = docker_exec(c, "mysql", "-urivet", "-privet", "rivet", "-N",
-                          "-e", f"SELECT count(*) FROM {table}").stdout.strip()
-    elif engine == "mssql":
-        out = docker_exec(c, "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost",
-                          "-U", "sa", "-P", "Rivet_Passw0rd!", "-d", "rivet",
-                          "-h-1", "-W", "-Q",
-                          f"SET NOCOUNT ON; SELECT count(*) FROM {table}").stdout.strip()
-    elif engine == "mongo":
-        # `mongosh` does not exist on 4.4 — see `scenarios.mongo_shell`. Asking
-        # for it there returned nothing, which this function turned into -1 and
-        # the oracle read as "source unreachable", SKIPping the comparison on the
-        # oldest gridded version. `countDocuments({})` and not the no-arg form:
-        # the legacy shell rejects it.
-        out = docker_exec(c, scenarios.mongo_shell(c), "--quiet", "rivet", "--eval",
-                          f"print(db.{table}.countDocuments({{}}))").stdout.strip()
-    else:
-        return -1
-    head = out.splitlines()[0].strip() if out else ""
+    """Row count from the source engine's own client (`scenarios.source_query`); -1 when unresolvable, which the caller SKIPs, never agrees with."""
+    query = f"db.{table}.countDocuments({{}})" if engine == "mongo" else f"SELECT count(*) FROM {table}"
+    head = scenarios.source_query(engine, url, query)
     return int(head) if head.isdigit() else -1
 
 
@@ -382,7 +351,7 @@ def sc_blessed_path(
     The two are the same contract with hand-written SQL on each side, so the
     chain is walked on both rather than assumed transferable.
     """
-    work = scenarios.work_dir() / f"blessed_{engine}_{tag}_{table.replace('.','_')}_{scenario}_{store}_{'pg' if state_url else 'sq'}"
+    work = scenarios.Scope(engine, tag).dir("blessed", table, scenario, store, "pg" if state_url else "sq")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     dest_dir = work / "out"
@@ -708,16 +677,16 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     # was right; the gate handed two concurrent processes one warehouse table. The
     # work dir and bucket prefix below already carried the tag; this did not.
     dset = ((os.environ.get("BQ_ORACLE_DATASET") or registry.bq_tmp("gate"))
-            + f"_{engine}_{tag.replace('.', '_')}")
+            + "_" + scenarios.Scope(engine, tag).key)
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",
                     f"{engine} {tag} · bigquery — no bq CLI or project", "no creds")
         return
 
-    work = scenarios.work_dir() / f"bq_{engine}_{tag}_{table}"
+    work = scenarios.Scope(engine, tag).dir("bq", table)
     work.mkdir(parents=True, exist_ok=True)
-    pfx = f"blessed/{engine}/{tag}/{table}"
+    pfx = scenarios.Scope(engine, tag).prefix("blessedbq", table)
     # `rivet load` derives the warehouse table from the `table:` field, NOT from
     # the export name — so this must be the source table's name or the verify
     # queries a table that was never created. It read `-1` (absent) while the

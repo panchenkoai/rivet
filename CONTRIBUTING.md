@@ -90,11 +90,37 @@ Rust API docs (`///` on public items) should also be English when added.
 
 ## Tests
 
-- Run `cargo test` before submitting changes.
+- Run the offline suite with `cargo nextest run` before submitting changes (see below for why not plain `cargo test`).
 - For database-dependent behavior, use the Docker Compose services and scripts under `dev/`.
 - Regression matrix harnesses live under [`dev/matrices/`](dev/matrices/README.md) — run `python3 -m dev.pytools.matrices --tier=pr` before release.
 - New code should include unit tests. Integration tests go in `tests/`.
 - Golden tests (exact output comparisons) are preferred for format/serialization code.
+
+### Running tests
+
+Tests run under [cargo-nextest](https://nexte.st) — it executes each test in its own process:
+
+```bash
+cargo install cargo-nextest --locked    # one-time
+cargo nextest run                        # offline suite (live tests are #[ignore], skipped)
+
+# Live engine tests need the docker services first:
+docker compose up -d                     # services match docker-compose.yaml
+make test-live                           # sweep stale fixtures, then run offline + live
+```
+
+A killed live run (slow-timeout / Ctrl-C) skips the per-test table cleanup, so `make test-live` first
+runs `make sweep-test-db` to drop any `<prefix>_<pid>_<counter>` object (tables, PostgreSQL slots, Mongo
+databases and collections) whose `<pid>` is no longer running, on every source in `dev/stand/registry.yaml`.
+It is safe to run by hand anytime, even beside a live run: a running process's objects are never touched.
+`make sweep-test-cloud` also drops leftover disposable BigQuery datasets (`rivet_tmp_*`); run it only when
+no gate or live run is in flight. The registry is the one list of stand endpoints and dataset names.
+
+The offline integration tests are consolidated into single binaries (`tests/offline_suite.rs`,
+`tests/live_suite.rs`) to keep link time down. **Run them with nextest, not plain `cargo test`** — the
+consolidated binaries run their tests as threads in one process, so without nextest's per-test process
+isolation a crashing or global-state test can take its siblings down with it. The pre-push hook
+(`git config core.hooksPath .githooks`) and CI both use nextest.
 
 ## Architecture
 

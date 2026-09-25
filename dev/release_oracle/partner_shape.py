@@ -23,8 +23,8 @@ init consolidates into one stream):
    the 5-row baseline → `compact` → per table: live rows (`WHERE NOT
    __is_deleted`) == source == 7, one flagged tombstone, the buffer dropped.
 
-Oracles: the `bq` CLI (never rivet) and a re-query of the source. SKIP — never a
-silent pass — without the engine URL, the `bq` CLI or a project. Cleans up the
+Oracles: BigQuery over REST (`gcp.bq_scalar`, never rivet) and a re-query of the source. SKIP — never a
+silent pass — without the engine URL, `gcloud` (the REST token) or a project. Cleans up the
 warehouse tables, the GCS prefix, the source tables and (PostgreSQL) the slot.
 """
 
@@ -37,6 +37,7 @@ from pathlib import Path
 
 from .cdc import _mysql, _psql
 from ..pytools import registry
+from . import gcp
 from .core import Ledger, have, rivet, run
 from .scenarios import NO_TIMEOUT, work_dir
 
@@ -75,9 +76,7 @@ def _sum_id(engine: str, url: str, table: str) -> int:
 
 
 def _bq_scalar(proj: str, dset: str, expr: str, table: str, where: str = "") -> int:
-    q = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql", "--format=csv",
-             f"SELECT {expr} FROM `{proj}.{dset}.{table}` {where}"], timeout=None)
-    return _scalar(q.stdout)
+    return _scalar(gcp.bq_scalar(proj, f"SELECT {expr} FROM `{proj}.{dset}.{table}` {where}") or "")
 
 
 def _bq_count(proj: str, dset: str, table: str, where: str = "") -> int:
@@ -138,9 +137,9 @@ def verify_partner_shape(led: Ledger) -> None:
     led.phase("Partner shape — `rivet init --mode cdc` over 3 tables → anchor + backfill → load → delta → load (BigQuery)")
     proj = os.environ.get("BQ_ORACLE_PROJECT") or run(["gcloud", "config", "get-value", "project"]).stdout.strip()
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
-    if not have("bq") or not proj:
+    if not have("gcloud") or not proj:
         led.skipped("-", "partner", "shape", "gcs",
-                    "partner shape: no `bq` CLI or no project (set BQ_ORACLE_PROJECT)", "no bq")
+                    "partner shape: no `gcloud` (the REST token) or no project (set BQ_ORACLE_PROJECT)", "no gcloud")
         return
     for engine in ("mysql", "postgres"):
         uvar = f"RIVET_CDC_{engine.upper()}_URL"
@@ -148,7 +147,11 @@ def verify_partner_shape(led: Ledger) -> None:
         if not url:
             led.skipped(engine, "partner", "shape", "gcs", f"partner[{engine}]: no {uvar}", "no url")
             continue
-        _one_engine(led, engine, url, proj, bucket)
+        try:
+            _one_engine(led, engine, url, proj, bucket)
+        except Exception as e:  # noqa: BLE001 — graded, never swallowed
+            led.failed(engine, "partner", "shape", "gcs",
+                       f"partner shape[{engine}]: stage raised: {e!r}"[:400], "raised")
 
 
 def _row(led: Ledger, engine: str, stage: str, ok: bool, detail: str) -> bool:
@@ -189,11 +192,11 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
         body = body.replace("prefix: exports/", f"prefix: {pfx}/exports/").replace("prefix: cdc/", f"prefix: {pfx}/cdc/")
         body += f"\nload:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n"
         cfg.write_text(body)
-        run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{dset}"])
+        gcp.bq_ensure_dataset(proj, dset)
         for t in TABLES:
-            run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{proj}:{dset}.{t}"])
-            run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{proj}:{dset}.{t}__changes"])
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+            gcp.bq_delete_table(proj, dset, t)
+            gcp.bq_delete_table(proj, dset, f"{t}__changes")
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
 
         for st in ("doctor", "check"):
             q = rivet(st, "-c", str(cfg), env=env, timeout=NO_TIMEOUT)
@@ -244,6 +247,10 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
              "; ".join(f"{t}: live={live} flagged={gone} source={src} sum(id) bq={bs} src={ss} buffer_left={buf}"
                        for t, (live, gone, src, bs, ss, buf) in got2.items()))
     finally:
-        run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", f"{proj}:{dset}"])
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+        # The source teardown first: it drops a replication slot, and a cloud call
+        # below may raise — a leaked slot pins WAL on the stand.
         _cleanup(engine, url, slot)
+        try:
+            gcp.bq_delete_dataset(proj, dset)
+        finally:
+            gcp.gcs_delete_prefix(bucket, f"{pfx}/")

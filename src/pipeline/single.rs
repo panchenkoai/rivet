@@ -12,7 +12,6 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
-use crate::destination;
 use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
@@ -27,6 +26,7 @@ pub(crate) fn run_with_reconnect(
     chunk_source: super::chunked::ChunkSource,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
+    let before_first_attempt = summary.clone();
 
     for attempt in 0..=plan.tuning.max_retries {
         // ADR-0028: the tail ledger accumulates ACROSS a runner invocation, and a
@@ -37,6 +37,7 @@ pub(crate) fn run_with_reconnect(
         // is the only one the seam applies.
         summary.ledger = Default::default();
         if attempt > 0 {
+            reset_for_retry(summary, &before_first_attempt);
             summary.retries = attempt;
             let class = last_err
                 .as_ref()
@@ -127,7 +128,7 @@ pub(crate) fn run_with_reconnect(
             Err(e) => match decide_export_retry(
                 attempt,
                 plan.tuning.max_retries,
-                summary.files_committed,
+                summary.files_committed_here(),
                 &plan.export_name,
                 &e,
             ) {
@@ -142,6 +143,17 @@ pub(crate) fn run_with_reconnect(
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("export failed after retries")))
+}
+
+/// Roll `summary` back to its state before the first attempt, keeping what spans
+/// attempts (the journal and the reconnect count): a retry re-reads from scratch and
+/// re-adopts resumed parts, so the failed attempt's totals and parts must not stay.
+fn reset_for_retry(summary: &mut RunSummary, before_first_attempt: &RunSummary) {
+    let journal = std::mem::take(&mut summary.journal);
+    let reconnects = summary.reconnects;
+    *summary = before_first_attempt.clone();
+    summary.journal = journal;
+    summary.reconnects = reconnects;
 }
 
 /// Outcome of the retry decision in `run_with_reconnect`.
@@ -329,7 +341,6 @@ pub(super) fn run_single_export(
     // under the observed schema. The INTEGRITY half stays below the loop.
     sink.drain_observations_into(&mut summary.ledger);
 
-    summary.total_rows += sink.total_rows as i64;
     log::info!(
         "export '{}': {} rows written",
         plan.export_name,
@@ -376,24 +387,7 @@ pub(super) fn run_single_export(
     }
 
     if sink.total_rows == 0 {
-        if plan.skip_empty {
-            summary.status = "skipped".into();
-            // Attach a short, mode-specific reason so the operator can see
-            // *why* nothing was written, not just `status: skipped` with
-            // an empty surrounding. Incremental no-op is the common case
-            // (no rows past the recorded cursor); other modes get a
-            // generic 0-rows note.
-            summary.skip_reason = Some(match plan.strategy.cursor_column() {
-                Some(col) => format!("no new rows since cursor '{col}'"),
-                None => "source returned 0 rows".into(),
-            });
-            log::info!(
-                "export '{}': skipped (0 rows, skip_empty=true)",
-                plan.export_name
-            );
-        } else {
-            log::info!("export '{}': no data to export", plan.export_name);
-        }
+        log::info!("export '{}': no data to export", plan.export_name);
         return Ok(());
     }
 
@@ -407,14 +401,6 @@ pub(super) fn run_single_export(
     let frame = super::frame::RunnerFrame::open(plan)?;
     let (dest, ext) = (frame.dest, frame.ext);
     let ext = ext.as_str();
-
-    // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
-    destination::log_capabilities(
-        &plan.export_name,
-        dest.as_ref(),
-        plan.destination.destination_type,
-        plan.tuning.max_retries,
-    );
 
     let has_parts = sink.completed_parts.len() > 1;
     // Millisecond precision (matches keyset.rs / mongo_parallel.rs / cdc sink):
@@ -707,7 +693,55 @@ mod tests {
 
     // ── zero-rows paths ───────────────────────────────────────────────────────
 
-    /// When there are 0 rows and skip_empty is false, run succeeds and status stays "running".
+    /// 0 rows: the runner succeeds and leaves the status to the dispatcher.
+    #[test]
+    fn a_retry_starts_from_the_pre_attempt_summary_but_keeps_journal_and_reconnects() {
+        let base = RunSummary {
+            export_name: "e".into(),
+            ..Default::default()
+        };
+        let mut s = base.clone();
+        s.total_rows = 1000;
+        s.files_committed = 3;
+        s.files_adopted = 3;
+        s.manifest_parts.push(crate::manifest::ManifestPart {
+            part_id: 0,
+            path: "p".into(),
+            rows: 1000,
+            size_bytes: 1,
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        });
+        s.reconnects = 2;
+        s.journal.record(RunEvent::RetryAttempted {
+            attempt: 1,
+            reason: "x".into(),
+            backoff_ms: 0,
+        });
+        let events = s.journal.entries.len();
+        super::reset_for_retry(&mut s, &base);
+        assert_eq!(
+            (s.total_rows, s.files_committed, s.files_adopted),
+            (0, 0, 0)
+        );
+        assert!(s.manifest_parts.is_empty());
+        assert_eq!(s.reconnects, 2);
+        assert_eq!(s.journal.entries.len(), events);
+    }
+
+    #[test]
+    fn adopted_parts_are_not_parts_this_run_committed() {
+        let mut s = RunSummary {
+            files_committed: 3,
+            files_adopted: 3,
+            ..Default::default()
+        };
+        assert_eq!(s.files_committed_here(), 0);
+        s.files_committed = 5;
+        assert_eq!(s.files_committed_here(), 2);
+    }
+
     #[test]
     fn zero_rows_no_skip_empty_succeeds() {
         let plan = minimal_plan();
@@ -715,40 +749,6 @@ mod tests {
         result.expect("0 rows without skip_empty should succeed");
         assert_eq!(summary.total_rows, 0);
         assert_ne!(summary.status, "skipped");
-    }
-
-    /// When skip_empty is true and source emits 0 rows, status is "skipped".
-    #[test]
-    fn zero_rows_with_skip_empty_sets_status_skipped() {
-        let mut plan = minimal_plan();
-        plan.skip_empty = true;
-        let (result, summary) = run(&mut EmptySource, &plan);
-        result.expect("skip_empty with 0 rows should succeed");
-        assert_eq!(summary.status, "skipped");
-        assert_eq!(summary.total_rows, 0);
-    }
-
-    /// When there are rows but skip_empty is true, skip_empty must NOT apply.
-    /// Verified without running the full pipeline: the early-return path only
-    /// triggers when `sink.total_rows == 0`, so any non-zero row count bypasses it.
-    /// (We only test the 0-row skip_empty path; the non-zero path needs a live dest.)
-    #[test]
-    fn skip_empty_semantics_zero_rows_only() {
-        // Confirmed by the skip_empty contract: `if sink.total_rows == 0 && skip_empty`.
-        // Non-zero rows cannot set status="skipped" — that branch is gated on total_rows==0.
-        // This test exists to document the invariant; the live behaviour is covered by
-        // live_harness_canary integration tests.
-        let mut plan_skip = minimal_plan();
-        plan_skip.skip_empty = true;
-        let (result_skip, summary_skip) = run(&mut EmptySource, &plan_skip);
-        result_skip.expect("skip_empty+0 rows must succeed");
-        assert_eq!(summary_skip.status, "skipped");
-
-        let mut plan_no_skip = minimal_plan();
-        plan_no_skip.skip_empty = false;
-        let (result_no_skip, summary_no_skip) = run(&mut EmptySource, &plan_no_skip);
-        result_no_skip.expect("no skip_empty+0 rows must succeed");
-        assert_ne!(summary_no_skip.status, "skipped");
     }
 
     // ── quality gate ──────────────────────────────────────────────────────────

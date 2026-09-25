@@ -12,16 +12,20 @@
 use crate::destination::gcs::GcsStore;
 use crate::types::target::{TargetColumnSpec, TargetStatus};
 use anyhow::{Context, Result, bail};
+use staging::maybe_cleanup;
 
 mod bigquery;
 mod bq_rest;
 pub mod cdc;
+pub mod compact;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
+mod pin;
 pub mod plan;
 pub(crate) mod pool;
 pub mod reconcile;
 mod snowflake;
+mod staging;
 
 pub use bigquery::BigQueryLoader;
 pub use snowflake::SnowflakeLoader;
@@ -464,77 +468,6 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
     }
 }
 
-/// What `rivet compact` may do with the base it is about to MERGE into.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CompactGate {
-    Go,
-    /// Proceed, saying why the check could not be made.
-    Note(String),
-    Refuse(String),
-}
-
-/// Whether the buffer may be merged into `base_fqtn`, from the two facts the
-/// glue can cheaply fetch: what the base currently IS, and whether the ledger
-/// knows rivet loaded it.
-///
-/// The load path checks both before it overwrites a table; compaction wrote
-/// through BigQuery's own error message instead — `Not found: Table ... in
-/// location US` for an absent base, and NOTHING at all for a base rivet never
-/// loaded, which a MERGE would happily rewrite.
-pub(crate) fn compact_gate(
-    base: ObjectKind,
-    ownership: Ownership,
-    base_fqtn: &str,
-    buffer_fqtn: &str,
-) -> CompactGate {
-    match (base, ownership) {
-        (ObjectKind::Absent, _) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the base table does not \
-             exist. The buffer holds changes for a table that was never loaded — load the \
-             backfill first (the `cdc.backfill:` export builds the base), or drop the buffer \
-             to discard EVERY change buffered since the last compaction (it accumulates \
-             across loads). Nothing was merged and the buffer is untouched"
-        )),
-        // Both layout levers are named, written one FIRST, because they have a
-        // PRECEDENCE and this message used to name only the loser. `cdc_layout`
-        // matches a written `load.layout:` before it consults `cdc.backfill:`
-        // (plan.rs), and `rivet init` WRITES `layout: base_buffer` for every
-        // compactable export — so "remove `cdc.backfill:`" was a no-op on the
-        // generated config, returning this very refusal again, which left the
-        // destructive branch as the only instruction that worked. The sibling
-        // predicate `compact_skip_reason` has always named both.
-        (ObjectKind::View, _) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
-             current-state view of the changelog+view layout, which has no base to merge into. \
-             To move to base+buffer, drop the view and `{buffer_fqtn}`; to stay on the view, \
-             set `load.layout: log_view` (or delete a written `layout:` key — a written one \
-             WINS over `cdc.backfill:`, and `rivet init` writes it), and remove `cdc.backfill:` \
-             from the export if it has one"
-        )),
-        (ObjectKind::Other, _) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
-             table nor a view"
-        )),
-        (ObjectKind::Table, Ownership::Foreign) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
-             DB's load ledger has no record of rivet loading it — a MERGE would rewrite someone \
-             else's rows. Drop or rename it, or point the export at another table"
-        )),
-        (ObjectKind::Table, Ownership::Unreadable) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the load ledger could not be \
-             read to confirm rivet loaded it. This is NOT the stateless case — a ledger is \
-             configured and the query failed, so a MERGE may rewrite someone else's rows and the \
-             record that would prove otherwise is unavailable. Fix the state backend and re-run; \
-             nothing was merged and the buffer is untouched"
-        )),
-        (ObjectKind::Table, Ownership::Unknown) => CompactGate::Note(format!(
-            "  note: `{base_fqtn}` exists and there is no load ledger to confirm rivet loaded it \
-             — compacting on its shape alone"
-        )),
-        (ObjectKind::Table, Ownership::Own) => CompactGate::Go,
-    }
-}
-
 /// Refuse a whole-table load onto a table that is not rivet's own, differs in shape, or is a view.
 fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Ownership) -> Result<()> {
     let fqtn = loader.fqtn(table);
@@ -706,26 +639,6 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Clean up iff `cleanup` is `Some`, downgrading a failure to a warning — the
-/// data is loaded and gated, so a stuck delete must not fail the load. Cleanup
-/// runs the driver's own [`delete_under`] over an injected [`GcsStore`], so no
-/// adapter owns a delete path. Returns whether the source was actually cleaned.
-fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
-    match cleanup {
-        Some((store, prefix)) => match delete_under(store, prefix) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!(
-                    "warning: source cleanup failed (data is safely loaded): {}",
-                    crate::redact::redact_secrets(&format!("{e:#}"))
-                );
-                false
-            }
-        },
-        None => false,
-    }
 }
 
 /// **Batch load driver.** Materialize `table` from `uris`, gate the landed rows
@@ -1175,18 +1088,6 @@ pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
     Ok((bucket, key))
 }
 
-/// Recursively delete a whole export-dedicated `gs://…/` prefix through an
-/// injected [`GcsStore`] — the driver's post-gate source cleanup, over the same
-/// native opendal GCS client the export destination uses (no `gcloud`). Taking
-/// the store as an argument (rather than each adapter building one from a
-/// config) is what lets an fs-backed store exercise this delete offline.
-pub(crate) fn delete_under(store: &GcsStore, gs_prefix: &str) -> Result<()> {
-    let (_, rel) = split_gs_uri(gs_prefix)?;
-    store
-        .remove_all(rel)
-        .with_context(|| format!("source cleanup (recursive delete of {gs_prefix}) failed"))
-}
-
 /// Open the one [`GcsStore`] a load reuses for reconcile, URI listing, and
 /// post-gate cleanup — the single production constructor `cli::dispatch` calls.
 ///
@@ -1269,6 +1170,7 @@ fn build_bigquery_loader(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::load::staging::delete_under;
 
     #[test]
     fn only_a_name_that_is_plain_once_its_cyrillic_lookalikes_are_latin_folds() {
@@ -1314,6 +1216,12 @@ pub(crate) mod tests {
         /// expired credential. Distinct from every `kinds` entry, which can only say
         /// what an object IS; the difference decides whether a stop is journaled as a
         /// refusal or as a failure, and only the failure forges ownership.
+        /// Say what `table` is when the driver probes it.
+        pub(crate) fn with_kind(self, table: &str, kind: ObjectKind) -> Self {
+            self.kinds.borrow_mut().insert(table.into(), kind);
+            self
+        }
+
         pub(crate) fn probe_fails(reason: &str) -> Self {
             Self {
                 kind_error: Some(reason.to_string()),
@@ -2554,121 +2462,6 @@ pub(crate) mod tests {
         assert!(
             f.appended.borrow().is_empty() && f.views.borrow().is_empty(),
             "must bail before appending or building the view"
-        );
-    }
-}
-
-#[cfg(test)]
-mod compact_gate_tests {
-    use super::*;
-
-    /// Every shape the base can be in when `rivet compact` reaches it. The two
-    /// silent ones are why this exists: an ABSENT base used to surface as
-    /// BigQuery's `Not found: Table`, and a FOREIGN one was not checked at all —
-    /// the MERGE would have rewritten rows rivet never loaded.
-    #[test]
-    fn the_compact_gate_refuses_every_base_that_is_not_rivets_own_table() {
-        let go = compact_gate(ObjectKind::Table, Ownership::Own, "p.d.t", "p.d.t__changes");
-        assert_eq!(go, CompactGate::Go);
-
-        let unknown = compact_gate(
-            ObjectKind::Table,
-            Ownership::Unknown,
-            "p.d.t",
-            "p.d.t__changes",
-        );
-        let CompactGate::Note(note) = unknown else {
-            panic!("a stateless compact proceeds with a note: {unknown:?}")
-        };
-        assert!(note.contains("no load ledger"), "{note}");
-
-        // An UNREADABLE ledger is not an ABSENT one, and the two must not share the
-        // Note arm: `Unknown` means the operator chose to run without a ledger, while
-        // `Unreadable` means the ledger that would have said "foreign" is the thing
-        // that broke. Both used to arrive here as `Unknown`.
-        let unreadable = compact_gate(
-            ObjectKind::Table,
-            Ownership::Unreadable,
-            "p.d.t",
-            "p.d.t__changes",
-        );
-        assert!(
-            matches!(unreadable, CompactGate::Refuse(_)),
-            "an unreadable ledger must REFUSE, never proceed like a stateless run: {unreadable:?}"
-        );
-        let CompactGate::Refuse(msg) = &unreadable else {
-            unreachable!()
-        };
-        assert!(
-            msg.contains("NOT the stateless case"),
-            "the refusal must say which of the two empty answers this is: {msg}"
-        );
-
-        for (kind, ownership, wanted) in [
-            (
-                ObjectKind::Absent,
-                Ownership::Own,
-                "the base table does not exist",
-            ),
-            (ObjectKind::View, Ownership::Own, "that name is a VIEW"),
-            (
-                ObjectKind::Other,
-                Ownership::Own,
-                "neither a table nor a view",
-            ),
-            (
-                ObjectKind::Table,
-                Ownership::Foreign,
-                "no record of rivet loading it",
-            ),
-            (
-                ObjectKind::Table,
-                Ownership::Unreadable,
-                "could not be read",
-            ),
-        ] {
-            let gate = compact_gate(kind, ownership, "p.d.t", "p.d.t__changes");
-            let CompactGate::Refuse(msg) = gate else {
-                panic!("{kind:?}/{ownership:?} must refuse: {gate:?}")
-            };
-            assert!(msg.contains(wanted), "{kind:?}/{ownership:?}: {msg}");
-            assert!(
-                msg.contains("`p.d.t__changes`") && msg.contains("`p.d.t`"),
-                "the refusal names both tables: {msg}"
-            );
-        }
-    }
-
-    /// The VIEW refusal names the layout lever that actually DECIDES.
-    ///
-    /// It offered two escapes and the non-destructive one was inert on exactly the
-    /// configs rivet generates: `cdc_layout` matches a WRITTEN `load.layout:` before
-    /// it consults `cdc.backfill:`, and `rivet init` writes `layout: base_buffer` for
-    /// every compactable export. So "remove `cdc.backfill:` from the export" returned
-    /// this same refusal, and the only instruction that worked was the destructive
-    /// one — drop the view. On a `mode: incremental` export it was worse than inert:
-    /// a `cdc:` block is a config-load error there, so the key named cannot exist.
-    ///
-    /// This pins the SPELLINGS, not a fragment both would satisfy — the key with its
-    /// underscore and the block it lives in — because the assertion that let the
-    /// `--allow-source-drift` message stay wrong for months was one loose enough to
-    /// admit either form.
-    #[test]
-    fn the_view_refusal_names_the_written_layout_key_that_overrides_the_derived_one() {
-        let gate = compact_gate(ObjectKind::View, Ownership::Own, "p.d.t", "p.d.t__changes");
-        let CompactGate::Refuse(msg) = gate else {
-            panic!("a VIEW base must refuse: {gate:?}")
-        };
-        assert!(
-            msg.contains("`load.layout: log_view`"),
-            "the non-destructive escape must name the key that WINS, with its block and \
-             its underscore — a message naming only `cdc.backfill:` sends the operator \
-             to a no-op on every generated config: {msg}"
-        );
-        assert!(
-            msg.contains("WINS over `cdc.backfill:`"),
-            "and it must say WHICH lever wins, or the reader cannot tell why removing \
-             the other one changed nothing: {msg}"
         );
     }
 }

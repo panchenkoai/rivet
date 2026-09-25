@@ -143,7 +143,7 @@ exports:
     mode: incremental
     cursor_column: updated_at
     format: parquet
-    skip_empty: true            # no file when there are no new rows
+    skip_empty: true            # a run with no new rows reports `skipped`
     destination:
       type: local
       path: ./output

@@ -8,7 +8,7 @@
 //! about adding one prompts a look at the sweep.
 //!
 //! So neither enumeration is typed in here. The field names are parsed out of
-//! `src/config/export.rs`; the hook names out of the `maybe_panic_at("cdc_…")`
+//! `src/config/cdc.rs`; the hook names out of the `maybe_panic_at("cdc_…")`
 //! call sites. Adding a knob or a fault point fails this test until the ledger
 //! says how it is swept — or says `na`, with a reason, which is also an answer.
 //!
@@ -25,7 +25,7 @@ use std::fs;
 use serde_yaml_ng::Value;
 
 const MATRIX: &str = "docs/cdc-axis-matrix.yaml";
-const CONFIG: &str = "src/config/export.rs";
+const CONFIG: &str = "src/config/cdc.rs";
 const SINK: &str = "src/source/cdc/sink.rs";
 const CDC_MOD: &str = "src/source/cdc/mod.rs";
 const SWEEP: &str = "dev/pytools/cdc_sweep.py";

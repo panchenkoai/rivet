@@ -391,7 +391,8 @@ fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
         skip_live("ping: read_concern: snapshot needs MongoDB 5.0+ (server is 4.x)");
         return;
     }
-    m.drop_collection("t");
+    // EMPTY, not absent: a batch export of an absent collection is refused (0.28).
+    m.create_empty_collection("t");
 
     let rig = Rig::mongo_batch("t")
         .source_url(&MongoTest::url(RS_PORT, &db))
@@ -426,7 +427,8 @@ fn mongo_batch_no_cursor_timeout_false_empty_first_run_then_populated() {
     require_alive(LiveService::Mongo);
     let db = unique_name("mnct");
     let m = MongoTest::connect(PORT, &db);
-    m.drop_collection("t");
+    // EMPTY, not absent: a batch export of an absent collection is refused (0.28).
+    m.create_empty_collection("t");
 
     // page_size forces a paged (multi-cursor) scan — where the cursor flag applies.
     let rig = batch(&db, "t").mongo("page_size: 400, no_cursor_timeout: false");

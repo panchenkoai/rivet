@@ -14,6 +14,9 @@
 
 use crate::error::Result;
 use crate::load;
+use crate::load::partition_budget::{budgeted_uris, partition_budget_ok, partition_label};
+use crate::load::pin::{late_runs_refusal, pin_plan_to_its_run};
+use crate::load::staging::{cleanup_target_leased, ledger_writers, maybe_gc_orphans};
 use crate::state::{LoadRecord, StateRef, StateStore};
 use anyhow::Context as _;
 
@@ -23,15 +26,6 @@ pub struct LoadArgs {
     /// Rebuild a change log whose partition differs from the config (ADR-0034 D5).
     pub rebuild_changelog: bool,
     /// Worker threads to load the config's tables on; `None` takes the default
-    /// pool (16, capped at the table count), not a sequential pass.
-    pub pool: Option<usize>,
-}
-
-/// `rivet compact` arguments.
-pub struct CompactArgs {
-    pub config: String,
-    pub run_id: Option<String>,
-    /// Worker threads to merge the config's tables on; `None` takes the default
     /// pool (16, capped at the table count), not a sequential pass.
     pub pool: Option<usize>,
 }
@@ -49,20 +43,15 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // truth for what's loaded, so cleanup is safe for every mode and retry is
     // DB-driven (the GCS listing is only a fallback). A state-DB problem must
     // never fail a load — degrade to the stateless path.
-    let (state, ledger_errored) = match StateStore::open(&args.config) {
-        Ok(s) => (Some(s), false),
-        Err(e) => {
-            eprintln!(
-                "  warning: state store unavailable ({e:#}); loading without a ledger \
-                 (no incremental skip / audit log)"
-            );
-            // The ERRORED half of the tri-state (round-9): `state=None` alone
-            // conflated a DB blip with absent-by-design, and the re-baseline
-            // guard then note-and-proceeded a doomed post-gap baseline on the
-            // very host whose ledger just blipped.
-            (None, true)
-        }
-    };
+    let state = open_state(
+        &args.config,
+        "loading without a ledger (no incremental skip / audit log)",
+    );
+    // The ERRORED half of the tri-state (round-9): `state=None` alone
+    // conflated a DB blip with absent-by-design, and the re-baseline
+    // guard then note-and-proceeded a doomed post-gap baseline on the
+    // very host whose ledger just blipped.
+    let ledger_errored = state.is_none();
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
     eprintln!(
         "{}: resolved {} table(s) → {} [run_id={}]: {}",
@@ -104,22 +93,12 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // `state_ref` is `Some` only when the parent's own open SUCCEEDED, so the
     // refusal below always fires for it. Stateless is reachable only through the
     // parent's degradation above, where no worker ever had a ledger to lose.
-    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
     // The parent store has done its job: it migrated the schema before any thread
     // starts (the order `pipeline/run.rs` uses) and handed over its `StateRef`.
     // Holding it left `--pool 1` with TWO connections and TWO migrations — on BOTH
     // backends, since the Postgres arm of `open_at_ref` migrates too — where the
     // sequential loop had one of each.
-    let parent_had_state = state.is_some();
-    drop(state);
-    let ledger = match &state_ref {
-        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
-        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
-        None => load::pool::LedgerKind::Absent,
-    };
-    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), ledger) {
-        eprintln!("  warning: {w}");
-    }
+    let (state_ref, parent_had_state) = hand_off_state(state, args.pool, plans.len());
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
@@ -130,19 +109,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // per-worker DB blip with absent-by-design — the conflation round-9 already
         // paid for, where the re-baseline guard note-and-proceeds a doomed post-gap
         // baseline on the very host whose ledger just blipped.
-        || match state_ref.as_ref() {
-            None => Some((None, ledger_errored)),
-            Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => Some((Some(s), ledger_errored)),
-                Err(e) => {
-                    eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); it takes \
-                         no table — the other workers load the queue"
-                    );
-                    None
-                }
-            },
-        },
+        || reconnect(state_ref.as_ref(), "load").map(|s| (s, ledger_errored)),
         |worker, _idx, plan| {
             let (state, ledger_errored) = (&worker.0, worker.1);
             // A worker that lost a ledger the RUN started with refuses its table.
@@ -280,187 +247,16 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // fit BOTH: its load panicked, or no worker survived to take it (an `init`
         // that panicked retires its worker). Naming only the panic sent an operator
         // to report a bug in a table where nothing had run at all.
-        |plan| {
-            anyhow::anyhow!(
-                "load '{}' did not complete — it PANICKED (a bug, please report it), or \
-                 no worker was left to take it (each one panicked or could not reopen the \
-                 state ledger — see the warnings above). Reported as this table's failure \
-                 so every other table still aggregates",
-                plan.table
-            )
-        },
+        |plan| no_outcome_error("load", &plan.table),
     );
     // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
     // the table, whatever order the workers finished in — so the representative
     // `aggregate_load_failures` picks out of a tie is the same on every run.
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    for outcome in outcomes {
-        if let Err(e) = outcome {
-            failures.push(e);
-        }
-    }
+    let failures = failures_of(outcomes);
     match aggregate_load_failures(failures) {
         Some(e) => Err(e),
         None => Ok(()),
     }
-}
-
-/// `plan` retyped from the spec of the NEWEST loadable run under its own prefix.
-///
-/// `plan_loads` types every table from `export_load_spec`, one row per export
-/// NAME — last writer wins. On a state DB shared by two configs whose exports
-/// share a name, the other config's run retypes this table between the run and
-/// its load (the release gate's engine matrix does exactly this with `users`:
-/// a `_id` key on a PostgreSQL table, another engine's DDL). The per-run table
-/// (`export_load_spec_run`) is written only by the run that produced the parts,
-/// so pinning the plan to that run's spec removes the race by construction.
-///
-/// Glue: one extra manifest listing per table, then `retype_plan`. Every path
-/// that cannot pin — no state, no store, no manifest, a run older than the
-/// per-run table — keeps the plan as typed and says so; it never fails the load.
-fn pin_plan_to_its_run(
-    plan: &load::plan::LoadPlan,
-    state: Option<&StateStore>,
-    cfg: &crate::config::Config,
-    op: &str,
-) -> Result<load::plan::LoadPlan> {
-    plan.refused()?;
-    // The by-name plan was built with its fit DEFERRED (`SpecFit::Deferred`), so
-    // a path that keeps it owes the strict check the pin would have done.
-    let unpinned = |why: &str| {
-        eprintln!(
-            "  {op} [{}]: typed from the by-name load spec — {why}",
-            plan.table
-        );
-        load::plan::check_spec_fit(plan)?;
-        Ok(plan.clone())
-    };
-    let Some(s) = state else {
-        return unpinned("no state DB, so no per-run spec to pin to");
-    };
-    // Newest first. The listing under `<table>/` also holds the baseline LEGS'
-    // manifests (`snapshot/`, their own run ids, no spec of their own — a leg is a
-    // read recipe), so "the newest run" is "the newest run that RECORDED a spec".
-    let runs = match load::open_store(&plan.destination)
-        .and_then(|store| load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix))
-        .and_then(|keyed| {
-            load::reconcile::select_runs(keyed, &std::collections::HashSet::new(), plan.mode)
-        }) {
-        Ok(runs) => runs,
-        Err(e) => return unpinned(&format!("could not list its runs ({e:#})")),
-    };
-    let mut newest_first: Vec<(String, String)> = runs
-        .into_iter()
-        .map(|(_, m)| (m.finished_at.clone(), m.run_id))
-        .collect();
-    if newest_first.is_empty() {
-        return unpinned("no run left to load under its prefix");
-    }
-    // ONE definition of "newer" — the census's instant compare, not a byte compare
-    // that mis-orders mixed RFC3339 precision; ties fall to the run id.
-    newest_first.sort_by(|a, b| {
-        use std::cmp::Ordering;
-        if crate::manifest::census::finished_after(&a.0, &b.0) {
-            Ordering::Less
-        } else if crate::manifest::census::finished_after(&b.0, &a.0) {
-            Ordering::Greater
-        } else {
-            b.1.cmp(&a.1)
-        }
-    });
-    let mut pinned: Option<(String, String, crate::state::LoadSpec)> = None;
-    // Newer Success runs that recorded no spec (a crash after the manifest and
-    // before the spec write; a drain that acked parts then failed) are typed from
-    // the older pinned run — said so, since a column added between them is
-    // exactly what the pin exists to type.
-    let mut skipped: Vec<&str> = Vec::new();
-    for (finished_at, run_id) in &newest_first {
-        // With the init-recorded key when the run recorded none (a `query:` export
-        // has no key to read) — never with a key another run wrote by name.
-        match s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), run_id) {
-            Ok(Some(spec)) => {
-                pinned = Some((run_id.clone(), finished_at.clone(), spec));
-                break;
-            }
-            Ok(None) => {
-                skipped.push(run_id);
-                continue;
-            }
-            Err(e) => {
-                return unpinned(&format!("run {run_id}'s own spec is unreadable ({e:#})"));
-            }
-        }
-    }
-    let Some((run_id, finished_at, spec)) = pinned else {
-        return unpinned(&format!(
-            "none of its {} loadable run(s) recorded a per-run spec (runs older than this \
-             release, baseline legs only, a run that crashed after its manifest and before \
-             its spec write, or a continuous stream — `until_current: false` — that was \
-             stopped rather than finished, which records nothing)",
-            newest_first.len()
-        ));
-    };
-    if let Some(note) = skipped_runs_note(&plan.table, &run_id, &skipped) {
-        eprintln!("{note}");
-    }
-    let pinned_names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
-    let loaded = s
-        .loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table))
-        .unwrap_or_default();
-    let mut respelled: Vec<(String, String, String)> = Vec::new();
-    for older in runs_loaded_with_the_pin(op, plan.mode, &newest_first, &run_id, &loaded) {
-        if let Ok(Some(o)) =
-            s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), older)
-        {
-            let names: Vec<&str> = o.columns.iter().map(|c| c.name.as_str()).collect();
-            for (was, now) in load::plan::lookalike_spelling_changes(&pinned_names, &names) {
-                respelled.push((older.to_string(), was, now));
-            }
-        }
-    }
-    if let Some(refusal) = respelled_refusal(&plan.table, &run_id, &respelled) {
-        anyhow::bail!("{refusal}");
-    }
-    let Some(target) = crate::types::target::ExportTarget::parse(plan.load.target.name()) else {
-        return unpinned("unknown load target");
-    };
-    // A readable spec the config does not fit is a REFUSAL, not a fallback: the
-    // by-name spec is exactly what this pin exists to distrust.
-    let mut retyped = load::plan::retype_plan(cfg, plan, &spec, target).with_context(|| {
-        format!(
-            "{op} [{}]: the config does not fit the columns run {run_id} recorded — if the \
-             config changed after that run (a new `pk:` / `partition.column`), run `rivet run \
-             -e {}` once so a run records the column, then {op} again",
-            plan.table, plan.export_name
-        )
-    })?;
-    retyped.refused()?;
-    retyped.pinned_run = Some((run_id, finished_at));
-    Ok(retyped)
-}
-
-/// Runs in this listing that finished AFTER the run the plan was typed from: a
-/// run landing between the pin's listing and the load's would be loaded with an
-/// older spec's columns. Refused for this cycle; the next load pins it.
-fn late_runs_refusal(
-    table: &str,
-    runs: &[(String, crate::manifest::RunManifest)],
-    pin: Option<&(String, String)>,
-) -> Option<String> {
-    let (pinned_id, pinned_at) = pin?;
-    let late: Vec<&str> = runs
-        .iter()
-        .filter(|(_, m)| crate::manifest::census::finished_after(&m.finished_at, pinned_at))
-        .map(|(_, m)| m.run_id.as_str())
-        .collect();
-    (!late.is_empty()).then(|| {
-        format!(
-            "load [{table}]: run(s) {} finished after run {pinned_id}, which this load was \
-             typed from — a run landed between typing and listing. Run `rivet load` again to \
-             type from the newest run.",
-            late.join(", ")
-        )
-    })
 }
 
 /// The typo warning for a prefix with no manifests — unless the ledger says runs were loaded from it, which `cleanup_source` then emptied.
@@ -484,61 +280,6 @@ fn nothing_to_load(mode: load::plan::LoadMode, no_files: bool) -> bool {
     no_files && mode != load::plan::LoadMode::Full
 }
 
-/// The runs listed after `pinned` in a newest-first listing; none when it is absent.
-fn runs_older_than<'a>(
-    newest_first: &'a [(String, String)],
-    pinned: &str,
-) -> &'a [(String, String)] {
-    let start = newest_first
-        .iter()
-        .position(|(_, id)| id == pinned)
-        .map_or(newest_first.len(), |i| i + 1);
-    &newest_first[start..]
-}
-
-/// The older runs this load will read alongside the pinned one: none for a compact (it reads only the landed buffer) or a full load (only the newest run), and never one already loaded.
-fn runs_loaded_with_the_pin<'a>(
-    op: &str,
-    mode: load::plan::LoadMode,
-    newest_first: &'a [(String, String)],
-    pinned: &str,
-    loaded: &std::collections::HashSet<String>,
-) -> Vec<&'a str> {
-    if op == "compact" || mode == load::plan::LoadMode::Full {
-        return Vec::new();
-    }
-    runs_older_than(newest_first, pinned)
-        .iter()
-        .map(|(_, id)| id.as_str())
-        .filter(|id| !loaded.contains(*id))
-        .collect()
-}
-
-/// The refusal for pending runs that spell a column differently from the run the load is typed from; `None` when none do.
-fn respelled_refusal(
-    table: &str,
-    pinned: &str,
-    respelled: &[(String, String, String)],
-) -> Option<String> {
-    if respelled.is_empty() {
-        return None;
-    }
-    let list = respelled
-        .iter()
-        .map(|(run, was, now)| format!("run {run} wrote `{was}` where run {pinned} writes `{now}`"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Some(format!(
-        "load [{table}]: {list}. The source column was renamed while the older run(s) were \
-         still unloaded, and one load cannot read both spellings: BigQuery matches Parquet \
-         columns by name, so the older files would load that column as NULL. Nothing was \
-         loaded and nothing is lost — every run stays staged. rivet cannot load the two \
-         spellings in one pass yet. To clear it by hand: load the older run(s)' files into a \
-         scratch table declaring the column under its OLD spelling, rename it there, append \
-         those rows to the warehouse table, and only then delete those runs' manifest(s)."
-    ))
-}
-
 /// The refusal when another `rivet load` or `rivet compact` holds the table's lease —
 /// both take the same per-table lease, so either may be the holder.
 fn lease_busy_message(target_fqtn: &str) -> String {
@@ -547,19 +288,6 @@ fn lease_busy_message(target_fqtn: &str) -> String {
          lease is held; it is released when that process ends, crash included). Wait for it, \
          then retry."
     )
-}
-
-/// The stderr line naming the newer runs the pin passed over, or `None` when the
-/// pinned run is the newest. Pure: the live-only pin decides through it.
-fn skipped_runs_note(table: &str, pinned: &str, skipped: &[&str]) -> Option<String> {
-    (!skipped.is_empty()).then(|| {
-        format!(
-            "  load [{table}]: typed from run {pinned}; {} newer run(s) recorded no spec and \
-             are loaded with its columns: {}",
-            skipped.len(),
-            skipped.join(", ")
-        )
-    })
 }
 
 /// Does this invocation have to resolve the source's `__pos` parse ENGINE?
@@ -571,7 +299,7 @@ fn skipped_runs_note(table: &str, pinned: &str, skipped: &[&str]) -> Option<Stri
 /// and inverted it resolves an engine for every BATCH config while leaving every
 /// CDC config with `None` — where `engine.expect(..)` then PANICS on exactly the
 /// configs the parse engine exists for.
-fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
+pub(super) fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
     plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
 }
 
@@ -607,9 +335,101 @@ pub(crate) fn aggregate_load_failures(mut failures: Vec<anyhow::Error>) -> Optio
     )))
 }
 
+/// The parent's state store, or `None` — warned, naming the `fallback` — when it cannot be opened.
+pub(super) fn open_state(config: &str, fallback: &str) -> Option<StateStore> {
+    match StateStore::open(config) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("  warning: state store unavailable ({e:#}); {fallback}");
+            None
+        }
+    }
+}
+
+/// Close the parent store and warn on the pool's connection ceiling; returns its `StateRef` and whether it had one.
+pub(super) fn hand_off_state(
+    state: Option<StateStore>,
+    pool: Option<usize>,
+    tables: usize,
+) -> (Option<StateRef>, bool) {
+    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
+    let parent_had_state = state.is_some();
+    drop(state);
+    let ledger = match &state_ref {
+        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
+        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
+        None => load::pool::LedgerKind::Absent,
+    };
+    if let Some(w) = load::pool::pool_ceiling_warning(pool, tables, ledger) {
+        eprintln!("  warning: {w}");
+    }
+    (state_ref, parent_had_state)
+}
+
+/// A worker's reconnect to the parent's backend: `Some(None)` when stateless, `None` (warned) when it failed.
+pub(super) fn reconnect(state_ref: Option<&StateRef>, verb: &str) -> Option<Option<StateStore>> {
+    match state_ref {
+        None => Some(None),
+        Some(r) => match StateStore::open_at_ref(r) {
+            Ok(s) => Some(Some(s)),
+            Err(e) => {
+                eprintln!(
+                    "  warning: state store unavailable to this worker ({e:#}); it takes \
+                     no table — the other workers {verb} the queue"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// The failure reported for a table that ended with no outcome of its own.
+pub(super) fn no_outcome_error(op: &str, table: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{op} '{table}' did not complete — it PANICKED (a bug, please report it), or \
+         no worker was left to take it (each one panicked or could not reopen the \
+         state ledger — see the warnings above). Reported as this table's failure \
+         so every other table still aggregates"
+    )
+}
+
+/// The failed outcomes, in the order the pool returned them.
+pub(super) fn failures_of(outcomes: Vec<Result<()>>) -> Vec<anyhow::Error> {
+    outcomes.into_iter().filter_map(Result::err).collect()
+}
+
+/// The table's lease (`None` when stateless); refuses when another load or compact holds it.
+pub(super) fn take_table_lease<'a>(
+    state: Option<&'a StateStore>,
+    target_fqtn: &str,
+) -> Result<Option<crate::state::LoadLease<'a>>> {
+    match state.map(|s| s.try_load_lease(target_fqtn)).transpose()? {
+        Some(None) => anyhow::bail!("{}", lease_busy_message(target_fqtn)),
+        held => Ok(held.flatten()),
+    }
+}
+
+/// Whether the ledger says rivet loaded `fqtn`; `Unreadable` (warned) when the probe fails.
+pub(super) fn ownership_of(state: Option<&StateStore>, fqtn: &str, op: &str) -> load::Ownership {
+    match state {
+        Some(s) => match s.has_load_attempt(fqtn) {
+            Ok(true) => load::Ownership::Own,
+            Ok(false) => load::Ownership::Foreign,
+            Err(e) => {
+                log::warn!(
+                    "{op}: the ownership probe for {fqtn} failed ({e:#}) — refusing rather \
+                     than treating it as a stateless {op}"
+                );
+                load::Ownership::Unreadable
+            }
+        },
+        None => load::Ownership::Unknown,
+    }
+}
+
 /// The resolved dedup key for an append mode (`cdc` / `incremental`); bails with a
 /// config-fix hint when neither the config nor the recorded source key gives one.
-fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
+pub(super) fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
     if plan.pk.is_empty() {
         anyhow::bail!(
             "export `{}` is mode: {mode} but has no primary key for the current-state dedup \
@@ -619,270 +439,6 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
         );
     }
     Ok(&plan.pk)
-}
-
-/// What the run-status LEDGER says about a prefix, folded from the three answers
-/// it can give. Pure, because the fold IS the decision and both its callers are
-/// live-only bodies (a real bucket, a real state DB) that the in-diff mutation
-/// gate reports MISSED whatever the assertions say.
-///
-/// * `None` — there is no state store to ask (a stateless or foreign-host load).
-///   NOT active: the manifest signal decides alone, exactly as the orphan path
-///   does.
-/// * `Some(Err(_))` — the query failed. ACTIVE, conservatively: a delete that
-///   spares too much costs disk, while one that removes a live run's committed
-///   parts costs data — and on a CDC/incremental export the source position has
-///   already advanced past them.
-/// * `Some(Ok(b))` — the ledger's own answer, used as given.
-fn ledger_says_active(answer: Option<Result<bool>>) -> bool {
-    match answer {
-        None => false,
-        Some(Ok(active)) => active,
-        Some(Err(_)) => true,
-    }
-}
-
-/// Fold the two INDEPENDENT activity signals into one verdict: the run-status
-/// ledger (precise when this load shares the extract's state — co-located /
-/// shared Postgres) and a `running` MARKER manifest projected into the bucket
-/// (the cross-boundary signal a stateless / foreign-host load reads when it
-/// cannot see the extract's state DB).
-///
-/// Either one alone must be enough to spare the prefix: they answer for
-/// DIFFERENT deployments, so each is structurally silent where the other speaks.
-/// An `&&` here would demand agreement from a signal that cannot give it and
-/// delete a live run's committed parts — and that is precisely the mutant the
-/// in-diff gate reported alive (`replace || with && in maybe_gc_orphans`), in a
-/// body no offline test can reach.
-fn prefix_is_active(ledger_active: bool, manifest_active: bool) -> bool {
-    ledger_active || manifest_active
-}
-
-/// Is a run writing into this prefix right now?
-///
-/// The verdict `maybe_gc_orphans` already computes, extracted so the DESTRUCTIVE
-/// delete can ask the same question. `cleanup_source` recursively removes the
-/// whole prefix — every part, every manifest, `_SUCCESS` — while `gc_orphans`
-/// removes only parts no `Success` manifest references. The gentler of the two
-/// consulted the ledger and the total one did not, which is the guard placed in
-/// inverse proportion to what it protects. `src/load/plan.rs` states the
-/// relationship in its own words: gc_orphans is "strictly gentler than
-/// `cleanup_source`, which wipes the whole prefix".
-///
-/// Conservative in both directions, deliberately — see [`ledger_says_active`]
-/// for what each ledger answer means and [`prefix_is_active`] for why the two
-/// signals fold with `||`.
-///
-/// Takes the store the CALLER already opened instead of re-opening one from
-/// `plan.destination` (the two were always the same object). That makes this
-/// guard reachable from an offline test over a filesystem-backed store, which is
-/// the whole reason its `-> true` / `-> false` body stubs no longer need a
-/// mutation-config exclusion: a guard on a recursive delete should not be
-/// gradable only against a real bucket.
-fn prefix_has_active_run(
-    store: &crate::destination::gcs::GcsStore,
-    prefix: &str,
-    state: Option<&StateStore>,
-) -> bool {
-    let ledger_active = ledger_says_active(state.map(|s| s.has_active_run_on_prefix(prefix)));
-    if ledger_active {
-        // Short-circuit: the manifest signal costs a bucket LISTING and cannot
-        // change a `true` — `prefix_is_active(true, _)` is `true` either way.
-        return true;
-    }
-    let manifest_active = match load::reconcile::fetch_manifests_keyed(store, prefix) {
-        Ok(keyed) => load::reconcile::has_active_running_manifest(&keyed),
-        // Cannot read the manifests → cannot rule a live run out. Spare.
-        Err(_) => true,
-    };
-    prefix_is_active(ledger_active, manifest_active)
-}
-
-/// Whether `cleanup_source` actually deletes a prefix — the THREE outcomes the
-/// caller's `Option` collapses into one `None`.
-///
-/// Separated from the `Option` because "nobody asked" and "asked, and REFUSED
-/// because a run is writing here" are the same value to the caller and very
-/// different things to an operator, and because the `!` in front of the request
-/// flag is a decision the in-diff gate reported alive (`delete ! in
-/// cleanup_target`) inside a live-only body. Inverted, it deletes the whole
-/// prefix for every config that did NOT ask for cleanup and spares every config
-/// that did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupVerdict {
-    /// `cleanup_source` is off — no delete, and nothing to announce.
-    NotRequested,
-    /// Cleanup was requested but a run is writing into the prefix.
-    RefusedRunActive,
-    /// Delete the staged Parquet under the prefix.
-    Delete,
-}
-
-/// The verdict, pure. `active` is a CLOSURE so the activity probe — a state-DB
-/// query plus a bucket listing — still runs ONLY when cleanup was requested,
-/// exactly as the `if` chain it replaced did.
-fn cleanup_verdict(requested: bool, active: impl FnOnce() -> bool) -> CleanupVerdict {
-    if !requested {
-        return CleanupVerdict::NotRequested;
-    }
-    if active() {
-        return CleanupVerdict::RefusedRunActive;
-    }
-    CleanupVerdict::Delete
-}
-
-/// The delete target for `cleanup_source`, or `None` when a run is writing here.
-///
-/// Refusing is announced, not silent: an operator who asked for cleanup and did
-/// not get it must know the prefix still holds the staged Parquet.
-fn cleanup_target<'a>(
-    plan: &'a load::plan::LoadPlan,
-    store: &'a crate::destination::gcs::GcsStore,
-    state: Option<&StateStore>,
-) -> Option<(&'a crate::destination::gcs::GcsStore, &'a str)> {
-    match cleanup_verdict(plan.load.cleanup_source, || {
-        prefix_has_active_run(store, &plan.gcs_prefix, state)
-    }) {
-        CleanupVerdict::NotRequested => None,
-        CleanupVerdict::RefusedRunActive => {
-            eprintln!(
-                "  cleanup [{}]: SKIPPED — a run is writing into {} right now. Deleting the \
-                 prefix would remove parts that run has already committed, and on a \
-                 CDC/incremental export the source position has advanced past them. Re-run the \
-                 load once the extract has finished — or, if this is a DEAD crash remnant \
-                 (no extract is actually running), inspect it with `rivet state runs -c \
-                 <config> --running` and close it with `rivet state finish-run -c <config> \
-                 --run-id <id>`.",
-                plan.table, plan.gcs_prefix
-            );
-            None
-        }
-        CleanupVerdict::Delete => Some((store, plan.gcs_prefix.as_str())),
-    }
-}
-
-/// [`cleanup_target`], plus the PREFIX lease the delete has to hold while it runs.
-///
-/// The table lease dies with `execute_load`'s frame, and the cleanup runs AFTER
-/// that — so load A could finish, release the table, and only then wipe the prefix,
-/// while load B of the SAME table had already taken the freed lease and begun
-/// reading the manifests A was about to delete. A scheduler whose cycles overlap is
-/// all it takes; `prefix_has_active_run` cannot see it, because it reads
-/// `run_status`, which only EXTRACT runs write.
-///
-/// A separate PREFIX lease rather than a longer table lease, deliberately: widening
-/// the table lease would hold it across network deletes and lengthen the window in
-/// which `rivet compact` is refused, for a resource compact never touches.
-///
-/// Every answer but "held" cancels the delete. Stateless is the exception and stays
-/// as it was — there is no lease to take and no second rivet to coordinate with, so
-/// refusing there would break the documented stateless path for nothing.
-fn cleanup_target_leased<'a>(
-    plan: &'a load::plan::LoadPlan,
-    store: &'a crate::destination::gcs::GcsStore,
-    state: Option<&'a StateStore>,
-) -> (
-    Option<(&'a crate::destination::gcs::GcsStore, &'a str)>,
-    Option<crate::state::LoadLease<'a>>,
-) {
-    let target = cleanup_target(plan, store, state);
-    if target.is_none() {
-        return (None, None);
-    }
-    let Some(s) = state else {
-        return (target, None);
-    };
-    match s.try_load_lease(&plan.gcs_prefix) {
-        Ok(Some(lease)) => (target, Some(lease)),
-        Ok(None) => {
-            eprintln!(
-                "  cleanup [{}]: SKIPPED — another rivet holds {} right now. The load itself \
-                 succeeded; only the staged Parquet is left in place, and the next load with \
-                 `cleanup_source` removes it.",
-                plan.table, plan.gcs_prefix
-            );
-            (None, None)
-        }
-        Err(e) => {
-            eprintln!(
-                "  cleanup [{}]: SKIPPED — could not take the prefix lease on {} ({e:#}). \
-                 Not deleting what cannot be confirmed idle; the load itself succeeded.",
-                plan.table, plan.gcs_prefix
-            );
-            (None, None)
-        }
-    }
-}
-
-/// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):
-/// delete staged `.parquet` no `Success` manifest references — an interrupted
-/// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
-/// already succeeded before this runs.
-///
-/// Gated on whether a run is ACTIVE on the prefix ([`prefix_is_active`]), so it
-/// never deletes a CONCURRENT extract's committed-but-not-yet-manifested parts.
-/// Only when NEITHER signal says active does a no-manifest part count as dead
-/// crash debris.
-fn maybe_gc_orphans(
-    store: &crate::destination::gcs::GcsStore,
-    plan: &load::plan::LoadPlan,
-    state: Option<&StateStore>,
-) {
-    let keyed = match load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!(
-                "  gc-orphans [{}]: skipped (manifest fetch failed): {e:#}",
-                plan.table
-            );
-            return;
-        }
-    };
-    // A query ERROR stays conservative (assume active → spare); a clean `false`
-    // (no running row) lets the manifest signal decide.
-    let ledger_active =
-        ledger_says_active(state.map(|s| s.has_active_run_on_prefix(&plan.gcs_prefix)));
-    let active = prefix_is_active(
-        ledger_active,
-        load::reconcile::has_active_running_manifest(&keyed),
-    );
-    // Which `running` MARKERS the ledger already knows are dead (`state
-    // finish-run`, the split ceased-ordinal stamp): their run_id has a
-    // TERMINAL row, so the sweep may retire the marker even though no Success
-    // ever superseded it. Stateless → empty → conservative sweep only.
-    let dead_marker_run_ids: std::collections::HashSet<String> = match state {
-        Some(s) => keyed
-            .iter()
-            .filter(|(_, m)| m.status == crate::manifest::ManifestStatus::Running)
-            .filter(|(_, m)| {
-                matches!(
-                    s.run_status_of(&m.run_id),
-                    Ok(Some(status)) if status != "running"
-                )
-            })
-            .map(|(_, m)| m.run_id.clone())
-            .collect(),
-        None => Default::default(),
-    };
-    match load::reconcile::gc_orphans(
-        store,
-        &plan.gcs_prefix,
-        &keyed,
-        active,
-        &dead_marker_run_ids,
-    ) {
-        Ok((0, _)) => {}
-        Ok((n, bytes)) => {
-            println!(
-                "  gc-orphans [{}]: removed {n} orphan part(s) ({bytes} bytes)",
-                plan.table
-            )
-        }
-        Err(e) => eprintln!(
-            "  gc-orphans [{}]: failed (load unaffected): {e:#}",
-            plan.table
-        ),
-    }
 }
 
 /// What a load will consume: the reconciled integrity, the parquet URIs to load,
@@ -980,7 +536,7 @@ fn prepare_load(
     // view). The reverse order — sample after fetch — reopens the TOCTOU this
     // exists to close: finish-then-fetch would read the run as consumable
     // against a manifest snapshot older than its last parts.
-    let active_at_fetch = state.and_then(|s| match s.active_run_ids_on_prefix(&plan.gcs_prefix) {
+    let active_at_fetch = ledger_writers(state, &plan.gcs_prefix).and_then(|r| match r {
         Ok(a) => Some(a),
         Err(e) => {
             log::warn!(
@@ -1164,20 +720,7 @@ fn prepare_load(
     // COUNT(*)` licensed a `mode: full` OVERWRITE of a table rivet has no record of
     // loading. Same class as the ledger READ below, and the `Err(_) => true` at the
     // gc callsite shows the direction was a real choice: there it fails SAFE.
-    let ownership = match state {
-        Some(s) => match s.has_load_attempt(target_fqtn) {
-            Ok(true) => load::Ownership::Own,
-            Ok(false) => load::Ownership::Foreign,
-            Err(e) => {
-                log::warn!(
-                    "load: the ownership probe for {target_fqtn} failed ({e:#}) — refusing rather \
-                     than treating it as a stateless load"
-                );
-                load::Ownership::Unreadable
-            }
-        },
-        None => load::Ownership::Unknown,
-    };
+    let ownership = ownership_of(state, target_fqtn, "load");
     Ok(Some(LoadInputs {
         integrity,
         uris,
@@ -1303,18 +846,19 @@ impl LoadCtx<'_> {
         // forever — the harm the comment above describes. Treating the answer as
         // "assume they are all active" records none of them, and the next cycle
         // re-evaluates: at-least-once, which the current-state view absorbs.
-        let mut active = match s.active_run_ids_on_prefix(self.source_prefix) {
+        let mut active = match ledger_writers(self.state, self.source_prefix) {
             // `Ok` is not the safe answer it looks like: an EMPTY set excludes
             // nothing, and empty-without-error is exactly what a FOREIGN-HOST load
             // gets — `StateStore::open` makes a fresh DB beside the load's own
             // config, which never saw the extract's runs. The `Err` arm below fails
             // safe; this one could not, so the BUCKET's markers are unioned in.
             // Union, never replace: the ledger stays authoritative where it answers.
-            Ok(mut a) => {
+            Some(Ok(mut a)) => {
                 a.extend(self.marker_active.iter().cloned());
                 a
             }
-            Err(e) => {
+            None => return,
+            Some(Err(e)) => {
                 log::warn!(
                     "load: cannot tell which runs are still writing into {} ({e:#}) — not \
                      recording any run as consumed this cycle, so nothing they write later is \
@@ -1421,14 +965,7 @@ fn execute_load<R>(
     let target_fqtn = loader.fqtn(&job.plan.table);
     // One load per table at a time: two concurrent loads both read the ledger
     // before either writes it and append the same runs twice.
-    let _lease = match job
-        .state
-        .map(|s| s.try_load_lease(&target_fqtn))
-        .transpose()?
-    {
-        Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
-        held => held.flatten(),
-    };
+    let _lease = take_table_lease(job.state, &target_fqtn)?;
     let mut ctx = LoadCtx {
         state: job.state,
         load_id: job.load_id,
@@ -1634,60 +1171,10 @@ fn buffer_uris(uris: Vec<String>) -> Option<Vec<String>> {
 /// A baseline leg is a BATCH run under the stream's prefix; the stream's own
 /// drains are `mode: cdc`. Names are no tell — a stream named `users` over table
 /// `t` writes `export_name = t`, exactly what a leg's family/name pair looks like.
-fn is_baseline_leg(m: &crate::manifest::RunManifest) -> bool {
+pub(crate) fn is_baseline_leg(m: &crate::manifest::RunManifest) -> bool {
     m.mode != "cdc"
 }
 
-/// Why `rivet compact` passes a table by, or `None` for a base-and-buffer CDC table.
-fn compact_skip_reason(
-    mode: &load::plan::LoadMode,
-    layout: &load::plan::CdcLayout,
-) -> Option<&'static str> {
-    match mode {
-        // A full load OVERWRITES the whole table on every pass, so there is never
-        // an accumulated buffer to merge — whatever a layout says.
-        load::plan::LoadMode::Full => Some("a full load overwrites its table; nothing to merge"),
-        // Otherwise compaction belongs to the LAYOUT, not the mode: any table kept
-        // as a physical base with a disposable buffer has something to merge. An
-        // incremental export asks for that with `load.layout: base_buffer`.
-        _ if layout.compacts() => None,
-        load::plan::LoadMode::Cdc => Some(
-            "a changelog + view table (no `cdc.backfill:` and no `load.layout: base_buffer`); \
-             nothing to merge",
-        ),
-        load::plan::LoadMode::Incremental => Some(
-            "a changelog + view table; `load.layout: base_buffer` gives it a base to merge into",
-        ),
-    }
-}
-
-/// What decides the WINNER in this table's compaction: a CDC stream ranks by its
-/// log position, an incremental export by the cursor its current state is ordered
-/// on. One resolver so a mode that gains compaction cannot forget to say.
-fn compact_order_of(
-    plan: &load::plan::LoadPlan,
-    engine: Option<load::cdc::SourceEngine>,
-) -> Result<load::cdc::CompactOrder> {
-    match plan.mode {
-        load::plan::LoadMode::Cdc => Ok(load::cdc::CompactOrder::Cdc(
-            engine.context("a cdc plan needs its source engine to rank the buffer")?,
-        )),
-        _ => plan
-            .cursor_column
-            .clone()
-            .map(load::cdc::CompactOrder::Cursor)
-            .with_context(|| {
-                format!(
-                    "compacting `{}` needs the export's `cursor_column:` — the buffer's \
-                     latest-per-key ordering",
-                    plan.table
-                )
-            }),
-    }
-}
-
-/// The two metadata reads [`load::compact_gate`] decides on, and the note it may
-/// print. Glue: it fetches the facts, the decision itself is the pure predicate.
 /// The status a load's CLOSING ledger row carries after the load failed.
 ///
 /// `refused` means "stopped before ANY warehouse write" — that is precisely why
@@ -1726,309 +1213,14 @@ fn closing_status(e: &anyhow::Error, consumed: &[String]) -> &'static str {
 ///
 /// The `{run_id}:` PREFIX is load-bearing and must stay first — the gate's ledger check
 /// scopes with `LIKE '<run-id>%'`.
-fn ledger_load_id(run_id: &str, op: &str, table: &str) -> String {
+pub(super) fn ledger_load_id(run_id: &str, op: &str, table: &str) -> String {
     format!("{run_id}:{op}:{table}")
-}
-
-/// Compact's PRE-MERGE phase, with every stop marked as one.
-///
-/// A named seam because the WIRING is the thing that was wrong, and wiring is only
-/// gradeable at a boundary a test can stand on: `run_compacts` is live-only, so a
-/// test of `compact_gate_of` alone grades correct logic on an input the real caller
-/// never hands it, while the defect lived in what the caller did with the error.
-///
-/// Everything this covers is metadata — `object_kind` is a warehouse QUERY, so a
-/// 503, a quota error or expired credentials arrive here having written NOTHING.
-/// Unwrapped they reached the ledger as `status='failed'`, and `has_load_attempt`
-/// reads a `failed` row as "rivet wrote this table", which flips the base from
-/// `Foreign` to `Own` and disarms the refusal that stops a later `rivet load`
-/// overwriting a table rivet never wrote.
-fn compact_preflight(
-    loader: &dyn load::TargetLoader,
-    table: &str,
-    state: Option<&StateStore>,
-) -> Result<()> {
-    load::before_write(compact_gate_of(loader, table, state))
-}
-
-fn compact_gate_of(
-    loader: &dyn load::TargetLoader,
-    table: &str,
-    state: Option<&StateStore>,
-) -> Result<()> {
-    let buffer = format!("{table}__changes");
-    if !matches!(loader.object_kind(&buffer)?, load::ObjectKind::Table) {
-        // No buffer: `compact` says that no-op itself, and a missing base is not a
-        // problem when there is nothing to merge into it.
-        return Ok(());
-    }
-    let base_fqtn = loader.fqtn(table);
-    // See the sibling in `prepare_load`: an UNANSWERABLE ledger must not read as an
-    // ABSENT one, or a failed probe turns compact's `Foreign` refusal into a note and
-    // the MERGE rewrites someone else's rows.
-    let ownership = match state {
-        Some(s) => match s.has_load_attempt(&base_fqtn) {
-            Ok(true) => load::Ownership::Own,
-            Ok(false) => load::Ownership::Foreign,
-            Err(e) => {
-                log::warn!(
-                    "compact: the ownership probe for {base_fqtn} failed ({e:#}) — refusing \
-                     rather than treating it as a stateless compact"
-                );
-                load::Ownership::Unreadable
-            }
-        },
-        None => load::Ownership::Unknown,
-    };
-    match load::compact_gate(
-        loader.object_kind(table)?,
-        ownership,
-        &base_fqtn,
-        &loader.fqtn(&buffer),
-    ) {
-        load::CompactGate::Go => Ok(()),
-        load::CompactGate::Note(note) => {
-            eprintln!("{note}");
-            Ok(())
-        }
-        load::CompactGate::Refuse(msg) => Err(load::refused(msg)),
-    }
-}
-
-/// `rivet compact`: merge every base-and-buffer table's buffer into its base and
-/// drop the buffer. One MERGE per table (per partition window), labelled
-/// `rivet_op:merge`; a table without a buffer is a no-op, said so.
-pub fn run_compacts(args: CompactArgs) -> Result<()> {
-    let plans = load::plan::plan_loads(&args.config)?;
-    let run_id = resolve_run_id(args.run_id.clone());
-    let state = match StateStore::open(&args.config) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("  warning: state store unavailable ({e:#}); compacting without a ledger");
-            None
-        }
-    };
-    let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
-    let engine = if needs_source_engine(&plans) {
-        Some(load::plan::source_engine(&args.config)?)
-    } else {
-        None
-    };
-    // Counted from several workers, so an atomic — read once after the join for
-    // the failure message below. Skipped tables are not attempts, so the count
-    // still happens AFTER the skip gate, exactly where `attempted += 1` sat.
-    //
-    // The cheaper shape — filter `plans` BEFORE the pool, so `attempted` is just
-    // `filtered.len()` and no atomic is needed — was considered and rejected: it
-    // moves every "skipped — <why>" line to the front of the run in one block,
-    // while the sequential loop interleaved them with the work. Keeping the skip
-    // INSIDE the worker keeps `--pool 1` printing exactly what it always printed.
-    let attempted = std::sync::atomic::AtomicUsize::new(0);
-    let state_ref = state.as_ref().map(|s| s.state_ref().clone());
-    // Same as the load leg: the parent migrated the schema before any thread starts
-    // and has handed over its `StateRef`. Holding it would leave `--pool 1` with TWO
-    // connections and TWO migrations — on both backends — where the sequential loop
-    // had one of each.
-    let parent_had_state = state.is_some();
-    drop(state);
-    let ledger = match &state_ref {
-        Some(StateRef::Sqlite(_)) => load::pool::LedgerKind::Sqlite,
-        Some(StateRef::Postgres(_)) => load::pool::LedgerKind::Postgres,
-        None => load::pool::LedgerKind::Absent,
-    };
-    if let Some(w) = load::pool::pool_ceiling_warning(args.pool, plans.len(), ledger) {
-        eprintln!("  warning: {w}");
-    }
-    let outcomes = load::pool::run_workers(
-        &plans,
-        load::pool::effective_pool(args.pool, plans.len()),
-        || match state_ref.as_ref() {
-            None => Some(None),
-            Some(r) => match StateStore::open_at_ref(r) {
-                Ok(s) => Some(Some(s)),
-                Err(e) => {
-                    eprintln!(
-                        "  warning: state store unavailable to this worker ({e:#}); it takes \
-                         no table — the other workers compact the queue"
-                    );
-                    None
-                }
-            },
-        },
-        |state, _idx, plan| {
-            if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
-                eprintln!("  compact [{}]: skipped — {why}", plan.table);
-                return Ok(());
-            }
-            // Counted BEFORE the refusal below, not after: a refused table IS an
-            // attempt — the run took it up and then refused it — and it becomes a
-            // FAILURE in the fold. Counting it only on the far side of the refusal
-            // let the numerator include tables the denominator did not, so a run
-            // that refused two of three printed "2 of 1 compacted table(s) failed".
-            // The sequential loop could not reach that state: it had no refusal, so
-            // `n <= attempted` held by construction. A table the skip gate above
-            // dropped is still NOT an attempt, which is why this sits below it.
-            attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // AFTER the skip gate on purpose: a table this run would not compact
-            // anyway needs no ledger, so refusing it would be noise. One that WOULD
-            // compact must not proceed without a lease — `rivet load` may hold it,
-            // and a ledger-less worker takes no lease at all rather than being
-            // refused (the lease is `state.map(..)`, so `None` skips it).
-            if load::pool::reconnect_failure_is_fatal(parent_had_state, state.is_some()) {
-                anyhow::bail!(
-                    "`{}`: this worker could not reopen the state ledger the run started \
-                     with — refusing the table rather than compacting it without a lease. \
-                     Lower `--pool`, or fix the state backend.",
-                    plan.table
-                );
-            }
-            let load_id = ledger_load_id(&run_id, "compact", &plan.table);
-            let outcome = (|| -> Result<()> {
-                let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
-                let loader = load::build_loader(&pinned, &run_id);
-                let target_fqtn = loader.fqtn(&pinned.table);
-                let _lease = match state
-                    .as_ref()
-                    .map(|s| s.try_load_lease(&target_fqtn))
-                    .transpose()?
-                {
-                    Some(None) => anyhow::bail!("{}", lease_busy_message(&target_fqtn)),
-                    held => held.flatten(),
-                };
-                // The export's OWN mode, not a hardcoded label. Compact runs on
-                // `incremental` exports too — `compact_skip_reason` says so in as many
-                // words — and telling the operator of a `mode: incremental` config that
-                // their export "is mode: cdc" sends them looking for a `cdc:` block
-                // their config cannot even contain (it is a config-load error there).
-                // Measured on a 60-table incremental run: two refusals, both mislabelled.
-                let pk = require_pk(&pinned, pinned.mode.ledger_str())?;
-                // The base is checked BEFORE the MERGE, and only when a buffer exists:
-                // an absent base surfaced as BigQuery's own `Not found: Table`, and a
-                // base rivet never loaded was not checked at all. Metadata, no job.
-                // `before_write` on the whole PRE-MERGE prefix, not just on the arm
-                // the gate refuses through. Everything up to `loader.compact` is
-                // metadata: `compact_gate_of`'s first statement is
-                // `loader.object_kind(&buffer)?`, a real warehouse QUERY, so expired
-                // credentials, a 503 or a quota error surface here having touched
-                // nothing — and `ledger_status` maps anything that is not a `Refused`
-                // to "failed". `has_load_attempt` then counts that row, which flips
-                // the base from `Foreign` to `Own` and disarms the refusal that stops
-                // `rivet load` overwriting a table rivet never wrote. The load path
-                // has wrapped its pre-write stops from the start (ten sites); this
-                // path had none, while the comment on the ledger row below claimed
-                // the protection.
-                let report = match compact_preflight(loader.as_ref(), &pinned.table, state.as_ref())
-                    .and_then(|()| load::before_write(compact_order_of(&pinned, engine)))
-                {
-                    Err(e) => Err(e),
-                    // Past the wrap: from here a failure may genuinely have written,
-                    // so it must stay a `failed` row — that is what tells the next
-                    // cycle the table is rivet's own.
-                    Ok(order) => {
-                        // The MERGE reads its tombstone arm off the specs it is HANDED,
-                        // and the recorded spec holds source columns only — the load leg
-                        // appends the flag to its own copy. Compact must do the same or
-                        // every delete merges as an ordinary upsert and every insert
-                        // lands with a NULL flag. `compact_skip_reason` already kept
-                        // non-compacting layouts out — that gate is the `true` here, so
-                        // the ONE predicate that owns this decision is the one asked.
-                        let mut specs = pinned.specs.clone();
-                        if load::plan::base_carries_delete_flag(true, pinned.deleted_flag) {
-                            specs.push(load::cdc::flag_spec(loader.warehouse()));
-                        }
-                        loader.compact(&pinned.table, &specs, pk, order)
-                    }
-                };
-                if let Some(s) = state.as_ref() {
-                    let rec = LoadRecord {
-                        load_id: load_id.clone(),
-                        export_name: pinned.table.clone(),
-                        target_table: target_fqtn.clone(),
-                        warehouse: pinned.load.target.name().to_string(),
-                        mode: "compact".to_string(),
-                        source_run_ids: Vec::new(),
-                        source_ident: String::new(),
-                        rows_loaded: report.as_ref().map_or(0, |r| r.changes_rows as i64),
-                        status: match &report {
-                            Ok(_) => "success".to_string(),
-                            // A refusal is a stop before the write, exactly as on the
-                            // load path — never a `failed` row that makes the target
-                            // look like rivet's own on the next attempt.
-                            Err(e) => ledger_status(e).to_string(),
-                        },
-                        finished_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    if let Err(e) = s.store_load(&rec) {
-                        eprintln!(
-                            "  warning: compact ledger write failed for `{target_fqtn}`: {e:#}"
-                        );
-                    }
-                }
-                let report = report?;
-                if report.had_buffer {
-                    println!(
-                        "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE statement(s); buffer dropped",
-                        plan.table, report.changes_rows, report.base, report.merge_jobs
-                    );
-                } else {
-                    println!(
-                        "COMPACT SKIP [{}]: no `{}__changes` buffer — nothing to merge",
-                        plan.table, plan.table
-                    );
-                }
-                Ok(())
-            })();
-            if let Err(e) = &outcome {
-                eprintln!("  COMPACT FAILED [{}]: {e:#}", plan.table);
-            }
-            outcome.map_err(|e| e.context(format!("compact '{}'", plan.table)))
-        },
-        |plan| {
-            anyhow::anyhow!(
-                "compact '{}' did not complete — it PANICKED (a bug, please report it), or \
-                 no worker was left to take it (each one panicked or could not reopen the \
-                 state ledger — see the warnings above). Reported as this table's failure \
-                 so every other table still aggregates",
-                plan.table
-            )
-        },
-    );
-    // Folded in CONFIG order, like the load leg: the pool returns one result per
-    // table, indexed by the table, so the `|`-joined list below reads the same on
-    // every run of the same failing config.
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    for outcome in outcomes {
-        if let Err(e) = outcome {
-            failures.push(e);
-        }
-    }
-    let attempted = attempted
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .max(failures.len());
-    match failures.len() {
-        0 => Ok(()),
-        1 => Err(failures.pop().unwrap()),
-        // COVERAGE, stated rather than implied: nothing calls `run_compacts` but
-        // `dispatch`, and no test — offline or live — drives this aggregate. The
-        // `n <= attempted` fix above is therefore correct by READING only. A unit
-        // test over the formatter would grade correct logic on inputs the supplier
-        // never produces (the ordering INSIDE the worker is the defect surface), so
-        // the honest close is a live compact whose ledger drops mid-run.
-        n => anyhow::bail!(
-            "{n} of {attempted} compacted table(s) failed: {}",
-            failures
-                .iter()
-                .map(|e| format!("{e:#}"))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ),
-    }
 }
 
 /// How the ledger records a load that did not complete: `refused` when it stopped before
 /// any warehouse write (the target is not rivet's own for having been refused), `failed`
 /// otherwise.
-fn ledger_status(e: &anyhow::Error) -> &'static str {
+pub(super) fn ledger_status(e: &anyhow::Error) -> &'static str {
     match e.downcast_ref::<load::Refused>() {
         Some(_) => "refused",
         None => "failed",
@@ -2066,71 +1258,6 @@ fn remaining_run_ids(all: &[String], consumed: &[String]) -> Vec<String> {
         .filter(|id| !consumed.contains(id))
         .cloned()
         .collect()
-}
-
-/// The URIs the partition budget applies to: the files that land in the
-/// PARTITIONED target. Under `BaseAndBuffer` the stream's files land in the
-/// BUFFER, which is created WITHOUT a partition and read whole by one MERGE, so
-/// budgeting them against the base's granularity refuses a load that would have
-/// worked. Found by dogfooding (2026-09-18): a 5,000-day buffer file on a
-/// day-partitioned base was refused by name, although no job would ever write
-/// those partitions — the adapter had already stopped packing the buffer, but
-/// this preflight still measured it.
-///
-/// A baseline manifest that resolves to no present part makes `select_load_keys`
-/// fall back to the whole listing; the check then covers everything again, which
-/// is the conservative direction.
-fn budgeted_uris(
-    layout: load::plan::CdcLayout,
-    runs: &[(String, crate::manifest::RunManifest)],
-    uris: &[String],
-) -> Vec<String> {
-    if !layout.log_is_disposable() {
-        return uris.to_vec();
-    }
-    let baseline: Vec<(String, crate::manifest::RunManifest)> = runs
-        .iter()
-        .filter(|(_, m)| is_baseline_leg(m))
-        .cloned()
-        .collect();
-    if baseline.is_empty() {
-        return Vec::new();
-    }
-    let keys: Vec<String> = uris
-        .iter()
-        .filter_map(|u| load::split_gs_uri(u).ok().map(|(_, k)| k.to_string()))
-        .collect();
-    let want: std::collections::HashSet<String> =
-        load::reconcile::select_load_keys(&baseline, &keys)
-            .into_iter()
-            .collect();
-    uris.iter()
-        .filter(|u| load::split_gs_uri(u).is_ok_and(|(_, k)| want.contains(k)))
-        .cloned()
-        .collect()
-}
-
-/// The pre-load partition budget of a BigQuery plan (ADR-0034 D4); no other target
-/// caps the partitions one job writes.
-fn partition_budget_ok(
-    store: &crate::destination::gcs::GcsStore,
-    plan: &load::plan::LoadPlan,
-    uris: &[String],
-) -> Result<()> {
-    match (&plan.load.target, &plan.partition) {
-        (load::plan::LoadTarget::Bigquery { .. }, Some(partition)) => {
-            load::partition_budget::check_partition_budget(store, uris, partition)
-                .with_context(|| format!("export `{}`", plan.export_name))
-        }
-        _ => Ok(()),
-    }
-}
-
-/// The partition a load declares, for the progress line.
-fn partition_label(plan: &load::plan::LoadPlan) -> String {
-    plan.partition
-        .as_ref()
-        .map_or_else(|| "none".to_string(), |p| p.key.describe())
 }
 
 /// The `(source cleaned)` suffix: a load that deleted its staged Parquet says so,
@@ -2819,7 +1946,7 @@ fn load_one(
 /// yields `Some("")` for `--run-id ""` / `RIVET_RUN_ID=""`) is treated as absent
 /// — otherwise it became an empty warehouse tag + empty-derived ledger load_id
 /// (dogfood LOW).
-fn resolve_run_id(explicit: Option<String>) -> String {
+pub(super) fn resolve_run_id(explicit: Option<String>) -> String {
     explicit
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(generate_run_id)
@@ -2841,6 +1968,43 @@ fn generate_run_id() -> String {
 #[cfg(test)]
 mod load_ledger_tests {
     use super::*;
+
+    #[test]
+    fn the_shared_pool_helpers_keep_state_leases_and_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        let state = open_state(cfg.to_str().unwrap(), "stateless").expect("a writable dir opens");
+
+        let lease = take_table_lease(Some(&state), "p.d.orders").unwrap();
+        assert!(lease.is_some(), "the first taker holds the table");
+        let Err(busy) = take_table_lease(Some(&state), "p.d.orders") else {
+            panic!("a held table must refuse a second taker");
+        };
+        assert!(format!("{busy:#}").contains("p.d.orders"), "{busy:#}");
+        drop(lease);
+        assert!(take_table_lease(None, "p.d.orders").unwrap().is_none());
+
+        let (state_ref, had) = hand_off_state(Some(state), None, 1);
+        assert!(had && state_ref.is_some());
+        assert!(matches!(
+            reconnect(state_ref.as_ref(), "drain"),
+            Some(Some(_))
+        ));
+        assert!(matches!(reconnect(None, "drain"), Some(None)));
+        let (none_ref, none_had) = hand_off_state(None, None, 1);
+        assert!(!none_had && none_ref.is_none());
+
+        let failed = failures_of(vec![
+            Ok(()),
+            Err(anyhow::anyhow!("a")),
+            Ok(()),
+            Err(anyhow::anyhow!("b")),
+        ]);
+        assert_eq!(
+            failed.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
 
     #[test]
     fn resolve_run_id_treats_blank_as_absent() {
@@ -3250,7 +2414,14 @@ mod load_ledger_tests {
 mod live_only_decisions {
     use super::*;
     use crate::destination::gcs::GcsStore;
-    use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
+    use crate::load::pin::{
+        respelled_refusal, runs_loaded_with_the_pin, runs_older_than, skipped_runs_note,
+    };
+    use crate::load::staging::{
+        CleanupVerdict, cleanup_target, cleanup_verdict, ledger_says_active, prefix_has_active_run,
+        prefix_is_active,
+    };
+    use load::plan::{CdcLayout, LoadMode, LoadPlan};
 
     /// `ledger_status`: a `Refused` stop, however deep under context, is `refused`;
     /// anything else is `failed`.
@@ -3411,40 +2582,6 @@ mod live_only_decisions {
         );
     }
 
-    /// COMPACT's pre-merge stops are refusals too — the sibling of
-    /// `a_refused_load_does_not_make_a_foreign_table_rivets_own`, and it was missing.
-    ///
-    /// The load path has wrapped its pre-write stops in `before_write` from the start
-    /// (ten sites). `run_compacts` had NONE, so every error that was not already a
-    /// `Refused` journaled `status='failed'` against the BASE — including errors from
-    /// `compact_gate_of`, whose very first statement is `loader.object_kind(&buffer)?`,
-    /// a warehouse QUERY. An expired credential or a 503 there wrote a `failed` row
-    /// having touched nothing, `has_load_attempt` counted it, and the base flipped
-    /// from `Foreign` to `Own` — disarming the guard that stops a later `rivet load`
-    /// overwriting a table rivet never wrote. The comment on that ledger row claimed
-    /// the protection the code did not have.
-    ///
-    /// Graded at the SEAM, not at `compact_gate_of`: the gate was always right, and
-    /// the defect was in what the caller did with its error.
-    ///
-    /// RED against dropping the `before_write` in `compact_preflight`.
-    #[test]
-    fn a_compact_stopped_before_the_merge_is_refused_not_failed() {
-        let probe_failed = load::tests::FakeLoader::probe_fails("503 Service Unavailable");
-        let err = compact_preflight(&probe_failed, "orders", None)
-            .expect_err("a metadata probe that will not answer must stop the compact");
-        assert_eq!(
-            ledger_status(&err),
-            "refused",
-            "nothing was merged, so this must NOT journal `failed` — a failed row is \
-             what `has_load_attempt` reads as `rivet wrote this table`: {err:#}"
-        );
-        assert!(
-            format!("{err:#}").contains("503"),
-            "and the real cause survives the wrap: {err:#}"
-        );
-    }
-
     /// The ownership guard must hold on EVERY `rivet load`, not just the first: the
     /// refusal it raises is journaled, and a `failed` row would make the foreign table
     /// rivet's own on the next cycle (a scheduler retry), which then overwrites it. The
@@ -3588,40 +2725,6 @@ mod live_only_decisions {
         );
     }
 
-    /// `rivet compact` merges every base-and-buffer table, CDC or incremental; every
-    /// other plan is passed by with a reason that names what it is, never silently.
-    #[test]
-    fn compact_passes_by_everything_but_a_base_and_buffer_cdc_table() {
-        use crate::load::plan::{CdcLayout, LoadMode};
-        assert_eq!(
-            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::BaseAndBuffer),
-            None
-        );
-        // The layout is decided by `cdc.backfill:` / `load.layout:`, never by `initial:`
-        // — the reason must name the levers that exist, not one that changes nothing.
-        assert!(
-            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::LogAndView)
-                .is_some_and(|w| w.contains("cdc.backfill:")
-                    && w.contains("load.layout: base_buffer")
-                    && !w.contains("initial:"))
-        );
-        assert!(
-            super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView)
-                .is_some_and(|w| w.contains("overwrites its table"))
-        );
-        // The LAYOUT decides, not the mode: an ordinary incremental export that
-        // asked for `load.layout: base_buffer` has a buffer to merge, and one that
-        // did not is skipped with the key that would give it one.
-        assert_eq!(
-            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::BaseAndBuffer),
-            None
-        );
-        assert!(
-            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::LogAndView)
-                .is_some_and(|w| w.contains("base_buffer"))
-        );
-    }
-
     #[test]
     fn only_the_runs_older_than_the_pin_are_compared() {
         let runs: Vec<(String, String)> = ["r3", "r2", "r1"]
@@ -3629,10 +2732,10 @@ mod live_only_decisions {
             .map(|r| (String::new(), r.to_string()))
             .collect();
         let ids = |v: &[(String, String)]| v.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(super::runs_older_than(&runs, "r2")), ["r1"]);
-        assert_eq!(ids(super::runs_older_than(&runs, "r3")), ["r2", "r1"]);
-        assert!(super::runs_older_than(&runs, "r1").is_empty());
-        assert!(super::runs_older_than(&runs, "gone").is_empty());
+        assert_eq!(ids(runs_older_than(&runs, "r2")), ["r1"]);
+        assert_eq!(ids(runs_older_than(&runs, "r3")), ["r2", "r1"]);
+        assert!(runs_older_than(&runs, "r1").is_empty());
+        assert!(runs_older_than(&runs, "gone").is_empty());
     }
 
     #[test]
@@ -3675,48 +2778,30 @@ mod live_only_decisions {
             .collect();
         let loaded: std::collections::HashSet<String> = ["r1".to_string()].into();
         assert_eq!(
-            super::runs_loaded_with_the_pin("load", LoadMode::Incremental, &runs, "r3", &loaded),
+            runs_loaded_with_the_pin("load", LoadMode::Incremental, &runs, "r3", &loaded),
             ["r2"],
             "r1 already landed: its spelling cannot load NULL any more"
         );
         assert_eq!(
-            super::runs_loaded_with_the_pin(
-                "load",
-                LoadMode::Cdc,
-                &runs,
-                "r3",
-                &Default::default()
-            ),
+            runs_loaded_with_the_pin("load", LoadMode::Cdc, &runs, "r3", &Default::default()),
             ["r2", "r1"]
         );
         assert!(
-            super::runs_loaded_with_the_pin(
-                "load",
-                LoadMode::Full,
-                &runs,
-                "r3",
-                &Default::default()
-            )
-            .is_empty(),
+            runs_loaded_with_the_pin("load", LoadMode::Full, &runs, "r3", &Default::default())
+                .is_empty(),
             "a full load reads only the newest run"
         );
         assert!(
-            super::runs_loaded_with_the_pin(
-                "compact",
-                LoadMode::Cdc,
-                &runs,
-                "r3",
-                &Default::default()
-            )
-            .is_empty(),
+            runs_loaded_with_the_pin("compact", LoadMode::Cdc, &runs, "r3", &Default::default())
+                .is_empty(),
             "compact merges the landed buffer and reads no pending run"
         );
     }
 
     #[test]
     fn the_respelling_refusal_names_each_run_and_both_spellings() {
-        assert_eq!(super::respelled_refusal("orders", "r2", &[]), None);
-        let msg = super::respelled_refusal(
+        assert_eq!(respelled_refusal("orders", "r2", &[]), None);
+        let msg = respelled_refusal(
             "orders",
             "r2",
             &[("r1".into(), "\u{441}ity".into(), "city".into())],
@@ -3731,8 +2816,8 @@ mod live_only_decisions {
 
     #[test]
     fn the_pin_names_the_newer_runs_it_passed_over_and_stays_quiet_otherwise() {
-        assert_eq!(super::skipped_runs_note("orders", "r1", &[]), None);
-        let note = super::skipped_runs_note("orders", "r1", &["r3", "r2"]).expect("named");
+        assert_eq!(skipped_runs_note("orders", "r1", &[]), None);
+        let note = skipped_runs_note("orders", "r1", &["r3", "r2"]).expect("named");
         assert!(note.contains("orders") && note.contains("r1"), "{note}");
         assert!(
             note.contains("2 newer run(s)") && note.contains("r3, r2"),
@@ -3791,39 +2876,7 @@ mod live_only_decisions {
 
     /// A resolved plan, so a test can vary the ONE field it is about.
     fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
-        LoadPlan {
-            deleted_flag: false,
-            renames: Vec::new(),
-            rename_warnings: Vec::new(),
-            refusal: None,
-            export_name: "orders".into(),
-            unit: None,
-            table: "orders".into(),
-            partition: None,
-            specs: vec![],
-            gcs_prefix: gcs_prefix.into(),
-            destination: crate::config::DestinationConfig::default(),
-            load: LoadSection {
-                deleted_flag: None,
-                layout: None,
-                target: LoadTarget::Bigquery {
-                    project: "p".into(),
-                    dataset: "d".into(),
-                },
-                cleanup_source: false,
-                pk: load::plan::KeyColumns::Columns(vec!["id".into()]),
-                allow_source_drift: false,
-                gc_orphans: false,
-                cluster_by: load::plan::KeyColumns::None,
-                partition: None,
-            },
-            mode,
-            cursor_column: None,
-            pk: vec!["id".into()],
-            clustering: load::plan::Clustering::Auto(vec![]),
-            pinned_run: None,
-            layout: CdcLayout::LogAndView,
-        }
+        load::plan::test_plan(mode, gcs_prefix)
     }
 
     /// An fs-backed store over `dir`, standing in for the bucket. `gs://b/base`
@@ -4018,23 +3071,20 @@ mod live_only_decisions {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            super::late_runs_refusal(
+            late_runs_refusal(
                 "orders",
                 &runs(vec![older.clone(), pinned.clone()]),
                 Some(&pin)
             ),
             None
         );
-        let why = super::late_runs_refusal("orders", &runs(vec![pinned, late]), Some(&pin))
-            .expect("r3 is late");
+        let why =
+            late_runs_refusal("orders", &runs(vec![pinned, late]), Some(&pin)).expect("r3 is late");
         assert!(
             why.contains("r3") && why.contains("r2") && why.contains("orders"),
             "{why}"
         );
-        assert_eq!(
-            super::late_runs_refusal("orders", &runs(vec![older]), None),
-            None
-        );
+        assert_eq!(late_runs_refusal("orders", &runs(vec![older]), None), None);
     }
 
     /// The partition budget measures the files that land in the PARTITIONED
@@ -4460,6 +3510,37 @@ mod live_only_decisions {
         assert!(
             !dir.path().join(orphan).exists(),
             "with no run active, an unmanifested part is crash debris and must be collected"
+        );
+    }
+
+    #[test]
+    fn gc_retires_a_running_marker_whose_run_the_ledger_says_is_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "gs://b/base";
+        let mut marker = success_manifest("run-dead", "part-0.parquet");
+        marker.status = crate::manifest::ManifestStatus::Running;
+        marker.parts.clear();
+        marker.part_count = 0;
+        marker.row_count = 0;
+        let key = "base/manifest-run-dead.json";
+        write_at(&dir, key, &serde_json::to_vec(&marker).unwrap());
+        let state = StateStore::open_in_memory().unwrap();
+        state
+            .begin_run("run-dead", "orders", prefix, "2026-08-21T00:00:00Z")
+            .unwrap();
+        state
+            .finish_run("run-dead", "failed", "2026-08-21T01:00:00Z")
+            .unwrap();
+
+        maybe_gc_orphans(
+            &fs_store(&dir),
+            &plan_at(LoadMode::Full, prefix),
+            Some(&state),
+        );
+
+        assert!(
+            !dir.path().join(key).exists(),
+            "a marker nothing supersedes is still dead once the ledger closed its run"
         );
     }
 

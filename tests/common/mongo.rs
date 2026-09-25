@@ -95,6 +95,20 @@ impl MongoTest {
         });
     }
 
+    /// A fresh, EMPTY collection: dropped, then created explicitly. Mongo creates a
+    /// collection on first write, so "empty" and "absent" differ — and rivet refuses
+    /// a batch export of an absent one.
+    pub fn create_empty_collection(&self, name: &str) {
+        self.drop_collection(name);
+        self.rt.block_on(async {
+            self.client
+                .database(&self.db)
+                .create_collection(name)
+                .await
+                .expect("mongo: create_collection");
+        });
+    }
+
     /// Drop the whole test database this helper is connected to.
     pub fn drop_database(&self) {
         self.rt.block_on(async {

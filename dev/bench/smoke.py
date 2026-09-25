@@ -51,11 +51,6 @@ PG_URL_NOSSL = PG_URL + "?sslmode=disable"
 # strings differ. Postgres is the reference; mysql/mssql/mongo slot in beside it.
 ENG = {}  # set in main() from ENGINES[args.engine]
 
-
-def _docker_sql(container, argv, q):
-    return sh(["docker", "exec", "-i", container] + argv, input=q).stdout.strip()
-
-
 # ── PostgreSQL engine ────────────────────────────────────────────────────────
 _PG_ADMIN = ["psql", "-U", "rivet", "-d", "rivet_bench", "-tAqc", ""]  # q via stdin
 

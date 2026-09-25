@@ -34,11 +34,11 @@ from pathlib import Path
 
 try:
     from .core import Ledger, have, rivet, run
-    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
+    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, have, rivet, run  # type: ignore
-    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
+    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
     DUCKDB = [__import__("sys").executable, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = ["verify_corruption_is_detected"]
@@ -115,7 +115,7 @@ def verify_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) 
         _skipped(led, engine, tag, "corruption_is_detected", "-", "corruption-detected: duckdb absent", "no duckdb")
         return
 
-    dest = work_dir() / f"corrupt_{engine}_{tag.replace('.', '_')}"
+    dest = Scope(engine, tag).dir("corrupt")
     cfg = _export(engine, url, table, dest)
     if cfg is None:
         _failed(led, engine, tag, "corruption_is_detected", "-", f"corruption-detected[{engine}]: export failed", "export")
@@ -278,7 +278,7 @@ def _cdc_corruption_locked(led: Ledger, engine: str, tag: str, url: str, cdc_mod
         )
         return
 
-    work = work_dir() / f"cdccorrupt_{engine}_{tag.replace('.', '_')}"
+    work = Scope(engine, tag).dir("cdccorrupt")
     work.mkdir(parents=True, exist_ok=True)
     cdc_block = spec.setup(cdc_url, work)
     if cdc_block is None:
@@ -489,15 +489,18 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
         )
         return
 
-    work = work_dir() / f"recon_{tag.replace('.', '_')}"
+    work = Scope(engine, tag).dir("recon")
     out = work / "out"
     out.mkdir(parents=True, exist_ok=True)
     table = "public.recon_probe"
+    name = Scope(engine, tag).name("recon_probe")
     cfg = work / "recon.yaml"
     cfg.write_text(
         f"source:\n  type: postgres\n  url_env: ORACLE_URL\n"
         f"exports:\n"
-        f"  - name: recon_probe\n"
+        # Per version: concurrent versions share the Postgres state, where one export
+        # name is one lease — the second version's run was refused.
+        f"  - name: {name}\n"
         f"    table: {table}\n"
         f"    mode: chunked\n"
         f"    chunk_column: id\n"
@@ -522,7 +525,7 @@ def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag
         return
 
     def rec() -> int:
-        return rivet("reconcile", "-c", str(cfg), "-e", "recon_probe", env=env, timeout=NO_TIMEOUT).returncode
+        return rivet("reconcile", "-c", str(cfg), "-e", name, env=env, timeout=NO_TIMEOUT).returncode
 
     def val() -> int:
         return rivet("validate", "-c", str(cfg), "--depth", "full", env=env, timeout=NO_TIMEOUT).returncode

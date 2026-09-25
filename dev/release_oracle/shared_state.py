@@ -16,7 +16,7 @@ Rig against the gate's binary, so the oracles are the test's: the source, `bq`,
 and the state DB read with a plain Postgres client.
 
 SKIP — never a silent pass — without cargo, the Postgres state URL, the BigQuery
-project/bucket or the `bq` CLI.
+project/bucket or `gcloud` (the REST token).
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
     proj = os.environ.get("BQ_ORACLE_PROJECT") or run(["gcloud", "config", "get-value", "project"]).stdout.strip()
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     missing = [w for w, ok in (
-        ("cargo", have("cargo")), ("bq", have("bq")),
+        ("cargo", have("cargo")), ("gcloud", have("gcloud")),
         ("Postgres state URL", state.startswith("postgres")), ("BigQuery project", bool(proj)),
     ) if not ok]
     if missing:
@@ -71,9 +71,15 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
         if any(q.endswith(name) or q == name for q in passed):
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
         else:
-            tail = out[out.find(name):][:1200] if name in out else out[-600:]
+            # From the test's captured-output block (`--- STDOUT/STDERR: … <name> ---`):
+            # the first mention is its START line and the last is the final summary,
+            # neither holds evidence. The tail goes on the printed line, not only the ledger.
+            m = re.search(r"--- STD(?:OUT|ERR):[^\n]*" + re.escape(name), out)
+            at = m.start() if m else out.find(name)
+            tail = out[at:][:4000] if at >= 0 else out[-2000:]
             led.failed("all", scenario, cell(name), "postgres",
-                       f"{msg(name)} — no PASS line for {name} (failed, renamed, or filtered out)",
+                       f"{msg(name)} — no PASS line for {name} (failed, renamed, or filtered "
+                       f"out)\n{tail[-1500:]}",
                        tail)
 
 

@@ -3,6 +3,241 @@
 #![allow(dead_code)]
 
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// One kept-alive HTTPS client for every BigQuery / GCS call a test makes. REST, not
+/// the `bq` / `gcloud` CLIs: a CLI start cost 2.3 s per query (measured over the
+/// shared-state cycle: 64 queries, 149 s), a request on this client well under 1 s.
+/// Plain HTTP with the operator's `gcloud` identity — shares no code with rivet's
+/// own BigQuery client, so the read stays an independent oracle.
+fn http() -> &'static reqwest::blocking::Client {
+    static C: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .expect("http client")
+    })
+}
+
+/// `gcloud auth print-access-token`, re-asked every 4 minutes or on `refresh`: gcloud
+/// hands back its CACHED token until it has under 5 minutes left, so one fetched now
+/// may expire in 5, not 60. None when gcloud fails — never a poisoned lock.
+fn token(refresh: bool) -> Option<String> {
+    static T: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+    let mut slot = T
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !refresh
+        && let Some((tok, at)) = slot.as_ref()
+        && at.elapsed() < Duration::from_secs(4 * 60)
+    {
+        return Some(tok.clone());
+    }
+    let out = Command::new("gcloud")
+        .args(["auth", "print-access-token"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    *slot = Some((tok.clone(), Instant::now()));
+    Some(tok)
+}
+
+/// (status, JSON body) of one authorised request, or None when it could not be made;
+/// a 401 re-asks gcloud for a token once. Never panics — the Drop cleanups use it.
+fn try_call(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> Option<(u16, serde_json::Value)> {
+    for refresh in [false, true] {
+        let mut req = http()
+            .request(method.clone(), url)
+            .bearer_auth(token(refresh)?);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().ok()?;
+        let status = resp.status().as_u16();
+        if status == 401 && !refresh {
+            continue;
+        }
+        let text = resp.text().unwrap_or_default();
+        return Some((
+            status,
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+        ));
+    }
+    None
+}
+
+/// [`try_call`] for a test body: a request that cannot be made fails the test loudly.
+fn call(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    try_call(method, url, body.as_ref())
+        .unwrap_or_else(|| panic!("{url}: no response (gcloud token or network)"))
+}
+
+/// A REST cell as `bq --format=json` renders it: scalars as strings, NULL as null,
+/// REPEATED as an array, RECORD as an object. (TIMESTAMP comes back as epoch
+/// seconds, not the CLI's formatted text — CAST it to STRING to compare text.)
+fn render_cell(field: &serde_json::Value, v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    if v.is_null() {
+        return Value::Null;
+    }
+    if field["mode"] == "REPEATED" {
+        let mut one = field.clone();
+        one["mode"] = Value::from("NULLABLE");
+        return Value::Array(
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| render_cell(&one, &e["v"]))
+                .collect(),
+        );
+    }
+    if field["type"] == "RECORD" || field["type"] == "STRUCT" {
+        return render_row(&field["fields"], v);
+    }
+    v.clone()
+}
+
+fn render_row(fields: &serde_json::Value, row: &serde_json::Value) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for (f, cell) in fields
+        .as_array()
+        .into_iter()
+        .flatten()
+        .zip(row["f"].as_array().into_iter().flatten())
+    {
+        obj.insert(
+            f["name"].as_str().unwrap_or_default().to_string(),
+            render_cell(f, &cell["v"]),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Every row of `sql` in `project`, paged and waited for; panics on a query error.
+fn bq_query(project: &str, sql: &str) -> Vec<serde_json::Value> {
+    let base = format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project}");
+    let (st, mut page) = call(
+        reqwest::Method::POST,
+        &format!("{base}/queries"),
+        Some(serde_json::json!({"query": sql, "useLegacySql": false, "timeoutMs": 120_000})),
+    );
+    assert_eq!(st, 200, "bq query failed: {sql}\n{page}");
+    let job = page["jobReference"]["jobId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let loc = page["jobReference"]["location"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let results = |token: Option<&str>| {
+        let mut url = format!("{base}/queries/{job}?location={loc}&timeoutMs=120000");
+        if let Some(t) = token {
+            url.push_str(&format!("&pageToken={t}"));
+        }
+        let (st, p) = call(reqwest::Method::GET, &url, None);
+        assert_eq!(st, 200, "bq query results failed: {sql}\n{p}");
+        p
+    };
+    while page["jobComplete"] != true {
+        page = results(None);
+    }
+    let fields = page["schema"]["fields"].clone();
+    let mut rows = Vec::new();
+    loop {
+        rows.extend(
+            page["rows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| render_row(&fields, r)),
+        );
+        match page["pageToken"].as_str().map(str::to_string) {
+            Some(t) => page = results(Some(&t)),
+            None => return rows,
+        }
+    }
+}
+
+/// Drop `dataset` with its contents if it exists, then create it empty in the stand's location.
+pub fn recreate_dataset(project: &str, dataset: &str) {
+    let base = format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project}/datasets");
+    let (st, body) = call(
+        reqwest::Method::DELETE,
+        &format!("{base}/{dataset}?deleteContents=true"),
+        None,
+    );
+    assert!(
+        st == 200 || st == 204 || st == 404,
+        "delete dataset {dataset}: {st} {body}"
+    );
+    let (st, body) = call(
+        reqwest::Method::POST,
+        &base,
+        Some(serde_json::json!({
+            "datasetReference": {"projectId": project, "datasetId": dataset},
+            "location": super::registry::stand_bq_location(),
+        })),
+    );
+    assert!(
+        st == 200 || st == 409,
+        "create dataset {dataset}: {st} {body}"
+    );
+}
+
+/// Delete every object under `gs://bucket/prefix/` (best effort — a cleanup path).
+fn gcs_delete_prefix(bucket: &str, prefix: &str) {
+    let list = format!("https://storage.googleapis.com/storage/v1/b/{bucket}/o");
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut url = format!(
+            "{list}?prefix={}/&fields=items(name),nextPageToken",
+            urlencode(prefix)
+        );
+        if let Some(t) = &page_token {
+            url.push_str(&format!("&pageToken={}", urlencode(t)));
+        }
+        let Some((200, page)) = try_call(reqwest::Method::GET, &url, None) else {
+            return;
+        };
+        for item in page["items"].as_array().into_iter().flatten() {
+            if let Some(name) = item["name"].as_str() {
+                let _ = try_call(
+                    reqwest::Method::DELETE,
+                    &format!("{list}/{}", urlencode(name)),
+                    None,
+                );
+            }
+        }
+        match page["nextPageToken"].as_str() {
+            Some(t) => page_token = Some(t.to_string()),
+            None => return,
+        }
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
 
 /// The live warehouse a test loads into, with a run-unique GCS prefix.
 pub struct BqLive {
@@ -35,21 +270,19 @@ impl BqLive {
                     .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
                     .collect();
                 let dataset = super::registry::stand_bq_tmp(&safe);
-                let out = Command::new("timeout")
-                    .args(["120", "bq"])
-                    .arg(format!("--project_id={project}"))
-                    .arg(format!(
-                        "--location={}",
-                        super::registry::stand_bq_location()
-                    ))
-                    .args(["mk", "-f", "--dataset"])
-                    .arg(format!("{project}:{dataset}"))
-                    .output()
-                    .expect("`bq mk` must run");
+                let (st, body) = call(
+                    reqwest::Method::POST,
+                    &format!(
+                        "https://bigquery.googleapis.com/bigquery/v2/projects/{project}/datasets"
+                    ),
+                    Some(serde_json::json!({
+                        "datasetReference": {"projectId": project, "datasetId": dataset},
+                        "location": super::registry::stand_bq_location(),
+                    })),
+                );
                 assert!(
-                    out.status.success(),
-                    "bq mk {dataset}: {}",
-                    String::from_utf8_lossy(&out.stderr)
+                    st == 200 || st == 409,
+                    "create dataset {dataset}: {st} {body}"
                 );
                 (dataset, true)
             }
@@ -71,44 +304,9 @@ impl BqLive {
         )
     }
 
-    /// Rows of `sql` as JSON objects (every value a string, as `bq` renders them). Every `bq`
-    /// call runs under `timeout`: the CLI can hang on a finished job, and a hang that fails
-    /// loudly is rerun, one that never returns eats the whole run.
+    /// Rows of `sql` as JSON objects, rendered the way `bq --format=json` renders them.
     pub fn read_bq_rows(&self, sql: &str) -> Vec<serde_json::Value> {
-        let run = || {
-            Command::new("timeout")
-                .args(["120", "bq"])
-                .arg(format!("--project_id={}", self.project))
-                .args([
-                    "query",
-                    "--use_legacy_sql=false",
-                    "--format=json",
-                    "--max_rows=100000",
-                ])
-                .arg(sql)
-                .output()
-                .expect("`bq query` must run")
-        };
-        let mut out = run();
-        // A hang (exit 124 from `timeout`) after the job finished is the CLI's, not
-        // the query's: seen twice on the same count right after a load. One retry.
-        if out.status.code() == Some(124) {
-            eprintln!("bq query hung and was killed; retrying once: {sql}");
-            out = run();
-        }
-        assert!(
-            out.status.success(),
-            "bq query failed: {sql}\n{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let text = String::from_utf8_lossy(&out.stdout);
-        let json = text.trim();
-        if json.is_empty() {
-            return Vec::new();
-        }
-        serde_json::from_str::<Vec<serde_json::Value>>(json)
-            .unwrap_or_else(|e| panic!("bq returned non-JSON for {sql}: {e}\n{json}"))
+        bq_query(&self.project, sql)
     }
 
     /// The clustering columns of `table`, in clustering order.
@@ -159,21 +357,16 @@ impl BqLive {
 
     /// The `tables.get` resource of `table` (`bq show --format=json`); the table must exist.
     pub fn read_bq_meta(&self, table: &str) -> serde_json::Value {
-        let out = Command::new("timeout")
-            .args(["120", "bq"])
-            .arg(format!("--project_id={}", self.project))
-            .args(["show", "--format=json"])
-            .arg(format!("{}.{table}", self.dataset))
-            .output()
-            .expect("`bq show` must run");
-        assert!(
-            out.status.success(),
-            "bq show failed for {table}:\n{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        let (st, meta) = call(
+            reqwest::Method::GET,
+            &format!(
+                "https://bigquery.googleapis.com/bigquery/v2/projects/{}/datasets/{}/tables/{table}",
+                self.project, self.dataset
+            ),
+            None,
         );
-        serde_json::from_slice(&out.stdout)
-            .unwrap_or_else(|e| panic!("bq show returned non-JSON for {table}: {e}"))
+        assert_eq!(st, 200, "tables.get failed for {table}: {meta}");
+        meta
     }
 
     /// `(type, field)` of `table`'s time partitioning, e.g. `("DAY", Some("ts"))`;
@@ -243,19 +436,7 @@ impl BqLive {
 
     /// Run one DDL statement, panicking on failure.
     pub fn exec(&self, sql: &str) {
-        let out = Command::new("timeout")
-            .args(["120", "bq"])
-            .arg(format!("--project_id={}", self.project))
-            .args(["query", "--use_legacy_sql=false"])
-            .arg(sql)
-            .output()
-            .expect("`bq query` must run");
-        assert!(
-            out.status.success(),
-            "bq failed: {sql}\n{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bq_query(&self.project, sql);
     }
 
     /// Drops `tables` and the staged GCS prefix when the returned guard goes out of scope.
@@ -264,7 +445,8 @@ impl BqLive {
             project: self.project.clone(),
             dataset: self.dataset.clone(),
             tables: tables.iter().map(|t| t.to_string()).collect(),
-            gcs: format!("gs://{}/{}/**", self.bucket, self.prefix),
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
         }
     }
 }
@@ -274,16 +456,15 @@ impl Drop for BqLive {
         if !self.owned {
             return;
         }
-        let _ = Command::new("timeout")
-            .args(["120", "bq"])
-            .arg(format!("--project_id={}", self.project))
-            .args(["rm", "-r", "-f", "--dataset"])
-            .arg(format!("{}:{}", self.project, self.dataset))
-            .output();
-        let _ = Command::new("timeout")
-            .args(["300", "gcloud", "storage", "rm", "-r", "--quiet"])
-            .arg(format!("gs://{}/{}/**", self.bucket, self.prefix))
-            .output();
+        let _ = try_call(
+            reqwest::Method::DELETE,
+            &format!(
+                "https://bigquery.googleapis.com/bigquery/v2/projects/{}/datasets/{}?deleteContents=true",
+                self.project, self.dataset
+            ),
+            None,
+        );
+        gcs_delete_prefix(&self.bucket, &self.prefix);
     }
 }
 
@@ -301,27 +482,19 @@ pub struct BqCleanup {
     project: String,
     dataset: String,
     tables: Vec<String>,
-    gcs: String,
+    bucket: String,
+    prefix: String,
 }
 
 impl Drop for BqCleanup {
     fn drop(&mut self) {
         for t in &self.tables {
-            for kind in ["TABLE", "VIEW"] {
-                let _ = Command::new("timeout")
-                    .arg("120")
-                    .arg("bq")
-                    .arg(format!("--project_id={}", self.project))
-                    .args(["query", "--use_legacy_sql=false"])
-                    .arg(format!(
-                        "DROP {kind} IF EXISTS `{}.{}.{t}`",
-                        self.project, self.dataset
-                    ))
-                    .output();
-            }
+            let url = format!(
+                "https://bigquery.googleapis.com/bigquery/v2/projects/{}/datasets/{}/tables/{t}",
+                self.project, self.dataset
+            );
+            let _ = try_call(reqwest::Method::DELETE, &url, None);
         }
-        let _ = Command::new("timeout")
-            .args(["300", "gcloud", "storage", "rm", "-r", "--quiet", &self.gcs])
-            .output();
+        gcs_delete_prefix(&self.bucket, &self.prefix);
     }
 }

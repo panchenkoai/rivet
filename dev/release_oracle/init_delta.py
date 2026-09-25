@@ -21,8 +21,8 @@ each a Rig test over a generated config:
 
 The two init flags no blessed cell carries (`--bigquery-project`, `--bigquery-dataset`)
 are exercised here, which is what their `FLAG_EXCUSED` entries point at. Oracles are
-the tests': the source, `bq`, the Parquet on disk — never rivet's report. SKIP — never
-a silent pass — without cargo, the Postgres state URL, the BigQuery project or `bq`.
+the tests': the source, BigQuery over REST, the Parquet on disk — never rivet's report. SKIP — never
+a silent pass — without cargo, the Postgres state URL, the BigQuery project or `gcloud` (the REST token).
 """
 
 from __future__ import annotations

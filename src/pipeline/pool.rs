@@ -428,6 +428,32 @@ pub(crate) fn classification_counts(fs: &[PredictedFrom]) -> (usize, usize, usiz
     (measured, attempt, placeholder)
 }
 
+/// The "prediction is a LOWER BOUND" line — or `None` when every prediction in
+/// the schedule rests on a real success.
+///
+/// ONE source for that claim, and it reads the RECONCILED classification
+/// ([`classification_counts`] over the post-split `predict_items` sweep).
+/// The `--split` block cannot answer the question, because the only input it
+/// has is the SEED: unit names are stable across runs, so from run 2 onward
+/// each `{giant}#i` has history of its OWN that supersedes the seed
+/// ([`reconcile_split_seed`]), while the giant is retained out of the run
+/// set and its rows stay frozen at the failure that motivated the split. A
+/// hedge derived there kept saying "the giant has no successful run to measure
+/// from" in the same run whose accounting printed "N measured, 0 estimated" —
+/// one run, two contradictory honesty claims about the same exports (bughunt
+/// 2026-08-14).
+pub(crate) fn lower_bound_hedge(attempt_n: usize, placeholder_n: usize) -> Option<String> {
+    let unmeasured = attempt_n + placeholder_n;
+    (unmeasured > 0).then(|| {
+        format!(
+            "prediction is a LOWER BOUND: {unmeasured} export(s) have no successful run to \
+             measure from ({attempt_n} scheduled at a failed attempt's duration, \
+             {placeholder_n} at a {}s placeholder) — it tightens as runs complete",
+            POOL_PLACEHOLDER_SECS as i64,
+        )
+    })
+}
+
 /// THE PoolItem constructor — both `rivet plan`'s preview and `apply --pool`'s
 /// schedule go through here, so the two commands cannot print different
 /// makespans for one config again. `split_seeds` carries `{giant}#N` units'
@@ -649,6 +675,53 @@ pub(crate) fn advise_split(
         return None;
     }
     Some((longest.name.clone(), n, broken))
+}
+
+#[cfg(test)]
+mod lower_bound_tests {
+    use super::lower_bound_hedge;
+
+    /// The "LOWER BOUND" claim has ONE source, fed the reconciled counts, shared by `plan` and `apply --pool`.
+    #[test]
+    fn the_lower_bound_claim_has_one_source_and_reads_the_reconciled_counts() {
+        assert!(
+            lower_bound_hedge(0, 0).is_none(),
+            "a schedule resting entirely on successes is not a lower bound"
+        );
+        let hedge = lower_bound_hedge(2, 3).expect("5 unmeasured exports must hedge");
+        assert!(
+            hedge.contains("5 export(s)")
+                && hedge.contains("2 scheduled at a failed attempt")
+                && hedge.contains("3 at a"),
+            "the hedge must count both flavours of unmeasured: {hedge}"
+        );
+        let needle = concat!("LOWER ", "BOUND");
+        let code = |whole: &str| -> String {
+            let product = whole
+                .find("\n#[cfg(test)]")
+                .map_or(whole, |at| &whole[..at]);
+            product
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (file, src) in [
+            ("run.rs", include_str!("run.rs")),
+            ("plan_cmd.rs", include_str!("plan_cmd.rs")),
+            ("split.rs", include_str!("split.rs")),
+        ] {
+            assert_eq!(
+                code(src).matches(needle).count(),
+                0,
+                "{file} re-states the hedge"
+            );
+        }
+        let pool = code(include_str!("pool.rs"));
+        assert_eq!(pool.matches(needle).count(), 1);
+        let at = pool.find(concat!("fn lower_bound", "_hedge")).unwrap();
+        assert!(pool[at..].find(needle).unwrap() < pool[at..].find("\n}\n").unwrap());
+    }
 }
 
 #[cfg(test)]

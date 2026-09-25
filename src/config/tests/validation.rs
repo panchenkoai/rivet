@@ -857,7 +857,13 @@ exports:
     destination: { type: local, path: ./out }
 "#;
     let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
-    assert!(msg.contains("mutually exclusive"), "{msg}");
+    assert!(
+        msg.contains(
+            "export 'app_cdc': `table:` and `tables:` are mutually exclusive — use \
+             `tables: [a, b]` for a multi-table stream"
+        ),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -1015,7 +1021,7 @@ fn cdc_export_config_rust_default_is_bounded_not_a_daemon() {
     // `until_current = false` (bool::default) = `DrainMode::Continuous` — a
     // never-terminating daemon on a minimal config. RED before the hand-written
     // `impl Default`; audit finding.
-    use crate::config::export::CdcExportConfig;
+    use crate::config::CdcExportConfig;
     use crate::source::cdc::DrainMode;
     let d = CdcExportConfig::default();
     assert!(

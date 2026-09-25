@@ -28,6 +28,12 @@ fn dir_boundary(path: &str) -> String {
     }
 }
 
+/// Append one streamed chunk; `Some(len)` once the body has grown past `cap` (stop reading).
+fn push_within(buf: &mut Vec<u8>, chunk: &[u8], cap: u64) -> Option<u64> {
+    buf.extend_from_slice(chunk);
+    (buf.len() as u64 > cap).then_some(buf.len() as u64)
+}
+
 /// A blocking GCS handle for the load layer's one-off object ops — recursive
 /// list (manifests / parquet), read (manifest bytes), and recursive delete
 /// (source cleanup). Mirrors [`CloudDestination`]'s runtime + blocking wrap,
@@ -36,6 +42,8 @@ fn dir_boundary(path: &str) -> String {
 pub(crate) struct GcsStore {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: opendal::blocking::Operator,
+    /// The same operator unwrapped, for reads issued concurrently.
+    async_op: Operator,
 }
 
 impl GcsStore {
@@ -63,10 +71,11 @@ impl GcsStore {
                 .with_jitter()
                 .with_notify(super::cloud::RivetRetryNotify),
         );
-        let op = opendal::blocking::Operator::new(async_op)?;
+        let op = opendal::blocking::Operator::new(async_op.clone())?;
         Ok(Self {
             _runtime: runtime,
             op,
+            async_op,
         })
     }
 
@@ -96,6 +105,48 @@ impl GcsStore {
     /// Raw bytes of the object at the bucket-relative `path`.
     pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>> {
         Ok(self.op.read(path)?.to_vec())
+    }
+
+    /// `parse(path, body)` over each object in `paths`, in order, 16 in flight. `body` is
+    /// the object's bytes, or `Err(size)` when it is over `cap`: a stat refuses it before
+    /// any byte is read, and the read itself stops past `cap` — so an object rewritten
+    /// in place between the two (a running marker becoming its terminal manifest) is
+    /// read whole when it still fits, and refused when it grew past the cap. A path
+    /// deleted after it was listed is left out, not an error.
+    pub(crate) fn read_each_within<T>(
+        &self,
+        paths: &[String],
+        cap: u64,
+        parse: impl Fn(&str, std::result::Result<Vec<u8>, u64>) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        use futures_util::{StreamExt, TryStreamExt};
+        let (op, parse) = (&self.async_op, &parse);
+        self._runtime.block_on(
+            futures_util::stream::iter(paths)
+                .map(|p| async move {
+                    let Some(meta) = unless_gone(op.stat(p).await)? else {
+                        return Ok(None);
+                    };
+                    let size = meta.content_length();
+                    if size > cap {
+                        return parse(p, Err(size)).map(Some);
+                    }
+                    let Some(reader) = unless_gone(op.reader(p).await)? else {
+                        return Ok(None);
+                    };
+                    let mut chunks = reader.into_bytes_stream(..).await?;
+                    let mut buf = Vec::with_capacity(size as usize);
+                    while let Some(chunk) = chunks.try_next().await? {
+                        if let Some(over) = push_within(&mut buf, &chunk, cap) {
+                            return parse(p, Err(over)).map(Some);
+                        }
+                    }
+                    parse(p, Ok(buf)).map(Some)
+                })
+                .buffered(16)
+                .try_filter_map(|x| async move { Ok(x) })
+                .try_collect(),
+        )
     }
 
     /// `len` bytes of the object at the bucket-relative `path`, from offset `start`.
@@ -209,9 +260,112 @@ impl CloudBackend for GcsBackend {
     }
 }
 
+/// `None` for an object deleted since it was listed; any other error stands.
+fn unless_gone<T>(r: opendal::Result<T>) -> Result<Option<T>> {
+    match r {
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+        other => Ok(Some(other?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_each_within_keeps_order_and_never_reads_an_object_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small"), b"abc").unwrap();
+        std::fs::write(dir.path().join("big"), vec![b'x'; 100]).unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let paths = ["big".to_string(), "small".to_string()];
+        let got = store
+            .read_each_within(&paths, 10, |p, body| {
+                Ok((p.to_string(), body.map(|b| b.len())))
+            })
+            .unwrap();
+        assert_eq!(got, vec![("big".into(), Err(100)), ("small".into(), Ok(3))]);
+        let none = store
+            .read_each_within(&[], 10, |_, b| Ok(b.is_ok()))
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn an_object_exactly_at_the_cap_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("edge"), vec![b'x'; 10]).unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let got = store
+            .read_each_within(&["edge".to_string()], 10, |_, body| {
+                Ok(body.map(|b| b.len()))
+            })
+            .unwrap();
+        assert_eq!(got, vec![Ok(10)]);
+    }
+
+    /// Only NotFound means "deleted since it was listed"; any other stat or open error fails the read.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_object_is_an_error_not_a_skip() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = dir.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::write(sealed.join("m"), b"abc").unwrap();
+        std::fs::write(dir.path().join("locked"), b"abc").unwrap();
+        let set = |p: &std::path::Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(&sealed, 0o000);
+        set(&dir.path().join("locked"), 0o000);
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let read = |p: &str| store.read_each_within(&[p.to_string()], 10, |_, b| Ok(b.is_ok()));
+        let (stat_denied, open_denied) = (read("sealed/m"), read("locked"));
+        set(&sealed, 0o755);
+        set(&dir.path().join("locked"), 0o644);
+        assert!(
+            stat_denied.is_err(),
+            "a stat that fails for another reason: {stat_denied:?}"
+        );
+        assert!(
+            open_denied.is_err(),
+            "an open that fails for another reason: {open_denied:?}"
+        );
+    }
+
+    /// A key listed and then deleted (a retired running marker) is skipped, not fatal.
+    #[test]
+    fn read_each_within_skips_a_path_deleted_after_it_was_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept"), b"abc").unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let paths = ["gone".to_string(), "kept".to_string()];
+        let got = store
+            .read_each_within(&paths, 10, |p, body| Ok((p.to_string(), body.is_ok())))
+            .unwrap();
+        assert_eq!(got, vec![("kept".into(), true)]);
+    }
+
+    /// The streamed read's own cap — the guard for an object that grew between the stat
+    /// and the read (the stat branch is covered above). A revert to reading exactly the
+    /// stat's size cannot be exercised here: the fs backend cannot swap an object between
+    /// the two calls.
+    #[test]
+    fn a_body_that_grows_past_the_cap_while_streaming_is_refused() {
+        let mut buf = Vec::new();
+        assert_eq!(push_within(&mut buf, b"abc", 5), None);
+        assert_eq!(
+            push_within(&mut buf, b"de", 5),
+            None,
+            "exactly the cap still fits"
+        );
+        assert_eq!(
+            push_within(&mut buf, b"f", 5),
+            Some(6),
+            "one byte over is refused"
+        );
+    }
 
     #[test]
     fn every_store_drives_its_operator_on_the_one_process_runtime() {

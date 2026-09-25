@@ -1524,3 +1524,43 @@ fn cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused() {
         "cross-shape overwrite must refuse loudly, naming the shapes: {err}"
     );
 }
+
+/// The CDC side of finding #44: a stream pointed at a batch export's prefix refuses at open,
+/// before its first part lands — the write-seam guard would only catch it after the data.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_cdc_stream_into_a_batch_prefix_refuses_before_its_first_part() {
+    let shared = tempfile::tempdir().unwrap();
+    let prefix = shared.path().to_path_buf();
+    let mut scn = CdcScenario::mysql_with("cdc_into_batch", "id INT PRIMARY KEY, v INT", |r, _| {
+        r.dest_path(prefix.clone())
+    });
+    scn.rig.run_ok(); // anchor, so the next run has a change to write
+    for e in std::fs::read_dir(&prefix).unwrap().filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with("manifest") || n == "_SUCCESS" {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+    }
+    scn.sql(&format!("INSERT INTO {} VALUES (1, 10)", scn.table));
+    Rig::mysql_batch(&scn.table)
+        .source_url(MYSQL_CDC_URL)
+        .dest_path(prefix.clone())
+        .run_ok();
+    scn.sql(&format!("INSERT INTO {} VALUES (2, 20)", scn.table));
+    let err = scn.rig.run_expect_fail();
+    assert!(
+        err.contains("refusing to") && err.contains("'batch' manifest"),
+        "the stream must refuse the batch prefix by name: {err}"
+    );
+    let cdc_parts: Vec<_> = std::fs::read_dir(&prefix)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("cdc-"))
+        .collect();
+    assert!(
+        cdc_parts.is_empty(),
+        "the refusal must come before the first part, found {cdc_parts:?}"
+    );
+}

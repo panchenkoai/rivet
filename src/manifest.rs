@@ -168,17 +168,6 @@ pub fn snapshot_family(name: &str) -> &str {
     }
 }
 
-/// The family a manifest belongs to: the recorded field when present, the
-/// legacy substring fold when not. Every consumer that groups manifests by
-/// export goes through here, so the recorded/derived split lives in ONE place.
-pub fn manifest_family(m: &RunManifest) -> &str {
-    if m.export_family.is_empty() {
-        snapshot_family(&m.export_name)
-    } else {
-        &m.export_family
-    }
-}
-
 /// Writability probe `rivet doctor` drops at the destination prefix.  It is a
 /// Rivet-internal sidecar (like [`MANIFEST_FILENAME`] / [`SUCCESS_FILENAME`]),
 /// so the manifest-aware `--validate` pass must not flag it as an untracked

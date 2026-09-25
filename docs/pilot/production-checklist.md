@@ -39,7 +39,7 @@ Complete this checklist before running Rivet against a production database.
   | Continuous low-latency replication | `cdc` |
 - [ ] **Query optimization**: test your queries with `EXPLAIN ANALYZE` first
 - [ ] **Indexes**: ensure `cursor_column`, `chunk_column`, and `time_column` are indexed
-- [ ] **`skip_empty: true`**: avoid creating empty files on incremental runs with no new data
+- [ ] **`skip_empty: true`**: record incremental runs with no new data as `skipped` rather than `success` (no file is written for 0 rows either way)
 - [ ] **`max_file_size`**: set for large exports to keep output files manageable
 
 ## Destination

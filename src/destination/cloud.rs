@@ -446,6 +446,11 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         }
     }
 
+    fn remove(&self, key: &str) -> Result<()> {
+        self.op.delete(&format!("{}{}", self.prefix, key))?;
+        Ok(())
+    }
+
     fn r#move(&self, from: &str, to: &str) -> Result<()> {
         // Object stores are not POSIX — no native rename. opendal 0.55
         // returns `Unsupported` for `rename` on S3 / GCS / Azure Blob, so we

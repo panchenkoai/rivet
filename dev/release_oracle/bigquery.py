@@ -18,17 +18,16 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import gcp
 from .core import (
     ROOT,
     Ledger,
-    Proc,
     docker,
     docker_exec,
     engine_container,
     have,
     rivet,
     run,
-    wait_until,
 )
 
 # The golden and the two dependency-free helper scripts stay in the BASH tree and
@@ -111,104 +110,6 @@ def _work_dir() -> Path:
     """The driver exports `WORK` for the whole run; make our own if it did not."""
     env = os.environ.get("WORK")
     return Path(env) if env else Path(tempfile.mkdtemp(prefix="rivet-oracle-bq-"))
-
-
-# ── engine bring-up / seed ─────────────────────────────────────────────────────
-# These mirror the driver's own `bring_up` / `seed_engine`. They are duplicated
-# here rather than imported from `__main__`, because importing the module that is
-# currently EXECUTING as `__main__` re-runs it under a second name. Both are
-# injectable below, so the driver can pass its own copies and keep one
-# definition; the right long-term home is `core`.
-def _bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str | None:
-    """Start one engine×version and wait for it to answer. Returns its URL, or
-    None when it could not start (the caller records the SKIP row).
-
-    The container name is a plain function of (engine, tag) — see
-    `core.engine_container`. In bash that expansion had to sit on its own line,
-    because a same-line `${eng}` read the ENCLOSING scope and so named THIS
-    stage's container after whichever engine the main loop had visited last.
-    """
-    name = engine_container(engine, tag)
-    docker("rm", "-fv", name)
-
-    args: list[str] = ["run", "-d", "--name", name]
-    if engine == "postgres":
-        args += ["-e", "POSTGRES_USER=rivet", "-e", "POSTGRES_PASSWORD=rivet",
-                 "-e", "POSTGRES_DB=rivet", "-p", f"{port}:5432"]
-    elif engine == "mysql":
-        args += ["-e", "MYSQL_ROOT_PASSWORD=rivet", "-e", "MYSQL_DATABASE=rivet",
-                 "-e", "MYSQL_USER=rivet", "-e", "MYSQL_PASSWORD=rivet", "-p", f"{port}:3306"]
-    elif engine == "mssql":
-        args += ["-e", "ACCEPT_EULA=Y", "-e", "MSSQL_SA_PASSWORD=Rivet_Passw0rd!",
-                 "-p", f"{port}:1433"]
-    elif engine == "mongo":
-        args += ["-p", f"{port}:27017"]
-    else:
-        led.skip(f"{engine}:{tag} could not start ({image})")
-        return None
-
-    if not docker(*args, image).ok:
-        led.skip(f"{engine}:{tag} could not start ({image})")
-        return None
-
-    probes = {
-        "postgres": ["pg_isready", "-U", "rivet"],
-        "mysql": ["mysqladmin", "ping", "-urivet", "-privet"],
-        "mssql": ["/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
-                  "-P", "Rivet_Passw0rd!", "-C", "-Q", "SELECT 1"],
-        "mongo": ["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
-    }[engine]
-    # Best-effort (~90 s). Deliberately not fatal: the URL is returned either
-    # way and the first real query is what decides, so a slow-but-alive engine
-    # is not turned into a phantom bring-up failure.
-    wait_until(lambda: docker_exec(name, *probes, timeout=20).ok, tries=45, delay=2.0)
-
-    if engine == "mssql":
-        docker_exec(name, "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
-                    "-P", "Rivet_Passw0rd!", "-C", "-Q",
-                    "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet")
-
-    return _matrix_cfg("url", engine).replace("%PORT%", str(port))
-
-
-def _seed_engine(engine: str, tag: str, url: str) -> str:
-    """Seed one engine from the canonical seed. Returns an error summary, "" when
-    clean.
-
-    Mongo is the ONLY engine seeded FROM THE HOST (pymongo); the SQL engines seed
-    inside the container over `docker exec`. That asymmetry is why the driver
-    preflights pymongo — without it, a host python lacking the module turned
-    every mongo cell into a cryptic "seed had errors" with nothing pointing at
-    the environment as the cause.
-    """
-    name = engine_container(engine, tag)
-    seed = ROOT / _matrix_cfg("seed", engine)
-
-    if engine == "postgres":
-        p: Proc = docker_exec(name, "psql", "-U", "rivet", "-d", "rivet", "-q",
-                              "-v", "ON_ERROR_STOP=1", stdin=seed.read_text(), timeout=900)
-    elif engine == "mysql":
-        p = docker_exec(name, "mysql", "-urivet", "-privet", "rivet",
-                        stdin=seed.read_text(), timeout=900)
-    elif engine == "mssql":
-        docker("cp", str(seed), f"{name}:/tmp/s.sql")
-        p = docker_exec(name, "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
-                        "-P", "Rivet_Passw0rd!", "-d", "rivet", "-C", "-i", "/tmp/s.sql",
-                        timeout=900)
-    else:  # mongo — from the host
-        p = run(["python3", str(seed)], timeout=1800,
-                env={"RIVET_MONGO_URI": url, "RIVET_SEED_USERS": "150000",
-                     "RIVET_SEED_ORDERS": "150000"})
-
-    needles = ("error", "msg ") if engine == "mssql" else ("error",)
-    hits = [ln for ln in p.out.splitlines()
-            if any(n in ln.lower() for n in needles)][:3]
-    # The exit status is the primary signal and the grep only supplies detail:
-    # deciding purely on the text (as the bash did) lets a seed that failed
-    # silently — non-zero, nothing matching "error" — read as seeded.
-    if p.ok and not hits:
-        return ""
-    return "; ".join(hits) or f"exit {p.returncode}"
 
 
 # ── the stage ──────────────────────────────────────────────────────────────────
@@ -323,11 +224,9 @@ def verify_load_pool(led: Ledger, *, proj: str, dset: str, bucket: str, work: Pa
     # A leftover prefix from an earlier gate run would be loaded alongside this
     # one's and the read-back would compare a union. init fixes the prefix at
     # `exports/<table>/`, so the wipe is by table name rather than by a token.
-    for t in tables:
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/exports/{t}"], timeout=300)
-    run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", pool_dset], timeout=600)
-    run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{pool_dset}"],
-        timeout=600)
+    gcp.gcs_delete_prefixes(bucket, [f"exports/{t}/" for t in tables])
+    gcp.bq_delete_dataset(proj, pool_dset)
+    gcp.bq_ensure_dataset(proj, pool_dset)
 
     cfg = work / f"load_pool_{engine}.yaml"
     gen = rivet("init", "--source-env", "ORACLE_URL",
@@ -447,9 +346,8 @@ def verify_load_pool(led: Ledger, *, proj: str, dset: str, bucket: str, work: Pa
                f"history shows {peak} of {len(spans)} LOAD_DATA jobs in flight at once",
                f"peak={peak}/{len(spans)}")
 
-    run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", pool_dset], timeout=600)
-    for t in tables:
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/exports/{t}"], timeout=300)
+    gcp.bq_delete_dataset(proj, pool_dset)
+    gcp.gcs_delete_prefixes(bucket, [f"exports/{t}/" for t in tables])
     docker_exec(name, "psql", "-U", "rivet", "-d", "rivet", "-q",
                 stdin="".join(f"DROP TABLE IF EXISTS {t};" for t in tables), timeout=600)
 
@@ -661,7 +559,7 @@ def _bq_one_engine(
     # independent and the ownership guard stays ARMED. This independence is what makes
     # the outer loop safe to parallelise.
     eng_dset = f"{dset}_{engine}"
-    run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{eng_dset}"])
+    gcp.bq_ensure_dataset(proj, eng_dset)
     pfx = f"release-oracle/bq/{engine}"
     cfgf = work / f"bqload_{engine}.yaml"
     cfgf.write_text(
@@ -682,9 +580,9 @@ def _bq_one_engine(
 
     # Clear the prefix first: a leftover part from an earlier run would be loaded
     # alongside this one's and the read-back would compare a union.
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    gcp.gcs_delete_prefix(bucket, f"{pfx}/")
     # And the table: a run killed before its cleanup strands it, and a fresh state DB refuses to overwrite it.
-    run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
+    gcp.bq_delete_table(proj, eng_dset, exp)
 
     got = ""
     child = {"ORACLE_URL": url}
@@ -723,11 +621,25 @@ def _bq_one_engine(
             verify_load_pool(led, proj=proj, dset=dset, bucket=bucket, work=work,
                              child=child, engine=engine, url=url)
 
-    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-    if not keep:
-        run(["bq", f"--project_id={proj}", "rm", "-r", "-f", "-d", f"{proj}:{eng_dset}"])
-        docker("rm", "-fv", engine_container(engine, _TAG))
+    try:
+        gcp.gcs_delete_prefix(bucket, f"{pfx}/")
+        if not keep:
+            gcp.bq_delete_dataset(proj, eng_dset)
+    finally:
+        # The engine container goes even when a cloud cleanup raises.
+        if not keep:
+            docker("rm", "-fv", engine_container(engine, _TAG))
     return None
+
+
+def _bq_one_engine_graded(led: Ledger, engine: str, **kw) -> None:
+    """`_bq_one_engine`, with an escaping error graded as this engine's FAIL — a cloud
+    call that raises must not take every other engine's graded rows down with it."""
+    try:
+        _bq_one_engine(led, engine, **kw)
+    except Exception as e:  # noqa: BLE001 — graded, never swallowed
+        led.failed(engine, "bq", "bigquery", "-", f"bigquery[{engine}]: stage raised: {e!r}"[:400],
+                   "raised")
 
 
 def run_bigquery_golden(
@@ -735,11 +647,10 @@ def run_bigquery_golden(
     *,
     keep: bool = False,
     parallel: int = 1,
-    bring_up: Callable[..., str | None] | None = None,
-    seed_engine: Callable[..., str] | None = None,
+    bring_up: Callable[..., str | None],
+    seed_engine: Callable[..., str],
 ) -> None:
-    _up = bring_up or _bring_up
-    _seed = seed_engine or _seed_engine
+    _up, _seed = bring_up, seed_engine
 
     proj_env = _matrix_cfg("bq", "project_env")
     dset_env = _matrix_cfg("bq", "dataset_env")
@@ -771,7 +682,7 @@ def run_bigquery_golden(
     if cap == 1 or len(engines) <= 1:
         for engine in engines:
             with led.span(f"bq {engine}: engine-total"):
-                _bq_one_engine(led, engine, **kw)
+                _bq_one_engine_graded(led, engine, **kw)
     else:
         # Each engine's leg is independent (own dataset/prefix/config/container), so
         # race them — same buffered-child pattern as the engine matrix, so an engine's
@@ -784,7 +695,7 @@ def run_bigquery_golden(
 
         def run_one(engine: str) -> None:
             with subs[engine].span(f"bq {engine}: engine-total"):
-                _bq_one_engine(subs[engine], engine, **kw)
+                _bq_one_engine_graded(subs[engine], engine, **kw)
 
         workers = min(cap, len(engines))
         with ThreadPoolExecutor(max_workers=workers) as ex:

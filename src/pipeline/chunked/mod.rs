@@ -23,9 +23,17 @@ mod detect;
 mod exec;
 pub(crate) mod math;
 mod parallel_checkpoint;
-mod poison;
 mod resume_m8;
 mod sequential_checkpoint;
+
+/// One checkpointed chunk's result: rows, part records, the chunk's Form-B
+/// checksums and its shape bytes.
+type ChunkOutcome = (
+    usize,
+    Vec<super::commit::PartRecord>,
+    super::commit::UnitChecksums,
+    super::commit::Observations,
+);
 
 // ─── Re-exports for callers in pipeline:: ────────────────────────────────────
 

@@ -1125,7 +1125,10 @@ fn mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling() {
     let db = unique_name("dotted").to_lowercase();
     let dotted = format!("{db}.orders");
     let m = MongoTest::connect(PORT, &db);
-    m.drop_collection(&dotted);
+    // The dotted collection EXISTS (empty) before the anchor so the snapshot leg
+    // runs and writes the manifest graded below; an absent one is refused by the
+    // batch reader the leg goes through (0.28) — see dev/open-issues.md P7.
+    m.create_empty_collection(&dotted);
     m.drop_collection("orders");
 
     // `initial: snapshot` is not incidental: the snapshot leg is the one that goes

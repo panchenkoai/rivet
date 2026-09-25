@@ -1173,7 +1173,7 @@ pub struct RunArgs {
     /// cannot accidentally re-export over a verified dataset.
     #[arg(long)]
     pub force: bool,
-    /// Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
+    /// Run the config's exports concurrently, at most 16 at once (needs 2+ exports); a CDC export run alone also takes its pending baseline snapshots at most 16 at once
     #[arg(long)]
     pub parallel_exports: bool,
     /// Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)

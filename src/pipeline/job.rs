@@ -827,6 +827,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         files_produced: 0,
         bytes_written: 0,
         files_committed: 0,
+        files_adopted: 0,
         duration_ms: 0,
         peak_rss_mb: 0,
         retries: 0,
@@ -1027,6 +1028,29 @@ fn should_reconcile(allow_reconcile: bool, plan_reconcile: bool, failed: bool) -
 /// `!rejected.is_empty()` gate sits in the live-only `run_export_job` body and
 /// its `!` survived the in-diff mutation gate — dropping it inverts the verdict,
 /// so a clean plan would be refused and a rejected one would RUN.
+/// Log every plan diagnostic and return the refusal naming ALL rejections, if any.
+fn log_plan_diagnostics(
+    export_name: &str,
+    diags: &[crate::plan::validate::Diagnostic],
+) -> Option<anyhow::Error> {
+    let mut rejected: Vec<String> = Vec::new();
+    for d in diags {
+        match d.level {
+            DiagnosticLevel::Rejected => {
+                log::error!("[{}] plan validation rejected: {}", d.rule, d.message);
+                rejected.push(d.message.clone());
+            }
+            DiagnosticLevel::Warning => {
+                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
+            }
+            DiagnosticLevel::Degraded => {
+                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
+            }
+        }
+    }
+    plan_rejection_error(export_name, &rejected)
+}
+
 fn plan_rejection_error(export_name: &str, rejected: &[String]) -> Option<anyhow::Error> {
     if rejected.is_empty() {
         return None;
@@ -1062,9 +1086,8 @@ fn rerun_warning_applies(resume: bool, force: bool) -> bool {
 /// May a successful run promote its status to `success`?
 ///
 /// Only from the transient `running` the summary is BUILT with. A deeper layer
-/// may already have decided a terminal status — `single` writes `skipped` for
-/// an incremental run with nothing new — and overwriting that would report a
-/// run that moved no rows as a successful export. Pure, because the `==` it
+/// may already have decided a terminal status, and overwriting it would
+/// misreport the run. `skipped` is decided here, by [`ok_status`]. Pure, because the `==` it
 /// replaces was the one decision left ungraded in `execute_resolved_plan`
 /// after that body's whole-function mutation exclusion was lifted: measured
 /// 2026-08-29, `==`→`!=` MISSED the whole offline battery, and it inverts BOTH
@@ -1072,6 +1095,53 @@ fn rerun_warning_applies(resume: bool, force: bool) -> bool {
 /// relabelled `success`).
 fn promotes_to_success(current_status: &str) -> bool {
     current_status == "running"
+}
+
+/// Does the `running` marker written under `opened` survive this run with nothing
+/// replacing it? A skipped run writes no terminal manifest, and a resume that adopted
+/// an earlier id (`finished` ≠ `opened`) writes its terminal manifest under that id.
+fn marker_outlived_its_run(status: &str, opened: &str, finished: &str) -> bool {
+    status == "skipped" || opened != finished
+}
+
+/// Terminal status of a run whose runner returned Ok: `skipped` when `skip_empty`
+/// is set and it delivered nothing — no rows and no parts (a resume that only
+/// re-adopted earlier parts still delivered them), else `success`.
+fn ok_status(skip_empty: bool, total_rows: i64, parts: usize) -> &'static str {
+    if skip_empty && total_rows == 0 && parts == 0 {
+        "skipped"
+    } else {
+        "success"
+    }
+}
+
+/// Terminal status of an Ok run plus, when it was skipped, why.
+fn ok_outcome(
+    skip_empty: bool,
+    total_rows: i64,
+    parts: usize,
+    strategy: &ExtractionStrategy,
+) -> (&'static str, Option<String>) {
+    let status = ok_status(skip_empty, total_rows, parts);
+    let reason = (status == "skipped").then(|| skip_reason(awaited_column(strategy)));
+    (status, reason)
+}
+
+/// The column a run with nothing new was waiting on: an incremental cursor, or the
+/// key a `keyset_incremental` run continues past.
+fn awaited_column(strategy: &ExtractionStrategy) -> Option<&str> {
+    match strategy {
+        ExtractionStrategy::Keyset(k) if k.incremental => Some(k.key_column.as_str()),
+        other => other.cursor_column(),
+    }
+}
+
+/// Why a `skip_empty` run wrote nothing, for the summary card and metrics.
+fn skip_reason(cursor_column: Option<&str>) -> String {
+    match cursor_column {
+        Some(col) => format!("no new rows since cursor '{col}'"),
+        None => "source returned 0 rows".into(),
+    }
 }
 
 /// Does this export bypass the batch plan/strategy machinery for the dedicated
@@ -1225,7 +1295,20 @@ fn execute_resolved_plan(
     match &result {
         Ok(()) => {
             if promotes_to_success(&summary.status) {
-                summary.status = "success".into();
+                let (status, reason) = ok_outcome(
+                    plan.skip_empty,
+                    summary.total_rows,
+                    summary.manifest_parts.len(),
+                    &plan.strategy,
+                );
+                summary.status = status.into();
+                if reason.is_some() {
+                    summary.skip_reason = reason;
+                    log::info!(
+                        "export '{}': skipped (0 rows, skip_empty=true)",
+                        plan.export_name
+                    );
+                }
             }
         }
         Err(e) => {
@@ -1314,6 +1397,9 @@ fn execute_resolved_plan(
     // itself cannot be re-written to say `failed` — failing to write it is the
     // problem.
     let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
+    if marker_outlived_its_run(&summary.status, &ledger_run_id, &summary.run_id) {
+        super::finalize::retire_running_marker(plan, &ledger_run_id);
+    }
     if let Some(why) = &manifest_gap {
         summary.status = "failed".into();
         // redact-at-assignment (round-8): this string reaches summary.json AND
@@ -1409,6 +1495,52 @@ pub(super) fn run_export_job(
     (result, summary)
 }
 
+/// Whether a CDC export's pending snapshot legs run on the pool: allowed for this run and more than one to run.
+fn snapshot_legs_fan_out(allowed: bool, legs: usize) -> bool {
+    allowed && legs > 1
+}
+
+/// Record one finished baseline snapshot in the state DB, right after it lands; best-effort.
+fn record_snapshot_done(
+    state: &StateStore,
+    export_name: &str,
+    synth: &ExportConfig,
+    summary: &RunSummary,
+) {
+    // Snapshot done → record it in the state DB, the cleanup-proof twin of
+    // the GCS `snapshot/_SUCCESS` marker: once here, `cleanup_source`
+    // wiping the bucket no longer re-snapshots. Best-effort — a state
+    // write failure must not fail an otherwise-successful snapshot.
+    //
+    // Degradation on that rare failure: the durable signal is lost, so if
+    // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
+    // NEXT run finds no evidence and re-snapshots the whole table —
+    // wasteful (a fresh full re-read + re-load), NOT data loss: the
+    // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
+    // anchor and no changes are skipped.
+    // The LABEL, never the relation read. `snapshot_plan` asks this store
+    // with the configured string, and on SQL Server `synth.table` is the
+    // catalog's pair — so writing that made the key unable to match itself
+    // and every cycle re-snapshotted the whole table under a green run
+    // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
+    // the two are the same string anyway.
+    if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
+        && let Err(e) = state.mark_snapshot_done(
+            export_name,
+            table,
+            &super::cdc_job::snapshot_key(&synth.destination),
+            &summary.journal.run_id,
+        )
+    {
+        log::warn!(
+            "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",
+            export_name,
+            table,
+            e
+        );
+    }
+}
+
 fn run_export_job_inner(
     config_path: &str,
     config: &Config,
@@ -1436,44 +1568,39 @@ fn run_export_job_inner(
                     return (Err(e), summary);
                 }
             };
-        for synth in &pending {
-            let (res, summary) =
-                run_export_job(config_path, config, synth, state, config_dir, opts);
-            if res.is_err() {
-                return (res, summary);
+        let outcomes = if snapshot_legs_fan_out(opts.parallel_snapshots, pending.len()) {
+            // The batch pool `--parallel-exports` runs on: every leg runs, each on its
+            // own state connection, and a finished snapshot is recorded as it lands.
+            let _flags = super::run::RenderFlags::set(super::run::multi_export_mode(), Some(true));
+            let (harm, _) = super::run::RunHarmBracket::open(&config.source);
+            let legs: Vec<&ExportConfig> = pending.iter().collect();
+            let (outcomes, workers) =
+                super::run::run_export_pool(config_path, &legs, |synth, own| {
+                    let outcome = run_export_job(config_path, config, synth, own, config_dir, opts);
+                    if outcome.0.is_ok() {
+                        record_snapshot_done(own, &export.name, synth, &outcome.1);
+                    }
+                    outcome
+                });
+            harm.close_and_warn(super::run::HarmWindow::Parallel { exports: workers });
+            outcomes
+        } else {
+            let mut done = Vec::with_capacity(pending.len());
+            for synth in &pending {
+                let outcome = run_export_job(config_path, config, synth, state, config_dir, opts);
+                if outcome.0.is_ok() {
+                    record_snapshot_done(state, &export.name, synth, &outcome.1);
+                }
+                let stop = outcome.0.is_err();
+                done.push(outcome);
+                if stop {
+                    break;
+                }
             }
-            // Snapshot done → record it in the state DB, the cleanup-proof twin of
-            // the GCS `snapshot/_SUCCESS` marker: once here, `cleanup_source`
-            // wiping the bucket no longer re-snapshots. Best-effort — a state
-            // write failure must not fail an otherwise-successful snapshot.
-            //
-            // Degradation on that rare failure: the durable signal is lost, so if
-            // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
-            // NEXT run finds no evidence and re-snapshots the whole table —
-            // wasteful (a fresh full re-read + re-load), NOT data loss: the
-            // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
-            // anchor and no changes are skipped.
-            // The LABEL, never the relation read. `snapshot_plan` asks this store
-            // with the configured string, and on SQL Server `synth.table` is the
-            // catalog's pair — so writing that made the key unable to match itself
-            // and every cycle re-snapshotted the whole table under a green run
-            // (round-4, DEMONSTRATED). Falls back to `table` for every engine where
-            // the two are the same string anyway.
-            if let Some(table) = synth.snapshot_label.as_deref().or(synth.table.as_deref())
-                && let Err(e) = state.mark_snapshot_done(
-                    &export.name,
-                    table,
-                    &super::cdc_job::snapshot_key(&synth.destination),
-                    &summary.journal.run_id,
-                )
-            {
-                log::warn!(
-                    "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",
-                    export.name,
-                    table,
-                    e
-                );
-            }
+            done
+        };
+        if let Some(failed) = outcomes.into_iter().find(|(res, _)| res.is_err()) {
+            return failed;
         }
         return super::cdc_job::run_cdc_export(config_path, config, export, state);
     }
@@ -1513,22 +1640,7 @@ fn run_export_job_inner(
     };
 
     let diags = validate_plan(&plan);
-    let mut rejected: Vec<String> = Vec::new();
-    for d in &diags {
-        match d.level {
-            DiagnosticLevel::Rejected => {
-                log::error!("[{}] plan validation rejected: {}", d.rule, d.message);
-                rejected.push(d.message.clone());
-            }
-            DiagnosticLevel::Warning => {
-                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
-            }
-            DiagnosticLevel::Degraded => {
-                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
-            }
-        }
-    }
-    if let Some(err) = plan_rejection_error(&plan.export_name, &rejected) {
+    if let Some(err) = log_plan_diagnostics(&plan.export_name, &diags) {
         let summary = synthetic_failed_summary(&export.name, &err);
         return (Err(err), summary);
     }
@@ -1638,28 +1750,9 @@ pub(crate) fn run_export_job_with_chunk_source(
     record_load_spec: bool,
 ) -> (Result<()>, RunSummary) {
     // Re-validate the plan from the artifact (fast, no DB queries).
-    let diags = validate_plan(plan);
-    for d in &diags {
-        match d.level {
-            DiagnosticLevel::Rejected => {
-                // A refusal BEFORE any work: the caller still gets a summary, so
-                // the run has one shape whatever it did (the same contract
-                // `run_export_job` keeps for its own early bails).
-                let err = anyhow::anyhow!(
-                    "export '{}': plan validation rejected: {}",
-                    plan.export_name,
-                    d.message
-                );
-                let summary = synthetic_failed_summary(&plan.export_name, &err);
-                return (Err(err), summary);
-            }
-            DiagnosticLevel::Warning => {
-                log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
-            }
-            DiagnosticLevel::Degraded => {
-                log::info!("[{}] plan validation degraded: {}", d.rule, d.message);
-            }
-        }
+    if let Some(err) = log_plan_diagnostics(&plan.export_name, &validate_plan(plan)) {
+        let summary = synthetic_failed_summary(&plan.export_name, &err);
+        return (Err(err), summary);
     }
 
     log::info!(
@@ -1691,6 +1784,62 @@ pub(crate) fn run_export_job_with_chunk_source(
             plan_warnings: Vec::new(),
         },
     )
+}
+
+#[cfg(test)]
+mod snapshot_leg_tests {
+    use super::*;
+
+    fn cdc_export() -> crate::config::ExportConfig {
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\n\
+             exports:\n  - name: cdc\n    mode: cdc\n    tables: [orders, items]\n\
+             \x20   format: parquet\n    cdc:\n      checkpoint: /tmp/ck\n\
+             \x20   destination:\n      type: local\n      path: ./out\n",
+        )
+        .expect("a two-table CDC config loads");
+        cfg.exports[0].clone()
+    }
+
+    /// Snapshot legs go to the pool only when this run allows it AND there is more than one.
+    #[test]
+    fn snapshot_legs_fan_out_needs_permission_and_more_than_one_leg() {
+        assert!(snapshot_legs_fan_out(true, 2));
+        assert!(
+            !snapshot_legs_fan_out(true, 1),
+            "one leg gains nothing from a pool"
+        );
+        assert!(
+            !snapshot_legs_fan_out(false, 5),
+            "not allowed, never pooled"
+        );
+    }
+
+    /// A finished leg is recorded under the key the next run's snapshot plan asks for,
+    /// so a rerun after a part-way failure does not redo it.
+    #[test]
+    fn a_finished_snapshot_leg_is_recorded_under_the_key_the_plan_reads() {
+        let export = cdc_export();
+        let leg =
+            crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders", "orders");
+        let state = StateStore::open_in_memory().unwrap();
+        let key = crate::pipeline::cdc_job::snapshot_key(&leg.destination);
+        assert!(
+            !state.snapshot_done("cdc", "orders", &key).unwrap(),
+            "fixture starts undone"
+        );
+        let mut summary = RunSummary::default();
+        summary.journal.run_id = "leg-run".into();
+        record_snapshot_done(&state, "cdc", &leg, &summary);
+        assert!(
+            state.snapshot_done("cdc", "orders", &key).unwrap(),
+            "the leg must be marked done where snapshot_plan looks"
+        );
+        assert!(
+            !state.snapshot_done("cdc", "items", &key).unwrap(),
+            "only the leg that finished"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1880,6 +2029,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn log_plan_diagnostics_refuses_on_every_rejection_and_passes_warnings() {
+        use super::log_plan_diagnostics;
+        use crate::plan::DiagnosticLevel;
+        use crate::plan::validate::Diagnostic;
+        let d = |level, message: &str| Diagnostic {
+            level,
+            rule: "r",
+            message: message.into(),
+        };
+        let warn_only = [
+            d(DiagnosticLevel::Warning, "w"),
+            d(DiagnosticLevel::Degraded, "g"),
+        ];
+        assert!(log_plan_diagnostics("orders", &warn_only).is_none());
+        let rejected = [
+            d(DiagnosticLevel::Rejected, "first"),
+            d(DiagnosticLevel::Warning, "w"),
+            d(DiagnosticLevel::Rejected, "second"),
+        ];
+        let msg = format!("{:#}", log_plan_diagnostics("orders", &rejected).unwrap());
+        assert!(msg.contains("first") && msg.contains("second") && !msg.contains("w\n"));
+    }
+
     /// A successful run promotes ONLY the transient status it was built with.
     ///
     /// Both directions matter and the `==`→`!=` mutant inverts both: with `!=`
@@ -1905,6 +2078,105 @@ mod tests {
                 "`{terminal}` is a decided status and must not be overwritten"
             );
         }
+    }
+
+    #[test]
+    fn skip_empty_skips_only_a_run_that_delivered_nothing() {
+        use super::ok_status;
+        assert_eq!(ok_status(true, 0, 0), "skipped");
+        assert_eq!(
+            ok_status(false, 0, 0),
+            "success",
+            "skip_empty off never skips"
+        );
+        assert_eq!(ok_status(true, 5, 1), "success", "rows were delivered");
+        assert_eq!(
+            ok_status(true, 0, 2),
+            "success",
+            "a resume re-adopted parts"
+        );
+        assert_eq!(
+            ok_status(true, 3, 0),
+            "success",
+            "rows counted, no parts yet"
+        );
+    }
+
+    #[test]
+    fn only_a_skipped_run_carries_a_skip_reason() {
+        use super::ok_outcome;
+        let full = ExtractionStrategy::Snapshot;
+        assert_eq!(
+            ok_outcome(true, 0, 0, &full),
+            ("skipped", Some("source returned 0 rows".to_string()))
+        );
+        assert_eq!(ok_outcome(true, 5, 1, &full), ("success", None));
+        assert_eq!(ok_outcome(false, 0, 0, &full), ("success", None));
+    }
+
+    #[test]
+    fn skip_reason_names_the_cursor_when_there_is_one() {
+        use super::skip_reason;
+        assert_eq!(
+            skip_reason(Some("updated_at")),
+            "no new rows since cursor 'updated_at'"
+        );
+        assert_eq!(skip_reason(None), "source returned 0 rows");
+    }
+
+    #[test]
+    fn a_marker_outlives_a_skipped_run_or_a_resume_under_another_id() {
+        use super::marker_outlived_its_run;
+        assert!(
+            marker_outlived_its_run("skipped", "r2", "r2"),
+            "no terminal manifest"
+        );
+        assert!(
+            marker_outlived_its_run("success", "r2", "r1"),
+            "resume wrote under r1"
+        );
+        assert!(
+            !marker_outlived_its_run("success", "r2", "r2"),
+            "terminal replaced it"
+        );
+        assert!(
+            !marker_outlived_its_run("failed", "r2", "r2"),
+            "failed manifest replaced it"
+        );
+    }
+
+    #[test]
+    fn a_keyset_incremental_run_waits_on_its_key_a_full_keyset_on_nothing() {
+        use super::awaited_column;
+        use crate::config::IncrementalCursorMode;
+        use crate::plan::{ExtractionStrategy, IncrementalCursorPlan, KeysetPlan};
+        let keyset = |incremental| {
+            ExtractionStrategy::Keyset(KeysetPlan {
+                key_column: "id".into(),
+                chunk_size: 10,
+                checkpoint: true,
+                incremental,
+                parallel: 1,
+            })
+        };
+        let incremental = ExtractionStrategy::Incremental(IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: IncrementalCursorMode::SingleColumn,
+            settle: None,
+        });
+        assert_eq!(
+            awaited_column(&incremental),
+            Some("updated_at"),
+            "the cursor it waited on"
+        );
+        assert_eq!(awaited_column(&keyset(true)), Some("id"));
+        assert_eq!(
+            awaited_column(&keyset(false)),
+            None,
+            "a full keyset pass awaits nothing"
+        );
+        assert_eq!(awaited_column(&ExtractionStrategy::Snapshot), None);
     }
 
     /// The resume/force policy as ONE truth table: the refuse-gate and the

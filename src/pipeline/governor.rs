@@ -99,41 +99,6 @@ fn recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// RAII exit accounting for ONE parallel worker: returns the worker's semaphore permit and bumps
-/// the `finished` counter [`GovernorHarness::spawn_into`]'s stop predicate reads — on EVERY exit
-/// path, **including an unwinding panic**.
-///
-/// Why a guard and not two tail statements: a tail statement is skipped when the worker UNWINDS, so
-/// a genuine panic in a worker (an Arrow/Parquet builder panic, a driver `unwrap`) leaves
-/// `finished == total - 1` forever. The governor thread's only exit is `finished >= total`
-/// ([`Governor::run`] has no deadline), and `std::thread::scope` cannot return until every spawned
-/// thread joins — so the panic that should have failed the run HANGS the process instead, and with
-/// `--parallel-exports` the whole pool stalls behind it. The leaked permit is the same class one
-/// layer down: at `parallel = 1` the spawner loop blocks forever on `acquire()` even with the
-/// governor disarmed. The keyset runner has carried an equivalent inline `FinishGuard` since #152;
-/// the chunked runner shipped the tail-statement form (bughunt 2026-08-13).
-pub(crate) struct WorkerExit<'a> {
-    semaphore: &'a Semaphore,
-    finished: &'a AtomicUsize,
-}
-
-impl<'a> WorkerExit<'a> {
-    /// Bind the guard at the TOP of the worker closure — before any fallible or panicking work.
-    pub(crate) fn new(semaphore: &'a Semaphore, finished: &'a AtomicUsize) -> Self {
-        Self {
-            semaphore,
-            finished,
-        }
-    }
-}
-
-impl Drop for WorkerExit<'_> {
-    fn drop(&mut self) {
-        self.semaphore.release();
-        self.finished.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// RAII permit for ONE unit of work in a POOL-shaped runner — a fixed set of long-lived workers
 /// that claim tasks in a loop (`parallel_checkpoint`), as opposed to the SPAWNER shape
 /// (`chunked/exec.rs`) where the parent takes the permit and one thread runs one chunk.
@@ -155,6 +120,10 @@ impl<'a> TaskPermit<'a> {
         semaphore.acquire();
         Self(semaphore)
     }
+    /// Take over a permit the PARENT already acquired (the spawner shape), releasing it on every exit.
+    pub(crate) fn adopt(semaphore: &'a Semaphore) -> Self {
+        Self(semaphore)
+    }
 }
 
 impl Drop for TaskPermit<'_> {
@@ -168,7 +137,7 @@ impl Drop for TaskPermit<'_> {
 /// (drained queue, claim error, or an unwinding panic).
 ///
 /// The permit half lives in [`TaskPermit`] instead of here — a pool worker's permit is per TASK,
-/// so pairing the two the way [`WorkerExit`] does would release a permit the worker no longer
+/// so pairing the two in one guard would release a permit the worker no longer
 /// holds (an unmatched `release()` underflows the semaphore's count). Same failure mode either way
 /// if the bump is skipped: the governor thread's only exit is `finished >= total`, so a missed
 /// bump loops it forever and `std::thread::scope` can never join.
@@ -256,7 +225,7 @@ impl GovernorHarness {
     /// its own monitoring connection and resizes `semaphore` within `[floor, ceiling]`,
     /// self-terminating once `finished` reaches `total` — keyed on FINISHED (success OR failure),
     /// not completed, so a failing worker can't strand it and deadlock the scope (a worker that
-    /// PANICS counts too — that is [`WorkerExit`]'s job). Decisions are buffered in `self.log` (the
+    /// PANICS counts too — `FanIn::spawn` binds [`WorkerFinished`] for that). Decisions are buffered in `self.log` (the
     /// journal is not thread-shared) and recorded by [`drain_into`](Self::drain_into) after the
     /// scope joins. Two things get a `warn` line rather than silence, and each gets exactly ONE:
     /// an armed governor whose very first probe cannot sample (the never-readable engine), and a
@@ -382,39 +351,20 @@ mod tests {
         false
     }
 
-    /// TWO workers, one of which UNWINDS — the fixture needs both because the
-    /// subject accumulates (a counter and a permit pool): with a single worker
-    /// a guard that bumps `finished` once for the whole run, or releases a
-    /// permit only on the happy path, is indistinguishable from a correct one.
-    ///
-    /// The panic is expected and its message is printed by the test harness.
+    /// The spawner's permit is released when its worker UNWINDS — a leaked one stalls the
+    /// spawner at `parallel = 1`.
     #[test]
-    fn worker_exit_guard_counts_and_releases_a_panicking_worker() {
-        let sem = Arc::new(Semaphore::new(2));
-        let finished = AtomicUsize::new(0);
-
-        for panics in [true, false] {
-            // The spawner takes the permit, exactly as `run_chunked_parallel` does.
-            sem.acquire();
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _exit = WorkerExit::new(&sem, &finished);
-                if panics {
-                    panic!("rivet test: injected worker panic (expected)");
-                }
-            }));
-            assert_eq!(outcome.is_err(), panics, "worker outcome (panics={panics})");
-        }
-
-        assert_eq!(
-            finished.load(Ordering::Relaxed),
-            2,
-            "an UNWINDING worker must still count as finished — the governor's only exit is \
-             `finished >= total`, so a missed bump hangs the run forever"
-        );
+    fn an_adopted_permit_is_released_by_a_panicking_worker() {
+        let sem = Arc::new(Semaphore::new(1));
+        sem.acquire();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _p = TaskPermit::adopt(&sem);
+            panic!("rivet test: injected worker panic (expected)");
+        }));
+        assert!(outcome.is_err());
         assert!(
-            acquires_within(&sem, 2, Duration::from_secs(5)),
-            "both permits must return — a permit leaked by a panicking worker stalls the \
-             spawner loop (permanently, at parallel = 1)"
+            acquires_within(&sem, 1, Duration::from_secs(5)),
+            "the permit leaked: the next acquire never returned"
         );
     }
 
@@ -834,7 +784,8 @@ mod tests {
     /// silent no-op on the `chunk_checkpoint: true` + `parallel: N` shape
     /// `rivet init` scaffolds — and `plan.strategy.is_resumable()` is the only
     /// thing that routes a config to one runner or the other (job.rs:1042).
-    /// RED against deleting any of the four calls.
+    /// RED against deleting any of the four calls. The drain itself is `FanIn::finish`'s,
+    /// which drains the governor before anything that can bail.
     #[test]
     fn the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor() {
         let src = include_str!("chunked/parallel_checkpoint.rs");
@@ -844,22 +795,21 @@ mod tests {
              is silent on the shape `rivet init` scaffolds"
         );
         assert!(
-            src.contains("governor.spawn_into(s, &semaphore, &finished, parallel,"),
+            src.contains("governor.spawn_into(s, &semaphore, fan.finished(), parallel,"),
             "arming without spawning never resizes anything; `total` is the POOL SIZE here \
              (workers that exit), not the task count"
         );
         assert!(
-            src.contains("governor.drain_into(summary);"),
-            "the ParallelismAdjusted events must reach the run journal"
+            src.contains("Some(governor),"),
+            "the ParallelismAdjusted events must reach the run journal — FanIn::finish drains \
+             the governor it is handed, first"
         );
         assert!(
             src.contains("TaskPermit::acquire(semaphore)"),
             "a pool worker must take its permit PER TASK — one permit held for the worker's \
              whole life is a ceiling the governor can shrink with no effect"
         );
-        let drain = src
-            .find("governor.drain_into(summary);")
-            .expect("drain call site");
+        let drain = src.find("Some(governor),").expect("drain call site");
         let bail = src
             .find("parallel checkpoint worker errors")
             .expect("worker-error bail");
@@ -870,20 +820,18 @@ mod tests {
         );
     }
 
-    /// Call-site pin for the guard above.
-    ///
-    /// The real subject — a chunk worker panicking inside `run_chunked_parallel` —
-    /// needs a live source, and BEFORE the fix it HANGS rather than fails, so it
-    /// cannot be a unit test (and a live watchdog test would have to kill the
-    /// process to report). What is pinned here instead is the wiring: the chunked
-    /// worker accounts for its exit through `WorkerExit`, and no longer through
-    /// tail statements that an unwind skips. RED against reverting either half.
+    /// Call-site pin: the chunked spawner's worker takes over the parent's permit with the
+    /// guard and leaves `finished` to `FanIn::spawn` — no tail statement an unwind skips.
     #[test]
     fn the_chunked_worker_accounts_for_its_exit_with_the_guard_not_tail_statements() {
         let src = include_str!("chunked/exec.rs");
         assert!(
-            src.contains("WorkerExit::new(semaphore, finished)"),
-            "the chunked worker must bind the exit guard at the top of its closure"
+            src.contains("TaskPermit::adopt(semaphore)"),
+            "the chunked worker must adopt the spawner's permit at the top of its closure"
+        );
+        assert!(
+            src.contains("fan.spawn("),
+            "FanIn::spawn owns the finished count"
         );
         assert!(
             !src.contains("finished.fetch_add"),

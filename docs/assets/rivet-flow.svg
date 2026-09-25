@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" width="1000" height="300" role="img" aria-label="PostgreSQL, MySQL, SQL Server and MongoDB flow through rivet, batch or CDC with no Kafka or connectors, to S3, GCS, Azure Blob or local disk, then into BigQuery (load and compact) or Snowflake (load)">
+  <defs>
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#cfe2ff"/>
+      <stop offset="0.55" stop-color="#6f9be0"/>
+      <stop offset="1" stop-color="#2f5fae"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .cap { font-size: 11px; font-weight: 600; letter-spacing: 1.6px; fill: #59636e; }
+      .pill { fill: #f6f8fa; stroke: #d1d9e0; stroke-width: 1; }
+      .card { fill: #f6f8fa; stroke: #d1d9e0; stroke-width: 1; }
+      .label { font-size: 15px; font-weight: 500; fill: #1f2328; }
+      .edge { fill: none; stroke: #8c959f; stroke-width: 1.5; }
+      .head { fill: #8c959f; }
+      .note { font-size: 11.5px; fill: #59636e; }
+      .dot { fill: #6f9be0; }
+      .node { fill: #0d1117; stroke: #2f5fae; stroke-width: 1.5; }
+      .brand { font-size: 21px; font-weight: 800; letter-spacing: 1px; fill: #ffffff; }
+      .chip { fill: #16233a; stroke: #2f5fae; stroke-width: 1; }
+      .chiptext { font-size: 10px; font-weight: 700; letter-spacing: 1.2px; fill: #cfe2ff; }
+      .hint { font-size: 12px; font-weight: 500; fill: #2f5fae; }
+      .muted { font-size: 11.5px; fill: #59636e; }
+      @media (prefers-color-scheme: dark) {
+        .cap { fill: #9198a1; }
+        .pill, .card { fill: #151b23; stroke: #3d444d; }
+        .label { fill: #f0f6fc; }
+        .edge { stroke: #656c76; }
+        .head { fill: #656c76; }
+        .note { fill: #9198a1; }
+        .node { fill: #0d1117; stroke: #6f9be0; }
+        .hint { fill: #8db3ee; }
+        .muted { fill: #9198a1; }
+      }
+    </style>
+  </defs>
+
+  <!-- column captions -->
+  <text class="cap" x="115" y="26" text-anchor="middle">SOURCES</text>
+  <text class="cap" x="400" y="26" text-anchor="middle">EXTRACT</text>
+  <text class="cap" x="645" y="26" text-anchor="middle">STORAGE</text>
+  <text class="cap" x="892" y="26" text-anchor="middle">WAREHOUSE</text>
+
+  <!-- sources -->
+  <rect class="pill" x="30" y="50" width="170" height="38" rx="19"/>
+  <text class="label" x="115" y="74" text-anchor="middle">PostgreSQL</text>
+  <rect class="pill" x="30" y="106" width="170" height="38" rx="19"/>
+  <text class="label" x="115" y="130" text-anchor="middle">MySQL</text>
+  <rect class="pill" x="30" y="162" width="170" height="38" rx="19"/>
+  <text class="label" x="115" y="186" text-anchor="middle">SQL Server</text>
+  <rect class="pill" x="30" y="218" width="170" height="38" rx="19"/>
+  <text class="label" x="115" y="242" text-anchor="middle">MongoDB</text>
+
+  <!-- sources converge on rivet -->
+  <path class="edge" d="M200,69 C265,69 270,153 328,153"/>
+  <path class="edge" d="M200,125 C265,125 270,153 328,153"/>
+  <path class="edge" d="M200,181 C265,181 270,153 328,153"/>
+  <path class="edge" d="M200,237 C265,237 270,153 328,153"/>
+
+  <!-- rivet -->
+  <rect class="node" x="330" y="98" width="140" height="110" rx="24"/>
+  <ellipse cx="364" cy="140" rx="15" ry="5.5" fill="url(#steel)"/>
+  <rect x="360.5" y="142" width="7" height="16" rx="2" fill="url(#steel)"/>
+  <text class="brand" x="385" y="159">RIVET</text>
+  <rect class="chip" x="345" y="174" width="52" height="20" rx="10"/>
+  <text class="chiptext" x="371" y="188" text-anchor="middle">BATCH</text>
+  <rect class="chip" x="403" y="174" width="52" height="20" rx="10"/>
+  <text class="chiptext" x="429" y="188" text-anchor="middle">CDC</text>
+  <text class="hint" x="400" y="232" text-anchor="middle">CDC without Kafka</text>
+  <text class="hint" x="400" y="248" text-anchor="middle">or connectors</text>
+
+  <!-- rivet -> storage -->
+  <path class="edge" d="M470,153 L556,153" marker-end="url(#arrow)"/>
+  <text class="note" x="514" y="143" text-anchor="middle">Parquet · CSV</text>
+
+  <!-- storage -->
+  <rect class="card" x="560" y="50" width="170" height="206" rx="16"/>
+  <circle class="dot" cx="590" cy="85" r="3.5"/>
+  <text class="label" x="604" y="90">Amazon S3</text>
+  <circle class="dot" cx="590" cy="130" r="3.5"/>
+  <text class="label" x="604" y="135">Google Cloud</text>
+  <circle class="dot" cx="590" cy="175" r="3.5"/>
+  <text class="label" x="604" y="180">Azure Blob</text>
+  <circle class="dot" cx="590" cy="220" r="3.5"/>
+  <text class="label" x="604" y="225">Local disk</text>
+
+  <!-- storage -> warehouse -->
+  <path class="edge" d="M730,153 L806,153" marker-end="url(#arrow)"/>
+
+  <!-- warehouse -->
+  <rect class="card" x="810" y="92" width="165" height="122" rx="16"/>
+  <circle class="dot" cx="836" cy="121" r="3.5"/>
+  <text class="label" x="850" y="126">BigQuery</text>
+  <text class="muted" x="850" y="144">load + compact</text>
+  <circle class="dot" cx="836" cy="173" r="3.5"/>
+  <text class="label" x="850" y="178">Snowflake</text>
+  <text class="muted" x="850" y="196">load</text>
+</svg>

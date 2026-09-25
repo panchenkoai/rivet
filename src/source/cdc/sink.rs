@@ -123,35 +123,65 @@ struct TableSink<'a> {
     /// re-read — see `value_checksum::Fold`) — recorded into the manifest so `rivet validate` Form B
     /// covers CDC prefixes instead of silently skipping the value leg.
     column_sums: std::collections::BTreeMap<String, u64>,
+    /// How many of `parts` the last per-roll manifest already declared.
+    manifested_parts: usize,
+}
+
+/// The facts one sink run shares across every table and every roll: who it is, how it writes, where it records.
+struct SinkRun<'a> {
+    engine: super::CdcEngine,
+    format: FormatType,
+    export_name: &'a str,
+    run_token: &'a str,
+    run_id: &'a str,
+    started_at: &'a str,
+    checkpoint: Option<&'a Path>,
+    state: Option<&'a crate::state::StateStore>,
 }
 
 impl TableSink<'_> {
-    /// Encode + upload this table's buffered changes as one part (no-op when
-    /// the buffer is empty). Does NOT touch the checkpoint or the stream — the
-    /// ack decision is global (see [`roll_all`]).
-    fn flush_buffered(
-        &mut self,
-        engine: super::CdcEngine,
-        format: FormatType,
-        run_token: &str,
-        ledger: Option<(&crate::state::StateStore, &str, &str)>,
-    ) -> Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
+    /// This table's run manifest over the parts it has so far.
+    fn manifest(&self, run: &SinkRun<'_>) -> RunManifest {
+        build_manifest(
+            run.engine,
+            &self.column_sums,
+            &self.out,
+            run.export_name,
+            run.format,
+            run.run_id,
+            run.started_at,
+            &self.parts,
+        )
+    }
+
+    /// Build this table's schema before its first flush, so the concurrent encode only reads the sink.
+    fn prepare_schema(&mut self) {
         // The schema is built lazily at the first flush so decimal column
         // scales can be refined from the data (SQL Server's metadata-only
         // resolve gives a placeholder scale of 0 — the same gap the batch path
         // fills from rows).
-        let sch = ensure_schema(
+        ensure_schema(
             &mut self.schema,
             &mut self.out.columns,
             &self.buf,
             &self.out.row_hash,
         );
-        let (part, sums) = flush(
+    }
+
+    /// Encode + upload this table's buffered changes as one part; touches nothing but the destination.
+    fn encode_and_upload(
+        &self,
+        engine: super::CdcEngine,
+        format: FormatType,
+        run_token: &str,
+    ) -> Result<(PartRecord, Vec<(String, u64)>)> {
+        let sch = self
+            .schema
+            .as_ref()
+            .expect("prepare_schema runs before every flush");
+        flush(
             &self.buf,
-            &sch,
+            sch,
             &self.out.columns,
             engine,
             format,
@@ -159,7 +189,17 @@ impl TableSink<'_> {
             self.seq,
             self.out.dest,
             &self.out.row_hash,
-        )?;
+        )
+    }
+
+    /// Account for a part that is durable at the destination: checksums, ledger, part list, buffer.
+    fn record_part(
+        &mut self,
+        part: PartRecord,
+        sums: Vec<(String, u64)>,
+        format: FormatType,
+        ledger: Option<(&crate::state::StateStore, &str, &str)>,
+    ) {
         for (name, sum) in sums {
             // wrapping_add, not XOR — the same fold `Fold::Sum` applies on
             // re-read. Under `^` two parts whose column checksums coincide
@@ -215,7 +255,6 @@ impl TableSink<'_> {
         self.parts.push(part);
         self.seq += 1;
         self.buf.clear();
-        Ok(())
     }
 }
 
@@ -302,24 +341,39 @@ pub(crate) fn table_matches(
 fn roll_all(
     sinks: &mut [TableSink<'_>],
     stream: &mut dyn ChangeStream,
-    engine: super::CdcEngine,
-    format: FormatType,
-    export_name: &str,
-    run_token: &str,
-    checkpoint: Option<&Path>,
+    run: &SinkRun<'_>,
     last_commit: &Option<Position>,
     unacked_commit: &mut bool,
-    run_id: &str,
-    started_at: &str,
-    state: Option<&crate::state::StateStore>,
 ) -> Result<()> {
-    for s in sinks.iter_mut() {
-        s.flush_buffered(
-            engine,
-            format,
-            run_token,
-            state.map(|st| (st, export_name, run_id)),
-        )?;
+    let pending: Vec<usize> = (0..sinks.len())
+        .filter(|&i| !sinks[i].buf.is_empty())
+        .collect();
+    for &i in &pending {
+        sinks[i].prepare_schema();
+    }
+    let uploaded = {
+        let view: Vec<&TableSink<'_>> = pending.iter().map(|&i| &sinks[i]).collect();
+        let (engine, format, run_token) = (run.engine, run.format, run.run_token);
+        crate::workers::run_each(&view, |s| s.encode_and_upload(engine, format, run_token))
+    };
+    // Every part that reached the store is recorded, even when a sibling's upload
+    // failed: it is durable either way, and the error still stops the ack below.
+    let mut first_err = None;
+    for (i, outcome) in pending.into_iter().zip(uploaded) {
+        match outcome {
+            Ok((part, sums)) => sinks[i].record_part(
+                part,
+                sums,
+                run.format,
+                run.state.map(|st| (st, run.export_name, run.run_id)),
+            ),
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
@@ -332,21 +386,25 @@ fn roll_all(
         // in the ack→terminal-manifest window would orphan the acked parts (silent,
         // count-gate-invisible loss). A `Success` run-unique manifest (no `_SUCCESS`
         // marker yet — the prefix is not complete) is idempotently rewritten as a
-        // superset each roll; the terminal write at clean end adds `_SUCCESS`.
-        for s in sinks.iter() {
-            let manifest = build_manifest(
-                engine,
-                &s.column_sums,
-                &s.out,
-                export_name,
-                format,
-                run_id,
-                started_at,
-                &s.parts,
-            );
-            write_manifest_without_success_marker(s.out.dest, &manifest)?;
+        // superset on each roll that gave the table a new part; the terminal write
+        // at clean end adds `_SUCCESS`.
+        let dirty: Vec<usize> = (0..sinks.len())
+            .filter(|&i| sinks[i].parts.len() != sinks[i].manifested_parts)
+            .collect();
+        let pending: Vec<(&dyn crate::destination::Destination, RunManifest)> = dirty
+            .iter()
+            .map(|&i| (sinks[i].out.dest, sinks[i].manifest(run)))
+            .collect();
+        crate::workers::run_each(&pending, |(dest, manifest)| {
+            write_manifest_without_success_marker(*dest, manifest).map(|_| ())
+        })
+        .into_iter()
+        .collect::<Result<()>>()?;
+        drop(pending);
+        for i in dirty {
+            sinks[i].manifested_parts = sinks[i].parts.len();
         }
-        if let Some(ck) = checkpoint {
+        if let Some(ck) = run.checkpoint {
             p.save(ck)?;
         }
         // Fault point: manifest + checkpoint persisted, source NOT acked — a crash
@@ -397,6 +455,7 @@ pub(crate) fn run_to_files(
             parts: Vec::new(),
             seq: 0,
             column_sums: std::collections::BTreeMap::new(),
+            manifested_parts: 0,
         })
         .collect();
 
@@ -405,6 +464,16 @@ pub(crate) fn run_to_files(
         rollover_bytes: cfg.rollover_memory_bytes,
     };
     let checkpoint = cfg.checkpoint.as_deref();
+    let run = SinkRun {
+        engine: cfg.engine,
+        format: cfg.format,
+        export_name: &cfg.export_name,
+        run_token: &run_token,
+        run_id: &cfg.run_id,
+        started_at: &cfg.started_at,
+        checkpoint,
+        state: cfg.state,
+    };
     let (mut total_rows, mut total_bytes, mut emitted) = (0usize, 0usize, 0usize);
     // The last commit-boundary position seen, and whether a commit has arrived
     // since the last ack — the only position it is ever valid to advance to.
@@ -495,20 +564,7 @@ pub(crate) fn run_to_files(
                     total_rows += 1;
                     emitted += 1;
                     if policy.should_roll(total_rows, total_bytes, committed) {
-                        roll_all(
-                            &mut sinks,
-                            stream,
-                            cfg.engine,
-                            cfg.format,
-                            &cfg.export_name,
-                            &run_token,
-                            checkpoint,
-                            &last_commit,
-                            &mut unacked_commit,
-                            &cfg.run_id,
-                            &cfg.started_at,
-                            cfg.state,
-                        )?;
+                        roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                         total_rows = 0;
                         total_bytes = 0;
                     }
@@ -537,20 +593,7 @@ pub(crate) fn run_to_files(
             // so a `max_events` stop mid-span still checkpoints a whole transaction.
             let buffered_rows: usize = sinks.iter().map(|s| s.buf.len()).sum();
             if pass_must_roll(unacked_commit, buffered_rows) {
-                roll_all(
-                    &mut sinks,
-                    stream,
-                    cfg.engine,
-                    cfg.format,
-                    &cfg.export_name,
-                    &run_token,
-                    checkpoint,
-                    &last_commit,
-                    &mut unacked_commit,
-                    &cfg.run_id,
-                    &cfg.started_at,
-                    cfg.state,
-                )?;
+                roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
                 total_rows = 0;
                 total_bytes = 0;
             }
@@ -576,37 +619,32 @@ pub(crate) fn run_to_files(
     // covered by the per-roll run-unique manifest `roll_all` wrote before each
     // ack, so the manifest is built for the CALLER's accounting and no
     // `_SUCCESS` is claimed — the run did not succeed.
-    let mut manifests = Vec::with_capacity(sinks.len());
+    let manifests: Vec<RunManifest> = sinks.iter().map(|s| s.manifest(&run)).collect();
+    // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
+    // AND an immutable run-unique copy, so a prefix accumulating several
+    // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
+    //
+    // Only on the clean path: writing `_SUCCESS` for a run that FAILED would
+    // tell every downstream reader the prefix is complete. A failed run's
+    // parts stay declared by the per-roll manifest, which carries no marker.
     // A failure to write the TERMINAL manifest becomes the run's outcome, but
     // must not discard the manifests either — the parts it describes are
     // durable regardless of whether the marker landed.
-    let mut write_err: Option<anyhow::Error> = None;
-    for s in &sinks {
-        let manifest = build_manifest(
-            cfg.engine,
-            &s.column_sums,
-            &s.out,
-            &cfg.export_name,
-            cfg.format,
-            &cfg.run_id,
-            &cfg.started_at,
-            &s.parts,
-        );
-        // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
-        // AND an immutable run-unique copy, so a prefix accumulating several
-        // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
-        //
-        // Only on the clean path: writing `_SUCCESS` for a run that FAILED would
-        // tell every downstream reader the prefix is complete. A failed run's
-        // parts stay declared by the per-roll manifest, which carries no marker.
-        if drain.is_ok()
-            && write_err.is_none()
-            && let Err(e) = write_manifest(s.out.dest, &manifest)
-        {
-            write_err = Some(e);
-        }
-        manifests.push(manifest);
-    }
+    let write_err: Option<anyhow::Error> = if drain.is_ok() {
+        let jobs: Vec<(&dyn crate::destination::Destination, &RunManifest)> = sinks
+            .iter()
+            .zip(&manifests)
+            .map(|(s, m)| (s.out.dest, m))
+            .collect();
+        crate::workers::run_each(&jobs, |(dest, manifest)| {
+            write_manifest(*dest, manifest).map(|_| ())
+        })
+        .into_iter()
+        .collect::<Result<()>>()
+        .err()
+    } else {
+        None
+    };
     match (drain, write_err) {
         (Err(e), _) => (manifests, Err(e)),
         (Ok(()), Some(e)) => (manifests, Err(e)),
@@ -2681,6 +2719,302 @@ mod tests {
         fn capabilities(&self) -> crate::destination::DestinationCapabilities {
             self.inner.capabilities()
         }
+    }
+
+    /// Records every object key written through it, delegating to a real destination.
+    struct RecordingDest {
+        inner: Box<dyn crate::destination::Destination>,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::destination::Destination for RecordingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            self.keys.lock().unwrap().push(key.to_string());
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A roll rewrites the run-unique manifest only for a table that gained a part since the
+    /// last one; an idle table in a busy stream is written once, at the terminal manifest.
+    #[test]
+    fn a_roll_rewrites_the_manifest_only_for_tables_that_gained_a_part() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let busy = RecordingDest {
+            inner: local_dest(&da),
+            keys: Default::default(),
+        };
+        let idle = RecordingDest {
+            inner: local_dest(&db),
+            keys: Default::default(),
+        };
+        let cols = int_col();
+        let ev = |table: &str, id: i64| {
+            let mut e = insert(id);
+            e.table = table.into();
+            e.committed = true;
+            e
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![ev("b", 4), ev("a", 1), ev("a", 2), ev("a", 3)]),
+            acked: Vec::new(),
+        };
+        fn output<'a>(
+            table: &str,
+            cols: &[TypeMapping],
+            dest: &'a dyn crate::destination::Destination,
+        ) -> TableOutput<'a> {
+            TableOutput {
+                table: table.into(),
+                columns: cols.to_vec(),
+                dest,
+                dest_uri: String::new(),
+                row_hash: crate::config::RowHash::All(false),
+            }
+        }
+        let base = cfg(&busy, &cols, FormatType::Parquet, 1);
+        let (m, r) = run_to_files(
+            &mut stream,
+            SinkConfig {
+                outputs: vec![output("a", &cols, &busy), output("b", &cols, &idle)],
+                ..base
+            },
+        );
+        r.unwrap();
+        assert_eq!(
+            (m[0].parts.len(), m[1].parts.len()),
+            (3, 1),
+            "fixture is inert — table a must roll three parts and b one"
+        );
+        let run_unique = |d: &RecordingDest| {
+            d.keys
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| k.rsplit('/').next().unwrap().starts_with("manifest-"))
+                .count()
+        };
+        assert_eq!(
+            run_unique(&idle),
+            2,
+            "b gained its part on the first roll and stayed idle for the next three: one \
+             per-roll manifest plus the terminal one, not one per roll of the whole stream"
+        );
+        assert_eq!(
+            run_unique(&busy),
+            4,
+            "a gained a part on every roll, then the terminal"
+        );
+    }
+
+    /// Lets a data part through only once `want` parts are uploading at once, across every table sharing it.
+    struct RendezvousDest {
+        inner: Box<dyn crate::destination::Destination>,
+        in_flight: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+        want: usize,
+    }
+    impl crate::destination::Destination for RendezvousDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            if key.ends_with(".parquet") {
+                let (count, arrived) = &*self.in_flight;
+                let mut n = count.lock().unwrap();
+                *n += 1;
+                arrived.notify_all();
+                let (n, timeout) = arrived
+                    .wait_timeout_while(n, std::time::Duration::from_secs(10), |n| *n < self.want)
+                    .unwrap();
+                anyhow::ensure!(
+                    !timeout.timed_out(),
+                    "only {} part upload(s) in flight at once",
+                    *n
+                );
+            }
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A part that landed, announced to whoever waits on it.
+    type Landed = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    /// Fails every data-part upload — after the sibling's part has landed, so the race is not the subject.
+    struct PartFailingDest {
+        inner: Box<dyn crate::destination::Destination>,
+        after: Landed,
+    }
+    impl crate::destination::Destination for PartFailingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            if key.ends_with(".parquet") {
+                let (flag, cv) = &*self.after;
+                let _ = cv
+                    .wait_timeout_while(
+                        flag.lock().unwrap(),
+                        std::time::Duration::from_secs(10),
+                        |landed| !*landed,
+                    )
+                    .unwrap();
+                anyhow::bail!("injected: part upload of '{key}' refused");
+            }
+            self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Delegates, and announces once a data part has landed.
+    struct AnnouncingDest {
+        inner: Box<dyn crate::destination::Destination>,
+        landed: Landed,
+    }
+    impl crate::destination::Destination for AnnouncingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            let out = self.inner.write(local, key)?;
+            if key.ends_with(".parquet") {
+                *self.landed.0.lock().unwrap() = true;
+                self.landed.1.notify_all();
+            }
+            Ok(out)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    fn two_table_outputs<'a>(
+        cols: &[TypeMapping],
+        a: &'a dyn crate::destination::Destination,
+        b: &'a dyn crate::destination::Destination,
+    ) -> Vec<TableOutput<'a>> {
+        [("a", a), ("b", b)]
+            .into_iter()
+            .map(|(table, dest)| TableOutput {
+                table: table.into(),
+                columns: cols.to_vec(),
+                dest,
+                dest_uri: String::new(),
+                row_hash: crate::config::RowHash::All(false),
+            })
+            .collect()
+    }
+
+    /// One transaction touching two tables: a roll uploads both tables' parts at once.
+    fn one_commit_over_two_tables() -> FakeStream {
+        let mut a = insert(1);
+        a.table = "a".into();
+        let mut b = insert(2);
+        b.table = "b".into();
+        b.committed = true;
+        FakeStream {
+            events: VecDeque::from(vec![a, b]),
+            acked: Vec::new(),
+        }
+    }
+
+    /// The tables of one roll upload their parts concurrently, not one PUT after another.
+    #[test]
+    fn a_roll_uploads_every_tables_part_at_once() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let in_flight = std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+        let (a, b) = (
+            RendezvousDest {
+                inner: local_dest(&da),
+                in_flight: in_flight.clone(),
+                want: 2,
+            },
+            RendezvousDest {
+                inner: local_dest(&db),
+                in_flight,
+                want: 2,
+            },
+        );
+        let cols = int_col();
+        let mut stream = one_commit_over_two_tables();
+        let (m, r) = run_to_files(
+            &mut stream,
+            SinkConfig {
+                outputs: two_table_outputs(&cols, &a, &b),
+                ..cfg(&a, &cols, FormatType::Parquet, 100)
+            },
+        );
+        r.expect("both parts must be in flight together");
+        assert_eq!((m[0].parts.len(), m[1].parts.len()), (1, 1));
+        assert_eq!(
+            stream.acked.len(),
+            1,
+            "the commit is acked once both parts landed"
+        );
+    }
+
+    /// A sibling's failed upload fails the roll without an ack, but the part that DID land
+    /// is still recorded — in the ledger and in the manifest the run returns.
+    #[test]
+    fn a_failed_part_upload_still_records_the_siblings_durable_part() {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let landed: Landed = Default::default();
+        let failing = PartFailingDest {
+            inner: local_dest(&da),
+            after: landed.clone(),
+        };
+        let fine = AnnouncingDest {
+            inner: local_dest(&db),
+            landed,
+        };
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut stream = one_commit_over_two_tables();
+        let (m, r) = run_to_files(
+            &mut stream,
+            SinkConfig {
+                state: Some(&state),
+                outputs: two_table_outputs(&cols, &failing, &fine),
+                ..cfg(&fine, &cols, FormatType::Parquet, 100)
+            },
+        );
+        assert!(r.is_err(), "a failed part upload is the roll's outcome");
+        assert!(
+            stream.acked.is_empty(),
+            "nothing may be acked past a part that never landed"
+        );
+        let landed: Vec<_> = std::fs::read_dir(db.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+            .collect();
+        assert_eq!(
+            landed.len(),
+            1,
+            "fixture is inert — b's part must have reached the store"
+        );
+        assert_eq!(
+            m[1].parts.len(),
+            1,
+            "b's durable part is missing from its manifest"
+        );
+        let logged = state.list_files_for_run("r").expect("read file_log");
+        assert!(
+            logged.iter().any(|f| f.file_name.starts_with("b/")),
+            "b's durable part never reached the ledger: {logged:?}"
+        );
     }
 
     /// A failed TERMINAL manifest write is the run's OUTCOME — never a success

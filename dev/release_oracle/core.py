@@ -29,6 +29,8 @@ by comparing transcripts rather than by trust.
 
 from __future__ import annotations
 
+import functools
+
 import os
 import shutil
 import subprocess
@@ -144,6 +146,10 @@ class Ledger:
         finally:
             self._spans.append((name, time.perf_counter() - t0))
 
+    def record_span(self, name: str, seconds: float) -> None:
+        """Record a wall-clock measured by the caller (a step between two marks)."""
+        self._spans.append((name, seconds))
+
     def buffered_child(self) -> "Ledger":
         """A sub-ledger that BUFFERS output (for one parallel engine). Its cells +
         buffered lines are folded back with `flush_into` after the engine finishes."""
@@ -246,6 +252,21 @@ class Ledger:
                     mx_name, mx = max(members, key=lambda p: p[1])
                     print(f"  {tot / 60.0:6.1f} min  {key:22} n={len(members):<3} "
                           f"mean={tot / len(members):4.1f}s  max={mx:4.1f}s ({mx_name.split(maxsplit=3)[-1]})")
+                print()
+            # Per-STEP rollup across every cell: "step <engine> <stage> <store>"
+            # spans, grouped by stage × store — which step of the chain the
+            # matrix's time actually goes to.
+            steps = [(n, d) for n, d in self._spans if n.startswith("step ")]
+            if steps:
+                by: dict[str, list[float]] = {}
+                for n, d in steps:
+                    _, _eng, stage, store = n.split(maxsplit=3)
+                    by.setdefault(f"{stage} {store}", []).append(d)
+                self.phase("Timing — chain steps per stage×store (summed over every cell and engine)")
+                for key in sorted(by, key=lambda k: sum(by[k]), reverse=True):
+                    ds = by[key]
+                    print(f"  {sum(ds) / 60.0:6.1f} min  {key:28} n={len(ds):<4} "
+                          f"mean={sum(ds) / len(ds):5.1f}s  max={max(ds):5.1f}s")
                 print()
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
@@ -371,8 +392,20 @@ def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:
 
 
 # ── the release binary under test ──────────────────────────────────────────────
+def target_dir() -> Path:
+    """Cargo's target directory: $CARGO_TARGET_DIR (relative to the repo) when set."""
+    return ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
+
+
 def rivet_bin() -> Path:
-    return Path(os.environ.get("RIVET_BIN", ROOT / "target" / "release" / "rivet"))
+    """$RIVET_BIN, else the release binary cargo builds under `target_dir()`."""
+    return Path(os.environ.get("RIVET_BIN", target_dir() / "release" / "rivet"))
+
+
+def release_bin_env() -> dict[str, str]:
+    """Env that makes a `cargo nextest` leg drive the gate's release binary: the Rust
+    tests resolve rivet from RIVET_BIN_OVERRIDE (tests/common/runner.rs), not RIVET_BIN."""
+    return {"RIVET_BIN": str(rivet_bin()), "RIVET_BIN_OVERRIDE": str(rivet_bin())}
 
 
 def rivet(*args: str, **kw) -> Proc:
@@ -405,10 +438,8 @@ def container_for_port(port: int) -> str | None:
     engine behind a URL. Returns None rather than an empty string, so a caller
     cannot pass ""/None into `docker exec` and get "invalid container name or ID:
     value is empty" (which is exactly what the bash version did)."""
-    for name in docker("ps", "--format", "{{.Names}}").stdout.split():
-        if any(line.endswith(f":{port}") for line in docker("port", name).stdout.splitlines()):
-            return name
-    return None
+    names = docker("ps", "--filter", f"publish={port}", "--format", "{{.Names}}").stdout.split()
+    return names[0] if names else None
 
 
 def port_of(url: str) -> int | None:
@@ -417,3 +448,12 @@ def port_of(url: str) -> int | None:
 
     m = re.search(r":(\d+)(?:/|$)", url)
     return int(m.group(1)) if m else None
+
+
+@functools.cache
+def sqlcmd(container: str) -> tuple[str, ...]:
+    """sqlcmd for THIS SQL Server image: tools18 (2022, needs `-C`) or tools (2019, no `-C`)."""
+    for path, flags in (("/opt/mssql-tools18/bin/sqlcmd", ("-C",)), ("/opt/mssql-tools/bin/sqlcmd", ())):
+        if docker_exec(container, "test", "-x", path, timeout=20).ok:
+            return (path, *flags)
+    raise SystemExit(f"{container}: no sqlcmd at tools18 or tools — the image changed its layout")

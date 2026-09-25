@@ -77,6 +77,12 @@ pub(crate) const TRIAGE_ROWS: i64 = 50_000;
 pub(crate) fn span_agrees_with_claim(catalog_rows: i64, span: i64) -> bool {
     span <= catalog_rows.saturating_mul(4).max(1_000)
 }
+/// Tier 0: is the catalog's small row claim trusted without probing? Only below
+/// [`TRIAGE_ROWS`] and only when the key span agrees with it.
+pub(crate) fn catalog_claim_trusted(catalog_rows: i64, span: i64) -> bool {
+    catalog_rows < TRIAGE_ROWS && span_agrees_with_claim(catalog_rows, span)
+}
+
 /// Default probe shape: ~1–2 s per table on a real index at any size.
 pub(crate) const PROBE_K: usize = 50;
 pub(crate) const PROBE_W: i64 = 10_000;
@@ -138,6 +144,16 @@ pub(crate) fn estimate_from_windows(min: i64, max: i64, counts: &[i64], w: i64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_small_claim_with_an_agreeing_span_is_trusted() {
+        assert!(catalog_claim_trusted(1_000, 1_000));
+        assert!(
+            !catalog_claim_trusted(TRIAGE_ROWS, TRIAGE_ROWS),
+            "not small"
+        );
+        assert!(!catalog_claim_trusted(1_000, 51_000), "frozen statistics");
+    }
 
     /// The grid covers the WHOLE span: first window at min, last window's end
     /// reaches max — a grid that stops short would systematically miss the

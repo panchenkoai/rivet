@@ -76,98 +76,45 @@ pub(crate) fn run_mongo_parallel(
     // GETs for an answer that cannot change mid-run (roast 2026-08-09, #173; the
     // chunked sibling was fixed the same way).
     let (shared_dest, shared_ext) = super::frame::RunnerFrame::open_shared(plan)?;
-    let results: Vec<(WorkerOutput, Result<()>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = ranges
-            .iter()
-            .enumerate()
-            .map(|(w, range)| {
-                let url = &url;
-                let key_plan = &key_plan;
-                let stamp = &stamp;
-                // Bson bounds aren't Copy — clone the slice into the worker.
-                let (lo, hi) = (range.0.clone(), range.1.clone());
-                let dest = std::sync::Arc::clone(&shared_dest);
-                let ext = &shared_ext;
-                s.spawn(move || range_worker(url, plan, key_plan, kp, stamp, w, lo, hi, dest, ext))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join().unwrap_or_else(|_| {
-                    // A panicked worker hands back nothing: its stack is gone, so
-                    // any part it wrote is genuinely unknown here (the orphan-GC
-                    // case, not a countable part).
-                    (
-                        WorkerOutput {
-                            rows: 0,
-                            parts: Vec::new(),
-                            schema: None,
-                            column_checksums: std::collections::BTreeMap::new(),
-                            checksum_key_column: None,
-                        },
-                        Err(anyhow::anyhow!("mongo parallel worker panicked")),
-                    )
-                })
-            })
-            .collect()
+    // No permits and no governor: one unthrottled thread per `_id` range. A worker
+    // publishes each page the moment it is durable, so a failed — or panicking —
+    // worker still hands back what it wrote.
+    let fan = super::fan_in::FanIn::default();
+    std::thread::scope(|s| {
+        for (w, range) in ranges.iter().enumerate() {
+            let (url, key_plan, stamp, ext, fan_r) = (&url, &key_plan, &stamp, &shared_ext, &fan);
+            // Bson bounds aren't Copy — clone the slice into the worker.
+            let (lo, hi) = (range.0.clone(), range.1.clone());
+            let dest = std::sync::Arc::clone(&shared_dest);
+            fan.spawn(s, format!("worker {w}"), move || {
+                range_worker_pages(url, plan, key_plan, kp, stamp, w, lo, hi, dest, ext, fan_r)
+            });
+        }
     });
-
-    // Drain on the main thread: sum rows + record every part through the shared
-    // commit path (single-threaded → the counter/journal ordering is race-free).
-    // Errors are COLLECTED, not propagated mid-drain. `let out = res?` used to sit
-    // here, above the record_part calls below — so a worker failure abandoned both
-    // its OWN durable pages and every later worker's, and handed
-    // `decide_export_retry` a files_committed of ZERO while parquet sat on the
-    // destination. Recording first is also the truthful thing: the run finalizes a
-    // Failed manifest, and listing the debris is what makes it discoverable to
-    // validate/gc instead of unreferenced.
-    let mut errs: Vec<String> = Vec::new();
-    for (w, (out, res)) in results.into_iter().enumerate() {
-        if let Err(e) = res {
-            errs.push(format!("worker {w}: {e}"));
-        }
-        summary.total_rows += out.rows;
-        // ADR-0028: feed the run ledger per worker — the seam pins the
-        // fingerprint, runs the drift gate and harvests Form B once, at the
-        // dispatcher. No application in this runner.
-        if let Some(sc) = &out.schema {
-            summary.ledger.note_schema(sc);
-        }
-        // ADR-0029: the worker RANGE is this runner's commit unit, and a worker
-        // hands back what it made durable even when it failed part-way — so the
-        // feed and the record_part drain below pair on the same unit and a
-        // failed worker's parts are covered by the checksums it did compute.
-        summary.ledger.contribute_checksums(
-            commit::UnitId::Chunk(w as i64),
-            &out.column_checksums,
-            out.checksum_key_column,
-        );
-        if plan.validate && out.rows > 0 {
-            summary.validated = Some(true);
-        }
-        for rec in &out.parts {
-            commit::record_part(
-                plan,
-                summary,
-                Some(state),
-                rec,
-                commit::PartKind::Chunk {
-                    chunk_index: w as i64,
-                },
-                commit::UnitId::Chunk(w as i64),
-            );
-        }
+    // ADR-0029: the worker range is this runner's commit unit; a worker contributes
+    // the checksums of every page it wrote, failed or not, so its parts stay covered.
+    let drained = fan.finish(
+        plan,
+        summary,
+        Some(state),
+        None,
+        |_, unit| match unit {
+            commit::UnitId::Chunk(chunk_index) => commit::PartKind::Chunk { chunk_index },
+            other => unreachable!("mongo parts are recorded under a chunk unit, not {other:?}"),
+        },
+        |errs| {
+            anyhow::anyhow!(
+                "export '{}': parallel mongo failed on {} range(s): {}",
+                plan.export_name,
+                errs.len(),
+                errs.join("; ")
+            )
+        },
+    );
+    if plan.validate {
+        summary.validated = Some(true);
     }
-    // Only now — every durable part is recorded and the counters are truthful.
-    if !errs.is_empty() {
-        anyhow::bail!(
-            "export '{}': parallel mongo failed on {} range(s): {}",
-            plan.export_name,
-            errs.len(),
-            errs.join("; ")
-        );
-    }
+    drained?;
 
     log::info!(
         "export '{}': parallel complete — {} range(s), {} rows",
@@ -179,53 +126,6 @@ pub(crate) fn run_mongo_parallel(
     // ADR-0028: fingerprint/drift/Form-B application lives in the ONE seam
     // (`finalize::finalize_export`), fed from the ledger above.
     Ok(())
-}
-
-struct WorkerOutput {
-    rows: i64,
-    parts: Vec<commit::PartRecord>,
-    schema: Option<arrow::datatypes::Schema>,
-    /// This worker's XOR-combined per-column Form B checksums (main thread folds
-    /// them run-wide across workers so the finalize manifest records Form B).
-    column_checksums: std::collections::BTreeMap<String, u64>,
-    checksum_key_column: Option<String>,
-}
-
-/// Runs one `_id` range and ALWAYS hands back what it made durable, even when it
-/// fails part-way.
-///
-/// The pages this worker already wrote are on the destination the moment
-/// `read_keyset_page` returns them; an error on a LATER page does not un-write
-/// them. Returning a bare `Result<WorkerOutput>` dropped that record on the floor
-/// — `summary.files_committed` is `decide_export_retry`'s only input, so a
-/// transient failure reported ZERO durable parts and the whole export retried
-/// over live data. Same defect the parallel-keyset runner was fixed for
-/// (`keyset.rs`, "Record what the SUCCESSFUL workers already made durable —
-/// BEFORE deciding whether to bail"); this is the Mongo twin of that shape.
-#[allow(clippy::too_many_arguments)]
-fn range_worker(
-    url: &str,
-    plan: &ResolvedRunPlan,
-    key_plan: &IncrementalCursorPlan,
-    kp: &KeysetPlan,
-    stamp: &str,
-    worker: usize,
-    lo: mongodb::bson::Bson,
-    hi: mongodb::bson::Bson,
-    dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
-    ext: &str,
-) -> (WorkerOutput, Result<()>) {
-    let mut out = WorkerOutput {
-        rows: 0,
-        parts: Vec::new(),
-        schema: None,
-        column_checksums: std::collections::BTreeMap::new(),
-        checksum_key_column: None,
-    };
-    let res = range_worker_pages(
-        url, plan, key_plan, kp, stamp, worker, lo, hi, dest, ext, &mut out,
-    );
-    (out, res)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -240,8 +140,9 @@ fn range_worker_pages(
     hi: mongodb::bson::Bson,
     dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
     ext: &str,
-    out: &mut WorkerOutput,
+    fan: &super::fan_in::FanIn,
 ) -> Result<()> {
+    let unit = commit::UnitId::Chunk(worker as i64);
     let mut src = MongoSource::connect(url, plan.source.tls.as_ref(), plan.source.mongo.as_ref())?
         .with_id_range(lo, hi);
 
@@ -278,15 +179,11 @@ fn range_worker_pages(
         else {
             break;
         };
-        out.rows += p.rows as i64;
-        if out.schema.is_none() {
-            out.schema = p.schema;
+        fan.observe(p.observed);
+        for part in p.parts {
+            fan.part(unit, part);
         }
-        out.parts.extend(p.parts);
-        super::commit::accumulate_column_checksums(&mut out.column_checksums, &p.column_checksums);
-        if out.checksum_key_column.is_none() {
-            out.checksum_key_column = p.checksum_key_column;
-        }
+        fan.contribute(unit, p.checksums);
         page += 1;
 
         if p.rows < kp.chunk_size {
@@ -295,10 +192,9 @@ fn range_worker_pages(
         match p.next_cursor {
             Some(v) => last = Some(v),
             None => anyhow::bail!(
-                // last-good key carried in the message: range_worker has no &mut
-                // summary (it returns WorkerOutput, errors aggregate upstream), so
-                // the forensic value rides error_message — which error_class reads
-                // as keyset_unreadable_key.
+                // last-good key carried in the message: a worker has no &mut summary
+                // (its failure is collected by the FanIn), so the forensic value
+                // rides error_message — which error_class reads as keyset_unreadable_key.
                 "export '{}': parallel worker {} could not read the '{}' value to advance keyset \
                  (NULL or unsupported type) — last readable key: {}.",
                 plan.export_name,

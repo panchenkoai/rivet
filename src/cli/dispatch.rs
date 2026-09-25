@@ -122,7 +122,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             config,
             run_id,
             pool,
-        } => load::orchestrate::run_compacts(load::orchestrate::CompactArgs {
+        } => load::compact::run_compacts(load::compact::CompactArgs {
             config,
             run_id,
             pool,

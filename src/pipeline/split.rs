@@ -22,8 +22,13 @@
 
 use std::path::Path;
 
+use std::collections::HashMap;
+
 use crate::config::{Config, ExportConfig, ExportMode, SourceType, SplitSynth};
 use crate::error::Result;
+use crate::pipeline::pool::{PoolItem, PredictedFrom};
+use crate::pipeline::summary::RunSummary;
+use crate::state::StateStore;
 
 /// The N half-open key windows `(lo, hi]` that partition the whole key span,
 /// given `n - 1` interior boundary values (ascending). The union is the entire
@@ -128,6 +133,11 @@ pub(crate) fn synthesize(
             // skipped by the pool; never-started units run fresh. Crash-recovery only (never the
             // append-only keyset_incremental), so a clean re-run does a full pass over the window.
             e.chunk_checkpoint = true;
+            // NEVER inherit skip_empty: an empty window would be `skipped` and write no
+            // manifest, so its split_window would be missing and the Full load would
+            // refuse the prefix as an incoherent set of windows. An empty unit still
+            // completes with a 0-part manifest that records its window.
+            e.skip_empty = false;
             e.split = Some(SplitSynth {
                 parent: parent.clone(),
                 key_column: key_column.to_string(),
@@ -603,6 +613,232 @@ fn reconstruct_units_from_manifests(
     Some(units)
 }
 
+/// What `--split` realized: the giant's one stable prefix and each unit's seeded prediction.
+pub(crate) struct Realized {
+    pub(crate) dest: crate::config::DestinationConfig,
+    pub(crate) family: String,
+    pub(crate) seeds: HashMap<String, PredictedFrom>,
+}
+
+/// Replace the dominating `giant` in `effective` with its range units; `None` when it is not splittable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn realize(
+    giant: &str,
+    n: usize,
+    broken: f64,
+    resume: bool,
+    predicted_pre: &[(PoolItem, PredictedFrom)],
+    effective: &mut Vec<ExportConfig>,
+    config: &Config,
+    config_dir: &Path,
+    state: &StateStore,
+) -> Result<Option<Realized>> {
+    let base = effective
+        .iter()
+        .find(|e| e.name == giant)
+        .expect("advise_split names an export in the set")
+        .clone();
+    // On --resume, RECONSTRUCT the exact partition the prior run used from its
+    // units' persisted windows — never re-sample (finding 2: sample_key_boundaries
+    // is offset/percentile-based, so a source that grew between crash and resume
+    // yields different boundaries, and the name-based skip below then covers a
+    // different key range than was exported → silent gap). Re-probe only when there
+    // is no prior split in the prefix (a genuine first run).
+    // A run-varying placeholder breaks split's stable-prefix identity
+    // (resume + stamp expand `for_today` at their own moments — a
+    // cross-midnight resume reads an EMPTY prefix, silently re-runs
+    // the giant and leaves yesterday's markers wedged). Refuse now,
+    // before any unit exists (round-5).
+    if let Some(token) = split_unsafe_placeholder(&base.destination) {
+        anyhow::bail!(
+            "apply --pool --split: export '{}' writes to a destination with the \
+             run-varying placeholder {token} — a split resume reconstructs its \
+             partition FROM the prefix, so the prefix must be one stable location \
+             across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
+             which are stable) for the split export.",
+            base.name
+        );
+    }
+    let reconstructed = match resume {
+        true => reconstruct_units_from_prefix(&base.destination, &base.family(), &base)?,
+        false => None,
+    };
+    let units_opt = match reconstructed {
+        Some(u) => {
+            // The reconstruction may have SHRUNK the partition (a
+            // trailing-adjacent crash: the open tail absorbed the
+            // crashed units). Stamp the ceased ordinals' ledger rows
+            // + bucket markers terminal NOW — this is the only
+            // moment that knows they ceased, and unstamped they
+            // wedge gc/cleanup on the shared prefix forever
+            // (round-4; born with the reconstruction in #217).
+            stamp_ceased_units(
+                &base.destination,
+                &base.family(),
+                &base.name,
+                u.len(),
+                state,
+            );
+            Some(u)
+        }
+        None => probe_and_synthesize(config, &base, config_dir, n)?,
+    };
+    let Some(units) = units_opt else {
+        log::warn!(
+            "apply --pool --split: '{giant}' dominates the floor but is not splittable \
+             (needs a `chunk_by_key:`/`chunk_column:`, and not incremental/CDC) — \
+             running it whole."
+        );
+        return Ok(None);
+    };
+    {
+        {
+            let realized = units.len();
+            // Seed each unit with its share of the giant's
+            // prediction so LPT places the slices where the giant
+            // stood (front of the queue), not at the 5 s
+            // placeholder tail — and with the giant's CLASSIFICATION,
+            // so a giant that has never succeeded does not turn into
+            // N "measured" units and silently delete the LOWER BOUND
+            // hedge below (bughunt 2026-08-14).
+            let (giant_secs, giant_from) = predicted_pre
+                .iter()
+                .find(|(i, _)| i.name == giant)
+                .map(|(i, f)| (i.predicted_secs, Some(f.clone())))
+                .unwrap_or((0.0, None));
+            let share = giant_secs / realized.max(1) as f64;
+            let unit_from = match &giant_from {
+                Some(f) => crate::pipeline::pool::split_unit_from(f, share),
+                None => crate::pipeline::pool::PredictedFrom::SeededSplit(share),
+            };
+            let seeds = units
+                .iter()
+                .map(|u| (u.name.clone(), unit_from.clone()))
+                .collect();
+            effective.retain(|e| e.name != giant);
+            // A synthesized unit is named `{giant}#i`; if a user export already carries
+            // that exact name, the `by_name` HashMap below collapses the two and
+            // silently DROPS the pre-existing export's whole table (convergence round-2
+            // LOW — `#` is not reserved in export-name validation). Refuse loudly.
+            if let Some(clash) = first_name_collision(&units, effective) {
+                anyhow::bail!(
+                    "apply --pool --split: the synthesized split unit '{clash}' collides \
+                     with an existing export of the same name. Rename that export — a \
+                     name of the form '{giant}#<n>' is reserved for split unit names."
+                );
+            }
+            effective.extend(units);
+            // `items` is rebuilt by the single post-split
+            // classification sweep below.
+            //
+            // This line speaks for the SPLIT, not for the run's
+            // prediction: `broken` is `advise_split`'s projection
+            // over the PRE-split items (the giant at whatever its
+            // frozen prediction was), and the seed it is derived
+            // from is only a first-run bootstrap — from run 2 on,
+            // each `{giant}#i` has history of its own that
+            // supersedes it (`pool::reconcile_split_seed`). So the
+            // honesty claim about the wall is NOT made here; it is
+            // made once, from the reconciled classification, by
+            // `lower_bound_hedge` beside the makespan print
+            // below. Hedging from `unit_from` printed "the giant
+            // has no successful run to measure from" in the same
+            // run whose accounting said "N measured, 0 estimated"
+            // (bughunt 2026-08-14).
+            log::warn!(
+                "apply --pool --split: split '{giant}' into {realized} range \
+                 sub-export(s) over its key — projected wall ~{:.1} min from the \
+                 pre-split predictions (was the single-export floor). The units share \
+                 one prefix and fold to family '{giant}', so the load view reads them \
+                 as one table. The run's own predicted makespan — reconciled against \
+                 each unit's own history, and hedged when any of it rests on an \
+                 unmeasured export — prints with the pool schedule on stdout, \
+                 unless the `--resume` skip leaves nothing to schedule (which says \
+                 so).",
+                broken / 60.0,
+            );
+            Ok(Some(Realized {
+                family: base.family(),
+                dest: base.destination,
+                seeds,
+            }))
+        }
+    }
+}
+
+/// Drop the split units whose Success manifest copy is already in the shared prefix; other exports skip on their own `_SUCCESS`.
+pub(crate) fn skip_completed(realized: Option<&Realized>, effective: &mut Vec<ExportConfig>) {
+    let completed_units = realized
+        .map(|r| completed_units_in_prefix(&r.dest, &r.family))
+        .unwrap_or_default();
+    effective.retain(|e| match &e.split {
+        Some(_) => {
+            let done = completed_units.contains(&e.name);
+            if done {
+                log::info!(
+                    "apply --pool --split: skipping unit '{}' — already complete (its \
+                     manifest copy is present)",
+                    e.name
+                );
+            }
+            !done
+        }
+        None => crate::pipeline::finalize::needs_run(e, true, "apply --pool"),
+    });
+}
+
+/// A split unit resumes only when it has a checkpoint to resume; any other export keeps the run-wide flag.
+pub(crate) fn unit_resume(export: &ExportConfig, resume: bool, state: &StateStore) -> bool {
+    match export.split {
+        Some(_) => {
+            resume
+                && state
+                    .has_resumable_checkpoint(&export.name)
+                    .unwrap_or(false)
+        }
+        None => resume,
+    }
+}
+
+/// Is this a split unit (its name under `unit_prefix`) that did NOT finish its share? Only `success` finishes it.
+pub(crate) fn unit_failed(unit_prefix: Option<&str>, summary: &RunSummary, ok: bool) -> bool {
+    unit_prefix.is_some_and(|p| summary.export_name.starts_with(p))
+        && !(ok && summary.status == "success")
+}
+
+/// Write the ONE prefix `_SUCCESS` the units suppressed, once every unit of the giant succeeded (best-effort).
+pub(crate) fn seal<'a>(
+    realized: &Realized,
+    outcomes: impl IntoIterator<Item = (&'a RunSummary, bool)>,
+) {
+    let unit_prefix = format!("{}#", realized.family);
+    if outcomes
+        .into_iter()
+        .any(|(s, ok)| unit_failed(Some(&unit_prefix), s, ok))
+    {
+        return;
+    }
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&realized.family);
+    let expanded = crate::destination::placeholder::expand_destination(realized.dest.clone(), &ctx);
+    if let Err(e) = crate::pipeline::finalize::write_split_success_marker(&expanded) {
+        log::warn!(
+            "apply --pool --split: could not write the prefix _SUCCESS for '{}': {e:#}",
+            realized.family
+        );
+    }
+}
+
+/// The first synthesized unit name (`{giant}#i`) that collides with an existing export's name; the caller refuses.
+pub(crate) fn first_name_collision<'a>(
+    units: &'a [ExportConfig],
+    existing: &[ExportConfig],
+) -> Option<&'a str> {
+    units
+        .iter()
+        .find(|u| existing.iter().any(|e| e.name == u.name))
+        .map(|u| u.name.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +882,86 @@ mod tests {
             row_hash: None,
             split_window: None,
         }
+    }
+
+    #[test]
+    fn a_split_unit_resumes_only_with_a_checkpoint_and_a_plain_export_keeps_the_flag() {
+        let state = StateStore::open_in_memory().unwrap();
+        let plain = sample_export("users");
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        let unit = synthesize(&giant, "id", &["10".into()]).remove(0);
+        assert!(unit_resume(&plain, true, &state));
+        assert!(!unit_resume(&plain, false, &state));
+        assert!(
+            !unit_resume(&unit, true, &state),
+            "a never-started unit runs fresh"
+        );
+        state.create_chunk_run("r0", &unit.name, "h", 3).unwrap();
+        assert!(unit_resume(&unit, true, &state), "a crashed unit resumes");
+        assert!(!unit_resume(&unit, false, &state));
+    }
+
+    #[test]
+    fn seal_writes_the_prefix_marker_only_when_every_unit_succeeded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
+        let realized = Realized {
+            dest: crate::config::DestinationConfig {
+                destination_type: crate::config::DestinationType::Local,
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            family: "orders".into(),
+            seeds: HashMap::new(),
+        };
+        let with = |name: &str, status: &str| {
+            let mut s = RunSummary::stub_for_testing("r", name);
+            s.status = status.into();
+            s
+        };
+        let (ok, bad, other) = (
+            with("orders#0", "success"),
+            with("orders#1", "failed"),
+            with("users", "failed"),
+        );
+        let marker = dir.path().join("_SUCCESS");
+        seal(&realized, [(&ok, true), (&bad, false), (&other, false)]);
+        assert!(!marker.exists(), "a failed unit leaves the giant unsealed");
+        seal(&realized, [(&ok, true), (&other, false)]);
+        assert!(
+            marker.exists(),
+            "a failed non-unit export does not block the seal"
+        );
+    }
+
+    #[test]
+    fn skip_completed_drops_only_units_whose_success_copy_is_in_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let m = unit_manifest("r0", "orders#0", crate::manifest::ManifestStatus::Success);
+        std::fs::write(
+            dir.path().join("manifest-r0.json"),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        let mut giant = sample_export("orders");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        let mut effective = synthesize(&giant, "id", &["10".into()]);
+        let realized = Realized {
+            dest,
+            family: "orders".into(),
+            seeds: HashMap::new(),
+        };
+        skip_completed(Some(&realized), &mut effective);
+        let left: Vec<_> = effective.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(left, ["orders#1"]);
     }
 
     /// A `{date}`/`{run_id}` prefix breaks split's stable-identity model (the
@@ -887,6 +1203,24 @@ mod tests {
     }
 
     #[test]
+    fn a_split_unit_never_inherits_skip_empty() {
+        let base = {
+            let mut e = sample_export("daily");
+            e.mode = ExportMode::Full;
+            e.chunk_by_key = Some("id".into());
+            e.skip_empty = true;
+            e
+        };
+        for u in synthesize(&base, "id", &["1000".into()]) {
+            assert!(
+                !u.skip_empty,
+                "unit {} must write its window's manifest even when empty",
+                u.name
+            );
+        }
+    }
+
+    #[test]
     fn synthesize_with_no_boundaries_leaves_the_export_whole() {
         let base = sample_export("solo");
         let units = synthesize(&base, "id", &[]);
@@ -1035,6 +1369,61 @@ mod tests {
         // Names must line up with ordinals so the pool's completed-unit skip stays correct.
         let names: Vec<&str> = units.iter().map(|u| u.name.as_str()).collect();
         assert_eq!(names, vec!["daily#0", "daily#1", "daily#2", "daily#3"]);
+    }
+
+    #[test]
+    fn realize_on_resume_swaps_the_giant_for_its_units_seeded_with_its_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("250"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("250"), Some("500"));
+        write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
+        let users = sample_export("users");
+        let item = |name: &str, secs: f64| PoolItem {
+            name: name.into(),
+            predicted_secs: secs,
+            parallel_safe: true,
+        };
+        let pre = [
+            (item("users", 10.0), PredictedFrom::Measured(10.0)),
+            (item("daily", 400.0), PredictedFrom::Measured(400.0)),
+        ];
+        let cfg = Config::from_yaml(
+            "source:\n  type: postgres\n  url: postgresql://localhost/db\nexports:\n\
+             \x20 - name: users\n    table: users\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out }\n",
+        )
+        .unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let mut effective = vec![users, giant];
+
+        let r = realize(
+            "daily",
+            4,
+            100.0,
+            true,
+            &pre,
+            &mut effective,
+            &cfg,
+            dir.path(),
+            &state,
+        )
+        .unwrap()
+        .expect("a reconstructable split is realized");
+
+        let names: Vec<&str> = effective.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["users", "daily#0", "daily#1", "daily#2", "daily#3"]);
+        assert_eq!(r.family, "daily");
+        assert_eq!(r.seeds.len(), 4);
+        for (unit, from) in &r.seeds {
+            assert!(
+                matches!(from, PredictedFrom::SeededSplit(s) if *s == 100.0),
+                "{unit} must inherit the giant's 400 s / 4 as a measured seed, got {from:?}"
+            );
+        }
     }
 
     // Helper: the (lo, hi) window of each reconstructed unit, in ordinal order.

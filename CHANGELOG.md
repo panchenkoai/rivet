@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **A multi-table CDC cycle to GCS is 10–13× faster** (60 tables, 330k changes,
+  measured against 0.28.0 on the same binlog span: 348 s → 35 s on a SQLite ledger,
+  376 s → 29 s on Postgres; an idle cycle 115 s → 10 s). The time was not data:
+  every roll uploaded each table's part, then rewrote EVERY table's run-unique
+  manifest, one PUT at a time. A roll now uploads all tables' parts and writes the
+  manifests concurrently (at most 16 at once), and rewrites a table's manifest only
+  when it gained a part. Parts and manifests are still durable before the
+  checkpoint and the ack. Peak RSS rises with the concurrency (+31% on the 60-table
+  stand); `rollover_memory_mb` bounds the change buffer, not the process.
+- **MySQL CDC no longer fails when a flush outlasts the server's
+  `net_write_timeout`** (60 s by default): the server dropped the binlog dump while
+  rivet was uploading and the run ended in `CodecError { bytes remaining on stream }`
+  (nothing was lost; the cycle was wasted). The binlog connection now sets a session
+  `net_write_timeout` of 3600 s.
+- **`--parallel-exports` runs at most 16 exports at once** (it started one thread
+  per export: a 150-table config opened 150 source and 150 state connections). The
+  same pool now takes a lone CDC export's pending baseline snapshots, at most 16 at
+  once (a 60-table first cycle: 235 s → 48 s); without the flag they stay one at a
+  time. A panicking export or snapshot is reported as that item's failure and the
+  others finish (release builds; `release-min` aborts).
+- GCS: the ADC access token is minted once per identity per process, not once per
+  destination (a multi-table CDC run opened one per table, ~0.4 s each).
+
 ## 0.28.0 — 2026-09-23
 
 - **Behaviour changes an operator upgrading from 0.27 will see.**

@@ -429,8 +429,8 @@ services:
       retries: 10
 
   minio:
-    # quay.io, not Docker Hub: `minio/minio` there answers "unauthorized" since 2026-09.
-    image: quay.io/minio/minio:latest
+    # Chainguard's build: `minio/minio` (Docker Hub) and `quay.io/minio/minio` both answer "unauthorized" since 2026-09.
+    image: cgr.dev/chainguard/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin

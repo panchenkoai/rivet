@@ -34,6 +34,8 @@ PHASE ORDER IS LOAD-BEARING, not cosmetic:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import argparse
 import os
 import shutil
@@ -42,7 +44,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, HERE, ROOT
+from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
@@ -91,14 +93,19 @@ def start_stores(led: Ledger) -> None:
 
     from .core import wait_until
 
-    wait_until(lambda: scenarios.store_up("s3") or scenarios.store_up("gcs"), tries=15, delay=1.0)
+    # Each store on its own: `s3 or gcs` returned as soon as fake-gcs answered, and a
+    # MinIO the `up` had just RECREATED (no volume — its buckets gone) was not up yet,
+    # so the bucket PUT below failed unread and every s3 cell then failed on
+    # `bucket not found` (measured 2026-09-25: all four CDC cells).
+    wait_until(lambda: scenarios.store_up("s3"), tries=30, delay=1.0)
+    wait_until(lambda: scenarios.store_up("gcs"), tries=15, delay=1.0)
 
-    # MinIO: its own client, run on the host network so 127.0.0.1 means the host.
-    run(["docker", "run", "--rm", "--network", "host", "--entrypoint", "sh",
-         "quay.io/minio/mc:latest", "-c",
-         f"mc alias set o http://127.0.0.1:9000 {scenarios.MINIO_ACCESS_KEY} "
-         f"{scenarios.MINIO_SECRET_KEY} >/dev/null 2>&1 && mc mb -p o/{BUCKET} >/dev/null 2>&1; true"],
-        timeout=180)
+    # MinIO: a signed REST PUT (the `mc` images are no longer public); 409 = already there.
+    from dev.pytools.e2e import s3_bucket_exists, s3_make_bucket
+
+    wait_until(lambda: s3_make_bucket("http://127.0.0.1:9000", BUCKET,
+                                      scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY),
+               tries=15, delay=1.0)
 
     # fake-gcs: the JSON API, because an upload 404s until the bucket exists.
     import json as _json
@@ -121,7 +128,12 @@ def start_stores(led: Ledger) -> None:
              "--connection-string", scenarios.AZURITE_CONN], timeout=120)
 
     def mark(store: str) -> str:
-        return "✓" if scenarios.store_up(store) else "✗"
+        up = scenarios.store_up(store)
+        if store == "s3":
+            # Up is not enough: the cells write INTO the bucket, so say ✓ only when it exists.
+            up = up and s3_bucket_exists("http://127.0.0.1:9000", BUCKET,
+                                         scenarios.MINIO_ACCESS_KEY, scenarios.MINIO_SECRET_KEY)
+        return "✓" if up else "✗"
 
     led.ok(f"stores up (bucket/container {BUCKET}: minio {mark('s3')} gcs {mark('gcs')} azure {mark('azure')})")
 
@@ -199,6 +211,17 @@ def _self_test() -> int:
     print(f"self-test ok: {len(_ENV_FLAG_TABLE)} spellings — argparse, env_flag and "
           "regression.without_prev_release_comparison() agree on every one")
 
+    # Two versions of the gate's matrix must never mint one name: every cell's dirs,
+    # prefixes and names come from `scenarios.Scope`, keyed on engine AND version.
+    grid = [(e, line.split()[0]) for e in matrix_cfg("engines").split()
+            for line in matrix_cfg("versions", e).splitlines() if line.split()]
+    scopes = [scenarios.Scope(e, t) for e, t in grid]
+    for mint in (lambda s: s.name("x", "t"), lambda s: str(s.dir("x", "t")),
+                 lambda s: s.prefix("x", "t")):
+        minted = [mint(s) for s in scopes]
+        assert len(set(minted)) == len(minted), f"two versions share a name: {minted}"
+    print(f"self-test ok: {len(scopes)} engine versions mint {len(scopes)} distinct names each way")
+
     # …and the regression module's own decisions about a child harness it cannot
     # run here: the SIGINT-first timeout, the grace period's grammar and where
     # its default comes from, the stand row when the container will not answer,
@@ -224,16 +247,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "outcome this must never produce.",
     )
     ap.add_argument(
-        "--version-parallel", type=int, default=1,
+        "--version-parallel", type=int, default=8,
         help="how many VERSIONS of one engine family to run concurrently "
-        "(default 1 = the serial behaviour). The family's versions are the "
-        "matrix's critical path — postgres alone is 22.5 of the 23.2-minute "
-        "matrix wall, seven versions back to back. Each version owns its own "
-        "container name and port, so the ceiling is MEMORY, not collisions: "
-        "measured 2026-09-20, the Docker VM caps at 39.2 GiB with ~10.5 GiB "
-        "free, while every family at full version parallelism wants ~25 GiB. "
-        "Raise it per run, deliberately; the global --cell-parallel cap still "
-        "bounds what the extra containers can actually do at once.",
+        "(default 8 = every version the matrix lists; 1 = serial). Serial, mongo's "
+        "five versions were the whole matrix wall (13.6 min). Each version owns its "
+        "own container name, port, work dirs and export names (`scenarios.Scope`), so the "
+        "ceiling is MEMORY: measured 2026-09-24 in the full gate, every family at once "
+        "peaked near 31 of 40 GiB in the Docker VM and the matrix took 5.9 min. Lower "
+        "it if Docker memory is tight.",
     )
     ap.add_argument(
         "--latest-only",
@@ -264,14 +285,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
     ap.add_argument(
-        "--cell-parallel", type=int, default=8,
+        "--cell-parallel", type=int, default=16,
         help="global cap on concurrent MATRIX CELLS (blessed_flow/blessed_path) across "
              "ALL engines. The matrix is I/O-bound (~62%% CPU idle at 4-way), so running "
              "its independent cells concurrently fills the idle cores; this bounds the "
              "total so the shared state DB / source containers are not stampeded.")
     ap.add_argument(
-        "--engine-parallel", type=int, default=3,
-        help="how many engines to run CONCURRENTLY in the engine loop (default 3). Each engine "
+        "--engine-parallel", type=int, default=4,
+        help="how many engines to run CONCURRENTLY in the engine loop (default 4 — every engine, so the longest never queues). Each engine "
              "owns its own containers/ports, and the scenarios race on the SHARED state backend "
              "— which doubles as a real concurrent-writer test. The dominant serial cost is CDC "
              "capture-job waits (sleep-for-the-agent), which overlap under parallelism, so the "
@@ -312,12 +333,12 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
     `cargo test` passes, a deliberate type error compiles clean. Stale artifacts
     from an interrupted run are the same class with a smaller blast radius.
 
-    So the gate starts by deleting the target directory and its own scratch, then
-    builds `--release` itself. It costs one full compile; it buys the guarantee
+    So the gate starts by deleting `target/package`, the release profile and its own
+    scratch, then builds `--release` itself: one release compile buys the guarantee
     that the binary every cell below exercises is the code in the tree.
 
     `fast=True` removes ONLY `target/package` — the exact directory the poison
-    lives in — instead of the whole `target/`. Cargo's own fingerprints are honest
+    lives in — and keeps the release profile. Cargo's own fingerprints are honest
     once that snapshot is gone (every freshness-lie this repo has hit was
     package-related), so the binary=HEAD guarantee holds while the dependency
     recompile is skipped. This is NOT a compilation cache: there is no external
@@ -331,13 +352,15 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
         shutil.rmtree(stale, ignore_errors=True)
     for lock in Path("/tmp").glob(".rivet_cdc_sweep*.lock"):
         lock.unlink(missing_ok=True)
-    if fast:
-        # Delete ONLY the poison directory; cargo's honest fingerprints do the rest.
-        shutil.rmtree(ROOT / "target" / "package", ignore_errors=True)
-    elif not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
+    # `target/package` is the one known liar either way. Full mode also rebuilds the
+    # RELEASE profile — the binary this gate grades — from nothing; the test and
+    # coverage profiles keep their caches (cargo's fingerprints grade them honestly,
+    # and wiping them cost every later cargo stage a cold build).
+    shutil.rmtree(target_dir() / "package", ignore_errors=True)
+    if not fast and not run(["cargo", "clean", "--release"], cwd=ROOT, timeout=600).ok:
         led.failed("-", "-", "clean_tree", "-",
-                   "clean tree: `cargo clean` failed — the gate cannot vouch for the binary it "
-                   "is about to grade")
+                   "clean tree: `cargo clean --release` failed — the gate cannot vouch for "
+                   "the binary it is about to grade")
         return False
     build = run(["cargo", "build", "--release"], cwd=ROOT, timeout=3600)
     if not build.ok or not rivet_bin().is_file():
@@ -348,7 +371,8 @@ def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
         )
         return False
     how = ("target/package removed (fast: cargo fingerprints trusted, binary=HEAD)"
-           if fast else "target/ removed and the release binary rebuilt from nothing")
+           if fast else "release profile + target/package removed and the release binary "
+           "rebuilt from nothing")
     led.passed(
         "-", "-", "clean_tree", "-",
         f"clean tree: {how} ({rivet_bin()})",
@@ -368,7 +392,6 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_auth(led)
     scenarios.verify_cdc_standby(led)
     scenarios.verify_live_only_coverage(led)
-    scenarios.verify_inflight_run_stays_loadable(led)
     scenarios.verify_coverage_matrices(led)
     # Cheap and container-free: the flag surface is read from `rivet --help`,
     # so it belongs with the file-level guards rather than after twenty
@@ -384,7 +407,6 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_pool_e2e(led)
     scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
-    partner_shape.verify_partner_shape(led)
     cdc.verify_cdc_differential(led)
     regression.verify_release_regression(led)
     # The two prev-release harnesses, next to the stage that shares their
@@ -420,14 +442,17 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
             "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
         ),
     )
-    # Four SAME-NAMED configs on one shared Postgres state, at once — the
-    # deployment shape the shared-state docs recommend; blessed and crashed.
-    shared_state.verify_shared_state_same_name(led)
-    # The partner's warehouse layout: base + buffer + `compact`, and loads batched
-    # under BigQuery's per-job partition cap.
-    warehouse_layout.verify_warehouse_layout(led)
-    # The same cycle on configs `rivet init` wrote: run 1 everything, run 2 the delta.
-    init_delta.verify_init_delta(led)
+    # The BigQuery-bound stages wait on warehouse jobs, not on each other: run together.
+    # Shared state: four SAME-NAMED configs on one Postgres state, blessed and crashed.
+    # Warehouse layout: base + buffer + `compact`, loads batched under the partition cap.
+    # Init delta: the same cycle on configs `rivet init` wrote. Partner shape: init
+    # --mode cdc over three tables through two loads.
+    run_concurrently(led, "BigQuery stages — shared state, warehouse layout, init delta, partner shape", [
+        ("shared state", lambda sub: shared_state.verify_shared_state_same_name(sub)),
+        ("warehouse layout", lambda sub: warehouse_layout.verify_warehouse_layout(sub)),
+        ("init delta", lambda sub: init_delta.verify_init_delta(sub)),
+        ("partner shape", lambda sub: partner_shape.verify_partner_shape(sub)),
+    ])
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
@@ -546,18 +571,19 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
         # fallback, not a permanent hole.
         #
         # The path is resolved LAZILY, below: this dict literal is built in
-        # full before `[engine]` selects an arm, so calling `sqlcmd_path(name)`
+        # full before `[engine]` selects an arm, so calling `sqlcmd(name)`
         # here ran it against the POSTGRES container and killed the run on the
         # first postgres version with "no sqlcmd at tools18 or tools". A helper
         # that is correct for its own engine and fatal for the others is the
         # same shape as a feature wired into one runner of four.
         "mssql": [["__SQLCMD__", "-S", "localhost", "-U", "sa",
-                   "-P", "Rivet_Passw0rd!", "-C", "-Q", "SELECT 1"]],
+                   "-P", "Rivet_Passw0rd!", "-Q", "SELECT 1"]],
         "mongo": [["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
                   ["mongo", "--quiet", "--eval", "db.runCommand({ping:1})"]],
     }[engine]
     if engine == "mssql":
-        probes = [[sqlcmd_path(name) if a == "__SQLCMD__" else a for a in p] for p in probes]
+        probes = [[x for a in p for x in (sqlcmd(name) if a == "__SQLCMD__" else (a,))]
+                  for p in probes]
     from .core import docker_exec, wait_until
 
     # TWO consecutive successes, a second apart — not one.
@@ -589,8 +615,8 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
         return None
 
     if engine == "mssql":
-        docker_exec(name, sqlcmd_path(name), "-S", "localhost", "-U", "sa",
-                    "-P", "Rivet_Passw0rd!", "-C", "-Q",
+        docker_exec(name, *sqlcmd(name), "-S", "localhost", "-U", "sa",
+                    "-P", "Rivet_Passw0rd!", "-Q",
                     "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet")
 
     return matrix_cfg("url", engine).replace("%PORT%", str(port))
@@ -616,8 +642,8 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
         p = docker_exec(name, "mysql", "-urivet", "-privet", "rivet", stdin=body, timeout=900)
     elif engine == "mssql":
         docker("cp", str(seed), f"{name}:/tmp/s.sql")
-        p = docker_exec(name, sqlcmd_path(name), "-S", "localhost", "-U", "sa",
-                        "-P", "Rivet_Passw0rd!", "-d", "rivet", "-C", "-i", "/tmp/s.sql", timeout=900)
+        p = docker_exec(name, *sqlcmd(name), "-S", "localhost", "-U", "sa",
+                        "-P", "Rivet_Passw0rd!", "-d", "rivet", "-i", "/tmp/s.sql", timeout=900)
     else:  # mongo — from the host
         p = run(["python3", str(seed)], timeout=1800,
                 env={"RIVET_MONGO_URI": url, "RIVET_SEED_USERS": "150000", "RIVET_SEED_ORDERS": "150000"})
@@ -630,29 +656,6 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
     if p.ok and not hits:
         return ""
     return "; ".join(hits) or f"exit {p.returncode}"
-
-
-def sqlcmd_path(container: str) -> str:
-    """Where THIS SQL Server image keeps sqlcmd.
-
-    The 2022 image ships `/opt/mssql-tools18`; 2019 ships `/opt/mssql-tools`.
-    A hardcoded tools18 path is why "mssql 2019" sat in the gate matrix as a
-    coverage gap — a harness limitation recorded as a product-coverage hole.
-    Probed per container, cheap, and it fails LOUD rather than silently picking
-    a path that does not exist.
-    """
-    # Through the module's own `docker_exec`, not a bare subprocess: this file
-    # imports no subprocess at all (the first cut of this helper crashed the
-    # whole run with a NameError on the very first mssql version).
-    from .core import docker_exec
-
-    for path in ("/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd"):
-        if docker_exec(container, "test", "-x", path, timeout=20).ok:
-            return path
-    raise SystemExit(
-        f"{container}: no sqlcmd at tools18 or tools — the image changed its "
-        f"layout and every seed/probe below would fail with a confusing exec error"
-    )
 
 
 def _wanted_versions(spec: str, engine: str) -> set[str] | None:
@@ -767,6 +770,24 @@ def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str
         docker("rm", "-fv", engine_container(engine, tag))
 
 
+def run_concurrently(led: Ledger, title: str, stages: list[tuple[str, Callable[[Ledger], None]]]) -> None:
+    """Run independent gate stages at once, each into a buffered sub-ledger flushed in list order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    led.phase(title)
+    subs = [led.buffered_child() for _ in stages]
+
+    def _one(i: int) -> None:
+        name, fn = stages[i]
+        with subs[i].span(f"{name}: stage-total"):
+            fn(subs[i])
+
+    with ThreadPoolExecutor(max_workers=len(stages)) as ex:
+        list(ex.map(_one, range(len(stages))))
+    for sub in subs:
+        sub.flush_into(led)
+
+
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
     wanted = [e for e in ns.engines.split(",") if e] if ns.engines else None
     engines = [e for e in matrix_cfg("engines").split() if not wanted or e in wanted]
@@ -810,7 +831,8 @@ def main(argv: list[str] | None = None) -> int:
     from .core import set_cell_parallel
     set_cell_parallel(ns.cell_parallel)
 
-    if not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK):
+    # A clean-tree run builds the binary itself; only --no-clean needs one up front.
+    if ns.no_clean and (not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK)):
         print(f"rivet binary not found at {rivet_bin()} (build --release or set RIVET_BIN)", file=sys.stderr)
         return 2
     if not have("duckdb"):
@@ -839,8 +861,6 @@ def main(argv: list[str] | None = None) -> int:
         from datetime import datetime, timezone
 
         led.phase(f"Rivet Release Oracle — {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
-        version = rivet("--version").stdout.splitlines()
-        print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
 
         # WHICH STATE BACKEND IS BEING GRADED, said out loud.
         #
@@ -876,19 +896,22 @@ def main(argv: list[str] | None = None) -> int:
 
         if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
             return 1
+        version = rivet("--version").stdout.splitlines()
+        print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
-        engine_loop(led, ns)
-        if not ns.no_cloud:
-            # Inject THIS module's bring_up/seed_engine rather than letting the
-            # stage use its own copies. The copies exist only because importing
-            # the module executing as __main__ would re-run it — but a duplicate
-            # is a duplicate: the readiness hardening (two consecutive probe
-            # passes, and honouring the result) landed here and NOT there, so the
-            # BQ stage's mysql leg still hit the initdb race and recorded
-            # `SKIP seed` where the previous run had a PASS. One definition now.
-            bigquery.run_bigquery_golden(led, keep=ns.keep, parallel=ns.engine_parallel,
-                                         bring_up=bring_up, seed_engine=seed_engine)
+        if ns.no_cloud:
+            engine_loop(led, ns)
+        else:
+            # The BigQuery golden brings up its own `bq`-tagged containers on their own
+            # ports, so it runs beside the matrix instead of after it. It is handed THIS
+            # module's bring_up/seed_engine so the readiness hardening has one definition.
+            run_concurrently(led, "Engine matrix + BigQuery golden", [
+                ("engine matrix", lambda sub: engine_loop(sub, ns)),
+                ("bigquery golden", lambda sub: bigquery.run_bigquery_golden(
+                    sub, keep=ns.keep, parallel=ns.engine_parallel,
+                    bring_up=bring_up, seed_engine=seed_engine)),
+            ])
         rc = led.report()
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is

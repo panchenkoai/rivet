@@ -456,6 +456,53 @@ fn gremlin_chunked_empty_middle_chunk_does_not_false_fire_row_count_min() {
     );
 }
 
+/// The parallel chunked runner writes a part only for a chunk that returned rows:
+/// sparse ids leave most `chunk_size: 10` windows empty, and none of them
+/// may land an empty Parquet in the prefix.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_chunked_empty_chunks_write_no_parts() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(0);
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "INSERT INTO {name} (id, name, amount) VALUES \
+         (1,'a',1),(2,'b',2),(3,'c',3),(100,'d',4),(101,'e',5),(102,'f',6);",
+        name = table.name()
+    ))
+    .expect("sparse insert");
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("gr_par_empty");
+
+    let rig = Rig::pg_batch(&export_name)
+        .tables(&[table.name()])
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 10")
+        .export_line("parallel: 2")
+        .dest_path(out.path().to_path_buf());
+
+    let result = rig.run_args(&["--export", &export_name]);
+    assert!(
+        result.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let parts: Vec<_> = std::fs::read_dir(out.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    assert!(!parts.is_empty());
+    for part in &parts {
+        assert!(
+            parquet_rows(&part.path()) > 0,
+            "an empty chunk wrote a part: {part:?}"
+        );
+    }
+    assert_eq!(duckdb_total_parquet_rows(out.path()), 6);
+}
+
 // ─── G10: multi-export with one quality-fail — others still execute ───────────
 
 /// Two exports in one config; the first has a row_count_min gate that will

@@ -525,7 +525,8 @@ pub(super) fn persist(state: &StateStore, agg: &RunAggregate, summary_output: Op
     }
 }
 
-fn write_json(path: &Path, agg: &RunAggregate) -> Result<()> {
+/// Write the aggregate as pretty JSON, creating missing parent directories.
+pub(super) fn write_json(path: &Path, agg: &RunAggregate) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

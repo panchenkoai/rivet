@@ -166,7 +166,7 @@ scenarios:
 
   - id: span_over_the_job_cap_refused
     what: "ONE Parquet file whose values alone span more than 4,000 partitions is refused from the footer statistics before any job, naming the file and the granularity that fits (D4) — the shape no batching splits (dates uncorrelated with the read key)"
-    bigquery:   { test: bigquery_hourly_partitions_over_the_job_cap_are_refused_before_the_load }
+    bigquery:   { test: a_file_spanning_the_whole_history_is_refused_by_name_before_any_job }
     snowflake:  { na: "no per-job partition cap" }
 
   - id: span_over_the_job_cap_loads_in_batches

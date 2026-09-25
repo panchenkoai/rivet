@@ -9,7 +9,7 @@
 # message.
 #
 # `tests/offline/cdc_axis_matrix_guard.rs` DERIVES both enumerations from the
-# product — the struct fields out of src/config/export.rs, the hooks out of the
+# product — the struct fields out of src/config/cdc.rs, the hooks out of the
 # `maybe_panic_at("cdc_…")` call sites — and fails when one has no row here. So a
 # new CDC knob cannot land without a sentence saying how it is swept, or an
 # explicit `na:` saying why it needs no sweeping.

@@ -57,7 +57,8 @@ Responsible for: durable state across runs. No execution logic.
 
 | Module | Responsibility |
 |--------|---------------|
-| `state/mod.rs` | `StateStore` entry point + migration runner |
+| `state/mod.rs` | `StateStore` entry point |
+| `state/migrations.rs` | Schema version + SQLite/PostgreSQL migration ladders and runners |
 | `state/cursor.rs` | Incremental cursor positions (`export_state`) |
 | `state/checkpoint.rs` | Chunk run/task lifecycle (`chunk_run`, `chunk_task`) |
 | `state/metrics.rs` | Run outcome history (`export_metrics`) |

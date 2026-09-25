@@ -87,9 +87,7 @@ pub(super) fn finalize_export(
     }
 
     // Epic 8: data shape drift — warn when string/binary columns grow beyond
-    // threshold. Applied wherever a runner fed shape bytes (today the single
-    // sink tracks them; a runner that starts feeding them gets the warn for
-    // free — born `na`, per ADR-0028).
+    // threshold. Every runner feeds its sinks' shape bytes into the ledger.
     if plan.shape_drift_warn_factor > 0.0
         && !ledger.observed.column_max_bytes.is_empty()
         && let Some(st) = state
@@ -325,7 +323,7 @@ pub(super) fn finalize_manifest(
 
     // A HEALTHY no-op describes nothing, so it must not describe the prefix.
     //
-    // `"skipped"` is a real production status — `single.rs` sets it when a run
+    // `"skipped"` is a real production status — `job.rs::ok_status` sets it when a run
     // reads 0 rows under `skip_empty: true`, the ordinary outcome of an
     // incremental export with nothing new past the cursor. It used to fall
     // through the `_` arm below to `Interrupted`, and `write_manifest` then
@@ -859,6 +857,25 @@ pub(crate) fn repair_missing_split_marker(
     }
 }
 
+/// False when `resume` is set and the export's destination, expanded for today, already holds `_SUCCESS` (logged as a skip by `who`).
+pub(crate) fn needs_run(export: &crate::config::ExportConfig, resume: bool, who: &str) -> bool {
+    if !resume {
+        return true;
+    }
+    // Expanded, not the raw template: a `{export}`/`{date}` prefix never matches a literal marker path.
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&export.name);
+    let expanded =
+        crate::destination::placeholder::expand_destination(export.destination.clone(), &ctx);
+    if destination_has_success(&expanded) {
+        log::info!(
+            "{who}: skipping '{}' — destination already complete (_SUCCESS)",
+            export.name
+        );
+        return false;
+    }
+    true
+}
+
 pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -> bool {
     use crate::manifest::SUCCESS_FILENAME;
     let Ok(d) = crate::destination::create_destination(dest) else {
@@ -885,6 +902,29 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
          reader over the prefix will double-count / orphan the old parts. \
          Use --resume to continue the prior run, or clear the prefix first."
     )
+}
+
+/// Delete the `running` marker written under `run_id` from a cloud prefix — one no
+/// terminal manifest replaced would otherwise say the prefix is live for ever
+/// (`cleanup_source` refused, gc sparing). Best-effort: the ledger is authoritative.
+pub(super) fn retire_running_marker(plan: &ResolvedRunPlan, run_id: &str) {
+    use crate::config::DestinationType;
+    if matches!(
+        plan.destination.destination_type,
+        DestinationType::Local | DestinationType::Stdout
+    ) {
+        return;
+    }
+    let key = crate::manifest::run_unique_manifest_name(run_id);
+    let removed = crate::destination::create_destination(&plan.destination)
+        .and_then(|dest| dest.remove(&key));
+    if let Err(e) = removed {
+        log::debug!(
+            "export '{}': could not retire the running marker {key} (not fatal; the ledger \
+             says the run ended): {e:#}",
+            plan.export_name
+        );
+    }
 }
 
 /// Project the `run_status` ledger's `running` row into the bucket as a
@@ -1191,7 +1231,10 @@ mod tests {
         let mut summary = crate::pipeline::summary::RunSummary::default();
         summary
             .ledger
-            .note_schema(&Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            .observe(crate::pipeline::commit::Observations {
+                drift_schema: Some(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                ..Default::default()
+            });
         summary.ledger.contribute_checksums(
             crate::pipeline::commit::UnitId::Run,
             &[("id".to_string(), 5u64)].into(),
@@ -1284,7 +1327,12 @@ mod tests {
         let mut plan = fin_plan(dir.path());
         plan.shape_drift_warn_factor = 2.0;
         let mut summary = crate::pipeline::summary::RunSummary::default();
-        summary.ledger.merge_shape(&shape_of(100));
+        summary
+            .ledger
+            .observe(crate::pipeline::commit::Observations {
+                column_max_bytes: shape_of(100),
+                ..Default::default()
+            });
         finalize_export(&plan, Some(&state), &mut summary).unwrap();
         assert!(
             warned(&summary),
@@ -1297,7 +1345,12 @@ mod tests {
         let mut plan = fin_plan(dir.path());
         plan.shape_drift_warn_factor = 0.0;
         let mut summary = crate::pipeline::summary::RunSummary::default();
-        summary.ledger.merge_shape(&shape_of(100_000));
+        summary
+            .ledger
+            .observe(crate::pipeline::commit::Observations {
+                column_max_bytes: shape_of(100_000),
+                ..Default::default()
+            });
         finalize_export(&plan, Some(&state), &mut summary).unwrap();
         assert!(
             !warned(&summary),
@@ -1550,6 +1603,24 @@ mod tests {
         // An unopenable destination counts as "not complete" (re-run it).
         let bad = cfg_local(Some("/nonexistent/definitely/missing"), None);
         assert!(!destination_has_success(&bad));
+    }
+
+    #[test]
+    fn needs_run_skips_only_a_resumed_export_whose_expanded_destination_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "name: orders\nquery: \"SELECT 1\"\nformat: parquet\ndestination:\n  type: local\n  path: {}/{{export}}\n",
+            dir.path().display()
+        );
+        let export: crate::config::ExportConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(needs_run(&export, true, "t"), "no marker -> runs");
+        std::fs::create_dir_all(dir.path().join("orders")).unwrap();
+        std::fs::write(dir.path().join("orders/_SUCCESS"), b"xxh3:0\n").unwrap();
+        assert!(
+            !needs_run(&export, true, "t"),
+            "marker under the expanded path -> skipped"
+        );
+        assert!(needs_run(&export, false, "t"), "without --resume -> runs");
     }
 
     /// The crash-in-[last unit → marker] window repair: a complete split prefix

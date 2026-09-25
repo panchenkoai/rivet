@@ -1,5 +1,5 @@
-//! Drift-guard for the coverage ledgers — `docs/chunking-matrix.yaml` and
-//! `docs/behaviour-matrix.yaml` (see [`MATRICES`]).
+//! Drift-guard for every coverage ledger in `docs/*-matrix.yaml` listed in
+//! [`MATRICES`] — not only the chunking one the file is named after.
 //!
 //! The sparse-key footgun shipped because a whole guard had ZERO engine-level
 //! tests and nobody noticed. This guard makes the ledgers self-protecting:
@@ -1096,6 +1096,9 @@ fn every_docs_yaml_parses_as_yaml() {
 /// function that commits parts is a commit loop whether or not anyone remembered
 /// to give it a column.
 const COMMIT_DRAIN: &str = "commit::record_part(";
+/// A runner that drains through the fan-in (`FanIn::finish` calls `record_part`)
+/// is a commit loop too — found by where it builds the fan-in.
+const FAN_IN_DRAIN: &str = "fan_in::FanIn::default()";
 
 /// Every COMMIT LOOP the product has → the runner-coverage COLUMN it collapses
 /// into. This table is the collapse the ledger's header describes, written where
@@ -1289,7 +1292,8 @@ fn runner_matrix_columns_are_derived_from_the_commit_loops() {
         "If the commit drain moved off `commit::record_part`, re-point COMMIT_DRAIN at the \
          new seam — the runner set is DERIVED from it, so a stale token derives nothing.",
     );
-    let loops = top_level_callers_of(COMMIT_DRAIN);
+    let mut loops = top_level_callers_of(COMMIT_DRAIN);
+    loops.extend(top_level_callers_of(FAN_IN_DRAIN));
     super::nonvacuity::require_enumerated(
         loops.len(),
         6,

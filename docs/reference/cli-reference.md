@@ -90,7 +90,7 @@ Run export jobs defined in config
 * `--force` — Override safety gates that would otherwise refuse the run.
 
    Today: with `--resume`, allows starting against a destination prefix whose `_SUCCESS` marker is already present.  Without `--force`, resume against an already-complete run refuses, so an operator cannot accidentally re-export over a verified dataset.
-* `--parallel-exports` — Run all exports from the config concurrently (ignored with `--export`; needs 2+ exports)
+* `--parallel-exports` — Run the config's exports concurrently, at most 16 at once (needs 2+ exports); a CDC export run alone also takes its pending baseline snapshots at most 16 at once
 * `--parallel-export-processes` — Run each export as a separate `rivet` child process (parallel; true per-export peak RSS; more overhead than threads)
 * `--summary-output <PATH>` — Write the run aggregate summary as JSON to this file (in addition to .rivet_state.db)
 * `--json` — Print the run aggregate summary as JSON to stdout at the end of the run

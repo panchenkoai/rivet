@@ -98,7 +98,7 @@ MSSQL_HOST_IN_NET = os.environ.get("CDC_ORACLE_MSSQL_HOST", "mssql-cdc")
 MSSQL_URL = os.environ.get("MSSQL_CDC_URL", "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet")
 MSSQL_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MSSQL_CONTAINER", "rivet-mssql-cdc-1"),
               "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
-              "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-Q"]
+              "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-h", "-1", "-W", "-b", "-Q"]
 MONGO_HOST_IN_NET = os.environ.get("CDC_ORACLE_MONGO_HOST", "mongo80-cdc")
 MONGO_URL = os.environ.get("MONGO_CDC_URL", "mongodb://127.0.0.1:27208/rivet?replicaSet=rs0&directConnection=true")
 MONGO_EXEC = ["docker", "exec", os.environ.get("CDC_ORACLE_MONGO_CONTAINER", "stand-mongo80-cdc-1"),
@@ -113,9 +113,11 @@ def mongo(js: str) -> str:
 
 
 def mssql(sql: str) -> str:
-    r = subprocess.run(MSSQL_EXEC + [sql], capture_output=True, text=True)
+    # NOCOUNT: without it sqlcmd appends "(N rows affected)" to every result, so
+    # `== NULL` / `.isdigit()` readiness checks below read the trailer, not the value.
+    r = subprocess.run(MSSQL_EXEC + [f"SET NOCOUNT ON; {sql}"], capture_output=True, text=True)
     if r.returncode != 0:
-        raise SystemExit(f"sqlcmd failed: {r.stderr.strip()}\n  sql: {sql}")
+        raise SystemExit(f"sqlcmd failed: {(r.stderr or r.stdout).strip()}\n  sql: {sql}")
     return r.stdout.strip()
 
 
@@ -326,7 +328,7 @@ def main() -> int:
             psql(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
                  f"WHERE slot_name IN ('{dbz_slot}','{riv_slot}')")
         elif a.engine == "mongo":
-            mongo(f"db.{t}.drop(); db.{t}_late.drop()")
+            mongo(f"db.{t}.drop(); db.{t}_late.drop(); db.{t}_probe.drop()")
         elif a.engine == "mssql":
             for tt in (t, f"{t}_late"):
                 mssql(f"IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance='dbo_{tt}') "
@@ -423,7 +425,7 @@ debezium.source.table.include.list=public.{t}"""
 debezium.source.mongodb.connection.string=mongodb://{MONGO_HOST_IN_NET}:27017/?replicaSet=rs0&directConnection=true
 debezium.source.topic.prefix=oracle
 debezium.source.database.include.list=rivet
-debezium.source.collection.include.list=rivet.{t}
+debezium.source.collection.include.list=rivet.{t},rivet.{t}_probe
 debezium.source.capture.mode=change_streams_update_full
 # A Mongo DELETE carries its `_id` only in the message KEY, and the http sink
 # forwards the value alone — so the body arrives as
@@ -434,7 +436,7 @@ debezium.source.capture.mode=change_streams_update_full
 debezium.transforms=unwrap
 debezium.transforms.unwrap.type=io.debezium.connector.mongodb.transforms.ExtractNewDocumentState
 debezium.transforms.unwrap.add.headers=op
-debezium.transforms.unwrap.add.fields=op,id
+debezium.transforms.unwrap.add.fields=op,id,collection
 debezium.transforms.unwrap.delete.tombstone.handling.mode=rewrite"""
         elif a.engine == "mssql":
             connector_block = f"""debezium.source.connector.class=io.debezium.connector.sqlserver.SqlServerConnector
@@ -542,13 +544,18 @@ quarkus.log.level=WARN
         # tail). A probe row through a SEPARATE included table (excluded from
         # the comparison by compare.py's `%_probe` filter) proves the pipe
         # delivers DATA before the scenario is allowed to start.
-        if a.engine == "mysql":
-            mysql(f"CREATE TABLE IF NOT EXISTS {t}_probe (id bigint PRIMARY KEY)")
+        if a.engine in ("mysql", "mongo"):
             # A per-run key, so a leaked probe table from an interrupted run
             # cannot make the next INSERT a duplicate-key failure (which
             # mysql() turns into SystemExit -> a SKIPPED gate cell).
             probe_key = int(time.time() * 1000)
-            mysql(f"INSERT INTO {t}_probe VALUES ({probe_key})")
+            if a.engine == "mysql":
+                mysql(f"CREATE TABLE IF NOT EXISTS {t}_probe (id bigint PRIMARY KEY)")
+                mysql(f"INSERT INTO {t}_probe VALUES ({probe_key})")
+            else:
+                # A server-wide `$changeStream` cursor in currentOp can be a previous
+                # scenario's (a SIGKILLed Debezium never closes it): only delivery counts.
+                mongo(f"db.{t}_probe.insertOne({{_id: {probe_key}}})")
             probe_jsonl = os.path.join(work, "debezium.jsonl")
             # 300s, not 120: measured 2026-08-29 on the shared mysql-cdc
             # (weeks of accumulated test tables), the connector takes 2-4
@@ -560,10 +567,12 @@ quarkus.log.level=WARN
             # minutes); on the dedicated one the probe lands in seconds, and a
             # long ceiling would just turn a broken stand into a 5-minute hang
             # inside a 900s gate cell.
-            for _ in range(150 if not MYSQL_FRESH else 30):
+            for _ in range(30 if MYSQL_FRESH or a.engine == "mongo" else 150):
                 if os.path.exists(probe_jsonl):
                     with open(probe_jsonl) as fh:
-                        if any(str(probe_key) in ln and '"op"' in ln for ln in fh):
+                        # Mongo's flattened events carry the op as `__op`.
+                        if any(str(probe_key) in ln and ('"op"' in ln or '"__op"' in ln)
+                               for ln in fh):
                             break
                 time.sleep(2)
             else:
@@ -587,7 +596,7 @@ quarkus.log.level=WARN
                 print("REFERENCE-STALLED: the reference pipe never delivered "
                       "the liveness probe", flush=True)
                 raise SystemExit(
-                    "Debezium never delivered the mysql liveness probe — the "
+                    f"Debezium never delivered the {a.engine} liveness probe — the "
                     "reference pipe is stalled; refusing to run a scenario that "
                     "would report the stall as a rivet finding.\n"
                     f"  reference lines delivered: {delivered}\n"
@@ -652,14 +661,14 @@ quarkus.log.level=WARN
             raise SystemExit("rivet run failed")
 
         # 7. compare — the guard inside refuses a silent capture
-        return subprocess.run([sys.executable, os.path.join(HERE, "compare.py"),
+        argv = ([sys.executable, os.path.join(HERE, "compare.py"),
                                "--rivet-dir", out,
                                "--debezium-jsonl", os.path.join(work, "debezium.jsonl"),
                                # The liveness probe's own table, by EXACT name:
                                # its events are harness plumbing on the
                                # reference side and must not read as a finding.
                                *(["--exclude-table", f"{t}_probe"]
-                                 if a.engine == "mysql" else []),
+                                 if a.engine in ("mysql", "mongo") else []),
                                # MongoDB's key is `_id` on both sides — rivet writes
                                # it under that name and Debezium's after-document
                                # carries it likewise.
@@ -693,7 +702,21 @@ quarkus.log.level=WARN
                               # here and in the README — an excluded op nobody wrote
                               # down is an op nobody checks.
                               + (["--exclude-op", "delete"] if a.engine == "mongo" else [])
-                              ).returncode
+                              )
+        rc = subprocess.run(argv).returncode
+        # Positive control: with the probe NOT excluded the reference holds one row
+        # rivet never saw, so the same comparison must DISAGREE — an oracle that
+        # cannot is blind, and its AGREE above means nothing.
+        if rc == 0 and a.engine in ("mysql", "mongo"):
+            ex = argv.index("--exclude-table")
+            ctl = subprocess.run(argv[:ex] + argv[ex + 2:], capture_output=True, text=True)
+            if ctl.returncode == 0:
+                print("ORACLE-BLIND: the comparison still AGREEs with the liveness probe "
+                      "left in — it cannot see a one-sided row", flush=True)
+                return 1
+            print("control: the probe left in reads as DISAGREE — the comparison sees "
+                  "one-sided rows", flush=True)
+        return rc
     finally:
         if not a.keep:
             cleanup()

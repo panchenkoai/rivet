@@ -241,11 +241,7 @@ def chain_census(
 
     attach, src_prefix = source_attach(engine, url)
     root = f"gs://{bucket}/{prefix.strip('/')}"
-    with Oracle(bigquery=True, gcs=True, **attach) as ora:
-        if state.startswith("postgres"):
-            ora.db.sql(f"ATTACH '{state}' AS st (TYPE postgres, READ_ONLY)")
-        else:
-            ora.db.sql(f"INSTALL sqlite; LOAD sqlite; ATTACH '{state}' AS st (TYPE sqlite, READ_ONLY)")
+    with Oracle(bigquery=True, bq_dataset=dataset, gcs=True, state=state, **attach) as ora:
         mans = fetch(ora, f"SELECT * FROM read_json_auto('{root}/manifest-*.json', union_by_name = true)")
         from .scenarios import success_part_names
 
@@ -299,7 +295,7 @@ def compare_to_bigquery(
     from .duck import Oracle
 
     attach, prefix = source_attach(engine, url)
-    with Oracle(bigquery=True, **attach) as ora:
+    with Oracle(bigquery=True, bq_dataset=dataset, **attach) as ora:
         return _rows_against_source(ora, engine, prefix, table, f"bq.{dataset}.{warehouse_table or table}")
 
 

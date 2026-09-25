@@ -113,14 +113,14 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // is dense with pagination/plan arithmetic. These are the ceilings most
     // worth spending: the runner-bypass class in the process rules is precisely a
     // per-runner decision that no offline test grades.
-    ("src/pipeline/keyset.rs::run_keyset", 5, 1, 3, 2),
-    ("src/pipeline/keyset.rs::run_keyset_parallel", 8, 0, 4, 4),
+    ("src/pipeline/keyset.rs::run_keyset", 3, 0, 1, 1),
+    ("src/pipeline/keyset.rs::run_keyset_parallel", 4, 0, 2, 2),
     (
         "src/pipeline/mongo_parallel.rs::run_mongo_parallel",
-        1,
         0,
-        1,
-        1,
+        0,
+        0,
+        0,
     ),
     // `run_with_reconnect`'s row is GONE: its whole-function exclusion was lifted
     // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
@@ -133,7 +133,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // `delete ! in run_pool` and `replace == with != in run_pool` had to be
     // triaged as separate entries: this ledger is the list of such entries
     // waiting to be written.
-    ("src/pipeline/run.rs::run_pool", 7, 1, 6, 2),
+    ("src/pipeline/run.rs::run_pool", 1, 0, 2, 0),
     // The CDC job's baseline pairing (2026-09-17). Its one remaining `||` is
     // `state.snapshot_done(..)? || dest.head("_SUCCESS")?.is_some()` — two I/O
     // reads whose SHORT-CIRCUIT is the point (the object-store HEAD is skipped
@@ -174,7 +174,11 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // conflicting_source_ident, up_to_date_label, ledger_says_active,
     // prefix_is_active, cleanup_verdict, consumable_run_ids, active_run_note,
     // append_done_line / full_done_line), and the mode router was made
-    // exhaustive so its arm-deletion mutants stop compiling.
+    // exhaustive so its arm-deletion mutants stop compiling. The staged-prefix
+    // predicates (ledger_says_active, prefix_is_active, cleanup_verdict) have
+    // since moved with their guards into src/load/staging.rs, and the other two
+    // excluded bodies with their commands: `run_compacts` into src/load/compact.rs,
+    // `pin_plan_to_its_run` into src/load/pin.rs — both clean, so no row either.
     //
     // `prepare_load`'s two remaining `&&` are LET-CHAINS (`if let Some(s) =
     // state && let Some((_, m)) = keyed.first()`), not boolean decisions: the
@@ -191,9 +195,9 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // 2026-08-29 after its stub proved CAUGHT by the offline battery. Its
     // inline decisions are graded per-diff by cargo-mutants now — a stronger
     // contract than this ceiling, which existed because they could not be.
-    ("src/init/mysql.rs::density_probe", 1, 0, 1, 2),
+    ("src/init/mysql.rs::density_probe", 0, 0, 1, 1),
     ("src/init/postgres.rs::density_probe", 0, 0, 1, 0),
-    ("src/source/postgres/mod.rs::pg_run_export", 2, 0, 2, 4),
+    ("src/source/postgres/mod.rs::pg_run_export", 1, 0, 1, 2),
     // ── preflight ────────────────────────────────────────────────────────
     // `check` diagnoses every export against a live source. The `==` in its
     // overlay export-match loop is already a named mutants.toml entry
@@ -202,7 +206,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // .has_target_fail()`, plus the `+=` it guarded) moved out to the pure
     // `TargetFailTally::add_export`, where the in-diff gate's `+=` → `*=`/`-=`
     // mutants are graded instead of MISSED.
-    ("src/preflight/mod.rs::check", 5, 0, 7, 2),
+    ("src/preflight/mod.rs::check", 2, 0, 5, 1),
 ];
 
 // ── reading the live-only set out of the mutation config ─────────────────

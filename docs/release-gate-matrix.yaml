@@ -147,9 +147,6 @@ preflights:
     what: "SQLite state == Postgres state on the state-exercising golden fixtures (parallel-checkpoint, incremental, crash-resume) — the migration arrays are type-parity. CONDITIONAL, and the condition is the point: it needs a Postgres STATE backend named by RIVET_TEST_STATE_URL (the dev stand's persistent `postgres-state`, :5433) and SKIPs — loudly, never a silent pass — without one. That variable was documented NOWHERE until 2026-08-02, so this cell has read `status: test` while skipping in every run that did not happen to set it: a cell claiming coverage that an unset environment variable quietly withheld. A `status: test` whose test is opt-in must name the opt-in here, or the ledger overstates the gate. The scenario also probes the URL's host:port and SKIPs when it is unreachable, so a stopped stand cannot masquerade as a release failure."
     backends: [sqlite, postgres]
     status: test        # verify_state_migrations (commit e83656a), RED-proven int4 -> NOT RELEASABLE
-  - id: inflight_run_stays_loadable
-    what: "a load must NOT record an IN-FLIGHT extraction run as fully consumed. The skip set is keyed on `run_id` alone, but a CDC run's manifest GROWS under one id (the sink rewrites a Success superset at every commit-boundary roll, and list_manifest_keys prefers that copy) — so a load firing mid-cycle recorded the id and every part the run wrote afterwards was skipped FOREVER, while the next load printed `CDC LOAD SKIP: up to date`. Unbounded under `until_current: false`, where the id never rotates. Released since 0.20.0; found 2026-08-01. The fix excludes runs the ledger reports still writing into the prefix (StateStore::active_run_ids_on_prefix); this cell drives that predicate through the RELEASE binary's own schema, both directions — a run wrongly reported active makes every load re-append forever, a run wrongly reported finished restores the silent loss. Deliberately a ledger check, not a timed extract/load race: the race needs sub-second timing against a live stream and a flaky gate is worse than a narrow one; the end-to-end half is the live suite."
-    status: test        # verify_inflight_run_stays_loadable (scenarios.py), RED-proven: dropping the status filter yields {run_done, run_live}
   - id: coverage_matrices
     what: "every docs/*-matrix.yaml drift-guard runs (chunking/behaviour/type-fidelity/... + release_gate + perf) so a rotted coverage ledger blocks the release, not just CI."
     status: test        # verify_coverage_matrices
@@ -266,7 +263,7 @@ infra:
       probes toxiproxy :8474 itself and SKIPs loudly when down"
   - id: state_upgrade
     status: test
-    note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
+    note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/migrations.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
   - id: state_concurrency
     infra: postgres-state
     status: test

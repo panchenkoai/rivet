@@ -1,0 +1,296 @@
+# Open issues — refactor/architecture-review-3 hunt (2026-09-24)
+
+Found during the five bughunt rounds on this branch and **not fixed**. Each entry was
+re-checked against the code at `b9d58284`; line numbers are from that commit.
+"Pre-existing" means the defect is on `main` too, not introduced by the branch.
+
+## Product (Rust)
+
+### P1. Chunked-sequential over-counts `total_rows` after a retried write — pre-existing — **FIXED** (live seam test RED-proven)
+`src/pipeline/chunked/exec.rs:116` adds `sink.total_rows` to `summary.total_rows`
+*before* `write_sink_parts` runs. If that write fails on the first non-empty chunk,
+`files_committed` is still 0, so `decide_export_retry` (`single.rs:129`) retries. The
+attempt boundary resets only `summary.ledger` (`single.rs:37`), not `total_rows`, so
+attempt 2 adds its rows on top of attempt 1's orphaned count.
+
+- **Effect:** a correct export reports N + chunk rows. `run_chunked_quality_gate`
+  reads `summary.total_rows`, so `quality.row_count_max` near N fails a good run
+  (exit 3); `export_metrics` and the run card over-report. Reconcile is unaffected
+  (it sums the manifest).
+- **Fix direction:** count after the write, or reset `total_rows` with the ledger.
+- **Test:** transient upload error on chunk 1 (`RIVET_TEST_ERROR_AT`), assert
+  `export_metrics.total_rows == manifest sum`.
+
+### P2. Resume rehydration makes a transient blip look like a duplicate-row risk — pre-existing — **FIXED** (live seam test RED-proven)
+`src/pipeline/chunked/resume_m8.rs:288` does `summary.files_committed += rehydrated`
+(keyset resume rehydrates the same way). `decide_export_retry` (`single.rs:189`) reads
+`files_committed > 0` as "this attempt wrote files, a retry would duplicate", so a
+transient source error on a `--resume` before the first NEW part becomes
+`BailDuplicateGuard` — although the checkpoint path cannot duplicate rows.
+
+- **Effect:** exit 3 "cannot safely retry (would duplicate rows)" for a recoverable blip;
+  a scheduler pages someone.
+- **Fix direction:** decide on parts written by *this attempt*, not adopted ones
+  (separate counter, or subtract the rehydrated count at the decision seam).
+- **Test:** crash after 3 of 10 chunks, resume with a transient error on the next
+  connect; assert it retries. Observe the value at the seam (the metrics row), not a
+  hand-fed decider input.
+
+### P3. A manifest deleted between list and stat fails the whole load — pre-existing, now reachable via the branch — **FIXED** (8455923d)
+`load::reconcile::fetch_manifests_keyed` (`src/load/reconcile.rs:78`) lists keys, then
+stats+reads each via `GcsStore::read_each_within`, whose `try_collect`
+(`src/destination/gcs.rs:140`) fails on the first error. `prepare_load` propagates it
+with `?` (`src/load/orchestrate.rs:995`); `pin_plan_to_its_run` (`:345`) already falls
+back on the same error.
+
+- **Who deletes a listed key:** gc's marker sweep, and — new on this branch — an export
+  retiring its running marker (`finalize::retire_running_marker`, called from
+  `job.rs:1364` for skipped / adopted-id runs).
+- **Effect:** a concurrent `rivet load` on the prefix fails with NotFound on a manifest
+  that carried no data. Recovers next cycle, loses nothing.
+- **Fix direction:** treat NotFound on a listed key as "vanished, skip it" inside
+  `read_each_within`'s callers.
+
+### P4. `execute_resolved_plan` decides `skipped` inline — branch — **FIXED** (8455923d)
+`src/pipeline/job.rs:1268`: `if summary.status == "skipped" { summary.skip_reason = … }`
+sits in a live-only body whose whole-function mutation exclusion was lifted on the
+ground that every decision there is a named predicate. No offline test observes
+`skip_reason` through this path; mutating `==` → `!=` stamps a false skip reason on
+every successful run.
+
+- **Fix direction:** fold it into a named pure function next to `ok_status`
+  (`job.rs:1080-1088`) with a unit test.
+
+### P7. A CDC `initial: snapshot` on a not-yet-created Mongo collection is refused — since 0.28 (on main)
+The Mongo CDC stream WARNS on a configured collection the database does not hold, on
+purpose (`src/source/mongo/cdc.rs`, "capturing one that does not exist YET is a
+legitimate setup — start the stream, then let the app create it. Refusing would break
+that"). But the stream's `initial: snapshot` leg reads through the batch
+`MongoSource::export`, which since 0.28 REFUSES a missing collection
+(`missing_collection_refusal`) — so exactly the setup the stream promises to support
+fails as soon as `initial: snapshot` is on (measured: `export '<cdc>__snapshot_<coll>'
+failed: MongoDB collection … does not exist`).
+- **Recommendation:** the snapshot leg follows the STREAM's policy — warn, snapshot 0
+  rows — keyed on the leg's own marker (`ExportConfig::snapshot_parent`, set by
+  `cdc_job::synth_snapshot_export`), while a plain batch export keeps the refusal. The
+  refusal's harm (a 0-row full load emptying the warehouse) does not apply to a baseline
+  of a collection that has never existed, and a typo is already warned by the stream.
+- **Not done:** it changes shipped behaviour — a product decision, not a test fix.
+
+### P8. `expiration_days` lets BigQuery drop loaded rows on arrival — by config, reported late
+`load.partition.expiration_days: N` becomes the table option `partition_expiration_days = N`
+(`src/load/bigquery/shape.rs`). BigQuery then deletes every partition older than N days
+— including partitions a load is filling right now with historical rows. rivet issues no
+DELETE; the retention does. The count validation catches it (`loaded 0 rows, expected
+200`) but blames nothing: "investigate before re-running".
+- **Policy (owner, 2026-09-24): rivet sets no partition expiry by default.** Verified:
+  `expiration_days` has no default, `rivet init` never writes it, and every
+  `partition_expiration_days` rivet emits comes from it (`shape.rs`); dropping it from the
+  config makes the next load `SET OPTIONS(partition_expiration_days = NULL)`.
+- The hourly-limit warning (`plan.rs`) offered `expiration_days` as its FIRST fix — a
+  nudge toward deletion. Now `granularity: day` comes first and the expiry is named as
+  the deletion it is; pinned by a unit test, RED against the old wording.
+- Still open: a load into a table that has an expiry does not warn, before any job, that
+  its rows fall in partitions BigQuery will drop on arrival.
+
+### P10. A resume after a FAILED chunked run under-reports its rows — pre-existing (on main) — **FIXED** (b20e9a4d)
+A chunk error that RETURNS (not a crash) still finalizes a Failed `manifest.json` under the
+same run id, so `--resume` takes the M8 `Skip` arm, which pushed the prior parts into the
+manifest and bumped no counter. export_metrics, the run card and the row-count gate read
+`total_rows`; `--reconcile` summed the manifest and hid it. Live, before the fix:
+`total_rows` 50 for a 150-row export (only the re-run chunk). Fixed by making the commit
+ledger the only writer of the counters (`record_part` + `adopt_part`); regression
+`a_resume_after_a_failed_run_reports_the_rows_it_adopted`, RED on the old Skip arm.
+
+### P9. `cleanup_source` decides "no live run" before the warehouse copy and deletes after it — found by reading, NOT measured
+`cleanup_target_leased` (`src/load/staging.rs`) asks `prefix_has_active_run` before
+`materialize`; the recursive `delete_under` runs in `maybe_cleanup` (`src/load/staging.rs`)
+after the copy and the count gate. An extract that STARTS during the copy writes its
+running marker and parts into a prefix that was already judged idle, and the delete takes
+them. The prefix lease covers load-vs-load only. Unverified: needs a live test that starts
+an extract between the decision and the delete. Fix direction: re-check activity at the
+delete, not only at the decision — a refreshed census at the decision point does not
+close the window.
+
+### P5. A load whose statement landed but whose ledger row did not strands the table — pre-existing (on main)
+`live_pool_ledger::a_ledger_cut_mid_load_fails_loudly_and_the_next_run_finishes_the_job`
+cuts the state DB by a TIMER (1800 ms) mid `rivet load --pool`. Measured 2026-09-24:
+- main at 1800 ms: `0 of 6` tables existed at the cut, three runs out of three — the cut
+  landed BEFORE any BigQuery statement, so the test passed without reaching its subject;
+- this branch at 1800 ms: `1`, `4`, `5 of 6` — the faster manifest reads (8ebd2d2d) move
+  the cut into the window the test was written for, and it fails every time;
+- main with the cut moved to 2400 ms: `4 of 6`, and the SAME failure — the top-up refuses
+  `…: it exists, and this state DB's load ledger has no record of rivet loading it`.
+So the branch exposed this, it did not cause it: a table rivet itself loaded, whose ledger
+row the crash lost, is treated as foreign on every later run. The test's own comment
+names the recovery signal: rivet labels every job (`managed_by=rivet`, `rivet_table`,
+`rivet_run`), so the top-up can adopt a table whose last load job is its own.
+Second defect in the same test: a wall-clock kill point is calibrated to one build's
+speed (1800 ms vacuous on main, 2800 ms vacuous again) — drive the cut from a fault hook
+at "statement done, ledger row not yet written", not a timer.
+
+### P6. Failing on main AND the branch, same environment, isolated — pre-existing
+Run 18-at-a-time-4 on both c6da13c5 and this branch; identical outcome:
+`full_cdc_cycle_{postgres,mysql,mssql,mongo}` and `partner_shape_three_tables_one_stream_
+{mysql,postgres}` — **FIXED, stale tests, not a product defect**: "left 5, right 10" was
+5 rows MISSING from the expectation, not 5 extra. The tests modelled the pre-0.27 layout
+(`__changes` accumulates baseline + delta, a view gives live state, no compact), while a
+`backfill:` stream runs base + buffer: the buffer holds only the delta and live state is
+the base after `rivet compact` (docs/cdc-full-cycle.md §4). Rewritten to the doc: compact
+after every load, the delta asserted in the buffer, live state on the base; all six
+green; RED-proven with the compact script's DROP removed. The doc's §5/§6 still said
+"the view" and were corrected too.
+Still open from the same run:
+`mongo_cdc_captures_a_dotted_collection_without_swallowing_its_sibling` and two
+`live_mongo::*_empty_first_run_then_populated` — **FIXED, stale tests**: they made
+"empty" by DROPPING the collection, which 0.28's missing-collection refusal now (rightly,
+for a batch export) refuses. They create an EMPTY collection instead
+(`MongoTest::create_empty_collection`); all three green. The dotted test's snapshot leg
+exposed a real contradiction, filed as P7. `bigquery_hourly_partitions_over_the_
+job_cap_are_refused_before_the_load`. Not caused by the refactor; each needs its own
+look — the doubled CDC append is the one to start with.
+
+Environment-only failures in the same run (no code signal): Snowflake cells without
+`RIVET_SF_*`, `RIVET_BQ_TEST_*_URI` fixtures unset, the `rivet_test` dataset the BigQuery
+unit tests expect no longer exists (only `rivet_e2e` is permanent), a leftover
+`cdc_bf_mysql` table.
+
+## Release gate / harness (Python)
+
+### H1. Blessed-flow `repeat` / `resume` load cells are copies of `clean` — pre-existing — **DROPPED** (fix/open-issues-r3: ⊘ with the reason; the two-run / resumed-prefix load stays UNCOVERED)
+`dev/release_oracle/blessed_flow.py` `_load_leg` uses `cell.lifecycle` only for names,
+wipes a fresh prefix and runs ONE `rivet run` of a hand-written full-mode config before
+`rivet load`. 22 of the 33 `flow:load` PASS rows grade exactly what `clean` grades.
+
+- **Never exercised:** loading a two-run union prefix, or a crash-resumed prefix with
+  orphan parts, into BigQuery — the cell names promise both.
+- **Cost:** this leg is the gate's single most expensive step (`load gcs` 12.9 min
+  summed, see the timing report). Either make the cells real (load the prefix the
+  lifecycle produced) or drop the 22 duplicates.
+- Also violates "config is generated by `rivet init`" — the load config is a `format!`.
+
+### H2. In-flight load skip-set cell never runs on the release gate — pre-existing — **SUPERSEDED by H7** (the cell was removed)
+`dev/release_oracle/scenarios.py:1606` SKIPs whenever state is in PostgreSQL ("graded on
+the SQLite pass"). `release-oracle-full` always sets `RIVET_GATE_STATE_URL` (Makefile),
+and `__main__` resolves `--state-url '' or env`, so no SQLite pass is reachable and none
+is run or documented. The ledger signal deciding whether a load re-appends forever is
+never graded in the judging gate.
+
+- **Fix direction:** a SQLite leg in `release-oracle-full`, or make the cell run against
+  a throwaway SQLite state inside the Postgres pass.
+
+### H3. CDC differential: Mongo readiness passes on ANY change-stream cursor — pre-existing — **FIXED** (a delivered probe, like MySQL's; live AGREE on all three scenarios)
+`dev/cdc-oracle/run.py:512-515` counts every idle `$changeStream` cursor on the server.
+The previous scenario's Debezium is `docker rm -f`'d (no killCursors) and rivet's own
+`watch()` also leaves one, so scenario 2/3 can pass readiness before the new connector
+streams → reference misses early changes → `DISAGREE (rivet-only)` → false release FAIL.
+
+- **Fix direction:** filter by the connector's appName/namespace, or a liveness probe
+  like MySQL's (write a sentinel, wait until Debezium emits it).
+
+### H4. CDC differential MSSQL: `sqlcmd` without `-b` — pre-existing (NOCOUNT fixed on branch) — **FIXED** (fix/open-issues-r3)
+`dev/cdc-oracle/run.py:99-101` `MSSQL_EXEC` has no `-b`, so sqlcmd exits 0 on a SQL error
+and the `returncode != 0` guard never fires (e.g. a failed `sp_cdc_enable_table`,
+22926). `SET NOCOUNT ON` was added in `9c20fd46`; `-b` was not.
+
+### H5. CDC e2e MSSQL shim logs in as `rivet`/`rivet` — pre-existing — **FIXED** (fix/open-issues-r3)
+`dev/release_oracle/cdc.py:195` uses `-U rivet -P rivet`; nothing in compose, `dev/stand`
+or seeds creates that login (every other harness client uses `sa`). Works only on a stand
+where it was created by hand; a fresh stand fails every MSSQL CDC cell as "source setup
+failed".
+
+### H6. `source_query` hardcodes mssql-tools18 — pre-existing — **FIXED** (fix/open-issues-r3)
+`dev/release_oracle/scenarios.py:586` builds `/opt/mssql-tools18/bin/sqlcmd -C …`;
+`__main__.sqlcmd_path` (`__main__.py:638`) already probes 2019's `/opt/mssql-tools`.
+Adding the 2019 row the matrix invites turns every source count into `""` → harness
+failures that read as product results.
+
+### H7. The in-flight cell grades a COPY of the active-run predicate — pre-existing — **FIXED: cell removed**
+Measured on removal: the copy had already DRIFTED — rivet's `live_on_prefix` needs a newer
+SUCCESS to supersede a running row (a failed re-run proves nothing), the copy accepted any
+newer row. The real predicate, still on the consume path (`orchestrate.rs`, unioned with
+the bucket markers), is graded by the unit tests beside it in `run_status_store.rs`
+(`a_newer_failed_run_does_not_supersede_a_live_one` and eleven siblings), which call
+rivet's own SQL. The gate row went with the cell.
+`verify_inflight_run_stays_loadable` (`dev/release_oracle/scenarios.py`) pastes the SQL of
+`run_status_store.rs` "verbatim" and runs it against the schema the release binary made.
+A change to rivet's own predicate cannot turn it red — only a schema change can. The
+fixture-against-itself class. Fix direction: read the active set through rivet (a
+`state show` field, or a `load` dry run), not through a re-typed query.
+
+### H8. The CDC differential could not DISAGREE — since 0.28.0 (on main) — **FIXED**
+Found while RED-proving H3. `compare.py` decided agreement by the absence of a box glyph
+(`│`) in DuckDB's `-box` output, but the pinned `dev/pytools/duckcli.py` (0.28.0) prints
+`-box` as a `|` list — so EVERY diff read as AGREE, on every engine. Measured: the Mongo
+crud capture with its probe left in returned `debezium-only|insert|…` and printed AGREE.
+Fix: agreement is a counted `SELECT count(*)` of the differing rows, never the rendering;
+and run.py now runs a positive control on the engines with a probe (MySQL, Mongo): the
+same comparison with the probe NOT excluded must DISAGREE, else `ORACLE-BLIND` fails the
+cell. RED-proven: with the glyph check restored, the control fails the run. Postgres and
+MSSQL have no probe, so no control there — the verdict code is shared and engine-free.
+
+### H9. The inertness baseline prints live under parallel versions — cosmetic
+`sc_not_inert` builds its baseline on a plain `Ledger()`, which prints as it goes while
+sibling versions print too: two `✓` lines glued into one, so counting ✓ lines in the log
+under-counts by the number of collisions (2 in the 626060c2 gate). The verdict is derived
+from ledger rows and is unaffected. Fix: a buffered baseline ledger.
+
+### H10. Live tests on `rivet init` configs leak their Postgres slot when they fail — found 2026-09-24
+The pre-release gate on c69805df went red on 9 `doctor` cells: three inactive LOGICAL slots
+(`rivet_appdb_68163`, `rivet_fullcdc_19408`, `rivet_snap_32968`, ~410 MiB of WAL each)
+pinned the CDC stand, and `doctor` rightly refused. `rivet init` names the slot
+`rivet_<database>`; these came from live tests on throwaway databases during a full
+`--run-ignored all` run whose failures skipped cleanup (`catalog_xmin` 386890-386893: one
+run). Dropped by hand. Fix direction: a Drop guard that drops the test's slot, like
+`MongoDbGuard` drops its database — a panic must not leave state the gate grades.
+
+### H11. The release-build-path cell did not say the Docker image was built — fixed
+With `RIVET_ORACLE_DOCKER=1` a successful image build added no note, so the PASS line read
+the same as a run that never built one. Now `(docker image built)`.
+
+### Architecture review 2026-09-24 — the "worth exploring" candidates, researched
+- **One prefix census per load:** only pin + prepare can share one (both read the same
+  manifests; pin's older read can type a load from a run older than the one loaded).
+  Cleanup and gc must keep their own fresh reads — they guard deletes, and gc already
+  re-reads each marker right before deleting it. The four error policies are deliberate
+  (fallback / spare / warn / propagate), each matching what its site guards. Narrowed
+  candidate: move pin after the lease and derive it from prepare's census; keep a
+  standalone pin for `rivet compact`.
+- **Warehouse-layout test oracle:** 4 duplicated helper families (12 copies) plus ~15
+  cleanup lists name `{t}__changes` by hand. Proposal: `BqLive::read_bq_buffered(t)`,
+  `BqLive::read_bq_live(t, select)` (adds `NOT __is_deleted` only when the column exists),
+  and a `cleanup` that also drops `__changes` / `__staging` / `__changes__merging`. Four
+  test files would then name no service table; `live_cdc_compact`, `live_load_spec`,
+  `live_init_delta` and `live_load_partition_batches` keep naming them because the layout
+  is their subject. `live_cdc_multi_table_cycle.rs`'s module doc still describes the view
+  layout.
+
+## Unexplained / unverified
+
+### U1. `init_delta[warehouse:mysql]` failed once, cause unknown
+Failed in the cd6d478b full gate, passed in isolation (70 s) and in the final gate on
+`dc23f005`. Leading hypothesis (the old 40-min token TTL in a test binary compiled
+mid-run) is plausible, not proven. The rig cells now print the nextest failure block,
+so the next failure carries its evidence.
+
+### U2. Full Docker build is not in the gate by default
+The release-build-path phase runs lock sync, manifest-chef, schema guards and the
+cargo-chef planner; `docker build` runs only with `RIVET_ORACLE_DOCKER=1`. Run it before
+tagging.
+
+## Found while fixing (2026-09-24)
+
+- **P1 and P2 are separate:** P1 is the per-attempt reset (`reset_for_retry`), P2 the
+  decision input (`files_committed_here`). A retry after a resume does NOT double-declare
+  the adopted parts even without the reset — rehydration skips a path already in
+  `manifest_parts` (`resume_m8.rs`), measured live with the reset removed.
+- **Live seam tests** (`tests/live/live_chunked_recovery.rs`, one-shot transient hook
+  `RIVET_TEST_TRANSIENT_ONCE`): `a_retried_chunk_write_does_not_count_its_rows_twice` RED
+  without the reset (`total_rows` 200 vs 150); `a_transient_error_after_resume_adopts_
+  parts_is_retried_not_refused` RED with the adopted-blind decision (exit 3).
+- **H3 needs a live Debezium run:** the MySQL probe cannot be copied as-is — compare.py
+  excludes the probe by `$.source.table`, Mongo events carry `$.source.collection`, and
+  `ExtractNewDocumentState` may strip the source block from the body entirely.
+- **The current `mssql/server:2019-latest` image ships tools18** (verified on
+  `stand-mssql2019-batch-1`); the `/opt/mssql-tools` fallback only matters for older
+  2019 images, and was not exercised live.

@@ -419,7 +419,7 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
     let (reports, keys) = crate::preflight::load_type_reports(&cfg, &state, target)?;
 
     // Deferred: this plan is typed from the BY-NAME spec, which the load then pins
-    // to the run it consumes (`orchestrate::pin_plan_to_its_run`) — a same-named
+    // to the run it consumes (`pin::pin_plan_to_its_run`) — a same-named
     // export of another config may have written that row, and its columns are not
     // this table's. The fit is checked strictly after the pin, or by
     // `check_spec_fit` when no pin is possible.
@@ -1106,6 +1106,44 @@ pub fn retype_plan(
 }
 
 /// [`build_plans_keyed`] with no recorded keys.
+/// A resolved BigQuery plan for tests, so each can vary the one field it is about.
+#[cfg(test)]
+pub(crate) fn test_plan(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
+    LoadPlan {
+        deleted_flag: false,
+        renames: Vec::new(),
+        rename_warnings: Vec::new(),
+        refusal: None,
+        export_name: "orders".into(),
+        unit: None,
+        table: "orders".into(),
+        partition: None,
+        specs: vec![],
+        gcs_prefix: gcs_prefix.into(),
+        destination: crate::config::DestinationConfig::default(),
+        load: LoadSection {
+            deleted_flag: None,
+            layout: None,
+            target: LoadTarget::Bigquery {
+                project: "p".into(),
+                dataset: "d".into(),
+            },
+            cleanup_source: false,
+            pk: KeyColumns::Columns(vec!["id".into()]),
+            allow_source_drift: false,
+            gc_orphans: false,
+            cluster_by: KeyColumns::None,
+            partition: None,
+        },
+        mode,
+        cursor_column: None,
+        pk: vec!["id".into()],
+        clustering: Clustering::Auto(vec![]),
+        pinned_run: None,
+        layout: CdcLayout::LogAndView,
+    }
+}
+
 #[cfg(test)]
 fn build_plans(
     cfg: &crate::config::Config,
@@ -1242,11 +1280,7 @@ fn resolve_partition(
         }
     };
     if hourly_partitions_outlive_the_table(&key, spec.expiration_days) {
-        eprintln!(
-            "  warning: export `{export}`: hourly partitions reach BigQuery's \
-             {MAX_TABLE_PARTITIONS}-partition limit after {HOURLY_LIFETIME_DAYS} days — set \
-             `expiration_days` to at most {HOURLY_LIFETIME_DAYS}, or use `granularity: day`"
-        );
+        eprintln!("{}", hourly_limit_warning(export));
     }
     if mode != LoadMode::Full {
         if spec.require_filter {
@@ -1273,6 +1307,16 @@ fn resolve_partition(
 }
 
 /// Whether an hourly key with this expiry can outgrow BigQuery's per-table partition cap.
+/// The hourly-partition limit warning: the lossless fix first; expiry only as the deletion it is.
+fn hourly_limit_warning(export: &str) -> String {
+    format!(
+        "  warning: export `{export}`: hourly partitions reach BigQuery's \
+         {MAX_TABLE_PARTITIONS}-partition limit after {HOURLY_LIFETIME_DAYS} days — use \
+         `granularity: day`. (`expiration_days` at most {HOURLY_LIFETIME_DAYS} also avoids it, \
+         but BigQuery then DELETES every partition older than that — rivet never sets it for you.)"
+    )
+}
+
 fn hourly_partitions_outlive_the_table(key: &PartitionKey, expiration_days: Option<u32>) -> bool {
     matches!(
         key,
@@ -3153,6 +3197,20 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
         assert!(e.contains("no `range` or `ingestion` partitions"), "{e}");
         let e = err(serde_json::json!({ "column": "n" }));
         assert!(e.contains("cannot partition on `n` (NUMBER)"), "{e}");
+    }
+
+    #[test]
+    fn the_hourly_limit_warning_offers_the_lossless_fix_first_and_names_expiry_a_deletion() {
+        let w = super::hourly_limit_warning("e");
+        let day = w
+            .find("use `granularity: day`")
+            .expect("names the day granularity");
+        let exp = w.find("`expiration_days`").expect("mentions the expiry");
+        assert!(day < exp, "the lossless fix comes first: {w}");
+        assert!(
+            w.contains("BigQuery then DELETES every partition older than that"),
+            "{w}"
+        );
     }
 
     #[test]

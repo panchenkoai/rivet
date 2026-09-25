@@ -106,17 +106,14 @@ fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
 pub(crate) struct KeysetPage {
     pub(crate) parts: Vec<super::commit::PartRecord>,
     pub(crate) rows: usize,
-    pub(crate) schema: Option<arrow::datatypes::Schema>,
+    /// What this page's sink SAW: dest schema (run fingerprint) + column max bytes.
+    pub(crate) observed: super::commit::Observations,
     pub(crate) next_cursor: Option<String>,
     /// First observed key of this page (the run floor when it is page 1 of
     /// range 0) — recorded so cursor_min lands in the metrics (#151).
     pub(crate) first_cursor: Option<String>,
-    /// This page's sink's per-column Form B value checksums — XOR-combined
-    /// run-wide by `run_keyset` so the finalize manifest records Form B (previously
-    /// dropped here, making `rivet validate`'s re-read a no-op on keyset exports).
-    pub(crate) column_checksums: std::collections::BTreeMap<String, u64>,
-    /// The key-column name the checksums are keyed on (constant across pages).
-    pub(crate) checksum_key_column: Option<String>,
+    /// This page's sink's Form-B value checksums and their key column.
+    pub(crate) checksums: super::commit::UnitChecksums,
 }
 
 /// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
@@ -178,7 +175,7 @@ pub(crate) fn read_keyset_page_bounded(
     if rows == 0 {
         return Ok(None); // range exhausted, or an exact-multiple last page
     }
-    let schema = sink.dest_schema.as_deref().cloned();
+    let observed = sink.take_observations();
     // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
     // write_sink_parts drains every part the sink produced — the final temp file
     // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
@@ -188,17 +185,15 @@ pub(crate) fn read_keyset_page_bounded(
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
     )?;
-    let checksum_key_column = sink.checksum_key();
     Ok(Some(KeysetPage {
         parts,
         rows,
-        schema,
+        observed,
         // The source's own lossless token (Mongo BSON `_id`) when it reported
         // one, else the column-extracted string (every SQL engine).
         next_cursor: sink.effective_cursor(),
         first_cursor: sink.first_cursor_value.clone(),
-        column_checksums: std::mem::take(&mut sink.column_checksums),
-        checksum_key_column,
+        checksums: sink.take_checksums(),
     }))
 }
 
@@ -406,7 +401,6 @@ fn run_keyset_parallel(
     state: Option<&StateStore>,
 ) -> Result<()> {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicI64, Ordering};
 
     let kp = keyset_plan(plan);
     let key = kp.key_column.clone();
@@ -444,12 +438,7 @@ fn run_keyset_parallel(
             "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
             plan.base_query
         ))?;
-        let advances = match (&anchor, &cur_max) {
-            (_, None) => false,                       // empty source
-            (None, Some(_)) => true,                  // no prior anchor → all rows new
-            (Some(a), Some(c)) => key_advances(a, c), // c strictly past a
-        };
-        if !advances {
+        if nothing_past_anchor(anchor.as_deref(), cur_max.as_deref()) {
             log::info!(
                 "export '{}': parallel keyset incremental — no new rows past the anchor, nothing to export",
                 plan.export_name
@@ -520,7 +509,7 @@ fn run_keyset_parallel(
     // range — the headline speed-up is silently absent. The usual cause is a key
     // type the boundary probe cannot render (e.g. a source that returns the key as
     // an unhandled type from query_scalar). warn, not info, so it is visible.
-    if parallel > 1 && total_ranges == 1 {
+    if fan_out_collapsed(parallel, total_ranges) {
         log::warn!(
             "export '{}': parallel keyset requested {} workers but sampled 0 boundaries — \
              running as a SINGLE worker. The key may be a type the boundary probe cannot \
@@ -562,51 +551,28 @@ fn run_keyset_parallel(
     let fmt_label = plan.format.label();
     let cmp_label = plan.compression.label();
 
-    let rows = AtomicI64::new(0);
-    // ADR-0029: both accumulators carry the RANGE index — the commit unit this
-    // runner publishes checksums at. Parts are published per PAGE (durability
-    // must reflect what is on disk, #200-1) while checksums are published per
-    // committed RANGE, so the range is the only id the two can agree on, and
-    // the seam needs them keyed alike to compute Form-B coverage.
-    #[allow(clippy::type_complexity)]
-    let parts_mx: Mutex<Vec<(usize, super::commit::PartRecord)>> = Mutex::new(Vec::new());
-    #[allow(clippy::type_complexity)]
-    let checksums_mx: Mutex<
-        Vec<(
-            usize,
-            std::collections::BTreeMap<String, u64>,
-            Option<String>,
-        )>,
-    > = Mutex::new(Vec::new());
-    let fingerprint: std::sync::OnceLock<arrow::datatypes::Schema> = std::sync::OnceLock::new();
+    // ADR-0029: parts are published per PAGE (durability must reflect what is on
+    // disk, #200-1) and checksums per committed RANGE — both under the range's
+    // `UnitId`, so the seam can compute Form-B coverage.
+    let fan = super::fan_in::FanIn::default();
     // Per-range high-water key, indexed by range_index (done ranges stay None —
     // they are not re-run). cursor_high = the highest populated range's max; on a
     // RESUME this reflects the RE-RUN ranges only (a range already `done` pre-crash
     // is skipped), which is acceptable — parallel keyset is a full snapshot, not an
     // incremental anchor, so its cursor range is descriptive, not a resume floor.
     let range_max: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; total_ranges]);
-    let range_first: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let range_first: Mutex<Option<String>> = Mutex::new(None);
 
-    // #152: the OPT-2 concurrency governor, previously chunked-only. Each worker
-    // acquires a permit PER PAGE (the guard releases at each iteration's end, on
-    // every path), so shrinking the ceiling sheds workers at page granularity —
-    // the same shape the range-chunked runner uses at chunk granularity. `finished`
-    // counts workers that have exited (success OR error) so the governor's exit
-    // predicate can't be stranded by a failing worker.
+    // #152: one permit PER PAGE, so shrinking the ceiling sheds workers at page
+    // granularity — the same shape the range-chunked runner uses at chunk granularity.
     let semaphore = crate::resource::Semaphore::new(parallel.max(1));
-    let finished = std::sync::atomic::AtomicUsize::new(0);
-    // OPT-2 adaptive concurrency governor — the SHARED seam (identical wiring in the chunked
-    // runner; #152). arm → spawn_into (in the scope) → drain_into (post-scope, before any bail).
     let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
 
     std::thread::scope(|scope| {
-        // Governor thread (shared seam): resizes the permit semaphore within [floor, ceiling],
-        // self-terminating once every worker has FINISHED (success OR failure).
         governor.spawn_into(
             scope,
             &semaphore,
-            &finished,
+            fan.finished(),
             pending.len(),
             &plan.export_name,
         );
@@ -615,91 +581,42 @@ fn run_keyset_parallel(
             let dest = std::sync::Arc::clone(&dest);
             let (plan_r, key_plan_r, ext_r, tag_r, key_r) =
                 (plan, &key_plan, &ext, run_tag.as_str(), key.as_str());
-            let rfirst_r = &range_first;
-            let (rows_r, parts_r, checks_r, fp_r, rmax_r, errs_r) = (
-                &rows,
-                &parts_mx,
-                &checksums_mx,
-                &fingerprint,
-                &range_max,
-                &errors,
-            );
+            let (fan_r, rfirst_r, rmax_r) = (&fan, &range_first, &range_max);
             let (sref_r, rid_r, fmt_r, cmp_r) = (&state_ref, run_id.as_str(), fmt_label, cmp_label);
             let sem_r = &semaphore;
-            let fin_r = &finished;
-            scope.spawn(move || {
-                // Count this worker as finished on EVERY exit path (success or
-                // error) so the governor's exit predicate can't be stranded.
-                struct FinishGuard<'a>(&'a std::sync::atomic::AtomicUsize);
-                impl Drop for FinishGuard<'_> {
-                    fn drop(&mut self) {
-                        self.0.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                let _finish = FinishGuard(fin_r);
-                let mut wsrc = match source::create_source(&plan_r.source) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        errs_r
-                            .lock()
-                            .unwrap()
-                            .push(format!("range {ridx}: connect: {e:#}"));
-                        return;
-                    }
-                };
+            let unit = super::commit::UnitId::Range(ridx as i64);
+            fan.spawn(scope, format!("range {ridx}"), move || {
+                let mut wsrc = source::create_source(&plan_r.source)
+                    .map_err(|e| anyhow::anyhow!("connect: {e:#}"))?;
                 let mut cursor = lo;
                 let mut pages = 0usize;
                 let mut rmax: Option<String> = None;
                 // Parts this range committed — recorded to file_log atomically with
                 // its `done` flip at completion (checkpoint only).
                 let mut range_parts: Vec<crate::state::KeysetRangePart> = Vec::new();
-                let mut local_checks: Vec<(
-                    std::collections::BTreeMap<String, u64>,
-                    Option<String>,
-                )> = Vec::new();
+                let mut local_checks: Vec<super::commit::UnitChecksums> = Vec::new();
                 loop {
-                    // #152: one permit per page (guard releases at the end of
-                    // THIS iteration on every path), so the governor sheds
-                    // workers at page granularity when it shrinks the ceiling.
-                    struct PermitGuard<'a>(&'a crate::resource::Semaphore);
-                    impl Drop for PermitGuard<'_> {
-                        fn drop(&mut self) {
-                            self.0.release();
-                        }
-                    }
-                    sem_r.acquire();
-                    let _permit = PermitGuard(sem_r);
-                    // Test-only: simulate a per-worker SQL error mid-range (Err path,
-                    // not a crash). The worker records it + returns; the post-join check
-                    // bails, so the run fails cleanly with no _SUCCESS / finalized manifest.
-                    if let Err(e) = crate::test_hook::maybe_error_at_index(
-                        "keyset_parallel_worker",
-                        ridx as i64,
-                    ) {
-                        errs_r.lock().unwrap().push(format!("range {ridx}: {e}"));
-                        return;
-                    }
+                    let _permit = crate::pipeline::governor::TaskPermit::acquire(sem_r);
+                    // Test-only: a per-worker SQL error at the range's first page
+                    // (Err path, not a crash) — the run fails after the drain.
+                    crate::test_hook::maybe_error_at_index("keyset_parallel_worker", ridx as i64)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     // Test-only: a MID-RANGE error — fires only once this range has
-                    // ALREADY made page(s) durable (`pages > 0`), unlike the hook
-                    // above which fires at the range's first page (range writes
-                    // nothing). This is the fixture #200-1 needs: pre-failure pages
-                    // are on disk but the range never commits, so they must still
-                    // reach `files_committed` (published per-page below), not be
-                    // dropped with the uncommitted range.
-                    if pages > 0
-                        && let Err(e) = crate::test_hook::maybe_error_at_index(
+                    // ALREADY made page(s) durable (`pages > 0`). The fixture #200-1
+                    // needs: pre-failure pages are on disk but the range never
+                    // commits, so they must still reach `files_committed`.
+                    if pages > 0 {
+                        crate::test_hook::maybe_error_at_index(
                             "keyset_parallel_worker_midrange",
                             ridx as i64,
                         )
-                    {
-                        errs_r.lock().unwrap().push(format!("range {ridx}: {e}"));
-                        return;
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     let base = format!(
                         "{}_{}_pk_w{}_{}.{}",
                         plan_r.export_name, tag_r, ridx, pages, ext_r
                     );
-                    let page = match read_keyset_page_bounded(
+                    let page = read_keyset_page_bounded(
                         &mut *wsrc,
                         plan_r,
                         key_plan_r,
@@ -708,21 +625,10 @@ fn run_keyset_parallel(
                         hi.as_deref(),
                         &**dest,
                         &base,
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            errs_r
-                                .lock()
-                                .unwrap()
-                                .push(format!("range {ridx}: page {pages}: {e:#}"));
-                            return;
-                        }
-                    };
+                    )
+                    .map_err(|e| anyhow::anyhow!("page {pages}: {e:#}"))?;
                     let Some(page) = page else { break };
-                    rows_r.fetch_add(page.rows as i64, Ordering::Relaxed);
-                    if let Some(sc) = &page.schema {
-                        let _ = fp_r.set(sc.clone());
-                    }
+                    fan_r.observe(page.observed);
                     rmax = page.next_cursor.clone().or(rmax);
                     for p in &page.parts {
                         range_parts.push(crate::state::KeysetRangePart {
@@ -731,40 +637,30 @@ fn run_keyset_parallel(
                             bytes: p.bytes as i64,
                         });
                     }
-                    if ridx == 0 && rfirst_r.lock().unwrap().is_none() {
+                    if ridx == 0 {
                         // Range 0 is the LOWEST range: its first key is the
                         // run's observed floor (#151).
-                        *rfirst_r.lock().unwrap() = page.first_cursor.clone();
-                    }
-                    // Publish the parts THIS page just wrote to the destination to
-                    // the shared count IMMEDIATELY — the parquet is durable the
-                    // moment `read_keyset_page_bounded` returns, before the range's
-                    // checkpoint commit below. Deferring this to range-completion
-                    // (the old `local_parts` at line 741) dropped every page a
-                    // FAILED range had already made durable from `files_committed`,
-                    // handing `decide_export_retry` a short count — the same
-                    // durable-parts blind spot as the worker-level bail, one level
-                    // deeper (page granularity within a range, #200-1). Cursor
-                    // (`rmax`) and checksums stay commit-gated below — those feed
-                    // the SUMMARY and must reflect only committed data — but the
-                    // durability count must reflect what is physically on disk.
-                    parts_r
-                        .lock()
-                        .unwrap()
-                        .extend(page.parts.into_iter().map(|p| (ridx, p)));
-                    local_checks.push((page.column_checksums, page.checksum_key_column));
-                    let last_page = page.rows < page_size;
-                    if !last_page {
-                        match page.next_cursor {
-                            Some(v) => cursor = Some(v),
-                            None => {
-                                errs_r.lock().unwrap().push(format!(
-                                    "range {ridx}: could not advance the '{key_r}' cursor at page \
-                                     {pages} (NULL or unsupported type)"
-                                ));
-                                return;
-                            }
+                        let mut first = rfirst_r.lock().unwrap_or_else(|e| e.into_inner());
+                        if first.is_none() {
+                            *first = page.first_cursor.clone();
                         }
+                    }
+                    // The parquet is durable the moment `read_keyset_page_bounded`
+                    // returns — publish its parts now, before the range commits, so
+                    // a range that later fails still counts them (#200-1). Cursor
+                    // and checksums stay commit-gated below.
+                    for p in page.parts {
+                        fan_r.part(unit, p);
+                    }
+                    local_checks.push(page.checksums);
+                    let last_page = is_last_page(page.rows, page_size);
+                    if !last_page {
+                        cursor = Some(page.next_cursor.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "could not advance the '{key_r}' cursor at page {pages} \
+                                 (NULL or unsupported type)"
+                            )
+                        })?);
                     }
                     pages += 1;
                     if last_page {
@@ -774,8 +670,8 @@ fn run_keyset_parallel(
                 // Atomic checkpoint: the range's parts → file_log AND `done=1` in one
                 // transaction (checkpoint runs only). A crash before this leaves the
                 // range `done=0` with no file_log rows — re-read on resume.
-                if let Some(sref) = sref_r
-                    && let Err(e) = crate::state::StateStore::commit_keyset_range_at_ref(
+                if let Some(sref) = sref_r {
+                    crate::state::StateStore::commit_keyset_range_at_ref(
                         sref,
                         rid_r,
                         &plan_r.export_name,
@@ -784,20 +680,10 @@ fn run_keyset_parallel(
                         fmt_r,
                         Some(cmp_r),
                     )
-                {
-                    errs_r
-                        .lock()
-                        .unwrap()
-                        .push(format!("range {ridx}: checkpoint commit: {e:#}"));
-                    return;
+                    .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
                 }
-                // Project the in-flight `running` aggregate from file_log, so the
-                // part-landed / aggregate-projected pair travels together on this
-                // runner like the other three (roast 2026-08-09, #173: keyset was
-                // the one runner whose mid-run metrics row lagged its parts).
-                // Best-effort observability over a fresh at-ref connection — the
-                // projection is race-safe by construction (INSERT ON CONFLICT +
-                // recompute-UPDATE) and never gates the checkpoint above.
+                // Project the in-flight `running` aggregate from file_log (#173):
+                // best-effort observability, never gates the checkpoint above.
                 if let Some(sref) = sref_r
                     && let Err(e) = crate::state::StateStore::open_at_ref(sref).and_then(|st| {
                         st.project_running_aggregate(
@@ -821,102 +707,43 @@ fn run_keyset_parallel(
                     "keyset_parallel_range_committed",
                     ridx as i64,
                 );
-                // Publish to the shared merge state ONLY after the checkpoint commits,
-                // so a failed commit does not leave half-merged summary state.
-                rmax_r.lock().unwrap()[ridx] = rmax;
-                // Parts were published per-page above (they are durable pre-commit);
-                // only the cursor and checksums — SUMMARY state — publish here, gated
-                // on the checkpoint commit so a failed commit leaves no half-merged
-                // summary (the parts count is intentionally NOT gated: it must show
-                // on-disk debris even for a range that failed to commit).
-                checks_r
-                    .lock()
-                    .unwrap()
-                    .extend(local_checks.into_iter().map(|(m, k)| (ridx, m, k)));
+                // Cursor and checksums publish only after the checkpoint commits.
+                rmax_r.lock().unwrap_or_else(|e| e.into_inner())[ridx] = rmax;
+                for c in local_checks {
+                    fan_r.contribute(unit, c);
+                }
+                Ok(())
             });
         }
     });
 
-    let errs = errors.into_inner().unwrap();
-
-    // Record what the SUCCESSFUL workers already made durable — BEFORE deciding
-    // whether to bail. `summary.files_committed` is the retry guard's only input
-    // (`decide_export_retry` -> `BailDuplicateGuard`, pipeline/single.rs), and
-    // `record_part` is the sole production site that raises it. Bailing above
-    // this loop left the guard reading ZERO while ranges were already on disk,
-    // so a TRANSIENT worker failure retried the whole export over durable parts.
-    //
-    // Measured before the fix: worker 2 failed transiently, 4 parts were on
-    // disk, rivet retried twice ("retry 1/2", "retry 2/2"). Stable run_id part
-    // names usually make attempt N+1 overwrite attempt N, which is why this hid
-    // since 0.23.0 — but when a range's output SHRINKS between attempts (rows
-    // deleted concurrently, or a part-count drop) the extra part of the earlier
-    // attempt survives as an orphan: a 2000-row fixture with a mid-backoff
-    // DELETE produced 751 rows / 750 distinct — id 501 duplicated, sitting in
-    // both `..._w0_1.parq` (attempt 1, unoverwritten) and `..._w1_0.parq`.
-    //
-    // Recording on the failure path is also the truthful thing: the run
-    // finalizes a Failed manifest, and listing the durable debris is what makes
-    // it discoverable to validate/gc instead of unreferenced.
-    // Records through the commit seam (populates summary.manifest_parts +
-    // counters + journal). On a CHECKPOINT run the workers ALREADY wrote
-    // file_log atomically with their `done` flip, so pass None to avoid a
-    // duplicate write. On a NON-checkpoint run the workers write no file_log
-    // (their commit_keyset_range_at_ref is gated on state_ref = checkpoint-only),
-    // so the merge must write it — matching the sequential keyset path.
+    // On a CHECKPOINT run the workers already wrote file_log atomically with their
+    // `done` flip, so the drain writes none; a non-checkpoint run persists no
+    // ranges, so the drain writes it — matching the sequential keyset path.
+    // The JOURNAL id stays the drain index (unchanged on-disk shape) while the
+    // COVERAGE unit is the range; a range that never committed published no
+    // checksums, so its pages stay uncovered and the seam suppresses Form B.
     let file_log_state = if checkpoint { None } else { state };
-    let parts = parts_mx.into_inner().unwrap();
-    for (idx, (ridx, rec)) in parts.iter().enumerate() {
-        super::commit::record_part(
-            plan,
-            summary,
-            file_log_state,
-            rec,
-            super::commit::PartKind::Page {
-                page_index: idx as i64,
-                // The PARALLEL keyset runner resumes via per-range done flags + stable run_id part
-                // names (immune to the sequential cursor window), so it does not use the v25
-                // cursor-atomic reconcile — None.
-                cursor_high: None,
-            },
-            // ADR-0029: the JOURNAL id stays the drain index (unchanged on-disk
-            // shape) while the COVERAGE unit is the range that committed — or
-            // failed to. A range that never committed published no checksums,
-            // so its pages are recorded-but-uncovered and the seam suppresses
-            // Form B rather than publish a record covering a strict subset of
-            // this manifest. That suppression is the whole reason the naive
-            // "move the feed above the bail" fix was rejected.
-            super::commit::UnitId::Range(*ridx as i64),
-        );
-    }
-    summary.total_rows += rows.into_inner();
-
-    // #152: drain the governor's decisions into the journal BEFORE the error bail — the failure
-    // path is EXACTLY where the back-off forensics matter (was the source under pressure when it
-    // failed?). The shared drain_into (which poison-recovers, unlike the old into_inner().unwrap()
-    // here) makes this identical to the chunked runner — the drift the copy re-introduced twice.
-    governor.drain_into(summary);
-
-    // ADR-0029 (the reported defect): the schema is an OBSERVATION — the workers
-    // converged on ONE run schema and it describes what they READ, with no
-    // coverage obligation — so feed it ABOVE the bail. This runner has no direct
-    // `summary.schema_fingerprint` assignment at all, so the ledger is its only
-    // path: fed below the bail, a FAILED parallel-keyset run pinned the stale
-    // open-time baseline onto a Failed manifest listing parts whose parquet
-    // carries the observed schema. The seam pins the fingerprint on BOTH paths
-    // and runs the drift gate only on success.
-    if let Some(sc) = fingerprint.get() {
-        summary.ledger.note_schema(sc);
-    }
-
-    if !errs.is_empty() {
-        anyhow::bail!(
-            "export '{}': parallel keyset failed on {} range(s): {}",
-            plan.export_name,
-            errs.len(),
-            errs.join("; ")
-        );
-    }
+    fan.finish(
+        plan,
+        summary,
+        file_log_state,
+        Some(governor),
+        |idx, _| super::commit::PartKind::Page {
+            page_index: idx as i64,
+            // Parallel keyset resumes via per-range done flags + stable run_id part
+            // names, not the sequential cursor reconcile — None.
+            cursor_high: None,
+        },
+        |errs| {
+            anyhow::anyhow!(
+                "export '{}': parallel keyset failed on {} range(s): {}",
+                plan.export_name,
+                errs.len(),
+                errs.join("; ")
+            )
+        },
+    )?;
 
     // Merge into the summary through the shared seams (identical to the sequential
     // runner's per-page path, folded run-wide).
@@ -924,10 +751,11 @@ fn run_keyset_parallel(
         summary.validated = Some(true);
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
-    summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
+    summary.cursor_high =
+        highest_range_max(range_max.into_inner().unwrap_or_else(|e| e.into_inner()));
     // #151: the observed floor = range 0's first key (the lowest range);
     // the incremental block below overwrites this with the anchor floor.
-    summary.cursor_low = range_first.into_inner().unwrap();
+    summary.cursor_low = range_first.into_inner().unwrap_or_else(|e| e.into_inner());
 
     // Resume completeness: reconstruct the parts of the ranges that completed in a
     // PRIOR (crashed) run — they were not re-run, so they are absent from
@@ -939,21 +767,12 @@ fn run_keyset_parallel(
     {
         rehydrate_keyset_pages_probed(st, &run_id, plan, summary)?;
     }
-    // ADR-0028/0029: feed every committed range's Form-B checksums to the ledger
-    // under the SAME `UnitId::Range` its parts were recorded with (commit-gated —
-    // a failed range published none, and the seam then sees the shortfall itself
-    // instead of being told about it). The seam harvests once.
-    for (ridx, m, k) in checksums_mx.into_inner().unwrap() {
-        summary
-            .ledger
-            .contribute_checksums(super::commit::UnitId::Range(ridx as i64), &m, k);
-    }
 
     log::info!(
         "export '{}': parallel keyset complete — {} range(s), {} parts, {} rows",
         plan.export_name,
         total_ranges,
-        parts.len(),
+        summary.manifest_parts.len(),
         summary.total_rows
     );
 
@@ -995,6 +814,43 @@ fn key_advances(anchor: &str, candidate: &str) -> bool {
         return ord.is_gt();
     }
     candidate > anchor
+}
+
+/// Is there nothing past the incremental anchor: an empty source, or a source
+/// max that does not advance it? No prior anchor means every row is new.
+fn nothing_past_anchor(anchor: Option<&str>, cur_max: Option<&str>) -> bool {
+    match (anchor, cur_max) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(c)) => !key_advances(a, c),
+    }
+}
+
+/// Did the sampler collapse a requested parallel fan-out to a single range?
+fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
+    parallel > 1 && total_ranges == 1
+}
+
+/// A short page means the key range is exhausted.
+fn is_last_page(rows: usize, page_size: usize) -> bool {
+    rows < page_size
+}
+
+/// Does a sequential keyset run seek from the persisted cursor (crash recovery,
+/// or `keyset_incremental`) rather than from the start of the key space?
+fn seeks_from_persisted_cursor(
+    checkpoint: bool,
+    recovering_crash: bool,
+    incremental: bool,
+) -> bool {
+    checkpoint && (recovering_crash || incremental)
+}
+
+/// Is the resume anchor released as soon as the data is complete? Only for a
+/// crash-recovery-only run: an incremental run keeps it until the manifest is
+/// written, or a crash in between would orphan the committed pages.
+fn releases_anchor_at_data_complete(checkpoint: bool, incremental: bool) -> bool {
+    checkpoint && !incremental
 }
 
 /// The `(lo, hi)` pairs of a sampled range list, for `persist_keyset_ranges`.
@@ -1066,17 +922,18 @@ pub(crate) fn run_keyset(
     // tell that the prior run crashed (a flaky-link diagnosis signal).
     summary.resumed = recovering_crash;
 
-    let mut last: Option<String> = if kp.checkpoint && (recovering_crash || kp.incremental) {
-        match state {
-            Some(s) => {
-                s.get_owned(&plan.export_name, &kp.key_column)?
-                    .last_cursor_value
+    let mut last: Option<String> =
+        if seeks_from_persisted_cursor(kp.checkpoint, recovering_crash, kp.incremental) {
+            match state {
+                Some(s) => {
+                    s.get_owned(&plan.export_name, &kp.key_column)?
+                        .last_cursor_value
+                }
+                None => None,
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     // Forensics (v18): a resume's lower bound is the checkpoint it continues from
     // (None on a fresh run — keyset seeks forward from the start). cursor_high (the
     // max reached) is set at the loop exits below.
@@ -1162,7 +1019,7 @@ pub(crate) fn run_keyset(
             seek_tag(last.as_deref()),
             ext
         );
-        let Some(page) = read_keyset_page(
+        let Some(mut page) = read_keyset_page(
             src,
             plan,
             &key_plan,
@@ -1191,27 +1048,21 @@ pub(crate) fn run_keyset(
         // ADR-0028: feed the run ledger from this page — the seam
         // (`finalize::finalize_export`) pins the fingerprint, runs the drift
         // gate and harvests Form B once, at the dispatcher. No application here.
-        if let Some(sc) = &page.schema {
-            summary.ledger.note_schema(sc);
-        }
+        summary.ledger.observe(std::mem::take(&mut page.observed));
         // ADR-0029: the sequential runner's commit unit is the PAGE — this feed
         // and the `record_part` calls below are the same loop iteration over the
         // same page, so the two sets agree by construction.
-        summary.ledger.contribute_checksums(
+        summary.ledger.contribute(
             super::commit::UnitId::Page(pages as i64),
-            &page.column_checksums,
-            page.checksum_key_column.clone(),
+            std::mem::take(&mut page.checksums),
         );
         if plan.validate {
             summary.validated = Some(true);
         }
         // Record the parts FIRST, tracking whether EVERY part deduped. With v25 the cursor
         // reconcile (above) means a committed page is never re-read, so a dedup normally fires only
-        // in the mid-page-crash fallback (below); the counter must still not double-count a deduped
-        // re-read (rehydration already counted that page), or total_rows diverges from
-        // sum(manifest_parts) and trips the coherence invariant — so total_rows is added only when
-        // a page has a genuinely-new part.
-        let mut any_new_part = page.parts.is_empty();
+        // in the mid-page-crash fallback (below); `record_part` counts each part's rows once, so a
+        // deduped re-read of a rehydrated part adds nothing.
         let n_parts = page.parts.len();
         for (pi, rec) in page.parts.iter().enumerate() {
             // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
@@ -1224,7 +1075,7 @@ pub(crate) fn run_keyset(
             // high-water would falsely mark a mid-page crash "done" and DROP its uncommitted parts
             // (there is no per-part key to reconcile against — KeysetPage carries only next_cursor).
             let is_last = pi + 1 == n_parts;
-            let deduped = super::commit::record_part(
+            super::commit::record_part(
                 plan,
                 summary,
                 state,
@@ -1239,10 +1090,6 @@ pub(crate) fn run_keyset(
                 },
                 super::commit::UnitId::Page(pages as i64),
             );
-            any_new_part |= !deduped;
-        }
-        if any_new_part {
-            summary.total_rows += page.rows as i64;
         }
         // Persist the high-water mark AFTER the parts are durably committed, so a
         // resume continues from committed data (peek→flush→ack). The crash window
@@ -1267,7 +1114,7 @@ pub(crate) fn run_keyset(
 
         // A short page means the index range is exhausted — stop without an
         // extra empty round-trip.
-        if page.rows < kp.chunk_size {
+        if is_last_page(page.rows, kp.chunk_size) {
             // Forensics (v18): the final page's max key is the run's true high-water.
             // Record it BEFORE breaking — the loop stops without advancing `last`, so
             // a short tail page (e.g. the 3 u64 ids above i64::MAX) is captured yet
@@ -1321,8 +1168,7 @@ pub(crate) fn run_keyset(
     // mark (0 new rows) and never rehydrates those parts, so the manifest-
     // authoritative loader silently drops them. The anchor must survive until
     // finalize for the incremental path (job.rs clears it AFTER the manifest write).
-    if kp.checkpoint
-        && !kp.incremental
+    if releases_anchor_at_data_complete(kp.checkpoint, kp.incremental)
         && let Some(st) = state
     {
         st.clear_resume_run_id(&plan.export_name)?;
@@ -1456,6 +1302,70 @@ mod tests {
         // A `||`→`&&` slip in the keep-predicate would drop alnum too — pinned by the
         // all-safe case round-tripping unchanged.
         assert_eq!(sanitize_run_id("ABCabc012"), "ABCabc012");
+    }
+
+    #[test]
+    fn nothing_past_anchor_covers_empty_first_and_stale_sources() {
+        assert!(nothing_past_anchor(Some("5"), None), "empty source");
+        assert!(nothing_past_anchor(None, None), "empty source, no anchor");
+        assert!(
+            !nothing_past_anchor(None, Some("1")),
+            "no anchor: every row is new"
+        );
+        assert!(
+            !nothing_past_anchor(Some("999"), Some("1000")),
+            "numeric, not lexical"
+        );
+        assert!(
+            nothing_past_anchor(Some("1000"), Some("1000")),
+            "max == anchor"
+        );
+    }
+
+    #[test]
+    fn fan_out_collapses_only_when_parallel_was_asked_for() {
+        assert!(fan_out_collapsed(4, 1));
+        assert!(!fan_out_collapsed(1, 1), "sequential was asked for");
+        assert!(!fan_out_collapsed(4, 2));
+    }
+
+    #[test]
+    fn a_short_page_is_the_last() {
+        assert!(is_last_page(2, 3));
+        assert!(!is_last_page(3, 3), "a full page may have a successor");
+    }
+
+    #[test]
+    fn keyset_seeks_from_the_cursor_only_for_recovery_or_incremental() {
+        assert!(
+            seeks_from_persisted_cursor(true, true, false),
+            "crash recovery"
+        );
+        assert!(
+            seeks_from_persisted_cursor(true, false, true),
+            "keyset_incremental"
+        );
+        assert!(
+            !seeks_from_persisted_cursor(true, false, false),
+            "clean re-run: full pass"
+        );
+        assert!(
+            !seeks_from_persisted_cursor(false, true, true),
+            "no checkpoint, no cursor"
+        );
+    }
+
+    #[test]
+    fn only_a_crash_recovery_run_releases_its_anchor_at_data_complete() {
+        assert!(releases_anchor_at_data_complete(true, false));
+        assert!(
+            !releases_anchor_at_data_complete(true, true),
+            "incremental keeps it to finalize"
+        );
+        assert!(
+            !releases_anchor_at_data_complete(false, false),
+            "no checkpoint, no anchor"
+        );
     }
 
     // ── key_advances: numeric-aware strictly-past-anchor compare ─────────────

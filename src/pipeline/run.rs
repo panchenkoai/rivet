@@ -39,6 +39,8 @@ pub struct RunOptions<'a> {
     /// (per ADR-0013: one `--force`, scoped to whichever gate it overrides).
     pub force: bool,
     pub params: Option<&'a std::collections::HashMap<String, String>>,
+    /// A CDC export's pending baseline snapshots run concurrently (up to the pool ceiling) — `--parallel-exports`.
+    pub parallel_snapshots: bool,
 }
 
 /// True when the current process is running more than one export in this
@@ -88,6 +90,115 @@ pub(crate) const ENV_PARENT_SELF_CHECK: &str = "RIVET_PARENT_OWNS_SELF_CHECK";
 pub(crate) fn multi_export_concurrent() -> bool {
     MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed)
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
+}
+
+/// How a `rivet run` fans out: `(exports_in_parallel, snapshot_legs_may_fan_out)`. Exports run in parallel when asked for, with no single export named and 2+ to run; a lone CDC export's snapshot legs may fan out when asked for and neither the exports nor sibling child processes already do, where the pools would nest past the ceiling.
+pub(crate) fn run_concurrency(
+    flag: bool,
+    config_flag: bool,
+    one_export_named: bool,
+    exports: usize,
+    sibling_child: bool,
+) -> (bool, bool) {
+    let requested = flag || config_flag;
+    let exports_parallel = requested && !one_export_named && exports > 1;
+    (
+        exports_parallel,
+        requested && !exports_parallel && !sibling_child,
+    )
+}
+
+/// One export's result and summary, as `job::run_export_job` returns them.
+pub(crate) type ExportOutcome = (Result<()>, RunSummary);
+
+/// Run every export on the shared worker pool (`workers::run_workers`), one state connection per worker; outcomes in input order, plus the worker count.
+pub(crate) fn run_export_pool(
+    config_path: &str,
+    exports: &[&ExportConfig],
+    run: impl Fn(&ExportConfig, &StateStore) -> ExportOutcome + Sync,
+) -> (Vec<ExportOutcome>, usize) {
+    let workers = crate::workers::effective_pool(None, exports.len());
+    let outcomes = crate::workers::run_workers(
+        exports,
+        workers,
+        || match StateStore::open(config_path) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                log::error!("export worker: failed to open the state database: {e:#}");
+                None
+            }
+        },
+        |state, _, export| Ok(run(export, state)),
+        |export| {
+            let err = anyhow::anyhow!(
+                "export '{}' did not complete: its worker panicked or could not open the state database (the log above names which)",
+                export.name
+            );
+            let summary = job::synthetic_failed_summary(&export.name, &err);
+            Box::new((Err(err), summary))
+        },
+    );
+    let outcomes = outcomes
+        .into_iter()
+        .map(
+            |o: std::result::Result<ExportOutcome, Box<ExportOutcome>>| {
+                o.unwrap_or_else(|lost| *lost)
+            },
+        )
+        .collect();
+    (outcomes, workers)
+}
+
+/// One-line cards: this process renders more than one export itself (not one pinned export, not a subprocess parent).
+fn compact_cards(pinned_export: bool, exports: usize, subprocess_parent: bool) -> bool {
+    !pinned_export && !subprocess_parent && exports > 1
+}
+
+/// Swaps the render flags in for one run and restores the previous values on drop, panic included.
+pub(crate) struct RenderFlags(bool, bool);
+
+impl RenderFlags {
+    /// Set `multi` and, when given, `concurrent`; the guard puts both back.
+    pub(crate) fn set(multi: bool, concurrent: Option<bool>) -> Self {
+        let prev_multi = MULTI_EXPORT_MODE.swap(multi, AtomicOrdering::Relaxed);
+        let prev_concurrent = match concurrent {
+            Some(c) => MULTI_EXPORT_CONCURRENT.swap(c, AtomicOrdering::Relaxed),
+            None => MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed),
+        };
+        Self(prev_multi, prev_concurrent)
+    }
+}
+
+impl Drop for RenderFlags {
+    fn drop(&mut self) {
+        MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
+        MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// The in-process card UI: installs the ipc sender and runs `parent_ui` until dropped, panic included.
+struct CardUi(Option<std::thread::JoinHandle<()>>);
+
+impl CardUi {
+    /// Install the sender and spawn the UI thread.
+    fn start(name_floor: usize, n_cards: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
+        ipc::install_in_process_tx(tx);
+        let thread = std::thread::Builder::new()
+            .name("rivet-ui".to_string())
+            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
+            .ok();
+        Self(thread)
+    }
+}
+
+impl Drop for CardUi {
+    fn drop(&mut self) {
+        ipc::clear_in_process_tx();
+        if let Some(t) = self.0.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 fn print_json_summary(agg: &crate::state::RunAggregate) {
@@ -443,12 +554,20 @@ pub fn run(
         selected
     };
 
+    let (run_parallel, parallel_snapshots) = run_concurrency(
+        parallel_exports_cli,
+        config.parallel_exports,
+        export_name.is_some(),
+        exports.len(),
+        multi_export_concurrent(),
+    );
     let opts = RunOptions {
         validate,
         reconcile,
         resume,
         force,
         params,
+        parallel_snapshots,
     };
 
     // Seeds the card-table name column so it aligns from the first redraw
@@ -558,26 +677,13 @@ pub fn run(
         return result;
     }
 
-    let run_parallel = (parallel_exports_cli || config.parallel_exports)
-        && export_name.is_none()
-        && exports.len() > 1;
-
     // Compact-rendering hints for the per-export renderers.  Set once here so
     // every code path below — sequential, `--parallel-exports`, the apply
     // path, etc. — sees a consistent mode.  Restored at the end of the run
     // so subsequent invocations within the same process (tests, library
     // callers) start with a clean slate.
-    let multi_export = export_name.is_none() && exports.len() > 1;
-    let prev_multi = MULTI_EXPORT_MODE.swap(multi_export, AtomicOrdering::Relaxed);
-    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(run_parallel, AtomicOrdering::Relaxed);
-    struct ResetMultiExport(bool, bool);
-    impl Drop for ResetMultiExport {
-        fn drop(&mut self) {
-            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
-            MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
-        }
-    }
-    let _reset_multi = ResetMultiExport(prev_multi, prev_concurrent);
+    let multi_export = compact_cards(export_name.is_some(), exports.len(), false);
+    let _render_flags = RenderFlags::set(multi_export, Some(run_parallel));
 
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(exports.len());
     // Keep the typed `anyhow::Error`s (not flattened strings) so the final bail
@@ -597,8 +703,9 @@ pub fn run(
 
     if run_parallel {
         log::info!(
-            "running {} exports in parallel (separate state DB connection per export)",
-            exports.len()
+            "running {} exports on up to {} worker threads (one state DB connection per worker)",
+            exports.len(),
+            crate::workers::effective_pool(None, exports.len())
         );
 
         // In threads mode every export emits the same `ChildEvent` stream
@@ -616,68 +723,30 @@ pub fn run(
             ));
         }
         let n_cards = exports.len();
-        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
-        ipc::install_in_process_tx(tx);
-        let ui_thread = std::thread::Builder::new()
-            .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
-            .ok();
+        let card_ui = CardUi::start(name_floor, n_cards);
 
         // In-process concurrency sets MULTI_EXPORT_CONCURRENT, so every export's
         // DIAGNOSIS hedges and points at the run-level harm line — emit it here
         // (same bracket as the pool and the process-parallel parent).
         let (run_harm, window_start) = RunHarmBracket::open(&config.source);
         started_at = window_start;
-        let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
-            std::sync::Mutex::new(Vec::with_capacity(exports.len()));
-        std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for &export in &exports {
-                handles.push(s.spawn(|| {
-                    let state = match StateStore::open(config_path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let err = anyhow::anyhow!(
-                                "export '{}': failed to open state database: {:#}",
-                                export.name,
-                                e
-                            );
-                            let summary = job::synthetic_failed_summary(&export.name, &err);
-                            return (Err(err), summary);
-                        }
-                    };
-                    job::run_export_job(config_path, &config, export, &state, &config_dir, &opts)
-                }));
-            }
-            // Every thread is spawned before any is joined, so the number of
-            // live handles IS the overlap this run reached — counted, not
-            // assumed from `run_parallel`.
-            peak_concurrency = peak_concurrency.max(handles.len());
-            for h in handles {
-                match h.join() {
-                    Ok(pair) => collected.lock().unwrap().push(pair),
-                    Err(payload) => std::panic::resume_unwind(payload),
-                }
-            }
+        let (collected, workers) = run_export_pool(config_path, &exports, |export, state| {
+            job::run_export_job(config_path, &config, export, state, &config_dir, &opts)
         });
+        peak_concurrency = peak_concurrency.max(workers);
 
         // All exports are done → drop the sender so `parent_ui::run_ui`
         // sees the channel close and exits cleanly (committing the final
         // card stack to scrollback).  Joining is best-effort: even if the
         // UI thread is wedged we still want to print the run aggregate
         // below.
-        ipc::clear_in_process_tx();
-        if let Some(t) = ui_thread {
-            let _ = t.join();
-        }
+        drop(card_ui);
         // Stamp the window BEFORE the bracket close queries the source, so the
         // aggregate's duration excludes the instrumentation round-trip.
         window_end = Some(chrono::Utc::now());
-        run_harm.close_and_warn(HarmWindow::Parallel {
-            exports: exports.len(),
-        });
+        run_harm.close_and_warn(HarmWindow::Parallel { exports: workers });
 
-        for (res, summary) in collected.into_inner().unwrap() {
+        for (res, summary) in collected {
             if let Err(e) = res {
                 failures.push(e);
             }
@@ -691,12 +760,7 @@ pub fn run(
         // attended bit is unset; `run_ui` already falls back to linear
         // mode for piped stderr.
         let n_cards = exports.len();
-        let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
-        ipc::install_in_process_tx(tx);
-        let ui_thread = std::thread::Builder::new()
-            .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
-            .ok();
+        let card_ui = CardUi::start(name_floor, n_cards);
 
         for export in &exports {
             let (res, summary) =
@@ -707,10 +771,7 @@ pub fn run(
             summaries.push(summary);
         }
 
-        ipc::clear_in_process_tx();
-        if let Some(t) = ui_thread {
-            let _ = t.join();
-        }
+        drop(card_ui);
         // Single-export sequential runs still emit the detailed block after
         // the card commits to scrollback.
         if exports.len() == 1
@@ -783,8 +844,7 @@ pub fn run(
         // stdout — honour both without polluting the DB or stderr (the
         // multi-export path writes the file through `persist` above).
         if let Some(out) = summary_output
-            && let Err(e) =
-                std::fs::write(out, serde_json::to_string_pretty(&agg).unwrap_or_default())
+            && let Err(e) = aggregate::write_json(out, &agg)
         {
             log::warn!(
                 "aggregate: failed to write summary JSON to {}: {:#}",
@@ -823,6 +883,7 @@ pub(crate) fn run_waves(
         resume,
         force,
         params: None,
+        parallel_snapshots: false,
     };
 
     // Group exports by wave (ascending; an export with no `wave:` runs last).
@@ -854,14 +915,7 @@ pub(crate) fn run_waves(
     // (subprocess) path renders the parent card stack itself and each child sees
     // `exports.len() == 1`, so the flag must stay clear there — matching `run`'s
     // parallel-processes branch.
-    let prev_multi = MULTI_EXPORT_MODE.swap(total > 1 && !parallel, AtomicOrdering::Relaxed);
-    struct ResetMulti(bool);
-    impl Drop for ResetMulti {
-        fn drop(&mut self) {
-            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
-        }
-    }
-    let _reset = ResetMulti(prev_multi);
+    let _render_flags = RenderFlags::set(compact_cards(false, total, parallel), None);
 
     let state = StateStore::open(config_path)?;
     // `apply --parallel` re-execs children with ENV_CONCURRENT_SIBLINGS, so each
@@ -913,28 +967,7 @@ pub(crate) fn run_waves(
         let pending: Vec<&ExportConfig> = exports
             .iter()
             .copied()
-            .filter(|e| {
-                // Probe the EXPANDED destination, not the raw template. A
-                // templated prefix (`{export}`/`{table}`/`{date}`) never matches a
-                // literal `_SUCCESS` path, so a completed templated export was
-                // never skipped and instead re-ran into the resume gate. Resolve
-                // the same way `rivet run` does at write time (today's UTC date, no
-                // `{run_id}` — a run-unique prefix is fresh every run, so there is
-                // nothing to skip and the literal token correctly never matches).
-                let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
-                let expanded = crate::destination::placeholder::expand_destination(
-                    e.destination.clone(),
-                    &ctx,
-                );
-                let done = resume && finalize::destination_has_success(&expanded);
-                if done {
-                    log::info!(
-                        "apply: skipping '{}' — destination already complete (_SUCCESS)",
-                        e.name
-                    );
-                }
-                !done
-            })
+            .filter(|e| finalize::needs_run(e, resume, "apply"))
             .collect();
         if pending.is_empty() {
             continue;
@@ -1150,8 +1183,8 @@ fn finish_run_tail(
 pub(crate) enum HarmWindow {
     /// `--pool m`: `exports` exports drained through `slots` slots.
     Pool { exports: usize, slots: usize },
-    /// `--parallel-exports` / `--parallel-export-processes` / `apply --parallel`:
-    /// `exports` exports concurrent with no slot cap. `exports` is the PEAK
+    /// `--parallel-exports` (at most 16 at once, also CDC snapshot legs) /
+    /// `--parallel-export-processes` (no cap) / `apply --parallel`: `exports` exports concurrent. `exports` is the PEAK
     /// number that actually overlapped, not how many the run covered — the
     /// frame is a concurrency claim, so it must count concurrency.
     Parallel { exports: usize },
@@ -1459,10 +1492,9 @@ fn pool_export_modes(windows: &[(String, i64, i64)]) -> Vec<(String, &'static st
 /// (`"parallel-processes"` at the child-process aggregate, `if run_parallel {
 /// "parallel-threads" } else { "sequential" }` at the tail).
 ///
-/// `peak` is how many exports ran AT ONCE: `exports.len()` on both concurrent
-/// paths, which spawn one child process / one thread per export with no cap and
-/// join them all, and 1 on the sequential loop. Nothing serializes those paths
-/// today — the fix is that the CLAIM is now derived from a count rather than
+/// `peak` is how many exports ran AT ONCE: the worker count on the threads path
+/// (at most 16), `exports.len()` on the child-process path (one child per export,
+/// no cap), and 1 on the sequential loop. The fix is that the CLAIM is now derived from a count rather than
 /// from `run_parallel`, so the first cost gate to split them (which is exactly
 /// how `apply --parallel`'s wave bug was born: a flag that meant "concurrent"
 /// until the gate started emitting single-child batches) cannot leave a
@@ -1480,20 +1512,22 @@ pub(super) fn run_mode_label(peak: usize, processes: bool) -> &'static str {
     }
 }
 
-/// The "prediction is a LOWER BOUND" line — or `None` when every prediction in
-/// the schedule rests on a real success.
-///
-/// ONE source for that claim, and it reads the RECONCILED classification
-/// (`pool::classification_counts` over the post-split `predict_items` sweep).
-/// The `--split` block cannot answer the question, because the only input it
-/// has is the SEED: unit names are stable across runs, so from run 2 onward
-/// each `{giant}#i` has history of its OWN that supersedes the seed
-/// (`pool::reconcile_split_seed`), while the giant is retained out of the run
-/// set and its rows stay frozen at the failure that motivated the split. A
-/// hedge derived there kept saying "the giant has no successful run to measure
-/// from" in the same run whose accounting printed "N measured, 0 estimated" —
-/// one run, two contradictory honesty claims about the same exports (bughunt
-/// 2026-08-14).
+/// Does this export DOMINATE the pool floor (more than its fair share of the
+/// predicted total across `m` slots) while being heavy (not `parallel_safe`)?
+fn dominates_as_heavy(predicted_secs: f64, total: f64, m: usize, parallel_safe: bool) -> bool {
+    predicted_secs > total / (m.max(1) as f64) && !parallel_safe
+}
+
+/// Signed error of the actual makespan against the prediction, in percent (0 when
+/// there was no prediction).
+fn makespan_error_pct(actual_secs: f64, predicted_secs: f64) -> f64 {
+    if predicted_secs > 0.0 {
+        (actual_secs - predicted_secs) / predicted_secs * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// What `apply --pool` says when the `--resume` skip leaves nothing to run.
 ///
 /// `split_noticed` is whether this run already emitted the `--split` notice,
@@ -1521,18 +1555,6 @@ fn nothing_to_run_message(split_noticed: bool) -> String {
     }
 }
 
-fn lower_bound_hedge(attempt_n: usize, placeholder_n: usize) -> Option<String> {
-    let unmeasured = attempt_n + placeholder_n;
-    (unmeasured > 0).then(|| {
-        format!(
-            "        prediction is a LOWER BOUND: {unmeasured} export(s) have no successful run \
-             to measure from ({attempt_n} scheduled at a failed attempt's duration, \
-             {placeholder_n} at a {}s placeholder) — it tightens as runs complete",
-            super::pool::POOL_PLACEHOLDER_SECS as i64,
-        )
-    })
-}
-
 /// The run-window harm verdict, pure so the threshold and wording are
 /// unit-tested (its per-export sibling in `job::run_diagnosis` always was;
 /// this copy had zero cover behind a live-only seam — walk find, 2026-08-13).
@@ -1556,7 +1578,9 @@ fn run_harm_verdict(deltas: &[(String, i64)], window: HarmWindow) -> Option<Stri
         HarmWindow::Parallel { exports } => (
             "parallel run",
             format!("the run window ({exports} concurrent exports)"),
-            Some("the export concurrency (`--pool N` bounds it)"),
+            Some(
+                "the export concurrency (`--pool N` bounds it; `--parallel-exports` is capped at 16)",
+            ),
         ),
         // No concurrency lever: this window HAD no concurrency. Naming one
         // would send the operator to shrink a 1, and would push the two levers
@@ -1628,7 +1652,9 @@ impl<'a> RunHarmBracket<'a> {
     /// taken after the probe (see [`snapshot_then_stamp`]). Call immediately
     /// before the concurrent work and use the returned instant as the run's
     /// `started_at`.
-    fn open(source: &'a crate::config::SourceConfig) -> (Self, chrono::DateTime<chrono::Utc>) {
+    pub(crate) fn open(
+        source: &'a crate::config::SourceConfig,
+    ) -> (Self, chrono::DateTime<chrono::Utc>) {
         let (before, window_start) = snapshot_then_stamp(|| job::harm_snapshot(source));
         (Self { source, before }, window_start)
     }
@@ -1636,7 +1662,7 @@ impl<'a> RunHarmBracket<'a> {
     /// Take the `after` snapshot and WARN the verdict if the window crossed the
     /// shared threshold. WARN (not info) so it is visible at the default log
     /// level — an invisible "your source is spilling" line is no line at all.
-    fn close_and_warn(self, window: HarmWindow) {
+    pub(crate) fn close_and_warn(self, window: HarmWindow) {
         if let (Some(before), Some(after)) = (&self.before, job::harm_snapshot(self.source))
             && let Some(line) = run_harm_verdict(&job::harm_deltas(before, &after), window)
         {
@@ -1689,6 +1715,7 @@ pub(crate) fn run_pool(
         resume,
         force,
         params: None,
+        parallel_snapshots: false,
     };
     // Pre-migrate the state DB once before worker threads race on DDL, and use
     // this handle for the duration reads below.
@@ -1721,17 +1748,7 @@ pub(crate) fn run_pool(
             if split {
                 return true; // per-unit skip happens after the split
             }
-            let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
-            let expanded =
-                crate::destination::placeholder::expand_destination(e.destination.clone(), &ctx);
-            let done = resume && finalize::destination_has_success(&expanded);
-            if done {
-                log::info!(
-                    "apply --pool: skipping '{}' — destination already complete (_SUCCESS)",
-                    e.name
-                );
-            }
-            !done
+            finalize::needs_run(e, resume, "apply --pool")
         })
         .cloned()
         .collect();
@@ -1766,149 +1783,24 @@ pub(crate) fn run_pool(
     //    never a silent fall-back to the un-split giant.
     //  * `--split` NOT set → the pre-existing ADVISORY warn (tells the operator
     //    the concrete floor-breaker; they act on it).
-    // #167 per-unit resume: (destination, family) of the giant that was split, so
-    // the post-split skip can read which of its units already completed.
-    let mut split_info: Option<(crate::config::DestinationConfig, String)> = None;
-    // #167 + bughunt 2026-08-13: a synthesized `{giant}#N` unit has no metrics
-    // history, so predicted_from would give it the 5 s placeholder and LPT
-    // would schedule the giant's slices LAST — smalls first, nothing
-    // backfilling behind the units, defeating the split's makespan purpose.
-    // Each unit inherits giant_predicted / realized (the same arithmetic
-    // pool::split_dominating models) AND the giant's classification, recorded
-    // here and consulted by the final classification sweep.
-    let mut split_seeds: std::collections::HashMap<String, super::pool::PredictedFrom> =
-        std::collections::HashMap::new();
+    // #167: what `--split` realized (the giant's prefix + each unit's seeded
+    // prediction, so LPT places the slices where the giant stood).
+    let mut realized: Option<super::split::Realized> = None;
     let advise = super::pool::advise_split(&items, m, 3.0, m.max(2));
     if split {
         match &advise {
             Some((giant, n, broken)) => {
-                let base = effective
-                    .iter()
-                    .find(|e| &e.name == giant)
-                    .expect("advise_split names an export in the set")
-                    .clone();
-                // On --resume, RECONSTRUCT the exact partition the prior run used from its
-                // units' persisted windows — never re-sample (finding 2: sample_key_boundaries
-                // is offset/percentile-based, so a source that grew between crash and resume
-                // yields different boundaries, and the name-based skip below then covers a
-                // different key range than was exported → silent gap). Re-probe only when there
-                // is no prior split in the prefix (a genuine first run).
-                // A run-varying placeholder breaks split's stable-prefix identity
-                // (resume + stamp expand `for_today` at their own moments — a
-                // cross-midnight resume reads an EMPTY prefix, silently re-runs
-                // the giant and leaves yesterday's markers wedged). Refuse now,
-                // before any unit exists (round-5).
-                if let Some(token) = super::split::split_unsafe_placeholder(&base.destination) {
-                    anyhow::bail!(
-                        "apply --pool --split: export '{}' writes to a destination with the \
-                         run-varying placeholder {token} — a split resume reconstructs its \
-                         partition FROM the prefix, so the prefix must be one stable location \
-                         across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
-                         which are stable) for the split export.",
-                        base.name
-                    );
-                }
-                let reconstructed = match resume {
-                    true => super::split::reconstruct_units_from_prefix(
-                        &base.destination,
-                        &base.family(),
-                        &base,
-                    )?,
-                    false => None,
-                };
-                let units_opt = match reconstructed {
-                    Some(u) => {
-                        // The reconstruction may have SHRUNK the partition (a
-                        // trailing-adjacent crash: the open tail absorbed the
-                        // crashed units). Stamp the ceased ordinals' ledger rows
-                        // + bucket markers terminal NOW — this is the only
-                        // moment that knows they ceased, and unstamped they
-                        // wedge gc/cleanup on the shared prefix forever
-                        // (round-4; born with the reconstruction in #217).
-                        super::split::stamp_ceased_units(
-                            &base.destination,
-                            &base.family(),
-                            &base.name,
-                            u.len(),
-                            &state,
-                        );
-                        Some(u)
-                    }
-                    None => super::split::probe_and_synthesize(&config, &base, &config_dir, *n)?,
-                };
-                match units_opt {
-                    Some(units) => {
-                        let realized = units.len();
-                        // Seed each unit with its share of the giant's
-                        // prediction so LPT places the slices where the giant
-                        // stood (front of the queue), not at the 5 s
-                        // placeholder tail — and with the giant's CLASSIFICATION,
-                        // so a giant that has never succeeded does not turn into
-                        // N "measured" units and silently delete the LOWER BOUND
-                        // hedge below (bughunt 2026-08-14).
-                        let (giant_secs, giant_from) = predicted_pre
-                            .iter()
-                            .find(|(i, _)| &i.name == giant)
-                            .map(|(i, f)| (i.predicted_secs, Some(f.clone())))
-                            .unwrap_or((0.0, None));
-                        let share = giant_secs / realized.max(1) as f64;
-                        let unit_from = match &giant_from {
-                            Some(f) => super::pool::split_unit_from(f, share),
-                            None => super::pool::PredictedFrom::SeededSplit(share),
-                        };
-                        for u in &units {
-                            split_seeds.insert(u.name.clone(), unit_from.clone());
-                        }
-                        split_info = Some((base.destination.clone(), base.family()));
-                        effective.retain(|e| &e.name != giant);
-                        // A synthesized unit is named `{giant}#i`; if a user export already carries
-                        // that exact name, the `by_name` HashMap below collapses the two and
-                        // silently DROPS the pre-existing export's whole table (convergence round-2
-                        // LOW — `#` is not reserved in export-name validation). Refuse loudly.
-                        if let Some(clash) = first_name_collision(&units, &effective) {
-                            anyhow::bail!(
-                                "apply --pool --split: the synthesized split unit '{clash}' collides \
-                                 with an existing export of the same name. Rename that export — a \
-                                 name of the form '{giant}#<n>' is reserved for split unit names."
-                            );
-                        }
-                        effective.extend(units);
-                        // `items` is rebuilt by the single post-split
-                        // classification sweep below.
-                        //
-                        // This line speaks for the SPLIT, not for the run's
-                        // prediction: `broken` is `advise_split`'s projection
-                        // over the PRE-split items (the giant at whatever its
-                        // frozen prediction was), and the seed it is derived
-                        // from is only a first-run bootstrap — from run 2 on,
-                        // each `{giant}#i` has history of its own that
-                        // supersedes it (`pool::reconcile_split_seed`). So the
-                        // honesty claim about the wall is NOT made here; it is
-                        // made once, from the reconciled classification, by
-                        // [`lower_bound_hedge`] beside the makespan print
-                        // below. Hedging from `unit_from` printed "the giant
-                        // has no successful run to measure from" in the same
-                        // run whose accounting said "N measured, 0 estimated"
-                        // (bughunt 2026-08-14).
-                        log::warn!(
-                            "apply --pool --split: split '{giant}' into {realized} range \
-                             sub-export(s) over its key — projected wall ~{:.1} min from the \
-                             pre-split predictions (was the single-export floor). The units share \
-                             one prefix and fold to family '{giant}', so the load view reads them \
-                             as one table. The run's own predicted makespan — reconciled against \
-                             each unit's own history, and hedged when any of it rests on an \
-                             unmeasured export — prints with the pool schedule on stdout, \
-                             unless the `--resume` skip leaves nothing to schedule (which says \
-                             so).",
-                            broken / 60.0,
-                        );
-                    }
-                    None => log::warn!(
-                        "apply --pool --split: '{giant}' dominates the floor but is not splittable \
-                         (needs a `chunk_by_key:`/`chunk_column:`, and not incremental/CDC) — \
-                         running it whole."
-                    ),
-                }
+                realized = super::split::realize(
+                    giant,
+                    *n,
+                    *broken,
+                    resume,
+                    &predicted_pre,
+                    &mut effective,
+                    &config,
+                    &config_dir,
+                    &state,
+                )?;
             }
             None => {
                 // advise_split returns None for a heavy dominator too, not only a balanced set.
@@ -1922,7 +1814,7 @@ pub(crate) fn run_pool(
                 match items
                     .iter()
                     .max_by(|a, b| a.predicted_secs.total_cmp(&b.predicted_secs))
-                    .filter(|l| l.predicted_secs > total / (m.max(1) as f64) && !l.parallel_safe)
+                    .filter(|l| dominates_as_heavy(l.predicted_secs, total, m, l.parallel_safe))
                 {
                     Some(l) => log::warn!(
                         "apply --pool --split: '{}' dominates the pool floor but is HEAVY (not \
@@ -1962,53 +1854,22 @@ pub(crate) fn run_pool(
     // never-started one runs fresh — the per-unit resume flag is set at the call
     // site below). Non-split exports still skip on their own prefix _SUCCESS.
     if split && resume {
-        let completed_units = split_info
-            .as_ref()
-            .map(|(dest, family)| super::split::completed_units_in_prefix(dest, family))
-            .unwrap_or_default();
-        effective.retain(|e| match &e.split {
-            Some(_) => {
-                let done = completed_units.contains(&e.name);
-                if done {
-                    log::info!(
-                        "apply --pool --split: skipping unit '{}' — already complete (its \
-                         manifest copy is present)",
-                        e.name
-                    );
-                }
-                !done
-            }
-            None => {
-                let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
-                let expanded = crate::destination::placeholder::expand_destination(
-                    e.destination.clone(),
-                    &ctx,
-                );
-                let done = finalize::destination_has_success(&expanded);
-                if done {
-                    log::info!(
-                        "apply --pool: skipping '{}' — destination already complete (_SUCCESS)",
-                        e.name
-                    );
-                }
-                !done
-            }
-        });
+        super::split::skip_completed(realized.as_ref(), &mut effective);
         if effective.is_empty() {
             // Every split unit is complete — but this return sits ABOVE the
             // pool's prefix-`_SUCCESS` writer, so a crash in the
             // [last unit's Success → marker] window would leave the marker
             // missing FOREVER (this is the only path that ever looks again).
             // Repair it before declaring "nothing to run" (round-4).
-            if let Some((dest_config, family)) = &split_info {
-                finalize::repair_missing_split_marker(dest_config, family);
+            if let Some(r) = &realized {
+                finalize::repair_missing_split_marker(&r.dest, &r.family);
             }
             // This return sits ABOVE the schedule + makespan block, so a run
             // that got here prints neither — and the `--split` notice above
             // points forward at exactly that makespan line. Cancel the pointer
             // here rather than leaving the operator hunting for a line that
             // cannot print (bughunt 2026-08-16).
-            log::warn!("{}", nothing_to_run_message(split_info.is_some()));
+            log::warn!("{}", nothing_to_run_message(realized.is_some()));
             return Ok(());
         }
     }
@@ -2021,12 +1882,13 @@ pub(crate) fn run_pool(
     // measured/estimated accounting below — a second predicted_from sweep
     // would re-query the state store per export and could describe a
     // different schedule than the one that runs (walk find, 2026-08-13).
+    let no_seeds = std::collections::HashMap::new();
     let predicted = super::pool::predict_items(
         &state,
         effective
             .iter()
             .map(|e| (e.name.as_str(), is_parallel_safe(e))),
-        &split_seeds,
+        realized.as_ref().map_or(&no_seeds, |r| &r.seeds),
     );
     let classified: Vec<super::pool::PredictedFrom> =
         predicted.iter().map(|(_, f)| f.clone()).collect();
@@ -2045,8 +1907,8 @@ pub(crate) fn run_pool(
         attempt_n + placeholder_n,
     );
     // The ONE honesty claim about the wall, from the RECONCILED classification.
-    if let Some(hedge) = lower_bound_hedge(attempt_n, placeholder_n) {
-        println!("{hedge}");
+    if let Some(hedge) = super::pool::lower_bound_hedge(attempt_n, placeholder_n) {
+        println!("        {hedge}");
     }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
@@ -2079,7 +1941,6 @@ pub(crate) fn run_pool(
         .map(|e| e.name.chars().count())
         .max()
         .unwrap_or(0);
-    let prev_multi = MULTI_EXPORT_MODE.swap(false, AtomicOrdering::Relaxed);
     // The pool runs up to `m` exports on concurrent in-process threads:
     // declare that, so (a) per-export indicatif chunk bars stay suppressed
     // (concurrent threads corrupt each other's terminal writes — same reason
@@ -2099,34 +1960,8 @@ pub(crate) fn run_pool(
     // bughunt). Counted once, here, and read by all three surfaces.
     let (safe_pending, heavy_pending) = pool_safe_heavy_split(&pending);
     let really_concurrent = pool_is_concurrent(m, safe_pending, heavy_pending);
-    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(really_concurrent, AtomicOrdering::Relaxed);
-    struct ResetPoolStatics(bool, bool);
-    impl Drop for ResetPoolStatics {
-        fn drop(&mut self) {
-            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
-            MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
-        }
-    }
-    let _reset_pool_statics = ResetPoolStatics(prev_multi, prev_concurrent);
-    // The ipc sender gets the same panic-safety: a worker panic re-raised by
-    // `thread::scope` would otherwise skip the straight-line clear below and
-    // leak a stale global Sender for the rest of the process (bughunt
-    // 2026-08-13). clear is idempotent, so the guard + the normal-path clear
-    // coexist harmlessly.
-    struct ClearIpcTx;
-    impl Drop for ClearIpcTx {
-        fn drop(&mut self) {
-            ipc::clear_in_process_tx();
-        }
-    }
-    let _clear_ipc = ClearIpcTx;
-    let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
-    ipc::install_in_process_tx(tx);
-    let n_cards = pending.len();
-    let ui_thread = std::thread::Builder::new()
-        .name("rivet-ui".to_string())
-        .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
-        .ok();
+    let _render_flags = RenderFlags::set(false, Some(really_concurrent));
+    let card_ui = CardUi::start(name_floor, pending.len());
 
     // Run-level source-harm bracket: the per-export deltas overlap in time
     // under pool concurrency (each reads the same server-global counters over
@@ -2203,10 +2038,7 @@ pub(crate) fn run_pool(
                             // never-started unit's "no in-progress checkpoint".
                             // Non-split exports keep the run-wide resume flag.
                             let mut unit_opts = opts;
-                            if export.split.is_some() {
-                                unit_opts.resume = resume
-                                    && st.has_resumable_checkpoint(&export.name).unwrap_or(false);
-                            }
+                            unit_opts.resume = super::split::unit_resume(export, resume, &st);
                             job::run_export_job(
                                 config_path,
                                 &config,
@@ -2244,10 +2076,7 @@ pub(crate) fn run_pool(
     // model would grade itself against its own measurement cost (bughunt
     // 2026-08-13). Taken here, right after the export loop drains.
     let finished_at = chrono::Utc::now();
-    ipc::clear_in_process_tx();
-    if let Some(h) = ui_thread {
-        let _ = h.join();
-    }
+    drop(card_ui);
     // The run-level harm verdict the per-export DIAGNOSIS lines point at:
     // spills during the pool window are REAL harm to the source (disk-spilling
     // tmp tables, PG temp files) whoever triggered them — WARN so it is visible
@@ -2266,51 +2095,26 @@ pub(crate) fn run_pool(
         "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
         actual_secs / 60.0,
         predicted_secs / 60.0,
-        if predicted_secs > 0.0 {
-            (actual_secs - predicted_secs) / predicted_secs * 100.0
-        } else {
-            0.0
-        },
+        makespan_error_pct(actual_secs, predicted_secs),
     );
 
     let mut summaries: Vec<RunSummary> = Vec::new();
     let mut failures: Vec<anyhow::Error> = Vec::new();
-    // #167: track whether every `--split` UNIT of the giant succeeded this run —
-    // the pool is the single writer of the prefix `_SUCCESS` (units suppress it),
-    // so the marker goes down only once the whole giant is complete.
-    let unit_prefix = split_info.as_ref().map(|(_, family)| format!("{family}#"));
-    let mut split_units_all_ok = true;
     // One `(export, start_ms, end_ms)` per export that ran — the input the
     // per-export concurrency label is MEASURED from (see [`pool_export_modes`]).
     let mut pool_windows: Vec<(String, i64, i64)> = Vec::with_capacity(summaries.capacity());
+    let mut oks: Vec<bool> = Vec::new();
     for (res, summary, (start_ms, end_ms)) in collected.into_inner().unwrap() {
-        if let Some(pfx) = &unit_prefix
-            && summary.export_name.starts_with(pfx.as_str())
-            && (res.is_err() || summary.status != "success")
-        {
-            split_units_all_ok = false;
-        }
+        oks.push(res.is_ok());
         if let Err(e) = res {
             failures.push(e);
         }
         pool_windows.push((summary.export_name.clone(), start_ms, end_ms));
         summaries.push(summary);
     }
-    // Every split unit succeeded → write the ONE prefix-level `_SUCCESS` the units
-    // deliberately suppressed (finalize wrote each unit's manifest + run-unique
-    // copy; this is the marker that says the whole giant is done). Best-effort: a
-    // missing marker only affects the resume-skip fast path, never data integrity.
-    if let Some((dest_config, family)) = &split_info
-        && split_units_all_ok
-    {
-        let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
-        let expanded =
-            crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
-        if let Err(e) = finalize::write_split_success_marker(&expanded) {
-            log::warn!(
-                "apply --pool --split: could not write the prefix _SUCCESS for '{family}': {e:#}"
-            );
-        }
+    // #167: the pool is the single writer of the split prefix `_SUCCESS`.
+    if let Some(r) = &realized {
+        super::split::seal(r, summaries.iter().zip(oks.iter().copied()));
     }
     // ONE aggregate, then the same routing every other orchestrator uses: the
     // card and the `run_aggregate` row are multi-export-only, the run-over-run
@@ -2413,18 +2217,173 @@ fn pool_safe_heavy_split(pending: &[&ExportConfig]) -> (usize, usize) {
     (pending.len() - heavy, heavy)
 }
 
-/// The first synthesized split-unit name (`{giant}#i`) that collides with an EXISTING export's
-/// name. `--pool --split` splices the units into the export set, and the downstream `by_name`
-/// HashMap collapses same-named entries — so a user export literally named `{giant}#0` would be
-/// silently dropped (its whole table lost). `Some(name)` here → the caller refuses loudly.
-fn first_name_collision<'a>(
-    units: &'a [ExportConfig],
-    existing: &[ExportConfig],
-) -> Option<&'a str> {
-    units
-        .iter()
-        .find(|u| existing.iter().any(|e| e.name == u.name))
-        .map(|u| u.name.as_str())
+#[cfg(test)]
+mod render_guard_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_process_rendering_several_exports_itself_uses_compact_cards() {
+        assert!(compact_cards(false, 2, false));
+        assert!(
+            !compact_cards(false, 1, false),
+            "one export gets the full card"
+        );
+        assert!(
+            !compact_cards(true, 5, false),
+            "a pinned --export gets the full card"
+        );
+        assert!(
+            !compact_cards(false, 5, true),
+            "subprocess children render their own"
+        );
+    }
+
+    #[test]
+    fn a_panic_under_the_card_ui_clears_the_sender_and_restores_the_flags() {
+        let unwound = std::panic::catch_unwind(|| {
+            let _flags = RenderFlags::set(true, Some(true));
+            let _ui = CardUi::start(0, 0);
+            assert!(ipc::IN_PROCESS_TX.lock().unwrap().is_some());
+            panic!("a worker panicked");
+        });
+        assert!(unwound.is_err());
+        assert!(
+            ipc::IN_PROCESS_TX
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+        assert!(!multi_export_mode());
+        assert!(!MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod run_concurrency_tests {
+    use super::{RunSummary, run_concurrency, run_export_pool};
+
+    /// Every export gets its own outcome, in input order, on a pool no wider than the work.
+    #[test]
+    fn run_export_pool_answers_every_export_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rivet.yaml");
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: mysql\n  url: \"mysql://localhost/test\"\n\
+             exports:\n\
+             \x20 - {name: a, table: a, format: parquet, destination: {type: local, path: ./o}}\n\
+             \x20 - {name: b, table: b, format: parquet, destination: {type: local, path: ./o}}\n\
+             \x20 - {name: c, table: c, format: parquet, destination: {type: local, path: ./o}}\n",
+        )
+        .expect("three exports load");
+        let exports: Vec<_> = cfg.exports.iter().collect();
+        let (outcomes, workers) =
+            run_export_pool(config_path.to_str().unwrap(), &exports, |export, _state| {
+                let summary = RunSummary {
+                    export_name: export.name.clone(),
+                    ..Default::default()
+                };
+                if export.name == "b" {
+                    (Err(anyhow::anyhow!("b refused")), summary)
+                } else {
+                    (Ok(()), summary)
+                }
+            });
+        assert_eq!(workers, 3, "never wider than the work");
+        let names: Vec<_> = outcomes
+            .iter()
+            .map(|(_, s)| s.export_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["a", "b", "c"],
+            "one outcome per export, in input order"
+        );
+        assert!(outcomes[0].0.is_ok() && outcomes[1].0.is_err() && outcomes[2].0.is_ok());
+    }
+
+    /// Every input that can flip either answer, each against the row that differs only in it.
+    #[test]
+    fn run_concurrency_fans_out_exports_or_snapshot_legs_never_both() {
+        // (flag, config flag, one export named, exports, sibling child) -> (exports, legs)
+        let rows = [
+            ((true, false, false, 3, false), (true, false)),
+            ((false, true, false, 3, false), (true, false)),
+            ((false, false, false, 3, false), (false, false)),
+            ((true, false, true, 3, false), (false, true)),
+            ((true, false, false, 1, false), (false, true)),
+            ((true, false, false, 2, false), (true, false)),
+            ((true, false, false, 1, true), (false, false)),
+            ((false, false, false, 1, false), (false, false)),
+        ];
+        for ((f, c, named, n, sib), want) in rows {
+            assert_eq!(
+                run_concurrency(f, c, named, n, sib),
+                want,
+                "flag={f} config={c} named={named} exports={n} sibling={sib}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_decision_tests {
+    use super::super::split::unit_failed as split_unit_failed;
+    use super::{RunSummary, dominates_as_heavy, makespan_error_pct};
+
+    #[test]
+    fn a_heavy_export_dominates_only_above_its_fair_share() {
+        assert!(
+            dominates_as_heavy(60.0, 100.0, 2, false),
+            "60 > 100/2 and heavy"
+        );
+        assert!(
+            !dominates_as_heavy(60.0, 100.0, 2, true),
+            "parallel_safe never dominates"
+        );
+        assert!(
+            !dominates_as_heavy(50.0, 100.0, 2, false),
+            "exactly the fair share"
+        );
+        assert!(
+            dominates_as_heavy(2.0, 1.5, 0, false),
+            "m=0 is one slot, not a divide-by-zero"
+        );
+    }
+
+    #[test]
+    fn makespan_error_is_signed_and_zero_without_a_prediction() {
+        assert_eq!(makespan_error_pct(150.0, 100.0), 50.0);
+        assert_eq!(makespan_error_pct(50.0, 100.0), -50.0);
+        assert_eq!(makespan_error_pct(50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn only_a_successful_split_unit_finished_its_share() {
+        let unit = |name: &str, status: &str| RunSummary {
+            export_name: name.into(),
+            status: status.into(),
+            ..Default::default()
+        };
+        let p = Some("orders#");
+        assert!(!split_unit_failed(p, &unit("orders#1", "success"), true));
+        assert!(
+            split_unit_failed(p, &unit("orders#1", "skipped"), true),
+            "a skipped unit wrote no window manifest"
+        );
+        assert!(split_unit_failed(p, &unit("orders#1", "failed"), true));
+        assert!(
+            split_unit_failed(p, &unit("orders#1", "success"), false),
+            "errored"
+        );
+        assert!(
+            !split_unit_failed(p, &unit("users", "failed"), false),
+            "not a unit"
+        );
+        assert!(
+            !split_unit_failed(None, &unit("orders#1", "failed"), false),
+            "no split"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3253,63 +3212,6 @@ mod pool_harm_tests {
             !pool_body.contains("HarmWindow::"),
             "the pool must route its harm frame through `pool_harm_window`, not \
              construct a window from the invocation"
-        );
-    }
-
-    /// The run's "this wall is a LOWER BOUND" claim has exactly ONE source, and
-    /// it is the pure function fed the RECONCILED classification.
-    ///
-    /// The split block used to make the same claim from the pre-reconcile SEED,
-    /// so a steady-state split (giant frozen at a failed attempt; every
-    /// `{giant}#i` measured from run 1) printed the LOWER BOUND warn at start
-    /// and "N measured, 0 estimated" — with the hedge suppressed — 130 lines
-    /// later. One run, two contradictory honesty claims about the same exports.
-    ///
-    /// RED against restoring the `unit_from`-derived `wall_hedge` (the needle
-    /// count reads 2), and against a hedge that fires on a fully measured
-    /// schedule (`lower_bound_hedge(0, 0)` then returns `Some`).
-    #[test]
-    fn the_lower_bound_claim_has_one_source_and_reads_the_reconciled_counts() {
-        use super::lower_bound_hedge;
-        assert!(
-            lower_bound_hedge(0, 0).is_none(),
-            "a schedule resting entirely on successes is not a lower bound"
-        );
-        // ≥2 of each so the fold is a real fold and the two counts cannot be
-        // swapped without the assert noticing.
-        let hedge = lower_bound_hedge(2, 3).expect("5 unmeasured exports must hedge");
-        assert!(
-            hedge.contains("5 export(s)")
-                && hedge.contains("2 scheduled at a failed attempt")
-                && hedge.contains("3 at a"),
-            "the hedge must count both flavours of unmeasured: {hedge}"
-        );
-        // One claim in the product half, and it lives in the pure function —
-        // not in the split block, whose only input is the first-run seed.
-        let whole = include_str!("run.rs");
-        let src = &whole[..whole
-            .find("\n#[cfg(test)]")
-            .expect("run.rs has test modules")];
-        let code: String = src
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let needle = concat!("LOWER ", "BOUND");
-        assert_eq!(
-            code.matches(needle).count(),
-            1,
-            "the run must publish ONE honesty claim about its wall"
-        );
-        let at = code
-            .find(concat!("fn lower_bound", "_hedge"))
-            .expect("the pure hedge exists");
-        let until = code
-            .find("\npub(crate) fn run_pool(")
-            .expect("run_pool's signature moved — update the anchor");
-        assert!(
-            code[at..until].contains(needle),
-            "the claim must be made by the function fed the reconciled counts"
         );
     }
 }
@@ -4477,7 +4379,8 @@ mod run_tail_tests {
 
 #[cfg(test)]
 mod wave_grouping_tests {
-    use super::{first_name_collision, group_exports_by_wave, is_parallel_safe, next_eligible};
+    use super::super::split::first_name_collision;
+    use super::{group_exports_by_wave, is_parallel_safe, next_eligible};
 
     #[test]
     fn a_synthesized_split_unit_colliding_with_an_existing_export_is_detected() {
