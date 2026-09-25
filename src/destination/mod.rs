@@ -298,38 +298,45 @@ pub fn create_destination_for_probe(config: &DestinationConfig) -> Result<Box<dy
 /// Object-store calls in flight at once when one step fans out over many tables' prefixes.
 pub(crate) const OBJECT_STORE_FANOUT: usize = 16;
 
-/// Apply `f` to every item on up to [`OBJECT_STORE_FANOUT`] threads; after the first error no new item starts, and that error is returned.
-pub(crate) fn for_each_concurrently<T: Sync>(
+/// Apply `f` to every item on up to [`OBJECT_STORE_FANOUT`] threads, results in input order; after the first error no new item starts (its slot is `None`).
+pub(crate) fn map_concurrently<T: Sync, R: Send>(
     items: &[T],
-    f: impl Fn(&T) -> Result<()> + Sync,
-) -> Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Vec<Option<Result<R>>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
-    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<std::sync::Mutex<Option<Result<R>>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|scope| {
         for _ in 0..OBJECT_STORE_FANOUT.min(items.len()) {
             scope.spawn(|| {
-                loop {
-                    if first_err.lock().expect("error slot poisoned").is_some() {
-                        break;
-                    }
-                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                while !failed.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else {
                         break;
                     };
-                    if let Err(e) = f(item) {
-                        first_err
-                            .lock()
-                            .expect("error slot poisoned")
-                            .get_or_insert(e);
+                    let outcome = f(item);
+                    if outcome.is_err() {
+                        failed.store(true, Ordering::Relaxed);
                     }
+                    *slots[i].lock().expect("result slot poisoned") = Some(outcome);
                 }
             });
         }
     });
-    first_err
-        .into_inner()
-        .expect("error slot poisoned")
-        .map_or(Ok(()), Err)
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().expect("result slot poisoned"))
+        .collect()
+}
+
+/// [`map_concurrently`] for calls with nothing to return: the first error, by item order, is the result.
+pub(crate) fn for_each_concurrently<T: Sync>(
+    items: &[T],
+    f: impl Fn(&T) -> Result<()> + Sync,
+) -> Result<()> {
+    map_concurrently(items, f).into_iter().flatten().collect()
 }
 
 #[cfg(test)]
