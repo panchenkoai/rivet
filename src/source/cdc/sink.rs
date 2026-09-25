@@ -2866,9 +2866,13 @@ mod tests {
         }
     }
 
-    /// Fails every data-part upload; everything else goes through.
+    /// A part that landed, announced to whoever waits on it.
+    type Landed = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    /// Fails every data-part upload — after the sibling's part has landed, so the race is not the subject.
     struct PartFailingDest {
         inner: Box<dyn crate::destination::Destination>,
+        after: Landed,
     }
     impl crate::destination::Destination for PartFailingDest {
         fn write(
@@ -2876,11 +2880,41 @@ mod tests {
             local: &std::path::Path,
             key: &str,
         ) -> Result<crate::destination::WriteOutcome> {
-            anyhow::ensure!(
-                !key.ends_with(".parquet"),
-                "injected: part upload of '{key}' refused"
-            );
+            if key.ends_with(".parquet") {
+                let (flag, cv) = &*self.after;
+                let _ = cv
+                    .wait_timeout_while(
+                        flag.lock().unwrap(),
+                        std::time::Duration::from_secs(10),
+                        |landed| !*landed,
+                    )
+                    .unwrap();
+                anyhow::bail!("injected: part upload of '{key}' refused");
+            }
             self.inner.write(local, key)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Delegates, and announces once a data part has landed.
+    struct AnnouncingDest {
+        inner: Box<dyn crate::destination::Destination>,
+        landed: Landed,
+    }
+    impl crate::destination::Destination for AnnouncingDest {
+        fn write(
+            &self,
+            local: &std::path::Path,
+            key: &str,
+        ) -> Result<crate::destination::WriteOutcome> {
+            let out = self.inner.write(local, key)?;
+            if key.ends_with(".parquet") {
+                *self.landed.0.lock().unwrap() = true;
+                self.landed.1.notify_all();
+            }
+            Ok(out)
         }
         fn capabilities(&self) -> crate::destination::DestinationCapabilities {
             self.inner.capabilities()
@@ -2957,10 +2991,15 @@ mod tests {
     #[test]
     fn a_failed_part_upload_still_records_the_siblings_durable_part() {
         let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let landed: Landed = Default::default();
         let failing = PartFailingDest {
             inner: local_dest(&da),
+            after: landed.clone(),
         };
-        let fine = local_dest(&db);
+        let fine = AnnouncingDest {
+            inner: local_dest(&db),
+            landed,
+        };
         let cols = int_col();
         let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
         let mut stream = one_commit_over_two_tables();
@@ -2968,8 +3007,8 @@ mod tests {
             &mut stream,
             SinkConfig {
                 state: Some(&state),
-                outputs: two_table_outputs(&cols, &failing, fine.as_ref()),
-                ..cfg(fine.as_ref(), &cols, FormatType::Parquet, 100)
+                outputs: two_table_outputs(&cols, &failing, &fine),
+                ..cfg(&fine, &cols, FormatType::Parquet, 100)
             },
         );
         assert!(r.is_err(), "a failed part upload is the roll's outcome");
