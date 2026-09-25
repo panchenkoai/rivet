@@ -637,9 +637,6 @@ pub fn dedup_view_sql(
     pk: &[&str],
     engine: SourceEngine,
 ) -> String {
-    if warehouse == Warehouse::ClickHouse {
-        return clickhouse_final_view(view_fqtn, changes_fqtn);
-    }
     let partition = quote_partition(warehouse, pk);
     // `initial: snapshot` backfill rows load as a plain full-snapshot parquet —
     // no `__op`/`__pos`/`__seq` — so they land in `__changes` with those NULL.
@@ -663,7 +660,7 @@ pub fn dedup_view_sql(
 }
 
 /// The ClickHouse current-state view: the engine keeps one version per key, `FINAL` reads it (ADR-0035 CH5).
-fn clickhouse_final_view(view_fqtn: &str, changes_fqtn: &str) -> String {
+pub(crate) fn clickhouse_final_view(view_fqtn: &str, changes_fqtn: &str) -> String {
     let wh = Warehouse::ClickHouse;
     format!(
         "CREATE OR REPLACE VIEW {view} AS\n\

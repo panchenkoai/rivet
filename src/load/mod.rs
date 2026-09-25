@@ -148,11 +148,29 @@ pub trait TargetLoader {
     /// per mode instead of once per adapter.
     fn warehouse(&self) -> cdc::Warehouse;
 
-    /// `CREATE OR REPLACE` the current-state view `<table>` from pre-built
-    /// `view_sql` (the driver builds it via [`cdc::dedup_view_sql`] for CDC or
-    /// [`cdc::inc_dedup_view_sql`] for incremental). The adapter only executes it
-    /// its way (e.g. Snowflake prefixes a `QUERY_TAG`).
+    /// Run a `CREATE OR REPLACE VIEW` statement its way (e.g. Snowflake prefixes a `QUERY_TAG`).
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()>;
+
+    /// Build the current-state view `<table>` over `<table>__changes`: the latest row per
+    /// `pk` by `order`; the default is the shared `ROW_NUMBER` view in this warehouse's dialect.
+    fn create_current_view(
+        &self,
+        table: &str,
+        pk: &[&str],
+        order: &cdc::CompactOrder,
+    ) -> Result<()> {
+        let view = self.fqtn(table);
+        let changes = self.fqtn(&format!("{table}__changes"));
+        let sql = match order {
+            cdc::CompactOrder::Cdc(engine) => {
+                cdc::dedup_view_sql(self.warehouse(), &view, &changes, pk, *engine)
+            }
+            cdc::CompactOrder::Cursor(column) => {
+                cdc::inc_dedup_view_sql(self.warehouse(), &view, &changes, pk, column)
+            }
+        };
+        self.create_view(table, &sql)
+    }
 
     /// Does `<table>__changes` already hold REAL change rows (`__pos IS NOT
     /// NULL`)? The RE-baseline refusal's condition (round-7): the truth about
@@ -947,14 +965,7 @@ pub fn run_load_cdc(
         "CDC",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-            let sql = cdc::dedup_view_sql(
-                l.warehouse(),
-                &l.fqtn(table),
-                &l.fqtn(&format!("{table}__changes")),
-                &pk_refs,
-                engine,
-            );
-            l.create_view(table, &sql)
+            l.create_current_view(table, &pk_refs, &cdc::CompactOrder::Cdc(engine))
         },
     )
 }
@@ -1030,14 +1041,11 @@ pub fn run_load_incremental(
         "incremental",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-            let sql = cdc::inc_dedup_view_sql(
-                l.warehouse(),
-                &l.fqtn(table),
-                &l.fqtn(&format!("{table}__changes")),
+            l.create_current_view(
+                table,
                 &pk_refs,
-                cursor_column,
-            );
-            l.create_view(table, &sql)
+                &cdc::CompactOrder::Cursor(cursor_column.to_string()),
+            )
         },
     )
 }

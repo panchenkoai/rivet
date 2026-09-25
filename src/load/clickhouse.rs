@@ -233,6 +233,28 @@ impl TargetLoader for ClickhouseLoader {
         self.query(view_sql).map(|_| ())
     }
 
+    fn create_current_view(
+        &self,
+        table: &str,
+        pk: &[&str],
+        order: &cdc::CompactOrder,
+    ) -> Result<()> {
+        let sql = match order {
+            cdc::CompactOrder::Cdc(_) => cdc::clickhouse_final_view(
+                &TargetLoader::fqtn(self, table),
+                &TargetLoader::fqtn(self, &format!("{table}__changes")),
+            ),
+            cdc::CompactOrder::Cursor(column) => cdc::inc_dedup_view_sql(
+                Warehouse::ClickHouse,
+                &TargetLoader::fqtn(self, table),
+                &TargetLoader::fqtn(self, &format!("{table}__changes")),
+                pk,
+                column,
+            ),
+        };
+        self.create_view(table, &sql)
+    }
+
     fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
         let changes = format!("{table}__changes");
         if let ObjectKind::Absent = self.object_kind(&changes)? {
@@ -622,14 +644,13 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let view = cdc::dedup_view_sql(
-            Warehouse::ClickHouse,
-            &format!("{db}.t"),
-            &format!("{db}.t__changes"),
-            &["id"],
-            cdc::SourceEngine::Postgres,
-        );
-        loader.create_view("t", &view).unwrap();
+        loader
+            .create_current_view(
+                "t",
+                &["id"],
+                &cdc::CompactOrder::Cdc(cdc::SourceEngine::Postgres),
+            )
+            .unwrap();
         let got = loader
             .query(&format!(
                 "SELECT id, v FROM `{db}`.`t` ORDER BY id FORMAT TSV"
@@ -687,14 +708,13 @@ mod tests {
             .append_changelog("t", &specs, &[uri("ok.parquet")], &pk)
             .unwrap();
         let refused = loader.append_changelog("t", &specs, &[uri("null_key.parquet")], &pk);
-        let view = cdc::dedup_view_sql(
-            Warehouse::ClickHouse,
-            &format!("{db}.t"),
-            &format!("{db}.t__changes"),
-            &["id"],
-            cdc::SourceEngine::Postgres,
-        );
-        loader.create_view("t", &view).unwrap();
+        loader
+            .create_current_view(
+                "t",
+                &["id"],
+                &cdc::CompactOrder::Cdc(cdc::SourceEngine::Postgres),
+            )
+            .unwrap();
         let got = loader
             .query(&format!(
                 "SELECT id, v FROM `{db}`.`t` ORDER BY id FORMAT TSV"
