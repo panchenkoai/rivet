@@ -96,10 +96,14 @@ pub(crate) fn build_chunk_query_sql(
 
     if chunk_dense {
         return format!(
-            "SELECT * FROM (SELECT _rivet_i.*, ROW_NUMBER() OVER (ORDER BY _rivet_i.{oc}) AS {rn} FROM ({bq}) AS _rivet_i) AS _rivet_w WHERE _rivet_w.{rn} BETWEEN {s} AND {e}",
+            "SELECT * FROM (SELECT {i}.*, ROW_NUMBER() OVER (ORDER BY {i}.{oc}) AS {rn} FROM ({bq}) {di}) {dw} WHERE {w}.{rn} BETWEEN {s} AND {e}",
             bq = base_query,
             oc = quoted_col,
-            rn = RIVET_CHUNK_RN_COL,
+            rn = crate::sql::alias(source_type, RIVET_CHUNK_RN_COL),
+            i = crate::sql::alias(source_type, "_rivet_i"),
+            di = crate::sql::derived(source_type, "_rivet_i"),
+            w = crate::sql::alias(source_type, "_rivet_w"),
+            dw = crate::sql::derived(source_type, "_rivet_w"),
             s = start,
             e = end,
         );
@@ -146,8 +150,9 @@ pub(crate) fn build_chunk_query_sql(
         let start_date = epoch + chrono::Duration::days(start);
         let end_date = epoch + chrono::Duration::days(end + 1);
         return format!(
-            "SELECT * FROM ({base}) AS _rivet WHERE {col} >= '{start}' AND {col} < '{end}'",
+            "SELECT * FROM ({base}) {d} WHERE {col} >= '{start}' AND {col} < '{end}'",
             base = base_query,
+            d = crate::sql::derived(source_type, "_rivet"),
             col = quoted_col,
             start = start_date.format(date_fmt),
             end = end_date.format(date_fmt),
@@ -155,8 +160,9 @@ pub(crate) fn build_chunk_query_sql(
     }
 
     format!(
-        "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
+        "SELECT * FROM ({base}) {d} WHERE {col} BETWEEN {start} AND {end}",
         base = base_query,
+        d = crate::sql::derived(source_type, "_rivet"),
         col = quoted_col,
         start = start,
         end = end,

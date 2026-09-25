@@ -263,7 +263,8 @@ pub(crate) fn sample_key_boundaries(
     };
     let total: i64 = src
         .query_scalar(&format!(
-            "SELECT COUNT(*) FROM ({base}) AS _rivet_pk_cnt {where_clause}"
+            "SELECT COUNT(*) FROM ({base}) {} {where_clause}",
+            crate::sql::derived(st, "_rivet_pk_cnt")
         ))?
         .as_deref()
         .and_then(|s| s.trim().parse::<i64>().ok())
@@ -275,8 +276,10 @@ pub(crate) fn sample_key_boundaries(
     for i in 1..parts {
         let off = percentile_offset(total, i, parts);
         let nth = nth_row_clause(st, off);
-        let sql =
-            format!("SELECT {k} FROM ({base}) AS _rivet_pk {where_clause} ORDER BY {k} {nth}");
+        let sql = format!(
+            "SELECT {k} FROM ({base}) {} {where_clause} ORDER BY {k} {nth}",
+            crate::sql::derived(st, "_rivet_pk")
+        );
         if let Some(v) = src.query_scalar(&sql)?
             && bounds.last().map(String::as_str) != Some(v.as_str())
         {
@@ -435,8 +438,9 @@ fn run_keyset_parallel(
         };
         let key_q = crate::sql::quote_ident(plan.source.source_type, &key);
         let cur_max = src.query_scalar(&format!(
-            "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
-            plan.base_query
+            "SELECT MAX({key_q}) FROM ({}) {}",
+            plan.base_query,
+            crate::sql::derived(plan.source.source_type, "_rivet_pk_max")
         ))?;
         if nothing_past_anchor(anchor.as_deref(), cur_max.as_deref()) {
             log::info!(

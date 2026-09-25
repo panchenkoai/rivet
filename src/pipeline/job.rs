@@ -719,8 +719,9 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> O
     }
 
     let count_sql = format!(
-        "SELECT COUNT(*) FROM ({}) AS _rivet_reconcile",
-        plan.base_query
+        "SELECT COUNT(*) FROM ({}) {}",
+        plan.base_query,
+        crate::sql::derived(plan.source.source_type, "_rivet_reconcile")
     );
     log::info!(
         "reconcile: running source count query for '{}'",

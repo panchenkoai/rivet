@@ -486,7 +486,7 @@ impl ExportConfig {
             validate_table_shortcut_ident(&self.name, tbl)?;
             return Ok(format!("SELECT * FROM {tbl}"));
         }
-        match (&self.query, &self.query_file) {
+        let q = match (&self.query, &self.query_file) {
             (Some(q), None) => {
                 if params.is_some() {
                     resolve_vars(q, params)
@@ -544,7 +544,8 @@ impl ExportConfig {
                     self.name
                 )
             }
-        }
+        }?;
+        Ok(crate::sql::wrappable_query(&q))
     }
 }
 

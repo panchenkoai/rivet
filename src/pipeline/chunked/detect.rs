@@ -14,10 +14,17 @@ use crate::source::Source;
 /// (we measured ~3.2 GB of `temp_files` on a 8.6 GB table) — the fast path
 /// avoids the wrap entirely so `COUNT(*)` becomes a plain heap-scan / index-only
 /// scan with no spill.
-fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64> {
+fn query_wrapped_row_count(
+    src: &mut dyn Source,
+    base_query: &str,
+    source_type: crate::config::SourceType,
+) -> Result<i64> {
     let sql = match strip_simple_projection_from(base_query) {
         Some(table_ident) => format!("SELECT COUNT(*) FROM {table_ident}"),
-        None => format!("SELECT COUNT(*) FROM ({base_query}) AS _rivet_rowcnt"),
+        None => format!(
+            "SELECT COUNT(*) FROM ({base_query}) {}",
+            crate::sql::derived(source_type, "_rivet_rowcnt")
+        ),
     };
     let raw = src
         .query_scalar(&sql)?
@@ -284,7 +291,7 @@ pub(crate) fn detect_and_generate_chunks(
     }
 
     if chunk_dense {
-        let row_count = query_wrapped_row_count(src, base_query)?;
+        let row_count = query_wrapped_row_count(src, base_query, source_type)?;
         log::info!(
             "export '{}': chunk_dense: ROW_NUMBER() OVER (ORDER BY `{}`) — {} row(s), chunk_size={}",
             export_name,
@@ -366,7 +373,7 @@ pub(crate) fn detect_and_generate_chunks(
                 )
             }),
             None => {
-                let rows = query_wrapped_row_count(src, base_query)?;
+                let rows = query_wrapped_row_count(src, base_query, source_type)?;
                 if rows <= 0 {
                     return Ok(0); // genuinely empty — the one legitimate zero
                 }

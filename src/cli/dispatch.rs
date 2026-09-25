@@ -504,23 +504,18 @@ fn check_plan_compatibility(
     for export in selected {
         // `--validate`/`--reconcile`/`--resume` are run-only flags; `check`
         // builds the plan with them off, matching how `rivet plan` validates.
-        //
-        // A `build_plan` failure here is NOT promoted to a `check` error: the
-        // source/destination/type probes in `preflight::check` already ran and
-        // own those diagnostics, and `build_plan` can fail for unrelated reasons
-        // (e.g. a `table:`-shortcut chunk-shape probe). We only want the
-        // compatibility verdict — when the plan won't build, log and skip it so
-        // `check` never regresses to a hard error it did not produce before.
+        // A plan that does not build cannot run, so it is a blocking finding.
         let plan =
             match crate::plan::build_plan(&config, export, config_dir, false, false, false, params)
             {
                 Ok(plan) => plan,
                 Err(e) => {
-                    log::warn!(
-                        "check '{}': plan-compatibility check skipped (plan did not build): {:#}",
-                        export.name,
-                        e
+                    let line = format!(
+                        "[plan-build] export '{}': the plan did not build: {e:#}",
+                        export.name
                     );
+                    println!("Rejected: {line}");
+                    rejected.get_or_insert(line);
                     continue;
                 }
             };
@@ -987,6 +982,30 @@ mod loads_listing_tests {
             empty_loads_message(None, 5)
                 .unwrap()
                 .contains("no loads recorded")
+        );
+    }
+}
+
+#[cfg(test)]
+mod check_plan_compatibility_tests {
+    /// A plan that fails to build is a blocking `check` finding, never a skip.
+    #[test]
+    fn a_plan_that_does_not_build_fails_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &cfg,
+            "source:\n  type: postgres\n  url: postgresql://u:p@127.0.0.1:1/db\n\
+             exports:\n  - name: orders\n    query_file: missing.sql\n    mode: full\n\
+             \x20   format: parquet\n    destination:\n      type: local\n      path: ./out\n",
+        )
+        .unwrap();
+        let err = super::check_plan_compatibility(cfg.to_str().unwrap(), None, None, false)
+            .expect_err("an unbuildable plan must fail `check`");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("[plan-build] export 'orders': the plan did not build"),
+            "{text}"
         );
     }
 }

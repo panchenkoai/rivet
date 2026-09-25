@@ -86,8 +86,9 @@ pub(crate) fn build_range_query(
     let q = crate::sql::quote_ident(source_type, col);
     let fmt = date_literal_format(source_type);
     format!(
-        "SELECT * FROM ({base}) AS _rivet_part WHERE {q} >= '{lo}' AND {q} < '{hi}'",
+        "SELECT * FROM ({base}) {d} WHERE {q} >= '{lo}' AND {q} < '{hi}'",
         base = base_query,
+        d = crate::sql::derived(source_type, "_rivet_part"),
         lo = range.lo.format(fmt),
         hi = range.hi.format(fmt),
     )
@@ -107,7 +108,8 @@ pub(crate) fn date_literal_format(source_type: SourceType) -> &'static str {
 /// partition so they are never silently dropped.
 pub(crate) fn build_null_query(base_query: &str, col: &str, source_type: SourceType) -> String {
     let q = crate::sql::quote_ident(source_type, col);
-    format!("SELECT * FROM ({base_query}) AS _rivet_part WHERE {q} IS NULL")
+    let d = crate::sql::derived(source_type, "_rivet_part");
+    format!("SELECT * FROM ({base_query}) {d} WHERE {q} IS NULL")
 }
 
 /// `SELECT count(*) … WHERE {col} IS NULL` — non-zero ⇒ emit a NULL bucket.
@@ -117,7 +119,8 @@ pub(crate) fn build_null_count_query(
     source_type: SourceType,
 ) -> String {
     let q = crate::sql::quote_ident(source_type, col);
-    format!("SELECT count(*) FROM ({base_query}) AS _rivet_nc WHERE {q} IS NULL")
+    let d = crate::sql::derived(source_type, "_rivet_nc");
+    format!("SELECT count(*) FROM ({base_query}) {d} WHERE {q} IS NULL")
 }
 
 fn day_ranges(min_day: NaiveDate, max_day: NaiveDate) -> Vec<PartitionRange> {

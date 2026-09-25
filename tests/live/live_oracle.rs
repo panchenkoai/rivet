@@ -839,3 +839,146 @@ fn an_unaliased_rowid_is_refused_with_the_alias_fix() {
         "stderr:\n{err}"
     );
 }
+
+/// Every source row landed exactly once: the database's own `COUNT(*)` against
+/// DuckDB's row count and distinct-`ID` count over the parts in `out`.
+fn assert_every_row_once(out: &Path, table: &str, ctx: &str) {
+    let source: i64 = ora_text_rows(&format!("SELECT TO_CHAR(COUNT(*)) FROM {table}"))[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        duckdb_total_parquet_rows(out) as i64,
+        source,
+        "{ctx}: every row"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(out, "count(DISTINCT \"ID\")", None),
+        source,
+        "{ctx}: no row read twice"
+    );
+}
+
+fn assert_ok(run: &std::process::Output, ctx: &str) {
+    assert!(
+        run.status.success(),
+        "{ctx}: stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Parallel keyset samples its range boundaries through a derived table Oracle must accept.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn parallel_keyset_reads_every_row_once() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(3_000);
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: ID")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 400")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert_ok(&run, "parallel keyset");
+    assert_every_row_once(out.path(), t.name(), "parallel keyset");
+}
+
+/// `run --reconcile` and `rivet reconcile` both count the source through a derived table.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn reconcile_counts_the_source_on_both_paths() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(1_000);
+    let export = unique_name("ora_rec");
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t.name())
+        .export_named(&export)
+        .query(&format!("SELECT id, name FROM {}", t.name()))
+        .mode("chunked")
+        .export_line("chunk_column: ID")
+        .export_line("chunk_size: 300")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
+    assert_ok(
+        &rig.run_args(&["--export", &export, "--reconcile"]),
+        "run --reconcile",
+    );
+    assert_every_row_once(out.path(), t.name(), "run --reconcile");
+    let rec = rig.cli(&["reconcile", "--export", &export, "--format", "json"]);
+    assert_ok(&rec, "rivet reconcile");
+    let json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&rec.stdout).trim()).expect("json report");
+    let parts = json["partitions"].as_array().expect("partitions");
+    assert_eq!(parts.len(), 4, "1000 rows / 300 per chunk: {json}");
+    assert!(
+        parts.iter().all(|p| p["status"] == "match"),
+        "every partition matches the source: {json}"
+    );
+}
+
+/// `chunk_dense` numbers rows through a quoted ordinal alias Oracle accepts.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn chunk_dense_reads_every_row_once() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(1_000);
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .query(&format!("SELECT id, name FROM {}", t.name()))
+        .mode("chunked")
+        .export_line("chunk_column: ID")
+        .export_line("chunk_size: 300")
+        .export_line("chunk_dense: true")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert_ok(&run, "chunk_dense");
+    assert_every_row_once(out.path(), t.name(), "chunk_dense");
+}
+
+/// Range chunking over a `query:` export wraps it as a derived table.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn range_chunking_over_a_query_reads_every_row_once() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(1_000);
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch(t.name())
+        .query(&format!("SELECT id, name, amount FROM {}", t.name()))
+        .mode("chunked")
+        .export_line("chunk_column: ID")
+        .export_line("chunk_size: 300")
+        .dest_path(out.path().to_path_buf())
+        .run_args(&[]);
+    assert_ok(&run, "range over query");
+    assert_every_row_once(out.path(), t.name(), "range over query");
+}
+
+/// A `query:` ending in `;` or a `-- comment` still wraps, in full and chunked mode.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_query_with_a_trailing_semicolon_or_comment_still_exports() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(500);
+    let n = t.name();
+    for query in [
+        format!("SELECT id, name FROM {n};"),
+        format!("SELECT id, name FROM {n}\\n-- trailing comment"),
+    ] {
+        for mode in ["full", "chunked"] {
+            let ctx = format!("{mode} over {query:?}");
+            let out = tempfile::tempdir().unwrap();
+            let mut rig = Rig::oracle_batch(n).query(&query).mode(mode);
+            if mode == "chunked" {
+                rig = rig
+                    .export_line("chunk_column: ID")
+                    .export_line("chunk_size: 200");
+            }
+            let run = rig.dest_path(out.path().to_path_buf()).run_args(&[]);
+            assert_ok(&run, &ctx);
+            assert_every_row_once(out.path(), n, &ctx);
+        }
+    }
+}

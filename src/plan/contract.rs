@@ -440,8 +440,9 @@ pub fn build_time_window_query(
     };
 
     format!(
-        "SELECT * FROM ({base}) AS _rivet WHERE {cond}",
+        "SELECT * FROM ({base}) {d} WHERE {cond}",
         base = base_query,
+        d = crate::sql::derived(source_type, "_rivet"),
         cond = condition,
     )
 }

@@ -61,6 +61,16 @@ pub(crate) fn derived(source_type: SourceType, name: &str) -> String {
     }
 }
 
+/// A user query made safe to wrap as `FROM (<query>)`: trailing whitespace and `;`
+/// trimmed, and a newline appended when the last line holds a `--` comment.
+pub(crate) fn wrappable_query(query: &str) -> String {
+    let q = query.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    match q.lines().last() {
+        Some(last) if last.contains("--") => format!("{q}\n"),
+        _ => q.to_string(),
+    }
+}
+
 /// If `base_query` is exactly `SELECT * FROM <ident>` (the `table:` YAML
 /// shortcut form), return the table ident; otherwise `None`.
 ///
@@ -332,6 +342,18 @@ mod tests {
         assert_eq!(oracle_catalog_preds("o'x").1, "'O''X'");
     }
     use super::*;
+
+    #[test]
+    fn wrappable_query_drops_the_semicolon_and_ends_a_trailing_comment() {
+        assert_eq!(wrappable_query("SELECT 1 ;\n  "), "SELECT 1");
+        assert_eq!(wrappable_query("SELECT 1;;"), "SELECT 1");
+        assert_eq!(
+            wrappable_query("SELECT 1\n-- the tail\n"),
+            "SELECT 1\n-- the tail\n"
+        );
+        assert_eq!(wrappable_query("SELECT 1 -- c"), "SELECT 1 -- c\n");
+        assert_eq!(wrappable_query("SELECT 1"), "SELECT 1");
+    }
 
     #[test]
     fn postgres_plain_identifier() {
