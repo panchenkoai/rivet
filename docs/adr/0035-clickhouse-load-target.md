@@ -1,0 +1,36 @@
+# ADR-0035: ClickHouse as a Load Target — the Log Collapses Itself
+
+- **Status:** Accepted
+- **Date:** 2026-09-25
+- **Context:** `ExportTarget::ClickHouse` already resolves column types (ADR-0014), but `rivet load` reaches only BigQuery and Snowflake. A contributed loader (#145 → #277) predates the 0.27 load contract: it implements 5 of the 12 `TargetLoader` methods, and it ranks a baseline row below EVERY change — including changes older than the snapshot, which is the round-10 re-baseline class the anchor stamp fixed on the other two warehouses. This ADR fixes what a ClickHouse load is, before the port.
+
+---
+
+## Decision
+
+ClickHouse uses the existing **log-and-view** layout (ADR-0034 D7's non-BigQuery shape). What differs is the log's engine: `<table>__changes` is a `ReplacingMergeTree(__ver)`, so ClickHouse itself discards superseded versions in the background and the log does not grow for ever the way a BigQuery or Snowflake log does. No new layout, no `rivet compact` for ClickHouse.
+
+| ID | Name | Statement |
+|----|------|-----------|
+| **CH1** | Full load | A whole-table load (`full`, `chunked`, `time_window`, a cursor-less incremental run) creates `<table>` as a plain `MergeTree` and replaces it, with the same ownership and shape preflight as the other targets (`ensure_overwritable`). |
+| **CH2** | The log engine | `<table>__changes` is `ENGINE = ReplacingMergeTree(__ver) ORDER BY (<pk>)`, unpartitioned. `<pk>` columns are declared non-Nullable; a NULL key value refuses the load naming the column. The `ORDER BY` IS the dedup key (it is not configurable separately). |
+| **CH3** | The version | `__ver UInt256 MATERIALIZED`, computed inside ClickHouse from the `__pos` / `__seq` the Parquet already carries: `(position << 128) \| (__seq + 1)`. `position` is the engine's cursor as an integer — PostgreSQL LSN `hi/lo` → `UInt64`; SQL Server's 10-byte LSN → `UInt128`; MySQL `(file ordinal << 64) \| pos`. A NULL `__pos` (a PostgreSQL leg without a checkpoint, a legacy leg) is version 0. A snapshot row carries the anchor and `__seq = -1`, so it outranks every change before the anchor and loses to every change at or after it — the same order the other warehouses' views compute. Versions are unique per key, so no tie is ever decided by insert order. |
+| **CH4** | Deletes | A delete is an ordinary row with `__op = 'delete'`; the engine keeps the last version of a key even when it is a delete. The engine's `is_deleted` parameter is NOT used: the view must expose `__is_deleted` like the other warehouses, and the only way to purge tombstones (`OPTIMIZE … FINAL CLEANUP`) is experimental in 24.8 and lets a late older version resurrect a deleted key. Tombstones stay, one row per deleted key. |
+| **CH5** | The view | `<table>` is `SELECT * EXCEPT (__op, __pos, __seq, __ver), __op = 'delete' AS __is_deleted FROM <table>__changes FINAL`. `FINAL` is the only read that returns one version per key before a merge. A filter on a non-key column must stay in `WHERE`; the same predicate in `PREWHERE` is applied before the collapse and returns superseded rows. |
+| **CH6** | Ingest | rivet reads each manifest-declared Parquet part from the export store and sends it as `INSERT … FORMAT Parquet` over HTTP (the server needs no access to the bucket). Each part carries `insert_deduplication_token = <part URI>` with pinned insert block sizes, and the log has `non_replicated_deduplication_window > 0`, so a retried part inserts nothing twice. The row count a load reports is the insert's own `written_rows` — a before/after `count()` races the background merges that shrink the table. |
+| **CH7** | Mongo | Not supported for CDC in this release: the resume token has no fixed-width integer encoding that ClickHouse documents an order for. The plan refuses a MongoDB CDC export with a ClickHouse target, naming the reason. |
+| **CH8** | Partitions | A `partition:` in the load spec is refused for ClickHouse CDC and incremental loads: a key whose partition value changes leaves one version in each partition for ever (merges never cross partitions). Full loads may partition. |
+| **CH9** | Primary-key updates | Unchanged from ADR-0030: an update that changes the key lands under the new key; the old key stays live. |
+| **CH10** | Incremental (cursor) loads | CH2–CH5 are the CDC log. An incremental log has no source position, and its cursor may be any type, so it is a plain `MergeTree` behind the same `ROW_NUMBER` view the other warehouses build (ordered by the cursor); it grows as theirs do. |
+
+## Consequences
+
+- **The re-baseline refusal stands** (ADR-0034, `rebaseline_action`): a key deleted during a gap has no row in a re-snapshot, so its pre-gap versions still win; `TRUNCATE <table>__changes` remains the remedy.
+- **No `rivet compact` for ClickHouse.** `compact` keeps its "BigQuery-only" refusal; a `layout: base_buffer` for ClickHouse is refused at config load as it is for Snowflake.
+- **Reads cost a `FINAL`.** The view is correct at any moment; its cost falls as merges catch up.
+- **Coverage owed before merge:** the load-spec matrix gains a `clickhouse` column; ClickHouse and a GCS emulator join `dev/stand`; the release gate's `warehouse_load` row gets ClickHouse cells that read the table back with an independent reader and compare every column to the source, including a mid-flush crash retry and a re-baseline.
+
+## Sources
+
+- ClickHouse documentation: *ReplacingMergeTree* (version column types, "keeps the last row for a key even if that row is a delete row", CLEANUP), *SELECT … FROM / FINAL*, *Deduplicating inserts on retries* (`insert_deduplication_token`, `non_replicated_deduplication_window`), *HTTP interface* (`wait_end_of_query`, `X-ClickHouse-Summary`), *ALTER COLUMN*.
+- Measured on ClickHouse 24.8.14 on the stand (2026-09-25): version-type acceptance, tie order, tombstone survival under `OPTIMIZE FINAL`, resurrection after `CLEANUP`, cross-partition duplicates, `PREWHERE` under `FINAL`, the LSN-to-integer orderings, and a Parquet file re-inserted three times — 8,223,906 rows for a 3,000,000-row file without a token, 3,000,000 with one.
