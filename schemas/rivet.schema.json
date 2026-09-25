@@ -700,7 +700,7 @@
           "$ref": "#/$defs/DestinationConfig"
         },
         "verify": {
-          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — e.g. a part too large to upload as a single PUT (lower\n`max_file_size` so it fits), or a backend that exposes no checksum.",
+          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — a part too large for a single PUT (on GCS / Azure, raise\n`destination.oneshot_budget_mb` above the part size), or a backend that\nexposes no trusted checksum (S3, local FS).",
           "$ref": "#/$defs/VerifyMode",
           "default": "size"
         },
@@ -1152,6 +1152,15 @@
         "allow_anonymous": {
           "type": "boolean",
           "default": false
+        },
+        "oneshot_budget_mb": {
+          "description": "Cap on the RAM one-shot (single-PUT) upload buffers may hold, in MB\n(default 64; cloud destinations only). A one-shot PUT buffers the whole part;\non GCS and Azure the store then records a `Content-MD5` that `validate` checks,\nand on every store it is one request instead of a sequential multipart (S3\nverifies size-only either way). A part that does not fit the remaining budget\nstreams instead (memory-bounded). `0` streams every non-empty part.\nEach distinct value is one pool per rivet process, shared by every destination\nconfigured with it (including each table of a CDC export). Different values\nare separate pools, so worst-case one-shot RAM is the sum of the distinct\nvalues in use; under `parallel_export_processes` every child has its own.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false,

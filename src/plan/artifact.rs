@@ -681,6 +681,37 @@ mod legacy_wire_compat {
             );
         }
     }
+
+    /// A plan SEALED by a released rivet must still verify: the seal hashes the whole
+    /// serialized plan, so a new field that serializes when unset breaks every old artifact.
+    #[test]
+    fn every_sealed_frozen_plan_artifact_still_verifies() {
+        for (label, body) in [
+            (
+                "v0_28_0_plan_keyset_sealed",
+                include_str!(
+                    "../../tests/fixtures/artifacts_legacy/v0_28_0_plan_keyset_sealed.json"
+                ),
+            ),
+            (
+                "v0_28_0_plan_full_sealed",
+                include_str!("../../tests/fixtures/artifacts_legacy/v0_28_0_plan_full_sealed.json"),
+            ),
+        ] {
+            let artifact = PlanArtifact::from_json(body).expect(label);
+            assert!(
+                !artifact.integrity.is_empty(),
+                "{label}: fixture must carry a seal"
+            );
+            if let Err(e) = artifact.verify_integrity() {
+                panic!(
+                    "{label}: `rivet apply` would reject this user's plan.json. A new field \
+                     on the resolved plan needs `skip_serializing_if` so an unset value \
+                     serializes as before: {e}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

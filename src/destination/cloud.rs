@@ -102,36 +102,46 @@ impl opendal::layers::RetryInterceptor for RivetRetryNotify {
     }
 }
 
-/// Process-wide ceiling on RAM held in one-shot upload buffers.
+/// Default ceiling on RAM held in one-shot upload buffers.
 ///
 /// A single-PUT upload (`op.write`) must buffer the whole part so the store
 /// computes and stores a content MD5 the listing exposes (the only way to get
 /// `Content-MD5` on Azure — a single `Put Blob`, not `Put Block List`).  That
-/// buffering is unavoidable, so the risk is buffer × upload concurrency
-/// (`parallel`, default 4, operator-tunable).  Rather than a per-part magic
-/// threshold that still multiplies by concurrency, a part one-shots only if it
-/// fits in the *remaining* shared budget; otherwise it streams (memory-bounded,
-/// size-only verification).  Total one-shot RAM is thus capped here regardless
-/// of how many workers upload at once, and any part larger than the whole
-/// budget always streams.
-const ONESHOT_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
-static ONESHOT_BUDGET: AtomicI64 = AtomicI64::new(ONESHOT_BUDGET_BYTES);
+/// buffering is unavoidable, so the risk is buffer × upload concurrency.  A part
+/// one-shots only if it fits in the *remaining* budget; otherwise it streams
+/// (memory-bounded, size-only verification), so total one-shot RAM is capped
+/// regardless of how many workers upload at once.
+const DEFAULT_ONESHOT_BUDGET_MB: u64 = 64;
 
-/// Releases the reserved bytes back to [`ONESHOT_BUDGET`] on drop — so the
-/// budget is restored even if the upload errors out.
-struct OneShotReservation(i64);
-impl Drop for OneShotReservation {
-    fn drop(&mut self) {
-        ONESHOT_BUDGET.fetch_add(self.0, Ordering::Relaxed);
-    }
+/// The process-wide one-shot pool for a budget size, shared by every destination configured with it.
+///
+/// Keyed by the configured `oneshot_budget_mb` (unset ≡ 64), never by the
+/// destination instance: one CDC export builds a destination PER TABLE and its
+/// roll uploads many tables at once, so a per-instance pool would turn one
+/// config line into tables × budget.  Distinct values are few, so the leak is bounded.
+fn oneshot_pool(config: &DestinationConfig) -> &'static AtomicI64 {
+    static POOLS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<u64, &'static AtomicI64>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mb = config
+        .oneshot_budget_mb
+        .unwrap_or(DEFAULT_ONESHOT_BUDGET_MB);
+    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    pools.entry(mb).or_insert_with(|| {
+        let bytes = i64::try_from(mb)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1024 * 1024);
+        Box::leak(Box::new(AtomicI64::new(bytes)))
+    })
 }
 
-/// Reserve `size` bytes for a one-shot buffer if the budget allows, else `None`
-/// (caller streams).  Parts larger than the whole budget never fit, so they
-/// always stream.
-fn reserve_oneshot(size: u64) -> Option<OneShotReservation> {
-    let size = i64::try_from(size).unwrap_or(i64::MAX);
-    take_from(&ONESHOT_BUDGET, size).then_some(OneShotReservation(size))
+/// Releases the reserved bytes back to the pool it was taken from on drop — so
+/// the budget is restored even if the upload errors out.
+struct OneShotReservation<'a>(&'a AtomicI64, i64);
+impl Drop for OneShotReservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1, Ordering::Relaxed);
+    }
 }
 
 /// Optimistic atomic reserve: subtract `size`; if that would overdraw, undo and
@@ -197,6 +207,8 @@ pub(crate) struct CloudDestination<B: CloudBackend> {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: blocking::Operator,
     prefix: String,
+    /// The one-shot upload pool this destination draws from (see [`oneshot_pool`]).
+    oneshot_budget: &'static AtomicI64,
     _backend: PhantomData<fn() -> B>,
 }
 
@@ -298,8 +310,17 @@ impl<B: CloudBackend> CloudDestination<B> {
             _runtime: runtime,
             op,
             prefix,
+            oneshot_budget: oneshot_pool(config),
             _backend: PhantomData,
         })
+    }
+
+    /// Reserve `size` bytes for a one-shot buffer from this destination's
+    /// budget if it allows, else `None` (caller streams).  Parts larger than
+    /// the whole budget never fit, so they always stream.
+    fn reserve_oneshot(&self, size: u64) -> Option<OneShotReservation<'_>> {
+        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        take_from(self.oneshot_budget, size).then(|| OneShotReservation(self.oneshot_budget, size))
     }
 }
 
@@ -307,20 +328,16 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
         let size = std::fs::metadata(local_path)?.len();
-        // One-shot upload when the part fits the shared memory budget: a single
-        // PUT (S3 `PutObject` / GCS upload / Azure `Put Blob`) makes the store
-        // compute and store a content checksum the listing then exposes for
-        // no-download verification.  This is what lets `--validate` md5-check
-        // Azure parts at all — Azure auto-computes `Content-MD5` only for a
-        // single `Put Blob`, never for the `Put Block List` the streaming
-        // writer produces (each `write()` past the first stages a block).
-        // Otherwise stream — memory-bounded, size-only for those parts.
-        let outcome = if let Some(_reservation) = reserve_oneshot(size) {
+        // One-shot upload when the part fits this destination's memory budget: one
+        // PUT instead of a sequential multipart (5 MiB parts on S3/GCS, 256 KiB
+        // blocks on Azure), and on GCS / Azure a store-computed Content-MD5 that
+        // `--validate` checks with no download (Azure computes it only for a single
+        // `Put Blob`). Otherwise stream — memory-bounded, size-only for those parts.
+        let outcome = if let Some(_reservation) = self.reserve_oneshot(size) {
             let body = std::fs::read(local_path)?;
             let meta = self.op.write(&key, body)?;
-            // The single-PUT response carries the store's own checksum: GCS /
-            // Azure as `content_md5` (base64), S3 as the ETag (hex MD5).  Hand
-            // it back for the commit-time transit check.
+            // The single-PUT response carries the store's own checksum on GCS /
+            // Azure (`content_md5`, base64); hand it back for the transit check.
             super::WriteOutcome {
                 // Use the store's REAL Content-MD5 header only (GCS / Azure
                 // return it, base64). Do NOT fall back to the S3 ETag: for an
@@ -468,7 +485,34 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicI64, CloudDestination, Ordering, normalize_prefix, take_from};
+    use super::{
+        AtomicI64, CloudDestination, OneShotReservation, Ordering, normalize_prefix, oneshot_pool,
+        take_from,
+    };
+    /// The RELEASE half: a finished reservation must return its bytes, or the pool
+    /// drains for the life of the process and every later part silently streams.
+    #[test]
+    fn a_finished_reservation_returns_its_bytes_so_the_next_part_can_one_shot() {
+        let pool = AtomicI64::new(8 * 1024 * 1024);
+        let whole = 8 * 1024 * 1024;
+
+        assert!(
+            take_from(&pool, whole),
+            "the whole budget is available to start with"
+        );
+        {
+            let _held = OneShotReservation(&pool, whole);
+            assert!(
+                !take_from(&pool, whole),
+                "while the whole budget is held, a second part of the same size must stream"
+            );
+        }
+        assert!(
+            take_from(&pool, whole),
+            "after the first reservation finished, the next part must one-shot again"
+        );
+    }
+
     use crate::config::{DestinationConfig, DestinationType};
     use crate::destination::gcs::GcsBackend;
 
@@ -521,6 +565,86 @@ mod tests {
         // proves the *behavioral* fail-fast against a closed port.)
         CloudDestination::<GcsBackend>::new_with_retries(&cfg, 0)
             .expect("no-retry probe destination must build");
+    }
+
+    /// A GCS destination config with the given budget (no network is touched).
+    fn gcs_cfg(budget_mb: Option<u64>) -> DestinationConfig {
+        DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("rivet-oneshot-pool".into()),
+            allow_anonymous: true,
+            endpoint: Some("http://127.0.0.1:4443".into()),
+            oneshot_budget_mb: budget_mb,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unset_budget_is_the_64mb_pool_and_a_value_sizes_its_own() {
+        assert!(
+            std::ptr::eq(
+                oneshot_pool(&gcs_cfg(None)),
+                oneshot_pool(&gcs_cfg(Some(64)))
+            ),
+            "unset must be the historical process-wide 64 MB pool"
+        );
+        assert_eq!(oneshot_pool(&gcs_cfg(Some(0))).load(Ordering::Relaxed), 0);
+        assert_eq!(
+            oneshot_pool(&gcs_cfg(Some(131))).load(Ordering::Relaxed),
+            131 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn configured_budget_moves_the_oneshot_switch_point() {
+        let part = 40 * 1024 * 1024;
+        let small =
+            CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(33)), 0).unwrap();
+        assert!(
+            small.reserve_oneshot(part).is_none(),
+            "a 40 MB part streams under a 33 MB budget"
+        );
+        let big = CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(129)), 0).unwrap();
+        assert!(
+            big.reserve_oneshot(part).is_some(),
+            "the same part one-shots under a 129 MB budget"
+        );
+    }
+
+    /// A refused reservation must not touch the pool: an eager `then_some` built the
+    /// guard anyway, and its drop credited every streamed part's size to the budget.
+    #[test]
+    fn a_refused_reservation_leaves_the_pool_unchanged() {
+        let dest = CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(71)), 0).unwrap();
+        assert!(dest.reserve_oneshot(72 * 1024 * 1024).is_none());
+        assert_eq!(
+            oneshot_pool(&gcs_cfg(Some(71))).load(Ordering::Relaxed),
+            71 * 1024 * 1024,
+            "a part that streams must not grow the one-shot budget"
+        );
+    }
+
+    /// One CDC export builds a destination per table: they must share ONE pool,
+    /// or `oneshot_budget_mb` multiplies by the table count.
+    #[test]
+    fn destinations_with_the_same_budget_share_one_pool() {
+        let whole = 67 * 1024 * 1024;
+        let a = CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(67)), 0).unwrap();
+        let b = CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(67)), 0).unwrap();
+        let other =
+            CloudDestination::<GcsBackend>::new_with_retries(&gcs_cfg(Some(68)), 0).unwrap();
+
+        let _held = a
+            .reserve_oneshot(whole)
+            .expect("a takes the whole 67 MB pool");
+        assert!(
+            b.reserve_oneshot(1).is_none(),
+            "b shares a's drained pool: the budget must not multiply per destination"
+        );
+        assert!(
+            other.reserve_oneshot(whole).is_some(),
+            "a different budget value is a different pool"
+        );
     }
 
     #[test]

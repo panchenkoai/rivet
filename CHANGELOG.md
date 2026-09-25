@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **`destination.oneshot_budget_mb`** (by @ssyusyukalov, #143): the RAM cap on
+  single-PUT uploads, until now fixed at 64 MB, is configurable. On GCS and Azure a
+  part that fits uploads in one PUT and gets a store-computed `Content-MD5` that
+  `validate` checks; larger parts stream with size-only verification (S3 is always
+  size-only, but a single PUT still saves the sequential multipart round trips:
+  measured 3–4.5× faster per part at 50 ms RTT). `0` streams every part. The cap
+  is shared by every destination with the same value, including each table of a
+  CDC export, so it never multiplies by table count.
+- **The one-shot upload budget no longer grows with every streamed part.** A part
+  too big for the budget was refused, but the refusal credited its size back to the
+  pool, so after one large streamed part the next one was read into memory whole:
+  the 64 MB cap was not a cap (since 2026-06). Measured on MinIO and Azurite with a
+  budget of 0: the first 10.8 MB part streamed, the next two went up as single PUTs.
+
 ## 0.29.0 — 2026-09-25
 
 - **A multi-table CDC cycle to GCS is 10–13× faster** (60 tables, 330k changes,
