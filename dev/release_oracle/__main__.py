@@ -44,7 +44,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, HERE, ROOT
+from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
@@ -229,17 +229,9 @@ def _self_test() -> int:
     # and the banner/footer that describe whether anything was compared at all.
     # One entry point, so CI and the offline suite get both halves.
     # A failed test that also leaked prints `FAIL + LEAK [`: it must never read as green.
-    from .core import nextest_outcomes, nextest_passed
-    sample = (
-        "        SLOW [> 60.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
-        "        PASS [  61.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
-        "        LEAK [   0.400s] (2/4) rivet-cli::live_suite m::leaky_pass\n"
-        " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
-        "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
-        "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
-    )
-    assert nextest_passed(sample) == {"m::slow_then_pass", "m::leaky_pass"}, nextest_passed(sample)
-    assert nextest_outcomes(sample)["m::leaky_fail"] == "FAIL + LEAK"
+    from .core import nextest_grading_error
+    why = nextest_grading_error()
+    assert why is None, why
     print("self-test ok: a FAIL + LEAK line is a failure, a LEAK line a pass, SLOW is not final")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
@@ -894,6 +886,9 @@ def main(argv: list[str] | None = None) -> int:
             backend = "SQLITE (a .rivet_state.db beside each config — the default)"
         print(f"  state backend under test: {backend}")
         print("  a pass grades ONE backend; --state-url runs the same cells against the other")
+        # The Rig cells are graded by parsing nextest; a parser that reads `FAIL + LEAK`
+        # as a pass turns red tests green, so it is checked before anything is graded.
+        verify_nextest_grading(led)
 
         # WHETHER THE RELEASE IS BEING GRADED AGAINST THE PREVIOUS ONE, said out
         # loud — for the same reason the state backend is. The stages read this

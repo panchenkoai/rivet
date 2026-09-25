@@ -478,3 +478,32 @@ def nextest_outcomes(out: str) -> dict[str, str]:
 def nextest_passed(out: str) -> set[str]:
     """The tests nextest reports green: `PASS`, or `LEAK` (passed, left a handle open)."""
     return {n for n, s in nextest_outcomes(out).items() if s in ("PASS", "LEAK")}
+
+
+# nextest's real line shapes, each with the verdict the gate must give it.
+_NEXTEST_SAMPLE = (
+    "        SLOW [> 60.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
+    "        PASS [  61.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
+    "        LEAK [   0.400s] (2/4) rivet-cli::live_suite m::leaky_pass\n"
+    " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
+    "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
+)
+
+
+def nextest_grading_error() -> str | None:
+    """Why the nextest parser would misgrade a real line shape, or None when it grades all correctly."""
+    passed = nextest_passed(_NEXTEST_SAMPLE)
+    want = {"m::slow_then_pass", "m::leaky_pass"}
+    if passed != want:
+        return f"graded green {sorted(passed)}, want {sorted(want)} (a FAIL + LEAK must stay red)"
+    return None
+
+
+def verify_nextest_grading(led: "Ledger") -> None:
+    """Refuse a gate whose parser would read a failed, leaky test as green."""
+    why = nextest_grading_error()
+    if why:
+        led.failed("-", "harness", "nextest-grading", "-", f"nextest parser misgrades: {why}")
+    else:
+        led.passed("-", "harness", "nextest-grading", "-",
+                   "nextest parser: FAIL + LEAK is red, LEAK green, SLOW not final", "ok")
