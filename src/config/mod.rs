@@ -416,6 +416,7 @@ impl Config {
     fn validate(&self) -> crate::error::Result<()> {
         self.validate_exports_list()?;
         self.validate_source_connection()?;
+        self.validate_non_sql_source_modes()?;
         for export in &self.exports {
             self.validate_export(export)?;
         }
@@ -423,7 +424,6 @@ impl Config {
         self.validate_csv_exports_are_not_loaded()?;
         self.validate_load_overrides()?;
         self.validate_layout_has_a_compacting_warehouse()?;
-        self.validate_non_sql_source_modes()?;
         Ok(())
     }
 
@@ -527,13 +527,9 @@ impl Config {
             if !matches!(e.mode, ExportMode::Full | ExportMode::Cdc) {
                 crate::config_bail!(
                     crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
-                    "export '{}': source type '{:?}' supports `mode: full` (batch) and \
-                     `mode: cdc` (change streams) (got `mode: {:?}`). MongoDB has no SQL, so \
-                     chunked / incremental / keyset / time-window are not available; every \
-                     document exports as `_id` + a `document` JSON column.",
+                    "export '{}': {}",
                     e.name,
-                    self.source.source_type,
-                    e.mode
+                    non_sql_mode_refusal(self.source.source_type, e.mode.as_str())
                 );
             }
             // An impossible combination must be a config error, not a silent
@@ -1572,6 +1568,15 @@ fn is_filename_safe_name(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// Why a non-SQL source refuses a mode other than `full` / `cdc` — shared by the loader and `rivet init`.
+pub(crate) fn non_sql_mode_refusal(source: SourceType, mode: &str) -> String {
+    format!(
+        "source type '{source:?}' supports `mode: full` (batch) and `mode: cdc` (change streams) \
+         (got `mode: {mode}`). MongoDB has no SQL, so chunked / incremental / keyset / \
+         time-window are not available; every document exports as `_id` + a `document` JSON \
+         column."
+    )
+}
 #[cfg(test)]
 mod tests;
 

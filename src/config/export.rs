@@ -808,6 +808,19 @@ pub enum ExportMode {
     Cdc,
 }
 
+impl ExportMode {
+    /// The `mode:` spelling in a config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+            Self::Chunked => "chunked",
+            Self::TimeWindow => "time_window",
+            Self::Cdc => "cdc",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeColumnType {

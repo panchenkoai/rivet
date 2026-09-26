@@ -937,8 +937,10 @@ exports:
 #[test]
 fn mongo_non_full_or_cdc_mode_is_rejected() {
     for (mode, extra) in [
+        ("incremental", ""),
         ("incremental", "\n    cursor_column: updated_at"),
         ("chunked", ""),
+        ("time_window", ""),
     ] {
         let yaml = format!(
             r#"
@@ -953,7 +955,10 @@ exports:
         );
         let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
         assert!(
-            msg.contains("MongoDB has no SQL") || msg.contains("supports `mode: full`"),
+            msg.contains(&format!(
+                "export 't': source type 'Mongo' supports `mode: full` (batch) and `mode: cdc` \
+                 (change streams) (got `mode: {mode}`). MongoDB has no SQL"
+            )),
             "mongo mode:{mode} must be rejected with the mode-unsupported message, got: {msg}"
         );
     }

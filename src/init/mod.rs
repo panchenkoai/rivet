@@ -551,6 +551,17 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
     }
 }
 
+/// Refuse a forced `--mode` the source cannot run, in the config loader's own words.
+fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Result<()> {
+    match (source_type_of(source_url), mode) {
+        (Ok(st), Some(m)) if !st.is_sql() && !matches!(m, "full" | "cdc") => anyhow::bail!(
+            "init: --mode {m}: {}",
+            crate::config::non_sql_mode_refusal(st, m)
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// [`source_type`] as the enum the rest of the tree speaks.
 pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceType> {
     use crate::config::SourceType;
@@ -724,6 +735,9 @@ pub fn init(
     tls: Option<&crate::config::TlsConfig>,
 ) -> Result<()> {
     yaml_destination.validate()?;
+    if matches!(format, InitFormat::Yaml) {
+        refuse_unsupported_forced_mode(source_url, mode_override)?;
+    }
     let (text, yaml_decimal_review, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
             tls,
@@ -3064,6 +3078,30 @@ mod tests {
         assert!(!f.matches_folded("BH2_SK_IOT_TMP"));
         assert!(!f.matches_folded("BH2_SK_NUM"));
         assert!(!f.matches("BH2_SK_IOT"), "the plain matcher stays exact");
+    }
+
+    #[test]
+    fn a_forced_mode_mongo_cannot_run_is_refused_in_the_loaders_words() {
+        for m in ["incremental", "chunked", "time_window"] {
+            let err = super::refuse_unsupported_forced_mode("mongodb://h/db", Some(m))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "init: --mode {m}: source type 'Mongo' supports `mode: full` (batch) and \
+                     `mode: cdc` (change streams) (got `mode: {m}`). MongoDB has no SQL, so \
+                     chunked / incremental / keyset / time-window are not available; every \
+                     document exports as `_id` + a `document` JSON column."
+                )
+            );
+        }
+        for m in [None, Some("full"), Some("cdc")] {
+            assert!(super::refuse_unsupported_forced_mode("mongodb://h/db", m).is_ok());
+        }
+        assert!(
+            super::refuse_unsupported_forced_mode("postgresql://h/db", Some("chunked")).is_ok()
+        );
     }
 
     #[test]
