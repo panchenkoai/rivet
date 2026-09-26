@@ -768,12 +768,13 @@ impl MysqlChangeStream {
         server_id: u32,
         mode: DrainMode,
         tls: Option<&TlsConfig>,
+        tables: &[&str],
     ) -> Result<Self> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        // No table filter: these tests read the stream directly rather than routing
-        // it, so every event is theirs — the same `configured.is_empty()` arm
-        // `rivet cdc` without `--table` takes.
-        Self::open(url, server_id, file, pos, mode, tls, Vec::new())
+        // Each test captures only its OWN table: tests run concurrently, and a stream
+        // over every table would take a sibling test's DROP as a captured table's.
+        let tables = tables.iter().map(|t| t.to_string()).collect();
+        Self::open(url, server_id, file, pos, mode, tls, tables)
     }
 
     /// Resume from a persisted [`Position`] checkpoint, or start from the current
@@ -2790,7 +2791,8 @@ mod tests {
     #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
     fn the_binlog_dump_session_outlives_a_long_flush() {
         let _stream =
-            MysqlChangeStream::open_from_current(URL, 4244, DrainMode::Continuous, None).unwrap();
+            MysqlChangeStream::open_from_current(URL, 4299, DrainMode::Continuous, None, &[])
+                .unwrap();
         // performance_schema is root-only on the stand; the stream itself runs as `rivet`.
         let mut c =
             Conn::new(Opts::from_url("mysql://root:rivet@127.0.0.1:3307/rivet").unwrap()).unwrap();
@@ -2819,8 +2821,14 @@ mod tests {
         c.query_drop("CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)")
             .unwrap();
 
-        let mut stream =
-            MysqlChangeStream::open_from_current(URL, 4243, DrainMode::Continuous, None).unwrap();
+        let mut stream = MysqlChangeStream::open_from_current(
+            URL,
+            4243,
+            DrainMode::Continuous,
+            None,
+            &["cdc_unit"],
+        )
+        .unwrap();
         c.query_drop("INSERT INTO cdc_unit VALUES (1, 10)").unwrap();
         c.query_drop("UPDATE cdc_unit SET v = 20 WHERE id = 1")
             .unwrap();
@@ -2940,8 +2948,14 @@ mod tests {
             .unwrap();
 
         // Read change A and checkpoint at its position.
-        let mut s =
-            MysqlChangeStream::open_from_current(URL, 4244, DrainMode::Continuous, None).unwrap();
+        let mut s = MysqlChangeStream::open_from_current(
+            URL,
+            4244,
+            DrainMode::Continuous,
+            None,
+            &["cdc_resume"],
+        )
+        .unwrap();
         c.query_drop("INSERT INTO cdc_resume VALUES (1, 100)")
             .unwrap();
         let a = s
@@ -2968,7 +2982,7 @@ mod tests {
             Some(&ckpt),
             DrainMode::Continuous,
             None,
-            Vec::new(),
+            vec!["cdc_resume".to_string()],
             None, // no spill dir — these tests never cross the cap
         )
         .unwrap();
