@@ -152,6 +152,14 @@ mod tests {
         }
     }
 
+    /// A non-PK column that leads an index.
+    fn ix(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            is_indexed: true,
+            ..c(name, ty, false)
+        }
+    }
+
     fn tbl(rows: i64, bytes: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
             density: None,
@@ -245,7 +253,7 @@ mod tests {
                 tbl(
                     300_000,
                     narrow(300_000),
-                    vec![c("k", "bigint", false), c("v", "int", false)],
+                    vec![ix("k", "bigint"), c("v", "int", false)],
                 ),
                 "chunked(k, size=100000, parallel=1, checkpoint)",
             ),
@@ -253,7 +261,7 @@ mod tests {
                 tbl(
                     2_000_000,
                     narrow(2_000_000),
-                    vec![c("k", "bigint", false), c("v", "int", false)],
+                    vec![ix("k", "bigint"), c("v", "int", false)],
                 ),
                 "chunked(k, size=250000, parallel=2, checkpoint)",
             ),
@@ -261,7 +269,7 @@ mod tests {
                 tbl(
                     10_000_000,
                     narrow(10_000_000),
-                    vec![c("k", "bigint", false), c("v", "int", false)],
+                    vec![ix("k", "bigint"), c("v", "int", false)],
                 ),
                 "chunked(k, size=1000000, parallel=4, checkpoint)",
             ),
@@ -285,7 +293,7 @@ mod tests {
                 tbl(
                     200_000,
                     narrow(200_000),
-                    vec![c("id", "decimal", true), c("seq", "int", false)],
+                    vec![c("id", "decimal", true), ix("seq", "int")],
                 ),
                 "chunked(seq, size=100000, parallel=1, checkpoint)",
             ),
@@ -295,6 +303,19 @@ mod tests {
                 assert_eq!(&scaffold_full(info, eng), want, "range-chunk on {eng}");
             }
         }
+        // An UNINDEXED integer is never the range key: every window would be a full scan.
+        let unindexed = tbl(
+            2_000_000,
+            narrow(2_000_000),
+            vec![c("k", "bigint", false), c("v", "int", false)],
+        );
+        for eng in ENGINES {
+            assert_eq!(
+                scaffold_full(&unindexed, eng),
+                "full",
+                "unindexed key on {eng}"
+            );
+        }
 
         // ── ENGINE DIFFERENCE: a WIDE (≥1024 B/row) range-chunk table. MySQL holds
         //    parallel at 1 (a single sequential scan beats chunked on wide MySQL
@@ -303,7 +324,7 @@ mod tests {
         let big_wide = tbl(
             10_000_000,
             wide(10_000_000),
-            vec![c("k", "bigint", false), c("v", "int", false)],
+            vec![ix("k", "bigint"), c("v", "int", false)],
         );
         assert_eq!(
             scaffold_full(&big_wide, "mysql"),

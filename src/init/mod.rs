@@ -69,26 +69,8 @@ pub(crate) struct TableInfo {
 }
 
 impl TableInfo {
-    /// Best candidate for `chunk_column`: integer primary key, or first integer column.
+    /// The range-chunk key: the integer PK, else the first INDEXED integer column (an unindexed one makes every window a full scan).
     pub(crate) fn best_chunk_column(&self) -> Option<&str> {
-        // Prefer integer PK
-        self.columns
-            .iter()
-            .find(|c| c.is_primary_key && is_integer_type(&c.data_type))
-            .or_else(|| {
-                // Fall back to first integer column
-                self.columns.iter().find(|c| is_integer_type(&c.data_type))
-            })
-            .map(|c| c.name.as_str())
-    }
-
-    /// Like [`best_chunk_column`](Self::best_chunk_column) but the fallback
-    /// integer column must be INDEXED (#199). The density probe runs MIN/MAX + K
-    /// windowed COUNTs on this key — on an UNINDEXED column that is up to 51
-    /// SEQUENTIAL SCANS of a large table inside `rivet init`. An integer PK is
-    /// always indexed; a non-PK integer key is used only when an index backs it,
-    /// else `None` (the probe then skips → catalog kept, unverified).
-    pub(crate) fn best_indexed_chunk_column(&self) -> Option<&str> {
         self.columns
             .iter()
             .find(|c| c.is_primary_key && is_integer_type(&c.data_type))
@@ -1924,9 +1906,9 @@ mod tests {
     /// #199: the density probe's key must be INDEXED. PK (always indexed) →
     /// returned; an unindexed integer fallback → None (probe skips, no 51-scan);
     /// an indexed non-PK integer → returned (the versioned KEY(ref_id) case #148
-    /// targets). RED against best_chunk_column (which returns the unindexed one).
+    /// targets).
     #[test]
-    fn best_indexed_chunk_column_requires_an_index() {
+    fn best_chunk_column_requires_an_index() {
         let c = |n: &str, ty: &str, pk: bool, idx: bool| ColumnInfo {
             name: n.into(),
             data_type: ty.into(),
@@ -1938,21 +1920,16 @@ mod tests {
         };
         // integer PK → indexed → returned.
         let t = make_table(1, vec![c("id", "bigint", true, true)]);
-        assert_eq!(t.best_indexed_chunk_column(), Some("id"));
+        assert_eq!(t.best_chunk_column(), Some("id"));
         // uuid PK + UNINDEXED integer fallback → None (no scan).
         let t = make_table(
             1,
             vec![c("uid", "uuid", true, true), c("qty", "int", false, false)],
         );
         assert_eq!(
-            t.best_indexed_chunk_column(),
-            None,
-            "unindexed fallback must not be probed"
-        );
-        assert_eq!(
             t.best_chunk_column(),
-            Some("qty"),
-            "but best_chunk_column still picks it"
+            None,
+            "an unindexed integer is never the chunk key"
         );
         // indexed non-PK integer → returned (versioned KEY(ref_id)).
         let t = make_table(
@@ -1962,7 +1939,7 @@ mod tests {
                 c("ref_id", "bigint", false, true),
             ],
         );
-        assert_eq!(t.best_indexed_chunk_column(), Some("ref_id"));
+        assert_eq!(t.best_chunk_column(), Some("ref_id"));
     }
 
     fn make_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
@@ -2495,7 +2472,13 @@ mod tests {
         // integer column, with `chunk_checkpoint: true` and parallel as before.
         let info = make_table(
             2_000_000,
-            vec![col("region_id", "int", false), col("name", "text", false)],
+            vec![
+                ColumnInfo {
+                    is_indexed: true,
+                    ..col("region_id", "int", false)
+                },
+                col("name", "text", false),
+            ],
         );
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2691,7 +2674,13 @@ mod tests {
 
         let mut with_int = make_table(
             100,
-            vec![col("uid", "uuid", true), col("n", "bigint", false)],
+            vec![
+                col("uid", "uuid", true),
+                ColumnInfo {
+                    is_indexed: true,
+                    ..col("n", "bigint", false)
+                },
+            ],
         );
         with_int.table = "Orders".into();
         let yaml = scaffold(&with_int, Some("chunked"));

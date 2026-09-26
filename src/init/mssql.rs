@@ -85,7 +85,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
 
     // Column metadata: one `RS`-delimited record per column, each holding six
     // `US`-delimited fields (name, data_type, is_pk, is_nullable, precision,
-    // scale). `COLUMNPROPERTY(..., 'IsXmlIndexable')` is not needed; PK-ness
+    // scale, leads-an-index). `COLUMNPROPERTY(..., 'IsXmlIndexable')` is not needed; PK-ness
     // comes from the primary-key constraint join, NULL-ability and numeric
     // precision/scale from `information_schema.COLUMNS`. `ISNULL(...,'')` keeps
     // absent precision/scale as empty fields so the `US` split stays aligned.
@@ -97,7 +97,8 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
                  CASE WHEN pk.COLUMN_NAME IS NULL THEN '0' ELSE '1' END, CHAR(31), \
                  c.IS_NULLABLE, CHAR(31), \
                  ISNULL(CONVERT(varchar(12), c.NUMERIC_PRECISION), ''), CHAR(31), \
-                 ISNULL(CONVERT(varchar(12), c.NUMERIC_SCALE), '') \
+                 ISNULL(CONVERT(varchar(12), c.NUMERIC_SCALE), ''), CHAR(31), \
+                 CASE WHEN ix.name IS NULL THEN '0' ELSE '1' END \
              )), CHAR(30)) WITHIN GROUP (ORDER BY c.ORDINAL_POSITION) \
          FROM information_schema.COLUMNS c \
          LEFT JOIN ( \
@@ -110,6 +111,13 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
              WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
                  AND tc.TABLE_SCHEMA = N'{schema_lit}' AND tc.TABLE_NAME = N'{table_lit}' \
          ) pk ON pk.COLUMN_NAME = c.COLUMN_NAME \
+         LEFT JOIN ( \
+             SELECT DISTINCT sc.name \
+             FROM sys.index_columns ic \
+             JOIN sys.columns sc ON sc.object_id = ic.object_id AND sc.column_id = ic.column_id \
+             WHERE ic.key_ordinal = 1 \
+                 AND ic.object_id = OBJECT_ID(QUOTENAME(N'{schema_lit}') + N'.' + QUOTENAME(N'{table_lit}')) \
+         ) ix ON ix.name = c.COLUMN_NAME \
          WHERE c.TABLE_SCHEMA = N'{schema_lit}' AND c.TABLE_NAME = N'{table_lit}'",
     );
 
@@ -142,11 +150,11 @@ fn parse_columns_agg(agg: &str) -> Vec<ColumnInfo> {
         .filter(|rec| !rec.is_empty())
         .filter_map(|rec| {
             let f: Vec<&str> = rec.split(US).collect();
-            if f.len() != 6 {
+            if f.len() != 7 {
                 return None;
             }
             Some(ColumnInfo {
-                is_indexed: f[2] == "1",
+                is_indexed: f[2] == "1" || f[6] == "1",
                 name: f[0].to_string(),
                 data_type: catalog_type(f[1]),
                 is_primary_key: f[2] == "1",
@@ -181,8 +189,8 @@ mod tests {
     #[test]
     fn a_rowversion_column_is_never_read_as_a_timestamp() {
         let agg = format!(
-            "id{US}bigint{US}1{US}NO{US}19{US}0{RS}rv{US}timestamp{US}0{US}NO{US}{US}{RS}\
-             seen_at{US}datetime2{US}0{US}YES{US}{US}"
+            "id{US}bigint{US}1{US}NO{US}19{US}0{US}1{RS}rv{US}timestamp{US}0{US}NO{US}{US}{US}0{RS}\
+             seen_at{US}datetime2{US}0{US}YES{US}{US}{US}0"
         );
         let cols = parse_columns_agg(&agg);
         let ty = |n: &str| cols.iter().find(|c| c.name == n).unwrap().data_type.clone();
@@ -231,9 +239,9 @@ mod tests {
     fn parse_columns_agg_round_trips_fields() {
         // id BIGINT PK NOT NULL, amount DECIMAL(12,2) NOT NULL, note NVARCHAR NULL.
         let s = agg(&[
-            rec(&["id", "bigint", "1", "NO", "", ""]),
-            rec(&["amount", "decimal", "0", "NO", "12", "2"]),
-            rec(&["note", "nvarchar", "0", "YES", "", ""]),
+            rec(&["id", "bigint", "1", "NO", "", "", "1"]),
+            rec(&["amount", "decimal", "0", "NO", "12", "2", "1"]),
+            rec(&["note", "nvarchar", "0", "YES", "", "", "0"]),
         ]);
         let cols = parse_columns_agg(&s);
         assert_eq!(cols.len(), 3);
@@ -249,6 +257,11 @@ mod tests {
         assert!(!cols[1].is_primary_key);
         assert_eq!(cols[1].numeric_precision, Some(12));
         assert_eq!(cols[1].numeric_scale, Some(2));
+        assert!(
+            cols[1].is_indexed,
+            "a non-PK column that leads an index is indexed"
+        );
+        assert!(!cols[2].is_indexed);
 
         assert_eq!(cols[2].name, "note");
         assert!(cols[2].is_nullable);
@@ -258,7 +271,7 @@ mod tests {
     fn parse_columns_agg_skips_malformed_record() {
         // Second record has only 2 fields — dropped, the well-formed one survives.
         let s = agg(&[
-            rec(&["id", "bigint", "1", "NO", "", ""]),
+            rec(&["id", "bigint", "1", "NO", "", "", "1"]),
             rec(&["broken", "rec"]),
         ]);
         let cols = parse_columns_agg(&s);

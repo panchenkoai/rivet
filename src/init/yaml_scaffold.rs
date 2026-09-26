@@ -2774,7 +2774,11 @@ mod tests {
     #[test]
     fn chunked_mode_keeps_select_query_form() {
         // chunked is curated; explicit SELECT remains.
-        let info = chunked_table(2_000_000, vec![col("id", "bigint"), col("name", "text")]);
+        let id = ColumnInfo {
+            is_indexed: true,
+            ..col("id", "bigint")
+        };
+        let info = chunked_table(2_000_000, vec![id, col("name", "text")]);
         let dest = InitYamlDestination::default();
         let yaml = generate_config(
             &info,
