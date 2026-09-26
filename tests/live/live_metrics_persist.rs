@@ -55,6 +55,7 @@ pub(crate) const MYSQL_HARM_COUNTERS: &[&str] = &[
 const MSSQL_HARM_COUNTERS: &[&str] = &[
     "mssql_lock_wait_ms",
     "mssql_lock_waits",
+    "mssql_logical_reads",
     "mssql_page_lookups",
     "mssql_page_reads",
     "mssql_workfiles_created",

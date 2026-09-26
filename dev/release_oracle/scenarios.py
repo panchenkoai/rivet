@@ -1807,10 +1807,23 @@ def verify_batch_resume(led: Ledger) -> None:
 def verify_audit_suspects(led: Ledger) -> None:
     """The contract audit's silent-loss cells (cleanup race, keyset collation, MySQL
     STATEMENT/DROP, Mongo drop, compact ADD COLUMN, MSSQL DATETIME), one row per case;
-    the BigQuery cells need the operator's warehouse credentials."""
+    the BigQuery cells get the same warehouse environment the rig cells do."""
+    proj = os.environ.get("BQ_ORACLE_PROJECT") or (
+        run(["gcloud", "config", "get-value", "project"]).stdout.strip() if have("gcloud") else "")
     _run_live_modules(led, "audit", "audit suspects",
                       "silent-loss cells from the 2026-09-26 contract audit (live_audit_suspects)",
-                      ["live_audit_suspects"])
+                      ["live_audit_suspects"],
+                      env={"BIGQUERY_TEST_PROJECT": proj,
+                           "RIVET_TEST_GCS_BUCKET": os.environ.get("BQ_ORACLE_BUCKET",
+                                                                   "rivet_data_test")})
+
+
+def verify_cdc_harm(led: Ledger) -> None:
+    """A CDC drain reads the log, not the table, on every engine — proven against the
+    server's own table-level counters (live_cdc_harm)."""
+    _run_live_modules(led, "cdc_harm", "cdc harm",
+                      "a CDC drain costs the source a fraction of one scan (live_cdc_harm)",
+                      ["live_cdc_harm"])
 
 
 def verify_partition_footer(led: Ledger) -> None:
@@ -1822,7 +1835,7 @@ def verify_partition_footer(led: Ledger) -> None:
 
 
 def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
-                      modules: list[str]) -> None:
+                      modules: list[str], env: dict[str, str] | None = None) -> None:
     """Run live_suite `modules` through the gate binary; one ledger row per test case."""
     led.phase(f"{label} · {phase}")
     if not have("cargo"):
@@ -1833,7 +1846,7 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
          "-E", " | ".join(f"test(/^{m}::/)" for m in modules)],
-        env=release_bin_env(),
+        env={**release_bin_env(), **(env or {})},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)

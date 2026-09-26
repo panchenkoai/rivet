@@ -991,13 +991,15 @@ impl MssqlSource {
     /// the run.
     pub(crate) fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
         let Self { rt, client, .. } = self;
-        // Lock waits, plus the buffer pool's logical and physical page reads and the
-        // work tables/files a sort or hash spills to tempdb — the SQL Server analogues of
-        // the other engines' rows-read and temp-spill counters. All cumulative.
+        // Lock waits; logical reads of every completed query (dm_exec_query_stats, updated
+        // as each query finishes); the buffer pool's page lookups/reads and the work
+        // tables/files a sort or hash spills to tempdb — performance counters SQL Server
+        // refreshes about once a second, so a sub-second run records 0 for those.
         let sql = "SELECT (SELECT SUM(waiting_tasks_count) FROM sys.dm_os_wait_stats \
                            WHERE wait_type LIKE 'LCK%'), \
                           (SELECT SUM(wait_time_ms) FROM sys.dm_os_wait_stats \
                            WHERE wait_type LIKE 'LCK%'), \
+                          (SELECT SUM(total_logical_reads) FROM sys.dm_exec_query_stats), \
                           SUM(CASE WHEN RTRIM(counter_name) = 'Page lookups/sec' \
                                AND object_name LIKE '%Buffer Manager%' THEN cntr_value END), \
                           SUM(CASE WHEN RTRIM(counter_name) = 'Page reads/sec' \
@@ -1012,6 +1014,7 @@ impl MssqlSource {
             let names = [
                 "mssql_lock_waits",
                 "mssql_lock_wait_ms",
+                "mssql_logical_reads",
                 "mssql_page_lookups",
                 "mssql_page_reads",
                 "mssql_worktables_created",

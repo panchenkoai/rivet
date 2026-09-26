@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **The release gate now grades what rivet costs the source database.** It compared wall time
+  and memory with the previous release, never the load on the source. A new stage exports the
+  same table with both binaries on every engine and fails if rows scanned or temp spills grow
+  past the previous release. Harm now also records PostgreSQL logical-decoding spill and decoded
+  bytes and SQL Server logical reads and tempdb work tables. A live test proves on every engine
+  that a CDC drain reads the change log and not the table.
 - **Breaking: `chunk_dense` is removed.** It paged by `ROW_NUMBER() OVER (ORDER BY
   chunk_column)`, recomputed per chunk, so a concurrent insert or delete skipped or
   duplicated rows even on a unique key. Nobody used it. A config that still sets
