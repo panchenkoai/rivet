@@ -729,7 +729,7 @@
           "default": null
         },
         "max_file_size": {
-          "description": "Rotate to a new part when the current file reaches this size.\nAccepts `B`/`KB`/`MB`/`GB` (case-insensitive) or a bare byte count;\na fractional value is allowed (`1.5GB`). Units are binary (IEC-style):\n`KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`.",
+          "description": "Rotate to a new part when the current file reaches this size.\nAccepts `B`/`KB`/`MB`/`GB` (case-insensitive) or a bare byte count;\na fractional value is allowed (`1.5GB`). Units are binary (IEC-style):\n`KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`.\nParquet row groups are capped at a quarter of it, so a part stays within\nabout one row group of the size whatever `parquet.row_group_strategy` says.",
           "type": [
             "string",
             "null"
