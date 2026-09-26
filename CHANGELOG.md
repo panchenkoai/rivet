@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Parallel keyset incremental no longer skips text keys the source collation ranks higher.**
+  Whether anything lay past the anchor was decided by a byte compare in rivet while the source
+  orders by its collation: on an `en_US` database 500 new keys `C…` after an anchor `b…` read as
+  "nothing new" and the run exported 0 of them with status success. The source now answers the
+  question itself (`MAX(key) … WHERE key > anchor`).
 - **`cleanup_source` no longer deletes parts an extract committed during the load.** The load
   checked for a running extract before appending, then deleted the whole prefix after it; an
   extract that started and committed in between lost its parts after the source position had
