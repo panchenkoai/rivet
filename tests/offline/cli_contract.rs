@@ -421,3 +421,29 @@ fn version_names_the_commit_beside_the_semver() {
     );
     assert_ne!(sha, "", "{out}");
 }
+
+/// `init --mode cdc` on Oracle refuses before connecting, in the config loader's own words, instead of writing a scaffold every later command refuses.
+#[test]
+fn init_refuses_oracle_cdc_before_writing_a_scaffold() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("r.yaml");
+    let (code, _out, err) = run(&[
+        "init",
+        "--source",
+        "oracle://u:p@127.0.0.1:1/X",
+        "--table",
+        "T",
+        "--mode",
+        "cdc",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains(
+            "init: `mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or `incremental`"
+        ),
+        "{err}"
+    );
+    assert!(!out.exists(), "no scaffold is written");
+}

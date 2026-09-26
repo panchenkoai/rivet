@@ -309,16 +309,18 @@ pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Op
     }
 }
 
+/// The catalog name Oracle resolves one identifier part to: unquoted folds upper-case, double-quoted stays verbatim.
+pub(crate) fn oracle_catalog_name(part: &str) -> String {
+    match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+        Some(quoted) => quoted.to_string(),
+        None => part.to_uppercase(),
+    }
+}
+
 /// `(owner, table)` catalog literals for an Oracle `[owner.]table`: an unquoted
 /// part folds upper-case as Oracle resolves it, a double-quoted part stays verbatim.
 pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
-    let lit = |part: &str| {
-        let name = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-            Some(quoted) => quoted.to_string(),
-            None => part.to_uppercase(),
-        };
-        format!("'{}'", name.replace('\'', "''"))
-    };
+    let lit = |part: &str| format!("'{}'", oracle_catalog_name(part).replace('\'', "''"));
     match qualified.rsplit_once('.') {
         Some((owner, table)) => (lit(owner), lit(table)),
         None => (

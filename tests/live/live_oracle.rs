@@ -1516,3 +1516,175 @@ fn check_reads_a_query_cursor_range_from_the_query() {
         want[0][1].as_deref()
     );
 }
+
+/// `rivet init <init_args> -o rivet.yaml` then `rivet run`, both asserted green; returns the dir and the scaffold.
+fn init_and_run(init_args: &[&str]) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let env = [("ORACLE_URL", ORACLE_URL)];
+    let mut args = vec!["init", "--source-env", "ORACLE_URL"];
+    args.extend_from_slice(init_args);
+    args.extend_from_slice(&["-o", "rivet.yaml"]);
+    let init = run_rivet_in_dir(dir.path(), &args, &env);
+    assert!(
+        init.status.success(),
+        "init:\n{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let yaml = std::fs::read_to_string(dir.path().join("rivet.yaml")).unwrap();
+    let run = run_rivet_in_dir(dir.path(), &["run", "-c", "rivet.yaml"], &env);
+    assert!(
+        run.status.success(),
+        "run:\n{}\n{yaml}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    (dir, yaml)
+}
+
+/// A mixed-case table with an upper-case twin: init's config must read the mixed-case table, not the twin Oracle folds an unquoted name to.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_on_a_mixed_case_table_reads_it_not_its_upper_case_twin() {
+    require_alive(LiveService::Oracle);
+    let base = unique_name("ora_mx").to_uppercase();
+    let (mixed_name, twin_name) = (format!("{base}_Mx"), format!("{base}_MX"));
+    let cols = "id NUMBER(10) PRIMARY KEY, v VARCHAR2(10) NOT NULL";
+    let mixed = OracleTable::create_exact(&mixed_name, cols);
+    let twin = OracleTable::create_exact(&twin_name, cols);
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, 'MIXED' FROM dual CONNECT BY LEVEL <= 3",
+        mixed.name()
+    ));
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, 'TWIN' FROM dual CONNECT BY LEVEL <= 5",
+        twin.name()
+    ));
+    let table_arg = format!("RIVET.\"{mixed_name}\"");
+    let (dir, yaml) = init_and_run(&["--table", &table_arg, "--mode", "chunked"]);
+    let out = dir.path().join("output").join(&mixed_name);
+    assert_eq!(
+        duckdb_total_parquet_rows(&out),
+        3,
+        "the mixed-case table's rows:\n{yaml}"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(&out, "count(*)", Some("\"V\" = 'MIXED'")),
+        3,
+        "no row from the twin:\n{yaml}"
+    );
+}
+
+/// Oracle INTEGER (NUMBER, precision NULL, scale 0) is a keyset key and exports its 38-digit values, not a decimal(38,18) override.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_keysets_an_integer_pk_and_exports_a_38_digit_integer() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_int", "id INTEGER PRIMARY KEY, c_int INTEGER");
+    let nines = "9".repeat(38);
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, CASE WHEN LEVEL = 1 THEN {nines} ELSE LEVEL END \
+         FROM dual CONNECT BY LEVEL <= 300",
+        t.name()
+    ));
+    let (dir, yaml) = init_and_run(&["--table", t.name(), "--mode", "chunked"]);
+    assert!(
+        yaml.contains("chunk_by_key: ID"),
+        "keyset on the INTEGER PK:\n{yaml}"
+    );
+    assert!(
+        !yaml.contains("decimal(38,18)"),
+        "no scaled override:\n{yaml}"
+    );
+    let out = dir.path().join("output").join(t.name());
+    assert_eq!(duckdb_dir_scalar(&out, "count(DISTINCT \"ID\")", None), 300);
+    assert_eq!(
+        duckdb_dir_scalar(
+            &out,
+            "count(*)",
+            Some(&format!("CAST(\"C_INT\" AS VARCHAR) = '{nines}'"))
+        ),
+        1,
+        "the 38-digit value survives exactly"
+    );
+    assert_eq!(
+        duckdb_dir_scalar(
+            &out,
+            "count(*)",
+            Some("typeof(\"C_INT\") = 'DECIMAL(38,0)'")
+        ),
+        300,
+        "the driver describes INTEGER as NUMBER(38,0), so the batch path types it decimal(38,0)"
+    );
+}
+
+/// A never-analyzed table (NUM_ROWS NULL) is counted, not read as empty: 150K rows scaffold `chunked`.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_counts_a_never_analyzed_table_instead_of_calling_it_empty() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_unan", "id NUMBER(10) PRIMARY KEY, v VARCHAR2(20)");
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, 'v' || LEVEL FROM dual CONNECT BY LEVEL <= 150000",
+        t.name()
+    ));
+    let stats = ora_text_rows(&format!(
+        "SELECT NVL(TO_CHAR(num_rows), 'NULL') FROM user_tables WHERE table_name = '{}'",
+        t.name()
+    ));
+    assert_eq!(
+        stats,
+        vec![vec![Some("NULL".to_string())]],
+        "fixture: no stats"
+    );
+    let (dir, yaml) = init_and_run(&["--table", t.name()]);
+    assert!(yaml.contains("(~150K rows)"), "counted estimate:\n{yaml}");
+    assert!(
+        yaml.contains("mode: chunked"),
+        "past the 100K threshold:\n{yaml}"
+    );
+    let out = dir.path().join("output").join(t.name());
+    assert_eq!(duckdb_total_parquet_rows(&out), 150_000);
+}
+
+/// `init --table <synonym>` introspects the synonym's base table and the scaffold reads it.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_follows_a_synonym_to_its_base_table() {
+    require_alive(LiveService::Oracle);
+    struct DropSyn(String);
+    impl Drop for DropSyn {
+        fn drop(&mut self) {
+            let _ = ora_conn().execute(&format!("DROP SYNONYM {}", self.0), &[]);
+        }
+    }
+    let t = seed_oracle_numeric_table(40);
+    let syn = unique_name("ora_syn").to_uppercase();
+    ora_exec(&format!("CREATE SYNONYM {syn} FOR {}", t.name()));
+    let _guard = DropSyn(syn.clone());
+    let (dir, yaml) = init_and_run(&["--table", &syn, "--mode", "chunked"]);
+    assert!(
+        yaml.contains(&format!("table: RIVET.{}", t.name())),
+        "the scaffold reads the base table:\n{yaml}"
+    );
+    let out = dir.path().join("output").join(t.name());
+    assert_eq!(duckdb_dir_scalar(&out, "count(DISTINCT \"ID\")", None), 40);
+}
+
+/// `--schema` / `--table` / `--include` typed lower-case resolve as Oracle folds an unquoted name.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_folds_lower_case_cli_names_like_oracle_does() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(25);
+    let lower = t.name().to_lowercase();
+    let (dir, _) = init_and_run(&["--schema", "rivet", "--table", &lower]);
+    assert_eq!(
+        duckdb_total_parquet_rows(&dir.path().join("output").join(t.name())),
+        25
+    );
+    let (dir, yaml) = init_and_run(&["--schema", "rivet", "--include", &lower]);
+    assert!(yaml.contains(&format!("name: {}", t.name())), "{yaml}");
+    assert_eq!(
+        duckdb_total_parquet_rows(&dir.path().join("output").join(t.name())),
+        25
+    );
+}

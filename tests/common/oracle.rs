@@ -79,6 +79,13 @@ impl OracleTable {
         Self(name)
     }
 
+    /// Create a table whose catalog name is exactly `name` (quoted, so a mixed case survives); `name()` returns it quoted.
+    pub fn create_exact(name: &str, columns: &str) -> Self {
+        let quoted = format!("\"{name}\"");
+        ora_exec(&format!("CREATE TABLE {quoted} ({columns})"));
+        Self(quoted)
+    }
+
     pub fn name(&self) -> &str {
         &self.0
     }

@@ -272,33 +272,41 @@ impl TableInfo {
                     None => base,
                 }
             }
-            "incremental" => match self.chosen_cursor_column() {
-                Some(cursor) => format!(
-                    "auto: ~{} rows {}; chunk column missing, falling back to \
-                     incremental on '{cursor}'",
-                    fmt_row_estimate(self.row_estimate),
-                    if self.row_estimate > 100_000 {
-                        "≥ 100K threshold"
-                    } else {
-                        "below the 100K threshold"
-                    },
-                ),
-                // No timestamp candidate: do NOT name a phantom `updated_at` —
-                // the scaffold emits a REVIEW marker here, so the rationale must
-                // agree (roast 2026-08-09).
-                None => format!(
-                    "auto: ~{} rows ≥ 100K threshold; chunk column missing — set cursor_column \
-                     manually (no timestamp column detected)",
-                    fmt_row_estimate(self.row_estimate),
-                ),
-            },
+            "incremental" => {
+                let on = match self.chosen_cursor_column() {
+                    Some(cursor) => format!("incremental on '{cursor}'"),
+                    // No timestamp candidate: do NOT name a phantom `updated_at` —
+                    // the scaffold emits a REVIEW marker here, so the rationale must
+                    // agree (roast 2026-08-09).
+                    None => "incremental — set cursor_column manually (no timestamp column \
+                             detected)"
+                        .to_string(),
+                };
+                match self.overridden_from(mode) {
+                    Some(auto) => format!(
+                        "~{} rows {}; auto would pick `{auto}`, written as {on}",
+                        fmt_row_estimate(self.row_estimate),
+                        threshold_phrase(self.row_estimate),
+                    ),
+                    None => format!(
+                        "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to {on}",
+                        fmt_row_estimate(self.row_estimate),
+                    ),
+                }
+            }
             "full" => {
                 // full is reached TWO ways: below the 100K threshold, OR above it
                 // with no usable chunk key / cursor column (e.g. a keyless table, or
                 // a Mongo collection whose `_id` isn't surfaced as a chunk key). The
                 // message must say WHICH — claiming "below 100K" on a 150K table is a
                 // false diagnostic that hides the real reason (no key to page by).
-                if self.row_estimate > 100_000 {
+                if let Some(auto) = self.overridden_from(mode) {
+                    format!(
+                        "~{} rows {}; auto would pick `{auto}`, written as a full scan",
+                        fmt_row_estimate(self.row_estimate),
+                        threshold_phrase(self.row_estimate),
+                    )
+                } else if self.row_estimate > 100_000 {
                     format!(
                         "auto: ~{} rows ≥ 100K but no chunk key or cursor column available — full scan",
                         fmt_row_estimate(self.row_estimate),
@@ -312,6 +320,12 @@ impl TableInfo {
             }
             _ => format!("mode={mode}"),
         }
+    }
+
+    /// `suggest_mode`'s pick when `mode` differs from it (a `--mode` override or a recipe), else `None`.
+    pub(crate) fn overridden_from(&self, mode: &str) -> Option<&'static str> {
+        let auto = self.suggest_mode();
+        (auto != mode).then_some(auto)
     }
 
     /// Default chunk_size scaled by the row estimate. Goal: keep the
@@ -368,6 +382,15 @@ impl TableInfo {
     /// Enumerate chunk candidates (integer-typed columns, PK preferred).
     pub(crate) fn chunk_candidates(&self) -> Vec<ChunkCandidate> {
         candidates::chunk_candidates(self)
+    }
+}
+
+/// Where `rows` sits against the 100K chunked threshold, as rationale text.
+fn threshold_phrase(rows: i64) -> &'static str {
+    if rows > 100_000 {
+        "≥ 100K threshold"
+    } else {
+        "below the 100K threshold"
     }
 }
 
@@ -574,6 +597,16 @@ impl TableFilter {
             return false;
         }
         self.include.is_empty() || self.include.iter().any(|g| glob_match(g, name))
+    }
+
+    /// [`matches`](Self::matches) ignoring case, for Oracle, where an unquoted name folds upper-case.
+    pub(super) fn matches_folded(&self, name: &str) -> bool {
+        let up = |v: &[String]| v.iter().map(|g| g.to_uppercase()).collect();
+        TableFilter {
+            include: up(&self.include),
+            exclude: up(&self.exclude),
+        }
+        .matches(&name.to_uppercase())
     }
 }
 
@@ -1000,7 +1033,11 @@ fn introspect_single_table(
         "oracle" => {
             let mut conn = oracle::connect(source_url, tls)?;
             let owner = oracle::resolve_schema(&mut conn, eff_schema.as_deref())?;
-            oracle::introspect(&mut conn, &owner, table_name)?
+            oracle::introspect(
+                &mut conn,
+                &owner,
+                &crate::sql::oracle_catalog_name(table_name),
+            )?
         }
         "mongo" => {
             // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
@@ -1014,6 +1051,12 @@ fn introspect_single_table(
         }
         _ => unreachable!(),
     })
+}
+
+/// The config loader's refusal of `mode` on `source_type`, when it would refuse the scaffold init is about to write.
+fn mode_refusal(source_type: &str, mode: Option<&str>) -> Option<&'static str> {
+    (source_type == "oracle" && mode == Some("cdc"))
+        .then_some(crate::config::ORACLE_CDC_UNSUPPORTED)
 }
 
 /// MongoDB has no schema namespace (collections live directly in a database), so
@@ -1042,6 +1085,9 @@ fn init_yaml(
     filter: &TableFilter,
     mode_override: Option<&str>,
 ) -> Result<(String, bool, Vec<crate::state::StrategySnapshot>)> {
+    if let Some(why) = mode_refusal(source_type(source_url)?, mode_override) {
+        anyhow::bail!("init: {why}");
+    }
     if let Some(t) = table {
         let info = introspect_single_table(tls, source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
@@ -1376,7 +1422,8 @@ fn introspect_all(
         "oracle" => {
             let mut conn = oracle::connect(source_url, tls)?;
             let owner = oracle::resolve_schema(&mut conn, schema)?;
-            let names = retain_filtered(oracle::list_tables(&mut conn, &owner)?, filter);
+            let mut names = oracle::list_tables(&mut conn, &owner)?;
+            names.retain(|n| filter.matches_folded(n));
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 if let Some(info) = scan_step(oracle::introspect(&mut conn, &owner, &n))? {
@@ -2111,6 +2158,39 @@ mod tests {
             "150K must not say below 100K: {r}"
         );
         assert!(r.contains("no chunk key"), "must name the real reason: {r}");
+    }
+
+    #[test]
+    fn a_forced_mode_rationale_names_the_override_not_the_auto_reasons() {
+        let small_keyed = make_table(
+            900,
+            vec![
+                col("id", "bigint", true),
+                col("updated_at", "timestamp", false),
+            ],
+        );
+        assert_eq!(
+            small_keyed.mode_rationale("incremental"),
+            "~900 rows below the 100K threshold; auto would pick `full`, written as \
+             incremental on 'updated_at'"
+        );
+        let small_no_cursor = make_table(900, vec![col("label", "text", false)]);
+        assert_eq!(
+            small_no_cursor.mode_rationale("incremental"),
+            "~900 rows below the 100K threshold; auto would pick `full`, written as \
+             incremental — set cursor_column manually (no timestamp column detected)"
+        );
+        let big_keyed = make_table(500_000, vec![col("id", "bigint", true)]);
+        assert_eq!(
+            big_keyed.mode_rationale("full"),
+            "~500K rows ≥ 100K threshold; auto would pick `chunked`, written as a full scan"
+        );
+        let big_cursor_only = make_table(500_000, vec![col("updated_at", "timestamp", false)]);
+        assert_eq!(
+            big_cursor_only.mode_rationale("incremental"),
+            "auto: ~500K rows ≥ 100K threshold; chunk column missing, falling back to \
+             incremental on 'updated_at'"
+        );
     }
 
     #[test]
@@ -2956,6 +3036,33 @@ mod tests {
         assert_eq!(mssql_table_schema("public"), "dbo");
         // An explicitly-qualified schema is honoured verbatim.
         assert_eq!(mssql_table_schema("sales"), "sales");
+    }
+
+    #[test]
+    fn init_refuses_oracle_cdc_with_the_loaders_exact_words() {
+        assert_eq!(
+            mode_refusal("oracle", Some("cdc")),
+            Some(
+                "`mode: cdc` is not supported for Oracle yet — use `mode: full`, `chunked` or \
+                 `incremental`"
+            )
+        );
+        assert_eq!(mode_refusal("oracle", Some("chunked")), None);
+        assert_eq!(mode_refusal("oracle", None), None);
+        assert_eq!(mode_refusal("postgres", Some("cdc")), None);
+    }
+
+    #[test]
+    fn an_oracle_include_glob_matches_whatever_case_it_is_typed_in() {
+        let f = TableFilter {
+            include: vec!["bh2_sk_i*".into()],
+            exclude: vec!["*_tmp".into()],
+        };
+        assert!(f.matches_folded("BH2_SK_IOT"));
+        assert!(f.matches_folded("BH2_SK_Iot"));
+        assert!(!f.matches_folded("BH2_SK_IOT_TMP"));
+        assert!(!f.matches_folded("BH2_SK_NUM"));
+        assert!(!f.matches("BH2_SK_IOT"), "the plain matcher stays exact");
     }
 
     #[test]

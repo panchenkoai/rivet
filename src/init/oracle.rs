@@ -26,7 +26,7 @@ pub(super) fn resolve_schema(conn: &mut OracleSource, schema: Option<&str>) -> R
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "public")
     {
-        Some(s) => Ok(s.to_string()),
+        Some(s) => Ok(crate::sql::oracle_catalog_name(s)),
         None => current_schema(conn),
     }
 }
@@ -44,15 +44,115 @@ pub(super) fn list_tables(conn: &mut OracleSource, schema: &str) -> Result<Vec<S
     ))
 }
 
+/// Introspect `schema.table` (catalog-exact names); a private or PUBLIC synonym is followed to its local base table.
 pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> Result<TableInfo> {
+    let mut columns = columns_of(conn, schema, table)?;
+    let (mut schema, mut table) = (schema.to_string(), table.to_string());
+    if columns.is_empty()
+        && let Some((base_owner, base_table)) = synonym_target(conn, &schema, &table)?
+    {
+        columns = columns_of(conn, &base_owner, &base_table)?;
+        if columns.is_empty() {
+            anyhow::bail!(
+                "Table '{schema}.{table}' not found or has no columns: it is a synonym for \
+                 '{base_owner}.{base_table}', which the user cannot read (or which does not exist)."
+            );
+        }
+        eprintln!(
+            "rivet: note: '{schema}.{table}' is a synonym for '{base_owner}.{base_table}' — the \
+             config reads the base table"
+        );
+        (schema, table) = (base_owner, base_table);
+    }
+    if columns.is_empty() {
+        anyhow::bail!(
+            "Table '{schema}.{table}' not found or has no columns. Oracle stores unquoted \
+             names upper-case — check the spelling, and that the user can SELECT it."
+        );
+    }
+    let (owner, name) = (lit(&schema), lit(&table));
+    let stats = conn.query_scalar(&format!(
+        "SELECT NVL(TO_CHAR(num_rows), 'NULL') FROM all_tables \
+         WHERE owner = '{owner}' AND table_name = '{name}'"
+    ))?;
+    let mut density = None;
+    let row_estimate = match stats.as_deref() {
+        Some("NULL") => {
+            let counted = conn
+                .query_scalar(&capped_count_sql(&schema, &table))?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let probe = unanalyzed_estimate(counted);
+            let rows = probe.rows;
+            density = Some(probe);
+            rows
+        }
+        other => other
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0),
+    };
+    Ok(TableInfo {
+        density,
+        schema,
+        table,
+        row_estimate,
+        total_bytes: None,
+        columns,
+    })
+}
+
+/// Rows a never-analyzed table's estimate counts up to: past the 100K mode threshold, cheap to read.
+const UNANALYZED_COUNT_CAP: i64 = 1_000_000;
+
+/// A `COUNT(*)` that stops reading at [`UNANALYZED_COUNT_CAP`] rows.
+fn capped_count_sql(schema: &str, table: &str) -> String {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM {}.{} WHERE ROWNUM <= {UNANALYZED_COUNT_CAP})",
+        q(schema),
+        q(table)
+    )
+}
+
+/// The estimate for a table with no optimizer stats: an exact count below the cap, a floor marked unverified at it.
+fn unanalyzed_estimate(counted: i64) -> crate::init::density::DensityProbe {
+    use crate::init::density::{DensityProbe, EstimateMethod};
+    DensityProbe {
+        rows: counted,
+        density: 0.0,
+        method: if counted < UNANALYZED_COUNT_CAP {
+            EstimateMethod::Counted
+        } else {
+            EstimateMethod::Unverified
+        },
+        catalog_rows: 0,
+        k: 0,
+        w: 0,
+    }
+}
+
+/// The local `(owner, table)` a synonym `schema.name` (private first, then PUBLIC) points at.
+fn synonym_target(
+    conn: &mut OracleSource,
+    schema: &str,
+    name: &str,
+) -> Result<Option<(String, String)>> {
+    let rows = conn.query_rows(&format!(
+        "SELECT table_owner, table_name FROM all_synonyms \
+         WHERE synonym_name = '{}' AND owner IN ('{}', 'PUBLIC') AND db_link IS NULL \
+         ORDER BY CASE owner WHEN 'PUBLIC' THEN 1 ELSE 0 END",
+        lit(name),
+        lit(schema)
+    ))?;
+    Ok(rows.into_iter().next().and_then(|r| match r.as_slice() {
+        [Some(o), Some(t)] => Some((o.clone(), t.clone())),
+        _ => None,
+    }))
+}
+
+fn columns_of(conn: &mut OracleSource, schema: &str, table: &str) -> Result<Vec<ColumnInfo>> {
     let (owner, name) = (lit(schema), lit(table));
-    let row_estimate = conn
-        .query_scalar(&format!(
-            "SELECT NVL(num_rows, 0) FROM all_tables WHERE owner = '{owner}' AND table_name = '{name}'"
-        ))?
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0)
-        .max(0);
     let columns_sql = format!(
         "SELECT c.column_name, c.data_type, \
              CASE WHEN pk.column_name IS NULL THEN '0' ELSE '1' END, \
@@ -70,25 +170,11 @@ pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> 
          WHERE c.owner = '{owner}' AND c.table_name = '{name}' \
          ORDER BY c.column_id"
     );
-    let columns: Vec<ColumnInfo> = conn
+    Ok(conn
         .query_rows(&columns_sql)?
         .iter()
         .filter_map(|r| column_info(r))
-        .collect();
-    if columns.is_empty() {
-        anyhow::bail!(
-            "Table '{schema}.{table}' not found or has no columns. Oracle stores unquoted \
-             names upper-case — check the spelling, and that the user can SELECT it."
-        );
-    }
-    Ok(TableInfo {
-        density: None,
-        schema: schema.to_string(),
-        table: table.to_string(),
-        row_estimate,
-        total_bytes: None,
-        columns,
-    })
+        .collect())
 }
 
 /// One catalog row `(name, type, is_pk, is_indexed, nullable, precision, scale)`.
@@ -112,13 +198,13 @@ fn column_info(f: &[Option<String>]) -> Option<ColumnInfo> {
 }
 
 /// An Oracle catalog type in the vocabulary init's classifiers read: an integer
-/// NUMBER(p<=18,0) is `bigint` (range-chunkable), a bare or wider integer NUMBER is
+/// NUMBER(p<=18,0) is `bigint` (range-chunkable), a bare, INTEGER (precision NULL, scale 0) or wider integer NUMBER is
 /// `number` (keysettable, never range-chunked), a scaled NUMBER is `numeric`, and DATE — which carries
 /// the time to the second — is `datetime`, not the day-coarse `date`.
 fn catalog_type(data_type: &str, precision: Option<u32>, scale: Option<i32>) -> String {
     match (data_type, precision, scale) {
         ("NUMBER", Some(p), Some(0)) if p <= 18 => "bigint".into(),
-        ("NUMBER", None, None) | ("NUMBER", Some(_), Some(0)) => "number".into(),
+        ("NUMBER", None, None) | ("NUMBER", _, Some(0)) => "number".into(),
         ("NUMBER", _, _) => "numeric".into(),
         ("DATE", _, _) => "datetime".into(),
         ("BINARY_FLOAT", _, _) => "real".into(),
@@ -136,6 +222,7 @@ mod tests {
         assert_eq!(catalog_type("NUMBER", Some(10), Some(0)), "bigint");
         assert_eq!(catalog_type("NUMBER", Some(19), Some(0)), "number");
         assert_eq!(catalog_type("NUMBER", None, None), "number");
+        assert_eq!(catalog_type("NUMBER", None, Some(0)), "number", "INTEGER");
         assert_eq!(catalog_type("NUMBER", Some(12), Some(2)), "numeric");
         assert_eq!(catalog_type("DATE", None, None), "datetime");
         assert_eq!(catalog_type("TIMESTAMP(6)", None, Some(6)), "timestamp(6)");
@@ -143,6 +230,25 @@ mod tests {
         assert!(!super::super::is_coarse_stamp_type(&catalog_type(
             "DATE", None, None
         )));
+    }
+
+    #[test]
+    fn a_never_analyzed_table_is_counted_up_to_a_cap_and_marked_unverified_there() {
+        use crate::init::density::EstimateMethod;
+        let below = unanalyzed_estimate(150_000);
+        assert_eq!(
+            (below.rows, below.method),
+            (150_000, EstimateMethod::Counted)
+        );
+        let at = unanalyzed_estimate(UNANALYZED_COUNT_CAP);
+        assert_eq!(
+            (at.rows, at.method),
+            (UNANALYZED_COUNT_CAP, EstimateMethod::Unverified)
+        );
+        assert_eq!(
+            capped_count_sql("RIVET", "Big\"T"),
+            "SELECT COUNT(*) FROM (SELECT 1 FROM \"RIVET\".\"Big\"\"T\" WHERE ROWNUM <= 1000000)"
+        );
     }
 
     #[test]
