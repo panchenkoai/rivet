@@ -315,6 +315,108 @@ pub(crate) struct Resume {
     /// True when that LSN is an ANCHOR (nothing was captured from it) rather
     /// than a flushed resume position.
     pub from_is_pin: bool,
+    /// The database identity the checkpoint recorded, when it recorded one.
+    pub identity: Option<DbIdentity>,
+}
+
+/// A database's log lineage: `family_guid` names the database, `recovery_fork_guid`
+/// the history since its last restore. Both are shared by an availability group's
+/// replicas (measured), so a checkpoint follows a failover and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DbIdentity {
+    pub family: String,
+    pub fork: String,
+}
+
+impl DbIdentity {
+    /// Read from a checkpoint's JSON; `None` when it predates identity recording.
+    fn from_checkpoint(pos: &crate::source::cdc::Position) -> Option<Self> {
+        let get = |k| pos.0.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        Some(Self {
+            family: get("family_guid")?,
+            fork: get("recovery_fork_guid")?,
+        })
+    }
+}
+
+/// What a resume may do given the checkpoint's recorded identity and the server's.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IdentityVerdict {
+    Ok,
+    /// Resume proceeds, but nothing could be verified; the text says why.
+    Warn(String),
+    /// Resume is refused; the text says why and how to recover.
+    Refuse(String),
+}
+
+/// Judge a resume: another database's LSNs, or a log rewound by a restore, are refused.
+pub(crate) fn identity_verdict(
+    checkpoint: Option<&DbIdentity>,
+    server: Option<&DbIdentity>,
+) -> IdentityVerdict {
+    const RECOVER: &str = "Delete the checkpoint to start CDC from a fresh anchor FIRST, then \
+         re-snapshot the table (mode: full): snapshotting first leaves the changes in between \
+         in neither.";
+    match (checkpoint, server) {
+        (None, _) => IdentityVerdict::Warn(
+            "mssql cdc: this checkpoint carries no database identity (it predates rivet \
+             recording one), so rivet cannot confirm it belongs to this database. LSNs are \
+             positions in ONE database's log; if the source moved, resuming skips changes."
+                .into(),
+        ),
+        (Some(_), None) => IdentityVerdict::Warn(
+            "mssql cdc: this login cannot read sys.database_recovery_status for the \
+             database, so rivet cannot confirm the checkpoint belongs to it."
+                .into(),
+        ),
+        (Some(c), Some(s)) if c.family != s.family => IdentityVerdict::Refuse(format!(
+            "mssql cdc: this checkpoint was written against a different database (family \
+             {}, the connection's is {}). LSNs are positions in one database's log: \
+             resuming here would start at an arbitrary point in another log and skip \
+             whatever lies below it, silently. {RECOVER}",
+            c.family, s.family
+        )),
+        (Some(c), Some(s)) if c.fork != s.fork => IdentityVerdict::Refuse(format!(
+            "mssql cdc: this database was restored from a backup since the checkpoint was \
+             written (recovery fork {} is now {}). The log was rewound: changes the \
+             checkpoint already covers may no longer exist in the source, and the \
+             destination still holds them. {RECOVER}",
+            c.fork, s.fork
+        )),
+        _ => IdentityVerdict::Ok,
+    }
+}
+
+/// The connected database's identity, or `None` when the login cannot see it.
+async fn db_identity(client: &mut Client<Compat<TcpStream>>) -> Result<Option<DbIdentity>> {
+    let row = client
+        .query(
+            "SELECT CONVERT(varchar(36), family_guid), CONVERT(varchar(36), recovery_fork_guid) \
+             FROM sys.database_recovery_status WHERE database_id = DB_ID()",
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?;
+    Ok(row.and_then(|r| {
+        Some(DbIdentity {
+            family: r.get::<&str, _>(0)?.to_string(),
+            fork: r.get::<&str, _>(1)?.to_string(),
+        })
+    }))
+}
+
+/// `position` with the database identity added, as a checkpoint records it.
+fn with_identity(
+    position: &crate::source::cdc::Position,
+    id: Option<&DbIdentity>,
+) -> crate::source::cdc::Position {
+    let mut v = position.0.clone();
+    if let (Some(id), Some(o)) = (id, v.as_object_mut()) {
+        o.insert("family_guid".into(), id.family.clone().into());
+        o.insert("recovery_fork_guid".into(), id.fork.clone().into());
+    }
+    crate::source::cdc::Position(v)
 }
 
 /// Read a resume position out of a checkpoint that has already PARSED.
@@ -350,6 +452,7 @@ pub(crate) fn resume_from_checkpoint(
         return Ok(Resume {
             from_lsn: None,
             from_is_pin: false,
+            identity: None,
         });
     };
     let from_lsn = pos
@@ -375,6 +478,7 @@ pub(crate) fn resume_from_checkpoint(
             .get("pinned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        identity: DbIdentity::from_checkpoint(pos),
     })
 }
 
@@ -398,6 +502,8 @@ pub(crate) struct MssqlCdcConfig {
     /// the instance's start; a resume position below `@min` is retention loss and
     /// must THROW. See `fill_sql`.
     pub from_is_pin: bool,
+    /// The identity the checkpoint recorded; checked against the server at open.
+    pub checkpoint_identity: Option<DbIdentity>,
 }
 
 /// Polls a CDC change table and yields canonical changes.
@@ -427,6 +533,7 @@ pub(crate) fn source_object_of_capture_instance(
         capture_instance: capture_instance.to_string(),
         from_lsn: None,
         from_is_pin: false,
+        checkpoint_identity: None,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -557,6 +664,8 @@ pub(crate) struct MssqlChangeStream {
     from_lsn: Option<String>,
     /// See `MssqlCdcConfig::from_is_pin`.
     from_is_pin: bool,
+    /// The database's identity at open, recorded into every checkpoint.
+    identity: Option<DbIdentity>,
     pending: VecDeque<ChangeEvent>,
     /// Where an oversized poll batch's tail goes. SQL Server's "stream" is a query
     /// result set — there is no wire to keep — so the tail is written through the
@@ -616,6 +725,14 @@ impl MssqlChangeStream {
             .enable_all()
             .build()?;
         let mut client = rt.block_on(connect(cfg, tls))?;
+        let identity = rt.block_on(db_identity(&mut client))?;
+        if cfg.from_lsn.is_some() {
+            match identity_verdict(cfg.checkpoint_identity.as_ref(), identity.as_ref()) {
+                IdentityVerdict::Refuse(why) => anyhow::bail!("{why}"),
+                IdentityVerdict::Warn(why) => log::warn!("{why}"),
+                IdentityVerdict::Ok => {}
+            }
+        }
 
         // Resolve the REAL schema/table from cdc.change_tables metadata. The
         // previous `<schema>_<table>` name heuristic silently mis-tagged every
@@ -730,6 +847,7 @@ impl MssqlChangeStream {
             table,
             from_lsn: cfg.from_lsn.clone(),
             from_is_pin: cfg.from_is_pin,
+            identity,
             pending: VecDeque::new(),
             // Overridden by `from_url`, which knows the checkpoint's location.
             // Overridden by `from_url`, the production constructor.
@@ -775,6 +893,7 @@ impl MssqlChangeStream {
                 capture_instance: capture_instance.to_string(),
                 from_lsn: resume.from_lsn,
                 from_is_pin: resume.from_is_pin,
+                checkpoint_identity: resume.identity,
             },
             tls,
             peek,
@@ -1043,6 +1162,13 @@ impl ChangeStream for MssqlChangeStream {
         .then(|| (self.schema.clone(), self.table.clone()))
     }
 
+    fn checkpoint_of(
+        &self,
+        position: &crate::source::cdc::Position,
+    ) -> crate::source::cdc::Position {
+        with_identity(position, self.identity.as_ref())
+    }
+
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
         // Refill a bounded batch whenever the buffer drains, advancing the cursor
         // each time, until a poll returns nothing (window drained to the max LSN).
@@ -1264,7 +1390,29 @@ pub(crate) fn pin_checkpoint_at_max_lsn(
     // `fn_cdc_get_min_lsn` — measured on a real server: before a forced cleanup
     // both read 0x…71F80036 with 5 change rows, after it both read 0x…7C980005
     // with 3.
-    Position(serde_json::json!({ "lsn": max, "pinned": true })).save(ckpt)
+    let identity = {
+        let p = crate::source::mssql::parse_mssql_url(url)?;
+        let cfg = MssqlCdcConfig {
+            host: p.host,
+            port: p.port,
+            database: p.database,
+            user: p.user,
+            password: p.password,
+            capture_instance: String::new(),
+            from_lsn: None,
+            from_is_pin: false,
+            checkpoint_identity: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async { db_identity(&mut connect(&cfg, tls).await?).await })?
+    };
+    with_identity(
+        &Position(serde_json::json!({ "lsn": max, "pinned": true })),
+        identity.as_ref(),
+    )
+    .save(ckpt)
 }
 
 /// The probe's max LSN as the bare hex the checkpoint stores (strip `0x`).
@@ -1731,6 +1879,7 @@ mod tests {
             password: "Rivet_Passw0rd!".into(),
             capture_instance: capture_instance.into(),
             from_lsn: None,
+            checkpoint_identity: None,
         }
     }
 
@@ -1861,5 +2010,68 @@ mod tests {
         // has ended, whatever is on disk. Rows arrive in LSN order and `@to` bounds
         // a poll at a group boundary, so a spilled row can only belong to the last.
         assert!(!head_group_continues_on_disk("0x01", false, Some("0x01")));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::source::cdc::Position;
+
+    fn id(family: &str, fork: &str) -> DbIdentity {
+        DbIdentity {
+            family: family.into(),
+            fork: fork.into(),
+        }
+    }
+
+    #[test]
+    fn a_resume_is_refused_on_another_database_or_a_rewound_log_and_only_then() {
+        let here = id("F1", "K1");
+        assert_eq!(
+            identity_verdict(Some(&here), Some(&here)),
+            IdentityVerdict::Ok
+        );
+        let IdentityVerdict::Refuse(why) = identity_verdict(Some(&here), Some(&id("F2", "K1")))
+        else {
+            panic!("another family must refuse");
+        };
+        assert!(why.starts_with("mssql cdc: this checkpoint was written against a different database (family F1, the connection's is F2)"), "{why}");
+        let IdentityVerdict::Refuse(why) = identity_verdict(Some(&here), Some(&id("F1", "K2")))
+        else {
+            panic!("another fork must refuse");
+        };
+        assert!(why.starts_with("mssql cdc: this database was restored from a backup since the checkpoint was written (recovery fork K1 is now K2)"), "{why}");
+        assert!(
+            why.contains(
+                "Delete the checkpoint to start CDC from a fresh anchor FIRST, then re-snapshot"
+            ),
+            "the recovery order must be anchor first: {why}"
+        );
+        assert!(matches!(
+            identity_verdict(None, Some(&here)),
+            IdentityVerdict::Warn(w) if w.contains("carries no database identity")
+        ));
+        assert!(matches!(
+            identity_verdict(Some(&here), None),
+            IdentityVerdict::Warn(w) if w.contains("cannot read sys.database_recovery_status")
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_records_the_identity_and_reads_it_back() {
+        let pos = Position(serde_json::json!({ "lsn": "0a0b", "pinned": true }));
+        let saved = with_identity(&pos, Some(&id("F1", "K1")));
+        assert_eq!(
+            saved.0,
+            serde_json::json!({ "lsn": "0a0b", "pinned": true, "family_guid": "F1", "recovery_fork_guid": "K1" })
+        );
+        assert_eq!(DbIdentity::from_checkpoint(&saved), Some(id("F1", "K1")));
+        assert_eq!(
+            with_identity(&pos, None).0,
+            pos.0,
+            "no identity leaves the position as is"
+        );
+        assert_eq!(DbIdentity::from_checkpoint(&pos), None);
     }
 }

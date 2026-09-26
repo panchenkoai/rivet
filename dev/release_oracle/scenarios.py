@@ -1700,6 +1700,17 @@ REPLICA_CELLS = (
     ("mongo-secondary", (27022, 27023),
      "mongo_cdc_streams_changes_from_a_secondary",
      "docker compose --profile replica up -d mongo-rs2-a mongo-rs2-b"),
+    # SQL Server's checkpoint carries the database identity: refused on another server's
+    # database or after a restore, followed across an availability-group failover.
+    ("mssql-foreign-checkpoint", (1434, 1440),
+     "mssql_checkpoint_from_another_database_is_refused",
+     "docker compose --profile cdc --profile replica up -d mssql-cdc mssql-ag-primary && dev/mssql-ag/setup.sh"),
+    ("mssql-restored-checkpoint", (1434,),
+     "mssql_checkpoint_on_a_database_restored_from_backup_is_refused",
+     "docker compose --profile cdc up -d mssql-cdc"),
+    ("mssql-failover-checkpoint", (1440, 1441),
+     "mssql_checkpoint_follows_a_failover_to_the_secondary",
+     "docker compose --profile replica up -d mssql-ag-primary mssql-ag-secondary && dev/mssql-ag/setup.sh"),
 )
 
 

@@ -464,6 +464,16 @@ primary's. A checkpoint taken against one replica does **not** transfer to anoth
 host: if you fail over (to a different replica, or to the primary), re-snapshot
 (`mode: full`) and restart CDC from a fresh checkpoint there.
 
+**SQL Server — the checkpoint follows a failover, and nothing else.** An availability
+group's replicas share one log, so a checkpoint written on the primary resumes on a
+secondary (verified live). The checkpoint records the database's `family_guid` and
+`recovery_fork_guid`, and rivet refuses to resume against a database whose
+`family_guid` differs (another server's database: its LSNs address a different log) or
+whose `recovery_fork_guid` changed (a `RESTORE` rewound the log). Recover by deleting the
+checkpoint so CDC re-anchors **first**, then re-snapshot the table with `mode: full` —
+in the other order, the changes between the snapshot and the new anchor land in neither.
+A checkpoint written before rivet recorded the identity resumes with a warning.
+
 So the answer to "can I read the log from a slave?" is **yes on all four engines**, each
 verified live: MySQL (with `log_replica_updates = ON`), PostgreSQL 16+ in continuous mode,
 a SQL Server readable secondary, and a MongoDB secondary. Point `source.url` at the replica;

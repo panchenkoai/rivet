@@ -405,7 +405,7 @@ fn roll_all(
             sinks[i].manifested_parts = sinks[i].parts.len();
         }
         if let Some(ck) = run.checkpoint {
-            p.save(ck)?;
+            stream.checkpoint_of(p).save(ck)?;
         }
         // Fault point: manifest + checkpoint persisted, source NOT acked — a crash
         // here must re-read (PG would re-peek; the file checkpoint already moved,

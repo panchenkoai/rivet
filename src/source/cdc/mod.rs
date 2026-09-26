@@ -525,6 +525,11 @@ pub(crate) trait ChangeStream {
         None
     }
 
+    /// The checkpoint to persist for `position`; an engine adds what verifies a later resume.
+    fn checkpoint_of(&self, position: &Position) -> Position {
+        position.clone()
+    }
+
     /// Which engine this stream speaks — required, never defaulted.
     ///
     /// Routing semantics differ by engine (a document store has no schema to
@@ -571,7 +576,7 @@ pub(crate) fn run(
                 .any(|t| sink::table_matches(eng, t, &ev.schema, &ev.table));
         if filtered {
             if committed && let Some(p) = &checkpoint {
-                ev.position.save(p)?;
+                stream.checkpoint_of(&ev.position).save(p)?;
             }
             continue;
         }
@@ -603,7 +608,7 @@ pub(crate) fn run(
         // at-least-once break, the save ran before the println). Emit→checkpoint
         // means a crash there re-emits on resume (a duplicate, never a loss).
         if committed && let Some(p) = &checkpoint {
-            ev.position.save(p)?;
+            stream.checkpoint_of(&ev.position).save(p)?;
         }
         // A SOFT cap, landing on the commit boundary — the same semantics the file
         // sink already had (`max_events_stops_at_a_commit_boundary_never_inside_a_

@@ -2847,3 +2847,209 @@ fn mssql_cdc_reads_changes_from_a_readable_secondary() {
         "both changes captured on the primary must be read from the readable secondary"
     );
 }
+
+/// Wait until `sql` on the server at `port` returns at least `want`.
+fn wait_on(port: u16, sql: &str, want: i64) {
+    for _ in 0..120 {
+        if mssql_query_i64_on(port, sql) >= want {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("fixture: `{sql}` on :{port} never reached {want}");
+}
+
+/// Assert a SQL Server is listening on `port`, naming the stand service when it is not.
+fn require_port(port: u16, what: &str) {
+    assert!(
+        std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        )
+        .is_ok(),
+        "fixture: {what} is not up on :{port}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql-cdc :1434 and the replica-profile AG primary :1440"]
+fn mssql_checkpoint_from_another_database_is_refused() {
+    const OTHER: u16 = 1440;
+    require_port(
+        OTHER,
+        "the availability group primary (dev/mssql-ag/setup.sh)",
+    );
+    let table = unique_name("cdc_foreign");
+    let ci = format!("dbo_{table}");
+    let _serial = cross_process_serial("mssql_cdc");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let t = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let a = Rig::mssql_cdc(&table, &ci);
+    a.run_ok(); // anchor on :1434
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1, 10), (2, 20)"));
+    wait_for_capture(&ci, 2);
+    a.run_ok();
+
+    mssql_exec_on(
+        OTHER,
+        &format!(
+            "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT);
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}',
+               @role_name=NULL, @capture_instance=N'{ci}';"
+        ),
+    );
+    mssql_exec_on(OTHER, &format!("INSERT INTO dbo.{table} VALUES (3, 30)"));
+    wait_on(OTHER, &format!("SELECT COUNT(*) FROM cdc.{ci}_CT"), 1);
+    let before = std::fs::read(a.checkpoint()).unwrap();
+    let b = Rig::mssql_cdc(&table, &ci)
+        .source_url(&format!(
+            "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:{OTHER}/rivet"
+        ))
+        .checkpoint_path(a.checkpoint());
+    let said = b.run_expect_fail();
+    mssql_exec_on(
+        OTHER,
+        &format!(
+            "EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}',
+               @capture_instance=N'{ci}';
+             DROP TABLE dbo.{table};"
+        ),
+    );
+    drop(t);
+    assert!(
+        said.contains("mssql cdc: this checkpoint was written against a different database"),
+        "a checkpoint from another server's database must be refused:\n{said}"
+    );
+    assert_eq!(
+        std::fs::read(a.checkpoint()).unwrap(),
+        before,
+        "the refused run must leave the checkpoint untouched"
+    );
+}
+
+/// A throwaway CDC-enabled database on `mssql-cdc`, dropped with its capture jobs.
+struct ForkDb(String);
+
+impl Drop for ForkDb {
+    fn drop(&mut self) {
+        mssql_cdc_try_exec(&format!(
+            "USE [{0}]; EXEC sys.sp_cdc_disable_db; USE master;
+             ALTER DATABASE [{0}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{0}];",
+            self.0
+        ));
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql-cdc :1434 (SQL Server Agent)"]
+fn mssql_checkpoint_on_a_database_restored_from_backup_is_refused() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let db = unique_name("rivet_fork");
+    let table = "t";
+    let ci = "dbo_t";
+    mssql_cdc_exec(&format!("CREATE DATABASE [{db}]"));
+    let _db = ForkDb(db.clone());
+    mssql_cdc_exec(&format!(
+        "USE [{db}]; ALTER DATABASE [{db}] SET RECOVERY FULL; EXEC sys.sp_cdc_enable_db;
+         CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT);
+         EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}',
+           @role_name=NULL, @capture_instance=N'{ci}';"
+    ));
+    let ct = |want| {
+        wait_on(
+            1434,
+            &format!("SELECT COUNT(*) FROM [{db}].cdc.{ci}_CT"),
+            want,
+        )
+    };
+    let rig = Rig::mssql_cdc(table, ci).source_url(&format!(
+        "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/{db}"
+    ));
+    rig.run_ok(); // anchor
+    let bak = format!("/var/opt/mssql/data/{db}.bak");
+    mssql_cdc_exec(&format!(
+        "BACKUP DATABASE [{db}] TO DISK = N'{bak}' WITH INIT"
+    ));
+    mssql_cdc_exec(&format!(
+        "INSERT INTO [{db}].dbo.{table} VALUES (1, 10), (2, 20)"
+    ));
+    ct(2);
+    rig.run_ok(); // the checkpoint now sits past both changes
+
+    mssql_cdc_exec(&format!(
+        "USE master; ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+         RESTORE DATABASE [{db}] FROM DISK = N'{bak}' WITH REPLACE, KEEP_CDC, RECOVERY;
+         ALTER DATABASE [{db}] SET MULTI_USER;"
+    ));
+    mssql_cdc_exec(&format!("INSERT INTO [{db}].dbo.{table} VALUES (3, 30)"));
+    ct(1);
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("mssql cdc: this database was restored from a backup"),
+        "a checkpoint that predates a restore must be refused, not resumed past the rewound log:\n{said}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the replica-profile availability group :1440/:1441 (dev/mssql-ag/setup.sh)"]
+fn mssql_checkpoint_follows_a_failover_to_the_secondary() {
+    const PRIMARY: u16 = 1440;
+    const SECONDARY: u16 = 1441;
+    require_port(PRIMARY, "the availability group primary");
+    require_port(SECONDARY, "the availability group secondary");
+    let table = unique_name("cdc_failover");
+    let ci = format!("dbo_{table}");
+    mssql_exec_on(
+        PRIMARY,
+        &format!(
+            "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT);
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}',
+               @role_name=NULL, @capture_instance=N'{ci}';"
+        ),
+    );
+    let url = |port: u16| format!("sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:{port}/rivet");
+    let on_primary = Rig::mssql_cdc(&table, &ci).source_url(&url(PRIMARY));
+    on_primary.run_ok(); // anchor
+    mssql_exec_on(
+        PRIMARY,
+        &format!("INSERT INTO dbo.{table} VALUES (1, 10), (2, 20)"),
+    );
+    wait_on(PRIMARY, &format!("SELECT COUNT(*) FROM cdc.{ci}_CT"), 2);
+    on_primary.run_ok();
+
+    mssql_exec_on(PRIMARY, &format!("INSERT INTO dbo.{table} VALUES (3, 30)"));
+    wait_on(SECONDARY, &format!("SELECT COUNT(*) FROM cdc.{ci}_CT"), 3);
+    let on_secondary = Rig::mssql_cdc(&table, &ci)
+        .source_url(&url(SECONDARY))
+        .checkpoint_path(on_primary.checkpoint());
+    let outcome = on_secondary.run_with_envs(&[]);
+    let delivered = outcome
+        .status
+        .success()
+        .then(|| duckdb_declared_dir_id_set(&on_secondary.out_dir()));
+    mssql_exec_on(
+        PRIMARY,
+        &format!(
+            "EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', @source_name=N'{table}',
+               @capture_instance=N'{ci}';
+             DROP TABLE dbo.{table};"
+        ),
+    );
+    assert!(
+        outcome.status.success(),
+        "a replica shares the primary's log, so its checkpoint must resume there:\n{}",
+        String::from_utf8_lossy(&outcome.stderr)
+    );
+    assert_eq!(
+        delivered,
+        Some([3].into_iter().collect()),
+        "the secondary resumes after the primary's checkpoint: only the new change"
+    );
+}

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **SQL Server CDC refuses a checkpoint from another database or from before a restore.**
+  The checkpoint held only an LSN, which every database accepts: pointed at another server's
+  database, a run resumed there, exited 0 and captured nothing, skipping that database's
+  changes. The checkpoint now records the database's `family_guid` and `recovery_fork_guid`.
+  rivet refuses a different family (another database) or a changed fork (a `RESTORE`), and
+  still follows an availability-group failover, whose replicas share both.
 - **A CDC run sends its notifications and says which batch settings it ignores.** A failed CDC
   run never reached `notifications:`, so an `on: [failure]` webhook stayed silent while the
   stream was down. It now fires like a batch run's. `quality:`, `parquet:`, `compression*`,
