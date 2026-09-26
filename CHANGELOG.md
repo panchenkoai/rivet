@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **MySQL CDC refuses a replica that does not re-log what it applies.** With
+  `log_replica_updates = OFF` (MySQL's default) a replica's binlog holds none of the primary's
+  changes; reading it captured nothing and exited 0. rivet now refuses such a replica at start.
+  MySQL only: the replica table in the CDC reference now says which engines' replica reads are
+  verified (MySQL), refused (PostgreSQL's default mode on a standby) or untested (SQL Server,
+  MongoDB).
 - **SQL Server incremental exports work on a legacy `DATETIME` cursor.** The saved boundary was
   rendered with six fractional digits, which `DATETIME` rejects, so every run after the first
   failed with `Conversion failed`. A rivet-rendered timestamp cursor is now typed `DATETIME2(7)`,

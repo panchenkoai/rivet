@@ -1642,6 +1642,37 @@ def verify_replica_read(led: Ledger) -> None:
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 
+    # A replica that does not re-log (MySQL's default) holds none of the primary's
+    # changes in its binlog: rivet must refuse it, never report an empty success.
+    if not _tcp_open("127.0.0.1", 3310):
+        _skipped(
+            led, "replica", "no-relog", "-", "-",
+            "replica no-relog: no mysql-replica-nolog :3310 "
+            "(docker compose --profile replica up -d mysql-replica-nolog)",
+            "no replica",
+        )
+        return
+    nolog_log = work_dir() / "replica_nolog.log"
+    p = run(
+        ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
+         "--test", "live_suite", "--run-ignored", "all",
+         "-E", "test(/cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing$/)"],
+        env=release_bin_env(),
+        timeout=NO_TIMEOUT,
+    )
+    nolog_log.write_text(p.out)
+    if p.ok:
+        _passed(
+            led, "replica", "no-relog", "-", "-",
+            "replica no-relog: rivet refuses a replica whose binlog omits replicated changes",
+        )
+    else:
+        _failed(
+            led, "replica", "no-relog", "-", "-",
+            f"replica no-relog FAILED — a non-re-logging replica was not refused (see {nolog_log})",
+            _first_match(p.out, r"FAILED|panic|assert|error"),
+        )
+
 
 def verify_pool_e2e(led: Ledger) -> None:
     """The pool scheduler's e2e flow AS A GATE STAGE (#166 GA): drives the

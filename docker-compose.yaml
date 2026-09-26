@@ -397,6 +397,34 @@ services:
       timeout: 3s
       retries: 10
 
+  # A replica that applies but does NOT re-log (the MySQL default): its binlog holds none
+  # of the primary's changes, which rivet must refuse rather than read as "no changes".
+  mysql-replica-nolog:
+    image: mysql:8.0
+    profiles: ["replica"]
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=12"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+      - "--log-replica-updates=OFF"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3310:3306"
+    volumes:
+      - ./dev/cdc/replica-grant.sql:/docker-entrypoint-initdb.d/grant.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---- Legacy MySQL ---------------------------------------------------------
   # MySQL 5.7 is EOL (Oct 2023) but still widely deployed. Use mysql_native_password
   # as the default auth plugin so older clients (and the `mysql` Rust crate's

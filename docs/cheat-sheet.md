@@ -156,8 +156,9 @@ Rules of thumb:
   `SELECT pg_drop_replication_slot('{{SLOT}}');`. Set `max_slot_wal_keep_size` to cap it.
 - SQL Server: change-table retention defaults to about 3 days. A run that falls
   behind it fails loudly and needs a re-snapshot.
-- Reading from a replica works on MySQL (`log_replica_updates=ON`), on SQL Server
-  (readable secondary) and on PostgreSQL 16+ standbys.
+- Reading from a replica is verified on MySQL only (`log_replica_updates=ON`; rivet
+  refuses a replica without it). PostgreSQL's default mode refuses on a standby; SQL Server
+  and MongoDB secondaries are untested.
 
 CDC config:
 
