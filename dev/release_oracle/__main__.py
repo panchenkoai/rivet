@@ -635,6 +635,14 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
                     "-P", "Rivet_Passw0rd!", "-Q",
                     "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet")
 
+    if engine == "oracle":
+        # processes=200 lets the listener's lagging handler count refuse a 16-cell connect burst (ORA-12516); measured 189/300 refused at 200, 0/300 at 1000.
+        docker_exec(name, "sqlplus", "-s", "/", "as", "sysdba", timeout=180,
+                    stdin="alter system set processes=1000 scope=spfile;\nshutdown immediate\nstartup\nexit\n")
+        if not wait_until(ready, tries=60, delay=2.0):
+            led.skipped(engine, tag, "all", "-", f"{engine}:{tag} not ready after the processes restart", "not ready")
+            return None
+
     return matrix_cfg("url", engine).replace("%PORT%", str(port))
 
 
