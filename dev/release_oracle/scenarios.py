@@ -1755,6 +1755,15 @@ def verify_batch_resume(led: Ledger) -> None:
                       ["live_chunked_recovery", "live_resume"])
 
 
+def verify_audit_suspects(led: Ledger) -> None:
+    """The contract audit's silent-loss cells (cleanup race, keyset collation, MySQL
+    STATEMENT/DROP, Mongo drop, compact ADD COLUMN, MSSQL DATETIME), one row per case;
+    the BigQuery cells need the operator's warehouse credentials."""
+    _run_live_modules(led, "audit", "audit suspects",
+                      "silent-loss cells from the 2026-09-26 contract audit (live_audit_suspects)",
+                      ["live_audit_suspects"])
+
+
 def verify_partition_footer(led: Ledger) -> None:
     """Every part each batch runner ships — the last one included — carries the
     `rivet.partition_buckets` note, and its count equals DuckDB's own distinct-day count."""
