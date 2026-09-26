@@ -2928,6 +2928,19 @@ mod tests {
     }
 
     #[test]
+    fn oracle_schema_scope_label_names_the_owner_or_the_current_schema() {
+        let url = "oracle://u:p@h:1521/SVC";
+        assert_eq!(
+            schema_scope_label(url, Some("RIVET"), 2).unwrap(),
+            "Oracle schema \"RIVET\" (2 objects)"
+        );
+        assert_eq!(
+            schema_scope_label(url, Some(" "), 1).unwrap(),
+            "Oracle schema \"(current schema)\" (1 object)"
+        );
+    }
+
+    #[test]
     fn source_type_unsupported_scheme_names_sqlserver() {
         let err = source_type("db2://host/db").expect_err("db2 is unsupported");
         let msg = format!("{err}");

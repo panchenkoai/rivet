@@ -1230,3 +1230,44 @@ fn a_statement_timeout_stops_a_long_query_on_the_server() {
         "the server stopped executing it"
     );
 }
+
+/// Schema-wide `rivet init` on Oracle discovers a table and scaffolds an Oracle source.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_oracle_schema_wide_discovers_seeded_table() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(3);
+    let out = run_rivet(&["init", "--source", ORACLE_URL]);
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&out.stdout);
+    assert!(yaml.contains("type: oracle"), "{yaml}");
+    assert!(yaml.contains(&format!("- name: {}", t.name())), "{yaml}");
+}
+
+/// `rivet init --discover --table` names the Oracle table by its catalog owner and name.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn init_discover_names_the_oracle_table_scope() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(3);
+    let out = run_rivet(&[
+        "init",
+        "--source",
+        ORACLE_URL,
+        "--table",
+        t.name(),
+        "--discover",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["source_type"], "oracle");
+    assert_eq!(d["scope"], format!("table \"RIVET\".\"{}\"", t.name()));
+}
