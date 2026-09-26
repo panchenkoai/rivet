@@ -39,7 +39,7 @@ Sleep 1200ms
 
 Type "rivet init --source-env MYSQL_URL --table content_items --mode cdc -o cdc.yaml"
 Enter
-Sleep 1800ms
+Sleep 3s
 
 Type "sed -n '/  - name:/,/server_id/p' cdc.yaml"
 Enter
@@ -54,7 +54,7 @@ Type "# capture changes since the checkpoint into typed Parquet, then exit"
 Enter
 Sleep 1000ms
 
-Type "rivet cdc --source-env MYSQL_URL --table content_items --checkpoint cdc.ckpt --output ./cdc-out"
+Type "rivet cdc --source-env MYSQL_URL --table rivet.content_items --checkpoint cdc.ckpt --output ./cdc-out"
 Enter
 Sleep 3s
 
