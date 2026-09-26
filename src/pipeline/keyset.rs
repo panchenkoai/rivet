@@ -424,8 +424,7 @@ fn run_keyset_parallel(
     // (`floor`) up to the source max AT OPEN (`ceil`) — bounding the last range at
     // `ceil` defers a row arriving mid-run to the next run, so the anchor advance is
     // exact. A RESUME reloads its ranges (floor/ceil already baked in), so it must
-    // NOT recompute. `key_advances` is numeric-aware so "no new rows" is not a
-    // lexical "1000" < "999" mistake.
+    // NOT recompute.
     let incremental = kp.incremental;
     let (floor, ceil): (Option<String>, Option<String>) = if incremental && resume_run_id.is_none()
     {
@@ -433,12 +432,23 @@ fn run_keyset_parallel(
             Some(s) => s.get_owned(&plan.export_name, &key)?.last_cursor_value,
             None => None,
         };
-        let key_q = crate::sql::quote_ident(plan.source.source_type, &key);
+        let st = plan.source.source_type;
+        let key_q = crate::sql::quote_ident(st, &key);
+        // The source answers "is anything past the anchor" in its own collation.
+        let past_anchor = anchor
+            .as_deref()
+            .map(|a| {
+                format!(
+                    " WHERE {key_q} > {}",
+                    crate::source::query::inline_literal(st, a)
+                )
+            })
+            .unwrap_or_default();
         let cur_max = src.query_scalar(&format!(
-            "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
+            "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max{past_anchor}",
             plan.base_query
         ))?;
-        if nothing_past_anchor(anchor.as_deref(), cur_max.as_deref()) {
+        if cur_max.is_none() {
             log::info!(
                 "export '{}': parallel keyset incremental — no new rows past the anchor, nothing to export",
                 plan.export_name
@@ -797,33 +807,6 @@ fn run_keyset_parallel(
         summary.cursor_low = anchor_floor.clone();
     }
     Ok(())
-}
-
-/// True when `candidate` advances strictly past `anchor` under cursor ordering —
-/// numeric-aware (i128 then f64, exact past f64's 2^53 mantissa) with a byte-wise
-/// string fallback for UUIDs / RFC3339 timestamps. Mirrors `progression::
-/// cursor_advances`; used to decide whether an incremental parallel run has any
-/// new rows past the anchor (a lexical compare would misread "1000" < "999").
-fn key_advances(anchor: &str, candidate: &str) -> bool {
-    if let (Ok(a), Ok(b)) = (anchor.parse::<i128>(), candidate.parse::<i128>()) {
-        return b > a;
-    }
-    if let (Ok(a), Ok(b)) = (anchor.parse::<f64>(), candidate.parse::<f64>())
-        && let Some(ord) = b.partial_cmp(&a)
-    {
-        return ord.is_gt();
-    }
-    candidate > anchor
-}
-
-/// Is there nothing past the incremental anchor: an empty source, or a source
-/// max that does not advance it? No prior anchor means every row is new.
-fn nothing_past_anchor(anchor: Option<&str>, cur_max: Option<&str>) -> bool {
-    match (anchor, cur_max) {
-        (_, None) => true,
-        (None, Some(_)) => false,
-        (Some(a), Some(c)) => !key_advances(a, c),
-    }
 }
 
 /// Did the sampler collapse a requested parallel fan-out to a single range?
@@ -1305,24 +1288,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_past_anchor_covers_empty_first_and_stale_sources() {
-        assert!(nothing_past_anchor(Some("5"), None), "empty source");
-        assert!(nothing_past_anchor(None, None), "empty source, no anchor");
-        assert!(
-            !nothing_past_anchor(None, Some("1")),
-            "no anchor: every row is new"
-        );
-        assert!(
-            !nothing_past_anchor(Some("999"), Some("1000")),
-            "numeric, not lexical"
-        );
-        assert!(
-            nothing_past_anchor(Some("1000"), Some("1000")),
-            "max == anchor"
-        );
-    }
-
-    #[test]
     fn fan_out_collapses_only_when_parallel_was_asked_for() {
         assert!(fan_out_collapsed(4, 1));
         assert!(!fan_out_collapsed(1, 1), "sequential was asked for");
@@ -1366,26 +1331,6 @@ mod tests {
             !releases_anchor_at_data_complete(false, false),
             "no checkpoint, no anchor"
         );
-    }
-
-    // ── key_advances: numeric-aware strictly-past-anchor compare ─────────────
-    #[test]
-    fn key_advances_is_numeric_not_lexical() {
-        // Numeric: "1000" advances past "999" (a lexical compare would say no).
-        assert!(key_advances("999", "1000"));
-        assert!(!key_advances("1000", "999"));
-        assert!(!key_advances("5", "5")); // equal is NOT an advance (strict >)
-        // Unsigned above i64::MAX still compares as i128.
-        assert!(key_advances("18446744073709551614", "18446744073709551615"));
-        // Float fallback.
-        assert!(key_advances("1.5", "2.0"));
-        assert!(!key_advances("2.0", "1.5"));
-        // String fallback (UUID / RFC3339): byte-wise.
-        assert!(key_advances("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"));
-        assert!(!key_advances(
-            "2026-01-02T00:00:00Z",
-            "2026-01-01T00:00:00Z"
-        ));
     }
 
     // ── lo_hi_pairs: project (lo, hi) out of a sampled range list ────────────
