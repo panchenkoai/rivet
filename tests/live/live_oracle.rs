@@ -1752,3 +1752,32 @@ fn check_on_an_init_scaffold_finds_the_cursor_index() {
     let d: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(d["diagnostic"]["uses_index"], true, "{d}");
 }
+
+/// The type report calls a TIMESTAMP(9) column lossy: rivet keeps microseconds.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn the_type_report_marks_a_timestamp_9_column_lossy() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_ts9r",
+        "id NUMBER(10) PRIMARY KEY, t9 TIMESTAMP(9), t6 TIMESTAMP(6)",
+    );
+    let check = Rig::oracle_batch(t.name()).cli(&["check", "--type-report", "--json"]);
+    assert!(
+        check.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let d: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let fidelity = |col: &str| {
+        d["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["column"] == col)
+            .unwrap()["fidelity"]
+            .clone()
+    };
+    assert_eq!(fidelity("T9"), "lossy");
+    assert_eq!(fidelity("T6"), "exact");
+}

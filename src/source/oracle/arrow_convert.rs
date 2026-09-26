@@ -87,14 +87,13 @@ fn number_type(precision: u8, scale: i8) -> RivetType {
         (0, _) | (_, -127) => RivetType::String,
         (1..=9, 0) => RivetType::Int32,
         (10..=18, 0) => RivetType::Int64,
-        (p, s) if s < 0 => match p.checked_add(s.unsigned_abs()).filter(|w| *w <= 38) {
+        (p, s) if s.is_negative() => match p.checked_add(s.unsigned_abs()).filter(|w| *w <= 38) {
             Some(w) => decimal(w, 0),
             None => RivetType::String,
         },
         // Past 38 digits no Decimal128 holds it: exact text, like a bare NUMBER.
         (_, s) if s > 38 => RivetType::String,
-        (p, s) if s as u8 > p => decimal(s as u8, s),
-        (p, s) => decimal(p, s),
+        (p, s) => decimal(p.max(s.unsigned_abs()), s),
     }
 }
 
@@ -199,7 +198,7 @@ fn interval_ym_iso(years: i32, months: i32) -> String {
 pub(super) fn timestamp_micros(t: &OracleTimestamp) -> Result<i64> {
     // Oracle has no year 0 (-1 is 1 BC); chrono's proleptic year 0 is 1 BC.
     let year = match t.year() as i32 {
-        y if y < 0 => y + 1,
+        y if y.is_negative() => y + 1,
         y => y,
     };
     let date = chrono::NaiveDate::from_ymd_opt(year, t.month() as u32, t.day() as u32)
