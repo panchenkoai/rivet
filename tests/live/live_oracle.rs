@@ -1482,3 +1482,37 @@ fn check_suggests_the_real_spelling_of_a_quoted_lowercase_column() {
         "stderr:\n{err}"
     );
 }
+
+/// `rivet check` probes a `query:`'s cursor range from the query, not from the table it reads.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn check_reads_a_query_cursor_range_from_the_query() {
+    require_alive(LiveService::Oracle);
+    let t = seed_oracle_numeric_table(10);
+    let check = Rig::oracle_batch(t.name())
+        .query(&format!(
+            "SELECT ID + 1000000000 AS ID, NAME FROM {} WHERE ID > 5",
+            t.name()
+        ))
+        .mode("incremental")
+        .export_line("cursor_column: ID")
+        .cli(&["check", "--json"]);
+    assert!(
+        check.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let d: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let want = ora_text_rows(&format!(
+        "SELECT TO_CHAR(MIN(ID + 1000000000)), TO_CHAR(MAX(ID + 1000000000)) FROM {} WHERE ID > 5",
+        t.name()
+    ));
+    assert_eq!(
+        d["diagnostic"]["cursor_min"].as_str(),
+        want[0][0].as_deref()
+    );
+    assert_eq!(
+        d["diagnostic"]["cursor_max"].as_str(),
+        want[0][1].as_deref()
+    );
+}

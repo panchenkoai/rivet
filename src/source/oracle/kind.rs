@@ -79,6 +79,14 @@ impl OraKind {
         })
     }
 
+    /// Fetched as a LOB (natively, or re-projected to CLOB), so a row's width is unknowable up front.
+    pub(super) fn fetched_as_lob(self) -> bool {
+        matches!(
+            self,
+            Self::Clob | Self::Blob | Self::Json | Self::Object | Self::Vector
+        )
+    }
+
     /// The driver returns a zero-length LOB as NULL; these kinds carry a server-side flag.
     pub(super) fn needs_empty_flag(self) -> bool {
         matches!(self, Self::Clob | Self::Blob)
@@ -171,5 +179,15 @@ mod tests {
         }
         assert!(OraKind::Clob.needs_empty_flag() && OraKind::Blob.needs_empty_flag());
         assert!(!OraKind::Raw.needs_empty_flag() && !OraKind::Text.needs_empty_flag());
+        for k in [
+            OraKind::Clob,
+            OraKind::Blob,
+            OraKind::Json,
+            OraKind::Object,
+            OraKind::Vector,
+        ] {
+            assert!(k.fetched_as_lob(), "{k:?}");
+        }
+        assert!(!OraKind::Text.fetched_as_lob() && !OraKind::Raw.fetched_as_lob());
     }
 }

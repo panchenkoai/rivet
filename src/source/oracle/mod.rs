@@ -170,13 +170,18 @@ pub(crate) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Connection> 
 
 /// Rows to fetch per round trip and in the first (probe) batch: few when a LOB
 /// makes the row width unknowable up front, else the controller's target.
-fn probe_rows(projection: &Projection, target: usize) -> usize {
+fn probe_rows(has_lob: bool, target: usize) -> usize {
     const LOB_PROBE_ROWS: usize = 16;
-    if projection.empty_flags.iter().any(Option::is_some) {
+    if has_lob {
         target.min(LOB_PROBE_ROWS)
     } else {
         target
     }
+}
+
+/// Whether a statement has used its whole time budget.
+fn budget_spent(elapsed: std::time::Duration, budget: std::time::Duration) -> bool {
+    elapsed >= budget
 }
 
 /// Oracle's cap on a select list's columns.
@@ -218,6 +223,8 @@ struct Projection {
     native: Vec<String>,
     /// For a LOB column, the index of its trailing "zero-length" flag column.
     empty_flags: Vec<Option<usize>>,
+    /// Some column is fetched as a LOB, so the row width is unknown until rows arrive.
+    has_lob: bool,
 }
 
 pub struct OracleSource {
@@ -237,6 +244,11 @@ impl OracleSource {
     pub(crate) fn sample_harm_views(url: &str, tls: Option<&TlsConfig>) -> Option<bool> {
         let mut src = Self::connect_with_tls(url, tls).ok()?;
         Some(src.harm_counters().is_some() && src.sample_governor_pressure().is_some())
+    }
+
+    /// Parse `sql` on the server without executing it; a missing table or column fails here.
+    pub(crate) fn parses(&self, sql: &str) -> Result<()> {
+        self.describe(sql).map(drop)
     }
 
     /// Every row of `sql`, each cell as text, read through the same re-projection as an export.
@@ -361,6 +373,7 @@ impl OracleSource {
             sql,
             native,
             empty_flags,
+            has_lob: metas.iter().any(|m| OraKind::of(m).fetched_as_lob()),
         })
     }
 }
@@ -389,8 +402,13 @@ fn cell_text(row: &Row, idx: usize) -> Result<Option<String>> {
     })
 }
 
-impl Source for OracleSource {
-    fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
+impl OracleSource {
+    /// One export under `tuning.statement_timeout_s`; `export` clears the call timeout after.
+    fn export_within_budget(
+        &mut self,
+        request: &ExportRequest<'_>,
+        sink: &mut dyn BatchSink,
+    ) -> Result<()> {
         let projection = self.projected(request.query)?;
         let reprojected = ExportRequest {
             query: &projection.sql,
@@ -404,7 +422,7 @@ impl Source for OracleSource {
         let max_value_bytes = request.tuning.max_value_bytes();
 
         let started = std::time::Instant::now();
-        let probe_rows = probe_rows(&projection, ctl.target());
+        let probe_rows = probe_rows(projection.has_lob, ctl.target());
         let fetch = u32::try_from(probe_rows).unwrap_or(u32::MAX);
         let stmt = self
             .conn
@@ -419,7 +437,7 @@ impl Source for OracleSource {
         // The budget bounds each server round trip too, not only the gaps between rows.
         self.conn.set_call_timeout(stmt_timeout).ora()?;
         let timed_out = |e: anyhow::Error| match stmt_timeout {
-            Some(budget) if started.elapsed() >= budget => {
+            Some(budget) if budget_spent(started.elapsed(), budget) => {
                 crate::source::StatementDurationTimeout::oracle(budget.as_secs()).into()
             }
             _ => e,
@@ -469,7 +487,7 @@ impl Source for OracleSource {
         };
         for row in cursor {
             if let Some(budget) = stmt_timeout
-                && started.elapsed() > budget
+                && budget_spent(started.elapsed(), budget)
             {
                 return Err(
                     crate::source::StatementDurationTimeout::oracle(budget.as_secs()).into(),
@@ -485,8 +503,16 @@ impl Source for OracleSource {
         if !buf.is_empty() {
             emit(&mut buf, &mut ctl)?;
         }
-        self.conn.set_call_timeout(None).ora()?;
         Ok(())
+    }
+}
+
+impl Source for OracleSource {
+    fn export(&mut self, request: &ExportRequest<'_>, sink: &mut dyn BatchSink) -> Result<()> {
+        let result = self.export_within_budget(request, sink);
+        // The call timeout is per connection: clear it on every exit, not only on success.
+        let reset = self.conn.set_call_timeout(None).ora();
+        result.and(reset)
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
@@ -621,6 +647,13 @@ pub(crate) fn introspect_oracle_table_for_chunking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lob_projection_probes_a_few_rows_first() {
+        assert_eq!(probe_rows(true, 500), 16);
+        assert_eq!(probe_rows(true, 8), 8);
+        assert_eq!(probe_rows(false, 500), 500);
+    }
 
     #[test]
     fn names_an_outer_query_cannot_reference_are_detected() {

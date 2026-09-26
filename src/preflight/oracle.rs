@@ -54,6 +54,8 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         .map(std::borrow::Cow::Borrowed)
         .or_else(|| table_from_simple_query(base_query));
     let base_table = base_table_owned.as_deref();
+    // Values and row counts describe the relation only when the export reads it whole.
+    let whole_table = strip_select_star_from(base_query);
     for col in key_columns(export) {
         if let Some(fail) = key_column_fail_oracle(conn, base_query, base_table, col) {
             return Err(fail);
@@ -64,7 +66,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_oracle(conn, t));
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
-    let row_estimate = base_table.and_then(|t| {
+    let row_estimate = whole_table.and_then(|t| {
         let (owner, table) = crate::sql::oracle_catalog_preds(t);
         scalar_i64(
             conn,
@@ -75,7 +77,7 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         )
         .map(|n| n.max(0))
     });
-    let avg_row_bytes = base_table.and_then(|t| {
+    let avg_row_bytes = whole_table.and_then(|t| {
         let (owner, table) = crate::sql::oracle_catalog_preds(t);
         scalar_i64(
             conn,
@@ -89,17 +91,17 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
 
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
         match incremental_key_expr(export, SourceType::Oracle) {
-            Some(expr) => range_min_max_oracle(conn, base_query, base_table, &expr),
+            Some(expr) => range_min_max_oracle(conn, base_query, whole_table, &expr),
             None => (None, None),
         }
     } else if let Some(col) = range_col {
         let expr = crate::sql::quote_ident(SourceType::Oracle, col);
-        range_min_max_oracle(conn, base_query, base_table, &expr)
+        range_min_max_oracle(conn, base_query, whole_table, &expr)
     } else {
         (None, None)
     };
 
-    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), whole_table)
         .and_then(|(table, col)| column_has_index_oracle(conn, table, col));
     let db_max_connections = conn
         .query_scalar("SELECT value FROM v$parameter WHERE name = 'processes'")
@@ -124,11 +126,10 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
     ))
 }
 
-/// Validate the query's relations with a zero-row wrap; a missing table/column
+/// Validate the query's relations by parsing it; a missing table/column
 /// (ORA-00942 / ORA-00904) is a loud preflight error, anything else fail-soft.
 fn schema_fail_oracle(conn: &mut OracleSource, base_query: &str) -> Option<anyhow::Error> {
-    let probe = format!("SELECT 1 FROM ({base_query}) \"_rivet_probe\" WHERE 1 = 0");
-    let Err(e) = conn.query_scalar(&probe) else {
+    let Err(e) = conn.parses(base_query) else {
         return None;
     };
     let m = format!("{e:#}");
@@ -167,8 +168,8 @@ fn key_column_fail_oracle(
     col: &str,
 ) -> Option<anyhow::Error> {
     let quoted = crate::sql::quote_ident(SourceType::Oracle, col);
-    let probe = format!("SELECT {quoted} FROM ({base_query}) \"_rivet_probe\" WHERE 1 = 0");
-    let e = conn.query_scalar(&probe).err()?;
+    let probe = format!("SELECT {quoted} FROM ({base_query}) \"_rivet_probe\"");
+    let e = conn.parses(&probe).err()?;
     if !format!("{e:#}").contains("ORA-00904") {
         return None;
     }
