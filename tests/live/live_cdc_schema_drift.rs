@@ -9,6 +9,25 @@ use mysql::prelude::Queryable as _;
 const DRIFT_FAIL: &str = "on_schema_drift: fail";
 const DRIFT_WARN: &str = "on_schema_drift: warn";
 
+/// DuckDB over the declared parts: both deferred changes, as inserts, with their values.
+fn duckdb_assert_deferred_changes_landed(out: &std::path::Path, second_v: i64) {
+    assert_eq!(
+        duckdb_declared_dir_id_set(out),
+        [1, 2].into_iter().collect(),
+        "both changes deferred by the refusal must be captured once drift is accepted"
+    );
+    assert_eq!(
+        duckdb_declared_dir_scalar(out, "count(*) FILTER (WHERE __op = 'insert')"),
+        2,
+        "each deferred change lands exactly once, as an insert"
+    );
+    assert_eq!(
+        duckdb_declared_dir_scalar(out, "sum(v)"),
+        10 + second_v,
+        "the deferred values must land intact through the widened type"
+    );
+}
+
 /// The refusal names the export and the retyped column, and says how to accept it.
 fn assert_drift_refusal(said: &str, export: &str) {
     assert!(
@@ -16,8 +35,8 @@ fn assert_drift_refusal(said: &str, export: &str) {
         "the run must name schema drift on its export:\n{said}"
     );
     assert!(
-        said.contains("type changed: a"),
-        "the refusal must name the retyped column `a`:\n{said}"
+        said.contains("type changed: v"),
+        "the refusal must name the retyped column `v`:\n{said}"
     );
     assert!(
         said.contains("set `on_schema_drift: warn` to accept"),
@@ -33,15 +52,17 @@ fn mysql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
         .and_then(|p| p.get_conn())
         .expect("connect mysql-cdc");
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
-    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, a INT)"))
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
     let _guard = MysqlCdcTable(tbl.clone());
 
     let mut rig = Rig::mysql_cdc(&tbl).export_line(DRIFT_FAIL);
     rig.run_ok(); // anchors the stream and records the schema baseline
 
-    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)")).unwrap();
-    c.query_drop(format!("ALTER TABLE {tbl} MODIFY a BIGINT")).unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    c.query_drop(format!("ALTER TABLE {tbl} MODIFY v BIGINT"))
+        .unwrap();
     c.query_drop(format!("INSERT INTO {tbl} VALUES (2, 30000000000)"))
         .unwrap();
 
@@ -55,11 +76,7 @@ fn mysql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
 
     rig.replace_export_line("on_schema_drift", DRIFT_WARN);
     rig.run_ok();
-    assert_eq!(
-        cdc_id_ops(&rig.out_dir()),
-        vec![(1, "insert".to_string()), (2, "insert".to_string())],
-        "both changes deferred by the refusal must be captured once drift is accepted"
-    );
+    duckdb_assert_deferred_changes_landed(&rig.out_dir(), 30000000000);
 }
 
 #[test]
@@ -70,7 +87,7 @@ fn pg_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
     let slot = unique_name("rivet_drift_slot");
     let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, a INT)"
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
     let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
@@ -80,7 +97,7 @@ fn pg_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
     let _slot = Slot(slot.clone());
 
     c.batch_execute(&format!(
-        "INSERT INTO {tbl} VALUES (1, 10); ALTER TABLE {tbl} ALTER COLUMN a TYPE BIGINT; \
+        "INSERT INTO {tbl} VALUES (1, 10); ALTER TABLE {tbl} ALTER COLUMN v TYPE BIGINT; \
          INSERT INTO {tbl} VALUES (2, 30000000000)"
     ))
     .unwrap();
@@ -103,11 +120,7 @@ fn pg_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
 
     rig.replace_export_line("on_schema_drift", DRIFT_WARN);
     rig.run_ok();
-    assert_eq!(
-        cdc_id_ops(&rig.out_dir()),
-        vec![(1, "insert".to_string()), (2, "insert".to_string())],
-        "both changes deferred by the refusal must be captured once drift is accepted"
-    );
+    duckdb_assert_deferred_changes_landed(&rig.out_dir(), 30000000000);
 }
 
 #[test]
@@ -117,7 +130,9 @@ fn mssql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
     let table = unique_name("cdc_drift_ms");
     let ci = format!("dbo_{table}");
     mssql_cdc_drop_table(&format!("dbo.{table}"));
-    mssql_cdc_exec(&format!("CREATE TABLE dbo.{table}(id INT PRIMARY KEY, a INT)"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
     enable_cdc(&table, &ci);
     let _guard = MssqlCdcTable {
         table: table.clone(),
@@ -128,8 +143,8 @@ fn mssql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
     rig.run_ok(); // pins the anchor and records the schema baseline
 
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1, 10)"));
-    mssql_cdc_exec(&format!("ALTER TABLE dbo.{table} ALTER COLUMN a BIGINT"));
-    // The capture instance keeps `a` as INT, so the value must fit the old type.
+    mssql_cdc_exec(&format!("ALTER TABLE dbo.{table} ALTER COLUMN v BIGINT"));
+    // The capture instance keeps `v` as INT, so the value must fit the old type.
     mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (2, 20)"));
     wait_for_capture(&ci, 2);
 
@@ -143,9 +158,5 @@ fn mssql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops() {
 
     rig.replace_export_line("on_schema_drift", DRIFT_WARN);
     rig.run_ok();
-    assert_eq!(
-        cdc_id_ops(&rig.out_dir()),
-        vec![(1, "insert".to_string()), (2, "insert".to_string())],
-        "both changes deferred by the refusal must be captured once drift is accepted"
-    );
+    duckdb_assert_deferred_changes_landed(&rig.out_dir(), 20);
 }

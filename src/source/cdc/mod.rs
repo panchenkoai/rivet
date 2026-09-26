@@ -1657,6 +1657,9 @@ pub(crate) struct CaptureOutput<'a> {
 /// is identical. Both entry points fill this in and call [`run_capture`].
 /// `outputs` carries one entry per captured table: several tables ride ONE stream
 /// (one slot / one binlog connection) and one checkpoint.
+/// Judges one captured table's resolved columns; an error ends the run before any change is read.
+pub(crate) type SchemaGate<'a> = dyn Fn(&str, &[crate::types::TypeMapping]) -> Result<()> + 'a;
+
 pub(crate) struct CdcCapture<'a> {
     /// `exports[].name` — recorded into each manifest's `export_family` so the
     /// load's shared-prefix guard groups the drain with its snapshot leg by what
@@ -1675,6 +1678,8 @@ pub(crate) struct CdcCapture<'a> {
     /// recorded in the DATABASE as it becomes durable; the `rivet cdc` CLI has
     /// no state store and passes `None`.
     pub state: Option<&'a crate::state::StateStore>,
+    /// Judges each table's resolved columns before any change is read; an error ends the run unacknowledged.
+    pub schema_gate: Option<&'a SchemaGate<'a>>,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
@@ -1759,6 +1764,12 @@ pub(crate) fn run_capture(
             Ok(c) => c,
             Err(e) => return (Vec::new(), Err(e)),
         };
+        if let Err(e) = cap
+            .schema_gate
+            .map_or(Ok(()), |gate| gate(&o.table, &columns))
+        {
+            return (Vec::new(), Err(e));
+        }
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,

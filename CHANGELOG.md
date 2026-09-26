@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`on_schema_drift` now applies to CDC exports.** A CDC run never consulted it: a column
+  retyped between runs wrote parts with different types into one prefix and exited 0 under
+  `fail`. Each captured table's schema is now checked before the stream reads a change, so a
+  refusal acknowledges nothing and switching to `warn` captures every deferred change.
 - **`rivet load` into ClickHouse** (ADR-0035; the loader started from
   @ssyusyukalov's #145). `load: { target: clickhouse, url, database, user,
   password_env }`, or `rivet init --clickhouse-url … --clickhouse-database …`. A

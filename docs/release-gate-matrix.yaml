@@ -255,6 +255,10 @@ preflights:
     what: "`rivet load` into ClickHouse (ADR-0035) against the stand's server: a CDC stream from MySQL, PostgreSQL and SQL Server whose `FINAL` view equals the source row for row with the deleted key flagged (the version decodes each engine's position); a load killed after appending re-runs, the log holds every row twice and the view is unchanged; a full load swaps in the current source; an incremental export adopts the table behind a latest-cursor view; `rivet init --clickhouse-*` scaffolds the block and its flags require each other. Oracles: the source and ClickHouse read back directly — never rivet's report."
     backends: [postgres, gcs]
     status: test        # verify_clickhouse_load (dev/release_oracle/clickhouse_load.py) — runs tests/live/live_clickhouse_load.rs + live_init_extended.rs through the Rig against the gate binary; needs cargo and the local services (clickhouse :8123, fake-gcs :4443, postgres, the three CDC engines), SKIP naming any that is down — no cloud prerequisite
+  - id: cdc_schema_drift
+    what: "`on_schema_drift` on a CDC export (found 2026-09-26: the CDC runner never consulted it — a retyped column wrote three differently-typed parts into one prefix, exit 0). Per SQL engine: a column retyped between two runs is refused under `fail` before the stream acknowledges anything (MySQL/SQL Server checkpoint bytes and the PostgreSQL slot's confirmed_flush_lsn unchanged), and after switching to `warn` both deferred changes land with their values (30000000000 needs the widened BIGINT). Oracles: the checkpoint/slot read directly and the Parquet re-read — never rivet's report. MongoDB is n/a: its CDC schema is the fixed document blob."
+    backends: [sqlite]
+    status: test        # verify_cdc_schema_drift (dev/release_oracle/cdc_schema_drift.py) — runs tests/live/live_cdc_schema_drift.rs through the Rig against the gate binary; needs cargo and postgres-cdc :5434, mysql-cdc :3307, mssql-cdc :1434, SKIP naming any that is down
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-

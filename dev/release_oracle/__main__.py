@@ -49,6 +49,7 @@ from . import (
     bigquery,
     blessed_flow,
     cdc,
+    cdc_schema_drift,
     clickhouse_load,
     concurrency,
     gifs,
@@ -472,6 +473,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     ])
     # Sequential: its CDC cells share the cross-process engine locks init delta holds.
     clickhouse_load.verify_clickhouse_load(led)
+    cdc_schema_drift.verify_cdc_schema_drift(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),

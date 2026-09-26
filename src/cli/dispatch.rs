@@ -383,6 +383,7 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             // supported path, and the one the sweep and the load read — passes its
             // store, so every part reaches the database as it becomes durable.
             state: None,
+            schema_gate: None,
         },
         &__cdc_read_bytes,
     )
