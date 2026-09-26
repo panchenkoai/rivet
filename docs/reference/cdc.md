@@ -451,11 +451,12 @@ replica**, never the master. Rivet reads the **log of whatever host you point
 `source.url` at** — it never needs the primary *specifically*. Whether a replica
 can serve that log is an engine + replica-config question, not a rivet limitation:
 
-| engine | from a replica? | what the replica needs |
-| --- | --- | --- |
-| **MySQL** | ✅ yes | `log_bin = ON` **and `log_replica_updates = ON`** (`log_slave_updates` pre-8.0) so the replica re-logs replicated changes into its *own* binlog — this is **off by default**: a replica applies changes but does not re-log them without it. Plus the `REPLICATION SLAVE` / `REPLICATION CLIENT` grant and a `server_id` distinct from both the primary and the replica. |
-| **PostgreSQL** | ⚠️ PG **16+** only | Logical decoding on a standby is a PostgreSQL 16 feature. On < 16 a logical slot can only be created on the primary — rivet's slot creation fails (PostgreSQL refuses logical decoding *"while in recovery"*). On 16+, set `hot_standby_feedback = on` on the standby (or a physical `primary_slot_name`) so the primary doesn't recycle WAL the standby's slot still needs. |
-| **SQL Server** | ✅ yes (readable secondary) | CDC is enabled on the **primary**; the `cdc.*` change tables are ordinary tables in the database, so they **replicate to an Always On readable secondary**. Point rivet at the secondary — the reads are plain `SELECT`s on the replicated change tables. The capture job still runs on the primary; LSNs are consistent across the availability group. |
+| engine | from a replica? | what the replica needs | verified |
+| --- | --- | --- | --- |
+| **MySQL** | ✅ yes | `log_bin = ON` **and `log_replica_updates = ON`** (`log_slave_updates` pre-8.0.26) so the replica re-logs replicated changes into its *own* binlog — this is **off by default**: a replica applies changes but does not re-log them without it. Plus the `REPLICATION SLAVE` / `REPLICATION CLIENT` grant and a `server_id` distinct from both the primary and the replica. rivet **refuses** a replica with `log_replica_updates = OFF` at start, because its binlog holds none of the replicated changes. | live test + release gate: capture from a replica, and the refusal on one that does not re-log |
+| **PostgreSQL** | ❌ not in the default mode | The default bounded run (`until_current`) **refuses** on a standby: the position it bounds by (`pg_current_wal_lsn()`) does not exist during recovery. Logical decoding on a standby is a PostgreSQL 16+ feature, but a continuous (`until_current: false`) capture from one is **not tested** — point rivet at the primary. | live test + release gate: the refusal only |
+| **SQL Server** | ⚠️ not verified | By design the `cdc.*` change tables replicate to an Always On readable secondary and are read with plain `SELECT`s, but **no test** reads one — the stand has no availability group. | none |
+| **MongoDB** | ⚠️ not verified | Change streams can be opened against a secondary, but **no test** does it. | none |
 
 **MySQL caveat — the checkpoint is replica-local.** Rivet resumes by binlog
 `{file, pos}` (not GTID), and a replica's binlog coordinates are its *own*, not the
@@ -463,10 +464,10 @@ primary's. A checkpoint taken against one replica does **not** transfer to anoth
 host: if you fail over (to a different replica, or to the primary), re-snapshot
 (`mode: full`) and restart CDC from a fresh checkpoint there.
 
-So the answer to "can I read the log from a slave?" is **yes for MySQL (with
-`log_replica_updates`) and SQL Server (readable secondary), and PostgreSQL 16+** —
-point `source.url` at the replica; everything else (grants, `mode: cdc`, output) is
-identical to running against a primary.
+So the answer to "can I read the log from a slave?" is **verified only for MySQL**
+(with `log_replica_updates = ON`): point `source.url` at the replica; everything else
+(grants, `mode: cdc`, output) is identical to running against a primary. PostgreSQL's
+default mode refuses on a standby, and SQL Server and MongoDB secondaries are untested.
 
 ---
 

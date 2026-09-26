@@ -612,6 +612,8 @@ impl MysqlChangeStream {
         let mut conn = connect_conn(url, tls)?;
         // Refuse a compressed binlog rather than read past it in silence.
         refuse_compressed_binlog(&mut conn)?;
+        // Refuse a replica that does not re-log what it applies: its binlog holds none of it.
+        refuse_replica_without_relog(&mut conn)?;
         // Read the connection's own database BEFORE the binlog stream consumes the
         // connection — it is the meaning of a bare configured name.
         // `Option<String>`, like the two sibling call sites (`mysql/mod.rs`,
@@ -1442,6 +1444,36 @@ fn compressed_payload_refusal() -> anyhow::Error {
 /// `EventStreamReader::read_decompressed()`, and the inner events carry the
 /// OUTER payload's `end_log_pos`, so the commit-position semantics carry over
 /// unchanged — but until that lands, refusing is the only honest option.
+/// Ask the server whether it replicates and whether it re-logs what it applies.
+fn refuse_replica_without_relog(conn: &mut Conn) -> Result<()> {
+    let replicating = conn
+        .query_first::<mysql::Row, _>("SHOW REPLICA STATUS")
+        .or_else(|_| conn.query_first::<mysql::Row, _>("SHOW SLAVE STATUS"))
+        .ok()
+        .flatten()
+        .is_some();
+    let relog: Option<String> = conn
+        .query_first("SELECT @@global.log_replica_updates")
+        .or_else(|_| conn.query_first("SELECT @@global.log_slave_updates"))
+        .ok()
+        .flatten();
+    replica_relog_refusal(replicating, relog.as_deref())
+}
+
+/// A replica whose binlog omits replicated changes would capture nothing and report success.
+fn replica_relog_refusal(replicating: bool, relog: Option<&str>) -> Result<()> {
+    let relogs = matches!(relog, Some("1") | Some("ON") | Some("on") | None);
+    if !replicating || relogs {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "mysql cdc: this server is a replica with log_replica_updates = OFF, so the changes it \
+         applies from its source never reach its own binlog — reading it would capture NOTHING of \
+         them and report success. Set log_replica_updates = ON (log_slave_updates before 8.0.26; \
+         it needs a restart), or read the source instead."
+    )
+}
+
 fn refuse_compressed_binlog(conn: &mut Conn) -> Result<()> {
     // Pre-8.0.20 servers (and MariaDB) have no such variable: the query errors
     // or returns nothing, and both mean "not compressed". Never let the ABSENCE
@@ -2293,6 +2325,21 @@ mod tests {
         assert_eq!(t("DROP DATABASE shop"), None);
         assert_eq!(t("DROP TABLESPACE ts"), None);
         assert_eq!(t("TRUNCATE orders"), None);
+    }
+
+    #[test]
+    fn only_a_replica_that_does_not_relog_is_refused() {
+        assert!(replica_relog_refusal(true, Some("0")).is_err());
+        assert!(replica_relog_refusal(true, Some("OFF")).is_err());
+        assert!(replica_relog_refusal(true, Some("1")).is_ok());
+        assert!(
+            replica_relog_refusal(false, Some("0")).is_ok(),
+            "a primary needs no re-logging"
+        );
+        assert!(
+            replica_relog_refusal(true, None).is_ok(),
+            "an unreadable setting must not block a source that may be fine"
+        );
     }
 
     #[test]
