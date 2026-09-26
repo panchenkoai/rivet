@@ -165,7 +165,7 @@ whole recovery story is operable from the Airflow UI:
 
 | Situation | What to do |
 |-----------|------------|
-| **Transient crash mid-chunk** (worker killed, timeout, retry) | **Nothing — automatic.** The task tries a clean run; if rivet reports the checkpoint is still in progress, it `--resume`s from the last good chunk. (Keyed on the checkpoint *state*, not the retry count — idempotent: a fresh run, a mid-chunk crash, and a finished export each do the right thing.) |
+| **Transient crash mid-chunk** (worker killed, timeout, retry) | **Nothing — automatic.** The retry's plain run resumes the crashed checkpoint from the last good chunk. A checkpoint still held by a LIVE rivet process is refused, and the task fails rather than touch it. |
 | **Unresumable checkpoint** (chunk params changed, or you want a clean re-extract) | **Admin → Variables → `rivet_reset`** = comma-list of tables → trigger the DAG. Each listed table's checkpoint is wiped (`rivet state reset-chunks`) before its run. Clear the Variable afterwards. |
 | **Anything else** | the normal task **Clear / re-trigger** in the UI. |
 

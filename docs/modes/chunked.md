@@ -30,7 +30,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 | Field | Effect |
 |---|---|
 | `parallel: N` | Up to `N` chunks execute concurrently (separate DB connections). Default `1`. `rivet init` scaffolds a row-scaled value (≤500 K → 1, <5 M → 2, ≥5 M → 4) |
-| `chunk_checkpoint: true` | Per-chunk row in state DB → `rivet run --resume` skips completed chunks after a crash |
+| `chunk_checkpoint: true` | Per-chunk row in state DB → after a crash, the next run (plain or `--resume`) skips completed chunks |
 | `chunk_max_attempts: 3` | **Requires `chunk_checkpoint: true`.** Total attempt budget per chunk (first attempt + retries): `3` means each failed chunk is retried up to 2 times before the run bails. The budget is stored on the checkpoint run and enforced when a chunk task is claimed, so without `chunk_checkpoint` it has no effect — the non-checkpointed runners have no per-chunk retry and a failed chunk fails the run. Defaults to `tuning.max_retries + 1` |
 
 > **Picking `parallel`.** Extraction is I/O-bound, so the win comes from
@@ -142,8 +142,8 @@ rivet state reset-chunks --config large_table.yaml --export orders_chunked
 
 Chunked mode is **not** "extract once, skip on the next clean run". Two
 plain `rivet run` invocations against the same table re-extract every
-chunk both times — `chunk_checkpoint: true` only matters for `--resume`
-after a crashed run. Each clean run produces a new file set with a
+chunk both times — `chunk_checkpoint: true` only matters after a crashed
+run, which the next run resumes. Each clean run produces a new file set with a
 fresh `run_id` and timestamp suffix.
 
 | Invocation | Behaviour |
@@ -355,4 +355,4 @@ with `N`.
 
 **High memory usage with parallel > 1** -- Reduce `chunk_size` or add `tuning.profile: safe`.
 
-**Export fails midway through 1000 chunks** -- Enable `chunk_checkpoint: true` and re-run with `--resume`.
+**Export fails midway through 1000 chunks** -- Enable `chunk_checkpoint: true`; the next run resumes from the completed chunks, whether the last run crashed or failed.

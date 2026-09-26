@@ -1563,3 +1563,138 @@ fn chunked_checkpoint_refuses_to_clobber_a_cdc_manifest() {
         );
     }
 }
+
+// ─── A crashed checkpoint run recovers on a PLAIN re-run; a live one is refused ──
+
+const RANGE: &[&str] = &["chunk_column: id"];
+const KEYSET: &[&str] = &["chunk_by_key: id"];
+
+/// A PG checkpointed export over `table`, chunked by `key_lines`.
+fn checkpointed_rig(table: &str, export: &str, key_lines: &[&str], slow: bool) -> Rig {
+    let mut rig = Rig::pg_batch(table).export_named(export).mode("chunked");
+    for line in key_lines {
+        rig = rig.export_line(line);
+    }
+    let mut rig = rig
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true");
+    if slow {
+        rig = rig
+            .source_line("tuning:")
+            .source_line("  batch_size: 10")
+            .source_line("  throttle_ms: 400");
+    }
+    rig.duckdb_oracle()
+}
+
+fn pg_count(table: &str) -> i64 {
+    pg_connect()
+        .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+        .unwrap()
+        .get(0)
+}
+
+fn a_crashed_checkpoint_run_recovers_on_a_plain_rerun(key_lines: &[&str], point: &str) {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("crash_plain");
+    let rig = checkpointed_rig(table.name(), &export, key_lines, false);
+    let crash = rig.run_args_env(&["--export", &export], &[("RIVET_TEST_PANIC_AT", point)]);
+    assert!(!crash.status.success(), "the crash run must die at {point}");
+    assert!(
+        duckdb_declared_rows(rig.oracle_dir()) < 150,
+        "fixture: the crash must leave the export incomplete"
+    );
+
+    let rerun = rig.run_args(&["--reconcile"]);
+    let said = String::from_utf8_lossy(&rerun.stderr);
+    assert!(
+        rerun.status.success(),
+        "the plain re-run must recover: {said}"
+    );
+    assert!(!said.contains("still in progress"), "{said}");
+    let source = pg_count(table.name());
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        source,
+        "a crashed run then a plain re-run must deliver every row exactly once",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_crashed_range_checkpoint_run_recovers_on_a_plain_rerun() {
+    a_crashed_checkpoint_run_recovers_on_a_plain_rerun(RANGE, "after_chunk_complete:0");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_crashed_keyset_checkpoint_run_recovers_on_a_plain_rerun() {
+    a_crashed_checkpoint_run_recovers_on_a_plain_rerun(KEYSET, "after_keyset_page:0");
+}
+
+fn a_live_checkpoint_run_refuses_a_concurrent_run(key_lines: &[&str]) {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("live_owner");
+    let rig = checkpointed_rig(table.name(), &export, key_lines, true);
+    let cfg = rig.config_path();
+    let mut owner = rig.spawn_args_env(&["--export", &export], &[]);
+    let t0 = std::time::Instant::now();
+    let owner_running = || {
+        open_state_db(&cfg)
+            .query_row(
+                "SELECT COUNT(*) FROM run_status WHERE status = 'running'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n > 0)
+    };
+    while !owner_running() {
+        assert!(
+            owner.try_wait().unwrap().is_none(),
+            "fixture: the owner run exited before the second run started"
+        );
+        assert!(
+            t0.elapsed().as_secs() < 20,
+            "fixture: the owner run never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let second = rig.run_expect_fail();
+    assert!(
+        owner.try_wait().unwrap().is_none(),
+        "fixture: the owner must still be running when the second run is refused"
+    );
+    assert!(
+        second.contains(&format!("export '{export}': chunk checkpoint run"))
+            && second.contains(
+                "still in progress in another live rivet process (it holds the export's run \
+                 lease); wait for it to finish"
+            ),
+        "{second}"
+    );
+    assert!(owner.wait().unwrap().success(), "the owner run must finish");
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        pg_count(table.name()),
+        "the refused run must not disturb the live one",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_live_range_checkpoint_run_refuses_a_concurrent_run() {
+    a_live_checkpoint_run_refuses_a_concurrent_run(RANGE);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_live_keyset_checkpoint_run_refuses_a_concurrent_run() {
+    a_live_checkpoint_run_refuses_a_concurrent_run(KEYSET);
+}

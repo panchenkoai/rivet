@@ -1172,6 +1172,14 @@ fn execute_resolved_plan(
     state: &StateStore,
     tail: TailPolicy<'_>,
 ) -> (Result<()>, RunSummary) {
+    let (_run_lease, recovered) = match chunked::claim_checkpoint_run(state, plan) {
+        Ok(claim) => claim,
+        Err(e) => {
+            let summary = synthetic_failed_summary(&plan.export_name, &e);
+            return (Err(e), summary);
+        }
+    };
+    let plan = recovered.as_ref().unwrap_or(plan);
     let start = std::time::Instant::now();
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);

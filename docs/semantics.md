@@ -105,10 +105,19 @@ The trade-off is **at-least-once at the destination**: a crash between write and
 ## Resume semantics
 
 `rivet run --resume` consults the state DB to decide what work is outstanding. A
-**plain** `rivet run` (no `--resume`) never skips completed chunks — it does a
-fresh full pass (and errors if a prior chunk-checkpoint run is still in progress,
-pointing you at `--resume` or `state reset-chunks`). Resume is opt-in via the flag,
-not a default of `chunk_checkpoint: true`:
+**plain** `rivet run` (no `--resume`) never skips the chunks of a run that
+FINISHED — it does a fresh full pass. A checkpointed run holds its export's run
+lease (an `flock` beside a SQLite state DB, a session advisory lock on a Postgres
+one) for as long as the process lives, and the OS releases it when the process
+dies, `kill -9` included. So when a plain run finds a chunk-checkpoint run still
+in progress:
+
+- **its process is gone** (the lease is free): the run resumes it, exactly as
+  `--resume` would. A `chunk_dense` plan cannot be resumed, so it starts over.
+- **its process is alive** (the lease is held): the run is refused, and so is
+  `--resume` — wait for the live run to finish.
+
+What `--resume` does:
 
 - **Incremental exports** resume from `export_state.last_cursor_value`.
 - **Chunked exports** consult the `chunk_task` table: tasks in `completed` are skipped; tasks in `pending` or `running` (the latter reset to `pending` on resume) are re-issued; tasks in `failed` are retried while `attempts < max_chunk_attempts`.
