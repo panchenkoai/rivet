@@ -120,8 +120,9 @@ fn no_compression_profile_falls_through_to_default_compression_type() {
         cfg.exports[0].compression_profile.is_none(),
         "minimal YAML must not set a compression_profile"
     );
-    // compression field default is Zstd; level is None (no compression_level set).
-    assert_eq!(ct, CompressionType::Zstd);
+    // The field defaults to Zstd, but MINIMAL_YAML is CSV, which the writer never compresses.
+    assert_eq!(cfg.exports[0].compression, CompressionType::Zstd);
+    assert_eq!(ct, CompressionType::None);
     assert!(level.is_none());
 }
 

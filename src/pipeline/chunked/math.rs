@@ -75,15 +75,11 @@ pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     chunks
 }
 
-/// Synthetic ordinal column for `chunk_dense`; stripped before writing files.
-pub(crate) const RIVET_CHUNK_RN_COL: &str = "_rivet_chunk_rn";
-
 pub(crate) fn build_chunk_query_sql(
     base_query: &str,
     order_column: &str,
     start: i64,
     end: i64,
-    chunk_dense: bool,
     chunk_by_days: bool,
     source_type: crate::config::SourceType,
 ) -> String {
@@ -93,17 +89,6 @@ pub(crate) fn build_chunk_query_sql(
     // unseparated form is ISO in every language. Same reason as
     // `plan::partition::build_range_query`, which owns the helper.
     let date_fmt = crate::plan::partition::date_literal_format(source_type);
-
-    if chunk_dense {
-        return format!(
-            "SELECT * FROM (SELECT _rivet_i.*, ROW_NUMBER() OVER (ORDER BY _rivet_i.{oc}) AS {rn} FROM ({bq}) AS _rivet_i) AS _rivet_w WHERE _rivet_w.{rn} BETWEEN {s} AND {e}",
-            bq = base_query,
-            oc = quoted_col,
-            rn = RIVET_CHUNK_RN_COL,
-            s = start,
-            e = end,
-        );
-    }
 
     // Fast path: when base_query is the `SELECT * FROM <simple-ident>` form
     // (typically produced by the `table:` YAML shortcut), append the WHERE
@@ -146,8 +131,9 @@ pub(crate) fn build_chunk_query_sql(
         let start_date = epoch + chrono::Duration::days(start);
         let end_date = epoch + chrono::Duration::days(end + 1);
         return format!(
-            "SELECT * FROM ({base}) AS _rivet WHERE {col} >= '{start}' AND {col} < '{end}'",
+            "SELECT * FROM ({base}) {d} WHERE {col} >= '{start}' AND {col} < '{end}'",
             base = base_query,
+            d = crate::sql::derived(source_type, "_rivet"),
             col = quoted_col,
             start = start_date.format(date_fmt),
             end = end_date.format(date_fmt),
@@ -155,8 +141,9 @@ pub(crate) fn build_chunk_query_sql(
     }
 
     format!(
-        "SELECT * FROM ({base}) AS _rivet WHERE {col} BETWEEN {start} AND {end}",
+        "SELECT * FROM ({base}) {d} WHERE {col} BETWEEN {start} AND {end}",
         base = base_query,
+        d = crate::sql::derived(source_type, "_rivet"),
         col = quoted_col,
         start = start,
         end = end,
@@ -168,7 +155,6 @@ pub(crate) fn chunk_plan_fingerprint(
     chunk_column: &str,
     chunk_size: usize,
     chunk_count: Option<usize>,
-    chunk_dense: bool,
     chunk_by_days: Option<u32>,
 ) -> String {
     use xxhash_rust::xxh3::xxh3_64;
@@ -188,7 +174,6 @@ pub(crate) fn chunk_plan_fingerprint(
     // differently — see `fingerprint_chunk_count_ignores_chunk_size`.
     let kind = match chunk_by_days {
         Some(d) => format!("date_{d}d"),
-        None if chunk_dense => "dense_rn".to_string(),
         None if chunk_count.is_some() => format!("count_{}", chunk_count.unwrap()),
         None => format!("range_{chunk_size}"),
     };
@@ -261,15 +246,7 @@ mod tests {
         // Fast path: `SELECT * FROM t` keeps the bare-table form. A single-day
         // window (start == end == day 0) must span exactly [1970-01-01,
         // 1970-01-02) — an `end - 1` mutant produces an EMPTY window.
-        let q = build_chunk_query_sql(
-            "SELECT * FROM t",
-            "d",
-            0,
-            0,
-            false,
-            true,
-            SourceType::Postgres,
-        );
+        let q = build_chunk_query_sql("SELECT * FROM t", "d", 0, 0, true, SourceType::Postgres);
         assert!(
             q.contains(">= '1970-01-01'") && q.contains("< '1970-01-02'"),
             "single-day window must be [day, day+1): {q}"
@@ -282,7 +259,6 @@ mod tests {
             "d",
             19000,
             19001,
-            false,
             true,
             SourceType::Postgres,
         );
@@ -323,12 +299,10 @@ mod tests {
             1,
             100,
             false,
-            false,
             crate::config::SourceType::Postgres,
         );
         // Column name is quoted; numeric bounds are not
         assert!(q.contains("WHERE \"id\" BETWEEN 1 AND 100"), "got: {}", q);
-        assert!(!q.contains("ROW_NUMBER()"), "got: {}", q);
     }
 
     // ── Fast-path: `SELECT * FROM <ident>` is rewritten in place ──────────
@@ -340,7 +314,6 @@ mod tests {
             "id",
             1,
             100,
-            false,
             false,
             crate::config::SourceType::Postgres,
         );
@@ -359,7 +332,6 @@ mod tests {
             "id",
             1,
             10,
-            false,
             false,
             crate::config::SourceType::Postgres,
         );
@@ -383,7 +355,6 @@ mod tests {
                 1,
                 10,
                 false,
-                false,
                 crate::config::SourceType::Postgres,
             );
             assert!(
@@ -400,7 +371,6 @@ mod tests {
             "created_at",
             18000, // 2019-04-14
             18001,
-            false,
             true,
             crate::config::SourceType::Postgres,
         );
@@ -422,26 +392,9 @@ mod tests {
             1,
             100,
             false,
-            false,
             crate::config::SourceType::Mysql,
         );
         assert!(q.contains("WHERE `id` BETWEEN 1 AND 100"), "got: {}", q);
-    }
-
-    #[test]
-    fn test_build_chunk_query_dense_mode() {
-        let q = build_chunk_query_sql(
-            "SELECT id FROM t",
-            "id",
-            1,
-            5000,
-            true,
-            false,
-            crate::config::SourceType::Postgres,
-        );
-        assert!(q.contains("ROW_NUMBER()"), "got: {}", q);
-        assert!(q.contains(RIVET_CHUNK_RN_COL), "got: {}", q);
-        assert!(q.contains("BETWEEN 1 AND 5000"), "got: {}", q);
     }
 
     // `parse_date_flexible` and `parse_scalar_i64` now live in the shared
@@ -459,7 +412,6 @@ mod tests {
             "created_at",
             start,
             end,
-            false,
             true,
             crate::config::SourceType::Postgres,
         );
@@ -477,7 +429,6 @@ mod tests {
             "ts",
             day,
             day,
-            false,
             true,
             crate::config::SourceType::Postgres,
         );
@@ -616,10 +567,9 @@ mod tests {
         col: &str,
         size: usize,
         count: Option<usize>,
-        dense: bool,
         by_days: Option<u32>,
     ) -> String {
-        chunk_plan_fingerprint(query, col, size, count, dense, by_days)
+        chunk_plan_fingerprint(query, col, size, count, by_days)
     }
 
     /// A plan's TEXT must not be able to imitate another plan's field
@@ -631,31 +581,31 @@ mod tests {
     #[test]
     fn fingerprint_cannot_be_forged_by_a_query_containing_the_old_separator() {
         // ("Q\x1fid", "x") vs ("Q", "id\x1fx") — same concatenation, different plans.
-        let a = fp("Q\u{1f}id", "x", 10, None, false, None);
-        let b = fp("Q", "id\u{1f}x", 10, None, false, None);
+        let a = fp("Q\u{1f}id", "x", 10, None, None);
+        let b = fp("Q", "id\u{1f}x", 10, None, None);
         assert_ne!(
             a, b,
             "a query carrying the separator must not forge the chunk_column boundary"
         );
         // And the boundary POSITION matters even with no separator involved.
         assert_ne!(
-            fp("ab", "c", 10, None, false, None),
-            fp("a", "bc", 10, None, false, None),
+            fp("ab", "c", 10, None, None),
+            fp("a", "bc", 10, None, None),
             "('ab','c') and ('a','bc') are different plans"
         );
     }
 
     #[test]
     fn fingerprint_changes_when_chunk_count_changes() {
-        let base = fp("SELECT * FROM t", "id", 10_000, None, false, None);
-        let with_count = fp("SELECT * FROM t", "id", 10_000, Some(10), false, None);
+        let base = fp("SELECT * FROM t", "id", 10_000, None, None);
+        let with_count = fp("SELECT * FROM t", "id", 10_000, Some(10), None);
         assert_ne!(base, with_count, "chunk_count=None vs Some(10) must differ");
     }
 
     #[test]
     fn fingerprint_changes_when_chunk_count_value_changes() {
-        let c5 = fp("SELECT * FROM t", "id", 10_000, Some(5), false, None);
-        let c10 = fp("SELECT * FROM t", "id", 10_000, Some(10), false, None);
+        let c5 = fp("SELECT * FROM t", "id", 10_000, Some(5), None);
+        let c10 = fp("SELECT * FROM t", "id", 10_000, Some(10), None);
         assert_ne!(c5, c10, "chunk_count=5 vs chunk_count=10 must differ");
     }
 
@@ -664,8 +614,8 @@ mod tests {
         // When chunk_count is set, chunk_size is not encoded in the fingerprint
         // (it's computed dynamically from min/max). Two configs with different
         // chunk_size but same chunk_count must produce the same fingerprint.
-        let a = fp("SELECT * FROM t", "id", 1_000, Some(5), false, None);
-        let b = fp("SELECT * FROM t", "id", 50_000, Some(5), false, None);
+        let a = fp("SELECT * FROM t", "id", 1_000, Some(5), None);
+        let b = fp("SELECT * FROM t", "id", 50_000, Some(5), None);
         assert_eq!(
             a, b,
             "chunk_size is not part of the fingerprint when chunk_count is set"
@@ -673,19 +623,19 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_chunk_count_differs_from_dense_and_by_days() {
-        let count = fp("SELECT * FROM t", "id", 100, Some(4), false, None);
-        let dense = fp("SELECT * FROM t", "id", 100, None, true, None);
-        let by_days = fp("SELECT * FROM t", "id", 100, None, false, Some(7));
-        assert_ne!(count, dense);
+    fn fingerprint_chunk_count_differs_from_range_and_by_days() {
+        let count = fp("SELECT * FROM t", "id", 100, Some(4), None);
+        let range = fp("SELECT * FROM t", "id", 100, None, None);
+        let by_days = fp("SELECT * FROM t", "id", 100, None, Some(7));
+        assert_ne!(count, range);
         assert_ne!(count, by_days);
-        assert_ne!(dense, by_days);
+        assert_ne!(range, by_days);
     }
 
     #[test]
     fn fingerprint_deterministic_for_same_inputs() {
-        let a = fp("SELECT id FROM orders", "id", 5_000, Some(8), false, None);
-        let b = fp("SELECT id FROM orders", "id", 5_000, Some(8), false, None);
+        let a = fp("SELECT id FROM orders", "id", 5_000, Some(8), None);
+        let b = fp("SELECT id FROM orders", "id", 5_000, Some(8), None);
         assert_eq!(a, b);
     }
 }

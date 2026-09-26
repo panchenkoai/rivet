@@ -160,6 +160,28 @@ services:
       timeout: 5s
       retries: 20
 
+  # Oracle Database 23ai Free (batch source). `gvenzl/oracle-free` is the
+  # Free edition packaged with a pre-built database, so it is ready in seconds
+  # (the official container-registry image builds its database on first boot).
+  # APP_USER creates `rivet/rivet` in the FREEPDB1 PDB; the init script grants
+  # the catalog role rivet's row estimates and harm counters read. Seeded by
+  # `make seed-oracle` (seeds/common/oracle.sql).
+  oracle:
+    image: gvenzl/oracle-free:23-slim-faststart
+    environment:
+      ORACLE_PASSWORD: rivet
+      APP_USER: rivet
+      APP_USER_PASSWORD: rivet
+    ports:
+      - "1521:1521"
+    volumes:
+      - ./dev/oracle/init:/container-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   # ---- CDC-configured source engines (cdc profile) --------------------------
   # Dedicated instances carrying the server-side config change data capture
   # needs — logical WAL (PostgreSQL), a REPLICATION grant (MySQL), the SQL

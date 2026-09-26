@@ -91,7 +91,7 @@ pub enum ValidateDepth {
     Light,
     /// Light + part reconcile + untracked surplus (one `list_prefix`).
     Sample,
-    /// Sample + the Form B value-checksum re-read (downloads parts).
+    /// Sample + the Form B value-checksum re-read (downloads parts; CSV: row counts only).
     #[default]
     Full,
 }
@@ -299,6 +299,12 @@ pub enum Failure {
     /// that was never written.  Fatal: a required-but-missing manifest is a
     /// refusal reason, not a "cannot certify" advisory.
     ManifestRequiredButAbsent { prefix: String },
+    /// The manifest's own run status is not `success` (`failed`, `interrupted`,
+    /// `running`): the prefix does not hold a completed export, whatever its parts say.
+    RunNotSuccessful { status: String },
+    /// Advisory: `--depth full` re-counted this CSV export's rows per part, but
+    /// CSV parts carry no value checksum, so no cell values were re-read.
+    ValueCheckNotAvailable { format: String },
 }
 
 impl Failure {
@@ -310,7 +316,10 @@ impl Failure {
     /// fatal by default — opt out here explicitly, so a forgotten case fails
     /// closed (safe) rather than silently passing.
     pub fn is_fatal(&self) -> bool {
-        !matches!(self, Failure::UntrackedObject { .. })
+        !matches!(
+            self,
+            Failure::UntrackedObject { .. } | Failure::ValueCheckNotAvailable { .. }
+        )
     }
 
     /// Whether this failure is COULD-NOT-VERIFY (an operational I/O error that
@@ -321,12 +330,15 @@ impl Failure {
     /// must not page a corruption incident (#7 bughunt: these fell into the
     /// verdict and drove exit 3). Fatal-by-omission the other way: a NEW variant
     /// is verified-wrong (exit 3) unless it is explicitly an I/O could-not-verify.
+    /// A non-success run status is operational too (exit 1): the fix is re-running
+    /// the export, not a corruption hunt.
     pub fn is_could_not_verify(&self) -> bool {
         matches!(
             self,
             Failure::ManifestReadError { .. }
                 | Failure::SuccessMarkerReadError { .. }
                 | Failure::ListPrefixError { .. }
+                | Failure::RunNotSuccessful { .. }
         )
     }
 
@@ -355,6 +367,8 @@ impl Failure {
             Failure::UntrackedObject { .. } => "RIVET_VERIFY_UNTRACKED_OBJECT",
             Failure::ContentVerificationUnmet { .. } => "RIVET_VERIFY_CONTENT_UNMET",
             Failure::ManifestRequiredButAbsent { .. } => "RIVET_VERIFY_MANIFEST_REQUIRED",
+            Failure::RunNotSuccessful { .. } => "RIVET_VERIFY_RUN_NOT_SUCCESSFUL",
+            Failure::ValueCheckNotAvailable { .. } => "RIVET_VERIFY_VALUE_CHECK_NOT_AVAILABLE",
         }
     }
 }
@@ -444,6 +458,16 @@ impl std::fmt::Display for Failure {
                  pinned --prefix) but none was found — this prefix was never \
                  written, or the data was relocated. Run the export first, or \
                  drop --prefix to validate the config-resolved destination."
+            ),
+            Failure::RunNotSuccessful { status } => write!(
+                f,
+                "the manifest records its last run as {status}, not success: this prefix \
+                 does not hold a completed export. Re-run the export."
+            ),
+            Failure::ValueCheckNotAvailable { format } => write!(
+                f,
+                "cell values were not re-read: {format} parts carry no value checksum \
+                 (only parquet does); each part's row count was re-counted instead"
             ),
         }
     }
@@ -788,6 +812,12 @@ pub fn verify_at_destination(
         // Don't short-circuit — we still want to surface part-presence
         // failures because the operator may want to know both classes at
         // once rather than fix-then-rerun.
+    }
+    if manifest.status != crate::manifest::ManifestStatus::Success {
+        let status = serde_json::to_value(manifest.status)?;
+        out.failures.push(Failure::RunNotSuccessful {
+            status: status.as_str().unwrap_or_default().to_string(),
+        });
     }
 
     // ── 3. Reconcile parts + surplus against ONE prefix listing ────────
@@ -1475,18 +1505,15 @@ mod tests {
 
     #[test]
     fn absent_success_marker_does_not_fail_validation_alone() {
-        // ADR-0012 M2: only successful runs land _SUCCESS.  A failed-then-
-        // rewritten manifest legitimately lacks one — verification must
-        // not flip `passed` just for that.
+        // ADR-0012 M2: a success manifest whose _SUCCESS is absent (a split unit)
+        // must not flip `passed` just for the missing marker.
         let dir = tempfile::tempdir().unwrap();
         let m = build_manifest(
             vec![part(1, 10, 4, "xxh3:1111111111111111")],
-            ManifestStatus::Failed,
+            ManifestStatus::Success,
         );
         write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
-        // Note: write_dataset only writes _SUCCESS for status == Success,
-        // so no marker exists here.
-        assert!(!dir.path().join(SUCCESS_FILENAME).exists());
+        std::fs::remove_file(dir.path().join(SUCCESS_FILENAME)).unwrap();
         let dest = local_dest(dir.path());
 
         let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
@@ -1495,9 +1522,34 @@ mod tests {
             !v.success_marker_consistent,
             "no marker => false (no signal)"
         );
-        // The parts still verified, so passed = true.
         assert!(v.passed);
         assert!(v.failures.is_empty());
+    }
+
+    #[test]
+    fn a_manifest_whose_last_run_failed_does_not_pass_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(vec![], ManifestStatus::Failed);
+        write_dataset(dir.path(), &m, &[]);
+        assert!(!dir.path().join(SUCCESS_FILENAME).exists());
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(
+            !v.passed,
+            "a failed run's manifest must not validate as PASSED"
+        );
+        assert_eq!(
+            v.failures,
+            vec![Failure::RunNotSuccessful {
+                status: "failed".into()
+            }]
+        );
+        assert_eq!(
+            v.failures[0].to_string(),
+            "the manifest records its last run as failed, not success: this prefix \
+             does not hold a completed export. Re-run the export."
+        );
     }
 
     // ── self-consistency ────────────────────────────────────────────────
@@ -2357,6 +2409,18 @@ mod tests {
                 },
                 "RIVET_VERIFY_PART_ROW_COUNT",
             ),
+            (
+                Failure::RunNotSuccessful {
+                    status: "failed".into(),
+                },
+                "RIVET_VERIFY_RUN_NOT_SUCCESSFUL",
+            ),
+            (
+                Failure::ValueCheckNotAvailable {
+                    format: "csv".into(),
+                },
+                "RIVET_VERIFY_VALUE_CHECK_NOT_AVAILABLE",
+            ),
         ];
         for (failure, code) in cases {
             assert_eq!(&failure.error_code(), code, "code for {failure:?}");
@@ -2416,6 +2480,8 @@ mod tests {
                 Failure::UntrackedObject { .. } => "UntrackedObject",
                 Failure::ContentVerificationUnmet { .. } => "ContentVerificationUnmet",
                 Failure::ManifestRequiredButAbsent { .. } => "ManifestRequiredButAbsent",
+                Failure::RunNotSuccessful { .. } => "RunNotSuccessful",
+                Failure::ValueCheckNotAvailable { .. } => "ValueCheckNotAvailable",
             })
             .collect();
         let missing: Vec<&&str> = declared.iter().filter(|v| !covered.contains(v)).collect();

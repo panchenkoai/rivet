@@ -10,7 +10,7 @@
 //! - cursor literal `N'…'` with `''` escaping (`query::cursor_rhs`)
 //! - introspection via `sys.*` catalog views
 //!
-//! Supported today: snapshot / incremental / chunked (range + dense) and keyset
+//! Supported today: snapshot / incremental / chunked (range) and keyset
 //! (seek) export, `check --type-report`, `doctor`, chunked-mode planning. The
 //! keyset page builder emits a dialect-correct
 //! `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` clause (T-SQL has no `LIMIT`).
@@ -56,32 +56,84 @@ pub struct MssqlSource {
     /// Whether the export issued `SET LOCK_TIMEOUT` on this connection, so the
     /// `Drop` teardown knows to reset it (Epic 18 B2 — pooler-safe session).
     lock_timeout_applied: bool,
+    /// Whether an incremental read switched this session to `SNAPSHOT`, so `Drop` resets it.
+    snapshot_applied: bool,
+    /// Whether the locking-read warning was already emitted on this connection.
+    locking_read_warned: bool,
+}
+
+/// How an incremental read can see one transaction-consistent state on this database.
+#[derive(Debug, PartialEq, Eq)]
+enum IncrementalReadIsolation {
+    /// `READ_COMMITTED_SNAPSHOT` is on: every statement already reads one snapshot.
+    StatementSnapshot,
+    /// `ALLOW_SNAPSHOT_ISOLATION` is on: rivet switches the read to `SNAPSHOT`.
+    Snapshot,
+    /// Neither: locking READ COMMITTED, which can read a concurrent transaction half-applied.
+    Locking,
+}
+
+/// Classify `sys.databases.snapshot_isolation_state` (1 = ON) and `is_read_committed_snapshot_on`.
+fn incremental_read_isolation(snapshot_state: u8, rcsi: bool) -> IncrementalReadIsolation {
+    if rcsi {
+        IncrementalReadIsolation::StatementSnapshot
+    } else if snapshot_state == 1 {
+        IncrementalReadIsolation::Snapshot
+    } else {
+        IncrementalReadIsolation::Locking
+    }
+}
+
+/// Run a session `SET` as a plain batch: under `sp_executesql` (tiberius `execute`) it reverts on return.
+async fn session_set(client: &mut MssqlClient, set: &str) -> tiberius::Result<()> {
+    client
+        .simple_query(set)
+        .await?
+        .into_results()
+        .await
+        .map(drop)
+}
+
+/// The warning an incremental read on a locking-READ-COMMITTED database emits.
+fn locking_incremental_read_warning(db: &str) -> String {
+    let ident = db.replace(']', "]]");
+    format!(
+        "mssql: database '{db}' has neither READ_COMMITTED_SNAPSHOT nor ALLOW_SNAPSHOT_ISOLATION on, \
+         so this incremental read runs under locking READ COMMITTED: a transaction that commits \
+         while the scan runs can be read half-applied, and the rows the scan had already passed \
+         can fall behind the new cursor and be skipped by every later run. Fix: \
+         `ALTER DATABASE [{ident}] SET ALLOW_SNAPSHOT_ISOLATION ON` (rivet then reads each \
+         incremental window from one snapshot), or add a `settle:` window longer than your \
+         longest write transaction"
+    )
 }
 
 impl Drop for MssqlSource {
     /// Pooler-safe session teardown (Epic 18 B2). rivet never opens a
     /// transaction on this connection — every read is an autocommit `SELECT`,
     /// so there is no transaction to leave dangling across the `block_on`
-    /// bridge (ADR-0011). The only session state the export mutates is
-    /// `SET LOCK_TIMEOUT`; reset it to the SQL Server default (`-1`, wait
-    /// indefinitely) before the connection closes so a *multiplexed* pooler
-    /// that keeps the backend connection alive cannot hand our non-default
-    /// `LOCK_TIMEOUT` to the next session that reuses it.
+    /// bridge (ADR-0011). The session state the export mutates is
+    /// `SET LOCK_TIMEOUT` and, on an incremental read, the isolation level;
+    /// reset both to the SQL Server defaults before the connection closes so a
+    /// *multiplexed* pooler that keeps the backend connection alive cannot hand
+    /// our non-default settings to the next session that reuses it.
     ///
     /// Best-effort and time-boxed: after a failed read the stream is
     /// half-drained and the connection is dying anyway, so the reset (and the
     /// physical connection) just goes away; the 2 s cap guarantees `Drop`
     /// can never hang on a wedged connection.
     fn drop(&mut self) {
-        if !self.lock_timeout_applied {
-            return;
-        }
+        let reset = match (self.lock_timeout_applied, self.snapshot_applied) {
+            (false, false) => return,
+            (true, false) => "SET LOCK_TIMEOUT -1",
+            (false, true) => "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            (true, true) => "SET LOCK_TIMEOUT -1; SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        };
         let Self { rt, client, .. } = self;
         let _ = rt.block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                client.execute("SET LOCK_TIMEOUT -1", &[]),
-            )
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                client.simple_query(reset).await?.into_results().await
+            })
             .await
         });
     }
@@ -272,6 +324,8 @@ impl MssqlSource {
             client,
             proxy_kind: MssqlProxyKind::Direct,
             lock_timeout_applied: false,
+            snapshot_applied: false,
+            locking_read_warned: false,
         };
         // Health round-trip — surfaces auth/permission errors at connect time
         // (doctor relies on this).
@@ -292,6 +346,50 @@ impl MssqlSource {
     #[allow(dead_code)]
     pub fn proxy_kind(&self) -> MssqlProxyKind {
         self.proxy_kind
+    }
+
+    /// Decide whether this incremental read runs under `SNAPSHOT`; warn once when it cannot.
+    fn prepare_incremental_isolation(&mut self) -> Result<bool> {
+        let Self { rt, client, .. } = self;
+        let (db, snapshot_state, rcsi) = rt.block_on(async {
+            let row = client
+                .query(
+                    "SELECT DB_NAME(), snapshot_isolation_state, is_read_committed_snapshot_on \
+                     FROM sys.databases WHERE database_id = DB_ID()",
+                    &[],
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("mssql: reading the database isolation options failed: {e}")
+                })?
+                .into_row()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("mssql: reading the database isolation options failed: {e}")
+                })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mssql: sys.databases has no row for the current database")
+                })?;
+            Ok::<_, anyhow::Error>((
+                row.get::<&str, _>(0).unwrap_or_default().to_string(),
+                row.get::<u8, _>(1).unwrap_or(0),
+                row.get::<bool, _>(2).unwrap_or(false),
+            ))
+        })?;
+        match incremental_read_isolation(snapshot_state, rcsi) {
+            IncrementalReadIsolation::Snapshot => {
+                self.snapshot_applied = true;
+                Ok(true)
+            }
+            IncrementalReadIsolation::StatementSnapshot => Ok(false),
+            IncrementalReadIsolation::Locking => {
+                if !self.locking_read_warned {
+                    self.locking_read_warned = true;
+                    log::warn!("{}", locking_incremental_read_warning(&db));
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Declared `(precision, scale)` per decimal/numeric column, read from
@@ -610,6 +708,8 @@ impl Source for MssqlSource {
         if lock_timeout_ms > 0 {
             self.lock_timeout_applied = true;
         }
+        let snapshot_read =
+            request.incremental.is_some() && self.prepare_incremental_isolation()?;
 
         let Self { rt, client, .. } = self;
         rt.block_on(async {
@@ -617,10 +717,14 @@ impl Source for MssqlSource {
             use tiberius::QueryItem;
 
             if lock_timeout_ms > 0 {
-                client
-                    .execute(format!("SET LOCK_TIMEOUT {lock_timeout_ms}"), &[])
+                session_set(client, &format!("SET LOCK_TIMEOUT {lock_timeout_ms}"))
                     .await
                     .map_err(|e| anyhow::anyhow!("mssql: SET LOCK_TIMEOUT failed: {e}"))?;
+            }
+            if snapshot_read {
+                session_set(client, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("mssql: SET TRANSACTION ISOLATION LEVEL SNAPSHOT failed: {e}"))?;
             }
 
             let started = std::time::Instant::now();
@@ -742,8 +846,15 @@ impl Source for MssqlSource {
                     max_value_bytes,
                 )?;
             }
+            drop(stream);
+            if snapshot_read {
+                session_set(client, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("mssql: resetting the isolation level failed: {e}"))?;
+            }
             Ok::<_, anyhow::Error>(())
         })?;
+        self.snapshot_applied = false;
         Ok(())
     }
 
@@ -1240,6 +1351,36 @@ mod tls_posture_tests {
             accept_invalid_certs: accept,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn incremental_read_isolation_prefers_rcsi_then_snapshot_then_locking() {
+        use super::IncrementalReadIsolation::*;
+        use super::incremental_read_isolation;
+        assert_eq!(incremental_read_isolation(0, true), StatementSnapshot);
+        assert_eq!(incremental_read_isolation(1, true), StatementSnapshot);
+        assert_eq!(incremental_read_isolation(1, false), Snapshot);
+        assert_eq!(incremental_read_isolation(0, false), Locking);
+        assert_eq!(
+            incremental_read_isolation(2, false),
+            Locking,
+            "IN_TRANSITION_TO_OFF"
+        );
+        assert_eq!(
+            incremental_read_isolation(3, false),
+            Locking,
+            "IN_TRANSITION_TO_ON"
+        );
+    }
+
+    #[test]
+    fn locking_read_warning_quotes_the_database_identifier() {
+        let w = super::locking_incremental_read_warning("a]b");
+        assert!(
+            w.contains("`ALTER DATABASE [a]]b] SET ALLOW_SNAPSHOT_ISOLATION ON`"),
+            "{w}"
+        );
+        assert!(w.contains("database 'a]b'"), "{w}");
     }
 
     /// Require must trust-without-verify, matching its documented contract and

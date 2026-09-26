@@ -205,7 +205,7 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
     }
     let q_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let rel = format!("{}.{}", q_ident(&info.schema), q_ident(&info.table));
-    let Some(key) = info.best_indexed_chunk_column().map(str::to_string) else {
+    let Some(key) = info.best_chunk_column().map(str::to_string) else {
         // No integer-indexed chunk key to probe density with — a uuid/text PK is keysettable but
         // not density-probeable here. If the catalog figure is the clamped/unknown 0 (the
         // just-restored/just-migrated moment we probe FOR), trusting it scaffolds `mode: full` on

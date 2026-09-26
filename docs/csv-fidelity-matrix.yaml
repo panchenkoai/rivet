@@ -56,6 +56,11 @@ scenarios:
     no_silent_loss:          { test: binary_is_written_as_hex }
     no_corruption_on_escape: { na: "hex output is `[0-9a-f]` only — it can never contain a comma/quote/newline, so no escaping is needed" }
 
+  - id: binary_null_vs_empty
+    what: "a PRESENT zero-length binary (Oracle EMPTY_BLOB(), PG '\\x'::bytea) writes quoted \"\" and NULL writes the bare empty field — the null_vs_empty rule applied to binary. HONESTY (round-3 hunt, 2026-09-26): until then the hex path wrote nothing for zero bytes, so an empty BLOB and a NULL were byte-identical and a unit test pinned the collision."
+    no_silent_loss:          { test: an_empty_binary_is_quoted_and_distinct_from_null }
+    no_corruption_on_escape: { na: "the empty field has no content to escape" }
+
   - id: unsupported_type_fails_loud
     what: "a type CSV cannot represent (nested list/struct/map) FAILS LOUD at writer construction, never a silently-skipped or mangled column."
     no_silent_loss:          { test: csv_rejects_array_columns_loudly }

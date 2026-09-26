@@ -171,6 +171,63 @@ def mysql_bit_columns(ora, database: str, table: str) -> frozenset:
     return frozenset(r[0] for r in rows)
 
 
+def oracle_available() -> bool:
+    """Whether the pinned python-oracledb (the Oracle source reader) is importable."""
+    try:
+        import oracledb  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def oracle_rows(url: str, sql: str) -> list[dict]:
+    """Rows of `sql` read by python-oracledb (thin): exact Decimals, LOBs read in full (an empty LOB is b''/'', not NULL), session zone UTC."""
+    from urllib.parse import unquote, urlparse
+
+    import oracledb
+
+    oracledb.defaults.fetch_decimals = True
+    u = urlparse(url)
+    with oracledb.connect(
+        user=unquote(u.username or ""), password=unquote(u.password or ""),
+        dsn=f"{u.hostname}:{u.port or 1521}/{u.path.lstrip('/')}",
+    ) as con, con.cursor() as cur:
+        cur.execute("ALTER SESSION SET TIME_ZONE = 'UTC'")
+        cur.arraysize = 5000
+        cur.execute(sql)
+        names = [d[0] for d in cur.description]
+        return [
+            {n: (v.read() if isinstance(v, oracledb.LOB) else v) for n, v in zip(names, row)}
+            for row in cur.fetchall()
+        ]
+
+
+def oracle_table_select(url: str, table: str) -> str:
+    """`SELECT` of every column of `table`, a WITH TIME ZONE column cast AT TIME ZONE 'UTC' (python-oracledb thin drops the offset and refuses region names)."""
+    cols = oracle_rows(
+        url,
+        "SELECT column_name, data_type FROM user_tab_columns "
+        f"WHERE table_name = '{table.upper()}' ORDER BY column_id",
+    )
+
+    def one(name: str, typ: str) -> str:
+        q = f'"{name}"'
+        if typ.endswith(" WITH TIME ZONE") and "LOCAL" not in typ:
+            return f"CAST({q} AT TIME ZONE 'UTC' AS TIMESTAMP(9)) AS {q}"
+        return q
+
+    proj = ", ".join(one(c["COLUMN_NAME"], c["DATA_TYPE"]) for c in cols)
+    return f"SELECT {proj} FROM {table}"
+
+
+def oracle_relation(ora, url: str, table: str) -> str:
+    """The Oracle table registered in the DuckDB session `ora` (read by python-oracledb, via pyarrow); returns its relation name."""
+    import pyarrow as pa
+
+    ora.db.register("ora_src", pa.Table.from_pylist(oracle_rows(url, oracle_table_select(url, table))))
+    return "ora_src"
+
+
 def source_attach(engine: str, url: str) -> tuple[dict, str]:
     """The `Oracle` keyword that attaches `url`, and the DuckDB schema prefix its tables live under."""
     from urllib.parse import urlparse
@@ -223,6 +280,11 @@ def compare_to_parquet(engine: str, url: str, table: str, preamble: str, dest: s
     """`tuple_mismatches` between the source table and a parquet relation (`preamble` sets up its store)."""
     from .duck import Oracle
 
+    if engine == "oracle":
+        with Oracle() as ora:
+            if preamble:
+                ora.db.sql(preamble)
+            return tuple_mismatches(ora, oracle_relation(ora, url, table), dest)
     attach, prefix = source_attach(engine, url)
     with Oracle(**attach) as ora:
         if preamble:
@@ -303,6 +365,14 @@ def compare_rows_to_parquet(engine: str, url: str, table: str, parquet: str) -> 
     """(delivered rows, differences) between the source table and a `read_parquet(...)` relation, every value in canonical form."""
     from .duck import Oracle
 
+    if engine == "oracle":
+        with Oracle() as ora:
+            dest = f"(SELECT * FROM {parquet})"
+            bad = invalid_text_columns(ora, dest)
+            if bad:
+                return 0, [f"STRING column(s) {bad} hold bytes that are not UTF-8 — unreadable as text"]
+            dst = fetch(ora, f"SELECT * FROM {dest} ORDER BY id")
+        return len(dst), diff_rows(oracle_rows(url, oracle_table_select(url, table)), dst, key="ID")
     attach, prefix = source_attach(engine, url)
     with Oracle(**attach) as ora:
         return _rows_against_source(ora, engine, prefix, table, f"(SELECT * FROM {parquet})")

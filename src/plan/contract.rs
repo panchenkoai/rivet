@@ -17,7 +17,6 @@ pub struct ChunkedPlan {
     /// When Some, `chunk_size` is recomputed at detect time from min/max.
     pub chunk_count: Option<usize>,
     pub parallel: usize,
-    pub dense: bool,
     pub by_days: Option<u32>,
     pub checkpoint: bool,
     /// Resolved from `chunk_max_attempts` or `tuning.max_retries + 1`.
@@ -428,11 +427,17 @@ pub fn build_time_window_query(
             // ISO-8601 with a 'T' is DATEFORMAT/LANGUAGE-immune on MSSQL (mirrors
             // partition.rs's date-literal rule); PG/MySQL keep the space form,
             // which they parse ISO-unambiguously (bug hunt 2026-08-09).
+            // Oracle's ANSI `TIMESTAMP '…'` ignores the session's pinned NLS format.
             let lit = match source_type {
-                crate::config::SourceType::Mssql => truncated.format("%Y-%m-%dT%H:%M:%S"),
-                _ => truncated.format("%Y-%m-%d %H:%M:%S"),
+                crate::config::SourceType::Mssql => {
+                    format!("'{}'", truncated.format("%Y-%m-%dT%H:%M:%S"))
+                }
+                crate::config::SourceType::Oracle => {
+                    format!("TIMESTAMP '{}'", truncated.format("%Y-%m-%d %H:%M:%S"))
+                }
+                _ => format!("'{}'", truncated.format("%Y-%m-%d %H:%M:%S")),
             };
-            format!("{quoted_col} >= '{lit}'")
+            format!("{quoted_col} >= {lit}")
         }
         TimeColumnType::Unix => {
             format!("{} >= {}", quoted_col, truncated.and_utc().timestamp())
@@ -440,8 +445,9 @@ pub fn build_time_window_query(
     };
 
     format!(
-        "SELECT * FROM ({base}) AS _rivet WHERE {cond}",
+        "SELECT * FROM ({base}) {d} WHERE {cond}",
         base = base_query,
+        d = crate::sql::derived(source_type, "_rivet"),
         cond = condition,
     )
 }
@@ -535,7 +541,6 @@ mod tests {
             chunk_size: 10_000,
             chunk_count: None,
             parallel: 1,
-            dense: false,
             by_days: None,
             checkpoint: false,
             max_attempts: 3,
@@ -553,7 +558,6 @@ mod tests {
             chunk_size: 10_000,
             chunk_count: None,
             parallel: 1,
-            dense: false,
             by_days: None,
             checkpoint: true,
             max_attempts: 3,
@@ -612,6 +616,19 @@ mod tests {
             !q.contains(" 00:00:00'"),
             "MSSQL literal must NOT use the DATEFORMAT-dependent space form: {q}"
         );
+    }
+
+    #[test]
+    fn build_time_window_query_oracle_uses_an_nls_immune_literal() {
+        let q = build_time_window_query(
+            "SELECT * FROM events",
+            "CREATED_AT",
+            TimeColumnType::Timestamp,
+            7,
+            SourceType::Oracle,
+        );
+        assert!(q.contains("\"CREATED_AT\" >= TIMESTAMP '"), "got: {q}");
+        assert!(q.ends_with(" 00:00:00'"), "got: {q}");
     }
 
     #[test]

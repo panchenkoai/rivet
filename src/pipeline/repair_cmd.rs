@@ -28,8 +28,10 @@
 //!    count and converges to a match; and
 //! 2. appends the repair-written part(s) to the destination `manifest.json`
 //!    (read → append → rewrite) so the new file is tracked and `validate` no
-//!    longer reports it as untracked. The originals are left in place and in
-//!    the manifest (repair is additive, ADR-0009 RR5 / ADR-0012).
+//!    longer reports it as untracked, and marks the chunk's original part(s)
+//!    `superseded` so a manifest reader sees each row once. The original FILES
+//!    stay on disk until opt-in `gc_orphans` (ADR-0009 RR5); when the mapping of
+//!    an original to its chunk is ambiguous the chunk stays additive, with a warning.
 //!
 //! Progression semantics (ADR-0008): repair does **not** advance
 //! `last_committed_*` — the committed boundary already covers the chunk index.
@@ -178,8 +180,8 @@ fn execute_repair(
     // again only in the manifest-rewrite step, which runs at most once).
     let dest = crate::destination::create_destination(&plan.destination)?;
 
-    // Repair-written parts to record in the destination manifest, in order.
-    let mut new_parts: Vec<ManifestPart> = Vec::new();
+    // Each executed chunk with the repair-written parts that replace it, in order.
+    let mut repaired: Vec<(i64, Vec<ManifestPart>)> = Vec::new();
 
     for a in &repair_plan.actions {
         let (start, end) = match (a.start_key.parse::<i64>(), a.end_key.parse::<i64>()) {
@@ -269,7 +271,7 @@ fn execute_repair(
                     );
                 }
 
-                new_parts.extend(chunk_parts);
+                repaired.push((a.chunk_index, chunk_parts));
                 results.push((a.clone(), RepairOutcome::Executed { rows_written: rows }));
             }
             Err(e) => {
@@ -285,8 +287,14 @@ fn execute_repair(
     //     already durable at the destination, so a manifest-rewrite failure
     //     must not change the repair's exit code — but it is logged loudly so
     //     the operator knows validate may still flag the files.
-    if !new_parts.is_empty()
-        && let Err(e) = record_repair_parts_in_manifest(&plan.destination, &new_parts)
+    if !repaired.is_empty()
+        && let Err(e) = record_repair_parts_in_manifest(
+            &plan.destination,
+            &repaired,
+            run_id.as_deref(),
+            &summary.ledger.integrity.column_checksums,
+            summary.ledger.integrity.checksum_key_column.as_deref(),
+        )
     {
         log::warn!(
             "repair: re-exported parts were written but the destination manifest could not be \
@@ -302,18 +310,18 @@ fn execute_repair(
     ))
 }
 
-/// Read the destination `manifest.json`, append the repair-written parts as new
-/// committed entries (fresh unique `part_id`s, recomputed `row_count` /
-/// `part_count`), and rewrite it. The originals stay recorded — repair is
-/// additive — so this closes the "untracked repair file" gap (finding #8)
-/// without dropping the manifest's history of the prior parts.
+/// Read the destination `manifest.json`, mark each repaired chunk's original parts
+/// `Superseded`, append the repair-written parts as committed, and rewrite it.
 ///
 /// Returns `Err` if no manifest exists at the prefix (a repair against a prefix
 /// that was never finalized has nothing to amend) or if the read/write fails;
 /// the caller logs and continues since the data itself is already durable.
 fn record_repair_parts_in_manifest(
     destination: &crate::config::DestinationConfig,
-    new_parts: &[ManifestPart],
+    repaired: &[(i64, Vec<ManifestPart>)],
+    chunk_run_id: Option<&str>,
+    repair_checksums: &std::collections::BTreeMap<String, u64>,
+    repair_key: Option<&str>,
 ) -> Result<()> {
     let dest = crate::destination::create_destination(destination)?;
 
@@ -334,9 +342,15 @@ fn record_repair_parts_in_manifest(
     let mut manifest: RunManifest = serde_json::from_slice(&raw)
         .map_err(|e| anyhow::anyhow!("destination manifest.json is unparseable: {e}"))?;
 
+    let superseded = superseded_parts(&manifest, repaired, chunk_run_id);
+    let removed = superseded_checksums(&*dest, &manifest, &superseded);
+    for &i in &superseded {
+        manifest.parts[i].status = PartStatus::Superseded;
+    }
+
     // Unique, monotonic part_ids (ADR-0012 M4): max existing + 1, incrementing.
     let mut next_id = manifest.parts.iter().map(|p| p.part_id).max().unwrap_or(0) + 1;
-    for p in new_parts {
+    for p in repaired.iter().flat_map(|(_, parts)| parts) {
         manifest.parts.push(ManifestPart {
             part_id: next_id,
             path: p.path.clone(),
@@ -354,23 +368,177 @@ fn record_repair_parts_in_manifest(
     manifest.row_count = manifest.committed_rows();
     manifest.part_count = manifest.committed_part_count() as u32;
     manifest.finished_at = chrono::Utc::now().to_rfc3339();
+    fold_repair_checksums(
+        &mut manifest,
+        repair_checksums,
+        repair_key,
+        removed.as_ref(),
+    );
 
     // Route through the shared writer so the canonical `manifest.json`, the
     // immutable run-unique `manifest-<run_id>.json` copy, and the `_SUCCESS`
     // fingerprint all update TOGETHER. The old hand-rolled write touched ONLY
     // the canonical file, leaving the run-unique sidecar stale — and `rivet load`
     // is manifest-authoritative and reads the run-unique copies preferentially
-    // (`list_manifest_keys`), so it saw the PRE-repair part list, resolved those
-    // parts as present (repair is additive, never deletes), never fell back to
-    // the full listing, and SILENTLY dropped the repaired parts (the exact rows
-    // the operator ran `repair` to recover) with every count/gate green. The
-    // canonical-only write also left `_SUCCESS` fingerprinting the old bytes
-    // (a false `SuccessMarkerStale` on `rivet validate`). `write_manifest`
+    // (`list_manifest_keys`), so it saw the PRE-repair part list and SILENTLY
+    // dropped the repaired parts with every count/gate green. `write_manifest`
     // re-emits `_SUCCESS` only for a `Success` manifest, so a repaired clean run
     // keeps its marker (re-fingerprinted to the new bytes) and a repaired failed
     // run stays marker-less — the terminal status is preserved.
     crate::pipeline::manifest_writer::write_manifest(&*dest, &manifest)?;
     Ok(())
+}
+
+/// Indexes of the committed manifest parts the repaired chunks replace; an ambiguous mapping supersedes nothing for that chunk.
+fn superseded_parts(
+    manifest: &RunManifest,
+    repaired: &[(i64, Vec<ManifestPart>)],
+    chunk_run_id: Option<&str>,
+) -> Vec<usize> {
+    let additive = |why: &str| {
+        log::warn!(
+            "repair: {why} — keeping the original part(s) declared beside the repair part \
+             (additive); a manifest reader will see the chunk's unchanged rows twice"
+        )
+    };
+    if chunk_run_id != Some(manifest.run_id.as_str()) {
+        additive(&format!(
+            "the destination manifest is run '{}', not the repaired chunk run {chunk_run_id:?}",
+            manifest.run_id
+        ));
+        return Vec::new();
+    }
+    let own_prefix = format!("{}_", manifest.export_name);
+    let chunk_of = |path: &str| -> Option<i64> {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        base.strip_prefix(&own_prefix)?;
+        super::chunked::chunk_index_of(base)?.parse().ok()
+    };
+    let committed = || {
+        manifest
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.status == PartStatus::Committed)
+    };
+    if let Some((_, p)) = committed().find(|(_, p)| chunk_of(&p.path).is_none()) {
+        additive(&format!(
+            "committed part '{}' carries no chunk index of export '{}'",
+            p.path, manifest.export_name
+        ));
+        return Vec::new();
+    }
+    let mut chunks = std::collections::BTreeSet::new();
+    for (chunk, parts) in repaired {
+        match parts.iter().find(|p| chunk_of(&p.path) != Some(*chunk)) {
+            Some(p) => additive(&format!(
+                "repair part '{}' is not named for chunk {chunk}",
+                p.path
+            )),
+            None => {
+                chunks.insert(*chunk);
+            }
+        }
+    }
+    committed()
+        .filter(|(_, p)| chunk_of(&p.path).is_some_and(|c| chunks.contains(&c)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The superseded parts' Form-B contribution, re-read with the manifest's own render and key; `None` when it cannot be recomputed.
+fn superseded_checksums(
+    dest: &dyn crate::destination::Destination,
+    manifest: &RunManifest,
+    superseded: &[usize],
+) -> Option<std::collections::BTreeMap<String, u64>> {
+    use std::io::Write;
+
+    if superseded.is_empty() || manifest.column_checksums.is_none() {
+        return Some(Default::default());
+    }
+    let mut tmps = Vec::with_capacity(superseded.len());
+    for &i in superseded {
+        let path = &manifest.parts[i].path;
+        let written = dest.read(path).and_then(|body| {
+            let mut tmp = tempfile::NamedTempFile::new()?;
+            tmp.write_all(&body)?;
+            tmp.flush()?;
+            Ok(tmp)
+        });
+        match written {
+            Ok(tmp) => tmps.push(tmp),
+            Err(e) => {
+                log::warn!("repair: cannot re-read superseded part '{path}': {e:#}");
+                return None;
+            }
+        }
+    }
+    let paths: Vec<std::path::PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
+    let fold =
+        crate::source::value_checksum::Fold::from_render_id(manifest.checksum_render.as_deref());
+    match crate::source::value_checksum::reread_column_checksums(
+        &paths,
+        manifest.checksum_key_column.as_deref(),
+        fold,
+    ) {
+        Ok(Ok(sums)) => Some(sums),
+        Ok(Err(detail)) => {
+            log::warn!("repair: {detail}");
+            None
+        }
+        Err(e) => {
+            log::warn!("repair: cannot re-read the superseded parts: {e:#}");
+            None
+        }
+    }
+}
+
+/// Fold the repair parts' Form-B checksums into the manifest, or drop the record when it cannot cover them truthfully.
+fn fold_repair_checksums(
+    manifest: &mut RunManifest,
+    repair: &std::collections::BTreeMap<String, u64>,
+    repair_key: Option<&str>,
+    superseded: Option<&std::collections::BTreeMap<String, u64>>,
+) {
+    let Some(recorded) = manifest.column_checksums.as_mut() else {
+        return;
+    };
+    let foldable = manifest.checksum_render.as_deref()
+        == Some(crate::source::value_checksum::CHECKSUM_RENDER_ID)
+        && manifest.checksum_key_column.as_deref() == repair_key
+        && recorded.len() == repair.len()
+        && recorded
+            .iter()
+            .all(|c| repair.contains_key(&c.name) && c.checksum.parse::<u64>().is_ok())
+        && superseded
+            .is_some_and(|s| s.is_empty() || recorded.iter().all(|c| s.contains_key(&c.name)));
+    if !foldable {
+        log::warn!(
+            "repair: the manifest's value checksums cannot be extended to cover the repaired \
+             parts (different fold, key column or column set, or a superseded part could not \
+             be re-read) — dropping them; `validate --depth full` will skip the value re-read \
+             for this prefix"
+        );
+        manifest.column_checksums = None;
+        manifest.checksum_render = None;
+        manifest.checksum_key_column = None;
+        return;
+    }
+    for c in recorded.iter_mut() {
+        let sum = c
+            .checksum
+            .parse::<u64>()
+            .unwrap_or(0)
+            .wrapping_add(repair[&c.name])
+            .wrapping_sub(
+                superseded
+                    .and_then(|s| s.get(&c.name))
+                    .copied()
+                    .unwrap_or(0),
+            );
+        c.checksum = sum.to_string();
+    }
 }
 
 /// Rewrite a repair-written part filename so it carries the ORIGINAL chunk
@@ -559,6 +727,60 @@ mod tests {
     // parts were silently dropped at load while every count/gate passed. Assert
     // on the manifest COPY (not a data re-read — a re-read can't see a sidecar
     // clobber; the process rules sidecar rule).
+    fn formb_manifest(render: Option<&str>, key: Option<&str>) -> RunManifest {
+        serde_json::from_value(serde_json::json!({
+            "manifest_version": crate::manifest::MANIFEST_VERSION,
+            "run_id": "r", "export_name": "e", "mode": "chunked",
+            "started_at": "t", "finished_at": "t", "status": "success",
+            "source": {"engine": "postgres"},
+            "destination": {"kind": "local", "uri": "/x"},
+            "format": "parquet", "compression": "zstd", "schema_fingerprint": "f",
+            "row_count": 0, "part_count": 0, "parts": [],
+            "column_checksums": [{"name": "id", "checksum": u64::MAX.to_string()},
+                                 {"name": "v", "checksum": "10"}],
+            "checksum_render": render, "checksum_key_column": key,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repair_checksums_fold_by_wrapping_sum_into_a_v2_manifest() {
+        use crate::source::value_checksum::CHECKSUM_RENDER_ID;
+        let repair = [("id".to_string(), 2u64), ("v".to_string(), 5u64)].into();
+        let mut m = formb_manifest(Some(CHECKSUM_RENDER_ID), Some("id"));
+        fold_repair_checksums(&mut m, &repair, Some("id"), Some(&Default::default()));
+        let got: Vec<(String, String)> = m
+            .column_checksums
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.name, c.checksum))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("id".into(), "1".into()), ("v".into(), "15".into())]
+        );
+        assert_eq!(m.checksum_render.as_deref(), Some(CHECKSUM_RENDER_ID));
+    }
+
+    #[test]
+    fn repair_checksums_are_dropped_when_they_cannot_be_folded_truthfully() {
+        use crate::source::value_checksum::CHECKSUM_RENDER_ID;
+        let full = [("id".to_string(), 2u64), ("v".to_string(), 5u64)].into();
+        let partial = [("id".to_string(), 2u64)].into();
+        for (render, key, repair) in [
+            (None, Some("id"), &full),
+            (Some(CHECKSUM_RENDER_ID), None, &full),
+            (Some(CHECKSUM_RENDER_ID), Some("id"), &partial),
+        ] {
+            let mut m = formb_manifest(render, key);
+            fold_repair_checksums(&mut m, repair, Some("id"), Some(&Default::default()));
+            assert!(
+                m.column_checksums.is_none(),
+                "{render:?} {key:?} {repair:?}"
+            );
+        }
+    }
+
     #[test]
     fn repair_updates_the_run_unique_manifest_copy_not_just_the_canonical() {
         use crate::config::{DestinationConfig, DestinationType};
@@ -623,7 +845,14 @@ mod tests {
             ..Default::default()
         };
         // Repair recovers one more part: id 3, 7 rows.
-        record_repair_parts_in_manifest(&dest_cfg, &[part(3, 7)]).unwrap();
+        record_repair_parts_in_manifest(
+            &dest_cfg,
+            &[(3, vec![part(3, 7)])],
+            Some(run_id),
+            &Default::default(),
+            None,
+        )
+        .unwrap();
 
         let read = |name: String| -> RunManifest {
             serde_json::from_slice(&std::fs::read(dir.path().join(name)).unwrap()).unwrap()
@@ -640,5 +869,292 @@ mod tests {
         );
         // The canonical stays consistent with it.
         assert_eq!(read(MANIFEST_FILENAME.to_string()).parts.len(), 3);
+    }
+
+    // ── option B: the manifest declares the replacement, the files stay ──────
+
+    use crate::pipeline::chunked::chunk_part_filename;
+
+    /// Write an `(id BIGINT, v TEXT)` parquet part at `dir/name` and return its write-side keyed checksums.
+    fn write_part(
+        dir: &std::path::Path,
+        name: &str,
+        ids: std::ops::RangeInclusive<i64>,
+    ) -> Vec<u64> {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let ids: Vec<i64> = ids.collect();
+        let vs: Vec<String> = ids.iter().map(|i| format!("v{i}")).collect();
+        let batch = arrow::array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(ids)),
+                std::sync::Arc::new(StringArray::from(vs)),
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join(name)).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        crate::source::value_checksum::arrow_batch_checksums_keyed(&batch, 0)
+    }
+
+    fn sum(parts: &[&Vec<u64>]) -> Vec<String> {
+        (0..2)
+            .map(|c| {
+                parts
+                    .iter()
+                    .fold(0u64, |a, p| a.wrapping_add(p[c]))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn mpart(id: u32, path: &str, rows: i64) -> ManifestPart {
+        ManifestPart {
+            part_id: id,
+            path: path.into(),
+            rows,
+            size_bytes: 1,
+            content_fingerprint: "xxh3:0000000000000000".into(),
+            content_md5: String::new(),
+            status: PartStatus::Committed,
+        }
+    }
+
+    /// A finalized chunked run of `orders` (run `r1`): chunk 0 = ids 1..=3, chunk 1 = ids 4..=5 (id 6 missing).
+    struct Fixture {
+        dir: tempfile::TempDir,
+        chunk0: String,
+        chunk1: String,
+        sums0: Vec<u64>,
+    }
+
+    fn fixture() -> Fixture {
+        use crate::source::value_checksum::CHECKSUM_RENDER_ID;
+        let dir = tempfile::tempdir().unwrap();
+        let exp = dir.path().join("exp");
+        std::fs::create_dir_all(&exp).unwrap();
+        let chunk0 = chunk_part_filename("orders", 0, "parquet");
+        let chunk1 = chunk_part_filename("orders", 1, "parquet");
+        let sums0 = write_part(&exp, &chunk0, 1..=3);
+        let sums1 = write_part(&exp, &chunk1, 4..=5);
+        let m = RunManifest {
+            export_name: "orders".into(),
+            export_family: "orders".into(),
+            mode: "chunked".into(),
+            column_checksums: Some(
+                ["id", "v"]
+                    .iter()
+                    .zip(sum(&[&sums0, &sums1]))
+                    .map(|(n, c)| crate::manifest::ColumnChecksum {
+                        name: (*n).into(),
+                        checksum: c,
+                    })
+                    .collect(),
+            ),
+            checksum_render: Some(CHECKSUM_RENDER_ID.into()),
+            checksum_key_column: Some("id".into()),
+            ..RunManifest::for_test("r1", &[(&chunk0, 3), (&chunk1, 2)])
+        };
+        crate::pipeline::manifest_writer::write_manifest(
+            &*crate::destination::create_destination(&dest_cfg(&exp)).unwrap(),
+            &m,
+        )
+        .unwrap();
+        Fixture {
+            dir,
+            chunk0,
+            chunk1,
+            sums0,
+        }
+    }
+
+    fn dest_cfg(exp: &std::path::Path) -> crate::config::DestinationConfig {
+        crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(exp.to_str().unwrap().to_string()),
+            ..Default::default()
+        }
+    }
+
+    impl Fixture {
+        fn exp(&self) -> std::path::PathBuf {
+            self.dir.path().join("exp")
+        }
+        /// Write the repair part of chunk 1 (ids 4..=6) and record it; returns (its name, its checksums).
+        fn repair(&self, run: &str, name: Option<String>) -> (String, Vec<u64>) {
+            let name = name.unwrap_or_else(|| chunk_part_filename("orders", 1, "parquet"));
+            let sums = write_part(&self.exp(), &name, 4..=6);
+            let repair = [("id".to_string(), sums[0]), ("v".to_string(), sums[1])].into();
+            record_repair_parts_in_manifest(
+                &dest_cfg(&self.exp()),
+                &[(1, vec![mpart(0, &name, 3)])],
+                Some(run),
+                &repair,
+                Some("id"),
+            )
+            .unwrap();
+            (name, sums)
+        }
+        fn manifest(&self) -> RunManifest {
+            serde_json::from_slice(&std::fs::read(self.exp().join(MANIFEST_FILENAME)).unwrap())
+                .unwrap()
+        }
+        fn status_of(&self, path: &str) -> PartStatus {
+            self.manifest()
+                .parts
+                .iter()
+                .find(|p| p.path == path)
+                .unwrap()
+                .status
+        }
+    }
+
+    #[test]
+    fn repair_supersedes_the_chunks_original_part_and_keeps_its_file() {
+        let f = fixture();
+        let (repair, repair_sums) = f.repair("r1", None);
+        let m = f.manifest();
+        assert_eq!(f.status_of(&f.chunk1), PartStatus::Superseded);
+        assert_eq!(f.status_of(&f.chunk0), PartStatus::Committed);
+        assert_eq!(f.status_of(&repair), PartStatus::Committed);
+        assert_eq!(
+            (m.row_count, m.part_count),
+            (6, 2),
+            "3 + 3, the replaced 2 gone"
+        );
+        assert!(
+            f.exp().join(&f.chunk1).exists(),
+            "RR5: the superseded file stays"
+        );
+        let got: Vec<String> = m
+            .column_checksums
+            .expect("the checksums can be recomputed truthfully, so they must survive")
+            .into_iter()
+            .map(|c| c.checksum)
+            .collect();
+        assert_eq!(
+            got,
+            sum(&[&f.sums0, &repair_sums]),
+            "the manifest must attest exactly the committed parts, written-side"
+        );
+        // Form B over the committed parts agrees with it.
+        let dest = crate::destination::create_destination(&dest_cfg(&f.exp())).unwrap();
+        assert!(
+            crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repair_drops_the_checksums_when_a_superseded_part_cannot_be_reread() {
+        let f = fixture();
+        std::fs::write(f.exp().join(&f.chunk1), b"not parquet").unwrap();
+        f.repair("r1", None);
+        assert_eq!(f.status_of(&f.chunk1), PartStatus::Superseded);
+        assert!(f.manifest().column_checksums.is_none(), "never left stale");
+    }
+
+    #[test]
+    fn repair_stays_additive_when_the_mapping_is_ambiguous() {
+        // A manifest from another run.
+        let f = fixture();
+        let (repair, _) = f.repair("r-other", None);
+        assert_eq!(f.status_of(&f.chunk1), PartStatus::Committed);
+        assert_eq!(f.status_of(&repair), PartStatus::Committed);
+        assert_eq!(f.manifest().row_count, 8);
+
+        // A repair part the rename could not relabel (still `_chunk0_`).
+        let f = fixture();
+        f.repair("r1", Some(chunk_part_filename("orders", 0, "parquet")));
+        assert_eq!(f.status_of(&f.chunk1), PartStatus::Committed);
+        assert_eq!(f.status_of(&f.chunk0), PartStatus::Committed);
+
+        // A committed part whose name carries no chunk index.
+        let m = RunManifest {
+            export_name: "orders".into(),
+            ..RunManifest::for_test(
+                "r1",
+                &[
+                    (&chunk_part_filename("orders", 1, "parquet"), 2),
+                    ("orders_stray.parquet", 1),
+                ],
+            )
+        };
+        let repaired = [(
+            1,
+            vec![mpart(0, &chunk_part_filename("orders", 1, "parquet"), 3)],
+        )];
+        assert!(superseded_parts(&m, &repaired, Some("r1")).is_empty());
+
+        // Another export's part named like a chunk part.
+        let m = RunManifest {
+            export_name: "orders".into(),
+            ..RunManifest::for_test("r1", &[(&chunk_part_filename("items", 1, "parquet"), 2)])
+        };
+        assert!(superseded_parts(&m, &repaired, Some("r1")).is_empty());
+    }
+
+    #[test]
+    fn a_superseded_part_is_neither_loaded_nor_kept_by_gc() {
+        use crate::destination::gcs::GcsStore;
+        use crate::load::reconcile::{fetch_manifests_keyed, gc_orphans, select_load_keys};
+
+        let f = fixture();
+        let (repair, _) = f.repair("r1", None);
+        let store = GcsStore::open_fs(f.dir.path().to_str().unwrap()).unwrap();
+        let keyed = fetch_manifests_keyed(&store, "gs://bucket/exp").unwrap();
+        let all: Vec<String> = [&f.chunk0, &f.chunk1, &repair]
+            .iter()
+            .map(|n| format!("exp/{n}"))
+            .collect();
+        let mut want = vec![format!("exp/{}", f.chunk0), format!("exp/{repair}")];
+        want.sort();
+        assert_eq!(
+            select_load_keys(&keyed, &all),
+            want,
+            "the load reads each row once"
+        );
+
+        // A run is active on the prefix: gc spares the superseded file.
+        gc_orphans(&store, "gs://bucket/exp", &keyed, true, &Default::default()).unwrap();
+        assert!(f.exp().join(&f.chunk1).exists());
+        // No run is active: gc collects it, and only it.
+        let (removed, _) = gc_orphans(
+            &store,
+            "gs://bucket/exp",
+            &keyed,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!f.exp().join(&f.chunk1).exists());
+        assert!(f.exp().join(&f.chunk0).exists() && f.exp().join(&repair).exists());
+    }
+
+    #[test]
+    fn validate_claims_a_superseded_part_instead_of_calling_it_untracked() {
+        let f = fixture();
+        f.repair("r1", None);
+        let dest = crate::destination::create_destination(&dest_cfg(&f.exp())).unwrap();
+        let rec = crate::pipeline::manifest_reconcile::reconcile_manifest_against_listing(
+            &f.manifest(),
+            &dest.list_prefix("").unwrap(),
+            "",
+        );
+        assert!(rec.untracked.is_empty(), "{:?}", rec.untracked);
+        assert_eq!(
+            rec.per_part.len(),
+            2,
+            "no presence verdict for the superseded part"
+        );
     }
 }

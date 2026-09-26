@@ -52,6 +52,9 @@ fn main() {
     // the truth without the per-attempt spam (field find, 2026-08-13: a
     // 154-export pool run interleaved a retry WARN between most result lines).
     redact::install_logger();
+    // The oracle driver links a second rustls crypto provider; name one for every TLS client.
+    #[cfg(feature = "oracle")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = cli::parse_cli();
     let json_errors = cli.json_errors;
     if let Err(e) = cli::dispatch(cli) {

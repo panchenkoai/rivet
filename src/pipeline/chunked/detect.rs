@@ -14,10 +14,17 @@ use crate::source::Source;
 /// (we measured ~3.2 GB of `temp_files` on a 8.6 GB table) — the fast path
 /// avoids the wrap entirely so `COUNT(*)` becomes a plain heap-scan / index-only
 /// scan with no spill.
-fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64> {
+fn query_wrapped_row_count(
+    src: &mut dyn Source,
+    base_query: &str,
+    source_type: crate::config::SourceType,
+) -> Result<i64> {
     let sql = match strip_simple_projection_from(base_query) {
         Some(table_ident) => format!("SELECT COUNT(*) FROM {table_ident}"),
-        None => format!("SELECT COUNT(*) FROM ({base_query}) AS _rivet_rowcnt"),
+        None => format!(
+            "SELECT COUNT(*) FROM ({base_query}) {}",
+            crate::sql::derived(source_type, "_rivet_rowcnt")
+        ),
     };
     let raw = src
         .query_scalar(&sql)?
@@ -35,8 +42,7 @@ fn query_wrapped_row_count(src: &mut dyn Source, base_query: &str) -> Result<i64
 /// range path historically did not. We detect the condition on the live data
 /// (one aggregate — a nullable column with zero actual NULLs is fine and must
 /// not be rejected) and bail with the same posture as keyset rather than drop
-/// rows silently. `chunk_dense` does NOT call this: its `ROW_NUMBER()` numbers
-/// every row, NULL-keyed included, so no row is lost.
+/// rows silently.
 fn bail_if_null_keyed(
     src: &mut dyn Source,
     base_query: &str,
@@ -55,8 +61,7 @@ fn bail_if_null_keyed(
             "export '{}': found NULL in chunk_column '{}'. Range/date chunking filters \
              with `BETWEEN min AND max` (or `>= .. < ..`), which excludes NULL — those rows would \
              be silently dropped from the export. Fix one of: use a NOT NULL column for \
-             chunk_column; add `WHERE {} IS NOT NULL` to the query to drop them explicitly; set \
-             `chunk_dense: true` (ROW_NUMBER covers every row, NULL-keyed included); or use \
+             chunk_column; add `WHERE {} IS NOT NULL` to the query to drop them explicitly; or use \
              `mode: full`.",
             export_name,
             chunk_column,
@@ -144,7 +149,7 @@ fn log_chunk_sparsity_at_run(
 /// key isn't worth a warning even over a slow link.
 const SPARSE_WARN_MIN_CHUNKS: usize = 64;
 /// With no scan-free row estimate (MySQL / curated query) we can't compute the
-/// dense-vs-actual ratio, so we only flag an *egregious* absolute window count.
+/// rows-vs-windows ratio, so we only flag an *egregious* absolute window count.
 const NO_ESTIMATE_WARN_CHUNKS: usize = 1000;
 
 /// What to do about a `chunk_size` range plan whose window count far exceeds
@@ -180,29 +185,26 @@ fn sparse_chunk_action(
     let cs = chunk_size.max(1);
     match row_estimate.filter(|&r| r > 0) {
         Some(rows) => {
-            let dense_windows = (rows as usize).div_ceil(cs).max(1);
-            if chunk_count < dense_windows.saturating_mul(4) {
+            let row_windows = (rows as usize).div_ceil(cs).max(1);
+            if chunk_count < row_windows.saturating_mul(4) {
                 return None; // roughly dense — the windows are earning their keep
             }
             let avg = (rows as usize) / chunk_count.max(1);
-            // Exact reduction: dense keyset paging tracks ROWS, so it collapses to
-            // rows/chunk_size windows — chunk_count/dense_windows fewer round-trips.
-            let factor = chunk_count / dense_windows.max(1);
             Some(SparseAction::Bail(format!(
                 "refusing to run a sparse range plan — {chunk_count} chunk windows for \
                  ~{rows} rows (~{avg} rows/window vs chunk_size {cs}). `chunk_size` divides \
                  the KEY RANGE, not the row count, so most windows are near-empty and each is \
                  a separate source query: {chunk_count} round-trips, very slow over a \
-                 tunnel/VPN. Set one of: `chunk_dense: true` (dense keyset paging → \
-                 ~{dense_windows} windows, ~{factor}× fewer round-trips), `chunk_count: N`, \
-                 or `mode: full`."
+                 tunnel/VPN. Set one of: `chunk_by_key: <unique key>` (keyset paging — \
+                 windows track rows and stay correct under concurrent writes), \
+                 `chunk_count: N`, or `mode: full`."
             )))
         }
         None => {
             if chunk_count < NO_ESTIMATE_WARN_CHUNKS {
                 return None;
             }
-            // No row estimate ⇒ can't name the dense window count, but `chunk_count`
+            // No row estimate ⇒ can't name the row-driven window count, but `chunk_count`
             // is deterministic (exactly N windows), so quantify the win against a
             // modest concrete N (the same floor below which round-trips are cheap).
             let example_n = SPARSE_WARN_MIN_CHUNKS;
@@ -211,9 +213,9 @@ fn sparse_chunk_action(
                 "{chunk_count} chunk windows on a range key (no scan-free row estimate to \
                  confirm density). If the key is sparse (large / gappy ids), most windows are \
                  near-empty and this is {chunk_count} source round-trips — very slow over a \
-                 tunnel/VPN. If so: `chunk_dense: true` makes windows track ROWS not the id \
-                 span; or `chunk_count: {example_n}` → {example_n} windows (~{factor}× fewer \
-                 round-trips); or `mode: full`."
+                 tunnel/VPN. If so: `chunk_by_key: <unique key>` pages by keyset, tracking \
+                 ROWS not the id span; or `chunk_count: {example_n}` → {example_n} \
+                 windows (~{factor}× fewer round-trips); or `mode: full`."
             )))
         }
     }
@@ -227,13 +229,12 @@ pub(crate) fn detect_and_generate_chunks(
     chunk_size: usize,
     chunk_count: Option<usize>,
     export_name: &str,
-    chunk_dense: bool,
     chunk_by_days: Option<u32>,
     source_type: crate::config::SourceType,
 ) -> Result<Vec<(i64, i64)>> {
     if let Some(days_per_chunk) = chunk_by_days {
         // NULL-keyed rows are excluded by the date predicate `>= start AND < end`
-        // — refuse rather than drop them silently. (chunk_dense, below, is exempt.)
+        // — refuse rather than drop them silently.
         bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
         let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
         let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
@@ -283,31 +284,8 @@ pub(crate) fn detect_and_generate_chunks(
         return Ok(chunks);
     }
 
-    if chunk_dense {
-        let row_count = query_wrapped_row_count(src, base_query)?;
-        log::info!(
-            "export '{}': chunk_dense: ROW_NUMBER() OVER (ORDER BY `{}`) — {} row(s), chunk_size={}",
-            export_name,
-            chunk_column,
-            row_count,
-            chunk_size
-        );
-        let chunks = if row_count <= 0 {
-            vec![]
-        } else {
-            generate_chunks(1, row_count, chunk_size as i64)
-        };
-        log::info!(
-            "export '{}': dense chunk plan: {} window(s) on ordinal 1..{}",
-            export_name,
-            chunks.len(),
-            row_count
-        );
-        return Ok(chunks);
-    }
-
     // NULL-keyed rows are excluded by `WHERE col BETWEEN min AND max` — refuse
-    // rather than drop them silently. (chunk_dense, above, is exempt.)
+    // rather than drop them silently.
     bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
 
     let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
@@ -366,7 +344,7 @@ pub(crate) fn detect_and_generate_chunks(
                 )
             }),
             None => {
-                let rows = query_wrapped_row_count(src, base_query)?;
+                let rows = query_wrapped_row_count(src, base_query, source_type)?;
                 if rows <= 0 {
                     return Ok(0); // genuinely empty — the one legitimate zero
                 }
@@ -441,7 +419,7 @@ pub(crate) fn detect_and_generate_chunks(
     // `bail` (the run can't silently pay thousands of round-trips); where we can
     // only suspect it (no estimate) we `warn`. Only the auto-window path
     // (`chunk_size`, not an explicit `chunk_count`) can blow up this way — an
-    // explicit count is already bounded, and dense/date paths never reach here.
+    // explicit count is already bounded, and date paths never reach here.
     if chunk_count.is_none() {
         match sparse_chunk_action(chunks.len(), row_estimate, chunk_size) {
             Some(SparseAction::Bail(msg)) => anyhow::bail!("export '{export_name}': {msg}"),
@@ -553,7 +531,6 @@ mod tests {
     fn detect(
         src: &mut dyn crate::source::Source,
         chunk_size: usize,
-        chunk_dense: bool,
         chunk_by_days: Option<u32>,
     ) -> Result<Vec<(i64, i64)>> {
         detect_and_generate_chunks(
@@ -563,7 +540,6 @@ mod tests {
             chunk_size,
             None,
             "orders",
-            chunk_dense,
             chunk_by_days,
             SourceType::Postgres,
         )
@@ -575,7 +551,7 @@ mod tests {
     fn integer_range_basic_chunks_computed_correctly() {
         // min=1, max=1000, est=500 (sparsity diagnostic only) → 10 chunks of size 100
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
-        let chunks = detect(&mut src, 100, false, None).unwrap();
+        let chunks = detect(&mut src, 100, None).unwrap();
         assert_eq!(chunks.len(), 10);
         assert_eq!(chunks[0], (1, 100));
         assert_eq!(chunks[9], (901, 1000));
@@ -591,7 +567,7 @@ mod tests {
     fn integer_range_empty_table_plans_one_empty_window() {
         // min → NULL, count → 0, max → NULL, count → 0, then the sparsity estimate.
         let mut src = ScriptedSource::new([null(), ok("0"), null(), ok("0"), ok("0")]);
-        let chunks = detect(&mut src, 100, false, None).unwrap();
+        let chunks = detect(&mut src, 100, None).unwrap();
         assert_eq!(chunks, vec![(0, 0)]);
     }
 
@@ -603,7 +579,7 @@ mod tests {
     #[test]
     fn unrenderable_bound_on_a_non_empty_table_is_an_error() {
         let mut src = ScriptedSource::new([null(), ok("100")]);
-        let err = detect(&mut src, 10, false, None)
+        let err = detect(&mut src, 10, None)
             .expect_err("a None bound over a NON-empty table must abort, not plan (0,0)");
         let msg = format!("{err:#}");
         assert!(
@@ -625,7 +601,7 @@ mod tests {
         // The count reply is scripted third because the None path does not fire
         // here — the bounds ARE readable, they are simply not whole integers.
         let mut src = ScriptedSource::new([ok("1.50"), ok("998.75"), ok("100")]);
-        let err = detect(&mut src, 10, false, None).expect_err(
+        let err = detect(&mut src, 10, None).expect_err(
             "an unreadable bound must abort the plan, not collapse to (0,0) and export nothing",
         );
         let msg = format!("{err:#}");
@@ -639,14 +615,14 @@ mod tests {
     fn integer_range_count_failure_still_returns_chunks() {
         // estimate returns unparseable → density skipped; chunks still come from min/max
         let mut src = ScriptedSource::new([ok("1"), ok("100"), ok("not-a-number")]);
-        let chunks = detect(&mut src, 50, false, None).unwrap();
+        let chunks = detect(&mut src, 50, None).unwrap();
         assert_eq!(chunks, vec![(1, 50), (51, 100)]);
     }
 
     #[test]
     fn integer_range_single_chunk_when_range_smaller_than_size() {
         let mut src = ScriptedSource::new([ok("5"), ok("20"), ok("15")]);
-        let chunks = detect(&mut src, 100, false, None).unwrap();
+        let chunks = detect(&mut src, 100, None).unwrap();
         assert_eq!(chunks, vec![(5, 20)]);
     }
 
@@ -657,7 +633,7 @@ mod tests {
         // Rows have NULL chunk_column → range chunking would exclude them via
         // BETWEEN. Refuse with a clear error instead of dropping them.
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]).with_null_keys(3);
-        let err = detect(&mut src, 100, false, None).unwrap_err();
+        let err = detect(&mut src, 100, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("NULL in chunk_column"), "got: {msg}");
     }
@@ -665,47 +641,8 @@ mod tests {
     #[test]
     fn null_keyed_rows_in_date_range_bail() {
         let mut src = ScriptedSource::new([ok("2023-01-01"), ok("2023-01-31")]).with_null_keys(7);
-        let err = detect(&mut src, 10_000, false, Some(7)).unwrap_err();
+        let err = detect(&mut src, 10_000, Some(7)).unwrap_err();
         assert!(format!("{err:#}").contains("NULL in chunk_column"));
-    }
-
-    #[test]
-    fn chunk_dense_is_exempt_from_null_guard() {
-        // ROW_NUMBER() numbers every row, NULL-keyed included, so dense must NOT
-        // run the guard even when NULLs exist — no bail, normal ordinal chunks.
-        let mut src = ScriptedSource::new([ok("250")]).with_null_keys(99);
-        let chunks = detect(&mut src, 100, true, None).unwrap();
-        assert_eq!(chunks, vec![(1, 100), (101, 200), (201, 250)]);
-    }
-
-    // ── chunk_dense path ────────────────────────────────────────────────────
-
-    #[test]
-    fn chunk_dense_nonzero_produces_ordinal_chunks() {
-        // COUNT=250, chunk_size=100 → ordinal windows 1..250
-        let mut src = ScriptedSource::new([ok("250")]);
-        let chunks = detect(&mut src, 100, true, None).unwrap();
-        assert_eq!(chunks, vec![(1, 100), (101, 200), (201, 250)]);
-    }
-
-    #[test]
-    fn chunk_dense_zero_rows_returns_empty() {
-        let mut src = ScriptedSource::new([ok("0")]);
-        let chunks = detect(&mut src, 100, true, None).unwrap();
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn chunk_dense_count_returned_no_row_propagates_error() {
-        // COUNT(*) returns no row (None) → error propagated (not just warned)
-        let mut src = ScriptedSource::new([null()]);
-        let result = detect(&mut src, 100, true, None);
-        assert!(result.is_err());
-        let msg = format!("{:#}", result.unwrap_err());
-        assert!(
-            msg.contains("COUNT") || msg.contains("no row"),
-            "got: {msg}"
-        );
     }
 
     // ── chunk_by_days path ──────────────────────────────────────────────────
@@ -714,7 +651,7 @@ mod tests {
     fn chunk_by_days_basic_range_produces_windows() {
         // 2023-01-01 .. 2023-01-31 (31 days), 7 days/chunk → 5 windows
         let mut src = ScriptedSource::new([ok("2023-01-01"), ok("2023-01-31")]);
-        let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
+        let chunks = detect(&mut src, 10_000, Some(7)).unwrap();
         assert_eq!(
             chunks.len(),
             5,
@@ -725,14 +662,14 @@ mod tests {
     #[test]
     fn chunk_by_days_single_day_returns_one_chunk() {
         let mut src = ScriptedSource::new([ok("2024-03-15"), ok("2024-03-15")]);
-        let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
+        let chunks = detect(&mut src, 10_000, Some(7)).unwrap();
         assert_eq!(chunks.len(), 1);
     }
 
     #[test]
     fn chunk_by_days_null_min_returns_error() {
         let mut src = ScriptedSource::new([null()]);
-        let result = detect(&mut src, 10_000, false, Some(7));
+        let result = detect(&mut src, 10_000, Some(7));
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
         assert!(msg.contains("NULL") || msg.contains("empty"), "got: {msg}");
@@ -741,7 +678,7 @@ mod tests {
     #[test]
     fn chunk_by_days_invalid_date_string_returns_error() {
         let mut src = ScriptedSource::new([ok("not-a-date"), ok("2023-12-31")]);
-        let result = detect(&mut src, 10_000, false, Some(7));
+        let result = detect(&mut src, 10_000, Some(7));
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
         assert!(msg.contains("parse") || msg.contains("date"), "got: {msg}");
@@ -751,7 +688,7 @@ mod tests {
     fn chunk_by_days_datetime_format_parsed_correctly() {
         // DB returns DATETIME strings instead of DATE — still parseable
         let mut src = ScriptedSource::new([ok("2023-06-01 00:00:00"), ok("2023-06-30 23:59:59")]);
-        let chunks = detect(&mut src, 10_000, false, Some(7)).unwrap();
+        let chunks = detect(&mut src, 10_000, Some(7)).unwrap();
         // 30 days / 7 = 5 chunks (days 0..29, each 7 except last)
         assert_eq!(chunks.len(), 5, "expected 5 windows, got: {chunks:?}");
     }
@@ -769,7 +706,6 @@ mod tests {
             100_000, // chunk_size ignored when chunk_count is Some
             Some(chunk_count),
             "orders",
-            false,
             None,
             SourceType::Postgres,
         )
@@ -812,7 +748,6 @@ mod tests {
     fn detect_with_base(
         src: &mut ScriptedSource,
         base_query: &str,
-        chunk_dense: bool,
         chunk_by_days: Option<u32>,
     ) -> Result<Vec<(i64, i64)>> {
         detect_and_generate_chunks(
@@ -822,7 +757,6 @@ mod tests {
             100,
             None,
             "tbl",
-            chunk_dense,
             chunk_by_days,
             SourceType::Postgres,
         )
@@ -834,7 +768,7 @@ mod tests {
         // anywhere. PG can satisfy min/max as index-only scans, no temp_files,
         // and the row-count is a scan-free `reltuples` estimate, not COUNT(*).
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
-        let _ = detect_with_base(&mut src, "SELECT * FROM public.users", false, None).unwrap();
+        let _ = detect_with_base(&mut src, "SELECT * FROM public.users", None).unwrap();
         for sql in &src.seen_sql {
             assert!(
                 !sql.contains("_rivet") && !sql.contains("FROM ("),
@@ -866,7 +800,7 @@ mod tests {
         // size sparsity from a catalog estimate, never a full COUNT(*) scan (which
         // cost ~12 min of silence before the first chunk on a 484M-row table).
         let mut src = ScriptedSource::new([ok("1"), ok("1000000"), ok("950000")]);
-        let _ = detect_with_base(&mut src, "SELECT * FROM warranty", false, None).unwrap();
+        let _ = detect_with_base(&mut src, "SELECT * FROM warranty", None).unwrap();
         assert!(
             src.seen_sql.iter().any(|s| s.contains("reltuples")
                 || s.contains("dm_db_partition_stats")
@@ -896,7 +830,6 @@ mod tests {
             100_000,
             None,
             "warranty",
-            false,
             None,
             SourceType::Mysql,
         )
@@ -922,13 +855,8 @@ mod tests {
         // so the sparsity diagnostic is skipped entirely — min/max still wrap, but
         // NO row-count query (COUNT(*) or estimate) is issued: no scan.
         let mut src = ScriptedSource::new([ok("1"), ok("1000"), ok("500")]);
-        let _ = detect_with_base(
-            &mut src,
-            "SELECT id FROM public.users WHERE active",
-            false,
-            None,
-        )
-        .unwrap();
+        let _ =
+            detect_with_base(&mut src, "SELECT id FROM public.users WHERE active", None).unwrap();
         assert!(
             src.seen_sql.iter().any(|s| s.contains("AS _rivet")),
             "min/max should still wrap for a curated query: {:?}",
@@ -947,7 +875,7 @@ mod tests {
     fn fast_path_chunk_by_days_also_unwraps() {
         // chunk_by_days path issues min + max; both should hit the fast path.
         let mut src = ScriptedSource::new([ok("2024-01-01"), ok("2024-12-31")]);
-        let _ = detect_with_base(&mut src, "SELECT * FROM public.events", false, Some(7)).unwrap();
+        let _ = detect_with_base(&mut src, "SELECT * FROM public.events", Some(7)).unwrap();
         for sql in &src.seen_sql {
             assert!(
                 !sql.contains("_rivet") && !sql.contains("FROM ("),
@@ -956,24 +884,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fast_path_chunk_dense_count_unwraps() {
-        let mut src = ScriptedSource::new([ok("500")]);
-        let _ = detect_with_base(&mut src, "SELECT * FROM public.orders", true, None).unwrap();
-        // Single SQL — the COUNT — must be unwrapped.
-        assert_eq!(src.seen_sql.len(), 1);
-        assert!(
-            src.seen_sql[0].starts_with("SELECT COUNT(*) FROM public.orders"),
-            "got: {}",
-            src.seen_sql[0]
-        );
-    }
-
     // ── sparse_chunk_action (bail when proven, warn when merely suspected) ───
 
     #[test]
-    fn sparse_with_estimate_bails_and_names_chunk_dense() {
-        // The 520k-over-a-tunnel shape: ~520k rows, chunk_size 100k → 6 dense
+    fn sparse_with_estimate_bails_and_names_keyset() {
+        // The 520k-over-a-tunnel shape: ~520k rows, chunk_size 100k → 6 row-driven
         // windows, but a huge/gappy id span produced 3428 BETWEEN windows. A
         // scan-free estimate PROVES it → refuse, don't just warn.
         let msg = match sparse_chunk_action(3428, Some(520_789), 100_000).expect("571x blow-up") {
@@ -981,19 +896,31 @@ mod tests {
             SparseAction::Warn(m) => panic!("proven sparse must bail, not warn: {m}"),
         };
         assert!(msg.contains("refusing"), "must be a refusal: {msg}");
-        assert!(msg.contains("chunk_dense: true"), "not actionable: {msg}");
-        assert!(msg.contains("3428"), "should cite the window count: {msg}");
-        // ceil(520789/100000)=6 dense windows → 3428/6 = 571× fewer round-trips.
         assert!(
-            msg.contains("~6 windows"),
-            "should name the dense count: {msg}"
+            msg.contains("chunk_by_key: <unique key>"),
+            "not actionable: {msg}"
         );
-        assert!(msg.contains("571"), "should quantify the reduction: {msg}");
+        assert!(msg.contains("3428"), "should cite the window count: {msg}");
+    }
+
+    #[test]
+    fn sparse_hints_never_recommend_the_removed_chunk_dense() {
+        for msg in [
+            match sparse_chunk_action(3428, Some(520_789), 100_000).unwrap() {
+                SparseAction::Bail(m) | SparseAction::Warn(m) => m,
+            },
+            match sparse_chunk_action(3428, None, 100_000).unwrap() {
+                SparseAction::Bail(m) | SparseAction::Warn(m) => m,
+            },
+        ] {
+            assert!(msg.contains("`chunk_by_key: <unique key>`"), "{msg}");
+            assert!(!msg.contains("chunk_dense"), "{msg}");
+        }
     }
 
     #[test]
     fn dense_with_estimate_is_silent() {
-        // 2M rows / 100k = 20 dense windows, 20 actual → not sparse, silent.
+        // 2M rows / 100k = 20 row-driven windows, 20 actual → not sparse, silent.
         assert!(sparse_chunk_action(20, Some(2_000_000), 100_000).is_none());
     }
 
@@ -1006,7 +933,10 @@ mod tests {
             SparseAction::Warn(m) => m,
             SparseAction::Bail(m) => panic!("unprovable suspicion must warn, not bail: {m}"),
         };
-        assert!(msg.contains("chunk_dense: true"), "not actionable: {msg}");
+        assert!(
+            msg.contains("chunk_by_key: <unique key>"),
+            "not actionable: {msg}"
+        );
         assert!(msg.contains("If the key is sparse"), "must hedge: {msg}");
         // No estimate → quantify via chunk_count: 3428/64 = 53× fewer round-trips.
         assert!(
@@ -1045,8 +975,8 @@ mod tests {
         // A zero row estimate is NOT proof of density — it degrades to the
         // no-estimate branch (silent at 64, needs the 1000 floor).
         assert!(sparse_chunk_action(64, Some(0), 100_000).is_none());
-        // Exactly 4x the dense window count is the first provable blow-up:
-        // 100k rows / 1k = 100 dense windows; 400 actual must Bail…
+        // Exactly 4x the row-driven window count is the first provable blow-up:
+        // 100k rows / 1k = 100 row-driven windows; 400 actual must Bail…
         assert!(sparse_chunk_action(400, Some(100_000), 1_000).is_some());
         // …399 is "roughly dense" and stays silent.
         assert!(sparse_chunk_action(399, Some(100_000), 1_000).is_none());

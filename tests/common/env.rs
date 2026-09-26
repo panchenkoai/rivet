@@ -99,6 +99,8 @@ pub fn mongo_toxi_url(db: &str) -> String {
 /// Base URLs for the Rig's Mongo constructors. Batch tests override the db via
 /// `.source_url(&MongoTest::url(PORT, &db))` (each uses a unique db); the replica
 /// set needs `directConnection=true` (port-mapped single node).
+/// Oracle Database 23ai Free, app user `rivet` in the FREEPDB1 service.
+pub const ORACLE_URL: &str = "oracle://rivet:rivet@127.0.0.1:1521/FREEPDB1";
 pub const MONGO_URL: &str = "mongodb://127.0.0.1:27017";
 pub const MONGO_RS_URL: &str = "mongodb://127.0.0.1:27018/?directConnection=true";
 
@@ -326,6 +328,8 @@ pub enum LiveService {
     /// SQL Server dedicated to the concurrency-governor canaries. TCP :1435.
     /// See [`MSSQL_GOVERNOR_URL`] for why it is not the shared instance.
     MssqlGovernor,
+    /// Oracle Database 23ai Free source engine. TCP :1521.
+    Oracle,
     /// MongoDB standalone source engine (batch JSON-blob). TCP :27017.
     Mongo,
     /// MongoDB single-node replica set (change-stream CDC). TCP :27018.
@@ -376,6 +380,7 @@ impl LiveService {
                 1435,
                 "service `mssql-governor` — run: docker compose --profile governor up -d mssql-governor",
             ),
+            LiveService::Oracle => ("127.0.0.1", 1521, "service `oracle` in docker-compose.yaml"),
             LiveService::Mongo => ("127.0.0.1", 27017, "service `mongo` in docker-compose.yaml"),
             LiveService::MongoRs => (
                 "127.0.0.1",

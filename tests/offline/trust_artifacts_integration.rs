@@ -1896,7 +1896,8 @@ fn verify_at_destination_flags_stale_success_marker_after_manifest_rewrite() {
 fn verify_at_destination_tolerates_absent_success_marker_for_failed_run() {
     // ADR-0012 M2: `_SUCCESS` exists iff status == Success.  A failed
     // (status: failed) manifest without `_SUCCESS` is the *correct*
-    // shape — the verifier must NOT flag the absent marker as a failure.
+    // shape — the verifier must NOT flag the absent marker. The verdict still
+    // fails, for the run status alone.
     let dir = dataset_dir();
     let dest_proxy = local_dest(dir.path());
     let payloads: &[&[u8]] = &[b"committed-before-failure"];
@@ -1917,8 +1918,14 @@ fn verify_at_destination_tolerates_absent_success_marker_for_failed_run() {
         !v.success_marker_consistent,
         "no marker → no signal, not a failure"
     );
-    assert!(v.passed, "absent marker on a failed manifest is allowed");
-    assert!(v.failures.is_empty());
+    assert!(!v.passed, "a failed run is not a completed export");
+    assert_eq!(
+        v.failures,
+        vec![ManifestVerificationFailure::RunNotSuccessful {
+            status: "failed".into()
+        }],
+        "the run status is the only failure — never the absent marker"
+    );
 }
 
 #[test]

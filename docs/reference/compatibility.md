@@ -1,7 +1,8 @@
 # Database version support
 
-Rivet supports four source engines — **PostgreSQL**, **MySQL**, **SQL Server**,
-and **MongoDB** — every supported version of which is listed in the table below.
+Rivet supports five source engines — **PostgreSQL**, **MySQL**, **SQL Server**,
+**MongoDB** and, in preview, **Oracle Database** — every supported version of which
+is listed in the table below.
 PostgreSQL and MySQL run the **full end-to-end suite** on each release —
 `doctor`, `check`, every export mode (full / incremental / chunked / time_window),
 every output format (CSV / Parquet) with every compression codec, `reconcile`,
@@ -39,6 +40,7 @@ time_window modes). See [mongodb.md](mongodb.md).
 | MongoDB    |      6.0 | Supported |
 | MongoDB    |      7.0 | Supported (primary target) |
 | MongoDB    |      8.0 | Supported |
+| Oracle     | 26ai Free (23.26) | **Preview** — batch only; see [oracle.md](oracle.md) |
 
 "Primary target" means the version that runs the e2e suite by default in the
 local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` services.

@@ -351,3 +351,66 @@ fn init_mssql_schema_wide_discovers_seeded_table() {
         table.name()
     );
 }
+
+// ─── MongoDB: a forced mode the source cannot run is refused, never rewritten ──
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn init_mongo_refuses_a_forced_mode_mongo_cannot_run() {
+    let db = unique_name("minit");
+    let _guard = MongoDbGuard {
+        port: 27017,
+        db: db.clone(),
+    };
+    MongoTest::connect(27017, &db).seed_int_id("c", 3);
+    let url = MongoTest::url(27017, &db);
+    let dir = tempfile::tempdir().unwrap();
+    for mode in ["incremental", "chunked", "time_window"] {
+        let path = dir.path().join(format!("{mode}.yaml"));
+        let out = run_rivet(&[
+            "init",
+            "--source",
+            &url,
+            "--table",
+            "c",
+            "--mode",
+            mode,
+            "-o",
+            path.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "--mode {mode} must be refused; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "init: --mode {mode}: source type 'Mongo' supports `mode: full` (batch) and"
+            )) && stderr.contains(&format!("(got `mode: {mode}`). MongoDB has no SQL")),
+            "{stderr}"
+        );
+        assert!(
+            !path.exists(),
+            "--mode {mode} wrote a config rivet cannot load"
+        );
+    }
+    let path = dir.path().join("full.yaml");
+    let out = run_rivet(&[
+        "init",
+        "--source",
+        &url,
+        "--table",
+        "c",
+        "--mode",
+        "full",
+        "-o",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    assert!(yaml.contains("    mode: full\n"), "{yaml}");
+}

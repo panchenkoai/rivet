@@ -31,12 +31,43 @@ pub(crate) fn quote_ident(source_type: SourceType, name: &str) -> String {
         SourceType::Mysql => format!("`{}`", name.replace('`', "``")),
         // SQL Server bracket-quoting: `[col]`; internal `]` doubled (`[a]]b]`).
         SourceType::Mssql => format!("[{}]", name.replace(']', "]]")),
+        // Oracle: double-quoted and therefore case-SENSITIVE — the name is used as the
+        // catalog stores it (unquoted DDL names fold to upper case).
+        SourceType::Oracle => format!("\"{}\"", name.replace('"', "\"\"")),
         // MongoDB has no SQL identifier dialect. Every SQL builder is guarded by
         // full-mode-only validation, so this arm is unreachable — panic loudly
         // if a future path ever routes a Mongo source through SQL.
         SourceType::Mongo => unreachable!(
             "quote_ident: MongoDB has no SQL dialect (guarded by full-mode-only validation)"
         ),
+    }
+}
+
+/// A derived table's alias as referenced (`_rivet.col`); Oracle needs it quoted,
+/// since an unquoted identifier may not start with `_`.
+pub(crate) fn alias(source_type: SourceType, name: &str) -> String {
+    match source_type {
+        SourceType::Oracle => format!("\"{name}\""),
+        _ => name.to_string(),
+    }
+}
+
+/// A derived table's alias as declared after `FROM (...)`: `AS name`, or the bare
+/// quoted name on Oracle, which rejects `AS` before a table alias.
+pub(crate) fn derived(source_type: SourceType, name: &str) -> String {
+    match source_type {
+        SourceType::Oracle => alias(source_type, name),
+        _ => format!("AS {name}"),
+    }
+}
+
+/// A user query made safe to wrap as `FROM (<query>)`: trailing whitespace and `;`
+/// trimmed, and a newline appended when the last line holds a `--` comment.
+pub(crate) fn wrappable_query(query: &str) -> String {
+    let q = query.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
+    match q.lines().last() {
+        Some(last) if last.contains("--") => format!("{q}\n"),
+        _ => q.to_string(),
     }
 }
 
@@ -113,7 +144,7 @@ fn find_from_keyword(s: &str) -> Option<usize> {
 
 /// A non-empty list of bare column references: only ASCII alphanumerics, `_`,
 /// `.`, `,`, `*`, and whitespace — and not a leading `DISTINCT` (which would
-/// change the row count / set, breaking the dense-chunk count and the
+/// change the row count / set, breaking the wrapped row count and the
 /// whole-table equivalence the fast path relies on). Functions (`(`), quoted
 /// idents / string literals, and any other punctuation → `false`.
 fn is_plain_column_list(s: &str) -> bool {
@@ -184,8 +215,11 @@ pub(crate) fn aggregate_sql(
 ) -> String {
     let q = quote_ident(source_type, col);
     match strip_simple_projection_from(base_query) {
-        Some(table_ident) => format!("SELECT {agg}({q}) FROM {table_ident}"),
-        None => format!("SELECT {agg}({q}) FROM ({base_query}) AS _rivet"),
+        Some(table_ident) => format!("SELECT {agg}({q}) AS rivet_agg FROM {table_ident}"),
+        None => format!(
+            "SELECT {agg}({q}) AS rivet_agg FROM ({base_query}) {}",
+            derived(source_type, "_rivet")
+        ),
     }
 }
 
@@ -202,13 +236,19 @@ pub(crate) fn aggregate_sql(
 pub(crate) fn null_key_probe_sql(source_type: SourceType, col: &str, base_query: &str) -> String {
     let from = match strip_simple_projection_from(base_query) {
         Some(table_ident) => table_ident.to_string(),
-        None => format!("({base_query}) AS _rivet_nullprobe"),
+        None => format!(
+            "({base_query}) {}",
+            derived(source_type, "_rivet_nullprobe")
+        ),
     };
     let q = quote_ident(source_type, col);
     match source_type {
         SourceType::Mssql => format!("SELECT TOP 1 1 FROM {from} WHERE {q} IS NULL"),
         SourceType::Postgres | SourceType::Mysql => {
             format!("SELECT 1 FROM {from} WHERE {q} IS NULL LIMIT 1")
+        }
+        SourceType::Oracle => {
+            format!("SELECT 1 FROM {from} WHERE {q} IS NULL FETCH FIRST 1 ROWS ONLY")
         }
         // Unreachable: the null-key probe is a chunked-mode concern, and chunked
         // mode is rejected for MongoDB at config validation.
@@ -256,13 +296,74 @@ pub(crate) fn row_estimate_sql(source_type: SourceType, table_ident: &str) -> Op
         // No scan-free row estimate for MongoDB in this SQL helper — the
         // chunk-sparsity diagnostic is a SQL/chunked concern Mongo never reaches.
         // `None` = "unknown", which the caller already tolerates.
+        // `ALL_TABLES.NUM_ROWS` is the optimizer statistic (NULL until DBMS_STATS
+        // has run — the caller's `> 0` guard then skips the density line). The
+        // `table:` shortcut ident is unquoted, so Oracle resolved it upper-cased.
+        SourceType::Oracle => {
+            let (owner, table) = oracle_catalog_preds(table_ident);
+            Some(format!(
+                "SELECT num_rows FROM all_tables WHERE owner = {owner} AND table_name = {table}"
+            ))
+        }
         SourceType::Mongo => None,
+    }
+}
+
+/// The catalog name Oracle resolves one identifier part to: unquoted folds upper-case, double-quoted stays verbatim.
+pub(crate) fn oracle_catalog_name(part: &str) -> String {
+    match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+        Some(quoted) => quoted.to_string(),
+        None => part.to_uppercase(),
+    }
+}
+
+/// `(owner, table)` catalog literals for an Oracle `[owner.]table`: an unquoted
+/// part folds upper-case as Oracle resolves it, a double-quoted part stays verbatim.
+pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
+    let lit = |part: &str| format!("'{}'", oracle_catalog_name(part).replace('\'', "''"));
+    match qualified.rsplit_once('.') {
+        Some((owner, table)) => (lit(owner), lit(table)),
+        None => (
+            "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string(),
+            lit(qualified),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn oracle_derived_aliases_are_quoted_and_carry_no_as() {
+        assert_eq!(alias(SourceType::Oracle, "_rivet"), "\"_rivet\"");
+        assert_eq!(alias(SourceType::Postgres, "_rivet"), "_rivet");
+        assert_eq!(derived(SourceType::Oracle, "_rivet"), "\"_rivet\"");
+        assert_eq!(derived(SourceType::Mysql, "_rivet"), "AS _rivet");
+    }
+
+    #[test]
+    fn oracle_catalog_names_fold_unquoted_parts_only() {
+        let (o, t) = oracle_catalog_preds("rivet.orders");
+        assert_eq!((o.as_str(), t.as_str()), ("'RIVET'", "'ORDERS'"));
+        let (o, t) = oracle_catalog_preds("orders");
+        assert_eq!(o, "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')");
+        assert_eq!(t, "'ORDERS'");
+        assert_eq!(oracle_catalog_preds("\"Mixed\"").1, "'Mixed'");
+        assert_eq!(oracle_catalog_preds("o'x").1, "'O''X'");
+    }
     use super::*;
+
+    #[test]
+    fn wrappable_query_drops_the_semicolon_and_ends_a_trailing_comment() {
+        assert_eq!(wrappable_query("SELECT 1 ;\n  "), "SELECT 1");
+        assert_eq!(wrappable_query("SELECT 1;;"), "SELECT 1");
+        assert_eq!(
+            wrappable_query("SELECT 1\n-- the tail\n"),
+            "SELECT 1\n-- the tail\n"
+        );
+        assert_eq!(wrappable_query("SELECT 1 -- c"), "SELECT 1 -- c\n");
+        assert_eq!(wrappable_query("SELECT 1"), "SELECT 1");
+    }
 
     #[test]
     fn postgres_plain_identifier() {
@@ -348,7 +449,7 @@ mod tests {
         );
         assert!(strip_simple_projection_from("SELECT id FROM t GROUP BY id").is_none());
         assert!(strip_simple_projection_from("SELECT id FROM t;").is_none());
-        // DISTINCT changes the row count/set (would break the dense-chunk COUNT).
+        // DISTINCT changes the row count/set (would break the wrapped row COUNT).
         assert!(strip_simple_projection_from("SELECT DISTINCT id FROM t").is_none());
         // A function / expression in the projection — can't reason syntactically.
         assert!(strip_simple_projection_from("SELECT count(*) FROM t").is_none());
@@ -370,7 +471,7 @@ mod tests {
                 "created_at",
                 "SELECT * FROM events"
             ),
-            "SELECT min(\"created_at\") FROM events"
+            "SELECT min(\"created_at\") AS rivet_agg FROM events"
         );
     }
 
@@ -383,7 +484,7 @@ mod tests {
                 "created_at",
                 "SELECT id, created_at FROM events WHERE x"
             ),
-            "SELECT max(\"created_at\") FROM (SELECT id, created_at FROM events WHERE x) AS _rivet"
+            "SELECT max(\"created_at\") AS rivet_agg FROM (SELECT id, created_at FROM events WHERE x) AS _rivet"
         );
         // dialect quoting flows through.
         assert!(

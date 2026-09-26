@@ -70,7 +70,8 @@
           "is_primary_key": false,
           "is_nullable": false,
           "numeric_precision": null,
-          "numeric_scale": null
+          "numeric_scale": null,
+          "is_indexed": true
         },
         {
           "name": "version",
@@ -484,8 +485,8 @@
     }
   },
   {
-    "expect": "chunked(seq)",
-    "note": "DECIMAL PK but WITH an integer non-PK column, ~200K rows. init range-chunks the integer column (chunk_column: seq), NEVER keysets the decimal PK (planner refuses a decimal keyset key). Locks that keysettable_pk_column gates the keyset branch \u2014 a decimal PK does not hijack it when a range-chunkable int column exists.",
+    "expect": "full",
+    "note": "DECIMAL PK with an UNINDEXED integer non-PK column, ~200K rows. init reads it full: an unindexed range key makes every window a full scan, and the decimal PK is NEVER keyset (the planner refuses a decimal key)",
     "table": {
       "schema": "s",
       "table": "decimal_pk_with_int_col_200k",

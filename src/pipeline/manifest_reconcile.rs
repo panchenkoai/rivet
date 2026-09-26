@@ -97,7 +97,7 @@ pub struct Reconciliation {
 ///
 /// - Committed parts are classified [`PartPresence::Present`] / `Missing` /
 ///   `SizeMismatch`.  Quarantined manifest entries are audit-only and skipped.
-/// - Untracked surplus is every listed key that is not a committed part, the
+/// - Untracked surplus is every listed key that is not a committed or superseded part, the
 ///   manifest, the `_SUCCESS` marker, the doctor probe, or under the
 ///   manifest-rooted `_quarantine/` directory.
 pub fn reconcile_manifest_against_listing(
@@ -123,6 +123,9 @@ pub fn reconcile_manifest_against_listing(
 
     for part in &manifest.parts {
         if part.status != PartStatus::Committed {
+            if part.status == PartStatus::Superseded {
+                claimed.push(join_key(manifest_dir, &part.path));
+            }
             continue; // quarantined entries carry no presence verdict
         }
         let key = join_key(manifest_dir, &part.path);

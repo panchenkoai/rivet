@@ -228,4 +228,4 @@ place the load reads them — not on the per-table recipes, which the load never
 
 - **Not** a migration or DDL tool — only read-only introspection and YAML output.
 - Views are included in schema-wide / database-wide runs; ensure each view is selectable for your user.
-- Suggested modes are heuristics; large or sparse tables may need manual `chunked` / `chunk_dense` / `chunk_by_days` tuning (see [chunked mode](../modes/chunked.md)).
+- Suggested modes are heuristics; large or sparse tables may need manual `chunked` / `chunk_by_key` / `chunk_by_days` tuning (see [chunked mode](../modes/chunked.md)).

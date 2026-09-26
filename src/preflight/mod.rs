@@ -14,6 +14,8 @@ mod doctor;
 mod mongo;
 mod mssql;
 mod mysql;
+#[cfg(feature = "oracle")]
+mod oracle;
 mod postgres;
 mod schema_error;
 pub mod type_report;
@@ -195,6 +197,10 @@ pub(crate) fn get_export_diagnostic(
         SourceType::Postgres => postgres::diagnose_export_pg(&url, tls, export),
         SourceType::Mysql => mysql::diagnose_export_mysql(&url, tls, export),
         SourceType::Mssql => mssql::diagnose_export_mssql(&url, tls, export),
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => oracle::diagnose_export_oracle(&url, tls, export),
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => {
             mongo::diagnose_export_mongo(&url, tls, export, config.source.mongo.as_ref())
         }
@@ -401,6 +407,10 @@ pub fn check(
         SourceType::Postgres => postgres::check_postgres(&url, tls, &exports)?,
         SourceType::Mysql => mysql::check_mysql(&url, tls, &exports)?,
         SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
+        #[cfg(feature = "oracle")]
+        SourceType::Oracle => oracle::check_oracle(&url, tls, &exports)?,
+        #[cfg(not(feature = "oracle"))]
+        SourceType::Oracle => return Err(crate::source::oracle_feature_missing()),
         SourceType::Mongo => mongo::check_mongo(&url, tls, &exports, config.source.mongo.as_ref())?,
     };
     // #149: measured beats declared — overlay the state store's actuals and
@@ -486,6 +496,7 @@ pub fn check(
         // but exit is gated only by --strict; without this note an operator or CI
         // reading the glyph alone would be misled into thinking rc != 0.
         let mut tally = TargetFailTally::default();
+        let mut reports_failed = 0usize;
         for export in &exports {
             let column_overrides =
                 crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
@@ -553,6 +564,9 @@ pub fn check(
                 }
                 Err(e) => {
                     log::warn!("type report for '{}' failed: {:#}", export.name, e);
+                    // An export whose column types cannot be described is not "Looks good".
+                    clean = false;
+                    reports_failed += 1;
                     // The type report could not be collected, but the diagnostic
                     // was. Under --json the verdict must still reach the
                     // consumer, so emit a diagnostic-only object (no `columns`/
@@ -566,6 +580,11 @@ pub fn check(
             }
         }
 
+        if strict_fails_on_unbuilt_reports(strict, reports_failed) {
+            anyhow::bail!(
+                "strict mode: the type report failed for {reports_failed} export(s) (see the warnings above)"
+            );
+        }
         match tally.outcome(strict, json_output) {
             TypeReportOutcome::Fail => {
                 anyhow::bail!("strict mode: unsafe type mappings found (see report above)")
@@ -599,6 +618,11 @@ pub fn check(
     // `clean` = the type check surfaced no fatal mapping. The caller ANDs this
     // with the plan-compatibility gate before printing the success epilogue.
     Ok(clean)
+}
+
+/// `--strict` fails when any export's type report could not be built.
+fn strict_fails_on_unbuilt_reports(strict: bool, reports_failed: usize) -> bool {
+    strict && reports_failed > 0
 }
 
 /// One type report per export unit against `target`, typed from the load spec
@@ -761,6 +785,13 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn strict_fails_on_unbuilt_reports_only_under_strict() {
+        assert!(super::strict_fails_on_unbuilt_reports(true, 1));
+        assert!(!super::strict_fails_on_unbuilt_reports(true, 0));
+        assert!(!super::strict_fails_on_unbuilt_reports(false, 3));
+    }
 
     /// The preflight must refuse exactly what the planner refuses — no more.
     ///
@@ -1595,30 +1626,6 @@ mod tests {
         e.chunk_size = 100_000;
         let w = check_sparse_range(&e, Some(100_000), Some("1"), Some("100000"));
         assert!(w.is_none(), "should not warn for dense range");
-    }
-
-    #[test]
-    fn sparse_range_skipped_when_chunk_dense() {
-        let mut e = make_export("t", ExportMode::Chunked, None);
-        e.chunk_column = Some("id".to_string());
-        e.chunk_dense = true;
-        e.chunk_size = 100_000;
-        let w = check_sparse_range(&e, Some(100_000), Some("1"), Some("10000000"));
-        assert!(
-            w.is_none(),
-            "chunk_dense uses ordinals, not physical id span"
-        );
-    }
-
-    #[test]
-    fn dense_surrogate_warning_when_chunk_dense_builtin() {
-        let mut e = make_export("t", ExportMode::Chunked, None);
-        e.chunk_column = Some("id".to_string());
-        e.chunk_dense = true;
-        e.query = Some("SELECT id FROM orders".to_string());
-        let w = check_dense_surrogate_cost(&e);
-        assert!(w.is_some(), "should warn about built-in ROW_NUMBER cost");
-        assert!(w.unwrap().contains("global sort"));
     }
 
     #[test]

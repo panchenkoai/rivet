@@ -271,11 +271,12 @@ pub fn run_plan_command(
     // match a `- name:` line — so the preview must model the value now ON DISK,
     // not `recs` (bughunt 2026-08-14; read-only contract 2026-08-20).
     let safe_of = effective_parallel_safe(&recs, &config, &fields, &written);
+    let wave_of = effective_wave(&recs, &config, &fields, &written);
     if pool_estimate_is_printable(&format, artifacts.len()) {
         print_pool_estimate(&artifacts, &safe_of, &state);
     }
 
-    emit_artifacts(&artifacts, &format, multi_export, config_path)?;
+    emit_artifacts(&artifacts, &format, multi_export, config_path, &wave_of)?;
 
     Ok(())
 }
@@ -432,7 +433,6 @@ fn build_plan_artifact(
             &cp.column,
             cp.chunk_size,
             cp.chunk_count,
-            cp.dense,
             cp.by_days,
         ),
         _ => String::new(),
@@ -513,29 +513,15 @@ const CATALOG_OVERRIDE_MIN_SPAN: i64 = 10_000;
 ///   config and the pool then reads as "cheap, run it concurrently with another
 ///   heavy" (bughunt 2026-08-14). The `CATALOG_OVERRIDE_MIN_SPAN` floor cannot
 ///   rescue this: a day span is always far below it.
-/// * `span_is_exact` short-circuits the rest. Under `chunk_dense: true` the
-///   ranges are ORDINALS `1..row_count` built from a real `COUNT(*)` taken in
-///   this very plan ([`super::chunked::detect`]) — the span IS the row count,
-///   not a key range, so `rows > distinct keys` cannot happen and there is
-///   nothing for the catalog to correct. Letting `max()` win there publishes a
-///   STALE `reltuples` over a fresh exact count: a table that lost 90% of its
-///   rows without `ANALYZE` would be scheduled at its old size (bughunt
-///   2026-08-13). Same reason the measured-actual branch is skipped — a prior
-///   run's actual is older than this run's COUNT.
 fn chunked_row_estimate(
     key_span: Option<i64>,
     catalog: Option<i64>,
     measured: bool,
-    span_is_exact: bool,
     span_is_days: bool,
 ) -> Option<i64> {
     // A day span is not a row count — it is not a candidate at all.
     if span_is_days {
         return catalog;
-    }
-    // An exact count needs no second opinion, in either direction.
-    if span_is_exact && let Some(span) = key_span {
-        return Some(span);
     }
     if measured {
         return catalog.or(key_span);
@@ -563,9 +549,7 @@ fn chunked_row_estimate(
 /// connection-owning glue stays live.
 ///
 /// Inclusive because a chunk range is `[lo, hi]` on both ends — a single-ordinal
-/// table (`first.0 == last.1`) holds one row, not zero. Under `chunk_dense` this
-/// number reaches [`chunked_row_estimate`] as an EXACT row count that no catalog
-/// is allowed to correct, so an off-by-one here is published as fact.
+/// table (`first.0 == last.1`) holds one row, not zero.
 fn chunked_key_span(first_lo: i64, last_hi: i64) -> i64 {
     (last_hi - first_lo + 1).max(0)
 }
@@ -597,7 +581,6 @@ fn compute_plan_data(
                 cp.chunk_size,
                 cp.chunk_count,
                 &plan.export_name,
-                cp.dense,
                 cp.by_days,
                 plan.source.source_type,
             )?;
@@ -612,16 +595,8 @@ fn compute_plan_data(
                 .first()
                 .zip(chunk_ranges.last())
                 .map(|(first, last)| chunked_key_span(first.0, last.1));
-            // `chunked_estimate` is a span over WHATEVER ordinals the detector
-            // chose, so pass the ordinals' MEANING with it — the two facts are
-            // independent and both branches of the estimate need them:
-            //  * days: `by_days` is checked FIRST in `detect_and_generate_chunks`,
-            //    so a config with both set produces DAY ordinals. A day count is
-            //    never a row count, in either direction (bughunt 2026-08-14).
-            //  * exact: only the dense path's ordinals are `1..COUNT(*)`, i.e.
-            //    the span IS the row count and no catalog may correct it.
+            // `by_days` ordinals are DAYS, never a row count (bughunt 2026-08-14).
             let span_is_days = cp.by_days.is_some();
-            let span_is_exact = cp.dense;
             Ok(ComputedPlanData {
                 chunk_ranges,
                 chunk_count,
@@ -630,7 +605,6 @@ fn compute_plan_data(
                     chunked_estimate,
                     row_estimate,
                     row_is_measured,
-                    span_is_exact,
                     span_is_days,
                 ),
             })
@@ -730,6 +704,7 @@ fn emit_artifacts(
     format: &PlanOutputFormat,
     multi_export: bool,
     config_path: &str,
+    wave_of: &HashMap<String, Option<u32>>,
 ) -> Result<()> {
     match format {
         PlanOutputFormat::Pretty => {
@@ -738,7 +713,7 @@ fn emit_artifacts(
                 // block would be hundreds of lines. Show a compact, one-line-per-
                 // export table sorted by wave, then the wave-execution hint. Use
                 // `--export <name>` for a single export's full detail.
-                print_compact_summary(artifacts, config_path);
+                print_compact_summary(artifacts, config_path, wave_of);
             } else {
                 for artifact in artifacts {
                     artifact.print_summary();
@@ -778,21 +753,21 @@ fn emit_artifacts(
     Ok(())
 }
 
-/// Compact one-line-per-export table for a multi-export plan, sorted by wave
-/// (then by descending score, then name). The full per-export block
-/// (`print_summary`) would be hundreds of lines for a schema scan, so it is
-/// reserved for a single-export plan (`--export <name>`).
-fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
+/// Compact one-line-per-export table for a multi-export plan, sorted by the
+/// `wave:` apply reads (then by descending score, then name). The full
+/// per-export block (`print_summary`) is reserved for `--export <name>`.
+fn print_compact_summary(
+    artifacts: &[PlanArtifact],
+    config_path: &str,
+    wave_of: &HashMap<String, Option<u32>>,
+) {
+    let wave = |a: &PlanArtifact| wave_of.get(&a.export_name).copied().flatten();
     let key = |a: &PlanArtifact| {
-        a.prioritization
+        let score = a
+            .prioritization
             .as_ref()
-            .map(|p| {
-                (
-                    p.export_recommendation.recommended_wave,
-                    p.export_recommendation.priority_score,
-                )
-            })
-            .unwrap_or((u32::MAX, 0))
+            .map_or(0, |p| p.export_recommendation.priority_score);
+        (wave(a).unwrap_or(u32::MAX), score)
     };
     let mut order: Vec<&PlanArtifact> = artifacts.iter().collect();
     order.sort_by(|a, b| {
@@ -810,15 +785,12 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
         .clamp(6, 32);
 
     println!();
-    println!(
-        "  Plan: {} exports — `rivet apply {}` runs them by wave (lowest first)",
-        artifacts.len(),
-        config_path
-    );
+    let waves: Vec<Option<u32>> = artifacts.iter().map(wave).collect();
+    println!("{}", apply_order_line(config_path, &waves));
     println!();
     println!("{}", PlanArtifact::summary_header(name_w));
     for a in &order {
-        println!("{}", a.summary_line(name_w));
+        println!("{}", a.summary_line(name_w, wave(a)));
     }
     println!();
     println!("  Full detail for one export:  rivet plan -c <config> --export <name>");
@@ -1047,6 +1019,56 @@ fn effective_parallel_safe(
         .collect()
 }
 
+/// The `wave:` each export carries on disk after this run — the value `apply`
+/// groups by (same three-input rule as [`effective_parallel_safe`]).
+fn effective_wave(
+    recs: &[(String, u32, bool)],
+    config: &Config,
+    fields: &ExportFields,
+    written: &std::collections::HashSet<String>,
+) -> HashMap<String, Option<u32>> {
+    recs.iter()
+        .map(|(name, rec_wave, _)| {
+            let wrote = written.contains(name)
+                && fields
+                    .get(name)
+                    .is_some_and(|items| items.iter().any(|(k, _)| *k == "wave"));
+            let on_disk = if wrote {
+                Some(*rec_wave)
+            } else {
+                config
+                    .exports
+                    .iter()
+                    .find(|e| &e.name == name)
+                    .and_then(|e| e.wave)
+            };
+            (name.clone(), on_disk)
+        })
+        .collect()
+}
+
+/// The table's headline: what `rivet apply` does with these `wave:` values.
+fn apply_order_line(config_path: &str, waves: &[Option<u32>]) -> String {
+    let n = waves.len();
+    let unset = waves.iter().filter(|w| w.is_none()).count();
+    if unset == n {
+        format!(
+            "  Plan: {n} exports — {config_path} sets no `wave:`, so `rivet apply {config_path}` \
+             runs them as one unscheduled group (Rec = the cost model's advice; \
+             `--annotate-waves` writes a schedule)"
+        )
+    } else if unset == 0 {
+        format!(
+            "  Plan: {n} exports — `rivet apply {config_path}` runs them by `wave:` (lowest first)"
+        )
+    } else {
+        format!(
+            "  Plan: {n} exports — `rivet apply {config_path}` runs them by `wave:` (lowest \
+             first); the {unset} with no `wave:` run last as one unscheduled group"
+        )
+    }
+}
+
 fn write_plan_fields_to_config(
     config_path: &str,
     fields: &ExportFields,
@@ -1149,9 +1171,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ExportFields, PlanWriteReport, apply_field_annotations, effective_parallel_safe,
-        fields_to_write, history_pack_items, plan_write_report, refuse_annotate_scoped_to_export,
-        repack_from_history,
+        ExportFields, PlanWriteReport, apply_field_annotations, apply_order_line,
+        effective_parallel_safe, effective_wave, fields_to_write, history_pack_items,
+        plan_write_report, refuse_annotate_scoped_to_export, repack_from_history,
     };
 
     /// The write-report the operator sees, per outcome. A WRITE always warns;
@@ -1192,8 +1214,7 @@ mod tests {
     ///
     /// RED, each verified by applying that exact mutation (first failing
     /// assertion, verbatim):
-    ///   * `+`→`*`: `left: 29, right: 30` — an off-by-one row estimate, which
-    ///     under `chunk_dense` is published as an EXACT count.
+    ///   * `+`→`*`: `left: 29, right: 30` — an off-by-one row estimate.
     ///   * `+`→`-`: `left: 28, right: 30`
     ///   * `-`→`+`: `left: 32, right: 30`
     ///   * `-`→`/`: `left: 31, right: 30`
@@ -1750,6 +1771,42 @@ mod tests {
             Some(&false),
             "nothing landed on disk, so apply's `unwrap_or(false)` is the truth"
         );
+
+        let wave = effective_wave(&recs, &cfg, &fields, &written);
+        assert_eq!(
+            wave.get("hand_tuned"),
+            Some(&Some(7)),
+            "apply reads the config's wave"
+        );
+        assert_eq!(
+            wave.get("blank"),
+            Some(&Some(2)),
+            "the landed write is on disk"
+        );
+        assert_eq!(
+            wave.get("unmatched"),
+            Some(&None),
+            "no wave on disk: unscheduled"
+        );
+    }
+
+    #[test]
+    fn the_plan_headline_says_what_apply_does_with_the_waves_on_disk() {
+        assert_eq!(
+            apply_order_line("r.yaml", &[None, None]),
+            "  Plan: 2 exports — r.yaml sets no `wave:`, so `rivet apply r.yaml` runs them as \
+             one unscheduled group (Rec = the cost model's advice; `--annotate-waves` writes a \
+             schedule)"
+        );
+        assert_eq!(
+            apply_order_line("r.yaml", &[Some(1), Some(3)]),
+            "  Plan: 2 exports — `rivet apply r.yaml` runs them by `wave:` (lowest first)"
+        );
+        assert_eq!(
+            apply_order_line("r.yaml", &[Some(1), None, None]),
+            "  Plan: 3 exports — `rivet apply r.yaml` runs them by `wave:` (lowest first); the \
+             2 with no `wave:` run last as one unscheduled group"
+        );
     }
 
     fn wave_fields(pairs: &[(&str, u32)]) -> ExportFields {
@@ -1891,81 +1948,32 @@ mod tests {
         use super::chunked_row_estimate;
         // catalog > span ⇒ rows > distinct keys ⇒ the span is only a floor.
         assert_eq!(
-            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false, false),
+            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false),
             Some(831_000_000),
         );
         // Sparse key (#149 shape): span dwarfs the catalog — span still wins,
         // exactly the pre-existing behavior (over-estimating is the safe
         // direction for scheduling; the catalog is not trusted to shrink it).
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false, false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false),
             Some(342_000_000),
         );
         // A measured whole-table actual beats the span in either direction.
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false, false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false),
             Some(520_000),
         );
         // F4 fresh-ANALYZE shape: tiny exact span, garbage catalog above it —
         // the span must survive (the catalog override is gated on a span big
         // enough to be worth chunking).
         assert_eq!(
-            chunked_row_estimate(Some(30), Some(1130), false, false, false),
+            chunked_row_estimate(Some(30), Some(1130), false, false),
             Some(30)
         );
         // Missing signals degrade to whichever side exists.
-        assert_eq!(
-            chunked_row_estimate(Some(42), None, false, false, false),
-            Some(42)
-        );
-        assert_eq!(
-            chunked_row_estimate(None, Some(42), false, false, false),
-            Some(42)
-        );
-        assert_eq!(chunked_row_estimate(None, None, false, false, false), None);
-    }
-
-    /// `chunk_dense: true` makes the span an EXACT `COUNT(*)` over ordinals
-    /// `1..row_count`, so no catalog figure — and no older measured actual —
-    /// may override it. Bughunt 2026-08-13: the `span.max(catalog)` rule was
-    /// written for a KEY span (where `catalog > span` proves a non-unique key);
-    /// applied to a dense span it republishes a stale `reltuples`, so a table
-    /// that lost 90% of its rows without `ANALYZE` schedules at its old size.
-    /// Both directions are asserted — a fold that only checked the larger side
-    /// would pass on `max()` alone.
-    #[test]
-    fn a_dense_span_is_an_exact_count_and_no_catalog_may_override_it() {
-        use super::chunked_row_estimate;
-        // Stale catalog ABOVE the fresh exact count (the 90%-deleted table):
-        // the count wins. RED against `span.max(cat)` reaching the dense path.
-        assert_eq!(
-            chunked_row_estimate(Some(120_000), Some(1_200_000), false, true, false),
-            Some(120_000),
-        );
-        // Catalog BELOW it (the ordinary lagging-stats direction): unchanged.
-        assert_eq!(
-            chunked_row_estimate(Some(1_200_000), Some(120_000), false, true, false),
-            Some(1_200_000),
-        );
-        // A prior run's MEASURED actual is older than this plan's COUNT(*),
-        // so the exact count outranks it too (RED against an early
-        // `if measured` return).
-        assert_eq!(
-            chunked_row_estimate(Some(120_000), Some(1_200_000), true, true, false),
-            Some(120_000),
-        );
-        // Small dense tables take the same path — the tiny-span carve-out for
-        // fresh-ANALYZE garbage is subsumed, not contradicted.
-        assert_eq!(
-            chunked_row_estimate(Some(30), Some(1130), false, true, false),
-            Some(30)
-        );
-        // An empty dense table yields no ranges → no span; the catalog is all
-        // that is left, exactly as on the non-dense path.
-        assert_eq!(
-            chunked_row_estimate(None, Some(1130), false, true, false),
-            Some(1130)
-        );
+        assert_eq!(chunked_row_estimate(Some(42), None, false, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, Some(42), false, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, None, false, false), None);
     }
 
     /// `chunk_by_days` ordinals are DAYS, so the span is not a row figure at
@@ -1979,43 +1987,33 @@ mod tests {
     /// table. That is `CostClass::Low` → `parallel_safe: true` written into the
     /// operator's config, and the pool then schedules the giant as a cheap
     /// concurrent export and drops it out of the heavy makespan floor. The
-    /// exactness guard at the call site was applied to the dense
-    /// short-circuit only; the `max()`/tiny-span rules underneath it needed the
-    /// OPPOSITE treatment, which is what `span_is_days` now carries.
+    /// `max()`/tiny-span rules need the OPPOSITE treatment for a day span, which
+    /// is what `span_is_days` carries.
     #[test]
     fn a_by_days_span_is_a_day_count_and_never_a_row_estimate() {
         use super::chunked_row_estimate;
         // The field shape: tiny day span, huge catalog. RED against today's
         // tiny-span-wins arm, which returned Some(1095).
         assert_eq!(
-            chunked_row_estimate(Some(1095), Some(831_000_000), false, false, true),
+            chunked_row_estimate(Some(1095), Some(831_000_000), false, true),
             Some(831_000_000),
         );
         // The other direction too — a day span ABOVE the catalog is still not
         // a row count, so `max()` must not reach it either (a fixture that
         // only tested the first direction would pass on `span.max(cat)`).
         assert_eq!(
-            chunked_row_estimate(Some(20_000), Some(4_000), false, false, true),
+            chunked_row_estimate(Some(20_000), Some(4_000), false, true),
             Some(4_000),
         );
         // A measured whole-table actual arrives in the same argument and wins
         // for the same reason.
         assert_eq!(
-            chunked_row_estimate(Some(1095), Some(520_000), true, false, true),
+            chunked_row_estimate(Some(1095), Some(520_000), true, true),
             Some(520_000),
         );
         // No catalog: NO estimate. `None` classifies Medium ("assume medium
         // cost until preflight succeeds"), which is the conservative answer;
         // the day count would classify Low.
-        assert_eq!(
-            chunked_row_estimate(Some(1095), None, false, false, true),
-            None
-        );
-        // `chunk_dense` + `chunk_by_days` together still produce DAY ordinals
-        // (by_days is checked first), so the exactness claim must not win here.
-        assert_eq!(
-            chunked_row_estimate(Some(1095), Some(831_000_000), false, true, true),
-            Some(831_000_000),
-        );
+        assert_eq!(chunked_row_estimate(Some(1095), None, false, true), None);
     }
 }

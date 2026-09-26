@@ -130,6 +130,13 @@ tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 # The MSSQL TLS config API (`trust_cert`/`trust_cert_ca`/`encryption`) is
 # backend-agnostic, so no source change is needed for the switch.
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
+# Oracle Database: Oracle's own pure-Rust thin driver (no Instant Client, so no
+# end-user-agreement licence to bundle). Beta — pinned exactly; see
+# dev/research/oracle-source.md. Behind the `oracle` feature (on by default).
+oracledb = { version = "=26.0.0-beta.4", optional = true }
+# Only to choose rustls' process-wide crypto provider before the Oracle driver
+# builds its TLS config: the driver brings aws-lc-rs, reqwest brings ring.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 # `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
 # `Client::connect` expects.
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -202,8 +209,10 @@ name = "resource_aware"
 harness = false
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "oracle"]
 jemalloc = ["tikv-jemallocator"]
+# The Oracle Database source (`source.type: oracle`).
+oracle = ["dep:oracledb", "dep:rustls"]
 # Builds the dev-only `seed` test-data generator (see `[[bin]] seed`). Off by
 # default so it is never installed by `cargo install rivet-cli`.
 dev-seed = []

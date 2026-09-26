@@ -128,6 +128,7 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             // after the source line, so its position is unchanged.
             if !json {
                 note_mssql_harm_permission(&config);
+                note_oracle_harm_permission(&config);
             }
         }
         Err(e) => {
@@ -335,6 +336,11 @@ fn check_source_auth(config: &Config) -> Result<()> {
             crate::source::mssql::MssqlSource::connect_with_tls(&url, tls)?;
             Ok(())
         }
+        SourceType::Oracle => {
+            // `create_source` connects, pins the session and fails on a bad login.
+            crate::source::create_source(&config.source)?;
+            Ok(())
+        }
         SourceType::Mongo => {
             // `connect_with_tls` runs a connect + `ping` round-trip itself, so a
             // successful construction is a green health-check.
@@ -367,6 +373,33 @@ fn note_mssql_harm_permission(config: &Config) {
             "[note] Source-harm metrics need VIEW SERVER STATE — this SQL Server login lacks it, \
              so lock-wait metrics will be skipped. Data extraction is unaffected. \
              Grant with: GRANT VIEW SERVER STATE TO [your_login];"
+        );
+    }
+}
+
+/// Advisory (never a `[FAIL]`): an Oracle user that cannot read V$SYSSTAT / V$SYSTEM_EVENT
+/// gets no harm metrics and no governor pressure, silently.
+#[cfg(not(feature = "oracle"))]
+fn note_oracle_harm_permission(_config: &Config) {}
+
+/// Advisory (never a `[FAIL]`): an Oracle user that cannot read V$SYSSTAT / V$SYSTEM_EVENT
+/// gets no harm metrics and no governor pressure, silently.
+#[cfg(feature = "oracle")]
+fn note_oracle_harm_permission(config: &Config) {
+    if config.source.source_type != SourceType::Oracle {
+        return;
+    }
+    let Ok(url) = config.source.resolve_url() else {
+        return;
+    };
+    if let Some(false) =
+        crate::source::oracle::OracleSource::sample_harm_views(&url, config.source.tls.as_ref())
+    {
+        println!(
+            "[note] This Oracle user cannot read V$SYSSTAT / V$SYSTEM_EVENT, so source-harm \
+             metrics and governor pressure will be absent. Data extraction is unaffected. \
+             Grant with: GRANT SELECT_CATALOG_ROLE TO your_user; (or SELECT on V_$SYSSTAT and \
+             V_$SYSTEM_EVENT)"
         );
     }
 }
@@ -531,6 +564,10 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
     {
         return "unknown database";
     }
+    // Oracle ORA-12514: the listener, before any login, does not know the URL's service.
+    if msg.contains("ora-12514") || msg.contains("not registered with the listener") {
+        return "unknown service";
+    }
     // ALL of 53300's renderings, measured against the stand's own PostgreSQL:
     // the max_connections cap says "sorry, too many clients already" or
     // "remaining connection slots are reserved" — NEITHER contains "too many
@@ -549,6 +586,9 @@ pub(crate) fn categorize_source_error(err: &anyhow::Error) -> &'static str {
         || msg.contains("access denied")
         // MSSQL bad credentials: `"Login failed for user 'sa'"`.
         || msg.contains("login failed")
+        // Oracle bad credentials: "ORA-01017: invalid credential or not authorized; logon denied".
+        || msg.contains("ora-01017")
+        || msg.contains("logon denied")
         // Postgres top-level Display when the real cause (auth) is nested and
         // `{:#}` still collapses to the bare wrapper — a server-side `DbError`
         // is never a connectivity failure (those say "connect"/"refused"). But
@@ -642,6 +682,9 @@ pub(super) fn categorize_dest_error(
     }
 }
 
+/// TLS hint for PostgreSQL and MySQL; every `tls.mode` it names must parse as a `TlsMode`.
+const SQL_TLS_HINT: &str = "TLS handshake failed. Set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA, or `tls.mode: require` to encrypt without verifying the certificate; if the server has no TLS at all, `tls.mode: disable` (trusted networks only).";
+
 /// Map a categorised source error (+ raw text) to an actionable hint.
 ///
 /// Returns `None` when nothing more useful than the underlying error
@@ -660,23 +703,22 @@ pub(crate) fn source_error_hint(
 
     // TLS misconfig leaks through every category — check first so a
     // generic "error" with a TLS root cause still gets the right hint.
-    if msg.contains("tls")
+    // The TLS-required policy refusal names its own fix; it is not a handshake failure.
+    if (msg.contains("tls") && !msg.contains("tls required"))
         || msg.contains("ssl")
         || msg.contains("certificate")
         || msg.contains("handshake")
     {
         return Some(match source_type {
-            SourceType::Postgres => {
-                "TLS handshake failed. Try `tls.mode: prefer` (downgrade gracefully) or set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA."
-            }
-            SourceType::Mysql => {
-                "TLS handshake failed. Try `tls.mode: prefer` or set `tls.ca_file: /path/to/ca-bundle.pem` to trust the DB's certificate authority."
-            }
+            SourceType::Postgres | SourceType::Mysql => SQL_TLS_HINT,
             SourceType::Mssql => {
                 "TLS handshake failed. SQL Server forces TLS on the login handshake; set `tls.ca_file: /path/to/ca-bundle.pem` to trust a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
+            SourceType::Oracle => {
+                "TLS handshake failed. Oracle over TLS uses `tcps`: check the listener's TCPS port and that its certificate chains to a public CA in the bundle compiled into the driver (not the system trust store; a private `tls.ca_file` is not supported yet)."
+            }
             SourceType::Mongo => {
-                "TLS handshake failed. For MongoDB, enable TLS in the connection string (`?tls=true`) and set `tls.ca_file: /path/to/ca-bundle.pem` for a private CA, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
+                "TLS handshake failed. If the MongoDB server has no TLS, set `tls.mode: disable` (trusted networks only); for a private CA set `tls.ca_file: /path/to/ca-bundle.pem`, or `tls.accept_invalid_certs: true` for a self-signed dev cert."
             }
         });
     }
@@ -686,6 +728,12 @@ pub(crate) fn source_error_hint(
         // catch-all — each hint names the actual fix, where "verify the
         // user/password" sent the operator to credentials they never had a
         // problem with.
+        "unknown service" => Some(
+            "The listener does not know the service named in the URL path \
+             (oracle://USER@HOST:PORT/SERVICE) — the login was never attempted. \
+             List the registered services with `lsnrctl services` on the server; \
+             Oracle Free's pluggable database is FREEPDB1.",
+        ),
         "unknown database" => Some(
             "The database named in the URL does not exist on this server. Check \
              the path segment of the connection URL — credentials are fine (the \
@@ -705,6 +753,9 @@ pub(crate) fn source_error_hint(
             }
             SourceType::Mssql => {
                 "Verify the SQL login/password and that the login maps to a database user with SELECT on the target tables (`GRANT SELECT ON dbo.tbl TO [user]`). Check you are pointed at the right database — contained-DB users and server logins are resolved differently."
+            }
+            SourceType::Oracle => {
+                "Verify the user/password (ORA-01017) and that the URL path is the SERVICE name (not a SID). The user needs CREATE SESSION and SELECT on the target tables; SELECT_CATALOG_ROLE (or SELECT on V$SYSSTAT and V$SYSTEM_EVENT) lets rivet read source-harm counters and governor pressure; row estimates come from ALL_TABLES and need no extra grant."
             }
             SourceType::Mongo => {
                 "Verify the user/password and `authSource`. MongoDB scopes users to an auth database — add `?authSource=admin` (or the DB where the user was created) to the connection URL, and grant the user the `read` role on the target database."
@@ -782,6 +833,34 @@ pub(super) fn destination_error_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tls_mode_a_tls_hint_names_is_one_the_loader_accepts() {
+        let err = anyhow::anyhow!("TLS handshake failed: certificate verify failed");
+        for engine in [
+            SourceType::Postgres,
+            SourceType::Mysql,
+            SourceType::Mssql,
+            SourceType::Oracle,
+            SourceType::Mongo,
+        ] {
+            let hint = source_error_hint("error", &err, &engine).expect("a TLS hint");
+            for named in hint.split("`tls.mode: ").skip(1) {
+                let mode = named.split('`').next().unwrap();
+                serde_yaml_ng::from_str::<crate::config::TlsMode>(mode).unwrap_or_else(|e| {
+                    panic!(
+                        "{engine:?} hint names `tls.mode: {mode}`, which the loader refuses: {e}"
+                    )
+                });
+            }
+        }
+        assert_eq!(
+            source_error_hint("error", &err, &SourceType::Postgres),
+            Some(
+                "TLS handshake failed. Set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA, or `tls.mode: require` to encrypt without verifying the certificate; if the server has no TLS at all, `tls.mode: disable` (trusted networks only)."
+            )
+        );
+    }
 
     #[test]
     fn doctor_transient_failure_classifies_as_retryable_exit_2() {
@@ -917,6 +996,39 @@ exports:
             "no actionable hint produced for Postgres 'db error' (category {:?}); operator gets no next step",
             cat
         );
+    }
+
+    #[test]
+    fn the_oracle_tls_hint_names_the_compiled_in_bundle_and_skips_the_policy_refusal() {
+        let handshake = anyhow::anyhow!("oracle: TLS handshake failed: invalid peer certificate");
+        let hint = source_error_hint("error", &handshake, &SourceType::Oracle).unwrap();
+        assert!(
+            hint.contains(
+                "public CA in the bundle compiled into the driver (not the system trust store"
+            ),
+            "{hint}"
+        );
+        let policy = anyhow::anyhow!(
+            "source: TLS required — refusing to connect to a remote (non-loopback) host"
+        );
+        assert_ne!(
+            source_error_hint("error", &policy, &SourceType::Oracle),
+            Some(hint)
+        );
+    }
+
+    #[test]
+    fn oracle_bad_credentials_and_unknown_service_get_their_own_categories() {
+        let auth = anyhow::anyhow!(
+            "oracle: ORA-01017: invalid credential or not authorized; logon denied"
+        );
+        assert_eq!(categorize_source_error(&auth), "auth error");
+        let service = anyhow::anyhow!(
+            "oracle: ORA-12514: Cannot connect to database. Service FREE_NOPE is not registered \
+             with the listener at host 127.0.0.1 port 1521. (CONNECTION_ID=abc)"
+        );
+        assert_eq!(categorize_source_error(&service), "unknown service");
+        assert!(source_error_hint("unknown service", &service, &SourceType::Oracle).is_some());
     }
 
     // AUDIT-RED doctor-categorizer (#1): MSSQL wrong-login Display is

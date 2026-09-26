@@ -468,10 +468,16 @@ fn verify_one_prefix(
             // Graded depth: Form B is the **only** part-download step, so it
             // runs at `--depth full` alone.  `light` and `sample` deliberately
             // skip it — `sample` is "all structural checks, no part bodies".
-            if target.depth.runs_part_download()
-                && manifest_verified
-                && export.format == crate::config::FormatType::Parquet
-            {
+            if target.depth.runs_part_download() && manifest_verified {
+                if export.format == crate::config::FormatType::Csv
+                    && let Some(ev) = all_results.last_mut()
+                {
+                    ev.verification.failures.push(
+                        crate::pipeline::validate_manifest::Failure::ValueCheckNotAvailable {
+                            format: export.format.label().into(),
+                        },
+                    );
+                }
                 match crate::source::value_checksum::validate_manifest_checksums(&*dest, "") {
                     // A value-checksum MISMATCH is post-write corruption
                     // (verified-wrong): fold it into THIS export's verdict so the

@@ -12,6 +12,9 @@ dependencies = [
     "duckdb==1.5.5",
     # The third independent Parquet reader (the Rust live tests' rivet-duckdb container installs from this lock).
     "pyarrow==18.1.0",
+    # The Oracle source reader (thin mode, no client install). DuckDB has no Oracle
+    # scanner, and this shares no code with rivet's Rust `oracledb` driver.
+    "oracledb==26.0.1",
     "pymongo>=4,<5",
     "pytz==2025.2",
     "pyyaml>=6,<7",

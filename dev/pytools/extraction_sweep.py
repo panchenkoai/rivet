@@ -127,10 +127,6 @@ CASES: list[Case] = [
         notes="crash mid-chunk, then --resume",
     ),
     Case(
-        "chunked+dense",
-        "    mode: chunked\n    chunk_column: id\n    chunk_dense: true\n    chunk_size: 1000\n",
-    ),
-    Case(
         "chunked+parallel",
         "    mode: chunked\n    chunk_column: id\n    chunk_size: 1000\n    parallel: 3\n",
     ),

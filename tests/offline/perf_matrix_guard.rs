@@ -2,7 +2,7 @@
 //! coverage matrix with no guard because its cells are `{measured: ...}` (a captured
 //! number), not the `test/gap/na` the shared chunking_matrix_guard understands. This
 //! closes that hole with the same discipline:
-//!   1. every scenario carries a cell for ALL four engines (column-completeness);
+//!   1. every scenario carries a cell for EVERY engine (column-completeness);
 //!   2. each cell is EXACTLY `{measured}` / `{gap}` / `{na}`;
 //!   3. a `measured` cell is a NON-EMPTY record (a number like rows_per_s, or a
 //!      qualitative note/class — but not an empty `{}` placeholder);
@@ -13,13 +13,14 @@ use std::fs;
 use serde_yaml_ng::Value;
 
 const PERF_MATRIX: &str = "docs/perf-matrix.yaml";
-const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
+const ENGINES: [&str; 5] = ["postgres", "mysql", "mssql", "mongo", "oracle"];
 
 // Shrink-only: LOWER when a gap is filled with a measured baseline; never raise. The
 // matrix currently has ZERO `{gap}` cells, so the ratchet is 0 — for usize `<= 0` is
 // exact equality, so ANY measured->gap downgrade (a lost baseline) fails immediately,
 // not after N accumulate (matching the sibling guards' zero-slack convention).
-const GAP_RATCHET: usize = 0;
+// Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps — no Oracle baseline measured yet.
+const GAP_RATCHET: usize = 7;
 
 fn load() -> Value {
     let s = fs::read_to_string(PERF_MATRIX).unwrap_or_else(|e| panic!("read {PERF_MATRIX}: {e}"));

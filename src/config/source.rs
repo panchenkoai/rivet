@@ -258,6 +258,15 @@ impl TlsMode {
     }
 }
 
+/// An IPv6 literal host in URL form: bracketed, so its colons are not read as a port.
+fn bracket_ipv6(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]").into()
+    } else {
+        host.into()
+    }
+}
+
 impl SourceConfig {
     /// Return a copy of this config with **all plaintext credential material stripped**,
     /// safe to embed in a persisted [`crate::plan::PlanArtifact`] (ADR-0005 PA9).
@@ -358,6 +367,7 @@ impl SourceConfig {
             SourceType::Postgres => 5432,
             SourceType::Mysql => 3306,
             SourceType::Mssql => 1433,
+            SourceType::Oracle => 1521,
             SourceType::Mongo => 27017,
         };
         let port = self.port.unwrap_or(default_port);
@@ -366,12 +376,14 @@ impl SourceConfig {
             SourceType::Postgres => "postgresql",
             SourceType::Mysql => "mysql",
             SourceType::Mssql => "sqlserver",
+            SourceType::Oracle => "oracle",
             SourceType::Mongo => "mongodb",
         };
 
         // Percent-encode the userinfo so a credential containing `/ @ : ? #` can't
         // make the URL ambiguous (breaking the driver) or defeat redaction.
         let user_enc = utf8_percent_encode(user, USERINFO);
+        let host = bracket_ipv6(host);
         if password.is_empty() {
             Ok(format!(
                 "{}://{}@{}:{}/{}",
@@ -488,6 +500,8 @@ pub enum SourceType {
     Postgres,
     Mysql,
     Mssql,
+    /// Oracle Database 19c+, read through Oracle's pure-Rust thin driver.
+    Oracle,
     /// Document store. Unlike the three SQL engines, MongoDB has no SQL, no
     /// fixed per-collection schema, and no `information_schema` — so the
     /// SQL-shaped read seam (chunked/keyset planning, incremental predicate
@@ -750,6 +764,13 @@ mod tests {
             url.contains("@db.example.com:5432/orders"),
             "host and path must be retained: {url}"
         );
+    }
+
+    #[test]
+    fn a_structured_ipv6_host_is_bracketed() {
+        assert_eq!(bracket_ipv6("::1"), "[::1]");
+        assert_eq!(bracket_ipv6("[::1]"), "[::1]");
+        assert_eq!(bracket_ipv6("db.example"), "db.example");
     }
 
     #[test]

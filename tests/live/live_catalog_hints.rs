@@ -331,33 +331,6 @@ fn chunked_nonsimple_query_resolves_numeric_via_base_catalog_hint() {
     );
 }
 
-/// Same regression for the `chunk_dense: true` path, which wraps the base query
-/// in a ROW_NUMBER() subquery *even for the simple `SELECT * FROM <ident>` form*
-/// — so it lost the NUMERIC catalog hint before the fix even on the fast-path
-/// query shape.
-#[test]
-#[ignore = "live: requires docker compose up -d postgres"]
-fn chunked_dense_resolves_numeric_via_base_catalog_hint() {
-    require_alive(LiveService::Postgres);
-    let tbl = seed_pg_numeric_table(60);
-    let tmp = tempfile::tempdir().expect("tmpdir");
-    let rig = Rig::pg_batch(tbl.name())
-        .query(&format!(r#"SELECT * FROM {name}"#, name = tbl.name()))
-        .mode("chunked")
-        .export_line("chunk_column: id")
-        .export_line("chunk_size: 25")
-        .export_line("chunk_dense: true")
-        .export_line("chunk_checkpoint: true")
-        .dest_path(tmp.path().join("o").to_path_buf());
-    let out = rig.run_args(&["--export", tbl.name()]);
-    assert!(
-        out.status.success(),
-        "chunked dense export with an undeclared NUMERIC must resolve via the \
-         base-query catalog hint (no override); stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
-
 /// Same regression for `time_window` mode: its `resolve_query` wraps the base in
 /// a `SELECT * FROM (base) WHERE <ts> BETWEEN …` subquery (single-query path),
 /// which — like chunked — hides the source table from the NUMERIC catalog-hint

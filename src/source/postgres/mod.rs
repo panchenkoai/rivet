@@ -20,6 +20,8 @@
 //!   unit-tested in isolation.
 
 mod arrow_convert;
+#[cfg(feature = "oracle")]
+pub(crate) use arrow_convert::pg_interval_to_iso8601;
 pub(crate) mod cdc;
 mod from_parse;
 pub(crate) mod pgoutput;

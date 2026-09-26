@@ -207,3 +207,325 @@ fn audit_repair_keeps_validate_clean() {
         json["exports"][0]["verification"]
     );
 }
+
+// ─── Gate finding: a repaired prefix must still pass `validate --depth full` ──
+
+/// Seed `id BIGINT, v TEXT` over 1..=1000 minus 500..=549, export chunked, insert the gap, repair.
+fn seed_gap_run_insert_repair() -> (PgTable, Rig) {
+    let (table, rig) = seed_gap_run_insert();
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
+    assert!(
+        repair.status.success(),
+        "repair: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let (ok, after) = reconcile_json(&rig, table.name());
+    assert!(ok, "reconcile must converge after repair: {after:#}");
+    (table, rig)
+}
+
+/// Seed 1..=1000 minus 500..=549, export chunked (chunk_size 250), insert the gap; reconcile sees it.
+fn seed_gap_run_insert() -> (PgTable, Rig) {
+    let name = unique_name("repair_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {name} (id BIGINT PRIMARY KEY, v TEXT NOT NULL); \
+         INSERT INTO {name} SELECT g, 'v' || g FROM generate_series(1, 1000) g \
+         WHERE g NOT BETWEEN 500 AND 549;"
+    ))
+    .expect("seed");
+    let table = PgTable::adopt(name);
+    let rig = Rig::pg_batch(table.name())
+        .census_oracle()
+        .query(&format!("SELECT id, v FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 250")
+        .export_line("chunk_checkpoint: true");
+    let run = rig.run_args(&["--export", table.name()]);
+    assert!(
+        run.status.success(),
+        "export: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    c.batch_execute(&format!(
+        "INSERT INTO {} SELECT g, 'v' || g FROM generate_series(500, 549) g",
+        table.name()
+    ))
+    .expect("insert gap");
+    let (ok, _) = reconcile_json(&rig, table.name());
+    assert!(!ok, "precondition: reconcile must see the inserted gap");
+    (table, rig)
+}
+
+/// The canonical manifest at `out` as JSON.
+fn manifest_json(out: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap()
+}
+
+/// Paths of the manifest parts with `status`.
+fn parts_with_status(m: &serde_json::Value, status: &str) -> Vec<String> {
+    m["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["status"] == status)
+        .map(|p| p["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// DuckDB `[count(*), count(DISTINCT id)]` over `names` under the oracle's view of `out`.
+fn duck_count_distinct(rig: &Rig, names: &[String]) -> serde_json::Value {
+    let container = rig.oracle_container_out();
+    let files: Vec<String> = names.iter().map(|n| format!("'{container}/{n}'")).collect();
+    duckdb_run_sql_json(&format!(
+        "SELECT count(*), count(DISTINCT id) FROM read_parquet([{}])",
+        files.join(", ")
+    ))["rows"][0]
+        .clone()
+}
+
+/// `validate --depth full` → (exit code, stdout+stderr).
+fn validate_full(rig: &Rig, export: &str) -> (Option<i32>, String) {
+    let v = rig.cli(&["validate", "--export", export, "--depth", "full"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+    (v.status.code(), text)
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn repaired_prefix_passes_validate_full_value_checksum() {
+    require_alive(LiveService::Postgres);
+    let (table, rig) = seed_gap_run_insert_repair();
+
+    // Independent oracle: the DISTINCT (id, v) set of the declared parts equals the source, both ways.
+    let container = rig.oracle_container_out();
+    let files: Vec<String> = declared_parquet_parts(&rig.out_dir())
+        .iter()
+        .map(|p| format!("'{container}/{}'", p.file_name().unwrap().to_string_lossy()))
+        .collect();
+    assert_eq!(
+        files.len(),
+        4,
+        "4 chunks, each declared once (the repaired ones by their repair part): {files:?}"
+    );
+    let e = OracleEngine::Postgres;
+    let (attach, from) = e.source_sql("rivet", table.name());
+    let v = duckdb_run_sql_json(&format!(
+        "{} {attach} WITH s AS (SELECT DISTINCT CAST(id AS BIGINT) id, CAST(v AS VARCHAR) v \
+         FROM {from}), d AS (SELECT DISTINCT CAST(id AS BIGINT) id, CAST(v AS VARCHAR) v \
+         FROM read_parquet([{}])) \
+         SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT SELECT * FROM d)), \
+                (SELECT count(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM s)), \
+                (SELECT count(*) FROM d)",
+        e.load_sql(),
+        files.join(", ")
+    ));
+    assert_eq!(
+        v["rows"][0],
+        serde_json::json!(["0", "0", "1000"]),
+        "DuckDB: the declared parts must equal the source"
+    );
+
+    let names: Vec<String> = declared_parquet_parts(&rig.out_dir())
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        duck_count_distinct(&rig, &names),
+        serde_json::json!(["1000", "1000"]),
+        "DuckDB over the DECLARED parts: every source row exactly once, no duplicate from a \
+         superseded original: {names:?}"
+    );
+    let m = manifest_json(&rig.out_dir());
+    let superseded = parts_with_status(&m, "superseded");
+    assert!(
+        !superseded.is_empty(),
+        "the repaired chunks' originals must be superseded: {m:#}"
+    );
+    for s in &superseded {
+        assert!(
+            rig.out_dir().join(s).is_file(),
+            "RR5: the superseded file '{s}' stays on disk"
+        );
+    }
+
+    let (code, text) = validate_full(&rig, table.name());
+    assert_eq!(
+        code,
+        Some(0),
+        "validate --depth full must PASS on a correctly repaired prefix (the manifest's value \
+         checksums must include the repair parts); output:\n{text}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn the_load_resolver_reads_a_repaired_prefix_without_duplicates() {
+    require_alive(LiveService::Postgres);
+    let (_table, rig) = seed_gap_run_insert_repair();
+    let out = rig.out_dir();
+    let m: rivet::manifest::RunManifest =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let all: Vec<String> = files_with_extension(&out, "parquet")
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let selected =
+        rivet::load::reconcile::select_load_keys(&[("manifest.json".to_string(), m)], &all);
+    assert!(
+        selected.len() < all.len(),
+        "fixture inert: the prefix holds no superseded file: {all:?}"
+    );
+    assert_eq!(
+        duck_count_distinct(&rig, &selected),
+        serde_json::json!(["1000", "1000"]),
+        "the parts `rivet load` would read hold every row exactly once: {selected:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn repair_stays_additive_when_an_original_part_has_no_chunk_index() {
+    require_alive(LiveService::Postgres);
+    let (table, rig) = seed_gap_run_insert();
+    let out = rig.out_dir();
+
+    // Rename one original part to a name that carries no chunk index.
+    let mut m = manifest_json(&out);
+    let old = m["parts"][0]["path"].as_str().unwrap().to_string();
+    std::fs::rename(out.join(&old), out.join("legacy_part.parquet")).unwrap();
+    m["parts"][0]["path"] = serde_json::json!("legacy_part.parquet");
+    let bytes = serde_json::to_string_pretty(&m).unwrap().into_bytes();
+    for f in std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
+        let n = f.file_name().unwrap().to_string_lossy().into_owned();
+        if n.starts_with("manifest") && n.ends_with(".json") {
+            std::fs::write(&f, &bytes).unwrap();
+        }
+    }
+    std::fs::write(
+        out.join("_SUCCESS"),
+        rivet::manifest::success_marker_body(&bytes),
+    )
+    .unwrap();
+
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
+    let stderr = String::from_utf8_lossy(&repair.stderr);
+    assert!(repair.status.success(), "repair: {stderr}");
+    assert!(
+        stderr.contains("carries no chunk index") && stderr.contains("(additive)"),
+        "the fallback must say why it stayed additive: {stderr}"
+    );
+    let m = manifest_json(&out);
+    assert!(
+        parts_with_status(&m, "superseded").is_empty(),
+        "never guess: {m:#}"
+    );
+    let committed = parts_with_status(&m, "committed");
+    assert_eq!(
+        committed.len(),
+        6,
+        "4 originals + 2 repair parts stay declared: {m:#}"
+    );
+    assert_eq!(
+        duck_count_distinct(&rig, &committed)[1],
+        "1000",
+        "no row lost by the fallback"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn repaired_prefix_with_a_corrupted_part_still_fails_validate_full() {
+    use arrow::array::{RecordBatch, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    require_alive(LiveService::Postgres);
+    let (table, rig) = seed_gap_run_insert_repair();
+    let out = rig.out_dir();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        m["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "Form B must survive repair or this test grades nothing: {m}"
+    );
+
+    // Tamper one `v` cell in the newest part (the repair part): same schema, same row count.
+    let part = files_with_extension(&out, "parquet")
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap())
+        .unwrap();
+    let batches: Vec<RecordBatch> =
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&part).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect();
+    let schema = batches[0].schema();
+    let idx = schema.index_of("v").unwrap();
+    {
+        let f = std::fs::File::create(&part).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        for (bi, b) in batches.iter().enumerate() {
+            let mut cols = b.columns().to_vec();
+            if bi == 0 {
+                let col = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let mut vals: Vec<String> =
+                    col.iter().map(|x| x.unwrap_or("").to_string()).collect();
+                vals[0].push('x');
+                cols[idx] = std::sync::Arc::new(StringArray::from(vals));
+            }
+            w.write(&RecordBatch::try_new(b.schema(), cols).unwrap())
+                .unwrap();
+        }
+        w.close().unwrap();
+    }
+    // Neutralise the size gate and re-stamp `_SUCCESS`, so only the value leg can fire.
+    let part_name = part.file_name().unwrap().to_string_lossy().into_owned();
+    let new_size = std::fs::metadata(&part).unwrap().len();
+    for mf in std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
+        let n = mf.file_name().unwrap().to_string_lossy().into_owned();
+        if !(n.starts_with("manifest") && n.ends_with(".json")) {
+            continue;
+        }
+        let mut j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mf).unwrap()).unwrap();
+        for p in j["parts"].as_array_mut().unwrap() {
+            if p["path"].as_str().is_some_and(|x| x.ends_with(&part_name)) {
+                p["size_bytes"] = serde_json::json!(new_size);
+            }
+        }
+        let bytes = serde_json::to_string_pretty(&j).unwrap().into_bytes();
+        std::fs::write(&mf, &bytes).unwrap();
+        if n == "manifest.json" {
+            std::fs::write(
+                out.join("_SUCCESS"),
+                rivet::manifest::success_marker_body(&bytes),
+            )
+            .unwrap();
+        }
+    }
+
+    let (code, text) = validate_full(&rig, table.name());
+    assert_eq!(
+        code,
+        Some(3),
+        "a corrupted repaired prefix must fail validate; output:\n{text}"
+    );
+    assert!(
+        text.contains("[RIVET_VERIFY_VALUE_CHECKSUM]") && text.contains("column 'v'"),
+        "the failure must be the value checksum on `v`, not another gate; output:\n{text}"
+    );
+}

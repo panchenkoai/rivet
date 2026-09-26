@@ -55,10 +55,10 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 use crate::error::Result;
 
 /// Side B — order-independent per-column checksum over a built batch: `xxh3` of
-/// each cell's **value bytes**, XOR-combined. int/uint/float/decimal128/date/
-/// timestamp(µs) → little-endian value bytes; bool → a 0/1 byte; utf8/binary → the
-/// raw bytes. Uncovered types (Time64, FixedSizeBinary/UUID, List, ns-timestamps)
-/// contribute 0 on BOTH sides. Hashing every cell (vs the old value-sum) makes the
+/// each cell's **value bytes**, combined by a wrapping sum (`Fold::Sum`). Coverage is
+/// declared once in `check_rule`; an uncovered type (ns-timestamps, lists of an
+/// unmatched element type, anything unlisted) contributes 0 on BOTH sides. Hashing
+/// every cell (vs the old value-sum) makes the
 /// check sensitive to **content** corruption that preserves length or sum — a byte
 /// flip, or two compensating changes — which a sum/length silently misses.
 pub fn arrow_batch_checksums(batch: &RecordBatch) -> Vec<u64> {
@@ -511,63 +511,10 @@ pub fn validate_recorded_checksums(
     key_col_name: Option<&str>,
     fold: Fold,
 ) -> Result<Option<String>> {
-    use std::collections::BTreeMap;
-
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    // Re-read every part, accumulate side C per column BY NAME — keyed to the same
-    // cursor column as the export when `key_col_name` is set, so the keyed hashes
-    // match. Name-keyed so a column reorder can't silently misalign the compare.
-    let mut actual: BTreeMap<String, u64> = BTreeMap::new();
-    for path in part_paths {
-        // File::open failing (EMFILE, a permissions blip) is OPERATIONAL — the
-        // verification could not run, so it must not be reported as corruption.
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
-        // A part the manifest recorded as committed Parquet that will NOT decode
-        // is post-write CORRUPTION — verified-wrong (Ok(Some), exit 3), not an
-        // operational could-not-verify. Distinct from File::open above.
-        let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(Some(format!(
-                    "value checksum: part {} is not readable as Parquet ({e}) — post-write corruption",
-                    path.display()
-                )));
-            }
-        };
-        for batch in reader {
-            let batch = match batch {
-                Ok(b) => b,
-                Err(e) => {
-                    return Ok(Some(format!(
-                        "value checksum: part {} failed to decode ({e}) — post-write corruption",
-                        path.display()
-                    )));
-                }
-            };
-            let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
-            // Re-derive with the fold that WROTE these numbers, not today's.
-            // EVERY column is keyed when a key exists — including the key column
-            // itself, exactly as `arrow_batch_checksums_keyed` does on the write
-            // side. Excluding it (an exception I invented on the first cut) makes
-            // the key column's re-read disagree with what was recorded, which a
-            // 4-part keyset export reported as post-write corruption.
-            let key_arr = key_col.map(|k| batch.column(k).clone());
-            let sums: Vec<u64> = batch
-                .columns()
-                .iter()
-                .map(|c| column_xxh3_with(c.as_ref(), key_arr.as_deref(), fold))
-                .collect();
-            for (i, f) in batch.schema().fields().iter().enumerate() {
-                // Folded by the SAME rule that produced the recorded value —
-                // see `Fold`. Combining batches with a different operation than
-                // the writer used would report every multi-batch part as corrupt.
-                let e = actual.entry(f.name().clone()).or_insert(0);
-                *e = fold.combine(*e, sums[i]);
-            }
-        }
-    }
+    let actual = match reread_column_checksums(part_paths, key_col_name, fold)? {
+        Ok(actual) => actual,
+        Err(detail) => return Ok(Some(detail)),
+    };
 
     // Compare each recorded (data) column to the re-read value by name. Re-read
     // columns absent from `recorded` (enrichment / meta columns) are not compared.
@@ -601,6 +548,72 @@ pub fn validate_recorded_checksums(
     Ok(None)
 }
 
+/// Re-read Parquet parts and fold per-column checksums by name; `Ok(Err(detail))` when a part will not decode.
+pub(crate) fn reread_column_checksums(
+    part_paths: &[std::path::PathBuf],
+    key_col_name: Option<&str>,
+    fold: Fold,
+) -> Result<std::result::Result<std::collections::BTreeMap<String, u64>, String>> {
+    use std::collections::BTreeMap;
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    // Re-read every part, accumulate side C per column BY NAME — keyed to the same
+    // cursor column as the export when `key_col_name` is set, so the keyed hashes
+    // match. Name-keyed so a column reorder can't silently misalign the compare.
+    let mut actual: BTreeMap<String, u64> = BTreeMap::new();
+    for path in part_paths {
+        // File::open failing (EMFILE, a permissions blip) is OPERATIONAL — the
+        // verification could not run, so it must not be reported as corruption.
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
+        // A part the manifest recorded as committed Parquet that will NOT decode
+        // is post-write CORRUPTION — verified-wrong (Ok(Some), exit 3), not an
+        // operational could-not-verify. Distinct from File::open above.
+        let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(Err(format!(
+                    "value checksum: part {} is not readable as Parquet ({e}) — post-write corruption",
+                    path.display()
+                )));
+            }
+        };
+        for batch in reader {
+            let batch = match batch {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(Err(format!(
+                        "value checksum: part {} failed to decode ({e}) — post-write corruption",
+                        path.display()
+                    )));
+                }
+            };
+            let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
+            // Re-derive with the fold that WROTE these numbers, not today's.
+            // EVERY column is keyed when a key exists — including the key column
+            // itself, exactly as `arrow_batch_checksums_keyed` does on the write
+            // side. Excluding it (an exception I invented on the first cut) makes
+            // the key column's re-read disagree with what was recorded, which a
+            // 4-part keyset export reported as post-write corruption.
+            let key_arr = key_col.map(|k| batch.column(k).clone());
+            let sums: Vec<u64> = batch
+                .columns()
+                .iter()
+                .map(|c| column_xxh3_with(c.as_ref(), key_arr.as_deref(), fold))
+                .collect();
+            for (i, f) in batch.schema().fields().iter().enumerate() {
+                // Folded by the SAME rule that produced the recorded value —
+                // see `Fold`. Combining batches with a different operation than
+                // the writer used would report every multi-batch part as corrupt.
+                let e = actual.entry(f.name().clone()).or_insert(0);
+                *e = fold.combine(*e, sums[i]);
+            }
+        }
+    }
+    Ok(Ok(actual))
+}
+
 /// What a destination-side re-read found wrong, typed so the caller classifies it
 /// without sniffing the message. Both are verified-wrong (exit 3); they differ in
 /// WHERE the operator should look — the data, or the manifest describing it.
@@ -624,7 +637,23 @@ fn part_row_count_mismatch(
 ) -> Result<Option<String>> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    for (part, path) in manifest.parts.iter().zip(paths) {
+    let committed = manifest
+        .parts
+        .iter()
+        .filter(|p| p.status == crate::manifest::PartStatus::Committed);
+    for (part, path) in committed.zip(paths) {
+        if manifest.format == crate::config::FormatType::Csv.label() {
+            let records = crate::pipeline::validate::count_csv_records(path)
+                .map_err(|e| anyhow::anyhow!("part row count: read {}: {e}", part.path))?;
+            let actual = records.saturating_sub(1) as i64;
+            if actual != part.rows {
+                return Ok(Some(format!(
+                    "part '{}' declares {} rows but holds {actual} CSV records after the header",
+                    part.path, part.rows
+                )));
+            }
+            continue;
+        }
         let file = std::fs::File::open(path)
             .map_err(|e| anyhow::anyhow!("part row count: open {}: {e}", part.path))?;
         // Footer only — `num_rows` lives in the file metadata, so this does not
@@ -786,6 +815,9 @@ fn validate_one_manifest_checksums(
     let Some(recorded) = manifest.column_checksums.as_deref() else {
         return Ok(None);
     };
+    if manifest.format == crate::config::FormatType::Csv.label() {
+        return Ok(None);
+    }
 
     // `validate_recorded_checksums` now classifies for us: Ok(None) clean,
     // Ok(Some) verified-wrong (exit 3), Err operational (exit 1). Everything
@@ -820,6 +852,81 @@ mod tests {
             Field::new("b", DataType::Int64, true),
             Field::new("c", DataType::Int64, true),
         ]))
+    }
+
+    fn csv_manifest(parts: Vec<crate::manifest::ManifestPart>) -> crate::manifest::RunManifest {
+        use crate::manifest::*;
+        RunManifest {
+            split_window: None,
+            checksum_render: None,
+            row_hash: None,
+            mode: "batch".into(),
+            manifest_version: MANIFEST_VERSION,
+            run_id: "r".into(),
+            export_name: "e".into(),
+            export_family: String::new(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: None,
+                table: None,
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: String::new(),
+            },
+            format: "csv".into(),
+            compression: "none".into(),
+            schema_fingerprint: String::new(),
+            row_count: 0,
+            part_count: 0,
+            parts,
+            column_checksums: None,
+            checksum_key_column: None,
+        }
+    }
+
+    fn csv_part(
+        path: &str,
+        rows: i64,
+        status: crate::manifest::PartStatus,
+    ) -> crate::manifest::ManifestPart {
+        crate::manifest::ManifestPart {
+            part_id: 0,
+            path: path.into(),
+            rows,
+            size_bytes: 0,
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status,
+        }
+    }
+
+    #[test]
+    fn csv_part_rows_are_recounted_after_the_header_and_skip_quarantined_parts() {
+        use crate::manifest::PartStatus::{Committed, Quarantined};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.csv");
+        std::fs::write(&file, "id,s\n1,\"x\ny\"\n2,z\n").unwrap();
+        let paths = vec![file];
+
+        let ok = csv_manifest(vec![
+            csv_part("q.csv", 7, Quarantined),
+            csv_part("a.csv", 2, Committed),
+        ]);
+        assert_eq!(part_row_count_mismatch(&ok, &paths).unwrap(), None);
+
+        let lost = csv_manifest(vec![
+            csv_part("q.csv", 7, Quarantined),
+            csv_part("a.csv", 3, Committed),
+        ]);
+        assert_eq!(
+            part_row_count_mismatch(&lost, &paths).unwrap().as_deref(),
+            Some("part 'a.csv' declares 3 rows but holds 2 CSV records after the header")
+        );
     }
 
     // ── mutation-tier2 gap closures ──────────────────────────────────────────

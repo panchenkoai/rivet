@@ -190,10 +190,10 @@ pub(crate) fn probe_and_synthesize(
     // `key > lo AND key <= hi`, which excludes NULL (SQL 3-valued logic), and the
     // per-unit `bail_if_null_keyed` is BLIND on a split unit because it probes the
     // already-windowed subquery — so NULL-keyed rows would be SILENTLY DROPPED while
-    // every unit reports success. The un-split chunked path bails loudly (and
-    // chunk_dense covers NULLs); the split cannot, so refuse it here against the WHOLE
-    // table's key domain, before any unit runs. Keyset (chunk_by_key) keys are
-    // planner-enforced NOT NULL — exempt; only chunk_column/dense range keys can be null.
+    // every unit reports success. The un-split chunked path bails loudly; the
+    // split cannot, so refuse it here against the WHOLE table's key domain, before any
+    // unit runs. Keyset (chunk_by_key) keys are planner-enforced NOT NULL — exempt;
+    // only chunk_column range keys can be null.
     if giant.chunk_by_key.is_none() && giant.chunk_column.is_some() {
         let probe =
             crate::sql::null_key_probe_sql(config.source.source_type, &key, &plan.base_query);
@@ -201,8 +201,7 @@ pub(crate) fn probe_and_synthesize(
             anyhow::bail!(
                 "export '{}': `--pool --split` over chunk_column '{}' would SILENTLY DROP \
                  NULL-keyed rows — each range sub-export's window excludes NULL, and unlike the \
-                 un-split path (which bails or, with chunk_dense, covers them) the split has no \
-                 way to carry them. Fix one of: use a NOT NULL column; add `WHERE {} IS NOT NULL` \
+                 un-split path (which bails) the split has no way to carry them. Fix one of: use a NOT NULL column; add `WHERE {} IS NOT NULL` \
                  to drop them explicitly; or run this export with `mode: full` (unsplit).",
                 giant.name,
                 key,

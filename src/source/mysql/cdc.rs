@@ -2790,8 +2790,9 @@ mod tests {
     #[test]
     #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
     fn the_binlog_dump_session_outlives_a_long_flush() {
+        // Its own server_id: a second dump with the same id makes MySQL drop the first (1236).
         let _stream =
-            MysqlChangeStream::open_from_current(URL, 4299, DrainMode::Continuous, None, &[])
+            MysqlChangeStream::open_from_current(URL, 4250, DrainMode::Continuous, None, &[])
                 .unwrap();
         // performance_schema is root-only on the stand; the stream itself runs as `rivet`.
         let mut c =

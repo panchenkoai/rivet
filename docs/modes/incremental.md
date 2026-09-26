@@ -166,6 +166,20 @@ exports:
 - The column must be a date or timestamp; zone-less values are compared as UTC.
 - Deletes stay invisible to a cursor. Use `mode: cdc` when they must reach the warehouse.
 
+## Transactions that commit during a run
+
+Each incremental read must see a transaction either whole or not at all. PostgreSQL and MySQL (InnoDB) read every statement from one snapshot, so they do. SQL Server does only when the database has a row-versioning option on:
+
+| database option | how rivet reads the window |
+| --- | --- |
+| `READ_COMMITTED_SNAPSHOT ON` | plain READ COMMITTED, which already reads one snapshot |
+| `ALLOW_SNAPSHOT_ISOLATION ON` | rivet switches the read to `SNAPSHOT` |
+| neither (the SQL Server default) | locking READ COMMITTED, with a warning |
+
+Under locking READ COMMITTED a scan can pass a row, wait on a row a writer holds, and read it once the writer commits, so the scan returns that transaction half-applied. The cursor then moves past the rows it had already passed, and no later run reads them. Enable `ALLOW_SNAPSHOT_ISOLATION` (`ALTER DATABASE [<db>] SET ALLOW_SNAPSHOT_ISOLATION ON`), or set a `settle` window longer than your longest write transaction.
+
+A snapshot does not cover everything. A transaction that stamps its rows, commits late, and ends up with a cursor value below a row that committed earlier is skipped on every engine, since each read already moved past it. `settle` guards that race: set `after` longer than your longest write transaction.
+
 ## Troubleshooting
 
 **`the stored cursor ... was written for ...`** -- The export's cursor changed (a new `cursor_column`, or a keyset `chunk_by_key` export switched to incremental on another column). The old value means nothing for the new column; `rivet state reset --config ... --export <name>` starts the new cursor with a full pass.

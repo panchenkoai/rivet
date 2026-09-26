@@ -153,7 +153,10 @@ fn reconcile_chunked_inner(plan: &ResolvedRunPlan, state: &StateStore) -> Result
 
     let mut src = source::create_source(&plan.source)?;
     let partitions = reconcile_chunked_tasks(plan, &tasks, |chunk_query| {
-        let count_sql = format!("SELECT COUNT(*) FROM ({chunk_query}) AS _rc");
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM ({chunk_query}) {}",
+            crate::sql::derived(plan.source.source_type, "_rc")
+        );
         let raw = src.query_scalar(&count_sql)?;
         Ok(raw.and_then(|s| s.trim().parse::<i64>().ok()))
     })?;
@@ -230,7 +233,6 @@ where
             &cp.column,
             start,
             end,
-            cp.dense,
             cp.by_days.is_some(),
             plan.source.source_type,
         );
@@ -360,7 +362,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: true,
                 max_attempts: 3,

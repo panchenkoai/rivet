@@ -490,12 +490,16 @@ pub(crate) fn write_part_file(
 ///
 /// Validation (when `validate` is `Some`) runs per part against that
 /// part's own row count — the only count the part actually contains.
+///
+/// Each part is pushed onto `written` as soon as it is durable, so a failure on a
+/// later part still leaves the caller every part that reached the destination.
 pub(crate) fn write_sink_parts(
     dest: &dyn Destination,
     sink: &mut crate::pipeline::sink::ExportSink,
     validate: Option<crate::config::FormatType>,
     name_for: impl Fn(usize, usize) -> String,
-) -> Result<Vec<PartRecord>> {
+    written: &mut Vec<PartRecord>,
+) -> Result<()> {
     sink.finish_writer()?;
     if sink.part_rows > 0 {
         sink.completed_parts
@@ -506,19 +510,21 @@ pub(crate) fn write_sink_parts(
         sink.part_rows = 0;
     }
     let count = sink.completed_parts.len();
-    let mut recs = Vec::with_capacity(count);
     for (idx, part) in sink.completed_parts.drain(..).enumerate() {
+        // Test-only: fail part `idx` after its earlier siblings are durable.
+        crate::test_hook::maybe_error_at_index("sink_part_write", idx as i64)
+            .map_err(|msg| anyhow::anyhow!(msg))?;
         if let Some(fmt) = validate {
             crate::pipeline::validate::validate_output(part.tmp.path(), fmt, part.rows)?;
         }
-        recs.push(write_part_file(
+        written.push(write_part_file(
             dest,
             part.tmp.path(),
             part.rows as i64,
             name_for(idx, count),
         )?);
     }
-    Ok(recs)
+    Ok(())
 }
 
 /// Sibling naming for rotated parts: a single-part chunk keeps its legacy

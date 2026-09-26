@@ -1,5 +1,8 @@
 """CDC soak runner + CDC source-parity sweep.
 
+(For a multi-hour, all-engine, batch + CDC soak graded by a ground-truth journal, see
+`dev/pytools/soak.py` / `make soak`; this MySQL-only `soak` stays as the quick check.)
+
 Port of two long-running verifiers over the same `cdc` compose profile:
 
 * `scripts/soak_cdc.sh`          → `soak()`

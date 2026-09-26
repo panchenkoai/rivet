@@ -461,6 +461,8 @@ pub enum PartStatus {
     Committed,
     /// Found in a prior manifest but rejected on resume (M9); retained for audit.
     Quarantined,
+    /// Replaced by a `rivet repair` part of the same chunk; the file stays on disk until opt-in gc (ADR-0009 RR5).
+    Superseded,
 }
 
 #[cfg(test)]

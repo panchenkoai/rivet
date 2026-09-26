@@ -127,6 +127,13 @@ fn extract_cursor_value_at(
                 .value(last_row)
                 .to_string(),
         ),
+        // Exact decimal text — an Oracle NUMBER(p>18,0) keyset key compares numerically.
+        DataType::Decimal128(_, _) => Some(
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()?
+                .value_as_string(last_row),
+        ),
         DataType::Utf8 => Some(
             array
                 .as_any()
@@ -245,6 +252,19 @@ mod tests {
         assert_eq!(
             extract_last_cursor_value(&batch, "id", &schema),
             Some("30".into())
+        );
+    }
+
+    #[test]
+    fn cursor_decimal_past_i64_is_exact_text() {
+        let dt = DataType::Decimal128(38, 0);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", dt.clone(), false)]));
+        let big: i128 = 12_345_678_901_234_567_890_123;
+        let arr = Decimal128Array::from(vec![1, big]).with_data_type(dt);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some("12345678901234567890123".into())
         );
     }
 

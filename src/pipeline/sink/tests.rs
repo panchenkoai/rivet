@@ -14,10 +14,10 @@ use std::sync::Arc;
 fn strip_internal_column_from_schema() {
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("_rivet_chunk_rn", DataType::Int64, false),
+        Field::new("_rivet_internal_col", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
     ]);
-    let result = ExportSink::schema_without_internal(&schema, "_rivet_chunk_rn").unwrap();
+    let result = ExportSink::schema_without_internal(&schema, "_rivet_internal_col").unwrap();
     assert_eq!(result.fields().len(), 2);
     assert_eq!(result.field(0).name(), "id");
     assert_eq!(result.field(1).name(), "name");
@@ -33,7 +33,7 @@ fn strip_internal_column_missing_errors() {
 fn strip_internal_column_from_batch() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("_rivet_chunk_rn", DataType::Int64, false),
+        Field::new("_rivet_internal_col", DataType::Int64, false),
     ]));
     let batch = RecordBatch::try_new(
         schema,
@@ -43,7 +43,8 @@ fn strip_internal_column_from_batch() {
         ],
     )
     .unwrap();
-    let stripped = ExportSink::record_batch_without_internal(&batch, "_rivet_chunk_rn").unwrap();
+    let stripped =
+        ExportSink::record_batch_without_internal(&batch, "_rivet_internal_col").unwrap();
     assert_eq!(stripped.num_columns(), 1);
     assert_eq!(stripped.schema().field(0).name(), "id");
     let ids = stripped

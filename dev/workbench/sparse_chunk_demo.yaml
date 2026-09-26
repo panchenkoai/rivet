@@ -12,11 +12,10 @@
 #     --sparse-chunk-rows 500000 --sparse-chunk-id-gap 1 --sparse-chunk-batch-size 8000
 #
 # `orders_sparse_on_id` — chunk on physical id → wide min..max, many windows (heavy plan).
-# `orders_sparse_builtin_dense` — same query as on_id; Rivet adds ROW_NUMBER() OVER (ORDER BY id)
-#   internally (`chunk_dense: true`). Output files contain only id + payload (no surrogate column).
-# `orders_sparse_dense` — manual view with chunk_rownum (legacy / explicit SQL).
+# `orders_sparse_keyset` — keyset (`chunk_by_key: id`) pages by rows, so the id gaps cost nothing.
+# `orders_sparse_dense` — manual view with chunk_rownum (legacy / explicit SQL; static tables only).
 #
-# Goal: few files / one file — prefer `chunk_dense: true` or a dense key; not sparse BETWEEN on `id`.
+# Goal: few files / one file — prefer keyset or a dense key; not sparse BETWEEN on `id`.
 # For one file: chunk_size >= row count on the dense ordinal (see `orders_sparse_dense_onefile`).
 
 source:
@@ -30,17 +29,15 @@ exports:
     chunk_column: id
     chunk_size: 500000
     chunk_checkpoint: true
-    chunk_dense: true
     format: csv
     destination:
       type: local
       path: ./dev/output/sparse_chunk
 
-  - name: orders_sparse_builtin_dense
-    query: "SELECT id, payload FROM orders_sparse"
+  - name: orders_sparse_keyset
+    table: orders_sparse
     mode: chunked
-    chunk_column: id
-    chunk_dense: true
+    chunk_by_key: id
     chunk_size: 10000
     format: csv
     destination:

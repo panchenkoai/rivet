@@ -285,3 +285,61 @@ fn plan_is_read_only_without_annotate_waves() {
          reached the annotator and the read-only assertion above proves nothing"
     );
 }
+
+/// The Wave column of `rivet plan` is the `wave:` apply groups by — before and
+/// after `--annotate-waves` — never the cost model's recommendation.
+#[test]
+#[ignore = "live: postgres"]
+fn plan_wave_column_is_the_wave_apply_reads() {
+    require_alive(LiveService::Postgres);
+    let a = unique_name("wave_col_a");
+    let b = unique_name("wave_col_b");
+    let c = unique_name("wave_col_c");
+    let rig = Rig::pg_batch(&a)
+        .query("SELECT id FROM orders")
+        .export_line("wave: 7")
+        .also_export(&b, "SELECT id FROM orders")
+        .also_export_line("wave: 9")
+        .also_export(&c, "SELECT id FROM orders");
+    let wave_col = |out: &str, name: &str| -> String {
+        let line = out
+            .lines()
+            .find(|l| l.split_whitespace().nth(2) == Some(name))
+            .unwrap_or_else(|| panic!("no plan row for {name}:\n{out}"));
+        line.split_whitespace().next().unwrap().to_string()
+    };
+
+    let plain = rig.cli(&["plan"]);
+    let out = String::from_utf8_lossy(&plain.stdout).into_owned();
+    assert!(plain.status.success(), "{out}");
+    assert_eq!(wave_col(&out, &a), "7", "{out}");
+    assert_eq!(wave_col(&out, &b), "9", "{out}");
+    assert_eq!(wave_col(&out, &c), "—", "{out}");
+    assert!(
+        out.contains(
+            "runs them by `wave:` (lowest first); the 1 with no `wave:` run last as one \
+             unscheduled group"
+        ),
+        "{out}"
+    );
+
+    // config_path() re-renders the file, so take it BEFORE the run that annotates it.
+    let cfg_path = rig.config_path();
+    let annotated = rig.cli(&["plan", "--annotate-waves"]);
+    let out = String::from_utf8_lossy(&annotated.stdout).into_owned();
+    assert!(annotated.status.success(), "{out}");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let on_disk = |name: &str| -> String {
+        let mut lines = cfg
+            .lines()
+            .skip_while(|l| !l.ends_with(&format!("name: {name}")));
+        lines.next().expect("export in config");
+        lines
+            .take_while(|l| !l.trim_start().starts_with("- name:"))
+            .find_map(|l| l.trim().strip_prefix("wave: ").map(str::to_string))
+            .unwrap_or_else(|| panic!("--annotate-waves wrote no wave for {name}:\n{cfg}"))
+    };
+    for name in [&a, &b, &c] {
+        assert_eq!(wave_col(&out, name), on_disk(name), "{name}:\n{out}\n{cfg}");
+    }
+}

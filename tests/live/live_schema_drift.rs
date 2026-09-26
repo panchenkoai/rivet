@@ -419,3 +419,86 @@ fn drift_failed_keyset_run_still_records_observed_fingerprint_and_form_b() {
         m2["column_checksums"]
     );
 }
+
+/// Incremental run → drop a column → `on_schema_drift: fail` run → `warn` run; every
+/// source row must sit under a SUCCESS manifest (DuckDB over the declared parts).
+fn drift_failed_run_holds_the_cursor(label: &str, mode: &str, strategy: &[&str]) {
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name(label);
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, name TEXT NOT NULL, tmp_col INT DEFAULT 0);
+         INSERT INTO {table_name} (id, name) SELECT g, 'r' || g FROM generate_series(1, 30) g;"
+    ))
+    .unwrap();
+    let _guard = PgCleanup(table_name.clone());
+
+    let export_name = unique_name(&format!("{label}_exp"));
+    let mut rig = Rig::pg_batch(&table_name)
+        .export_named(&export_name)
+        .mode(mode);
+    for line in strategy {
+        rig = rig.export_line(line);
+    }
+    let mut rig = rig.export_line("on_schema_drift: fail").duckdb_oracle();
+
+    assert!(
+        rig.run_args(&["--export", &export_name]).status.success(),
+        "run 1 (baseline, records the schema) must succeed"
+    );
+    c.batch_execute(&format!(
+        "ALTER TABLE {table_name} DROP COLUMN tmp_col;
+         INSERT INTO {table_name} (id, name) SELECT g, 'r' || g FROM generate_series(31, 37) g;"
+    ))
+    .unwrap();
+    let r2 = rig.run_args(&["--export", &export_name]);
+    assert!(
+        !r2.status.success(),
+        "fixture inert: the drift gate did not fail run 2; stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+
+    rig.replace_export_line("on_schema_drift:", "on_schema_drift: warn");
+    let r3 = rig.run_args(&["--export", &export_name]);
+    assert!(
+        r3.status.success(),
+        "run 3 (warn) must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r3.stderr)
+    );
+
+    let source: i64 = c
+        .query_one(&format!("SELECT count(*) FROM {table_name}"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(source, 37, "source count");
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        source,
+        "rows written only by the drift-FAILED run must be re-exported under a SUCCESS \
+         manifest — a failed run that advanced the cursor strands ids 31..37",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn drift_failed_incremental_run_holds_the_cursor_single() {
+    drift_failed_run_holds_the_cursor("r2_0_inc", "incremental", &["cursor_column: id"]);
+}
+
+/// Belt-and-suspenders, not a RED proof: `keyset_incremental` implies a checkpoint, so the
+/// failed run keeps its resume anchor and run 3 adopts its parts even with the cursor advanced.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn drift_failed_incremental_run_holds_the_cursor_keyset() {
+    drift_failed_run_holds_the_cursor(
+        "r2_0_ks",
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "chunk_size: 10",
+            "chunk_checkpoint: true",
+            "keyset_incremental: true",
+        ],
+    );
+}

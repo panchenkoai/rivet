@@ -54,7 +54,7 @@ mod single;
 mod sink;
 pub(crate) mod split;
 mod summary;
-mod validate;
+pub(crate) mod validate;
 mod validate_cmd;
 pub(crate) mod validate_manifest;
 
@@ -446,7 +446,6 @@ mod tests {
             chunk_size: 1000,
             chunk_count: None,
             parallel: 1,
-            dense: false,
             by_days: None,
             max_attempts: 3,
             checkpoint: false,

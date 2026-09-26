@@ -1127,8 +1127,8 @@ fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
 ///
 /// Here TWO guards stand between a partial export and a green `_SUCCESS`: the
 /// collected worker errors, and the chunk-completion count behind it. Disabling
-/// BOTH left 56 live tests green — chunked-recovery, chunked-dense, cli-flags and
-/// crash-soak — while a run missing a whole chunk reported success.
+/// BOTH left 56 live tests green — chunked-recovery, the since-removed chunked-dense,
+/// cli-flags and crash-soak — while a run missing a whole chunk reported success.
 ///
 /// So this injects an ERROR instead (`RIVET_TEST_ERROR_AT=chunk_export:1`): the
 /// chunk returns, the loop completes, and the guard is the only thing that can
@@ -1223,7 +1223,7 @@ fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
 ///     process death never reaches a guard that runs after the join.
 ///   * So do the tests that DO drive this very runner:
 ///     `live_governor::governor_activates_and_run_completes`,
-///     `live_chunked_dense::dense_ties_pg_parallel_no_loss_no_dup` and
+///     the since-removed `chunk_dense` parallel test, and
 ///     `live_schema_drift::chunked_range_export_enforces_on_schema_drift_fail`
 ///     are all `mode: chunked` + `parallel: N` with no checkpoint, and all pass
 ///     with the guard gone — they never make a chunk fail.
@@ -1515,5 +1515,397 @@ fn a_resume_after_a_failed_run_reports_the_rows_it_adopted() {
         latest_metric_total_rows(&cfg, &export),
         Some(150),
         "the reported total counts the adopted parts, not only the re-run chunk"
+    );
+}
+
+// Cross-shape manifest guard (graph-surfaced runner-bypass). The two
+// chunk-checkpoint runners were the ONLY batch runners not calling
+// guard_manifest_mode, so a chunked-checkpoint export into a prefix that
+// already held a CDC manifest would silently overwrite it — destroying the CDC
+// export's audit trail. Both runners must now refuse: parallel=1 exercises the
+// sequential checkpoint runner, parallel=4 the parallel one.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_checkpoint_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(150);
+    for parallel in [1usize, 4] {
+        let out = tempfile::tempdir().unwrap();
+        // A prior CDC run's manifest already sits at the destination prefix.
+        std::fs::write(
+            out.path().join("manifest.json"),
+            br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+        )
+        .unwrap();
+        let export = unique_name("cdc_clobber_guard");
+        let rig = Rig::pg_batch(&export)
+            .query(&format!("SELECT id, name FROM {}", table.name()))
+            .mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 50")
+            .export_line("chunk_checkpoint: true")
+            .export_line(&format!("parallel: {parallel}"))
+            .dest_path(out.path().to_path_buf());
+        let run = rig.run_args(&["--export", &export]);
+        assert!(
+            !run.status.success(),
+            "parallel={parallel}: a chunked-checkpoint batch export must REFUSE to \
+             overwrite a CDC manifest"
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            combined.contains("already holds a 'cdc' manifest"),
+            "parallel={parallel}: must name the cross-shape collision; got:\n{combined}"
+        );
+    }
+}
+
+// ─── A crashed checkpoint run recovers on a PLAIN re-run; a live one is refused ──
+
+const RANGE: &[&str] = &["chunk_column: id"];
+const KEYSET: &[&str] = &["chunk_by_key: id"];
+
+/// A PG checkpointed export over `table`, chunked by `key_lines`.
+fn checkpointed_rig(table: &str, export: &str, key_lines: &[&str], slow: bool) -> Rig {
+    let mut rig = Rig::pg_batch(table).export_named(export).mode("chunked");
+    for line in key_lines {
+        rig = rig.export_line(line);
+    }
+    let mut rig = rig
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true");
+    if slow {
+        rig = rig
+            .source_line("tuning:")
+            .source_line("  batch_size: 10")
+            .source_line("  throttle_ms: 400");
+    }
+    rig.duckdb_oracle()
+}
+
+fn pg_count(table: &str) -> i64 {
+    pg_connect()
+        .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+        .unwrap()
+        .get(0)
+}
+
+fn a_crashed_checkpoint_run_recovers_on_a_plain_rerun(key_lines: &[&str], point: &str) {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("crash_plain");
+    let rig = checkpointed_rig(table.name(), &export, key_lines, false);
+    let crash = rig.run_args_env(&["--export", &export], &[("RIVET_TEST_PANIC_AT", point)]);
+    assert!(!crash.status.success(), "the crash run must die at {point}");
+    assert!(
+        duckdb_declared_rows(rig.oracle_dir()) < 150,
+        "fixture: the crash must leave the export incomplete"
+    );
+
+    let rerun = rig.run_args(&["--reconcile"]);
+    let said = String::from_utf8_lossy(&rerun.stderr);
+    assert!(
+        rerun.status.success(),
+        "the plain re-run must recover: {said}"
+    );
+    assert!(!said.contains("still in progress"), "{said}");
+    let source = pg_count(table.name());
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        source,
+        "a crashed run then a plain re-run must deliver every row exactly once",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_crashed_range_checkpoint_run_recovers_on_a_plain_rerun() {
+    a_crashed_checkpoint_run_recovers_on_a_plain_rerun(RANGE, "after_chunk_complete:0");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_crashed_keyset_checkpoint_run_recovers_on_a_plain_rerun() {
+    a_crashed_checkpoint_run_recovers_on_a_plain_rerun(KEYSET, "after_keyset_page:0");
+}
+
+fn a_live_checkpoint_run_refuses_a_concurrent_run(key_lines: &[&str]) {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("live_owner");
+    let rig = checkpointed_rig(table.name(), &export, key_lines, true);
+    let cfg = rig.config_path();
+    let mut owner = rig.spawn_args_env(&["--export", &export], &[]);
+    let t0 = std::time::Instant::now();
+    let owner_running = || {
+        open_state_db(&cfg)
+            .query_row(
+                "SELECT COUNT(*) FROM run_status WHERE status = 'running'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n > 0)
+    };
+    while !owner_running() {
+        assert!(
+            owner.try_wait().unwrap().is_none(),
+            "fixture: the owner run exited before the second run started"
+        );
+        assert!(
+            t0.elapsed().as_secs() < 20,
+            "fixture: the owner run never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let second = rig.run_expect_fail();
+    assert!(
+        owner.try_wait().unwrap().is_none(),
+        "fixture: the owner must still be running when the second run is refused"
+    );
+    assert!(
+        second.contains(&format!("export '{export}': chunk checkpoint run"))
+            && second.contains(
+                "still in progress in another live rivet process (it holds the export's run \
+                 lease); wait for it to finish"
+            ),
+        "{second}"
+    );
+    assert!(owner.wait().unwrap().success(), "the owner run must finish");
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        pg_count(table.name()),
+        "the refused run must not disturb the live one",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_live_range_checkpoint_run_refuses_a_concurrent_run() {
+    a_live_checkpoint_run_refuses_a_concurrent_run(RANGE);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_live_keyset_checkpoint_run_refuses_a_concurrent_run() {
+    a_live_checkpoint_run_refuses_a_concurrent_run(KEYSET);
+}
+
+// ─── A failed chunk's durable parts are counted, and never declared twice ────────
+
+/// 2000 rows of ~1 KiB, so a 250-row chunk rolls into several 64 KB parts.
+fn seed_rolling_table() -> PgTable {
+    let name = unique_name("frt_roll");
+    pg_connect()
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {name}; \
+             CREATE TABLE {name} (id BIGINT PRIMARY KEY, payload TEXT NOT NULL); \
+             INSERT INTO {name} SELECT g, repeat(md5(g::text), 32) FROM generate_series(1, 2000) g;"
+        ))
+        .unwrap();
+    PgTable::adopt(name)
+}
+
+/// Fail a chunked run by `err_at`, grade `files_committed` against the parts on disk, re-run plainly.
+fn a_failed_chunks_durable_parts_are_counted(runner: &[&str], err_at: &str) {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_rolling_table();
+    let mut rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 250")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("parquet: { row_group_strategy: fixed_rows, row_group_rows: 100 }")
+        .source_line("tuning:")
+        .source_line("  batch_size: 100");
+    for line in runner {
+        rig = rig.export_line(line);
+    }
+    let rig = rig.duckdb_oracle();
+    let cfg = rig.config_path();
+
+    let failed = rig.run_args_env(&[], &[("RIVET_TEST_ERROR_AT", err_at)]);
+    assert!(!failed.status.success(), "the run must fail at {err_at}");
+    let on_disk = std::fs::read_dir(rig.out_dir())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "parquet")
+        })
+        .count() as i64;
+    let db = StateDb::next_to_config(&cfg);
+    let committed = db
+        .metrics_row(&db.latest_run_id(table.name()))
+        .files_committed
+        .unwrap_or(0);
+    assert!(
+        on_disk > 0,
+        "fixture inert: the failed run left no durable part"
+    );
+    assert_eq!(
+        committed, on_disk,
+        "files_committed must count every part the failed run left durable"
+    );
+
+    rig.run_ok();
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        pg_count(table.name()),
+        "the re-run after a failed chunk must deliver every row exactly once",
+    );
+    if runner.contains(&"chunk_checkpoint: true") {
+        assert_eq!(
+            undeclared_parts(&rig.out_dir()),
+            Vec::<String>::new(),
+            "the resume must move the failed attempt's debris out of the prefix, not strand it"
+        );
+    }
+}
+
+/// Parquet at the prefix root that no Success manifest copy declares.
+fn undeclared_parts(dir: &std::path::Path) -> Vec<String> {
+    let mut declared = std::collections::BTreeSet::new();
+    let mut parts = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".parquet") {
+            parts.push(name);
+        } else if name.starts_with("manifest-") && name.ends_with(".json") {
+            let m: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if m["status"].as_str() == Some("success") {
+                for p in m["parts"].as_array().into_iter().flatten() {
+                    declared.insert(p["path"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+    }
+    parts.retain(|p| !declared.contains(p));
+    parts.sort();
+    parts
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_failed_parallel_checkpoint_chunk_counts_its_durable_part() {
+    a_failed_chunks_durable_parts_are_counted(
+        &["chunk_checkpoint: true", "parallel: 4"],
+        "chunk_export:1",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_parallel_checkpoint() {
+    a_failed_chunks_durable_parts_are_counted(
+        &["chunk_checkpoint: true", "parallel: 4"],
+        "sink_part_write:1",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_sequential_checkpoint() {
+    a_failed_chunks_durable_parts_are_counted(&["chunk_checkpoint: true"], "sink_part_write:1");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_parallel() {
+    a_failed_chunks_durable_parts_are_counted(&["parallel: 4"], "sink_part_write:1");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_sequential() {
+    a_failed_chunks_durable_parts_are_counted(&[], "sink_part_write:1");
+}
+
+// ─── A failed run over a completed prefix retires its _SUCCESS ───────────────────
+
+/// Run once to success, then fail a second run into the SAME prefix; return the prefix's
+/// `_SUCCESS` presence and canonical `manifest.json` status after each run.
+fn success_marker_after_a_failed_rerun(s3: bool) -> [(bool, String); 2] {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(150);
+    let mut rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("parallel: 2");
+    let prefix = unique_name("stale_success");
+    let bucket = "rivet-qa-stale-success";
+    if s3 {
+        require_alive(LiveService::Minio);
+        ensure_minio_bucket(bucket);
+        rig = rig.dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    }
+    let env = [
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+    let observe = |rig: &Rig| {
+        let pulled = tempfile::tempdir().unwrap();
+        let dir = if s3 {
+            minio_pull_prefix(bucket, &prefix, pulled.path());
+            pulled.path().to_path_buf()
+        } else {
+            rig.out_dir()
+        };
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap();
+        (
+            dir.join("_SUCCESS").exists(),
+            m["status"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    let ok = rig.run_args_env(&[], &env);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let first = observe(&rig);
+    let mut failing = env.to_vec();
+    failing.push(("RIVET_TEST_ERROR_AT", "chunk_export:1"));
+    let failed = rig.run_args_env(&[], &failing);
+    assert!(!failed.status.success(), "the second run must fail");
+    [first, observe(&rig)]
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_failed_rerun_retires_the_prior_success_marker_local() {
+    assert_eq!(
+        success_marker_after_a_failed_rerun(false),
+        [(true, "success".into()), (false, "failed".into())],
+        "a _SUCCESS beside a failed canonical manifest reads as complete to a sensor"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + minio"]
+fn a_failed_rerun_retires_the_prior_success_marker_s3() {
+    assert_eq!(
+        success_marker_after_a_failed_rerun(true),
+        [(true, "success".into()), (false, "failed".into())],
+        "a _SUCCESS beside a failed canonical manifest reads as complete to a sensor"
     );
 }

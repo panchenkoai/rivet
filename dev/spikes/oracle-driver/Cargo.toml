@@ -1,0 +1,13 @@
+[package]
+name = "oracle-driver-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+oracledb = { version = "=26.0.0-beta.4", features = ["arrow"] }
+arrow = "59"
+parquet = { version = "59", features = ["arrow"] }
+anyhow = "1"

@@ -105,10 +105,19 @@ The trade-off is **at-least-once at the destination**: a crash between write and
 ## Resume semantics
 
 `rivet run --resume` consults the state DB to decide what work is outstanding. A
-**plain** `rivet run` (no `--resume`) never skips completed chunks — it does a
-fresh full pass (and errors if a prior chunk-checkpoint run is still in progress,
-pointing you at `--resume` or `state reset-chunks`). Resume is opt-in via the flag,
-not a default of `chunk_checkpoint: true`:
+**plain** `rivet run` (no `--resume`) never skips the chunks of a run that
+FINISHED — it does a fresh full pass. A checkpointed run holds its export's run
+lease (an `flock` beside a SQLite state DB, a session advisory lock on a Postgres
+one) for as long as the process lives, and the OS releases it when the process
+dies, `kill -9` included. So when a plain run finds a chunk-checkpoint run still
+in progress:
+
+- **its process is gone** (the lease is free): the run resumes it, exactly as
+  `--resume` would. A `chunk_dense` plan cannot be resumed, so it starts over.
+- **its process is alive** (the lease is held): the run is refused, and so is
+  `--resume` — wait for the live run to finish.
+
+What `--resume` does:
 
 - **Incremental exports** resume from `export_state.last_cursor_value`.
 - **Chunked exports** consult the `chunk_task` table: tasks in `completed` are skipped; tasks in `pending` or `running` (the latter reset to `pending` on resume) are re-issued; tasks in `failed` are retried while `attempts < max_chunk_attempts`.
@@ -190,7 +199,6 @@ Rivet does **not** currently guarantee:
 - **Exactly-once delivery to the destination.** Crashes between destination write and cursor advancement can produce duplicate files. Plan downstream dedup or idempotent ingestion — the manifest's per-part `content_fingerprint` is the supported dedup key: identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint. See [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md).
 - **Continuous / near-real-time replication.** Rivet *does* capture CDC to files (`mode: cdc` — inserts/updates/deletes via a Postgres logical replication slot / MySQL binlog / SQL Server CDC change tables / MongoDB change streams, into typed Parquet/CSV — or the JSON-blob document image for MongoDB — resuming from the last committed log position each run), but it is not a continuously-running stream — changes are captured per invocation, not delivered live. For always-on near-real-time replication use Debezium or Estuary.
 - **Completeness of incremental cursors that can tie.** Incremental resume uses a strict `WHERE cursor > last_value`. If two rows share the high-watermark value and the second becomes visible only *after* the run that advanced the watermark past it — e.g. a low-resolution `updated_at` (second granularity) or rows committed at the same timestamp after the read snapshot — the next run skips them and they are never exported. (Keyset pagination is unaffected: its key is planner-enforced unique + NOT NULL.) Use a **strictly per-row-distinct, monotonic** cursor (a sequence/identity id, or a timestamp with sub-value uniqueness); when the cursor can tie, re-snapshot the affected window with `full`/`chunked` mode.
-- **Dense-chunking stability on a tied, concurrently-written `chunk_column`.** `chunk_dense: true` pages by `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query per chunk. The ordinal partition itself never gaps or overlaps, but the ordinal→row mapping is only stable if the `ORDER BY` is deterministic. On a column with a large **tied** peer group straddling a chunk boundary *while the source is being written concurrently*, two chunk queries could order the tied band differently — duplicating or dropping a boundary row. Against a **static** table this does not occur on any tested engine (PG 16 / MySQL 8 / SQL Server 2022 — verified by `tests/live/live_chunked_dense.rs`). Prefer a `chunk_column` with no large tied groups, or **keyset** (`chunk_by_key`) on a unique key, when chunking a live-writing table.
 - **Automatic cleanup of an interrupted write's temp file.** A crash mid-write on the local destination may leave a dot-prefixed temp file in the target directory — never a partial *final* file (the commit is an atomic `rename`, so the final path is the complete file or absent). The stray temp file is harmless and can be removed manually.
 - **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live/live_schema_drift.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_schema_drift.rs)).
 - **Correctness of user-authored SQL.** Rivet executes `query:` verbatim. A query that omits a `WHERE` clause or selects from the wrong table will export the wrong data — there is no semantic validation.

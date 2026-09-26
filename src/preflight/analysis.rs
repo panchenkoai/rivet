@@ -482,9 +482,6 @@ pub(crate) fn check_sparse_range(
     if export.chunk_by_key.is_some() {
         return None;
     }
-    if export.chunk_dense {
-        return None;
-    }
     if export.chunk_by_days.is_some() {
         // Date chunks iterate by calendar interval; sparsity concept does not apply.
         return None;
@@ -518,8 +515,7 @@ pub(crate) fn check_sparse_range(
     Some(format!(
         "Sparse key range: ~{}% of chunk windows will be empty (range {}..{}, ~{} rows). \
          Switch to keyset pagination (`chunk_by_key: <unique key>`) — it pages by ROWS and is \
-         immune to a sparse/gappy key — or chunk on a dense surrogate (ROW_NUMBER), or use \
-         incremental mode.",
+         immune to a sparse/gappy key — or use `chunk_count: N`, or incremental mode.",
         empty_pct, min_val, max_val, rows
     ))
 }
@@ -534,7 +530,7 @@ const MAX_CHUNK_SCAN_BYTES: i64 = 256 * 1024 * 1024;
 /// B3b (dual of [`check_sparse_range`]): warn when `chunk_size` makes a single
 /// chunk query scan *too many* bytes — `rows_per_chunk × avg_row_bytes`.
 ///
-/// `rows_per_chunk` is `chunk_size` exactly for a dense (ROW_NUMBER) chunk, and
+/// `rows_per_chunk` is `chunk_size` exactly for a keyset page, and
 /// `density × chunk_size` for a range chunk (`density = rows / key-span`, via
 /// [`chunk_sparsity_from_counts`]). Date chunks (`chunk_by_days`) iterate by
 /// calendar interval, so rows-per-chunk is data-shaped and not derivable here —
@@ -556,10 +552,9 @@ pub(crate) fn check_oversized_chunk(
         return None;
     }
 
-    let rows_per_chunk: i64 = if export.chunk_dense || export.chunk_by_key.is_some() {
-        // Dense ordinal windows and keyset (seek) pages both hold exactly
-        // chunk_size rows (bar the last), independent of key density — no
-        // cursor_min/max span math applies.
+    let rows_per_chunk: i64 = if export.chunk_by_key.is_some() {
+        // Keyset (seek) pages hold exactly chunk_size rows (bar the last),
+        // independent of key density — no cursor_min/max span math applies.
         export.chunk_size as i64
     } else {
         let min_i: i64 = cursor_min?.parse().ok()?;
@@ -572,7 +567,7 @@ pub(crate) fn check_oversized_chunk(
     // range key (few distinct values, many rows each) makes `density × chunk_size`
     // extrapolate the density past the actual key span — e.g. 150K rows over 100
     // distinct values reports 151M rows/chunk, a 1000× phantom "heavy chunk"; and
-    // (2) a dense/keyset `chunk_size` larger than the whole table. When chunk_size
+    // (2) a keyset `chunk_size` larger than the whole table. When chunk_size
     // ≥ span, one chunk IS the table, so `min(…, rows)` is the exact row count.
     let rows_per_chunk = rows_per_chunk.clamp(1, rows);
 
@@ -581,7 +576,7 @@ pub(crate) fn check_oversized_chunk(
         return None;
     }
 
-    // Bytes scale linearly with chunk_size (dense: chunk_size×B; range:
+    // Bytes scale linearly with chunk_size (keyset: chunk_size×B; range:
     // density×chunk_size×B), so scaling chunk_size by budget/actual lands one
     // chunk under the budget regardless of mode.
     let suggested = (export.chunk_size as i64)
@@ -606,8 +601,7 @@ pub(crate) fn check_oversized_chunk(
 pub(crate) fn check_dense_surrogate_cost(export: &ExportConfig) -> Option<String> {
     let query = export.query.as_deref().unwrap_or("");
     let q_upper = query.to_uppercase();
-    if export.mode == ExportMode::Chunked && (q_upper.contains("ROW_NUMBER") || export.chunk_dense)
-    {
+    if export.mode == ExportMode::Chunked && q_upper.contains("ROW_NUMBER") {
         Some(
             "Dense surrogate (ROW_NUMBER) requires a global sort -- this adds CPU and I/O cost \
              proportional to the full result set. For very large or hot tables, consider \
@@ -1978,12 +1972,6 @@ mod tests {
     }
 
     #[test]
-    fn check_sparse_range_chunk_dense_returns_none() {
-        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\n");
-        assert!(check_sparse_range(&e, Some(100), Some("1"), Some("1000000")).is_none());
-    }
-
-    #[test]
     fn check_sparse_range_chunk_by_days_returns_none() {
         let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
         assert!(check_sparse_range(&e, Some(100), Some("1"), Some("1000000")).is_none());
@@ -2124,8 +2112,8 @@ mod tests {
     }
 
     #[test]
-    fn check_oversized_chunk_dense_chunk_larger_than_table_does_not_phantom_warn() {
-        // Dense/keyset branch, same class: chunk_size 100000 on a 50K-row table.
+    fn check_oversized_chunk_keyset_chunk_larger_than_table_does_not_phantom_warn() {
+        // Keyset branch, same class: chunk_size 100000 on a 50K-row table.
         // A chunk holds only 50K rows (the whole table), 50K × 500 B ≈ 24 MB <
         // budget. Unclamped `rows_per_chunk = chunk_size = 100000` → 48 MB, still
         // under here — so push chunk_size past the point the phantom crosses the
@@ -2134,7 +2122,7 @@ mod tests {
         // the true row count. Use a case where the phantom warns but the truth
         // does not: 50K rows × 500 B, chunk_size 700000 → phantom 700K×500=334 MB
         // warns; clamped 50K×500=24 MB does not.
-        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\nchunk_size: 700000\n");
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 700000\n");
         let w = check_oversized_chunk(&e, Some(50_000), Some(500), None, None);
         assert!(
             w.is_none(),
@@ -2143,12 +2131,12 @@ mod tests {
     }
 
     #[test]
-    fn check_oversized_chunk_dense_uses_chunk_size_directly() {
-        // Dense ordinal windows hold exactly chunk_size rows — no min/max needed.
+    fn check_oversized_chunk_keyset_uses_chunk_size_directly() {
+        // Keyset pages hold exactly chunk_size rows — no min/max needed.
         // 2M rows/chunk × 200 B = ~381 MB > 256 MB.
-        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\nchunk_size: 2000000\n");
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 2000000\n");
         let w = check_oversized_chunk(&e, Some(50_000_000), Some(200), None, None)
-            .expect("dense heavy chunk must warn even without a key range");
+            .expect("keyset heavy chunk must warn even without a key range");
         assert!(w.contains("Heavy chunk"), "got: {w}");
     }
 
@@ -2159,12 +2147,6 @@ mod tests {
         let e = cfg(
             "mode: chunked\nchunk_column: id\nquery: \"SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t\"\n",
         );
-        assert!(check_dense_surrogate_cost(&e).is_some());
-    }
-
-    #[test]
-    fn check_dense_surrogate_chunk_dense_flag_returns_warning() {
-        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\n");
         assert!(check_dense_surrogate_cost(&e).is_some());
     }
 

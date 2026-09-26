@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Breaking: `chunk_dense` is removed.** It paged by `ROW_NUMBER() OVER (ORDER BY
+  chunk_column)`, recomputed per chunk, so a concurrent insert or delete skipped or
+  duplicated rows even on a unique key. Nobody used it. A config that still sets
+  `chunk_dense: true` is refused at load with a pointer to `chunk_by_key` (keyset) or
+  `chunk_column` range chunking; `chunk_dense: false` is still accepted. A chunked
+  `plan.json` written by an older rivet fails `apply`'s integrity check; re-run
+  `rivet plan`.
 - **CDC keeps each change part inside a load job's partition budget.** Under the `log_view`
   layout the change log is partitioned, and BigQuery writes at most 4,000 partitions per load
   job. The CDC drain wrote each flush as one part with no partition count in its footer, so a

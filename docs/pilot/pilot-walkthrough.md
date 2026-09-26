@@ -259,7 +259,7 @@ rivet repair -c pilot.yaml -e orders --report reconcile.json --execute
 What `--execute` does:
 
 - Re-runs only the flagged chunk ranges via `run_chunked_sequential(ChunkSource::Precomputed)` — same SQL shape as extraction and reconcile (RR3).
-- Writes **new** output files alongside originals with `<export>_<ts>_chunk<idx>_<16-hex-nonce>.<ext>` naming (e.g. `orders_20260611_120000_chunk2_a1b2c3d4e5f6a7b8.parquet`; the random nonce is what guarantees a repair part can never overwrite the original) — Rivet does **not** delete or overwrite prior files (RR5). Downstream deduplication is the operator's responsibility (or put the output under a versioned prefix / partitioned path).
+- Writes **new** output files alongside originals with `<export>_<ts>_chunk<idx>_<16-hex-nonce>.<ext>` naming (e.g. `orders_20260611_120000_chunk2_a1b2c3d4e5f6a7b8.parquet`; the random nonce is what guarantees a repair part can never overwrite the original) — Rivet does **not** delete or overwrite prior files (RR5), but the manifest declares the replacement: the chunk's original part(s) are marked `superseded`, so `rivet load` and `rivet validate` see each row once. The superseded files stay on disk until `load.gc_orphans: true` collects them. A warehouse that already loaded the original part keeps those rows unless it dedups by primary key.
 - Leaves `last_committed_*` untouched (RR4) — the chunk index was already covered at the original run; repair is corrective, not commitment.
 
 ---
@@ -325,7 +325,7 @@ rivet apply plan.json
 | "Does `coalesce` mode leak a synthetic column to my files?" | CC5 | No, `_rivet_coalesced_cursor` is stripped before write. |
 | "Is a chunk whose file landed but whose manifest write failed lost?" | I7, PG2 | No — file is at the destination; only manifest is missing. `rivet reconcile` surfaces it as `unknown`. |
 | "Does reconcile write anything other than progression?" | RC5, PG5 | No — reports are ephemeral JSON; only `last_verified_*` is persisted when all partitions match. |
-| "Does `rivet repair --execute` delete old bad files?" | RR5 | No. New files sit alongside originals. Clean up downstream. |
+| "Does `rivet repair --execute` delete old bad files?" | RR5 | No. New files sit alongside originals; the manifest marks the originals `superseded` and `load.gc_orphans` collects them. |
 
 ---
 

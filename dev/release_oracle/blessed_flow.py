@@ -265,11 +265,14 @@ def _flags_for(cell_ix: int, pipeline: str, lifecycle: str, store: str) -> dict[
         # mutually exclusive in meaning (redo everything vs continue), so they
         # rotate rather than stack.
         # The reconcile leg is a second `rivet run` over a prefix that already
-        # has `_SUCCESS`, so `--force` is REQUIRED — rivet refuses otherwise,
-        # by design and with a clear message ("re-running would overwrite a
-        # verified dataset"). The first draft rotated `--resume` in here and
-        # the refusal is what taught it: `--resume` belongs to the lifecycle
-        # that actually crashed, not to a rotation over completed runs.
+        # has `_SUCCESS`. Without `--force` a FRESH run there only WARNS and
+        # appends a second part set beside the first (job.rs
+        # `rerun_warning_applies`); `--force` makes the overwrite explicit and
+        # silences that warning. What rivet REFUSES is `--resume` over
+        # `_SUCCESS` ("Re-running would overwrite a verified dataset") — the
+        # first draft rotated `--resume` in here and that refusal is what
+        # taught it: `--resume` belongs to the lifecycle that actually
+        # crashed, not to a rotation over completed runs.
         f["reconcile"] = ["--reconcile", "--force"]
         f["reconcile"] += [
             [],

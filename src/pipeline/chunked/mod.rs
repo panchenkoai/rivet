@@ -41,9 +41,7 @@ pub(crate) use detect::detect_and_generate_chunks;
 pub(crate) use exec::run_chunked_parallel;
 pub(crate) use exec::run_chunked_sequential;
 pub use math::generate_chunks;
-pub(crate) use math::{
-    RIVET_CHUNK_RN_COL, build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from,
-};
+pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from};
 pub(crate) use parallel_checkpoint::run_chunked_parallel_checkpoint;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
 pub(crate) use resume_m8::rehydrate_manifest_parts_probed;
@@ -187,7 +185,6 @@ pub(super) fn prepare_chunk_plan(
         cp.chunk_size,
         cp.chunk_count,
         &plan.export_name,
-        cp.dense,
         cp.by_days,
         plan.source.source_type,
     )?;
@@ -243,6 +240,29 @@ pub(super) fn check_drift_only_fresh(
     check_drift_only(&mut *src, plan, Some(state), summary)
 }
 
+/// Idle source connections shared by one parallel chunked run: a chunk reuses one instead of reconnecting per chunk.
+#[derive(Default)]
+pub(super) struct IdleSources(std::sync::Mutex<Vec<Box<dyn crate::source::Source>>>);
+
+impl IdleSources {
+    /// An idle connection, or a fresh one when none is idle.
+    pub(super) fn take(
+        &self,
+        cfg: &crate::config::SourceConfig,
+    ) -> Result<Box<dyn crate::source::Source>> {
+        let idle = self.0.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        match idle {
+            Some(src) => Ok(src),
+            None => crate::source::create_source(cfg),
+        }
+    }
+
+    /// Return a connection after a chunk that SUCCEEDED; a failed chunk's connection is dropped instead.
+    pub(super) fn give(&self, src: Box<dyn crate::source::Source>) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(src);
+    }
+}
+
 /// Like [`prepare_chunk_plan`], but for the parallel runners that don't already
 /// hold a `Source`: open a short-lived connection, compute the plan, and drop
 /// the connection here — **before** the workers open theirs. The detect
@@ -272,6 +292,75 @@ pub(super) fn chunked_plan(plan: &ResolvedRunPlan) -> &ChunkedPlan {
     }
 }
 
+/// What a checkpointed run does about a chunk run a DEAD process left in progress.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CrashedChunkRun {
+    /// Nothing to recover (or `--resume` already asked for it).
+    Nothing,
+    /// Resume the crashed plan, as `--resume` would.
+    Resume,
+}
+
+/// Decide the recovery for a crashed chunk run once this process holds the export's run lease.
+pub(crate) fn crashed_chunk_run_action(
+    explicit_resume: bool,
+    crashed_run: bool,
+) -> CrashedChunkRun {
+    if explicit_resume || !crashed_run {
+        CrashedChunkRun::Nothing
+    } else {
+        CrashedChunkRun::Resume
+    }
+}
+
+/// The refusal a checkpointed run gives when a LIVE process holds the export's run lease.
+pub(crate) fn live_chunk_run_refusal(export: &str, run_id: Option<&str>) -> String {
+    let run = run_id.map(|r| format!(" '{r}'")).unwrap_or_default();
+    format!(
+        "export '{export}': chunk checkpoint run{run} still in progress in another live rivet \
+         process (it holds the export's run lease); wait for it to finish — if it is stopped \
+         instead, the next run resumes it"
+    )
+}
+
+/// Hold the export's run lease for the whole checkpointed run, refuse while a live process
+/// holds it, and recover a chunk run whose process died (OS-released lease, no clock).
+pub(crate) fn claim_checkpoint_run<'s>(
+    state: &'s StateStore,
+    plan: &ResolvedRunPlan,
+) -> Result<(Option<crate::state::LoadLease<'s>>, Option<ResolvedRunPlan>)> {
+    if !plan.strategy.is_resumable() {
+        return Ok((None, None));
+    }
+    let export = &plan.export_name;
+    let Some(lease) = state.try_load_lease(&format!("chunk-run:{export}"))? else {
+        let rid = match state.find_in_progress_chunk_run(export)? {
+            Some((rid, _)) => Some(rid),
+            None => state.get_resume_run_id(export)?,
+        };
+        anyhow::bail!(live_chunk_run_refusal(export, rid.as_deref()));
+    };
+    let crashed = match &plan.strategy {
+        ExtractionStrategy::Chunked(_) => state.find_in_progress_chunk_run(export)?,
+        _ => None,
+    };
+    match (
+        crashed_chunk_run_action(plan.resume, crashed.is_some()),
+        crashed,
+    ) {
+        (CrashedChunkRun::Resume, Some((rid, _))) => {
+            log::warn!(
+                "export '{export}': chunk checkpoint run '{rid}' was left in progress by a \
+                 process that is no longer running — resuming it"
+            );
+            let mut resumed = plan.clone();
+            resumed.resume = true;
+            Ok((Some(lease), Some(resumed)))
+        }
+        _ => Ok((Some(lease), None)),
+    }
+}
+
 /// Render the `--config <path>` argument used in user-facing recovery hints,
 /// or a `<CONFIG>` placeholder when the config path is not available (e.g.
 /// the `rivet apply` path which only knows the plan file).
@@ -296,7 +385,6 @@ pub(super) fn ensure_chunk_checkpoint_plan(
         &cp.column,
         cp.chunk_size,
         cp.chunk_count,
-        cp.dense,
         cp.by_days,
     );
     let max_att = cp.max_attempts;
@@ -319,7 +407,7 @@ pub(super) fn ensure_chunk_checkpoint_plan(
             Some((rid, stored_hash)) => {
                 if stored_hash != plan_hash {
                     anyhow::bail!(
-                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, or chunk_dense changed); cannot resume — \
+                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume — \
                          to abandon the interrupted run and start over: `rivet state reset-chunks -c {config_path} -e {}`",
                         plan.export_name,
                         plan.export_name
@@ -449,6 +537,28 @@ mod tests {
     //! no mocks, no docker. They are *intentionally* the only unit cover
     //! for this file's recovery logic; everything that touches a live
     //! `Source` is exercised by `tests/live_*.rs` instead.
+
+    #[test]
+    fn a_dead_owners_plan_resumes_unless_resume_was_asked_or_nothing_crashed() {
+        use super::{CrashedChunkRun::*, crashed_chunk_run_action};
+        assert_eq!(crashed_chunk_run_action(false, true), Resume);
+        assert_eq!(crashed_chunk_run_action(true, true), Nothing);
+        assert_eq!(crashed_chunk_run_action(false, false), Nothing);
+    }
+
+    #[test]
+    fn a_live_owner_is_refused_without_a_remedy_that_touches_it() {
+        assert_eq!(
+            super::live_chunk_run_refusal("t", Some("r1")),
+            "export 't': chunk checkpoint run 'r1' still in progress in another live rivet \
+             process (it holds the export's run lease); wait for it to finish — if it is \
+             stopped instead, the next run resumes it"
+        );
+        assert!(super::live_chunk_run_refusal("t", None).starts_with(
+            "export 't': chunk checkpoint run still in progress in another live rivet process"
+        ));
+    }
+
     /// An export whose NAME contains `_chunk<digits>_` must not fool the index
     /// parser — and the fixture must cross that threshold, or the two ends of the
     /// name are indistinguishable.
@@ -541,7 +651,6 @@ mod tests {
                 chunk_size: 100,
                 chunk_count: None,
                 parallel: 1,
-                dense: false,
                 by_days: None,
                 checkpoint: true,
                 max_attempts: 3,
@@ -703,7 +812,6 @@ mod tests {
             &cp.column,
             cp.chunk_size,
             cp.chunk_count,
-            cp.dense,
             cp.by_days,
         );
         state
