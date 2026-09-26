@@ -121,11 +121,14 @@ fn mysql_cdc_a_dropped_captured_table_is_refused_like_a_truncate() {
 
     c.query_drop(format!("DROP TABLE {tbl}")).unwrap();
     let out = rig.run();
+    // The schema probe meets the missing table before the stream reaches the DROP.
+    let text = said(&out);
     assert!(
-        !out.status.success(),
-        "the source table is gone while the destination still holds row 1 — a green \
-         run here is the divergence a TRUNCATE is refused for:\n{}",
-        said(&out)
+        !out.status.success()
+            && (text.contains(&format!("captured table `rivet.{tbl}` was DROPped"))
+                || text.contains(&format!("Table 'rivet.{tbl}' doesn't exist"))),
+        "the source table is gone while the destination still holds row 1 — the run must \
+         refuse it by name, as it refuses a TRUNCATE:\n{text}"
     );
 }
 
@@ -152,9 +155,12 @@ fn mongo_cdc_a_dropped_captured_collection_is_refused_not_skipped() {
     m.drop_collection("t");
     let out = rig.run();
     assert!(
-        !out.status.success(),
-        "the collection is gone while the destination still holds document 1 — a green \
-         run here silently diverges:\n{}",
+        !out.status.success()
+            && said(&out).contains(&format!(
+                "captured collection `{db}.t` was removed by `Drop`"
+            )),
+        "the collection is gone while the destination still holds document 1 — the run must \
+         refuse it by name:\n{}",
         said(&out)
     );
 }
@@ -270,9 +276,10 @@ fn mysql_cdc_a_dropped_and_recreated_captured_table_is_refused_not_merged() {
         .unwrap();
     let out = rig.run();
     assert!(
-        !out.status.success(),
-        "the source now holds only row 2 while the destination keeps row 1 as live — a \
-         green run merges two tables' histories:\n{}",
+        !out.status.success()
+            && said(&out).contains(&format!("captured table `rivet.{tbl}` was DROPped")),
+        "the source now holds only row 2 while the destination keeps row 1 as live — the \
+         run must refuse at the DROP rather than merge two tables' histories:\n{}",
         said(&out)
     );
 }
@@ -542,5 +549,54 @@ fn mysql_cdc_a_statement_logged_insert_into_another_table_does_not_stop_capture(
         duckdb_declared_dir_id_set(&rig.out_dir()),
         [1].into_iter().collect(),
         "a statement on a table nobody captures must not stop this export's capture"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW)"]
+fn mysql_cdc_dropping_another_table_does_not_stop_capture() {
+    let tbl = unique_name("aud_drop_ours");
+    let other = unique_name("aud_drop_other");
+    let mut c = mysql_cdc_conn(MYSQL_CDC_URL);
+    for t in [&tbl, &other] {
+        c.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        c.query_drop(format!("CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+    }
+    let _guard = MysqlCdcTable(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl);
+    rig.run_ok(); // anchor
+    c.query_drop(format!("DROP TABLE {other}")).unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    rig.run_ok();
+    assert_eq!(
+        duckdb_declared_dir_id_set(&rig.out_dir()),
+        [1].into_iter().collect(),
+        "a drop of a table nobody captures must not stop this export's capture"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_dropping_another_collection_does_not_stop_capture() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    let db = unique_name("aud_mother");
+    let m = MongoTest::connect(MONGO_RS_PORT, &db);
+    m.drop_collection("t");
+    m.upsert_set("other", 9, "v", "z");
+
+    let rig = Rig::mongo_cdc("t")
+        .source_url(&MongoTest::url(MONGO_RS_PORT, &db))
+        .duckdb_oracle();
+    rig.run_ok(); // anchor
+    m.drop_collection("other");
+    m.upsert_set("t", 1, "v", "a");
+    rig.run_ok();
+    assert!(
+        duckdb_declared_distinct_set(rig.oracle_dir(), "_id").contains("1"),
+        "a drop of a collection nobody captures must not stop this export's capture"
     );
 }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **CDC refuses a captured table or collection that was dropped.** MySQL skipped `DROP TABLE`
+  and MongoDB skipped `drop`/`rename`/`dropDatabase`, so the destination kept the removed rows
+  live and a table re-created under the same name continued the old history as one table. Both
+  now fail naming the object and the recovery order; the same DDL on something nobody captures
+  is still skipped.
 - **MySQL CDC refuses a change to a captured table that was logged as a SQL statement.** A
   writer session on `binlog_format=STATEMENT` (or MIXED) put its DML in the binlog as text,
   which the row reader skipped: the run exited 0 with the change missing. It now fails naming
