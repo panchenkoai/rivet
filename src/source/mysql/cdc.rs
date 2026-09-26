@@ -1248,6 +1248,17 @@ impl MysqlChangeStream {
                 self.tx_bytes = 0;
                 self.spill = None;
             }
+            Some(EventData::QueryEvent(qe))
+                if statement_dml_target(&qe.query(), &qe.schema()).is_some_and(|t| {
+                    undecodable_event_is_ours(
+                        t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
+                        &self.configured_tables,
+                    )
+                }) =>
+            {
+                let target = statement_dml_target(&qe.query(), &qe.schema()).flatten();
+                anyhow::bail!(statement_dml_refusal_message(target.as_ref()));
+            }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
                     return Ok(false);
@@ -1648,6 +1659,54 @@ pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, Stri
         Some(at) => Some((unq(&rest[..at]), unq(&rest[at + 1..]))),
         None => Some((event_db.to_string(), unq(rest))),
     }
+}
+
+/// The table a statement-logged DML event writes: `None` when the event is not DML, `Some(None)` when it is but its target cannot be read.
+pub(crate) fn statement_dml_target(sql: &str, event_db: &str) -> Option<Option<(String, String)>> {
+    let stripped = strip_sql_comments(sql);
+    let mut words = stripped.split_whitespace();
+    let verb = words.next()?.to_ascii_lowercase();
+    let skip: &[&str] = match verb.as_str() {
+        "insert" | "replace" => &["low_priority", "delayed", "high_priority", "ignore", "into"],
+        "update" => &["low_priority", "ignore"],
+        "delete" => &["low_priority", "quick", "ignore", "from"],
+        "load" => return Some(None),
+        _ => return None,
+    };
+    let mut token = words.find(|w| !skip.contains(&w.to_ascii_lowercase().as_str()))?;
+    token = token.split('(').next().unwrap_or(token);
+    let multi = token.ends_with(',') || words.next().is_some_and(|w| w.starts_with(','));
+    let unbalanced = token.matches('`').count() % 2 == 1;
+    if token.is_empty() || multi || unbalanced {
+        return Some(None);
+    }
+    let unq = |s: &str| s.trim_matches('`').replace("``", "`");
+    let (db, table) = match token.split_once("`.`").or_else(|| {
+        (!token.starts_with('`'))
+            .then(|| token.split_once('.'))
+            .flatten()
+    }) {
+        Some((d, t)) => (unq(d), unq(t)),
+        None => (event_db.to_string(), unq(token)),
+    };
+    Some(Some((db, table)))
+}
+
+/// Refuse a change a writer logged as a SQL statement: this reader decodes only row events.
+pub(crate) fn statement_dml_refusal_message(target: Option<&(String, String)>) -> String {
+    let what = match target {
+        Some((schema, table)) if !schema.is_empty() => format!("`{schema}.{table}`"),
+        Some((_, table)) => format!("`{table}`"),
+        None => "a table this reader could not identify".to_string(),
+    };
+    format!(
+        "mysql cdc: a change to {what} was written to the binlog as a SQL STATEMENT (the writing \
+         session ran with binlog_format=STATEMENT or MIXED), and this reader decodes only row \
+         events. Skipping it would drop the change while the checkpoint moves past it. Set \
+         binlog_format=ROW for every writer — the global setting does not bind a session that \
+         changes its own — then recover in rivet's OWN order: re-anchor FIRST (delete the \
+         checkpoint so the next run pins a fresh one), THEN re-snapshot the table (`mode: full`)."
+    )
 }
 
 /// Refuse a TRUNCATE on a captured table. Same contract as the PostgreSQL arm —
@@ -2122,6 +2181,38 @@ mod tests {
             "say WHY no catalog check warned them, or the next reader adds one and it \
              does not fire either: {why}"
         );
+    }
+
+    #[test]
+    fn a_statement_logged_dml_names_the_table_it_writes() {
+        let t = |sql: &str| statement_dml_target(sql, "shop");
+        let at = |d: &str, n: &str| Some(Some((d.to_string(), n.to_string())));
+        assert_eq!(t("INSERT INTO orders VALUES (1)"), at("shop", "orders"));
+        assert_eq!(
+            t("insert ignore into rivet.orders(id) values (1)"),
+            at("rivet", "orders")
+        );
+        assert_eq!(
+            t("/* app */ REPLACE INTO `odd name` VALUES (1)"),
+            Some(None),
+            "a spaced name is not read by guess"
+        );
+        assert_eq!(t("UPDATE `a`.`b` SET v = 1"), at("a", "b"));
+        assert_eq!(t("DELETE FROM orders WHERE id = 1"), at("shop", "orders"));
+        assert_eq!(
+            t("UPDATE orders, items SET v = 1"),
+            Some(None),
+            "multi-table is unknown"
+        );
+        assert_eq!(t("LOAD DATA INFILE 'x' INTO TABLE orders"), Some(None));
+        assert_eq!(t("BEGIN"), None);
+        assert_eq!(t("COMMIT"), None);
+        assert_eq!(
+            t("CREATE TABLE orders (id INT)"),
+            None,
+            "DDL is not row data"
+        );
+        assert_eq!(t("TRUNCATE orders"), None, "TRUNCATE has its own refusal");
     }
 
     /// MySQL's TRUNCATE parser had ZERO offline coverage while the evidence matrix
