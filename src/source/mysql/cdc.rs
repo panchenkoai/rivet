@@ -1249,6 +1249,25 @@ impl MysqlChangeStream {
                 self.spill = None;
             }
             Some(EventData::QueryEvent(qe))
+                if drop_table_targets(&qe.query(), &qe.schema()).is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        undecodable_event_is_ours(
+                            t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
+                            &self.configured_tables,
+                        )
+                    })
+                }) =>
+            {
+                let targets = drop_table_targets(&qe.query(), &qe.schema()).unwrap_or_default();
+                let ours = targets.iter().find(|t| {
+                    undecodable_event_is_ours(
+                        t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
+                        &self.configured_tables,
+                    )
+                });
+                anyhow::bail!(drop_refusal_message(ours.and_then(|t| t.as_ref())));
+            }
+            Some(EventData::QueryEvent(qe))
                 if statement_dml_target(&qe.query(), &qe.schema()).is_some_and(|t| {
                     undecodable_event_is_ours(
                         t.as_ref().map(|(sc, tb)| (sc.as_str(), tb.as_str())),
@@ -1659,6 +1678,78 @@ pub(crate) fn truncate_target(sql: &str, event_db: &str) -> Option<(String, Stri
         Some(at) => Some((unq(&rest[..at]), unq(&rest[at + 1..]))),
         None => Some((event_db.to_string(), unq(rest))),
     }
+}
+
+/// The tables a `DROP TABLE` QUERY event removes (`None` for an unreadable name); `None` when the event is not one.
+pub(crate) fn drop_table_targets(
+    sql: &str,
+    event_db: &str,
+) -> Option<Vec<Option<(String, String)>>> {
+    let stripped = strip_sql_comments(sql);
+    let mut rest = stripped.trim().trim_end_matches(';').trim();
+    for w in ["drop", "table"] {
+        let head = rest.get(..w.len())?;
+        let after = &rest[w.len()..];
+        if !head.eq_ignore_ascii_case(w)
+            || !(after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            return None;
+        }
+        rest = after.trim_start();
+    }
+    if rest
+        .get(..9)
+        .is_some_and(|h| h.eq_ignore_ascii_case("if exists"))
+    {
+        rest = rest[9..].trim_start();
+    }
+    let (mut names, mut start, mut in_tick) = (Vec::new(), 0usize, false);
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '`' => in_tick = !in_tick,
+            ',' if !in_tick => {
+                names.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    names.push(&rest[start..]);
+    Some(
+        names
+            .into_iter()
+            .map(|n| {
+                let n = n.trim();
+                let n = ["restrict", "cascade"]
+                    .iter()
+                    .find_map(|k| {
+                        n.len()
+                            .checked_sub(k.len() + 1)
+                            .and_then(|at| n.get(at..))
+                            .filter(|tail| tail.trim_start().eq_ignore_ascii_case(k))
+                            .map(|tail| n[..n.len() - tail.len()].trim())
+                    })
+                    .unwrap_or(n);
+                truncate_target(&format!("TRUNCATE {n}"), event_db)
+            })
+            .collect(),
+    )
+}
+
+/// Refuse a DROP of a captured table: its rows leave the source without events, and a table re-created under the name is another table's history.
+pub(crate) fn drop_refusal_message(target: Option<&(String, String)>) -> String {
+    let what = match target {
+        Some((schema, table)) if !schema.is_empty() => format!("`{schema}.{table}`"),
+        Some((_, table)) => format!("`{table}`"),
+        None => "a table this reader could not identify".to_string(),
+    };
+    format!(
+        "mysql cdc: captured table {what} was DROPped, and this reader cannot represent that as a \
+         change. Skipping it would leave every row it held live in the destination, and a table \
+         re-created under the same name would continue that history as if it were one table. \
+         Recover in rivet's OWN order: re-anchor FIRST (delete the checkpoint so the next run pins \
+         a fresh one), THEN re-snapshot the table (`mode: full`)."
+    )
 }
 
 /// The table a statement-logged DML event writes: `None` when the event is not DML, `Some(None)` when it is but its target cannot be read.
@@ -2181,6 +2272,27 @@ mod tests {
             "say WHY no catalog check warned them, or the next reader adds one and it \
              does not fire either: {why}"
         );
+    }
+
+    #[test]
+    fn a_drop_table_names_every_table_it_removes() {
+        let t = |sql: &str| drop_table_targets(sql, "shop");
+        let at = |d: &str, n: &str| Some((d.to_string(), n.to_string()));
+        assert_eq!(
+            t("DROP TABLE `orders` /* generated by server */"),
+            Some(vec![at("shop", "orders")])
+        );
+        assert_eq!(
+            t("drop table if exists a, `b`.`c`, `odd, name`"),
+            Some(vec![at("shop", "a"), at("b", "c"), at("shop", "odd, name")])
+        );
+        assert_eq!(
+            t("DROP TABLE orders CASCADE"),
+            Some(vec![at("shop", "orders")])
+        );
+        assert_eq!(t("DROP DATABASE shop"), None);
+        assert_eq!(t("DROP TABLESPACE ts"), None);
+        assert_eq!(t("TRUNCATE orders"), None);
     }
 
     #[test]
