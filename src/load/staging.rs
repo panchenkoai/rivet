@@ -309,7 +309,7 @@ pub(super) fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
 /// the store as an argument (rather than each adapter building one from a
 /// config) is what lets an fs-backed store exercise this delete offline.
 pub(crate) fn delete_under(store: &GcsStore, gs_prefix: &str) -> Result<()> {
-    let (_, rel) = load::split_gs_uri(gs_prefix)?;
+    let (_, rel) = load::split_object_uri(gs_prefix)?;
     store
         .remove_all(rel)
         .with_context(|| format!("source cleanup (recursive delete of {gs_prefix}) failed"))

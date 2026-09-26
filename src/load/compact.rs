@@ -96,11 +96,16 @@ pub(crate) fn compact_gate(
 fn compact_skip_reason(
     mode: &load::plan::LoadMode,
     layout: &load::plan::CdcLayout,
+    warehouse_compacts: bool,
 ) -> Option<&'static str> {
     match mode {
         // A full load OVERWRITES the whole table on every pass, so there is never
         // an accumulated buffer to merge — whatever a layout says.
         load::plan::LoadMode::Full => Some("a full load overwrites its table; nothing to merge"),
+        // No layout makes a base here, so the layout hints below would be refused.
+        _ if !warehouse_compacts => Some(
+            "this warehouse keeps a change log behind a view and never compacts; nothing to merge",
+        ),
         // Otherwise compaction belongs to the LAYOUT, not the mode: any table kept
         // as a physical base with a disposable buffer has something to merge. An
         // incremental export asks for that with `load.layout: base_buffer`.
@@ -227,7 +232,11 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         load::pool::effective_pool(args.pool, plans.len()),
         || reconnect(state_ref.as_ref(), "compact"),
         |state, _idx, plan| {
-            if let Some(why) = compact_skip_reason(&plan.mode, &plan.layout) {
+            if let Some(why) = compact_skip_reason(
+                &plan.mode,
+                &plan.layout,
+                load::plan::warehouse_compacts(&plan.load),
+            ) {
                 eprintln!("  compact [{}]: skipped — {why}", plan.table);
                 return Ok(());
             }
@@ -455,32 +464,42 @@ mod tests {
     fn compact_passes_by_everything_but_a_base_and_buffer_cdc_table() {
         use crate::load::plan::{CdcLayout, LoadMode};
         assert_eq!(
-            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::BaseAndBuffer),
+            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::BaseAndBuffer, true),
             None
         );
         // The layout is decided by `cdc.backfill:` / `load.layout:`, never by `initial:`
         // — the reason must name the levers that exist, not one that changes nothing.
         assert!(
-            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::LogAndView)
-                .is_some_and(|w| w.contains("cdc.backfill:")
+            super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::LogAndView, true).is_some_and(
+                |w| w.contains("cdc.backfill:")
                     && w.contains("load.layout: base_buffer")
-                    && !w.contains("initial:"))
+                    && !w.contains("initial:")
+            )
         );
         assert!(
-            super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView)
+            super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView, true)
                 .is_some_and(|w| w.contains("overwrites its table"))
         );
         // The LAYOUT decides, not the mode: an ordinary incremental export that
         // asked for `load.layout: base_buffer` has a buffer to merge, and one that
         // did not is skipped with the key that would give it one.
         assert_eq!(
-            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::BaseAndBuffer),
+            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::BaseAndBuffer, true),
             None
         );
         assert!(
-            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::LogAndView)
+            super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::LogAndView, true)
                 .is_some_and(|w| w.contains("base_buffer"))
         );
+        // A warehouse that never compacts must not suggest a layout it refuses.
+        for mode in [LoadMode::Cdc, LoadMode::Incremental] {
+            let why =
+                super::compact_skip_reason(&mode, &CdcLayout::LogAndView, false).expect("skipped");
+            assert!(
+                why.contains("never compacts") && !why.contains("base_buffer"),
+                "{why}"
+            );
+        }
     }
 }
 

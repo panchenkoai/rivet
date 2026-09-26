@@ -17,6 +17,7 @@ use staging::maybe_cleanup;
 mod bigquery;
 mod bq_rest;
 pub mod cdc;
+mod clickhouse;
 pub mod compact;
 pub mod orchestrate;
 pub(crate) mod partition_budget;
@@ -147,11 +148,29 @@ pub trait TargetLoader {
     /// per mode instead of once per adapter.
     fn warehouse(&self) -> cdc::Warehouse;
 
-    /// `CREATE OR REPLACE` the current-state view `<table>` from pre-built
-    /// `view_sql` (the driver builds it via [`cdc::dedup_view_sql`] for CDC or
-    /// [`cdc::inc_dedup_view_sql`] for incremental). The adapter only executes it
-    /// its way (e.g. Snowflake prefixes a `QUERY_TAG`).
+    /// Run a `CREATE OR REPLACE VIEW` statement its way (e.g. Snowflake prefixes a `QUERY_TAG`).
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()>;
+
+    /// Build the current-state view `<table>` over `<table>__changes`: the latest row per
+    /// `pk` by `order`; the default is the shared `ROW_NUMBER` view in this warehouse's dialect.
+    fn create_current_view(
+        &self,
+        table: &str,
+        pk: &[&str],
+        order: &cdc::CompactOrder,
+    ) -> Result<()> {
+        let view = self.fqtn(table);
+        let changes = self.fqtn(&format!("{table}__changes"));
+        let sql = match order {
+            cdc::CompactOrder::Cdc(engine) => {
+                cdc::dedup_view_sql(self.warehouse(), &view, &changes, pk, *engine)
+            }
+            cdc::CompactOrder::Cursor(column) => {
+                cdc::inc_dedup_view_sql(self.warehouse(), &view, &changes, pk, column)
+            }
+        };
+        self.create_view(table, &sql)
+    }
 
     /// Does `<table>__changes` already hold REAL change rows (`__pos IS NOT
     /// NULL`)? The RE-baseline refusal's condition (round-7): the truth about
@@ -739,6 +758,7 @@ fn append_and_view(
     before_write(append_preflight(loader, table, specs, uris, pk, label))?;
 
     if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership, rebuild_changelog)? {
+        crate::test_hook::maybe_panic_at("load_after_adopt");
         eprintln!(
             "  note: `{}` held {rows} rows from an earlier full load — it is now `{}`, the change \
              log this load appends to, and the name becomes the current-state view",
@@ -761,6 +781,7 @@ fn append_and_view(
     }
 
     build_view(loader)?;
+    crate::test_hook::maybe_panic_at("load_after_append");
     // Cleanup runs here (inside the driver, after the gate), BEFORE the caller
     // records the ledger in `execute_load`. A crash between the two re-appends
     // this run next load — an at-least-once double-append the dedup view absorbs
@@ -945,14 +966,7 @@ pub fn run_load_cdc(
         "CDC",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-            let sql = cdc::dedup_view_sql(
-                l.warehouse(),
-                &l.fqtn(table),
-                &l.fqtn(&format!("{table}__changes")),
-                &pk_refs,
-                engine,
-            );
-            l.create_view(table, &sql)
+            l.create_current_view(table, &pk_refs, &cdc::CompactOrder::Cdc(engine))
         },
     )
 }
@@ -1028,14 +1042,11 @@ pub fn run_load_incremental(
         "incremental",
         |l| {
             let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-            let sql = cdc::inc_dedup_view_sql(
-                l.warehouse(),
-                &l.fqtn(table),
-                &l.fqtn(&format!("{table}__changes")),
+            l.create_current_view(
+                table,
                 &pk_refs,
-                cursor_column,
-            );
-            l.create_view(table, &sql)
+                &cdc::CompactOrder::Cursor(cursor_column.to_string()),
+            )
         },
     )
 }
@@ -1064,11 +1075,12 @@ fn cursor_preflight(table: &str, specs: &[TargetColumnSpec], cursor_column: &str
 
 /// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
 /// shape opendal's bucket-scoped operator wants.
-pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
-    let (bucket, key) = uri
-        .strip_prefix("gs://")
+pub(crate) fn split_object_uri(uri: &str) -> Result<(&str, &str)> {
+    let (bucket, key) = ["gs://", "s3://", "az://"]
+        .iter()
+        .find_map(|s| uri.strip_prefix(s))
         .and_then(|rest| rest.split_once('/'))
-        .with_context(|| format!("not a `gs://bucket/path` URI: {uri}"))?;
+        .with_context(|| format!("not a `gs://`, `s3://` or `az://` bucket/path URI: {uri}"))?;
     // Refuse an EMPTY bucket-relative key. It addresses the bucket ROOT, and the
     // load's recursive cleanup (delete_under → remove_all) and gc_orphans (list +
     // remove) would then wipe the ENTIRE bucket — including unrelated exports and
@@ -1079,13 +1091,27 @@ pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
     // everything. (Trailing/only slashes collapse to empty too.)
     if key.trim_matches('/').is_empty() {
         anyhow::bail!(
-            "refusing a bucket-root staging prefix `{uri}`: a GCS load stages into and cleans up a \
+            "refusing a bucket-root staging prefix `{uri}`: a load stages into and cleans up a \
              DEDICATED prefix, so an empty prefix would list/delete the whole bucket. Set a \
              non-empty `destination.prefix`, and put any `{{partition}}` token AFTER a literal \
              segment (e.g. `exports/{{partition}}/`, not `{{partition}}/`)."
         );
     }
     Ok((bucket, key))
+}
+
+/// The URI scheme the load layer writes for a destination's parts: `gs`, `s3` or `az`.
+pub(crate) fn uri_scheme(t: crate::config::DestinationType) -> &'static str {
+    match t {
+        crate::config::DestinationType::S3 => "s3",
+        crate::config::DestinationType::Azure => "az",
+        _ => "gs",
+    }
+}
+
+/// The scheme of a load URI (`gs` for `gs://b/k`).
+pub(crate) fn scheme_of(uri: &str) -> &str {
+    uri.split("://").next().unwrap_or("gs")
 }
 
 /// Open the one [`GcsStore`] a load reuses for reconcile, URI listing, and
@@ -1142,6 +1168,24 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.private_key_path = std::env::var("RIVET_SNOWFLAKE_KEY").ok();
             Box::new(l)
         }
+        LoadTarget::Clickhouse {
+            url,
+            database,
+            user,
+            password_env,
+            named_collection,
+        } => Box::new(
+            clickhouse::ClickhouseLoader::new(
+                url,
+                database,
+                user,
+                password_env,
+                plan.destination.clone(),
+            )
+            .named_collection(named_collection.clone())
+            .cluster_by(plan.clustering.columns().to_vec())
+            .cdc(plan.mode == plan::LoadMode::Cdc),
+        ),
     }
 }
 
@@ -2287,24 +2331,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn split_gs_uri_parses_bucket_and_bucket_relative_key() {
+    fn split_object_uri_parses_bucket_and_bucket_relative_key() {
         // The parse every load op addresses through: (bucket, bucket-relative
         // key). The `delete_under` test above can't pin this — it drains by REL
         // regardless of what split returns — so a mangled split (wrong bucket, or
         // an empty key that lists/deletes the whole bucket root) is invisible
         // there. Pin it directly.
-        assert_eq!(split_gs_uri("gs://b/p").unwrap(), ("b", "p"));
+        assert_eq!(split_object_uri("gs://b/p").unwrap(), ("b", "p"));
         assert_eq!(
-            split_gs_uri("gs://bucket/a/b/c.parquet").unwrap(),
+            split_object_uri("gs://bucket/a/b/c.parquet").unwrap(),
             ("bucket", "a/b/c.parquet"),
             "only the FIRST '/' splits bucket from key; the rest is the key"
         );
-        assert!(
-            split_gs_uri("s3://b/p").is_err(),
-            "a non-gs scheme is rejected"
+        assert_eq!(
+            split_object_uri("s3://b/p").unwrap(),
+            ("b", "p"),
+            "an S3 part"
+        );
+        assert_eq!(
+            split_object_uri("az://c/p").unwrap(),
+            ("c", "p"),
+            "an Azure part"
         );
         assert!(
-            split_gs_uri("gs://bucket-only").is_err(),
+            split_object_uri("http://b/p").is_err(),
+            "a scheme no store writes is rejected"
+        );
+        assert!(
+            split_object_uri("gs://bucket-only").is_err(),
             "a bucket with no '/' has no (bucket, key) split"
         );
         // The bucket-ROOT prefix must be REFUSED, never returned as an empty key:
@@ -2314,12 +2368,15 @@ pub(crate) mod tests {
         // that would otherwise wipe unrelated data. (RED before the empty-key guard.)
         for root in ["gs://bucket/", "gs://bucket//", "gs://bucket///"] {
             assert!(
-                split_gs_uri(root).is_err(),
+                split_object_uri(root).is_err(),
                 "bucket-root prefix {root:?} must be refused, not parsed to an empty (root) key"
             );
         }
         // A non-empty key with a trailing slash is still a real prefix.
-        assert_eq!(split_gs_uri("gs://b/exports/").unwrap(), ("b", "exports/"));
+        assert_eq!(
+            split_object_uri("gs://b/exports/").unwrap(),
+            ("b", "exports/")
+        );
     }
 
     #[test]

@@ -1484,6 +1484,13 @@ FLAG_EXCUSED = {
                           "run → load → compact on the generated file (three engines, "
                           "incremental and CDC) — run 1 everything, run 2 the delta.",
     "--bigquery-dataset": "the other half of the `load:` scaffold — see --bigquery-project.",
+    "--clickhouse-url": "scaffolds a ClickHouse `load:` section, which the blessed chain never "
+                        "loads. Carried INSIDE the gate by clickhouse_load.verify_clickhouse_load: "
+                        "live_init_extended::init_clickhouse_flags_scaffold_the_load_block_and_"
+                        "require_each_other runs init with the flags on GCS and S3 and checks "
+                        "every refusal between them.",
+    "--clickhouse-database": "the other half of the ClickHouse `load:` scaffold — see --clickhouse-url.",
+    "--clickhouse-user": "the ClickHouse `load:` scaffold's user — see --clickhouse-url.",
 }
 
 

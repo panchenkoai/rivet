@@ -32,6 +32,7 @@ from __future__ import annotations
 import functools
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -457,3 +458,62 @@ def sqlcmd(container: str) -> tuple[str, ...]:
         if docker_exec(container, "test", "-x", path, timeout=20).ok:
             return (path, *flags)
     raise SystemExit(f"{container}: no sqlcmd at tools18 or tools — the image changed its layout")
+
+
+# A nextest status line: `<STATUS> [ 1.2s] (3/7) <binary> <test>`. The status is the whole
+# run of capitals before `[`, so `FAIL + LEAK` is read whole: matching `(PASS|LEAK) [`
+# found the `LEAK [` inside it and graded a failed, leaky test green.
+_NEXTEST_LINE = re.compile(r"^\s*([A-Z][A-Z +]*[A-Z])\s+\[[^\]]*\] \([^)]*\) \S+ (\S+)", re.M)
+
+
+def nextest_outcomes(out: str) -> dict[str, str]:
+    """Each test's final nextest status (`PASS`, `LEAK`, `FAIL`, `FAIL + LEAK`, …); `SLOW` is not final."""
+    final: dict[str, str] = {}
+    for status, name in _NEXTEST_LINE.findall(out):
+        if status != "SLOW":
+            final[name] = status
+    return final
+
+
+def nextest_passed(out: str) -> set[str]:
+    """The tests nextest reports green: `PASS`, or `LEAK` (passed, left a handle open)."""
+    return {n for n, s in nextest_outcomes(out).items() if s in ("PASS", "LEAK")}
+
+
+# nextest's real line shapes, each with the verdict the gate must give it.
+_NEXTEST_SAMPLE = (
+    "        SLOW [> 60.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
+    "        PASS [  61.000s] (1/4) rivet-cli::live_suite m::slow_then_pass\n"
+    "        LEAK [   0.400s] (2/4) rivet-cli::live_suite m::leaky_pass\n"
+    " FAIL + LEAK [   0.476s] (3/4) rivet-cli::live_suite m::leaky_fail\n"
+    "        FAIL [   0.200s] (4/4) rivet-cli::live_suite m::plain_fail\n"
+)
+
+
+def nextest_grading_error() -> str | None:
+    """Why the nextest parser would misgrade a real line shape, or None when it grades all correctly."""
+    passed = nextest_passed(_NEXTEST_SAMPLE)
+    want = {"m::slow_then_pass", "m::leaky_pass"}
+    if passed != want:
+        return f"graded green {sorted(passed)}, want {sorted(want)} (a FAIL + LEAK must stay red)"
+    return None
+
+
+def verify_nextest_grading(led: "Ledger") -> None:
+    """Refuse a gate whose parser would read a failed, leaky test as green."""
+    why = nextest_grading_error()
+    if why:
+        led.failed("-", "harness", "nextest-grading", "-", f"nextest parser misgrades: {why}")
+    else:
+        led.passed("-", "harness", "nextest-grading", "-",
+                   "nextest parser: FAIL + LEAK is red, LEAK green, SLOW not final", "ok")
+
+
+def nextest_filter(tests: Sequence[str]) -> str:
+    """A nextest `-E` expression selecting exactly these test fns, by their whole last path segment."""
+    return " or ".join(f"test(/(^|::){t}$/)" for t in tests)
+
+
+def test_passed(name: str, passed: set[str]) -> bool:
+    """Whether the test fn `name` is among `passed` — a whole path segment, never a suffix of another name."""
+    return any(q == name or q.endswith("::" + name) for q in passed)

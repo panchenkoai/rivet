@@ -79,7 +79,7 @@ pub fn fetch_manifests_keyed(
     store: &GcsStore,
     gcs_prefix: &str,
 ) -> Result<Vec<(String, RunManifest)>> {
-    let (_, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let (_, base) = crate::load::split_object_uri(gcs_prefix)?;
     let keys = list_manifest_keys(store, base)?;
     // CWE-400: a manifest over the cap is refused, never read past the cap. One
     // stat + read per key, 16 keys in flight — a prefix keeps one copy per run it held.
@@ -126,7 +126,7 @@ pub fn select_load_uris(
     gcs_prefix: &str,
     new: &[(String, RunManifest)],
 ) -> Result<Vec<String>> {
-    let (bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let (bucket, base) = crate::load::split_object_uri(gcs_prefix)?;
     let all_parquet: Vec<String> = store
         .list_files(base)?
         .into_iter()
@@ -143,7 +143,7 @@ pub fn select_load_uris(
     }
     Ok(select_load_keys(new, &all_parquet)
         .into_iter()
-        .map(|k| format!("gs://{bucket}/{k}"))
+        .map(|k| format!("{}://{bucket}/{k}", crate::load::scheme_of(gcs_prefix)))
         .collect())
 }
 
@@ -260,7 +260,7 @@ pub fn gc_orphans(
     // supersession-only sweep.
     dead_marker_run_ids: &std::collections::HashSet<String>,
 ) -> Result<(usize, u64)> {
-    let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let (_bucket, base) = crate::load::split_object_uri(gcs_prefix)?;
     // Success parts → keep. Failed/Interrupted parts → terminal ONLY once a
     // newer same-family Success supersedes their run (until then a checkpoint
     // resume may still adopt them); then deletable regardless of `active`. A

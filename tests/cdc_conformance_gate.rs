@@ -1046,6 +1046,9 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // suite): the CDC parquet is loaded and queried by another engine.
                 || chunk.contains("duckdb_run_sql_json(")
                 || chunk.contains("clickhouse_run_sql_json(")
+                // `rivet load` into ClickHouse, read back from the server and
+                // compared to the source (tests/live/live_clickhouse_load.rs).
+                || chunk.contains("clickhouse_rows")
                 // Read-back helpers the newer suites use. This dictionary
                 // is INTENTIONALLY wide: the read-backs differ because the
                 // oracles differ (manifest vs parquet vs csv vs gcs listing

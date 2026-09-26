@@ -652,6 +652,9 @@ services:
       # Allow the `file()` table function to read Parquet from /work — by
       # default ClickHouse only trusts /var/lib/clickhouse/user_files.
       - ./dev/clickhouse/user_files.xml:/etc/clickhouse-server/config.d/user_files.xml:ro
+      # The named collection the load's server-side pull reads MinIO through.
+      - ./dev/clickhouse/named_collections.xml:/etc/clickhouse-server/config.d/named_collections.xml:ro
+      - ./dev/clickhouse/rivet_user.xml:/etc/clickhouse-server/users.d/rivet_user.xml:ro
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
              "http://127.0.0.1:8123/ping"]

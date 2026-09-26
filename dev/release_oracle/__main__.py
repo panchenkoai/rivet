@@ -44,11 +44,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, HERE, ROOT
+from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, sqlcmd, target_dir, verify_nextest_grading, HERE, ROOT
 from . import (
     bigquery,
     blessed_flow,
     cdc,
+    clickhouse_load,
     concurrency,
     gifs,
     init_delta,
@@ -227,6 +228,22 @@ def _self_test() -> int:
     # its default comes from, the stand row when the container will not answer,
     # and the banner/footer that describe whether anything was compared at all.
     # One entry point, so CI and the offline suite get both halves.
+    # A failed test that also leaked prints `FAIL + LEAK [`: it must never read as green.
+    from .core import nextest_grading_error
+    why = nextest_grading_error()
+    assert why is None, why
+    print("self-test ok: a FAIL + LEAK line is a failure, a LEAK line a pass, SLOW is not final")
+    # A Rig cell whose local service is down is a SKIP naming it, and needs no cloud.
+    from .shared_state import run_rig_tests
+    probe = Ledger(colour=False)
+    run_rig_tests(probe, "probe", ("t",), cell=str, msg=str, cloud=False, services=(("nothing", 1),))
+    skipped = [c for c in probe.cells if c.status == Status.SKIP]
+    assert len(probe.cells) == 1 and skipped and "nothing (:1)" in skipped[0].detail, probe.cells
+    print("self-test ok: a Rig cell with a service down SKIPs naming it, without cloud prerequisites")
+    from .core import nextest_filter, test_passed
+    assert test_passed("t", {"m::t"}) and not test_passed("t", {"m::at", "m::t_x"}), "suffix match"
+    assert nextest_filter(["t"]) == "test(/(^|::)t$/)"
+    print("self-test ok: a test is matched by its whole name, never by a suffix of another")
     print("\nregression stage (child harness, stand, banner):")
     return regression._self_test()
 
@@ -453,6 +470,8 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
         ("init delta", lambda sub: init_delta.verify_init_delta(sub)),
         ("partner shape", lambda sub: partner_shape.verify_partner_shape(sub)),
     ])
+    # Sequential: its CDC cells share the cross-process engine locks init delta holds.
+    clickhouse_load.verify_clickhouse_load(led)
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
@@ -608,7 +627,8 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # than the bring-up — the same "ignored boolean" shape this gate exists to
     # catch elsewhere.
     if not wait_until(ready, tries=45, delay=2.0):
-        led.skipped(engine, tag, "all", "-",
+        # FAIL, not SKIP: an engine the gate was asked to grade and did not is a hole.
+        led.failed(engine, tag, "all", "-",
                     f"{engine}:{tag} never became ready (no probe of "
                     f"{[p[0] for p in probes]} "
                     f"never passed twice in ~90s)", "not ready")
@@ -744,7 +764,7 @@ def _run_one_version(led: Ledger, ns: argparse.Namespace, engine: str, line: str
     with led.span(f"{engine}: bring-up"):
         url = bring_up(led, engine, tag, image, port)
     if not url:
-        led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
+        led.add(engine, tag, "all", "-", Status.FAIL, "bring-up failed")
         return
     # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
     # failure is retried: a fresh container under load can drop the seed
@@ -879,6 +899,9 @@ def main(argv: list[str] | None = None) -> int:
             backend = "SQLITE (a .rivet_state.db beside each config — the default)"
         print(f"  state backend under test: {backend}")
         print("  a pass grades ONE backend; --state-url runs the same cells against the other")
+        # The Rig cells are graded by parsing nextest; a parser that reads `FAIL + LEAK`
+        # as a pass turns red tests green, so it is checked before anything is graded.
+        verify_nextest_grading(led)
 
         # WHETHER THE RELEASE IS BEING GRADED AGAINST THE PREVIOUS ONE, said out
         # loud — for the same reason the state backend is. The stages read this

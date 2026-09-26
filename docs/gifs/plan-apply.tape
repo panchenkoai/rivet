@@ -53,4 +53,4 @@ Sleep 1500ms
 
 Type "rivet apply plan.json"
 Enter
-Sleep 3s
+Sleep 5s

@@ -82,6 +82,7 @@
 - [Recover an interrupted run](recipes/recover-interrupted-run.md)
 - [Idempotent warehouse load](recipes/idempotent-warehouse-load.md)
 - [Snowflake load](recipes/snowflake-load.md)
+- [ClickHouse load](recipes/clickhouse-load.md)
 - [Airflow DAG](recipes/airflow/README.md)
 
 # Reference

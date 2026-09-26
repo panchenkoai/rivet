@@ -57,7 +57,7 @@ scenarios:
     duckdb:     { test: duckdb_validates_postgres_type_matrix_parquet }
     bigquery:   { test: bigquery_validates_postgres_type_matrix_parquet }
     snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
-    clickhouse: { test: clickhouse_time_autoloads_as_int64 }
+    clickhouse: { test: clickhouse_time_loads_as_decimal_seconds_of_day }
 
   - id: timestamp_naive
     what: "naive timestamp — BQ/SF autoload as INT64/NUMBER (recover via cast), DuckDB/CH native"

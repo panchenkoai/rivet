@@ -64,6 +64,7 @@ pub fn parse_cli() -> Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process; its size never matters
 pub enum Commands {
     /// Run export jobs defined in config
     Run(RunArgs),
@@ -259,6 +260,7 @@ pub enum Commands {
     },
     /// Generate a config scaffold from a live database (connect + introspect)
     #[command(group = clap::ArgGroup::new("source_spec").required(true).multiple(false))]
+    #[command(group = clap::ArgGroup::new("staging_bucket").multiple(false))]
     Init {
         /// Database URL (postgresql://, mysql://, sqlserver://, or mongodb://). Visible in shell history / `ps`;
         /// prefer `--source-env` or `--source-file` for anything other than local dev.
@@ -307,7 +309,12 @@ pub enum Commands {
         mode: Option<String>,
         /// Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`).
         /// Incompatible with `--s3-bucket` and `--discover`.
-        #[arg(long = "gcs-bucket", value_name = "NAME", conflicts_with = "s3_bucket")]
+        #[arg(
+            long = "gcs-bucket",
+            value_name = "NAME",
+            conflicts_with = "s3_bucket",
+            group = "staging_bucket"
+        )]
         gcs_bucket: Option<String>,
         /// Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC
         /// (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML.
@@ -319,7 +326,7 @@ pub enum Commands {
         gcs_credentials_file: Option<String>,
         /// Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`).
         /// Incompatible with `--gcs-bucket` and `--discover`.
-        #[arg(long = "s3-bucket", value_name = "NAME")]
+        #[arg(long = "s3-bucket", value_name = "NAME", group = "staging_bucket")]
         s3_bucket: Option<String>,
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
@@ -345,6 +352,32 @@ pub enum Commands {
             requires = "bigquery_project"
         )]
         bigquery_dataset: Option<String>,
+        /// Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g.
+        /// `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the
+        /// export stages in (`--gcs-bucket` or `--s3-bucket`).
+        #[arg(
+            long = "clickhouse-url",
+            value_name = "URL",
+            requires = "clickhouse_database",
+            requires = "staging_bucket",
+            conflicts_with = "bigquery_project"
+        )]
+        clickhouse_url: Option<String>,
+        /// The ClickHouse database the load creates its tables in (with `--clickhouse-url`).
+        #[arg(
+            long = "clickhouse-database",
+            value_name = "DATABASE",
+            requires = "clickhouse_url"
+        )]
+        clickhouse_database: Option<String>,
+        /// The ClickHouse user the load authenticates as (with `--clickhouse-url`).
+        #[arg(
+            long = "clickhouse-user",
+            value_name = "USER",
+            default_value = "default",
+            requires = "clickhouse_url"
+        )]
+        clickhouse_user: String,
         /// TLS posture for BOTH the introspection connection init opens AND the
         /// `source.tls:` block written into the scaffold. Required (or `disable`,
         /// explicitly) for any non-loopback host — without it the TLS gate
