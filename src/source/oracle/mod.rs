@@ -15,9 +15,7 @@ use oracledb::{Connection, Metadata, OracleNumber, OracleTimestamp, Row};
 
 use crate::config::TlsConfig;
 use crate::error::Result;
-use crate::source::batch_controller::{
-    AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB, PROBE_BATCH_SIZE,
-};
+use crate::source::batch_controller::{AdaptiveBatchController, DEFAULT_BATCH_TARGET_MB};
 use crate::source::query::build_export_query;
 use crate::source::{BatchSink, ExportRequest, Source};
 use crate::types::{ColumnOverrides, TypeMapping};
@@ -181,6 +179,17 @@ fn projection_expr(meta: &Metadata, quoted: &str) -> Option<Result<String>> {
     }))
 }
 
+/// Rows to fetch per round trip and in the first (probe) batch: few when a LOB
+/// makes the row width unknowable up front, else the controller's target.
+fn probe_rows(projection: &Projection, target: usize) -> usize {
+    const LOB_PROBE_ROWS: usize = 16;
+    if projection.empty_flags.iter().any(Option::is_some) {
+        target.min(LOB_PROBE_ROWS)
+    } else {
+        target
+    }
+}
+
 /// A result column name an outer query cannot reference: the ROWID pseudo-column
 /// shadows it, or it cannot be written as a quoted identifier.
 fn unreferenceable(name: &str) -> bool {
@@ -271,16 +280,16 @@ impl OracleSource {
     /// Column metadata of `query` without fetching a row. Locator mode, so a LOB is
     /// described as CLOB/BLOB (an inline fetch reports it as LONG / LONG RAW).
     fn describe(&self, query: &str) -> Result<Vec<Metadata>> {
-        let cursor = self
+        // Parse-only: a `WHERE 1 = 0` wrap still EXECUTES an aggregate query in full.
+        let mut stmt = self
             .conn
-            .statement(&format!("SELECT * FROM ({query}) \"_rivet_d\" WHERE 1 = 0"))
+            .statement(query)
             .ora()?
             .fetch_lobs()
             .build()
-            .ora()?
-            .query(&[])
             .ora()?;
-        Ok(cursor.columns().to_vec())
+        stmt.ensure_fully_parsed().ora()?;
+        Ok(stmt.out_metadata().to_vec())
     }
 
     /// `query` re-projected so every column is one the row decoder reads correctly.
@@ -373,7 +382,8 @@ impl Source for OracleSource {
         let max_value_bytes = request.tuning.max_value_bytes();
 
         let started = std::time::Instant::now();
-        let fetch = u32::try_from(ctl.target().max(PROBE_BATCH_SIZE)).unwrap_or(u32::MAX);
+        let probe_rows = probe_rows(&projection, ctl.target());
+        let fetch = u32::try_from(probe_rows).unwrap_or(u32::MAX);
         let stmt = self
             .conn
             .statement(&built.sql)
@@ -384,12 +394,20 @@ impl Source for OracleSource {
             .prefetch_rows(1)
             .build()
             .ora()?;
+        // The budget bounds each server round trip too, not only the gaps between rows.
+        self.conn.set_call_timeout(stmt_timeout).ora()?;
+        let timed_out = |e: anyhow::Error| match stmt_timeout {
+            Some(budget) if started.elapsed() >= budget => {
+                crate::source::StatementDurationTimeout::oracle(budget.as_secs()).into()
+            }
+            _ => e,
+        };
         let cursor = match &built.cursor_param {
             Some(v) => {
                 let bind: &dyn oracledb::ToDbValue = v;
-                stmt.query(&[bind]).ora()?
+                stmt.query(&[bind]).ora().map_err(timed_out)?
             }
-            None => stmt.query(&[]).ora()?,
+            None => stmt.query(&[]).ora().map_err(timed_out)?,
         };
         let metas = cursor.columns()[..projection.native.len()].to_vec();
         let empty_flags = projection.empty_flags.clone();
@@ -401,7 +419,8 @@ impl Source for OracleSource {
         ctl.raise_configured_ceiling(request.tuning.effective_batch_size(Some(&schema)));
         sink.on_schema(Arc::clone(&schema))?;
 
-        let mut buf: Vec<Row> = Vec::with_capacity(ctl.target());
+        let mut buf: Vec<Row> = Vec::with_capacity(probe_rows);
+        let mut emitted = false;
         let mut cap_applied = false;
         let mut emit = |buf: &mut Vec<Row>, ctl: &mut AdaptiveBatchController| -> Result<()> {
             let batch = arrow_convert::rows_to_batch(buf, &schema, max_value_bytes, &empty_flags)?;
@@ -414,7 +433,7 @@ impl Source for OracleSource {
                     .tuning
                     .batch_size_memory_mb
                     .unwrap_or(DEFAULT_BATCH_TARGET_MB);
-                let safe = ((target_mb * 1024 * 1024) / per_row).max(PROBE_BATCH_SIZE);
+                let safe = ((target_mb * 1024 * 1024) / per_row).max(1);
                 if let Some(new) = ctl.apply_memory_cap(safe) {
                     log::info!(
                         "Oracle batch cap: arrow≈{per_row} B/row, target={target_mb} MB → batch_size → {new}"
@@ -434,14 +453,17 @@ impl Source for OracleSource {
                     crate::source::StatementDurationTimeout::oracle(budget.as_secs()).into(),
                 );
             }
-            buf.push(row.ora()?);
-            if buf.len() >= ctl.target() {
+            buf.push(row.ora().map_err(timed_out)?);
+            let limit = if emitted { ctl.target() } else { probe_rows };
+            if buf.len() >= limit {
                 emit(&mut buf, &mut ctl)?;
+                emitted = true;
             }
         }
         if !buf.is_empty() {
             emit(&mut buf, &mut ctl)?;
         }
+        self.conn.set_call_timeout(None).ora()?;
         Ok(())
     }
 

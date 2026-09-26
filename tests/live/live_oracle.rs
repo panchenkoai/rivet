@@ -1161,3 +1161,72 @@ fn doctor_is_silent_on_harm_views_for_a_catalog_reader() {
         "no harm-view note for a catalog reader; stdout:\n{stdout}"
     );
 }
+
+/// Wide LOB rows honour `batch_size_memory_mb`: the probe and fetch array stay small until the width is known.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn wide_clob_rows_stay_within_the_memory_budget() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create("ora_wclob", "id NUMBER(10) PRIMARY KEY, c CLOB");
+    ora_exec(&format!(
+        "DECLARE l CLOB; BEGIN l := TO_CLOB(RPAD('x', 32000, 'x')); \
+         FOR i IN 1..4 LOOP l := l || l; END LOOP; \
+         FOR i IN 1..1000 LOOP INSERT INTO {} VALUES (i, l); END LOOP; END;",
+        t.name()
+    ));
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t.name())
+        .export_named("wclob")
+        .export_line("tuning:")
+        .export_line("  batch_size_memory_mb: 16")
+        .dest_path(out.path().to_path_buf());
+    let run = rig.run_args(&[]);
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(duckdb_total_parquet_rows(out.path()), 1000, "every row");
+    assert_eq!(
+        duckdb_dir_scalar(out.path(), "min(length(\"C\"))", None),
+        512_000,
+        "every CLOB whole"
+    );
+    let state = StateDb::next_to_config(&rig.config_path());
+    let rss = state.metrics_row(&state.latest_run_id("wclob")).peak_rss_mb;
+    // 1000 × 512 KB fetched 500 rows at a time peaked at ~1 GB; the budget keeps it bounded.
+    assert!(
+        rss.is_some_and(|mb| mb < 400),
+        "peak RSS {rss:?} MB over a 16 MB batch budget"
+    );
+}
+
+/// `statement_timeout_s` stops the server's work, not only the wait between fetched rows.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_statement_timeout_stops_a_long_query_on_the_server() {
+    require_alive(LiveService::Oracle);
+    let marker = "ROWNUM <= 60001";
+    let out = tempfile::tempdir().unwrap();
+    let run = Rig::oracle_batch("ORDERS")
+        .query(&format!(
+            "SELECT COUNT(*) AS c FROM ORDERS a CROSS JOIN (SELECT id FROM ORDERS WHERE {marker}) b"
+        ))
+        .export_line("tuning:")
+        .export_line("  statement_timeout_s: 2")
+        .dest_path(out.path().to_path_buf())
+        .run_with_envs_bounded(&[], std::time::Duration::from_secs(60))
+        .expect("a 2 s statement budget must end the run long before the query would");
+    assert!(!run.status.success(), "the budget must fail the export");
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(err.contains("statement timeout after 2s"), "stderr:\n{err}");
+    let active = ora_text_rows(&format!(
+        "SELECT TO_CHAR(COUNT(*)) FROM v$session s JOIN v$sql q ON q.sql_id = s.sql_id \
+         WHERE s.status = 'ACTIVE' AND q.sql_text LIKE '%{marker}%' AND q.sql_text NOT LIKE '%v$session%'"
+    ));
+    assert_eq!(
+        active[0][0].as_deref(),
+        Some("0"),
+        "the server stopped executing it"
+    );
+}

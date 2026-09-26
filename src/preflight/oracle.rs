@@ -199,6 +199,11 @@ fn single_int_pk_oracle(conn: &mut OracleSource, qualified: &str) -> Option<Stri
 }
 
 /// `MIN`/`MAX` of `expr` over the export's rows, as display text.
+/// One boundary probe: MIN and MAX in one statement make Oracle scan the whole index, alone each is a seek.
+fn range_bound_sql(agg: &str, expr: &str, from: &str) -> String {
+    format!("SELECT TO_CHAR({agg}({expr})) AS rivet_agg FROM {from}")
+}
+
 fn range_min_max_oracle(
     conn: &mut OracleSource,
     base_query: &str,
@@ -209,20 +214,15 @@ fn range_min_max_oracle(
         Some(t) => t.to_string(),
         None => format!("({base_query}) \"_rivet\""),
     };
-    let sql = format!("SELECT TO_CHAR(MIN({expr})) || CHR(31) || TO_CHAR(MAX({expr})) FROM {from}");
-    match conn.query_scalar(&sql) {
-        Ok(Some(agg)) => {
-            let mut parts = agg.splitn(2, '\u{1f}');
-            let lo = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
-            let hi = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
-            (lo, hi)
-        }
-        Ok(None) => (None, None),
-        Err(e) => {
-            log::debug!("preflight: oracle range probe on '{expr}' failed: {e:#}");
-            (None, None)
-        }
-    }
+    let mut bound = |agg: &str| {
+        conn.query_scalar(&range_bound_sql(agg, expr, &from))
+            .inspect_err(|e| log::debug!("preflight: oracle range probe on '{expr}' failed: {e:#}"))
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+    };
+    let lo = bound("MIN");
+    (lo, bound("MAX"))
 }
 
 /// `Some(true)` when `column` leads some index on `table`, `Some(false)` when the
@@ -239,4 +239,21 @@ fn column_has_index_oracle(conn: &mut OracleSource, qualified: &str, column: &st
         "index",
     )
     .map(|n| n > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_range_bound_is_its_own_single_aggregate_statement() {
+        let min = range_bound_sql("MIN", "\"ID\"", "ORDERS");
+        assert_eq!(min, "SELECT TO_CHAR(MIN(\"ID\")) AS rivet_agg FROM ORDERS");
+        assert!(!min.contains("MAX"));
+    }
+
+    #[test]
+    fn an_unknown_key_column_names_the_upper_case_spelling() {
+        assert!(unknown_key_column_detail("id").ends_with("write 'ID'"));
+    }
 }
