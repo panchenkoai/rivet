@@ -73,6 +73,8 @@ pub(crate) struct MongoChangeStream {
     /// first `_id` bracket seen; the warning fires once when a second appears.
     hetero_first: Option<Option<u8>>,
     hetero_warned: bool,
+    /// The collections this export captures, so a DDL event can be told apart from one on another collection.
+    configured_tables: Vec<String>,
 }
 
 /// How a whole-db change-stream operation is handled: a document change we emit,
@@ -84,6 +86,45 @@ enum OpClass {
     Row,
     Skip,
     Invalidate,
+}
+
+/// Whether a DDL event drops or renames a captured collection — every one of them, for `dropDatabase`.
+fn ddl_removes_a_capture(
+    op: &OperationType,
+    coll: Option<&str>,
+    db: &str,
+    configured: &[String],
+) -> bool {
+    match (op, coll) {
+        (OperationType::DropDatabase, _) => true,
+        (OperationType::Drop | OperationType::Rename, None) => true,
+        (OperationType::Drop | OperationType::Rename, Some(c)) => {
+            configured.is_empty()
+                || configured.iter().any(|t| {
+                    crate::source::cdc::sink::table_matches(
+                        crate::source::cdc::CdcEngine::Mongo,
+                        t,
+                        db,
+                        c,
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Refuse a captured collection that left the source without per-document deletes.
+fn dropped_capture_message(op: &OperationType, db: &str, coll: Option<&str>) -> String {
+    let what = coll.map_or_else(
+        || format!("database `{db}`"),
+        |c| format!("collection `{db}.{c}`"),
+    );
+    format!(
+        "mongodb cdc: captured {what} was removed by `{op:?}`, and a change stream carries no \
+         per-document deletes for that — skipping it would leave every document it held live in \
+         the destination. Recover in rivet's OWN order: re-anchor FIRST (delete the checkpoint so \
+         the next run pins a fresh one), THEN re-snapshot the collection (`mode: full`)."
+    )
 }
 
 fn classify_op(op: &OperationType) -> OpClass {
@@ -488,6 +529,7 @@ impl MongoChangeStream {
             until_current_ts,
             hetero_first: None,
             hetero_warned: false,
+            configured_tables: configured_tables.to_vec(),
         };
         // Idle-first-run anchor (MongoDB has no server-side anchor — the MySQL
         // model): a fresh checkpointed open persists its current resume token NOW.
@@ -821,6 +863,7 @@ impl ChangeStream for MongoChangeStream {
         // heterogeneous-`_id` observation below can mutate warn state in-loop.
         let hetero_first = &mut self.hetero_first;
         let hetero_warned = &mut self.hetero_warned;
+        let configured_tables = &self.configured_tables;
         loop {
             // Pull one raw event (or terminate). Bounded run: drain up to the
             // open-time target; `next_if_any` returns `None` on an empty poll, but a
@@ -891,7 +934,18 @@ impl ChangeStream for MongoChangeStream {
                     }
                     return Some(to_change_event(cse, canonical, db_name));
                 }
-                OpClass::Skip => continue,
+                OpClass::Skip => {
+                    let coll = cse.ns.as_ref().and_then(|n| n.coll.as_deref());
+                    if ddl_removes_a_capture(&cse.operation_type, coll, db_name, configured_tables)
+                    {
+                        return Some(Err(anyhow::anyhow!(dropped_capture_message(
+                            &cse.operation_type,
+                            db_name,
+                            coll
+                        ))));
+                    }
+                    continue;
+                }
                 OpClass::Invalidate => {
                     return Some(Err(anyhow::anyhow!(
                         "mongodb cdc: the change stream was INVALIDATED (the watched \
@@ -917,6 +971,27 @@ mod tests {
     /// All three decide what a change MEANS, and each fails silently: a
     /// misclassified op, a delete that carries the wrong image, or a hint that
     /// buries the diagnosis it was written to surface.
+    #[test]
+    fn only_a_ddl_on_a_captured_collection_is_refused() {
+        let cap = ["orders".to_string()];
+        let r = |op, coll| ddl_removes_a_capture(&op, coll, "shop", &cap);
+        assert!(r(OperationType::Drop, Some("orders")));
+        assert!(r(OperationType::Rename, Some("orders")));
+        assert!(
+            !r(OperationType::Drop, Some("audit_log")),
+            "another collection's drop is skipped"
+        );
+        assert!(r(OperationType::DropDatabase, None));
+        assert!(
+            !r(OperationType::Insert, Some("orders")),
+            "a row change is not DDL"
+        );
+        assert!(
+            ddl_removes_a_capture(&OperationType::Drop, Some("x"), "shop", &[]),
+            "capture-all owns every collection"
+        );
+    }
+
     #[test]
     fn op_classification_delete_framing_and_the_diagnosis_check_all_answer() {
         // CLASSIFY. The row ops must all be Row, Invalidate its own class, and
