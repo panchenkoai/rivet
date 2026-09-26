@@ -207,3 +207,193 @@ fn audit_repair_keeps_validate_clean() {
         json["exports"][0]["verification"]
     );
 }
+
+// ─── Gate finding: a repaired prefix must still pass `validate --depth full` ──
+
+/// Seed `id BIGINT, v TEXT` over 1..=1000 minus 500..=549, export chunked, insert the gap, repair.
+fn seed_gap_run_insert_repair() -> (PgTable, Rig) {
+    let name = unique_name("repair_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {name} (id BIGINT PRIMARY KEY, v TEXT NOT NULL); \
+         INSERT INTO {name} SELECT g, 'v' || g FROM generate_series(1, 1000) g \
+         WHERE g NOT BETWEEN 500 AND 549;"
+    ))
+    .expect("seed");
+    let table = PgTable::adopt(name);
+    let rig = Rig::pg_batch(table.name())
+        .census_oracle()
+        .query(&format!("SELECT id, v FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 250")
+        .export_line("chunk_checkpoint: true");
+    let run = rig.run_args(&["--export", table.name()]);
+    assert!(
+        run.status.success(),
+        "export: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    c.batch_execute(&format!(
+        "INSERT INTO {} SELECT g, 'v' || g FROM generate_series(500, 549) g",
+        table.name()
+    ))
+    .expect("insert gap");
+    let (ok, _) = reconcile_json(&rig, table.name());
+    assert!(!ok, "precondition: reconcile must see the inserted gap");
+    let repair = rig.cli(&["repair", "--export", table.name(), "--execute"]);
+    assert!(
+        repair.status.success(),
+        "repair: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let (ok, after) = reconcile_json(&rig, table.name());
+    assert!(ok, "reconcile must converge after repair: {after:#}");
+    (table, rig)
+}
+
+/// `validate --depth full` → (exit code, stdout+stderr).
+fn validate_full(rig: &Rig, export: &str) -> (Option<i32>, String) {
+    let v = rig.cli(&["validate", "--export", export, "--depth", "full"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+    (v.status.code(), text)
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn repaired_prefix_passes_validate_full_value_checksum() {
+    require_alive(LiveService::Postgres);
+    let (table, rig) = seed_gap_run_insert_repair();
+
+    // Independent oracle: the DISTINCT (id, v) set of the declared parts equals the source, both ways.
+    let container = rig.oracle_container_out();
+    let files: Vec<String> = declared_parquet_parts(&rig.out_dir())
+        .iter()
+        .map(|p| format!("'{container}/{}'", p.file_name().unwrap().to_string_lossy()))
+        .collect();
+    assert!(
+        files.len() >= 5,
+        "4 chunk parts + the repair part: {files:?}"
+    );
+    let e = OracleEngine::Postgres;
+    let (attach, from) = e.source_sql("rivet", table.name());
+    let v = duckdb_run_sql_json(&format!(
+        "{} {attach} WITH s AS (SELECT DISTINCT CAST(id AS BIGINT) id, CAST(v AS VARCHAR) v \
+         FROM {from}), d AS (SELECT DISTINCT CAST(id AS BIGINT) id, CAST(v AS VARCHAR) v \
+         FROM read_parquet([{}])) \
+         SELECT (SELECT count(*) FROM (SELECT * FROM s EXCEPT SELECT * FROM d)), \
+                (SELECT count(*) FROM (SELECT * FROM d EXCEPT SELECT * FROM s)), \
+                (SELECT count(*) FROM d)",
+        e.load_sql(),
+        files.join(", ")
+    ));
+    assert_eq!(
+        v["rows"][0],
+        serde_json::json!(["0", "0", "1000"]),
+        "DuckDB: the declared parts must equal the source"
+    );
+
+    let (code, text) = validate_full(&rig, table.name());
+    assert_eq!(
+        code,
+        Some(0),
+        "validate --depth full must PASS on a correctly repaired prefix (the manifest's value \
+         checksums must include the repair parts); output:\n{text}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres duckdb"]
+fn repaired_prefix_with_a_corrupted_part_still_fails_validate_full() {
+    use arrow::array::{RecordBatch, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    require_alive(LiveService::Postgres);
+    let (table, rig) = seed_gap_run_insert_repair();
+    let out = rig.out_dir();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        m["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "Form B must survive repair or this test grades nothing: {m}"
+    );
+
+    // Tamper one `v` cell in the newest part (the repair part): same schema, same row count.
+    let part = files_with_extension(&out, "parquet")
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap())
+        .unwrap();
+    let batches: Vec<RecordBatch> =
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&part).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect();
+    let schema = batches[0].schema();
+    let idx = schema.index_of("v").unwrap();
+    {
+        let f = std::fs::File::create(&part).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        for (bi, b) in batches.iter().enumerate() {
+            let mut cols = b.columns().to_vec();
+            if bi == 0 {
+                let col = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let mut vals: Vec<String> =
+                    col.iter().map(|x| x.unwrap_or("").to_string()).collect();
+                vals[0].push('x');
+                cols[idx] = std::sync::Arc::new(StringArray::from(vals));
+            }
+            w.write(&RecordBatch::try_new(b.schema(), cols).unwrap())
+                .unwrap();
+        }
+        w.close().unwrap();
+    }
+    // Neutralise the size gate and re-stamp `_SUCCESS`, so only the value leg can fire.
+    let part_name = part.file_name().unwrap().to_string_lossy().into_owned();
+    let new_size = std::fs::metadata(&part).unwrap().len();
+    for mf in std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()) {
+        let n = mf.file_name().unwrap().to_string_lossy().into_owned();
+        if !(n.starts_with("manifest") && n.ends_with(".json")) {
+            continue;
+        }
+        let mut j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mf).unwrap()).unwrap();
+        for p in j["parts"].as_array_mut().unwrap() {
+            if p["path"].as_str().is_some_and(|x| x.ends_with(&part_name)) {
+                p["size_bytes"] = serde_json::json!(new_size);
+            }
+        }
+        let bytes = serde_json::to_string_pretty(&j).unwrap().into_bytes();
+        std::fs::write(&mf, &bytes).unwrap();
+        if n == "manifest.json" {
+            std::fs::write(
+                out.join("_SUCCESS"),
+                rivet::manifest::success_marker_body(&bytes),
+            )
+            .unwrap();
+        }
+    }
+
+    let (code, text) = validate_full(&rig, table.name());
+    assert_eq!(
+        code,
+        Some(3),
+        "a corrupted repaired prefix must fail validate; output:\n{text}"
+    );
+    assert!(
+        text.contains("[RIVET_VERIFY_VALUE_CHECKSUM]") && text.contains("column 'v'"),
+        "the failure must be the value checksum on `v`, not another gate; output:\n{text}"
+    );
+}

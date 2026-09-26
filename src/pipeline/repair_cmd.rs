@@ -286,7 +286,12 @@ fn execute_repair(
     //     must not change the repair's exit code — but it is logged loudly so
     //     the operator knows validate may still flag the files.
     if !new_parts.is_empty()
-        && let Err(e) = record_repair_parts_in_manifest(&plan.destination, &new_parts)
+        && let Err(e) = record_repair_parts_in_manifest(
+            &plan.destination,
+            &new_parts,
+            &summary.ledger.integrity.column_checksums,
+            summary.ledger.integrity.checksum_key_column.as_deref(),
+        )
     {
         log::warn!(
             "repair: re-exported parts were written but the destination manifest could not be \
@@ -314,6 +319,8 @@ fn execute_repair(
 fn record_repair_parts_in_manifest(
     destination: &crate::config::DestinationConfig,
     new_parts: &[ManifestPart],
+    repair_checksums: &std::collections::BTreeMap<String, u64>,
+    repair_key: Option<&str>,
 ) -> Result<()> {
     let dest = crate::destination::create_destination(destination)?;
 
@@ -354,6 +361,7 @@ fn record_repair_parts_in_manifest(
     manifest.row_count = manifest.committed_rows();
     manifest.part_count = manifest.committed_part_count() as u32;
     manifest.finished_at = chrono::Utc::now().to_rfc3339();
+    fold_repair_checksums(&mut manifest, repair_checksums, repair_key);
 
     // Route through the shared writer so the canonical `manifest.json`, the
     // immutable run-unique `manifest-<run_id>.json` copy, and the `_SUCCESS`
@@ -371,6 +379,43 @@ fn record_repair_parts_in_manifest(
     // run stays marker-less — the terminal status is preserved.
     crate::pipeline::manifest_writer::write_manifest(&*dest, &manifest)?;
     Ok(())
+}
+
+/// Fold the repair parts' Form-B checksums into the manifest, or drop the record when it cannot cover them truthfully.
+fn fold_repair_checksums(
+    manifest: &mut RunManifest,
+    repair: &std::collections::BTreeMap<String, u64>,
+    repair_key: Option<&str>,
+) {
+    let Some(recorded) = manifest.column_checksums.as_mut() else {
+        return;
+    };
+    let foldable = manifest.checksum_render.as_deref()
+        == Some(crate::source::value_checksum::CHECKSUM_RENDER_ID)
+        && manifest.checksum_key_column.as_deref() == repair_key
+        && recorded.len() == repair.len()
+        && recorded
+            .iter()
+            .all(|c| repair.contains_key(&c.name) && c.checksum.parse::<u64>().is_ok());
+    if !foldable {
+        log::warn!(
+            "repair: the manifest's value checksums cannot be extended to cover the repaired \
+             parts (different fold, key column or column set) — dropping them; `validate \
+             --depth full` will skip the value re-read for this prefix"
+        );
+        manifest.column_checksums = None;
+        manifest.checksum_render = None;
+        manifest.checksum_key_column = None;
+        return;
+    }
+    for c in recorded.iter_mut() {
+        let sum = c
+            .checksum
+            .parse::<u64>()
+            .unwrap_or(0)
+            .wrapping_add(repair[&c.name]);
+        c.checksum = sum.to_string();
+    }
 }
 
 /// Rewrite a repair-written part filename so it carries the ORIGINAL chunk
@@ -559,6 +604,60 @@ mod tests {
     // parts were silently dropped at load while every count/gate passed. Assert
     // on the manifest COPY (not a data re-read — a re-read can't see a sidecar
     // clobber; the process rules sidecar rule).
+    fn formb_manifest(render: Option<&str>, key: Option<&str>) -> RunManifest {
+        serde_json::from_value(serde_json::json!({
+            "manifest_version": crate::manifest::MANIFEST_VERSION,
+            "run_id": "r", "export_name": "e", "mode": "chunked",
+            "started_at": "t", "finished_at": "t", "status": "success",
+            "source": {"engine": "postgres"},
+            "destination": {"kind": "local", "uri": "/x"},
+            "format": "parquet", "compression": "zstd", "schema_fingerprint": "f",
+            "row_count": 0, "part_count": 0, "parts": [],
+            "column_checksums": [{"name": "id", "checksum": u64::MAX.to_string()},
+                                 {"name": "v", "checksum": "10"}],
+            "checksum_render": render, "checksum_key_column": key,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repair_checksums_fold_by_wrapping_sum_into_a_v2_manifest() {
+        use crate::source::value_checksum::CHECKSUM_RENDER_ID;
+        let repair = [("id".to_string(), 2u64), ("v".to_string(), 5u64)].into();
+        let mut m = formb_manifest(Some(CHECKSUM_RENDER_ID), Some("id"));
+        fold_repair_checksums(&mut m, &repair, Some("id"));
+        let got: Vec<(String, String)> = m
+            .column_checksums
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.name, c.checksum))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("id".into(), "1".into()), ("v".into(), "15".into())]
+        );
+        assert_eq!(m.checksum_render.as_deref(), Some(CHECKSUM_RENDER_ID));
+    }
+
+    #[test]
+    fn repair_checksums_are_dropped_when_they_cannot_be_folded_truthfully() {
+        use crate::source::value_checksum::CHECKSUM_RENDER_ID;
+        let full = [("id".to_string(), 2u64), ("v".to_string(), 5u64)].into();
+        let partial = [("id".to_string(), 2u64)].into();
+        for (render, key, repair) in [
+            (None, Some("id"), &full),
+            (Some(CHECKSUM_RENDER_ID), None, &full),
+            (Some(CHECKSUM_RENDER_ID), Some("id"), &partial),
+        ] {
+            let mut m = formb_manifest(render, key);
+            fold_repair_checksums(&mut m, repair, Some("id"));
+            assert!(
+                m.column_checksums.is_none(),
+                "{render:?} {key:?} {repair:?}"
+            );
+        }
+    }
+
     #[test]
     fn repair_updates_the_run_unique_manifest_copy_not_just_the_canonical() {
         use crate::config::{DestinationConfig, DestinationType};
@@ -623,7 +722,8 @@ mod tests {
             ..Default::default()
         };
         // Repair recovers one more part: id 3, 7 rows.
-        record_repair_parts_in_manifest(&dest_cfg, &[part(3, 7)]).unwrap();
+        record_repair_parts_in_manifest(&dest_cfg, &[part(3, 7)], &Default::default(), None)
+            .unwrap();
 
         let read = |name: String| -> RunManifest {
             serde_json::from_slice(&std::fs::read(dir.path().join(name)).unwrap()).unwrap()
