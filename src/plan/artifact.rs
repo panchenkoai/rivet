@@ -312,12 +312,12 @@ impl PlanArtifact {
         }
     }
 
-    /// One compact row for the multi-export plan table — `wave  export  strategy
-    /// rows  verdict`, the export name padded to `name_width` (ellipsised if
-    /// longer). Used instead of [`print_summary`] when planning many exports,
-    /// where the full per-export block would run to hundreds of lines.
-    pub fn summary_line(&self, name_width: usize) -> String {
-        let wave = self
+    /// One compact row for the multi-export plan table — `wave  rec  export
+    /// strategy  rows  verdict`: `apply_wave` is the `wave:` apply reads ("—" when
+    /// unset), `rec` the cost model's recommendation.
+    pub fn summary_line(&self, name_width: usize, apply_wave: Option<u32>) -> String {
+        let wave = apply_wave.map_or_else(|| "—".to_string(), |w| w.to_string());
+        let rec = self
             .prioritization
             .as_ref()
             .map(|p| p.export_recommendation.recommended_wave.to_string())
@@ -335,6 +335,7 @@ impl PlanArtifact {
         };
         Self::compact_row(
             &wave,
+            &rec,
             &name,
             &self.strategy.to_string(),
             &rows,
@@ -348,19 +349,22 @@ impl PlanArtifact {
     /// [`PlanArtifact::compact_row`], so the geometry lives in one place and
     /// widening a column can't silently misalign the table.
     pub fn summary_header(name_width: usize) -> String {
-        Self::compact_row("Wave", "Export", "Strategy", "Rows", "Verdict", name_width)
+        Self::compact_row(
+            "Wave", "Rec", "Export", "Strategy", "Rows", "Verdict", name_width,
+        )
     }
 
     /// The shared column geometry of the compact plan table (header + rows).
     fn compact_row(
         wave: &str,
+        rec: &str,
         export: &str,
         strategy: &str,
         rows: &str,
         verdict: &str,
         name_width: usize,
     ) -> String {
-        format!("  {wave:<5} {export:<name_width$}  {strategy:<11}  {rows:<12}  {verdict}")
+        format!("  {wave:<5} {rec:<4} {export:<name_width$}  {strategy:<11}  {rows:<12}  {verdict}")
     }
 
     /// Pretty-print a human-readable plan summary to stdout.

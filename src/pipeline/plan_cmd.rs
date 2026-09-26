@@ -271,11 +271,12 @@ pub fn run_plan_command(
     // match a `- name:` line — so the preview must model the value now ON DISK,
     // not `recs` (bughunt 2026-08-14; read-only contract 2026-08-20).
     let safe_of = effective_parallel_safe(&recs, &config, &fields, &written);
+    let wave_of = effective_wave(&recs, &config, &fields, &written);
     if pool_estimate_is_printable(&format, artifacts.len()) {
         print_pool_estimate(&artifacts, &safe_of, &state);
     }
 
-    emit_artifacts(&artifacts, &format, multi_export, config_path)?;
+    emit_artifacts(&artifacts, &format, multi_export, config_path, &wave_of)?;
 
     Ok(())
 }
@@ -730,6 +731,7 @@ fn emit_artifacts(
     format: &PlanOutputFormat,
     multi_export: bool,
     config_path: &str,
+    wave_of: &HashMap<String, Option<u32>>,
 ) -> Result<()> {
     match format {
         PlanOutputFormat::Pretty => {
@@ -738,7 +740,7 @@ fn emit_artifacts(
                 // block would be hundreds of lines. Show a compact, one-line-per-
                 // export table sorted by wave, then the wave-execution hint. Use
                 // `--export <name>` for a single export's full detail.
-                print_compact_summary(artifacts, config_path);
+                print_compact_summary(artifacts, config_path, wave_of);
             } else {
                 for artifact in artifacts {
                     artifact.print_summary();
@@ -778,21 +780,21 @@ fn emit_artifacts(
     Ok(())
 }
 
-/// Compact one-line-per-export table for a multi-export plan, sorted by wave
-/// (then by descending score, then name). The full per-export block
-/// (`print_summary`) would be hundreds of lines for a schema scan, so it is
-/// reserved for a single-export plan (`--export <name>`).
-fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
+/// Compact one-line-per-export table for a multi-export plan, sorted by the
+/// `wave:` apply reads (then by descending score, then name). The full
+/// per-export block (`print_summary`) is reserved for `--export <name>`.
+fn print_compact_summary(
+    artifacts: &[PlanArtifact],
+    config_path: &str,
+    wave_of: &HashMap<String, Option<u32>>,
+) {
+    let wave = |a: &PlanArtifact| wave_of.get(&a.export_name).copied().flatten();
     let key = |a: &PlanArtifact| {
-        a.prioritization
+        let score = a
+            .prioritization
             .as_ref()
-            .map(|p| {
-                (
-                    p.export_recommendation.recommended_wave,
-                    p.export_recommendation.priority_score,
-                )
-            })
-            .unwrap_or((u32::MAX, 0))
+            .map_or(0, |p| p.export_recommendation.priority_score);
+        (wave(a).unwrap_or(u32::MAX), score)
     };
     let mut order: Vec<&PlanArtifact> = artifacts.iter().collect();
     order.sort_by(|a, b| {
@@ -810,15 +812,12 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
         .clamp(6, 32);
 
     println!();
-    println!(
-        "  Plan: {} exports — `rivet apply {}` runs them by wave (lowest first)",
-        artifacts.len(),
-        config_path
-    );
+    let waves: Vec<Option<u32>> = artifacts.iter().map(wave).collect();
+    println!("{}", apply_order_line(config_path, &waves));
     println!();
     println!("{}", PlanArtifact::summary_header(name_w));
     for a in &order {
-        println!("{}", a.summary_line(name_w));
+        println!("{}", a.summary_line(name_w, wave(a)));
     }
     println!();
     println!("  Full detail for one export:  rivet plan -c <config> --export <name>");
@@ -1047,6 +1046,56 @@ fn effective_parallel_safe(
         .collect()
 }
 
+/// The `wave:` each export carries on disk after this run — the value `apply`
+/// groups by (same three-input rule as [`effective_parallel_safe`]).
+fn effective_wave(
+    recs: &[(String, u32, bool)],
+    config: &Config,
+    fields: &ExportFields,
+    written: &std::collections::HashSet<String>,
+) -> HashMap<String, Option<u32>> {
+    recs.iter()
+        .map(|(name, rec_wave, _)| {
+            let wrote = written.contains(name)
+                && fields
+                    .get(name)
+                    .is_some_and(|items| items.iter().any(|(k, _)| *k == "wave"));
+            let on_disk = if wrote {
+                Some(*rec_wave)
+            } else {
+                config
+                    .exports
+                    .iter()
+                    .find(|e| &e.name == name)
+                    .and_then(|e| e.wave)
+            };
+            (name.clone(), on_disk)
+        })
+        .collect()
+}
+
+/// The table's headline: what `rivet apply` does with these `wave:` values.
+fn apply_order_line(config_path: &str, waves: &[Option<u32>]) -> String {
+    let n = waves.len();
+    let unset = waves.iter().filter(|w| w.is_none()).count();
+    if unset == n {
+        format!(
+            "  Plan: {n} exports — {config_path} sets no `wave:`, so `rivet apply {config_path}` \
+             runs them as one unscheduled group (Rec = the cost model's advice; \
+             `--annotate-waves` writes a schedule)"
+        )
+    } else if unset == 0 {
+        format!(
+            "  Plan: {n} exports — `rivet apply {config_path}` runs them by `wave:` (lowest first)"
+        )
+    } else {
+        format!(
+            "  Plan: {n} exports — `rivet apply {config_path}` runs them by `wave:` (lowest \
+             first); the {unset} with no `wave:` run last as one unscheduled group"
+        )
+    }
+}
+
 fn write_plan_fields_to_config(
     config_path: &str,
     fields: &ExportFields,
@@ -1149,9 +1198,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ExportFields, PlanWriteReport, apply_field_annotations, effective_parallel_safe,
-        fields_to_write, history_pack_items, plan_write_report, refuse_annotate_scoped_to_export,
-        repack_from_history,
+        ExportFields, PlanWriteReport, apply_field_annotations, apply_order_line,
+        effective_parallel_safe, effective_wave, fields_to_write, history_pack_items,
+        plan_write_report, refuse_annotate_scoped_to_export, repack_from_history,
     };
 
     /// The write-report the operator sees, per outcome. A WRITE always warns;
@@ -1749,6 +1798,42 @@ mod tests {
             safe.get("unmatched"),
             Some(&false),
             "nothing landed on disk, so apply's `unwrap_or(false)` is the truth"
+        );
+
+        let wave = effective_wave(&recs, &cfg, &fields, &written);
+        assert_eq!(
+            wave.get("hand_tuned"),
+            Some(&Some(7)),
+            "apply reads the config's wave"
+        );
+        assert_eq!(
+            wave.get("blank"),
+            Some(&Some(2)),
+            "the landed write is on disk"
+        );
+        assert_eq!(
+            wave.get("unmatched"),
+            Some(&None),
+            "no wave on disk: unscheduled"
+        );
+    }
+
+    #[test]
+    fn the_plan_headline_says_what_apply_does_with_the_waves_on_disk() {
+        assert_eq!(
+            apply_order_line("r.yaml", &[None, None]),
+            "  Plan: 2 exports — r.yaml sets no `wave:`, so `rivet apply r.yaml` runs them as \
+             one unscheduled group (Rec = the cost model's advice; `--annotate-waves` writes a \
+             schedule)"
+        );
+        assert_eq!(
+            apply_order_line("r.yaml", &[Some(1), Some(3)]),
+            "  Plan: 2 exports — `rivet apply r.yaml` runs them by `wave:` (lowest first)"
+        );
+        assert_eq!(
+            apply_order_line("r.yaml", &[Some(1), None, None]),
+            "  Plan: 3 exports — `rivet apply r.yaml` runs them by `wave:` (lowest first); the \
+             2 with no `wave:` run last as one unscheduled group"
         );
     }
 
