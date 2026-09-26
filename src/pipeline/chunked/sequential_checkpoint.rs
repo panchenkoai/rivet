@@ -50,6 +50,7 @@ fn export_one_chunk_range(
         &crate::pipeline::progress::ChunkProgressHandle,
         &std::sync::Arc<std::sync::atomic::AtomicI64>,
     )>,
+    debris: &mut Vec<super::super::commit::PartRecord>,
 ) -> Result<ChunkOutcome> {
     let chunk_query = build_chunk_query_sql(
         base_query,
@@ -104,12 +105,17 @@ fn export_one_chunk_range(
     let dest = frame.dest;
     // Worker-safe half of commit (I1 + dest.write + fingerprint), draining
     // every part the sink produced (max_file_size rotation included).
-    let recs = super::super::commit::write_sink_parts(
+    let mut recs = Vec::new();
+    if let Err(e) = super::super::commit::write_sink_parts(
         dest.as_ref(),
         &mut sink,
         plan.validate.then_some(plan.format),
         |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-    )?;
+        &mut recs,
+    ) {
+        debris.append(&mut recs);
+        return Err(e);
+    }
     if plan.validate {
         summary.validated = Some(true);
     }
@@ -131,6 +137,7 @@ fn run_chunk_with_source_retries(
         &crate::pipeline::progress::ChunkProgressHandle,
         &std::sync::Arc<std::sync::atomic::AtomicI64>,
     )>,
+    debris: &mut Vec<super::super::commit::PartRecord>,
 ) -> Result<ChunkOutcome> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
@@ -197,6 +204,7 @@ fn run_chunk_with_source_retries(
             plan,
             summary,
             row_progress,
+            debris,
         ) {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -317,10 +325,13 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             end_key: ek.clone(),
         });
 
+        // Parts a FAILED chunk left durable: counted and logged below, never lost.
+        let mut debris = Vec::new();
         // Test-only: make ONE chunk fail without killing the process, so the
         // "not every claimed chunk completed" guard below can be exercised. A
         // panic hook cannot reach it — the guard only runs when the loop
-        // finishes, which a crash never does.
+        // finishes, which a crash never does. (`sink_part_write:N` fails a chunk
+        // MID-write instead, after its earlier parts are durable.)
         let chunk_result = match crate::test_hook::maybe_error_at_index("chunk_export", chunk_index)
         {
             Err(msg) => Err(anyhow::anyhow!(msg)),
@@ -333,6 +344,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 plan,
                 summary,
                 Some((&pb_handle, &streamed_rows)),
+                &mut debris,
             ),
         };
         match chunk_result {
@@ -397,6 +409,16 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     error: msg.clone(),
                     attempt: 1,
                 });
+                for rec in &debris {
+                    super::super::commit::record_part(
+                        plan,
+                        summary,
+                        Some(state),
+                        rec,
+                        super::super::commit::PartKind::Chunk { chunk_index },
+                        super::super::commit::UnitId::Chunk(chunk_index),
+                    );
+                }
                 state.fail_chunk_task(&run_id, chunk_index, &msg, retryable)?;
             }
         }

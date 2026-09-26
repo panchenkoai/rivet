@@ -179,11 +179,13 @@ pub(crate) fn read_keyset_page_bounded(
     // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
     // write_sink_parts drains every part the sink produced — the final temp file
     // plus anything maybe_split rotated at max_file_size — so rotation can't drop.
-    let parts = super::commit::write_sink_parts(
+    let mut parts = Vec::new();
+    super::commit::write_sink_parts(
         dest,
         &mut sink,
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
+        &mut parts,
     )?;
     Ok(Some(KeysetPage {
         parts,

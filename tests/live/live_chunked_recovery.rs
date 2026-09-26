@@ -1698,3 +1698,140 @@ fn a_live_range_checkpoint_run_refuses_a_concurrent_run() {
 fn a_live_keyset_checkpoint_run_refuses_a_concurrent_run() {
     a_live_checkpoint_run_refuses_a_concurrent_run(KEYSET);
 }
+
+// ─── A failed chunk's durable parts are counted, and never declared twice ────────
+
+/// 2000 rows of ~1 KiB, so a 250-row chunk rolls into several 64 KB parts.
+fn seed_rolling_table() -> PgTable {
+    let name = unique_name("frt_roll");
+    pg_connect()
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {name}; \
+             CREATE TABLE {name} (id BIGINT PRIMARY KEY, payload TEXT NOT NULL); \
+             INSERT INTO {name} SELECT g, repeat(md5(g::text), 32) FROM generate_series(1, 2000) g;"
+        ))
+        .unwrap();
+    PgTable::adopt(name)
+}
+
+/// Fail a chunked run by `err_at`, grade `files_committed` against the parts on disk, re-run plainly.
+fn a_failed_chunks_durable_parts_are_counted(runner: &[&str], err_at: &str) {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+    let table = seed_rolling_table();
+    let mut rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 250")
+        .export_line("compression: none")
+        .export_line("max_file_size: 64KB")
+        .export_line("parquet: { row_group_strategy: fixed_rows, row_group_rows: 100 }")
+        .source_line("tuning:")
+        .source_line("  batch_size: 100");
+    for line in runner {
+        rig = rig.export_line(line);
+    }
+    let rig = rig.duckdb_oracle();
+    let cfg = rig.config_path();
+
+    let failed = rig.run_args_env(&[], &[("RIVET_TEST_ERROR_AT", err_at)]);
+    assert!(!failed.status.success(), "the run must fail at {err_at}");
+    let on_disk = std::fs::read_dir(rig.out_dir())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "parquet")
+        })
+        .count() as i64;
+    let db = StateDb::next_to_config(&cfg);
+    let committed = db
+        .metrics_row(&db.latest_run_id(table.name()))
+        .files_committed
+        .unwrap_or(0);
+    assert!(
+        on_disk > 0,
+        "fixture inert: the failed run left no durable part"
+    );
+    assert_eq!(
+        committed, on_disk,
+        "files_committed must count every part the failed run left durable"
+    );
+
+    rig.run_ok();
+    duckdb_declared_assert_complete(
+        rig.oracle_dir(),
+        "id",
+        pg_count(table.name()),
+        "the re-run after a failed chunk must deliver every row exactly once",
+    );
+    if runner.contains(&"chunk_checkpoint: true") {
+        assert_eq!(
+            undeclared_parts(&rig.out_dir()),
+            Vec::<String>::new(),
+            "the resume must move the failed attempt's debris out of the prefix, not strand it"
+        );
+    }
+}
+
+/// Parquet at the prefix root that no Success manifest copy declares.
+fn undeclared_parts(dir: &std::path::Path) -> Vec<String> {
+    let mut declared = std::collections::BTreeSet::new();
+    let mut parts = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".parquet") {
+            parts.push(name);
+        } else if name.starts_with("manifest-") && name.ends_with(".json") {
+            let m: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if m["status"].as_str() == Some("success") {
+                for p in m["parts"].as_array().into_iter().flatten() {
+                    declared.insert(p["path"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+    }
+    parts.retain(|p| !declared.contains(p));
+    parts.sort();
+    parts
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_failed_parallel_checkpoint_chunk_counts_its_durable_part() {
+    a_failed_chunks_durable_parts_are_counted(
+        &["chunk_checkpoint: true", "parallel: 4"],
+        "chunk_export:1",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_parallel_checkpoint() {
+    a_failed_chunks_durable_parts_are_counted(
+        &["chunk_checkpoint: true", "parallel: 4"],
+        "sink_part_write:1",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_sequential_checkpoint() {
+    a_failed_chunks_durable_parts_are_counted(&["chunk_checkpoint: true"], "sink_part_write:1");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_parallel() {
+    a_failed_chunks_durable_parts_are_counted(&["parallel: 4"], "sink_part_write:1");
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_part_write_failing_mid_chunk_counts_the_earlier_parts_plain_sequential() {
+    a_failed_chunks_durable_parts_are_counted(&[], "sink_part_write:1");
+}

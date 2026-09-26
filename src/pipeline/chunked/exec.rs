@@ -132,16 +132,19 @@ pub(crate) fn run_chunked_sequential(
             // write_sink_parts drains every part the sink produced — the
             // final temp file plus anything maybe_split rotated at
             // max_file_size — so rotation cannot drop data.
-            let recs = super::super::commit::write_sink_parts(
+            let mut recs = Vec::new();
+            let wrote = super::super::commit::write_sink_parts(
                 dest.as_ref(),
                 &mut sink,
                 plan.validate.then_some(plan.format),
                 |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-            )?;
-            if plan.validate {
+                &mut recs,
+            );
+            if plan.validate && wrote.is_ok() {
                 summary.validated = Some(true);
             }
-            // record_part journals the ChunkCompleted event with file_name=Some.
+            // record_part journals the ChunkCompleted event with file_name=Some. Every
+            // durable part is recorded, a failed write's earlier siblings included.
             for rec in &recs {
                 super::super::commit::record_part(
                     plan,
@@ -156,6 +159,7 @@ pub(crate) fn run_chunked_sequential(
                     super::super::commit::UnitId::Chunk(i as i64),
                 );
             }
+            wrote?;
         } else {
             // Empty chunk: no file, but still journal completion so the run
             // record covers every chunk index. record_part only handles the
@@ -361,21 +365,23 @@ pub(crate) fn run_chunked_parallel(
                         // draining every part the sink produced (max_file_size
                         // rotation included). Touches no shared run state;
                         // record_part runs in the drain.
-                        let recs = super::super::commit::write_sink_parts(
+                        let mut recs = Vec::new();
+                        let wrote = super::super::commit::write_sink_parts(
                             &**shared_destination,
                             &mut sink,
                             plan_for_worker.validate.then_some(plan_for_worker.format),
                             |idx, count| super::super::commit::part_indexed_name(&base, idx, count),
-                        )?;
+                            &mut recs,
+                        );
                         let unit = super::super::commit::UnitId::Chunk(i as i64);
                         for rec in recs {
                             fan_r.part(unit, rec);
                         }
+                        wrote?;
                         // ADR-0029: the chunk is the commit unit its parts are recorded under.
                         fan_r.observe(sink.take_shape());
                         fan_r.contribute(unit, sink.take_checksums());
                     }
-
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     // Advance the chunk count; show the streamed-rows total (≥
                     // agg_rows, monotonic) so the bar never jumps backward from

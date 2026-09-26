@@ -149,6 +149,34 @@ fn attempt_key(file_name: &str) -> &str {
     }
 }
 
+/// Completed chunk index → the attempt key of the part that completed it.
+fn surviving_attempts(
+    tasks: &[crate::state::ChunkTaskInfo],
+) -> std::collections::BTreeMap<String, String> {
+    tasks
+        .iter()
+        .filter(|t| t.status == "completed")
+        .filter_map(|t| {
+            t.file_name
+                .as_deref()
+                .map(|f| (t.chunk_index.to_string(), attempt_key(f).to_string()))
+        })
+        .collect()
+}
+
+/// A chunk part counts for the run only if it is the attempt that COMPLETED its chunk.
+fn is_surviving_attempt(
+    file_name: &str,
+    surviving: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    match super::chunk_index_of(file_name) {
+        Some(idx) => surviving
+            .get(idx)
+            .is_some_and(|key| attempt_key(file_name) == key),
+        None => true,
+    }
+}
+
 pub(crate) fn rehydrate_manifest_parts_from_file_log(
     state: &StateStore,
     run_id: &str,
@@ -220,16 +248,7 @@ pub(crate) fn rehydrate_manifest_parts_probed(
     // Rotation siblings of the surviving attempt must still be kept: they share
     // its base (nonce included) and differ only by the `_p{n}` suffix
     // `part_indexed_name` appends, which `attempt_key` strips.
-    let surviving: std::collections::BTreeMap<String, String> = state
-        .list_chunk_tasks_for_run(run_id)?
-        .into_iter()
-        .filter(|t| t.status == "completed")
-        .filter_map(|t| {
-            t.file_name
-                .as_deref()
-                .map(|f| (t.chunk_index.to_string(), attempt_key(f).to_string()))
-        })
-        .collect();
+    let surviving = surviving_attempts(&state.list_chunk_tasks_for_run(run_id)?);
 
     let mut next_id = summary
         .manifest_parts
@@ -249,11 +268,8 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         // …nor resurrect a part that does not belong to the attempt that
         // COMPLETED its chunk: it is either an interrupted chunk's abandoned
         // write, or an earlier attempt superseded by the one that finished.
-        if let Some(idx) = super::chunk_index_of(&f.file_name) {
-            match surviving.get(idx) {
-                Some(key) if attempt_key(&f.file_name) == *key => {}
-                _ => continue,
-            }
+        if !is_surviving_attempt(&f.file_name, &surviving) {
+            continue;
         }
         if let Some(present) = present {
             let base = f.file_name.rsplit('/').next().unwrap_or(&f.file_name);
@@ -477,6 +493,7 @@ pub(crate) fn apply_m8_resume_decisions(
     // ── 5. Apply the matrix + reset misaligned chunk_tasks ─────────────
     let resume_plan = build_resume_plan(&manifest, &listing);
     let tasks = state.list_chunk_tasks_for_run(run_id)?;
+    let surviving = surviving_attempts(&tasks);
 
     // Index by file_name so we can find the chunk_task for a manifest
     // part in O(1).  Missing file_name (chunk that crashed before
@@ -520,6 +537,12 @@ pub(crate) fn apply_m8_resume_decisions(
 
     for (path, decision) in &resume_plan.per_part {
         match decision.decision {
+            // A failed chunk's durable debris is declared in the FAILED manifest this
+            // resume reads; its chunk re-exports, so adopting it would duplicate rows.
+            // Move it aside like any other surplus object (M9), never delete it.
+            ResumeDecision::Skip if !is_surviving_attempt(path, &surviving) => {
+                quarantine_move(&*dest, path, run_id, &plan.export_name, &mut stats);
+            }
             ResumeDecision::Skip => {
                 stats.skipped += 1;
                 // Hydrate the summary so the end-of-resume manifest carries
@@ -713,6 +736,35 @@ mod tests {
 
     use super::*;
     use crate::state::ChunkTaskInfo;
+
+    #[test]
+    fn only_the_attempt_that_completed_a_chunk_survives() {
+        let task = |idx: i64, status: &str, file: Option<&str>| ChunkTaskInfo {
+            chunk_index: idx,
+            start_key: String::new(),
+            end_key: String::new(),
+            status: status.into(),
+            attempts: 1,
+            last_error: None,
+            rows_written: None,
+            file_name: file.map(Into::into),
+        };
+        let won = "t_20260101_000000_chunk0_00000000000000aa.parquet";
+        let lost = "t_20260101_000000_chunk0_00000000000000bb.parquet";
+        let debris = "t_20260101_000000_chunk1_00000000000000cc_p0.parquet";
+        let s = surviving_attempts(&[task(0, "completed", Some(won)), task(1, "failed", None)]);
+        assert!(is_surviving_attempt(won, &s));
+        assert!(is_surviving_attempt(
+            "t_20260101_000000_chunk0_00000000000000aa_p1.parquet",
+            &s
+        ));
+        assert!(!is_surviving_attempt(lost, &s), "a superseded attempt");
+        assert!(!is_surviving_attempt(debris, &s), "a failed chunk's debris");
+        assert!(
+            is_surviving_attempt("t_single.parquet", &s),
+            "not a chunk part"
+        );
+    }
 
     // ── mutation-tier2 gap closure ───────────────────────────────────────────
     // `apply_m8_resume_decisions` — the resume-decision CORE (skip / rewrite /
