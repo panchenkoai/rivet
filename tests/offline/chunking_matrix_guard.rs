@@ -249,7 +249,10 @@ const MATRICES: &[(&str, usize)] = &[
     // on the drain.
     // Lowered 8 -> 6 the same day: open_forensics + source_harm_and_diagnosis on
     // cdc closed (HarmBracket shared with the batch tail; RED-proven live).
-    ("docs/runner-coverage-matrix.yaml", 6),
+    // Lowered 6 -> 1: partition_budget_footer_note proven per batch runner by a
+    // footer readback (which found the chunked runners' bare take+finish); only the
+    // cdc cell remains.
+    ("docs/runner-coverage-matrix.yaml", 1),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     ("docs/mode-transition-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a

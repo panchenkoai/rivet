@@ -1750,15 +1750,31 @@ def verify_batch_resume(led: Ledger) -> None:
     """`rivet run --resume` after a crash, per runner and engine: the live_chunked_recovery
     and live_resume modules, each case a ledger row. The blessed chain applies a sealed
     plan, where `--resume` is ignored, so this cell is the gate's only real resume."""
-    led.phase("batch resume · `rivet run --resume` after a crash (live_chunked_recovery + live_resume)")
+    _run_live_modules(led, "resume", "batch resume",
+                      "`rivet run --resume` after a crash (live_chunked_recovery + live_resume)",
+                      ["live_chunked_recovery", "live_resume"])
+
+
+def verify_partition_footer(led: Ledger) -> None:
+    """Every part each batch runner ships — the last one included — carries the
+    `rivet.partition_buckets` note, and its count equals DuckDB's own distinct-day count."""
+    _run_live_modules(led, "partition", "partition footer",
+                      "every shipped part notes its partitions, per runner (live_partition_footer)",
+                      ["live_partition_footer"])
+
+
+def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
+                      modules: list[str]) -> None:
+    """Run live_suite `modules` through the gate binary; one ledger row per test case."""
+    led.phase(f"{label} · {phase}")
     if not have("cargo"):
-        _skipped(led, "resume", "batch", "-", "-", "batch resume: cargo absent", "no cargo")
+        _skipped(led, scenario, "batch", "-", "-", f"{label}: cargo absent", "no cargo")
         return
-    log_path = work_dir() / "batch_resume.log"
+    log_path = work_dir() / f"{scenario}_{'_'.join(modules)}.log"
     p = run(
         ["cargo", "nextest", "run", "--manifest-path", str(ROOT / "Cargo.toml"),
          "--test", "live_suite", "--run-ignored", "all", "--no-fail-fast",
-         "-E", "test(/^live_chunked_recovery::/) | test(/^live_resume::/)"],
+         "-E", " | ".join(f"test(/^{m}::/)" for m in modules)],
         env=release_bin_env(),
         timeout=NO_TIMEOUT,
     )
@@ -1769,16 +1785,15 @@ def verify_batch_resume(led: Ledger) -> None:
             r"^\s+(PASS|LEAK|FAIL|TIMEOUT|SIGABRT|SIGSEGV) \[[^\]]*\] \(\d+/\d+\) \S+ (\S+)$",
             p.out, re.M)
     }
-    cases = sorted((v, n) for n, v in verdicts.items())
-    if not cases:
-        _failed(led, "resume", "batch", "-", "-",
-                f"batch resume: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
+    if not verdicts:
+        _failed(led, scenario, "batch", "-", "-",
+                f"{label}: no test ran (see {log_path})", _first_match(p.out, r"error|FAILED"))
         return
-    for verdict, name in cases:
+    for name, verdict in sorted(verdicts.items()):
         if verdict in ("PASS", "LEAK"):
-            _passed(led, "resume", "batch", "-", "-", f"batch resume · {name}")
+            _passed(led, scenario, "batch", "-", "-", f"{label} · {name}")
         else:
-            _failed(led, "resume", "batch", "-", "-", f"batch resume FAILED · {name} (see {log_path})")
+            _failed(led, scenario, "batch", "-", "-", f"{label} FAILED · {name} (see {log_path})")
 
 
 def verify_pool_split(led: Ledger) -> None:

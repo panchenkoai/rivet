@@ -187,6 +187,8 @@ mod live_parquet_roundtrip;
 mod live_partition_by;
 #[path = "live/live_partition_cloud.rs"]
 mod live_partition_cloud;
+#[path = "live/live_partition_footer.rs"]
+mod live_partition_footer;
 #[path = "live/live_performance_smoke.rs"]
 mod live_performance_smoke;
 #[path = "live/live_pg_state.rs"]

@@ -512,10 +512,10 @@ scenarios:
     cdc:            { test: the_recipe_column_types_reach_the_stream_and_the_recorded_spec }
 
   - id: partition_budget_footer_note
-    what: "the writer keeps every part inside the load job's partition cap (`PartBudget`, 4,000 distinct buckets of the `load.partition` column) and records the count it measured in the Parquet footer (`rivet.partition_buckets`), which the loader takes as the bound instead of the footer's min/max span. The budget itself is shared-seam (one `ExportSink`, one `on_batch_inner`); the NOTE is not — it is written when the writer CLOSES, and every runner closes its LAST part itself (`ExportSink::finish_writer`, formerly a bare `writer.take()` + `finish()` that shipped the final part of every export, and every keyset page, unnoted — bughunt round 4). The sink unit test proves the method; a per-runner proof reads the footers of the parts each runner actually shipped, which no test does yet."
-    single:         { gap: "no test reads the footer of a single-runner export's last part" }
-    chunked:        { gap: "no test reads the footer of a chunk's tail part" }
-    chunked_checkpoint: { gap: "as chunked" }
-    keyset:         { gap: "a keyset page is one part closed by the runner — the only path the note took before round 4 never ran here" }
-    mongo_parallel: { gap: "as keyset" }
+    what: "the writer keeps every part inside the load job's partition cap (`PartBudget`, 4,000 distinct buckets of the `load.partition` column) and records the count it measured in the Parquet footer (`rivet.partition_buckets`), which the loader takes as the bound instead of the footer's min/max span. The budget itself is shared-seam (one `ExportSink`, one `on_batch_inner`); the NOTE is not — it is written when the writer CLOSES, and every runner closes its LAST part itself (`ExportSink::finish_writer`, formerly a bare `writer.take()` + `finish()` that shipped the final part of every export, and every keyset page, unnoted — bughunt round 4). The per-runner proof reads the footers of the parts each runner actually shipped (tests/live/live_partition_footer.rs, DuckDB `parquet_kv_metadata` vs its own distinct-day count, every part including the last). Writing it found the chunked, parallel-chunked and parallel-checkpoint runners still closing their part with a bare `writer.take()` + `finish()` — every chunked part shipped unnoted — fixed 2026-09-26 and pinned by the offline `no_runner_closes_a_part_behind_finish_writers_back`."
+    single:         { test: the_single_runner_rotates_at_the_partition_budget_and_notes_every_part }
+    chunked:        { test: every_chunked_part_notes_its_partitions_sequential_and_parallel }
+    chunked_checkpoint: { test: every_chunked_checkpoint_part_notes_its_partitions_sequential_and_parallel }
+    keyset:         { test: every_keyset_page_notes_its_partitions_sequential_and_parallel }
+    mongo_parallel: { na: "a Mongo export's Arrow schema is the fixed {_id, document, meta} shape, so there is no date column for `load.partition` to name — PartBudget::resolve finds none and the part is unbudgeted by construction" }
     cdc:            { gap: "the drain writes parts through its own flush (src/source/cdc/sink.rs), with no PartBudget rotation and no rivet.partition_buckets note — both live only in pipeline/sink/mod.rs" }

@@ -457,3 +457,41 @@ fn assert_both_job_entry_points_do(needles: &[(&str, &str)], harm: &str) {
         offenders.join("\n")
     );
 }
+
+/// Every part closes through `ExportSink::finish_writer`, the one path that writes the footer note.
+#[test]
+fn no_runner_closes_a_part_behind_finish_writers_back() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/pipeline") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !rel.ends_with(".rs") || rel == "sink/mod.rs" || rel == "sink/tests.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            let product = text.split("#[cfg(test)]").next().unwrap_or_default();
+            for (i, line) in product.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or_default();
+                if code.contains("writer.take()") {
+                    offenders.push(format!("src/pipeline/{rel}:{}", i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a runner closes a part with a bare `writer.take()` — that part ships without the \
+         `rivet.partition_buckets` note the loader bounds it by. Call `sink.finish_writer()?`: {offenders:?}"
+    );
+}

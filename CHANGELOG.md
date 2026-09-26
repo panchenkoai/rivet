@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Chunked exports record their partition count in every part again.** The chunked,
+  parallel-chunked and parallel-checkpoint runners closed each part without the
+  `rivet.partition_buckets` footer note, so `rivet load` fell back to the part's min/max
+  date span — a wider bound than the part really holds, which can refuse a load that fits.
+  Every runner now closes parts the same way, and a live test reads every part's footer.
 - **SQL Server CDC refuses a checkpoint from another database or from before a restore.**
   The checkpoint held only an LSN, which every database accepts: pointed at another server's
   database, a run resumed there, exited 0 and captured nothing, skipping that database's
