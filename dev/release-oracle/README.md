@@ -41,12 +41,26 @@ codifies the manual CDC dogfood as a preflight: for each engine whose
    holds the per-engine anchor (PG slot / MySQL binlog ckpt / MSSQL from-LSN /
    Mongo resume token), and the re-run **re-reads** the delta (`id=4`), never
    losing it;
-5. proves **large-transaction atomicity** (the committed-boundary invariant, PG):
-   a single transaction of 12 rows at `rollover: 5` must roll as ONE unit (the
-   adapter marks only its LAST event `committed`), so a `cdc_after_ack` crash
-   holds the anchor BEFORE the whole transaction and recovery re-reads it entire —
-   **all 12 rows survive**;
-6. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
+5. proves **large-transaction atomicity on every engine** (`large-tx-atomic`): a
+   single transaction of 12 rows at `rollover: 5`, crashed at the hook right after
+   that engine's anchor moves (`cdc_after_ack` PG, `cdc_after_checkpoint_before_ack`
+   MySQL / SQL Server / Mongo); the union of declared parts after resume must equal
+   the **source's own 12 rows**. Per engine because `committed` is set by each
+   ADAPTER (PG `BEGIN`/`COMMIT`, MySQL XID, SQL Server rows sharing
+   `__$start_lsn`, Mongo per event by design — there the cell grades no-loss, not
+   no-split);
+6. proves **resume exactness** per engine (`resume-exact`): after a crash-recovery,
+   an IDLE run's own `manifest-<run_id>.json` and DuckDB over only its declared
+   parts hold **exactly 0** events, and one change then yields **exactly 1** —
+   scoped per run, never by prefix totals, so an engine that re-reads its whole
+   change table every run (at-least-*everything*) goes red;
+7. PG only: **starvation** (`pg-starvation` — a 200-row UNCAPTURED transaction
+   ahead of a 30-row captured backlog, `rollover: 5`; one bounded run must capture
+   the whole backlog, DuckDB over declared parts vs the source table) and **DDL
+   churn** (`pg-ddl-churn` — `pg_replication_slots.confirmed_flush_lsn` must advance
+   across a zero-yield run over 20 CREATE/DROP pairs; the SERVER is the oracle).
+   Both run in a throwaway database, since a slot decodes its whole database;
+8. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
    must populate the **same** table set, matching `golden/cdc_state_snapshot.json`
    (the reference snapshot — a release that stops populating `run_status`, or
    drifts the state schema, fails here).
@@ -60,6 +74,16 @@ makes the large-transaction leg go **RED** (the tx splits at the shared commit-L
 the mid-flush crash advances the anchor past it, resume skips the tail — **5/12**
 rows survive, 7 lost). Both mutants revert cleanly; the gate is green only on
 correct code.
+
+The lifecycle cells were RED-proven the same way (2026-09-26, mutant debug builds):
+SQL Server `resume_from_checkpoint` ignoring its checkpoint → `resume-exact[mssql]`
+idle run delivered 2 (want 0), +1 run 3 (want 1); SQL Server `committed: true` on
+every event → `large-tx-atomic[mssql]` 5/12 (ids 6-12 lost); the sink re-drain loop
+disabled → `pg-starvation` 0/30 **with exit 0**; `release_empty_frontier` disabled →
+`pg-ddl-churn` slot frozen. Each cell uses its own uniquely named table / slot /
+capture instance / `server_id`, and an engine whose CDC service is down (no logical
+WAL, binlog not ROW, Agent stopped, not a replica set) SKIPs every cell with that
+reason.
 
 Env-driven and **SKIP** (never a silent pass) when a URL is absent:
 

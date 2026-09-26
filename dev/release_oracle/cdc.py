@@ -432,7 +432,7 @@ def _cdc_mssql_crashdelta(url: str) -> None:
 
 
 def _cdc_mssql_cleanup(url: str, work: Path) -> None:
-    _sqlcmd(url, q="IF OBJECT_ID('dbo.orc_cdc_probe') IS NOT NULL DROP TABLE dbo.orc_cdc_probe;")
+    _lc_drop("mssql", url, "orc_cdc_probe")  # disable the capture instance BEFORE the drop
 
 
 def _cdc_mongo(url: str, work: Path) -> str | None:
@@ -526,27 +526,29 @@ class _Capture:
     prefix: str
 
 
-def _cdc_write_cfg(eng: str, url: str, work: Path, store: str, cdc_block: str) -> _Capture | None:
-    """Write $work/cdc.yaml pointing at $store, using the engine's `cdc:` block.
+def _cdc_write_cfg(
+    eng: str, url: str, work: Path, store: str, cdc_block: str, table: str = "orc_cdc_probe"
+) -> _Capture | None:
+    """Write $work/<table>.yaml pointing at $store, using the engine's `cdc:` block.
 
     The bash passed the bucket and prefix back through `$work/bkt` / `$work/pfx`
     files because a shell function has one return channel; here they ride back on
     the object.
     """
     bkt = _cfg("store", store, "bucket")
-    pfx = f"oracle-cdc/{_work_root().name}/{eng}/{store}/{work.name}"
+    pfx = f"oracle-cdc/{_work_root().name}/{eng}/{store}/{work.name}/{table}"
     dest = _store_dest(store, bkt, pfx)
     if dest is None:
         return None
     tls = "\n  tls: { accept_invalid_certs: true }" if eng == "mssql" else ""
-    yaml = work / "cdc.yaml"
+    yaml = work / ("cdc.yaml" if table == "orc_cdc_probe" else f"{table}.yaml")
     yaml.write_text(
         "source:\n"
         f"  type: {eng}\n"
         f'  url: "{url}"{tls}\n'
         "exports:\n"
-        "  - name: orc_cdc_probe\n"
-        "    table: orc_cdc_probe\n"
+        f"  - name: {table}\n"
+        f"    table: {table}\n"
         "    mode: cdc\n"
         "    format: parquet\n"
         f"    {cdc_block}\n"
@@ -666,10 +668,17 @@ def verify_cdc_e2e(led: Ledger) -> None:
             led.skipped(eng, "cdc", "e2e", "-", f"cdc[{eng}]: no {uvar}", "no url")
             continue
         any_engine = True
+        down = _cdc_engine_down(eng, url)
+        if down is not None:
+            for cell in ("e2e", "resume-exact", "large-tx-atomic"):
+                led.skipped(eng, "cdc", cell, "-", f"cdc[{eng}]: CDC service down — {down}", "service down")
+            continue
         led.phase(
             f"CDC end-to-end [{eng}] (anchor → typed changes → capture → store → "
             "independent readback + validate + state + crash)"
         )
+        _cdc_resume_exact(led, eng, url)
+        _cdc_large_tx_atomic(led, eng, url)
         work = _workdir()
         idc = spec.id_col
         cdc_block = setup_with_retry(spec, url, work)
@@ -741,99 +750,336 @@ def verify_cdc_e2e(led: Ledger) -> None:
 
     if not any_engine:
         return
-    _cdc_large_tx_atomic(led)
+    pg = os.environ.get("RIVET_CDC_POSTGRES_URL", "")
+    if pg and _cdc_engine_down("postgres", pg) is None:
+        _cdc_pg_starvation_and_churn(led, pg)
+    else:
+        for cell in ("pg-starvation", "pg-ddl-churn"):
+            led.skipped("postgres", "cdc", cell, "-", "cdc: no RIVET_CDC_POSTGRES_URL or its CDC service is down", "no pg cdc")
     _cdc_state_parity(led)
 
 
-# ── large-transaction atomicity (the committed-boundary invariant) ────────────
-# A source transaction LARGER than `rollover` must roll as ONE unit — the adapter
-# marks ONLY its last event `committed`, so the sink flushes+checkpoints+acks at
-# the true commit boundary, never mid-transaction. A crash mid-flush therefore
-# holds the anchor BEFORE the whole transaction; recovery re-reads it entire,
-# losing no tail. RED-proven against the `committed:true`-on-every-event mutant
-# (which rolls + acks mid-transaction, so a crash advances the anchor past the
-# committed prefix and the tail is skipped on resume). PG only — the slot-anchor
-# engine where the mid-transaction advance is observable (the sink code is shared,
-# so one engine proves the invariant).
-def _cdc_large_tx_atomic(led: Ledger) -> None:
-    url = os.environ.get("RIVET_CDC_POSTGRES_URL", "")
-    if not url:
-        led.skipped(
-            "postgres",
-            "cdc",
-            "large-tx-atomic",
-            "-",
-            "cdc large-tx-atomic: no RIVET_CDC_POSTGRES_URL",
-            "no pg cdc url",
-        )
-        return
-    _export_store_creds()
-    led.phase("CDC large-transaction atomicity (a >rollover transaction survives a mid-flush crash whole)")
-    work = _workdir()
-    slot = _slot_name("orc_ltx_", work)
-    bkt = _cfg("store", "s3", "bucket")
-    pfx = f"oracle-cdc-ltx/{_work_root().name}/{work.name}"
-    _psql(
-        url,
-        sql=(
-            "DROP TABLE IF EXISTS orc_ltx;\n"
-            f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots WHERE slot_name='{slot}';\n"
-            "CREATE TABLE orc_ltx (id int PRIMARY KEY);\n"
-            "ALTER TABLE orc_ltx REPLICA IDENTITY FULL;\n"
-        ),
-    )
-    dest = _s3_dest(bkt, pfx)
-    yaml = work / "ltx.yaml"
-    yaml.write_text(
-        f'source: {{ type: postgres, url: "{url}" }}\n'
-        "exports:\n"
-        "  - name: orc_ltx\n"
-        "    table: orc_ltx\n"
-        "    mode: cdc\n"
-        "    format: parquet\n"
-        f"    cdc: {{ slot: {slot}, until_current: true, rollover: 5 }}\n"
-        "    destination:\n"
-        f"{dest}\n"
-    )
-    rivet("run", "-c", str(yaml))  # anchor
-    # ONE transaction of 12 rows — larger than rollover 5. Must NOT split.
-    _psql(url, sql="BEGIN;\nINSERT INTO orc_ltx SELECT g FROM generate_series(1,12) g;\nCOMMIT;\n")
-    crashp = rivet("run", "-c", str(yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_ACK})  # crash mid-flush
-    rivet("run", "-c", str(yaml))  # recover
-    ids = _cdc_store_ids("s3", bkt, pfx, "id", work)
-    cnt = sum(1 for t in ids.split(",") if re.fullmatch(r"[0-9]+", t.strip()))
-    _psql(
-        url,
-        "-c",
-        f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots WHERE slot_name='{slot}'; "
-        "DROP TABLE IF EXISTS orc_ltx;",
-    )
-    # The crash MUST have fired: if the panic run exited 0 the hook never ran, no tail was
-    # left mid-flush, and 12/12 proves nothing about atomicity across a crash.
-    if cnt == 12 and not crashp.ok:
-        led.passed(
-            "postgres",
-            "cdc",
-            "large-tx-atomic",
-            "s3",
-            "cdc large-tx-atomic: all 12 rows of the >rollover transaction survived the mid-flush crash",
-            "12/12",
-        )
-    elif crashp.ok:
-        led.failed(
-            "postgres", "cdc", "large-tx-atomic", "s3",
-            "cdc large-tx-atomic: crash-hook INERT — the panic run exited 0, so no mid-flush "
-            f"crash was exercised (cnt={cnt}/12 proves nothing)", "crash-inert",
-        )
+# ── lifecycle cells: per-run exactness, large-tx on every engine, PG starvation ─
+# Each cell owns a UNIQUELY NAMED table (and slot / capture instance / server_id)
+# derived from its work dir, so it cannot collide with another gate on the shared
+# stand. The `committed` flag is set by each ADAPTER (PG test_decoding BEGIN/COMMIT,
+# MySQL XID, SQL Server rows sharing `__$start_lsn`, Mongo per event), so a
+# commit-boundary cell on one engine proves nothing about another; likewise each
+# engine resumes by its own mechanism, so resume exactness is graded per engine.
+def _cdc_engine_down(eng: str, url: str) -> str | None:
+    """Why this engine's CDC service cannot serve a capture, or None when it is up."""
+    if eng == "postgres":
+        p = _psql(url, "-tAc", "SHOW wal_level")
+        return None if p.ok and p.stdout.strip() == "logical" else f"postgres cdc down/not logical: {(p.stderr or p.stdout).strip()[-120:]}"
+    if eng == "mysql":
+        p = _mysql(url, "SELECT @@log_bin, @@binlog_format;")
+        return None if p.ok and "ROW" in p.stdout else f"mysql binlog down/not ROW: {(p.stderr or p.stdout).strip()[-120:]}"
+    if eng == "mssql":
+        p = _sqlcmd(url, q="SET NOCOUNT ON; SELECT status_desc FROM sys.dm_server_services WHERE servicename LIKE 'SQL Server Agent%'")
+        return None if p.ok and "Running" in p.stdout else f"mssql Agent not running (CDC capture job cannot run): {(p.stderr or p.stdout).strip()[-120:]}"
+    p = _mongosh(url, "print(db.hello().setName || '')")
+    return None if p.ok and p.stdout.strip() else f"mongo not a replica set / down: {(p.stderr or p.stdout).strip()[-120:]}"
+
+
+def _lc_token(work: Path) -> str:
+    """A lowercase identifier-safe token unique to one cell's work dir."""
+    return _slot_name("", work)[-12:]
+
+
+def _lc_create(eng: str, url: str, work: Path, t: str) -> str | None:
+    """Create table `t` (id int PK) and return the engine's `cdc:` keys, or None."""
+    if eng == "postgres":
+        slot = f"orc_{t}"
+        p = _psql(url, sql=f"DROP TABLE IF EXISTS {t};\nCREATE TABLE {t} (id int PRIMARY KEY);\nALTER TABLE {t} REPLICA IDENTITY FULL;\n")
+        return f"slot: {slot}" if p.ok else None
+    if eng == "mysql":
+        sid = 20000 + int.from_bytes(t.encode()[-6:], "big") % 40000
+        p = _mysql(url, f"DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id int PRIMARY KEY);")
+        return f'checkpoint: "{work}/{t}.ckpt", server_id: {sid}' if p.ok else None
+    if eng == "mssql":
+        ci = f"dbo_{t}"
+        p = _sqlcmd(url, sql=(
+            f"CREATE TABLE dbo.{t} (id int PRIMARY KEY);\n"
+            f"EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='{t}', @role_name=NULL, @capture_instance='{ci}';\n"
+        ))
+        if not p.ok or not wait_until(
+            lambda: "NULL" not in _sqlcmd(url, q=f"SET NOCOUNT ON; SELECT ISNULL(CONVERT(varchar(64), sys.fn_cdc_get_min_lsn('{ci}'), 1), 'NULL')").stdout,
+            tries=30, delay=1.5,
+        ):
+            return None
+        return f'capture_instance: {ci}, checkpoint: "{work}/{t}.ckpt"'
+    p = _mongosh(url, f'db.{t}.drop(); db.createCollection("{t}");')
+    return f'checkpoint: "{work}/{t}.ckpt"' if p.ok else None
+
+
+def _lc_insert(eng: str, url: str, t: str, ids: list[int]) -> bool:
+    """Insert `ids` as ONE source transaction (SQL Server: then wait for the capture job)."""
+    vals = ",".join(f"({i})" for i in ids)
+    if eng == "postgres":
+        return _psql(url, "-c", f"INSERT INTO {t} VALUES {vals};").ok
+    if eng == "mysql":
+        return _mysql(url, f"INSERT INTO {t} VALUES {vals};").ok
+    if eng == "mssql":
+        before = _mssql_max_lsn(url)
+        ok = _sqlcmd(url, q=f"INSERT INTO dbo.{t} VALUES {vals};").ok
+        _wait_mssql_captured(url, before)
+        return ok
+    docs = ",".join(f"{{_id:{i}}}" for i in ids)
+    return _mongosh(url, (
+        "const s=db.getMongo().startSession(); s.startTransaction(); "
+        f"s.getDatabase(db.getName()).getCollection('{t}').insertMany([{docs}]); s.commitTransaction(); print('ok')"
+    )).ok
+
+
+def _lc_source_ids(eng: str, url: str, t: str) -> list[int]:
+    """The source table's own id set, read through the engine's client (never rivet)."""
+    if eng == "postgres":
+        out = _psql(url, "-tAc", f"SELECT id FROM {t}").stdout
+    elif eng == "mysql":
+        out = _mysql(url, f"SELECT id FROM {t};").stdout
+    elif eng == "mssql":
+        out = _sqlcmd(url, q=f"SET NOCOUNT ON; SELECT id FROM dbo.{t}").stdout
     else:
-        led.failed(
-            "postgres",
-            "cdc",
-            "large-tx-atomic",
-            "s3",
-            f"cdc large-tx-atomic: only {cnt}/12 rows survived — the transaction split + lost its tail across the crash",
-            f"{cnt}/12 (ids={ids})",
-        )
+        out = _mongosh(url, f"db.{t}.find({{}},{{_id:1}}).forEach(d=>print(d._id))").stdout
+    return sorted(int(x) for x in out.split() if x.isdigit())
+
+
+def _lc_drop(eng: str, url: str, t: str) -> None:
+    """Remove every trace of the cell: slot / capture instance, then the table."""
+    if eng == "postgres":
+        _psql(url, sql=f"SELECT pg_drop_replication_slot('orc_{t}') FROM pg_replication_slots WHERE slot_name='orc_{t}';\nDROP TABLE IF EXISTS {t};\n")
+    elif eng == "mysql":
+        _mysql(url, f"DROP TABLE IF EXISTS {t};")
+    elif eng == "mssql":
+        _sqlcmd(url, sql=(
+            f"IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_{t}')\n"
+            f"  EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='{t}', @capture_instance='dbo_{t}';\n"
+            f"IF OBJECT_ID('dbo.{t}') IS NOT NULL DROP TABLE dbo.{t};\n"
+        ))
+    else:
+        _mongosh(url, f"db.{t}.drop();")
+
+
+def _lc_oracle():
+    """A DuckDB session (dev/release_oracle/duck.py) that reads the MinIO store."""
+    try:
+        from .duck import Oracle
+    except ImportError:
+        from duck import Oracle  # type: ignore[no-redef]
+    o = Oracle()
+    o.db.sql(scenarios.S3_HTTPFS_PREAMBLE)
+    return o
+
+
+def _lc_manifests(o, cap: _Capture) -> set[str]:
+    """The run-unique manifest copies currently under the capture's prefix."""
+    return {r[0] for r in o.rows(f"SELECT file FROM glob('s3://{cap.bucket}/{cap.prefix}/manifest-*.json')")}
+
+
+@dataclass(frozen=True)
+class _RunRead:
+    """One run's delivery, scoped by its own run-unique manifest."""
+
+    manifest_rows: int | None
+    ids: list[int]
+    why: str  # "" when exactly one new manifest was read
+
+
+def _lc_run_read(o, cap: _Capture, before: set[str], idc: str) -> _RunRead:
+    """Read the ONE manifest this run added and DuckDB over only the parts it declares."""
+    new = sorted(_lc_manifests(o, cap) - before)
+    if len(new) != 1:
+        return _RunRead(None, [], f"{len(new)} new run manifests (want exactly 1)")
+    doc = json.loads(o.scalar(f"SELECT content FROM read_text('{new[0]}')"))
+    parts = scenarios.success_part_names(doc)
+    ids: list[int] = []
+    if parts:
+        lst = ", ".join(f"'s3://{cap.bucket}/{cap.prefix}/{n}'" for n in parts)
+        ids = sorted(int(r[0]) for r in o.rows(f"SELECT CAST({idc} AS BIGINT) FROM read_parquet([{lst}])"))
+    return _RunRead(int(doc.get("row_count", -1)), ids, "")
+
+
+def _lc_union_ids(o, cap: _Capture, idc: str) -> list[int]:
+    """Distinct ids across EVERY success manifest's declared parts under the prefix."""
+    names: set[str] = set()
+    for f in _lc_manifests(o, cap):
+        names.update(scenarios.success_part_names(json.loads(o.scalar(f"SELECT content FROM read_text('{f}')"))))
+    if not names:
+        return []
+    lst = ", ".join(f"'s3://{cap.bucket}/{cap.prefix}/{n}'" for n in sorted(names))
+    return sorted(int(r[0]) for r in o.rows(f"SELECT DISTINCT CAST({idc} AS BIGINT) FROM read_parquet([{lst}])"))
+
+
+def _lc_run(o, cap: _Capture, idc: str, env: dict | None = None) -> tuple[Proc, _RunRead]:
+    """One `rivet run`, and what that run (only) delivered."""
+    before = _lc_manifests(o, cap)
+    p = rivet("run", "-c", str(cap.yaml), **({"env": env} if env else {}))
+    return p, _lc_run_read(o, cap, before, idc)
+
+
+def _cdc_resume_exact(led: Ledger, eng: str, url: str) -> None:
+    """C2a: after a crash-recovery, an idle run delivers exactly 0 and one change exactly 1."""
+    t0 = time.perf_counter()
+    work = _workdir()
+    t = f"orc_rx_{_lc_token(work)}"
+    idc = _ENGINES[eng].id_col
+    blk = _lc_create(eng, url, work, t)
+    cap = _cdc_write_cfg(eng, url, work, "s3", f"cdc: {{ until_current: true, {blk} }}", t) if blk else None
+    if cap is None:
+        _lc_drop(eng, url, t)
+        led.failed(eng, "cdc", "resume-exact", "-", f"cdc resume-exact[{eng}]: source setup failed", "setup")
+        return
+    reasons: list[str] = []
+    with _lc_oracle() as o:
+        rivet("run", "-c", str(cap.yaml))  # anchor (an idle first run)
+        _lc_insert(eng, url, t, [1, 2])
+        crashp = rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_FLUSH})
+        rp, rec = _lc_run(o, cap, idc)
+        ip, idle = _lc_run(o, cap, idc)
+        _lc_insert(eng, url, t, [3])
+        op, one = _lc_run(o, cap, idc)
+    _lc_drop(eng, url, t)
+    if crashp.ok:
+        reasons.append("crash-hook-inert")
+    for label, p, r, want in (("recover", rp, rec, [1, 2]), ("idle", ip, idle, []), ("+1", op, one, [3])):
+        if not p.ok:
+            reasons.append(f"{label}-run-failed[{(p.stderr or p.stdout).strip()[-160:]}]")
+        elif r.why:
+            reasons.append(f"{label}: {r.why}")
+        elif (label == "recover" and sorted(set(r.ids)) != want) or (label != "recover" and (r.ids != want or r.manifest_rows != len(want))):
+            reasons.append(f"{label}: manifest row_count={r.manifest_rows} duck ids={r.ids} want {want}")
+    wall = f"{time.perf_counter() - t0:.1f}s"
+    if reasons:
+        led.failed(eng, "cdc", "resume-exact", "s3", f"cdc resume-exact[{eng}]: {' '.join(reasons)} ({wall})", " ".join(reasons))
+    else:
+        led.passed(eng, "cdc", "resume-exact", "s3",
+                   f"cdc resume-exact[{eng}]: recovery re-read {{1,2}}, idle run manifest 0 / duck 0, "
+                   f"+1 change → manifest 1 / duck [3] ({wall})", wall)
+
+
+# The fault point that sits right after the ANCHOR moves: PG's anchor is the slot
+# (moved by the ack); the other engines' anchor is the checkpoint file (moved just
+# before `cdc_after_checkpoint_before_ack`).
+_LTX_HOOK = {"postgres": CDC_HOOK_ACK, "mysql": "cdc_after_checkpoint_before_ack",
+             "mssql": "cdc_after_checkpoint_before_ack", "mongo": "cdc_after_checkpoint_before_ack"}
+
+
+def _cdc_large_tx_atomic(led: Ledger, eng: str, url: str) -> None:
+    """C2b: a 12-row transaction at rollover 5 survives a mid-flush crash whole, per engine.
+
+    Mongo frames every event as its own commit by design (#158: per-event resume
+    tokens re-read, never skip), so on Mongo this grades no-loss, not no-split.
+    """
+    t0 = time.perf_counter()
+    work = _workdir()
+    t = f"orc_ltx_{_lc_token(work)}"
+    idc = _ENGINES[eng].id_col
+    blk = _lc_create(eng, url, work, t)
+    cap = _cdc_write_cfg(eng, url, work, "s3", f"cdc: {{ until_current: true, rollover: 5, {blk} }}", t) if blk else None
+    if cap is None:
+        _lc_drop(eng, url, t)
+        led.failed(eng, "cdc", "large-tx-atomic", "-", f"cdc large-tx-atomic[{eng}]: source setup failed", "setup")
+        return
+    rivet("run", "-c", str(cap.yaml))  # anchor
+    _lc_insert(eng, url, t, list(range(1, 13)))  # ONE transaction, larger than rollover 5
+    crashp = rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": _LTX_HOOK[eng]})
+    recp = rivet("run", "-c", str(cap.yaml))
+    src = _lc_source_ids(eng, url, t)
+    with _lc_oracle() as o:
+        got = _lc_union_ids(o, cap, idc)
+    _lc_drop(eng, url, t)
+    wall = f"{time.perf_counter() - t0:.1f}s"
+    if crashp.ok:
+        led.failed(eng, "cdc", "large-tx-atomic", "s3",
+                   f"cdc large-tx-atomic[{eng}]: crash-hook INERT — the {_LTX_HOOK[eng]} panic run exited 0, "
+                   f"so no mid-flush crash was exercised ({len(got)}/12 proves nothing) ({wall})", "crash-inert")
+    elif len(src) != 12 or got != src or not recp.ok:
+        led.failed(eng, "cdc", "large-tx-atomic", "s3",
+                   f"cdc large-tx-atomic[{eng}]: declared parts hold {len(got)} of the source's {len(src)} ids "
+                   f"(missing {sorted(set(src) - set(got))}; recover exit {recp.returncode}) — the transaction "
+                   f"split and lost its tail across the crash ({wall})", f"{len(got)}/{len(src)}")
+    else:
+        led.passed(eng, "cdc", "large-tx-atomic", "s3",
+                   f"cdc large-tx-atomic[{eng}]: all 12 source rows of the >rollover transaction survived a "
+                   f"{_LTX_HOOK[eng]} crash ({wall})", wall)
+
+
+def _cdc_pg_starvation_and_churn(led: Ledger, url: str) -> None:
+    """C3: PG reaches the open bound past a 200-row uncaptured tx; DDL churn advances the slot."""
+    t0 = time.perf_counter()
+    work = _workdir()
+    tok = _lc_token(work)
+    db, a, b = f"orc_c3_{tok}", f"orc_capa_{tok}", f"orc_forgnb_{tok}"
+    u = urllib.parse.urlsplit(url)
+    dburl = urllib.parse.urlunsplit(u._replace(path=f"/{db}"))
+    c = _container_for(url)
+    if c is None:
+        led.skipped("postgres", "cdc", "pg-starvation", "-", f"cdc pg-starvation: {_no_container(url).stderr}", "down")
+        return
+
+    def q(sql: str) -> Proc:
+        return docker_exec(c, "psql", "-U", "rivet", "-d", db, "-v", "ON_ERROR_STOP=1", "-tAq", stdin=sql)
+
+    def lsn(slot: str) -> str:
+        return q(f"SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name='{slot}';").stdout.strip()
+
+    if not _psql(url, "-c", f"CREATE DATABASE {db};").ok:
+        led.failed("postgres", "cdc", "pg-starvation", "-", f"cdc pg-starvation: CREATE DATABASE {db} failed", "setup")
+        return
+    try:
+        # Fixture 1 — a 200-row UNCAPTURED transaction ahead of a 30-row captured backlog.
+        q(f"CREATE TABLE {a} (id int PRIMARY KEY); CREATE TABLE {b} (id int PRIMARY KEY);")
+        cap = _cdc_write_cfg("postgres", dburl, work, "s3",
+                             f"cdc: {{ slot: orc_s_{tok}, until_current: true, rollover: 5 }}", a)
+        assert cap is not None
+        rivet("run", "-c", str(cap.yaml))  # anchor: creates the slot
+        q(f"INSERT INTO {b} SELECT g FROM generate_series(1,200) g;")
+        q("".join(f"INSERT INTO {a} VALUES ({i});\n" for i in range(30)))  # 30 transactions
+        with _lc_oracle() as o:
+            o.db.sql("INSTALL postgres; LOAD postgres;")
+            o.db.sql(f"ATTACH '{dburl}' AS pg (TYPE postgres, READ_ONLY)")
+            before = _lc_manifests(o, cap)
+            runp = rivet("run", "-c", str(cap.yaml))
+            r = _lc_run_read(o, cap, before, "id")
+            src = sorted(int(x[0]) for x in o.rows(f"SELECT id FROM pg.public.{a}"))
+        q(f"SELECT pg_drop_replication_slot('orc_s_{tok}');")
+        wall1 = f"{time.perf_counter() - t0:.1f}s"
+        if runp.ok and not r.why and len(src) == 30 and sorted(set(r.ids)) == src:
+            led.passed("postgres", "cdc", "pg-starvation", "s3",
+                       f"cdc pg-starvation: one bounded run past a 200-row uncaptured tx captured all "
+                       f"{len(src)} backlog rows (duck over declared parts == source) ({wall1})", wall1)
+        else:
+            led.failed("postgres", "cdc", "pg-starvation", "s3",
+                       f"cdc pg-starvation: run exit {runp.returncode}, {r.why or ''} captured "
+                       f"{len(set(r.ids))} of the source's {len(src)} backlog rows — the slot starved on the "
+                       f"uncaptured span ({wall1})", f"{len(set(r.ids))}/{len(src)}")
+
+        # Fixture 2 — DDL churn on an idle database must advance the slot (read the SERVER).
+        t1 = time.perf_counter()
+        e = f"orc_churn_{tok}"
+        q(f"CREATE TABLE {e} (id int PRIMARY KEY);")
+        cap2 = _cdc_write_cfg("postgres", dburl, work, "s3", f"cdc: {{ slot: orc_c_{tok}, until_current: true }}", e)
+        assert cap2 is not None
+        rivet("run", "-c", str(cap2.yaml))  # anchor: creates the slot
+        lsn0 = lsn(f"orc_c_{tok}")
+        q("".join(f"CREATE TABLE {e}_j{i} (id int); DROP TABLE {e}_j{i};\n" for i in range(20)))
+        churnp = rivet("run", "-c", str(cap2.yaml))
+        lsn1 = lsn(f"orc_c_{tok}")
+        adv = q(f"SELECT '{lsn1}'::pg_lsn > '{lsn0}'::pg_lsn;").stdout.strip() == "t" if lsn0 and lsn1 else False
+        q(f"SELECT pg_drop_replication_slot('orc_c_{tok}');")
+        wall2 = f"{time.perf_counter() - t1:.1f}s"
+        if churnp.ok and adv:
+            led.passed("postgres", "cdc", "pg-ddl-churn", "s3",
+                       f"cdc pg-ddl-churn: confirmed_flush_lsn advanced {lsn0} → {lsn1} across a zero-yield "
+                       f"DDL-churn run ({wall2})", wall2)
+        else:
+            led.failed("postgres", "cdc", "pg-ddl-churn", "s3",
+                       f"cdc pg-ddl-churn: run exit {churnp.returncode}, confirmed_flush_lsn {lsn0!r} → {lsn1!r} "
+                       f"did not advance — the empty-transaction span pins the slot ({wall2})", "pinned")
+    finally:
+        q("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+          f"WHERE slot_name IN ('orc_s_{tok}','orc_c_{tok}');")
+        _psql(url, "-c", f"DROP DATABASE IF EXISTS {db};")
 
 
 # ── SQLite-vs-Postgres state PARITY + reference snapshot (эталонный слепок) ───
