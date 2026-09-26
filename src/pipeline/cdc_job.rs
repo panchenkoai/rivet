@@ -74,6 +74,57 @@ fn cdc_ignored_meta_warning(export: &ExportConfig) -> Option<String> {
     })
 }
 
+/// The run-start warning naming batch-only knobs a CDC export set: the drain ignores them.
+fn cdc_ignored_knobs_warning(export: &ExportConfig) -> Option<String> {
+    let set = [
+        ("quality", export.quality.is_some()),
+        ("parquet", export.parquet.is_some()),
+        (
+            "compression",
+            export.compression != crate::config::CompressionType::default(),
+        ),
+        ("compression_level", export.compression_level.is_some()),
+        ("compression_profile", export.compression_profile.is_some()),
+        ("max_file_size", export.max_file_size.is_some()),
+        (
+            "shape_drift_warn_factor",
+            export.shape_drift_warn_factor.is_some(),
+        ),
+    ];
+    let named: Vec<&str> = set.iter().filter(|(_, on)| *on).map(|(k, _)| *k).collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "export '{}': mode: cdc ignores {} on the change stream — the drain writes its own \
+             parts (fixed compression per format, rolled by `cdc.rollover`) and runs no quality checks. They apply only \
+             to an `initial: snapshot` / `backfill:` baseline. Remove them, or use a batch mode \
+             if the captured changes need them.",
+            export.name,
+            named.join(", ")
+        )
+    })
+}
+
+/// The run-start warning for `run --validate` / `--reconcile` on a CDC export: the drain skips both.
+pub(super) fn cdc_ignored_run_flags_warning(
+    export: &str,
+    validate: bool,
+    reconcile: bool,
+) -> Option<String> {
+    let named: Vec<&str> = [("--validate", validate), ("--reconcile", reconcile)]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(k, _)| *k)
+        .collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "export '{export}': {} checks only an `initial: snapshot` / `backfill:` baseline — \
+             the change stream is not validated or reconciled by `rivet run`. Run `rivet \
+             validate` over the destination to check the captured parts.",
+            named.join(" and ")
+        )
+    })
+}
+
 pub(super) fn run_cdc_export(
     config_path: &str,
     config: &Config,
@@ -82,7 +133,13 @@ pub(super) fn run_cdc_export(
 ) -> (Result<()>, RunSummary) {
     // No-silent-config-drop: warn (don't hard-fail — a shared default may set
     // meta_columns for a mixed batch+CDC config) that the request has no effect.
-    if let Some(msg) = cdc_ignored_meta_warning(export) {
+    for msg in [
+        cdc_ignored_meta_warning(export),
+        cdc_ignored_knobs_warning(export),
+    ]
+    .into_iter()
+    .flatten()
+    {
         log::warn!("{msg}");
     }
     let started = std::time::Instant::now();
@@ -231,6 +288,7 @@ pub(super) fn run_cdc_export(
 
     record_metric(state, config, export, &summary);
     finalize_run_report(config_path, &summary, "cdc");
+    crate::notify::maybe_send(config.notifications.as_ref(), &summary);
     (outcome, summary)
 }
 
@@ -1115,6 +1173,37 @@ mod tests {
             cdc_ignored_meta_warning(&e).is_none(),
             "row_hash is emitted on the CDC leg now, so claiming it is ignored would be a lie"
         );
+    }
+
+    #[test]
+    fn cdc_names_every_batch_only_knob_it_ignores_and_only_those() {
+        let mut e = crate::config::sample_export("orders");
+        e.compression = crate::config::CompressionType::default();
+        assert!(
+            cdc_ignored_knobs_warning(&e).is_none(),
+            "defaults must not warn"
+        );
+        e.quality = serde_yaml_ng::from_str("row_count_min: 1").ok();
+        e.compression = crate::config::CompressionType::Gzip;
+        e.max_file_size = Some("256MB".into());
+        let msg = cdc_ignored_knobs_warning(&e).expect("set knobs must warn");
+        assert!(
+            msg.contains("ignores quality, compression, max_file_size on the change stream"),
+            "names exactly the set knobs, in order: {msg}"
+        );
+        assert!(msg.contains("'orders'"), "names the export: {msg}");
+    }
+
+    #[test]
+    fn cdc_warns_that_run_validate_and_reconcile_skip_the_change_stream() {
+        assert!(cdc_ignored_run_flags_warning("orders", false, false).is_none());
+        let msg = cdc_ignored_run_flags_warning("orders", true, true).expect("must warn");
+        assert!(
+            msg.starts_with("export 'orders': --validate and --reconcile checks only"),
+            "names both flags: {msg}"
+        );
+        let msg = cdc_ignored_run_flags_warning("orders", false, true).expect("must warn");
+        assert!(msg.contains("'orders': --reconcile checks only"), "{msg}");
     }
 
     // The snapshot (batch) leg and the CDC stream are two legs of ONE dataset the

@@ -1553,6 +1553,13 @@ fn run_export_job_inner(
     // plan/strategy machinery entirely and run through the dedicated CDC runner,
     // which produces the same (Result, RunSummary) contract + metric row.
     if dispatches_to_cdc_runner(export.mode) {
+        if let Some(msg) = super::cdc_job::cdc_ignored_run_flags_warning(
+            &export.name,
+            opts.validate,
+            opts.reconcile,
+        ) {
+            log::warn!("{msg}");
+        }
         // `initial: snapshot`: anchor first, then each pending table's full
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails
@@ -1565,6 +1572,7 @@ fn run_export_job_inner(
                 Ok(p) => p,
                 Err(e) => {
                     let summary = synthetic_failed_summary(&export.name, &e);
+                    crate::notify::maybe_send(config.notifications.as_ref(), &summary);
                     return (Err(e), summary);
                 }
             };

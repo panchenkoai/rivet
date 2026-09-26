@@ -15,6 +15,8 @@ CELLS = {
     "mysql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops": "mysql",
     "pg_cdc_retyped_column_refuses_under_fail_and_defers_not_drops": "postgres",
     "mssql_cdc_retyped_column_refuses_under_fail_and_defers_not_drops": "mssql",
+    "a_failed_cdc_run_sends_the_failure_notification": "mysql",
+    "a_cdc_export_names_the_batch_knobs_its_drain_ignores": "mysql",
 }
 
 

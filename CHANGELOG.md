@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A CDC run sends its notifications and says which batch settings it ignores.** A failed CDC
+  run never reached `notifications:`, so an `on: [failure]` webhook stayed silent while the
+  stream was down. It now fires like a batch run's. `quality:`, `parquet:`, `compression*`,
+  `max_file_size` and `shape_drift_warn_factor` apply only to a CDC export's snapshot baseline,
+  and `run --validate` / `--reconcile` likewise check only the baseline; each run now warns,
+  naming the ones that were set.
+- **The release gate grades what it used to wave through.** A run that bypasses the
+  run-integrity facade only warns in a release build, and the gate now fails on that warning.
+  Without `cargo-llvm-cov` the offline battery still runs and is graded instead of skipping.
 - **Reading CDC from a replica is verified on every engine.** Live tests and release-gate rows
   now cover a PostgreSQL 16 standby (continuous mode; the default bounded mode still refuses,
   and its message no longer claims a standby cannot host a slot), a SQL Server read-scale
@@ -10,9 +19,7 @@
 - **MySQL CDC refuses a replica that does not re-log what it applies.** With
   `log_replica_updates = OFF` (MySQL's default) a replica's binlog holds none of the primary's
   changes; reading it captured nothing and exited 0. rivet now refuses such a replica at start.
-  MySQL only: the replica table in the CDC reference now says which engines' replica reads are
-  verified (MySQL), refused (PostgreSQL's default mode on a standby) or untested (SQL Server,
-  MongoDB).
+  MySQL only: the other engines have no such setting to get wrong.
 - **SQL Server incremental exports work on a legacy `DATETIME` cursor.** The saved boundary was
   rendered with six fractional digits, which `DATETIME` rejects, so every run after the first
   failed with `Conversion failed`. A rivet-rendered timestamp cursor is now typed `DATETIME2(7)`,
