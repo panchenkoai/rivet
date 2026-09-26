@@ -1748,7 +1748,7 @@ def verify_pool_e2e(led: Ledger) -> None:
 
 def verify_pool_split(led: Ledger) -> None:
     """The `--pool --split` scenarios AS THEIR OWN GATE CELLS (#167): a dominating
-    export is broken into N range sub-exports over its key span. Three scenarios,
+    export is broken into N range sub-exports over its key span. Four scenarios,
     each an independent live oracle in tests/live/live_pool_toxiproxy.rs
     (`pool_split_*`):
 
@@ -1757,7 +1757,9 @@ def verify_pool_split(led: Ledger) -> None:
       * manifest coherence — validate does not flag a sibling unit's parts as
         untracked, yet a true foreign orphan still is;
       * per-unit resume — a crashed split re-runs ONLY the incomplete units on
-        `--resume` (skip complete, resume crashed), no gap/no dup.
+        `--resume` (skip complete, resume crashed), no gap/no dup;
+      * NULL-keyed rows — a split over a nullable chunk_column refuses before any
+        unit writes (without the refusal it delivered 200000 of 200002 rows).
 
     Separate from `verify_pool_e2e` so the split coverage is a NAMED matrix cell,
     not bundled invisibly into the pool cell. Needs toxiproxy (:8474) + postgres

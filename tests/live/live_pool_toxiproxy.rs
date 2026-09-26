@@ -556,3 +556,80 @@ fn pool_split_resume_recovers_a_crashed_partial_with_no_gap_or_dup() {
 
     let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
 }
+
+/// `--pool --split` over a nullable `chunk_column` must refuse before any unit runs:
+/// each range window excludes NULL, so a split would drop NULL-keyed rows under a
+/// successful run. The durations are primed while every key is set (the un-split
+/// chunked path refuses NULL keys on its own), then NULL-keyed rows arrive.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pool_split_over_a_nullable_chunk_column_refuses_instead_of_dropping_null_keys() {
+    const HEAVY: i64 = 200_000;
+    let tbl = unique_name("pool_split_nullable");
+    let mut c = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl};
+         CREATE TABLE {tbl} (id BIGINT, a TEXT, b TEXT);
+         INSERT INTO {tbl} SELECT g, md5(g::text), md5((g*3)::text) FROM generate_series(1, {HEAVY}) g;"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    let rig = Rig::pg_batch("pool_split_nullable_giant")
+        .query(&format!("SELECT id, a, b FROM {tbl}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50000")
+        .export_line("parallel_safe: true")
+        .also_export(
+            "pool_split_nullable_small",
+            "SELECT g AS id, md5(g::text) AS payload FROM generate_series(1, 1000) g",
+        )
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[]);
+    assert!(
+        prime.status.success(),
+        "priming run must succeed:\n{}",
+        String::from_utf8_lossy(&prime.stderr)
+    );
+
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (NULL, 'n1', 'n1'), (NULL, 'n2', 'n2')"
+    ))
+    .unwrap();
+    for d in [rig.out_dir(), rig.out_dir_for("pool_split_nullable_small")] {
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    let out = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &[],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let range_parts = files_with_extension(&rig.out_dir(), "parquet")
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("pool_split_nullable_giant#"))
+        })
+        .count();
+    let delivered = (range_parts > 0).then(|| duckdb_total_parquet_rows(&rig.out_dir()) as i64);
+    assert!(
+        !out.status.success()
+            && log.contains(
+                "`--pool --split` over chunk_column 'id' would SILENTLY DROP NULL-keyed rows"
+            ),
+        "a split over NULL-keyed rows must refuse (source holds {} rows, the split delivered {delivered:?}):\n{log}",
+        HEAVY + 2
+    );
+    assert_eq!(
+        range_parts, 0,
+        "the refusal must come before any range unit writes"
+    );
+}
