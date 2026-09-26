@@ -440,13 +440,13 @@ fn split_go(sql: &str) -> Vec<String> {
 /// For DERIVING an enumeration from the catalog rather than re-typing it in a
 /// test — a hand-written column list grades only what its author remembered, and
 /// silently stops covering a column the fixture gains later.
-pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
+fn query_strings_at(port: u16, sql: &str) -> Vec<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("mssql: tokio runtime");
     rt.block_on(async {
-        let mut client = connect_at(1434).await;
+        let mut client = connect_at(port).await;
         let rows = client
             .simple_query(sql)
             .await
@@ -458,6 +458,15 @@ pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
             .filter_map(|r| r.get::<&str, _>(0).map(String::from))
             .collect()
     })
+}
+
+pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
+    query_strings_at(1434, sql)
+}
+
+/// First column of every row as a string, against the shared `mssql` (`:1433`).
+pub fn mssql_query_strings(sql: &str) -> Vec<String> {
+    query_strings_at(1433, sql)
 }
 
 /// Seed ONE transaction spanning `ids` on SQL Server — a scenario, not a `format!`

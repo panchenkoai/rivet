@@ -153,6 +153,8 @@ mod live_mssql_chunked_recovery;
 mod live_mssql_crash_recovery;
 #[path = "live/live_mssql_harm_permission.rs"]
 mod live_mssql_harm_permission;
+#[path = "live/live_mssql_incremental_isolation.rs"]
+mod live_mssql_incremental_isolation;
 #[path = "live/live_mssql_reconcile_repair.rs"]
 mod live_mssql_reconcile_repair;
 #[path = "live/live_mssql_resume.rs"]
