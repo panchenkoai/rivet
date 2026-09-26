@@ -24,6 +24,21 @@ python3 -m dev.release_oracle --engines postgres,mysql
 | **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source, then one DuckDB session attaches the source and compares **every value** of the declared parts (`value_diff.compare_to_parquet`; Mongo's `document` JSON is unpacked into the source's columns). A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
 | **gc_survival** | the concurrent-extract bucket-erasure guard (spare an in-flight part while a run is active, delete a true orphan). Runs in the BigQuery stage (needs a warehouse load target). |
 
+### Oracle (23-free, batch only)
+
+The gate starts its own `gvenzl/oracle-free:23-slim-faststart` on `:55023` (3 GiB cap, readiness
+waits up to ~5 min, a SKIP when it never answers) and seeds it from `seeds/common/oracle.sql` plus
+the gate-owned `oracle_tz_probe.sql` (TIMESTAMP WITH TIME ZONE by offset and by region name,
+which the canonical type matrix lacks). DuckDB has no Oracle scanner, so the SOURCE side is read by
+**python-oracledb** (thin, uv-pinned, imported lazily): exact `Decimal`s, LOBs read in full so an
+empty LOB is `''`/`b''` and not NULL, session zone UTC, and each `WITH TIME ZONE` column projected
+`AT TIME ZONE 'UTC'` (the thin driver drops the offset and refuses region names). Oracle runs
+verdicts, integrity+types (type matrix + tz probe, value by value), keyset_parallel, load (all
+three stores, the source registered into the DuckDB session through pyarrow), corruption_is_detected
+and blessed_path (with bq_cycle). CDC cells are `na` (`mode: cdc` is refused); `row_hash` SKIPs
+(Oracle stores `''` as NULL, so the probe's rows 3 and 4 are one row); blessed_flow and not_inert
+are recorded gaps (they ride the CDC stand in `cdc.py`, which has no Oracle).
+
 ## CDC end-to-end stage (all engines, independent oracle)
 
 The batch scenarios above never exercise **change-data-capture** — the most

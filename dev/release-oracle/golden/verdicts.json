@@ -177,6 +177,92 @@
       "verdict": "ACCEPTABLE"
     }
   },
+  "oracle": {
+    "CONTENT_ITEMS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EVENTS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EXT_BIGINT_PK_DUAL_TS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EXT_BIGINT_UNSIGNED_PK": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EXT_DECIMAL_KEY": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EXT_HEAP_NO_KEY": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "EXT_INT_PK_DUAL_TS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EXT_NO_PK_NO_TS": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "EXT_ORDER_KEYED": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "EXT_REF_ID_HISTORY": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "EXT_SPARSE_KEY": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "EXT_UNINDEXED_ID": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "ORDERS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ORDERS_COALESCE": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ORDERS_SPARSE": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "ORDERS_SPARSE_FOR_EXPORT": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "PAGE_VIEWS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "RIVET_TYPE_MATRIX": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "RIVET_TZ_PROBE": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "ROW_HASH_PROBE": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "USERS": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    }
+  },
   "postgres": {
     "array_matrix": {
       "strategy": "full",

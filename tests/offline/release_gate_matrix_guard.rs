@@ -71,7 +71,9 @@ const ENGINES: [&str; 5] = ["postgres", "mysql", "mssql", "mongo", "oracle"];
 // leftover: the message-truth class, in the comment over a ratchet.)
 // Raised 2 -> 11 (2026-09-26): the Oracle column's honest gaps — 8 scenario cells + the
 // un-gated `grid.oracle` version (the gate does not bring Oracle up yet).
-const GAP_RATCHET: usize = 11;
+// Lowered 11 -> 4 (2026-09-26): the gate brings up oracle 23-free; 6 scenario cells flipped to
+// test, blessed_flow + not_inert remain gaps (they ride the CDC stand, which has no Oracle).
+const GAP_RATCHET: usize = 4;
 
 fn load(path: &str) -> Value {
     let s = super::nonvacuity::subject_text(path);

@@ -136,8 +136,10 @@ SCENARIOS: dict[str, dict] = {
     "full":     {"block": "    mode: full", "applies": lambda t, e: True},
     "keyset":   {"block": "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 20000",
                  "applies": lambda t, e: e != "mongo"},
+    # Oracle range chunking needs NUMBER(p <= 18, 0) (docs/reference/oracle.md); content_items.id is
+    # NUMBER(19), which rivet refuses at plan by design.
     "chunked":  {"block": "    mode: chunked\n    chunk_column: id\n    chunk_size: 20000",
-                 "applies": lambda t, e: e != "mongo"},
+                 "applies": lambda t, e: e != "mongo" and not (e == "oracle" and t == "content_items")},
     # `{date_col}` is substituted per table: the golden seed does NOT use one
     # name everywhere (orders has `ordered_at`, not `created_at`), and hard-
     # coding one produced a plan failure that looked like a product defect for
@@ -146,6 +148,17 @@ SCENARIOS: dict[str, dict] = {
     "datewin":  {"block": "    mode: chunked\n    chunk_column: {date_col}\n    chunk_by_days: 30",
                  "applies": lambda t, e: e != "mongo" and t in DATE_COLUMN},
 }
+
+
+def _block(engine: str, scenario: str, table: str) -> str:
+    """The scenario's strategy block, its columns spelled as the engine's catalog does."""
+    block = SCENARIOS[scenario]["block"].format(date_col=DATE_COLUMN.get(table, "created_at"))
+    if engine != "oracle":
+        return block
+    return "\n".join(
+        f"{k}: {scenarios.key_column(engine, v.strip())}" if k.strip() in ("chunk_by_key", "chunk_column") else line
+        for line in block.splitlines() for k, _, v in [line.partition(":")]
+    )
 
 
 def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
@@ -433,7 +446,7 @@ def sc_blessed_path(
         f"exports:\n"
         f"  - name: blessed\n"
         f"    table: {table}\n"
-        f"{SCENARIOS[scenario]['block'].format(date_col=DATE_COLUMN.get(table, 'created_at'))}\n"
+        f"{_block(engine, scenario, table)}\n"
         f"    format: parquet\n"
         f"{dest_block}\n"
     )

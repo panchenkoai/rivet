@@ -51,6 +51,7 @@ PROBE = {
     "postgres": "public.row_hash_probe",
     "mysql": "row_hash_probe",
     "mssql": "dbo.row_hash_probe",
+    "oracle": "row_hash_probe",
 }
 
 #: rivet's data-integrity exit code. A corrupted part must be classified as
@@ -195,7 +196,7 @@ def verify_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) 
             "wrong exit",
         )
         return
-    if "value checksum mismatch" not in text or "column 'b'" not in text:
+    if "value checksum mismatch" not in text or "column 'b'" not in text.lower():  # Oracle names it 'B'
         _failed(
             led, engine, tag, "corruption_is_detected", "-",
             f"corruption-detected[{engine}]: failed, but not as a value-checksum mismatch naming the "

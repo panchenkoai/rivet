@@ -161,7 +161,8 @@ class Scope:
 
     def __init__(self, engine: str, tag: str) -> None:
         self.engine, self.tag = engine, tag
-        self.key = f"{engine}_{tag.replace('.', '_')}"
+        # `-` too: the key names BigQuery datasets, which allow only [A-Za-z0-9_] (oracle `23-free`).
+        self.key = f"{engine}_{tag.replace('.', '_').replace('-', '_')}"
 
     def name(self, kind: str, *parts: str) -> str:
         """An identifier-safe name: `<kind>_<engine>_<tag>_<parts…>`."""
@@ -446,7 +447,7 @@ def _golden_put(path: Path, engine: str, key: str, got: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     golden = _golden_load(path)
     golden.setdefault(engine, {})[key] = json.loads(got)
-    path.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(golden, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 def docker_names() -> list[str]:
@@ -603,6 +604,14 @@ def source_query(engine: str, url: str, query: str) -> str:
         argv = [*sqlcmd(container), "-S", "localhost", "-U", "sa",
                 "-P", "Rivet_Passw0rd!", "-d", "rivet", "-h", "-1", "-W",
                 "-Q", f"SET NOCOUNT ON; {query}"]
+    elif engine == "oracle":
+        # python-oracledb, from the host: the independent reader (no DuckDB scanner exists).
+        from .value_diff import oracle_available, oracle_rows
+
+        if not oracle_available():
+            return ""
+        rows = oracle_rows(url, query)
+        return str(next(iter(rows[0].values()))) if rows else ""
     elif engine == "mongo":
         # countDocuments({}) not countDocuments(): the legacy 4.4 shell rejects the no-arg form.
         argv = [mongo_shell(container), "mongodb://127.0.0.1:27017/rivet", "--quiet",
@@ -620,6 +629,7 @@ def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> st
         "postgres": f"SELECT count(*)||' '||count(DISTINCT {id_col}) FROM {table}",
         "mysql": concat,
         "mssql": concat,
+        "oracle": f"SELECT count(*)||' '||count(DISTINCT {id_col}) FROM {table}",
         "mongo": f"db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length",
     }.get(engine)
     return source_query(engine, url, query) if query else ""
@@ -656,6 +666,11 @@ def _fidelity_check(engine: str, key: str, got: str) -> bool:
         return True
     want = _golden_get(GOLDEN_DUCKDB, engine, key)
     return bool(want) and _json_canon(got) == want
+
+
+def key_column(engine: str, col: str = "id") -> str:
+    """A strategy column as the catalog spells it: Oracle matches the upper-case name exactly."""
+    return col.upper() if engine == "oracle" else col
 
 
 # ── config generation ────────────────────────────────────────────────────────
@@ -746,7 +761,7 @@ def _export_local(
         mode = "full"  # Mongo keyset is `source.mongo.page_size` (+ `parallel`), not chunk_by_key — see mongo_keyset.py
     key_block = "    mode: full"
     if mode == "chunked":
-        key_block = "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000"
+        key_block = f"    mode: chunked\n    chunk_by_key: {key_column(engine)}\n    chunk_size: 50000"
         # parallel: N fans keyset out into N row-percentile ranges.
         if parallel:
             key_block += f"\n    parallel: {parallel}"
@@ -791,8 +806,8 @@ def sc_verdicts(led: Ledger, engine: str, tag: str, url: str) -> None:
             return
         checks = [sc]
         # pg/mssql keep the garbage tables in schema `ext` (a separate init);
-        # mysql has them in the same DB.
-        if engine != "mysql":
+        # mysql and oracle have them in the same schema.
+        if engine not in ("mysql", "oracle"):
             gc = _init_cfg(engine, url, "ext")
             if gc is not None:
                 checks.append(gc)
@@ -884,7 +899,8 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     #     canonical full type set, a port of
     #     tests/type_roundtrip/fixtures/<eng>_schema.sql.
     if engine != "mongo":
-        for tmt in ("rivet_type_matrix",):
+        # Oracle adds the gate's TIMESTAMP WITH TIME ZONE probe (dev/release-oracle/oracle_tz_probe.sql).
+        for tmt in ("rivet_type_matrix", "rivet_tz_probe") if engine == "oracle" else ("rivet_type_matrix",):
             if _export_local(engine, url, tmt, out / tmt, "full").ok:
                 psrc = _declared_read(out / tmt, ".parquet")
                 if not psrc:
@@ -1036,7 +1052,7 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
         return
     yaml_path = Scope(engine, tag).dir("load", store).with_suffix(".yaml")
     tls_block = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
-    mode_block = "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000"
+    mode_block = f"    mode: chunked\n    chunk_by_key: {key_column(engine)}\n    chunk_size: 50000"
     if engine == "mongo":
         mode_block = "    mode: full"  # Mongo: full scan only
     yaml_path.write_text(
@@ -1136,6 +1152,14 @@ def sc_load_pool(led: Ledger, engine: str, tag: str, url: str) -> None:
 
 def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     """Every batch scenario for one engine×version, in the gate's order."""
+    if engine == "oracle":
+        from .value_diff import oracle_available
+
+        if not oracle_available():
+            _skipped(led, engine, tag, "all", "-",
+                     "oracle: python-oracledb (the source oracle) is not importable — run through `uv run`",
+                     "no python-oracledb")
+            return
     sc_verdicts(led, engine, tag, url)
     sc_integrity_types(led, engine, tag, url)
     # When blessing the local goldens (verdicts + duckdb-type) the store loads add
@@ -1152,12 +1176,21 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     # that is not rivet — see rowhash.py for why the in-tree auditor cannot.
     from . import corruption, rowhash
 
-    rowhash.verify_row_hash(led, engine, tag, url)
+    if engine == "oracle":
+        _skipped(led, engine, tag, "row_hash", "-",
+                 "row_hash[oracle]: the probe's rows 3 and 4 are one row on Oracle ('' is NULL), "
+                 "so its injectivity pair cannot be expressed", "fixture")
+    else:
+        rowhash.verify_row_hash(led, engine, tag, url)
     # The NEGATIVE half: does verification fail when the data is wrong?
     corruption.verify_corruption_is_detected(led, engine, tag, url)
     # The CDC sink has its OWN accumulator and manifests — proving the batch leg
     # detects corruption says nothing about this one.
-    corruption.verify_cdc_corruption_is_detected(led, engine, tag, url)
+    if engine == "oracle":
+        _skipped(led, engine, tag, "cdc_corruption_is_detected", "-",
+                 "cdc-corruption[oracle]: n/a — `mode: cdc` is refused for Oracle (batch-only source)", "na")
+    else:
+        corruption.verify_cdc_corruption_is_detected(led, engine, tag, url)
     # reconcile and validate check DIFFERENT sides; the pair is the claim.
     corruption.verify_reconcile_and_validate_cover_both_sides(led, engine, tag, url)
     # Is the schema fingerprint sensitive to a real schema change at all?
@@ -1198,6 +1231,18 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
                 err = e
         return child, err
 
+    if engine == "oracle":
+        # blessed_flow and not_inert are keyed on the CDC stand (cdc._ENGINES), which has no Oracle.
+        child, err = _half("blessed_path",
+                           lambda l: blessed_path.verify_blessed_path(l, engine, tag, url, state_url=state_url))
+        child.flush_into(led)
+        for sc in ("blessed_flow", "not_inert"):
+            _skipped(led, engine, tag, sc, "-",
+                     f"{sc}[oracle]: not wired — its cells ride the CDC stand, which has no Oracle "
+                     f"(docs/release-gate-matrix.yaml records the gap)", "gap")
+        if err is not None:
+            raise err
+        return
     with ThreadPoolExecutor(max_workers=2) as ex:
         halves = list(ex.map(lambda a: _half(*a), (
             ("blessed_path",

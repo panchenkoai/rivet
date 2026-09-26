@@ -70,13 +70,11 @@ grid:
     gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
     gaps:  []
   oracle:
-    gated: []
-    gaps:  ["23-free"]               # the Oracle batch source (phase 1) has a compose stand
-                                     # (gvenzl/oracle-free:23-slim-faststart) and live tests, but
-                                     # dev/release-oracle/matrix.yaml does not list the engine, so
-                                     # the gate brings up no Oracle version. Deliberately NOT an
-                                     # empty `versions:` there: that would be a gate leg over zero
-                                     # versions, a vacuous pass.
+    gated: ["23-free"]               # gvenzl/oracle-free:23-slim-faststart, the compose stand's image,
+                                     # brought up by the gate on :55023 and seeded from
+                                     # seeds/common/oracle.sql + dev/release-oracle/oracle_tz_probe.sql.
+                                     # BATCH ONLY: `mode: cdc` is refused for Oracle at config load.
+    gaps:  []
 
 # ── Per-(engine, version) DATA / BEHAVIOUR scenarios (run once per gridded version) ──
 # Cell is per-ENGINE (uniform across that engine's gridded versions); a version-specific
@@ -88,49 +86,49 @@ scenarios:
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   test
   - id: blessed_path
     what: "COMPLEMENTS docs/scenario-artifact-matrix.yaml, which owns the artifact/meta-DB half more deeply (14 lifecycle scenarios, all engines, canonical seed, chunk_run/chunk_task/load_run snapshots). What is added here and provably absent there: an INDEPENDENT oracle (that driver has zero duckdb calls — it compares rivet's records to rivet's files), the COMMAND CHAIN in one traversal: init -> doctor -> check -> plan -> apply -> validate, one cell per stage, asserting every artifact (config, plan.json, parquet, manifest.json, _SUCCESS, export_metrics/file_log/run_status) with DuckDB as the independent oracle for rows and file count. Per-stage coverage existed everywhere; no test drove three of the five subcommands in one body, and both defects found 2026-08-04 (apply's empty config path, CDC's unexpanded {date}) lived in that handoff gap."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   test
   - id: blessed_flow
     what: "The WHOLE journey as ONE declared cross-product, not per-defect additions: pipeline{batch,cdc} x lifecycle{clean,repeat,resume} x store{local,s3,gcs} x state{sqlite,postgres} x engine = 144 cells, 76 runnable, 68 `na` each carrying its reason in the ledger. Where blessed_path walks init->apply for one strategy, this adds what that chain cannot reach: the CDC pipeline (plan/apply REFUSE a cdc export, so those cells run `run`), the crash-then-resume lifecycle (a fault hook kills the first apply, and the probe FAILS the cell if the hook did not stop it — a resume whose first run succeeded is a clean re-run wearing a flag), the repeat lifecycle asserted on the MANIFEST COPIES rather than the parquet (the data surviving is what makes a sidecar clobber invisible), and `load` with load_run/loaded_source_run. Values are read ONLY by DuckDB, and only from parts a manifest DECLARES as committed — counting every parquet under the prefix reads a crashed run's orphans as delivered data. State is scoped per-run (watermark on export_metrics, which has no run_id; run ids from the manifests for file_log/run_status): the first draft counted `export_name='flow'` and read 37 rows of unrelated history on a cell that wrote one."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   { gap: "not wired for Oracle: blessed_flow's cells (and its CDC half, which Oracle refuses) ride the CDC stand in dev/release_oracle/cdc.py, which has no Oracle engine; the batch chain is graded by blessed_path" }
   - id: not_inert
     what: "The chain's own oracles must be able to go RED. Breaks each artifact class and requires the matching stage to fail: every declared part removed (oracle must stop agreeing with the source), no manifest (must report undelivered, not count the parquet lying next to it), a run id that never ran (state must refuse). Carries a NEGATIVE control too — removing ONE redundant copy of a repeated export must NOT move the oracle; the first draft demanded a failure there and went red against a correct oracle."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   { gap: "not wired for Oracle: sc_not_inert breaks blessed_flow's artifacts, and blessed_flow does not run on Oracle" }
   - id: verdicts
     what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   test
   - id: integrity_types
     what: "users 150K loss/dup 0 (source count+distinct == DuckDB read) + per-engine DuckDB type/CSV golden (parquet binary path + CSV all-varchar text path)."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    { na: "Mongo is a JSON-blob model (full-scan only) — no per-engine type matrix; the loss/dup arm still runs under integrity_types" }
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   test
   - id: keyset_parallel
     what: "parallel:4 keyset fan-out: loss/dup 0 (DuckDB oracle) AND >=2 distinct pk_w{ridx} workers (no silent degrade to sequential)."
     postgres: test
     mysql:    test
     mssql:    test
     mongo:    { na: "Mongo keyset is page_size (+ parallel -> mongo_parallel), graded by the mongo_keyset row" }
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   test
   - id: mongo_keyset
     what: "Mongo keyset on ONE version (8): `source.mongo.page_size` sequential AND `parallel: 4` (run_mongo_parallel) must each equal the pymongo source count+distinct via DuckDB over the DECLARED parts, over >=2 range parts; an int+string `_id` collection must be REFUSED on both (exit != 0, zero parts, the ensure_uniform_id_type message) — `$gt` is BSON-type-bracketed, so an unguarded keyset exports one bracket and reports success. RED-proven against the guard disabled and a dropped parallel range."
     postgres: { na: "SQL keyset is the keyset_parallel row" }
@@ -144,7 +142,7 @@ scenarios:
     mysql:    test
     mssql:    test
     mongo:    test
-    oracle:   { gap: "the release gate does not bring up Oracle (grid.oracle.gated is empty)" }
+    oracle:   test
   - id: gc_survival
     what: "concurrent-extract bucket-erasure guard: a Running manifest spares an in-flight part; none deletes the orphan; Success parts always kept."
     postgres: test

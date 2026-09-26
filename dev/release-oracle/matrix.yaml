@@ -67,6 +67,15 @@ engines:
       - { tag: "6",   image: "mongo:6",   port: 55006 }
       - { tag: "7",   image: "mongo:7",   port: 55007 }
       - { tag: "8",   image: "mongo:8",   port: 55008 }
+  oracle:
+    # Batch only: `mode: cdc` is refused for Oracle at config load, so no CDC cell
+    # runs. The source oracle is python-oracledb (thin), since DuckDB has no Oracle
+    # scanner. The image starts in ~1-3 min; bring-up waits up to ~5 min.
+    driver: oracle
+    url: "oracle://rivet:rivet@127.0.0.1:%PORT%/FREEPDB1"
+    seed: seeds/common/oracle.sql
+    versions:
+      - { tag: "23-free", image: "gvenzl/oracle-free:23-slim-faststart", port: 55023 }
 
 # ── Object-store backends (local fakes) ─────────────────────────────────────
 # One CloudDestination impl (src/destination/cloud.rs) serves all three; the gate
@@ -114,21 +123,21 @@ preflight:
 scenarios:
   - id: verdicts
     what: "init → the strategy per table matches expectation: clean-PK seeds (users/orders/…) → keyset; orders_sparse → full; garbage decimal_key → full-bail, ref_id_history → chunked (non-unique), heap_no_key/no_pk_no_ts → chunked DEGRADED, unindexed_id → NOT keyset (name-trap), ext_bigint_unsigned_pk (mysql) → keyset; zero phantom heavy-chunk."
-    applies: [postgres, mysql, mssql, mongo]
+    applies: [postgres, mysql, mssql, mongo, oracle]
 
   - id: integrity_types
-    what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS two fidelity arguments per type matrix: <tmt> = the PARQUET readback compared value by value to the SOURCE table (value_diff.compare_rows_to_parquet — decimal precision, uuid, timestamp, enum, arrays, float4; no golden) and <tmt>__csv = a per-engine DuckDB GOLDEN of the CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only."
-    applies: [postgres, mysql, mssql, mongo]
+    what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS two fidelity arguments per type matrix: <tmt> = the PARQUET readback compared value by value to the SOURCE table (value_diff.compare_rows_to_parquet — decimal precision, uuid, timestamp, enum, arrays, float4; no golden) and <tmt>__csv = a per-engine DuckDB GOLDEN of the CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only. Oracle's SOURCE side is read by python-oracledb (DuckDB has no Oracle scanner)."
+    applies: [postgres, mysql, mssql, mongo, oracle]
 
   - id: keyset_parallel
     what: "the feat/parallel-keyset fan-out end-to-end: users 150K exported with mode:chunked + chunk_by_key:id + parallel:4 must (a) lose/dup ZERO rows vs the DuckDB read of the parts (same independent oracle as integrity_types) AND (b) actually FAN OUT — >=2 distinct pk_w{ridx} worker parts, proving parallel:N engaged and did not silently degrade to sequential keyset (which integrity_types/load already exercise)."
-    applies: [postgres, mysql, mssql]   # mongo keyset (page_size + parallel -> mongo_parallel) is the mongo_keyset row
+    applies: [postgres, mysql, mssql, oracle]   # mongo keyset (page_size + parallel -> mongo_parallel) is the mongo_keyset row
   - id: mongo_keyset
     what: "one Mongo version: page_size keyset sequential AND parallel:4 (run_mongo_parallel) == the pymongo source count+distinct (DuckDB over DECLARED parts, >=2 range parts); an int+string _id collection is refused with zero parts (ensure_uniform_id_type)."
     applies: [mongo]
   - id: load
-    what: "load the manifested parts into each store {s3/minio, gcs/fake-gcs, azure/azurite} and read them back: the DECLARED parts' row count == the source's, then DuckDB attaches the source and compares every value, source strictly CAST to the parquet type, EXCEPT ALL both ways (Mongo: `document` unpacked into the source columns)."
-    applies: [postgres, mysql, mssql, mongo]
+    what: "load the manifested parts into each store {s3/minio, gcs/fake-gcs, azure/azurite} and read them back: the DECLARED parts' row count == the source's, then DuckDB attaches the source and compares every value, source strictly CAST to the parquet type, EXCEPT ALL both ways (Mongo: `document` unpacked into the source columns; Oracle: the source read by python-oracledb and registered in the same DuckDB session)."
+    applies: [postgres, mysql, mssql, mongo, oracle]
 
   - id: gc_survival
     what: "the concurrent-extract bucket-erasure guard: with a Running manifest present, a load's gc_orphans SPARES an unmanifested in-flight part; with none, it DELETES the true orphan; Success parts always kept. Run once per store."
