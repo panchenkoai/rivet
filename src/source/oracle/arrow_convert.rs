@@ -17,6 +17,7 @@ use arrow::record_batch::RecordBatch;
 use oracledb::{Metadata, OracleIntervalDS, OracleIntervalYM, OracleNumber, OracleTimestamp, Row};
 
 use super::Ora;
+use super::kind::{OraKind, native_label};
 use crate::error::Result;
 use crate::types::decimal::decimal_str_to_scaled_i128;
 use crate::types::{
@@ -39,7 +40,7 @@ pub(super) fn oracle_type_to_rivet(
     native: &str,
     overrides: &ColumnOverrides,
 ) -> RivetType {
-    crate::types::resolve_or(overrides, meta.name(), || match meta.db_type().name() {
+    crate::types::resolve_or(overrides, meta.name(), || match OraKind::of(meta) {
         _ if native.starts_with("timestamp_tz") || native.starts_with("timestamp_ltz") => {
             RivetType::Timestamp {
                 unit: TimeUnit::Microsecond,
@@ -49,31 +50,26 @@ pub(super) fn oracle_type_to_rivet(
         _ if native.starts_with("interval") => RivetType::Interval,
         _ if native == "json" => RivetType::Json,
         _ if native == "vector" || native == "object" || native == "xmltype" => RivetType::String,
-        "DB_TYPE_NUMBER" => number_type(meta.precision(), meta.scale()),
-        "DB_TYPE_BINARY_FLOAT" => RivetType::Float32,
-        "DB_TYPE_BINARY_DOUBLE" => RivetType::Float64,
-        "DB_TYPE_BOOLEAN" => RivetType::Bool,
-        "DB_TYPE_DATE" | "DB_TYPE_TIMESTAMP" => RivetType::Timestamp {
+        OraKind::Number => number_type(meta.precision(), meta.scale()),
+        OraKind::BinaryFloat => RivetType::Float32,
+        OraKind::BinaryDouble => RivetType::Float64,
+        OraKind::Boolean => RivetType::Bool,
+        OraKind::Date | OraKind::Timestamp => RivetType::Timestamp {
             unit: TimeUnit::Microsecond,
             timezone: None,
         },
-        "DB_TYPE_VARCHAR"
-        | "DB_TYPE_NVARCHAR"
-        | "DB_TYPE_CHAR"
-        | "DB_TYPE_NCHAR"
-        | "DB_TYPE_LONG"
-        | "DB_TYPE_LONG_NVARCHAR"
-        | "DB_TYPE_CLOB"
-        | "DB_TYPE_NCLOB" => RivetType::String,
-        "DB_TYPE_RAW" | "DB_TYPE_LONG_RAW" | "DB_TYPE_BLOB" => RivetType::Binary,
-        other => RivetType::Unsupported {
-            native_type: native_label(other),
-            reason: format!(
-                "Oracle column type {} has no Rivet mapping; select a convertible \
-                     expression of it in a `query:`, or drop it",
-                native_label(other)
-            ),
-        },
+        OraKind::Text | OraKind::Clob => RivetType::String,
+        OraKind::Raw | OraKind::Blob => RivetType::Binary,
+        _ => {
+            let label = native_label(meta);
+            RivetType::Unsupported {
+                native_type: label.clone(),
+                reason: format!(
+                    "Oracle column type {label} has no Rivet mapping; select a convertible \
+                     expression of it in a `query:`, or drop it"
+                ),
+            }
+        }
     })
 }
 
@@ -95,14 +91,9 @@ fn number_type(precision: u8, scale: i8) -> RivetType {
     }
 }
 
-/// The lowercase native type label (`number`, `timestamp`, …) for reports.
-fn native_label(db_type: &str) -> String {
-    db_type.trim_start_matches("DB_TYPE_").to_lowercase()
-}
-
 /// True when `meta` is a bare `NUMBER`/`FLOAT` (exported as exact text).
 fn is_bare_number(meta: &Metadata) -> bool {
-    meta.db_type().name() == "DB_TYPE_NUMBER" && (meta.precision() == 0 || meta.scale() == -127)
+    OraKind::of(meta) == OraKind::Number && (meta.precision() == 0 || meta.scale() == -127)
 }
 
 /// `TypeMapping` for every column, with the Oracle-specific warnings attached.
@@ -171,9 +162,9 @@ pub(super) fn oracle_schema(
 }
 
 /// An Oracle interval cell as the ISO 8601 duration rivet writes for every engine.
-fn interval_iso(row: &Row, idx: usize, db_type: &str) -> Result<Option<String>> {
-    Ok(match db_type {
-        "DB_TYPE_INTERVAL_DS" => row.get::<Option<OracleIntervalDS>>(idx).ora()?.map(|v| {
+fn interval_iso(row: &Row, idx: usize, kind: OraKind) -> Result<Option<String>> {
+    Ok(match kind {
+        OraKind::IntervalDs => row.get::<Option<OracleIntervalDS>>(idx).ora()?.map(|v| {
             let us = i64::from(v.hours()) * 3_600_000_000
                 + i64::from(v.minutes()) * 60_000_000
                 + i64::from(v.seconds()) * 1_000_000
@@ -315,14 +306,14 @@ fn build_column(
         }
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(rows.len(), 0);
-            let db_type = rows
+            let kind = rows
                 .first()
                 .and_then(|r| r.columns().get(idx))
-                .map_or("", |m| m.db_type().name());
+                .map_or(OraKind::Other, OraKind::of);
             for r in rows {
-                let v = match db_type {
-                    "DB_TYPE_NUMBER" => number(r)?,
-                    "DB_TYPE_INTERVAL_DS" | "DB_TYPE_INTERVAL_YM" => interval_iso(r, idx, db_type)?,
+                let v = match kind {
+                    OraKind::Number => number(r)?,
+                    OraKind::IntervalDs | OraKind::IntervalYm => interval_iso(r, idx, kind)?,
                     _ => r.get::<Option<String>>(idx).ora()?,
                 };
                 match v {

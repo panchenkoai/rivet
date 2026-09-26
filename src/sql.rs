@@ -332,6 +332,14 @@ pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {
 mod tests {
 
     #[test]
+    fn oracle_derived_aliases_are_quoted_and_carry_no_as() {
+        assert_eq!(alias(SourceType::Oracle, "_rivet"), "\"_rivet\"");
+        assert_eq!(alias(SourceType::Postgres, "_rivet"), "_rivet");
+        assert_eq!(derived(SourceType::Oracle, "_rivet"), "\"_rivet\"");
+        assert_eq!(derived(SourceType::Mysql, "_rivet"), "AS _rivet");
+    }
+
+    #[test]
     fn oracle_catalog_names_fold_unquoted_parts_only() {
         let (o, t) = oracle_catalog_preds("rivet.orders");
         assert_eq!((o.as_str(), t.as_str()), ("'RIVET'", "'ORDERS'"));

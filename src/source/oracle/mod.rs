@@ -7,6 +7,9 @@
 //! reach it (`TIMESTAMP WITH TIME ZONE` holding a region name panics the driver).
 
 mod arrow_convert;
+mod kind;
+
+use kind::OraKind;
 
 use std::sync::Arc;
 
@@ -163,22 +166,6 @@ pub(crate) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Connection> 
     Ok(conn)
 }
 
-/// The server-side expression a column is fetched through, or `None` to fetch it as is.
-fn projection_expr(meta: &Metadata, quoted: &str) -> Option<Result<String>> {
-    Some(Ok(match meta.db_type().name() {
-        // The driver decodes a region-named zone with `todo!()`; UTC on the server instead.
-        "DB_TYPE_TIMESTAMP_TZ" | "DB_TYPE_TIMESTAMP_LTZ" => format!("SYS_EXTRACT_UTC({quoted})"),
-        // TO_CHAR on an INTERVAL DAY(0) raises ORA-01877; intervals are decoded
-        // from the driver's signed fields instead (arrow_convert::interval_iso).
-        "DB_TYPE_ROWID" | "DB_TYPE_UROWID" => format!("ROWIDTOCHAR({quoted})"),
-        "DB_TYPE_JSON" => format!("JSON_SERIALIZE({quoted} RETURNING CLOB)"),
-        // The driver describes XMLTYPE as DB_TYPE_OBJECT; any other object type fails here loudly.
-        "DB_TYPE_XMLTYPE" | "DB_TYPE_OBJECT" => format!("XMLSERIALIZE(CONTENT {quoted} AS CLOB)"),
-        "DB_TYPE_VECTOR" => format!("FROM_VECTOR({quoted} RETURNING CLOB)"),
-        _ => return None,
-    }))
-}
-
 /// Rows to fetch per round trip and in the first (probe) batch: few when a LOB
 /// makes the row width unknowable up front, else the controller's target.
 fn probe_rows(projection: &Projection, target: usize) -> usize {
@@ -198,16 +185,12 @@ fn unreferenceable(name: &str) -> bool {
 
 /// The native type label a mapping reports: the DECLARED type, before re-projection.
 fn native_type(meta: &Metadata) -> String {
-    let base = meta
-        .db_type()
-        .name()
-        .trim_start_matches("DB_TYPE_")
-        .to_lowercase();
-    match meta.db_type().name() {
-        "DB_TYPE_NUMBER" if meta.precision() > 0 && meta.scale() != -127 => {
+    let base = kind::native_label(meta);
+    match OraKind::of(meta) {
+        OraKind::Number if meta.precision() > 0 && meta.scale() != -127 => {
             format!("number({},{})", meta.precision(), meta.scale())
         }
-        "DB_TYPE_TIMESTAMP" | "DB_TYPE_TIMESTAMP_TZ" | "DB_TYPE_TIMESTAMP_LTZ" => {
+        OraKind::Timestamp | OraKind::TimestampTz | OraKind::TimestampLtz => {
             format!("{base}({})", meta.scale())
         }
         _ => base,
@@ -302,18 +285,15 @@ impl OracleSource {
         let mut empty_flags = vec![None; metas.len()];
         for (i, m) in metas.iter().enumerate() {
             let quoted = crate::sql::quote_ident(crate::config::SourceType::Oracle, m.name());
-            match projection_expr(m, &quoted) {
+            let k = OraKind::of(m);
+            match k.projection(&quoted) {
                 Some(expr) => {
                     rewritten = true;
-                    cols.push(format!("{} {quoted}", expr?));
+                    cols.push(format!("{expr} {quoted}"));
                 }
                 None => cols.push(quoted.clone()),
             }
-            // The driver returns a zero-length LOB as NULL; the server says which it was.
-            if matches!(
-                m.db_type().name(),
-                "DB_TYPE_CLOB" | "DB_TYPE_NCLOB" | "DB_TYPE_BLOB"
-            ) {
+            if k.needs_empty_flag() {
                 rewritten = true;
                 empty_flags[i] = Some(metas.len() + flags.len());
                 flags.push(format!(
@@ -348,15 +328,15 @@ fn cell_text(row: &Row, idx: usize) -> Result<Option<String>> {
     let Some(meta) = row.columns().get(idx) else {
         return Ok(None);
     };
-    Ok(match meta.db_type().name() {
-        "DB_TYPE_NUMBER" => row
+    Ok(match OraKind::of(meta) {
+        OraKind::Number => row
             .get::<Option<OracleNumber>>(idx)
             .ora()?
             .map(|n| n.to_string()),
-        "DB_TYPE_BINARY_FLOAT" => row.get::<Option<f32>>(idx).ora()?.map(|v| v.to_string()),
-        "DB_TYPE_BINARY_DOUBLE" => row.get::<Option<f64>>(idx).ora()?.map(|v| v.to_string()),
-        "DB_TYPE_BOOLEAN" => row.get::<Option<bool>>(idx).ora()?.map(|v| v.to_string()),
-        "DB_TYPE_DATE" | "DB_TYPE_TIMESTAMP" => row
+        OraKind::BinaryFloat => row.get::<Option<f32>>(idx).ora()?.map(|v| v.to_string()),
+        OraKind::BinaryDouble => row.get::<Option<f64>>(idx).ora()?.map(|v| v.to_string()),
+        OraKind::Boolean => row.get::<Option<bool>>(idx).ora()?.map(|v| v.to_string()),
+        OraKind::Date | OraKind::Timestamp => row
             .get::<Option<OracleTimestamp>>(idx)
             .ora()?
             .map(|t| arrow_convert::timestamp_micros(&t))
