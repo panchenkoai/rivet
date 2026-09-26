@@ -13,7 +13,9 @@
   stream was down. It now fires like a batch run's. `quality:`, `parquet:`, `compression*`,
   `max_file_size`, `shape_drift_warn_factor` and `skip_empty` apply only to a CDC export's snapshot baseline,
   and `run --validate` / `--reconcile` likewise check only the baseline; each run now warns,
-  naming the ones that were set.
+  naming the ones that were set. A CDC run now also records the source server it ran against
+  (even when it fails) and the source-harm counters of its window, with the same DIAGNOSIS line
+  a batch run prints.
 - **The release gate grades what it used to wave through.** A run that bypasses the
   run-integrity facade only warns in a release build, and the gate now fails on that warning.
   Without `cargo-llvm-cov` the offline battery still runs and is graded instead of skipping.

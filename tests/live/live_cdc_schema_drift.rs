@@ -273,3 +273,68 @@ fn a_cdc_export_names_the_batch_knobs_its_drain_ignores() {
         "the ignored knobs must not cost the stream a change"
     );
 }
+
+// ── CDC drain: harm bracket + open forensics ────────────────────────────────
+
+/// A MySQL CDC run records the source-harm counters of its own window, and a run
+/// that FAILS (schema drift under `fail`) still records the server it ran against.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog ROW)"]
+fn mysql_cdc_run_persists_source_harm_and_server_context_even_when_it_fails() {
+    let tbl = unique_name("cdc_harm_my");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL)
+        .and_then(|p| p.get_conn())
+        .expect("connect mysql-cdc");
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = MysqlCdcTable(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl).export_line("on_schema_drift: fail");
+    rig.run_ok(); // anchor
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
+        .unwrap();
+    rig.run_ok();
+    assert_eq!(
+        duckdb_declared_dir_id_set(&rig.out_dir()),
+        [1].into_iter().collect(),
+        "the captured change lands"
+    );
+    let db = StateDb::next_to_config(&rig.config_path());
+    super::live_metrics_persist::assert_harm_contract(
+        &db,
+        &db.latest_run_id(rig.export_name()),
+        super::live_metrics_persist::MYSQL_HARM_COUNTERS,
+    );
+
+    c.query_drop(format!("ALTER TABLE {tbl} MODIFY v BIGINT"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (2, 30000000000)"))
+        .unwrap();
+    rig.run_expect_fail();
+    let failed = db.latest_run_id(rig.export_name());
+    let conn =
+        rusqlite::Connection::open(rig.config_path().parent().unwrap().join(".rivet_state.db"))
+            .expect("open state db");
+    let (status, server_ctx): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, server_context_json FROM export_metrics WHERE run_id = ?1",
+            [&failed],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("the failed CDC run has a metrics row");
+    assert_eq!(
+        status, "failed",
+        "fixture: the drift refusal must fail the run"
+    );
+    let sc = server_ctx.expect("a failed CDC run must still record the server it ran against");
+    assert!(
+        sc.contains("\"engine\":\"mysql\"") && sc.contains("max_execution_time_ms"),
+        "{sc}"
+    );
+    super::live_metrics_persist::assert_harm_contract(
+        &db,
+        &failed,
+        super::live_metrics_persist::MYSQL_HARM_COUNTERS,
+    );
+}

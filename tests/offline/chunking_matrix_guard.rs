@@ -247,7 +247,9 @@ const MATRICES: &[(&str, usize)] = &[
     // loop the derivation now finds) brought three honest gaps — open_forensics,
     // source_harm_and_diagnosis, partition_budget_footer_note — none of them wired
     // on the drain.
-    ("docs/runner-coverage-matrix.yaml", 8),
+    // Lowered 8 -> 6 the same day: open_forensics + source_harm_and_diagnosis on
+    // cdc closed (HarmBracket shared with the batch tail; RED-proven live).
+    ("docs/runner-coverage-matrix.yaml", 6),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     ("docs/mode-transition-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a

@@ -210,6 +210,12 @@ pub(super) fn run_cdc_export(
     // memory is the rollover buffer + the spill, and the ledger recorded 0.
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
+    // Open forensics + the source-harm bracket, as the batch tail takes them: a
+    // failed drain still records the server it ran against and what it cost it.
+    let server_context = crate::source::create_source(&config.source)
+        .ok()
+        .and_then(|mut s| s.server_context());
+    let harm = super::job::HarmBracket::open(&config.source);
     let result = run_cdc_inner(config, export, &run_id, state, &read_bytes, config_dir);
     let duration_ms = started.elapsed().as_millis() as i64;
     let peak_rss_mb = rss_sampler
@@ -248,6 +254,15 @@ pub(super) fn run_cdc_export(
         outcome.as_ref().err().map(crate::redact::redact_error),
     );
     summary.peak_rss_mb = peak_rss_mb;
+    summary.server_context_json = server_context;
+    let harm_deltas = harm.close(&config.source, state, &mut summary);
+    if let Some(line) = super::job::run_diagnosis(
+        &summary,
+        &harm_deltas,
+        super::run::multi_export_concurrent(),
+    ) {
+        log::warn!("{line}");
+    }
 
     // Transition the ledger to the CDC run's terminal status (mirrors the batch
     // path). A crash before here leaves the row `running`; the next CDC run
@@ -963,6 +978,7 @@ fn cdc_metric_row(
             .as_deref()
             .and_then(classify_error_message)
             .map(str::to_string),
+        server_context_json: summary.server_context_json.clone(),
         ..Default::default()
     }
 }
@@ -1141,6 +1157,19 @@ mod tests {
             row.destination_type.as_deref(),
             Some("local"),
             "destination engine must reach the export_metrics row"
+        );
+    }
+
+    #[test]
+    fn cdc_metric_row_carries_the_server_context() {
+        let export = crate::config::sample_export("t");
+        let mut summary =
+            super::cdc_summary("r1", &export, "failed", 0, 0, 0, 0, 50, Some("boom".into()));
+        summary.server_context_json = Some(r#"{"version":"8.0"}"#.into());
+        let row = super::cdc_metric_row(&summary, None, None);
+        assert_eq!(
+            row.server_context_json.as_deref(),
+            Some(r#"{"version":"8.0"}"#)
         );
     }
 

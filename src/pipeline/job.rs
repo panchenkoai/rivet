@@ -367,12 +367,66 @@ fn run_chunked_quality_gate(
 /// snapshot probe fails (URL unresolvable, connection refused, view filtered).
 /// Failures are silent — this is an observability metric, not a correctness
 /// signal, so a failed probe must never block the actual export.
-fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
-    if !matches!(plan.source.source_type, crate::config::SourceType::Postgres) {
-        return None;
+fn pg_temp_bytes_snapshot(source: &crate::config::SourceConfig) -> Option<i64> {
+    samples_pg_temp_bytes(source.source_type)
+        .then(|| {
+            let url = source.resolve_url().ok()?;
+            crate::source::postgres::sample_temp_bytes(&url, source.tls.as_ref())
+        })
+        .flatten()
+}
+
+/// Only PostgreSQL has the cluster temp-spill counter the bracket samples.
+fn samples_pg_temp_bytes(source_type: crate::config::SourceType) -> bool {
+    matches!(source_type, crate::config::SourceType::Postgres)
+}
+
+/// Source-harm counters taken before a run window; `close` turns them into the run's deltas.
+pub(super) struct HarmBracket {
+    temp_bytes: Option<i64>,
+    harm: Option<Vec<(String, i64)>>,
+}
+
+impl HarmBracket {
+    /// Snapshot the source's temp-spill and harm counters before the run.
+    pub(super) fn open(source: &crate::config::SourceConfig) -> Self {
+        Self {
+            temp_bytes: pg_temp_bytes_snapshot(source),
+            harm: harm_snapshot(source),
+        }
     }
-    let url = plan.source.resolve_url().ok()?;
-    crate::source::postgres::sample_temp_bytes(&url, plan.source.tls.as_ref())
+
+    /// Close on the same window: set the temp delta (warning on a spill), persist and return the harm deltas.
+    pub(super) fn close(
+        self,
+        source: &crate::config::SourceConfig,
+        state: &StateStore,
+        summary: &mut RunSummary,
+    ) -> Vec<(String, i64)> {
+        if let (Some(before), Some(after)) = (self.temp_bytes, pg_temp_bytes_snapshot(source)) {
+            let delta = pg_temp_bytes_delta(before, after);
+            summary.pg_temp_bytes_delta = Some(delta);
+            if let Some(line) = pg_temp_bytes_warning(
+                &summary.export_name,
+                delta,
+                super::run::multi_export_concurrent(),
+            ) {
+                log::warn!("{line}");
+            }
+        }
+        let (Some(before), Some(after)) = (self.harm, harm_snapshot(source)) else {
+            return Vec::new();
+        };
+        let deltas = harm_deltas(&before, &after);
+        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &deltas) {
+            log::debug!(
+                "'{}': harm metrics write failed (informational): {:#}",
+                summary.export_name,
+                e
+            );
+        }
+        deltas
+    }
 }
 
 /// The temp-spill the run gets CREDITED with, from the two snapshots bracketing
@@ -1190,14 +1244,9 @@ fn execute_resolved_plan(
     // before finalize still explains itself (export_schema is otherwise success-only).
     capture_open_forensics(plan, state, &mut summary, tail.record_load_spec);
 
-    // PG cursor / sort spill probe — captured around the actual run window.
-    // Cluster-level counter, so this is a noisy upper bound on a shared host
-    // but accurate on the single-tenant test DBs pilots typically use.
-    let pg_temp_bytes_before = pg_temp_bytes_snapshot(plan);
-    // Tier 2: broader source-harm counters (locks, rows read, buffer misses,
-    // temp files) bracketed around the same run window; the per-counter delta is
-    // stored in export_harm. Best-effort — see `harm_snapshot`.
-    let harm_before = harm_snapshot(&plan.source);
+    // PG temp-spill + the broader source-harm counters, bracketed around the run
+    // window; the deltas land in export_harm. Best-effort — see `harm_snapshot`.
+    let harm = HarmBracket::open(&plan.source);
 
     // Record plan diagnostics the caller already logged at validate time.
     for (rule, message) in &tail.plan_warnings {
@@ -1256,39 +1305,7 @@ fn execute_resolved_plan(
 
     // Close the harm bracket on the SAME window the run occupied, before the
     // status resolution below — the deltas are what the DIAGNOSIS reads.
-    // Compute the temp_bytes delta only when both snapshots succeeded — partial
-    // failures (e.g. dropped connection between runs) leave the field None so
-    // the summary card omits the line entirely.
-    if let Some(before) = pg_temp_bytes_before
-        && let Some(after) = pg_temp_bytes_snapshot(plan)
-    {
-        let delta = pg_temp_bytes_delta(before, after);
-        summary.pg_temp_bytes_delta = Some(delta);
-        if let Some(line) = pg_temp_bytes_warning(
-            &plan.export_name,
-            delta,
-            super::run::multi_export_concurrent(),
-        ) {
-            log::warn!("{line}");
-        }
-    }
-
-    // Tier 2: record the per-counter source-harm delta. A failed or absent probe
-    // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
-    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
-    if let Some(before) = &harm_before
-        && let Some(after) = harm_snapshot(&plan.source)
-    {
-        harm_delta_vec = harm_deltas(before, &after);
-        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
-            log::debug!(
-                "{} '{}': harm metrics write failed (informational): {:#}",
-                tail.kind,
-                summary.export_name,
-                e
-            );
-        }
-    }
+    let harm_delta_vec = harm.close(&plan.source, state, &mut summary);
     let tuning_class = plan.tuning.profile_name().to_string();
     let result = run_chunked_quality_gate(result, plan, &mut summary);
     let failed = result.is_err();
@@ -2545,6 +2562,15 @@ mod tests {
     /// difference: over `3 MB → 7 MB` the difference is 4 MB, the sum 10 MB, the
     /// quotient 2 — three distinct values, all positive, so `.max(0)` cannot mask
     /// the disagreement.
+    #[test]
+    fn only_postgres_samples_the_temp_spill_counter() {
+        use crate::config::SourceType;
+        assert!(super::samples_pg_temp_bytes(SourceType::Postgres));
+        for other in [SourceType::Mysql, SourceType::Mssql, SourceType::Mongo] {
+            assert!(!super::samples_pg_temp_bytes(other), "{other:?}");
+        }
+    }
+
     #[test]
     fn pg_temp_bytes_delta_is_the_windows_growth_and_never_a_counter_reset() {
         const MB: i64 = 1024 * 1024;
