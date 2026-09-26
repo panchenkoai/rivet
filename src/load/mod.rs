@@ -758,6 +758,7 @@ fn append_and_view(
     before_write(append_preflight(loader, table, specs, uris, pk, label))?;
 
     if let Some(rows) = adopt_full_load_table(loader, table, specs, ownership, rebuild_changelog)? {
+        crate::test_hook::maybe_panic_at("load_after_adopt");
         eprintln!(
             "  note: `{}` held {rows} rows from an earlier full load — it is now `{}`, the change \
              log this load appends to, and the name becomes the current-state view",

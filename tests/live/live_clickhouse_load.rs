@@ -688,3 +688,75 @@ fn a_part_clickhouse_cannot_address_is_sent_by_rivet_instead() {
     };
     staged_cdc_cycle("rivet_ch_odd", odd, &MINIO_ENV, Some("rivet_stand_minio"));
 }
+
+/// A load that dies right after turning the full-load table into the change log leaves the
+/// log and no table; the next load must append to that log and build the view, not land a
+/// second table beside it (which made every later delta refuse). The shape the bughunt hit:
+/// a full export switched to incremental, its first run adopting the table.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_load_that_dies_after_adopting_the_table_resumes_into_the_log() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_adopt", 5);
+    let db = Db::new("rivet_chtest");
+    let dir = tempfile::tempdir().expect("config dir");
+    let prefix = unique_name("chload");
+    let config = |rig: Rig| {
+        rig.dest_gcs(BUCKET, &prefix, FAKE_GCS_ENDPOINT)
+            .top_line(&format!(
+                "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+                 user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id] }}",
+                db.0
+            ))
+            .config_in(dir.path())
+    };
+    let cli = |args: &[&str], hook: Option<&str>| {
+        let mut envs = vec![(PASSWORD_ENV, CLICKHOUSE_PASSWORD)];
+        if let Some(h) = hook {
+            envs.push(("RIVET_TEST_PANIC_AT", h));
+        }
+        run_rivet_env(args, &envs)
+    };
+    let ok = |args: &[&str]| {
+        let out = cli(args, None);
+        assert!(
+            out.status.success(),
+            "{args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    let full = config(Rig::pg_batch(&tbl).mode("full"));
+    let cfg = full.to_str().expect("utf-8");
+    ok(&["run", "--config", cfg]);
+    ok(&["load", "--config", cfg]);
+
+    config(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+    );
+    ok(&["run", "--config", cfg]);
+    let crashed = cli(&["load", "--config", cfg], Some("load_after_adopt"));
+    assert!(
+        !crashed.status.success(),
+        "the hook must stop the load after the adoption"
+    );
+    ok(&["load", "--config", cfg]);
+
+    c.batch_execute(&format!(
+        "UPDATE {tbl} SET v = 99, updated_at = TIMESTAMP '2026-02-01' WHERE id = 1"
+    ))
+    .expect("change");
+    ok(&["run", "--config", cfg]);
+    ok(&["load", "--config", cfg]);
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        )),
+        pg_rows(&mut c, &tbl)
+    );
+}

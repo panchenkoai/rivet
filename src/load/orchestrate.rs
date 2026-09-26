@@ -1698,9 +1698,15 @@ impl SplitRuns {
 /// Whether a whole-table run joins the change log rather than landing as `<table>`:
 /// whenever that name is already taken. An incremental load never overwrites an existing
 /// table — the table becomes the log's baseline and the run is appended to it — and it
-/// cannot replace a view at all. Only an absent name is landed as a new table.
-fn whole_table_run_joins_the_log(kind: load::ObjectKind) -> bool {
-    matches!(kind, load::ObjectKind::Table | load::ObjectKind::View)
+/// cannot replace a view at all. An absent name joins too when `<table>__changes` exists:
+/// a load that adopted the table died before building the view, and landing a new table
+/// beside that log would make every later delta refuse. Otherwise it lands as a new table.
+fn whole_table_run_joins_the_log(kind: load::ObjectKind, changes: load::ObjectKind) -> bool {
+    match kind {
+        load::ObjectKind::Table | load::ObjectKind::View => true,
+        load::ObjectKind::Absent => changes == load::ObjectKind::Table,
+        load::ObjectKind::Other => false,
+    }
 }
 
 /// Why a whole-table run is appended to the change log instead of landing as `<table>`.
@@ -1710,6 +1716,11 @@ fn whole_table_run_note(kind: load::ObjectKind, fqtn: &str, run_id: &str) -> Str
             "  note: `{fqtn}` is already the current-state view over its change log — run \
              {run_id} re-read the whole table, so it is appended to the log (at least once; the \
              view keeps the latest row per key) instead of replacing it"
+        ),
+        load::ObjectKind::Absent => format!(
+            "  note: `{fqtn}` is missing but its change log `{fqtn}__changes` exists — a load \
+             that turned the table into that log stopped before building the view — so run \
+             {run_id}'s whole pass is appended to the log and the view is built"
         ),
         _ => format!(
             "  note: `{fqtn}` already holds rows from an earlier load, and an incremental load \
@@ -1804,7 +1815,9 @@ fn load_one_incremental(
                 .filter(|_| load::plan::whole_table_pass_may_join_the_log(base_and_buffer));
             if let Some((_, first)) = joins_the_log {
                 let kind = load::before_write(loader.object_kind(&plan.table))?;
-                if whole_table_run_joins_the_log(kind) {
+                let changes =
+                    load::before_write(loader.object_kind(&format!("{}__changes", plan.table)))?;
+                if whole_table_run_joins_the_log(kind, changes) {
                     eprintln!(
                         "{}",
                         whole_table_run_note(kind, &loader.fqtn(&plan.table), &first.run_id)
@@ -3039,9 +3052,12 @@ mod live_only_decisions {
     #[test]
     fn a_whole_table_run_joins_the_log_whenever_the_target_already_exists() {
         use load::ObjectKind::*;
-        assert!(whole_table_run_joins_the_log(View));
-        assert!(whole_table_run_joins_the_log(Table));
-        assert!(!whole_table_run_joins_the_log(Absent));
+        assert!(whole_table_run_joins_the_log(View, Absent));
+        assert!(whole_table_run_joins_the_log(Table, Absent));
+        assert!(!whole_table_run_joins_the_log(Absent, Absent));
+        // An adoption interrupted before its view: the log exists, the name does not.
+        assert!(whole_table_run_joins_the_log(Absent, Table));
+        assert!(!whole_table_run_joins_the_log(Other, Table));
 
         let on_table = whole_table_run_note(Table, "p.d.orders", "f1");
         assert!(
