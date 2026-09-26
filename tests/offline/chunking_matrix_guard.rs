@@ -115,7 +115,8 @@ const EXEMPT: &[(&str, &str)] = &[
 
 const MATRICES: &[(&str, usize)] = &[
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/chunking-matrix.yaml", 14),
+    // Lowered 14 -> 12 (2026-09-26): Oracle init keyset scaffold + chunk_by_days proven live.
+    ("docs/chunking-matrix.yaml", 12),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
     // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
     // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand
@@ -123,7 +124,8 @@ const MATRICES: &[(&str, usize)] = &[
     // cursor = MySQL, regclass-throw = PG, STRING_AGG cap = MSSQL) are one test
     // + justified n/a. 0 gaps — every cell is a test or a justified n/a.
     // Raised 0 -> 10 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/cli-flag-matrix.yaml", 10),
+    // Lowered 10 -> 8 (2026-09-26): Oracle wide-table introspection + time_window proven live.
+    ("docs/cli-flag-matrix.yaml", 8),
     // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
     // cloud findings (prefix normalization B, --validate-is-advisory A) + the
     // emulator round-trip + cross-backend parity.
@@ -134,13 +136,15 @@ const MATRICES: &[(&str, usize)] = &[
     // per-backend definition of delivered.
     ("docs/destination-matrix.yaml", 0),
     // Raised 0 -> 2 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/behaviour-matrix.yaml", 2),
+    // Lowered 2 -> 1 (2026-09-26): Oracle time_window proven live.
+    ("docs/behaviour-matrix.yaml", 1),
     // Raised 0 -> 1 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     ("docs/type-fidelity-matrix.yaml", 1),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
     // parity, csv, tuning profile) — visible + un-growable; fill by writing the test.
     // Raised 0 -> 7 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
-    ("docs/cross-config-matrix.yaml", 7),
+    // Lowered 7 -> 5 (2026-09-26): Oracle --reconcile + parallel: N proven live.
+    ("docs/cross-config-matrix.yaml", 5),
     // CDC — the most engine-divergent surface (12 scenarios × 4 engines). Complements
     // tests/cdc_conformance_gate.rs. The 5 holes it surfaced (schema-drift on PG +
     // MSSQL, until_current-terminates-under-load on the three SQL engines) are now
